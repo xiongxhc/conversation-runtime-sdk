@@ -140,6 +140,19 @@ curl_processes() {
     "$api_base/api/ps"
 }
 
+validate_processes_json() {
+  jq -e '
+    (.models | type == "array") and
+    all(
+      .models[];
+      type == "object" and
+      ((has("name") | not) or (.name | type == "string")) and
+      ((has("model") | not) or (.model | type == "string")) and
+      (has("name") or has("model"))
+    )
+  ' >/dev/null
+}
+
 unload_model() {
   local unload_request
   local processes_json
@@ -156,17 +169,7 @@ unload_model() {
       echo "Could not read Ollama process state while unloading: $model" >&2
       return 1
     fi
-    if ! printf '%s' "$processes_json" |
-      jq -e '
-        (.models | type == "array") and
-        all(
-          .models[];
-          type == "object" and
-          ((has("name") | not) or (.name | type == "string")) and
-          ((has("model") | not) or (.model | type == "string")) and
-          (has("name") or has("model"))
-        )
-      ' >/dev/null; then
+    if ! printf '%s' "$processes_json" | validate_processes_json; then
       echo "Ollama process response did not match the expected model schema." >&2
       return 1
     fi
@@ -191,6 +194,32 @@ unload_model() {
 
   echo "Model did not unload within the bounded polling window: $model" >&2
   return 1
+}
+
+capture_loaded_state() {
+  local processes_json
+  local match_count
+  if ! processes_json="$(curl_processes)"; then
+    echo "Could not read loaded Ollama state for benchmark evidence." >&2
+    return 1
+  fi
+  if ! printf '%s' "$processes_json" | validate_processes_json; then
+    echo "Loaded Ollama state did not match the expected model schema." >&2
+    return 1
+  fi
+  match_count="$(
+    printf '%s' "$processes_json" |
+      jq -r --arg model "$model" \
+        '[.models[] | select(.name == $model or .model == $model)] | length'
+  )"
+  if [[ "$match_count" -ne 1 ]]; then
+    echo "Expected one loaded model entry after warm-up, found $match_count." >&2
+    return 1
+  fi
+  printf '%s' "$processes_json" |
+    jq --arg model "$model" \
+      '.models[] | select(.name == $model or .model == $model)' \
+      >"$output_directory/loaded-state.json"
 }
 
 cleanup() {
@@ -302,6 +331,7 @@ if ! run_probe warmup; then
   echo "Warm-up failed; evidence retained in $relative_output_directory" >&2
   exit 1
 fi
+capture_loaded_state
 
 for run in 1 2 3; do
   if ! run_probe "run-${run}"; then

@@ -24,7 +24,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 async fn run_probe(arguments: ProbeArguments, endpoint: &str) -> Result<(), Box<dyn Error>> {
     let model = OllamaLanguageModel::new(
-        OllamaConfig::new(arguments.model.clone())
+        OllamaConfig::new(arguments.model.clone())?
             .with_endpoint(endpoint)?
             .with_thinking(false),
     );

@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use conversation_model_adapters::{
-    LanguageModel, LanguageModelRequest, OllamaConfig, OllamaLanguageModel,
+    LanguageModel, LanguageModelRequest, OllamaConfig, OllamaLanguageModel, OllamaThinkingLevel,
 };
 use conversation_protocol::TurnId;
 use serde_json::Value;
@@ -23,6 +23,7 @@ async fn streams_chat_content_and_serializes_the_request() {
 
     let model = OllamaLanguageModel::new(
         OllamaConfig::new("test-model")
+            .unwrap()
             .with_endpoint(server.endpoint())
             .unwrap(),
     );
@@ -39,6 +40,30 @@ async fn streams_chat_content_and_serializes_the_request() {
 }
 
 #[tokio::test]
+async fn preserves_reverse_proxy_base_paths_when_posting_chat_requests() {
+    let server = FakeOllamaServer::streaming([
+        r#"{"message":{"role":"assistant","content":""},"done":true}"#,
+    ])
+    .await;
+    let model = OllamaLanguageModel::new(
+        OllamaConfig::new("test-model")
+            .unwrap()
+            .with_endpoint(server.endpoint_with_base_path("/reverse-proxy/ollama"))
+            .unwrap(),
+    );
+    let mut output = model.stream(
+        LanguageModelRequest::new(TurnId::new(1), "hi"),
+        CancellationToken::new(),
+    );
+
+    assert!(output.recv().await.is_none());
+    assert_eq!(
+        server.request_target().await,
+        "/reverse-proxy/ollama/api/chat"
+    );
+}
+
+#[tokio::test]
 async fn serializes_optional_configuration() {
     let server = FakeOllamaServer::streaming([
         r#"{"message":{"role":"assistant","content":""},"done":true}"#,
@@ -46,6 +71,7 @@ async fn serializes_optional_configuration() {
     .await;
     let model = OllamaLanguageModel::new(
         OllamaConfig::new("test-model")
+            .unwrap()
             .with_endpoint(server.endpoint())
             .unwrap()
             .with_system_prompt("Be concise.")
@@ -77,6 +103,7 @@ async fn serializes_each_configured_thinking_value_and_omits_defaults() {
     .await;
     let default_model = OllamaLanguageModel::new(
         OllamaConfig::new("test-model")
+            .unwrap()
             .with_endpoint(default_server.endpoint())
             .unwrap(),
     );
@@ -94,6 +121,7 @@ async fn serializes_each_configured_thinking_value_and_omits_defaults() {
     .await;
     let configured_model = OllamaLanguageModel::new(
         OllamaConfig::new("test-model")
+            .unwrap()
             .with_endpoint(configured_server.endpoint())
             .unwrap()
             .with_thinking(false),
@@ -112,6 +140,7 @@ async fn serializes_each_configured_thinking_value_and_omits_defaults() {
     .await;
     let enabled_model = OllamaLanguageModel::new(
         OllamaConfig::new("test-model")
+            .unwrap()
             .with_endpoint(enabled_server.endpoint())
             .unwrap()
             .with_thinking(true),
@@ -126,10 +155,40 @@ async fn serializes_each_configured_thinking_value_and_omits_defaults() {
 }
 
 #[tokio::test]
+async fn serializes_each_configured_thinking_level() {
+    for (thinking, expected) in [
+        (OllamaThinkingLevel::Low, "low"),
+        (OllamaThinkingLevel::Medium, "medium"),
+        (OllamaThinkingLevel::High, "high"),
+        (OllamaThinkingLevel::Max, "max"),
+    ] {
+        let server = FakeOllamaServer::streaming([
+            r#"{"message":{"role":"assistant","content":""},"done":true}"#,
+        ])
+        .await;
+        let model = OllamaLanguageModel::new(
+            OllamaConfig::new("test-model")
+                .unwrap()
+                .with_endpoint(server.endpoint())
+                .unwrap()
+                .with_thinking_level(thinking),
+        );
+        let mut output = model.stream(
+            LanguageModelRequest::new(TurnId::new(1), "hi"),
+            CancellationToken::new(),
+        );
+
+        assert!(output.recv().await.is_none());
+        assert_eq!(server.request_json().await["think"], expected);
+    }
+}
+
+#[tokio::test]
 async fn reports_one_error_for_http_failures() {
     let server = FakeOllamaServer::failure(500, "model unavailable").await;
     let model = OllamaLanguageModel::new(
         OllamaConfig::new("test-model")
+            .unwrap()
             .with_endpoint(server.endpoint())
             .unwrap(),
     );
@@ -146,10 +205,62 @@ async fn reports_one_error_for_http_failures() {
 }
 
 #[tokio::test]
+async fn bounds_truncated_http_failure_bodies() {
+    let prefix = "model unavailable: ";
+    let suffix = "untrusted-body-data".repeat(1024);
+    let server = FakeOllamaServer::failure(500, format!("{prefix}{suffix}")).await;
+    let model = OllamaLanguageModel::new(
+        OllamaConfig::new("test-model")
+            .unwrap()
+            .with_endpoint(server.endpoint())
+            .unwrap(),
+    );
+    let mut output = model.stream(
+        LanguageModelRequest::new(TurnId::new(1), "hi"),
+        CancellationToken::new(),
+    );
+
+    let error = output.recv().await.unwrap().unwrap_err();
+
+    assert!(error.message().contains(prefix));
+    assert!(error.message().contains("truncated"));
+    assert!(!error.message().contains(&suffix));
+    assert!(output.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn rejects_cumulative_assistant_content_before_forwarding_the_overflowing_delta() {
+    let server = FakeOllamaServer::streaming([
+        r#"{"message":{"role":"assistant","content":"abc"},"done":false}"#,
+        r#"{"message":{"role":"assistant","content":"de"},"done":true}"#,
+    ])
+    .await;
+    let model = OllamaLanguageModel::new(
+        OllamaConfig::new("test-model")
+            .unwrap()
+            .with_endpoint(server.endpoint())
+            .unwrap()
+            .with_max_assistant_content_bytes(4)
+            .unwrap(),
+    );
+    let mut output = model.stream(
+        LanguageModelRequest::new(TurnId::new(1), "hi"),
+        CancellationToken::new(),
+    );
+
+    assert_eq!(output.recv().await.unwrap().unwrap(), "abc");
+    let error = output.recv().await.unwrap().unwrap_err();
+
+    assert!(error.message().contains("assistant content"));
+    assert!(output.recv().await.is_none());
+}
+
+#[tokio::test]
 async fn reports_one_error_for_malformed_ndjson() {
     let server = FakeOllamaServer::streaming(["not json"]).await;
     let model = OllamaLanguageModel::new(
         OllamaConfig::new("test-model")
+            .unwrap()
             .with_endpoint(server.endpoint())
             .unwrap(),
     );
@@ -169,6 +280,7 @@ async fn reports_one_error_for_ollama_error_records() {
     let server = FakeOllamaServer::streaming([r#"{"error":"model unavailable"}"#]).await;
     let model = OllamaLanguageModel::new(
         OllamaConfig::new("test-model")
+            .unwrap()
             .with_endpoint(server.endpoint())
             .unwrap(),
     );
@@ -191,6 +303,7 @@ async fn reports_one_error_for_an_unterminated_final_record() {
     .await;
     let model = OllamaLanguageModel::new(
         OllamaConfig::new("test-model")
+            .unwrap()
             .with_endpoint(server.endpoint())
             .unwrap(),
     );
@@ -213,6 +326,7 @@ async fn reports_one_error_when_a_newline_terminated_stream_omits_done() {
     .await;
     let model = OllamaLanguageModel::new(
         OllamaConfig::new("test-model")
+            .unwrap()
             .with_endpoint(server.endpoint())
             .unwrap(),
     );
@@ -238,6 +352,7 @@ async fn reports_one_error_for_an_oversized_ndjson_record() {
     let server = FakeOllamaServer::raw_streaming([record]).await;
     let model = OllamaLanguageModel::new(
         OllamaConfig::new("test-model")
+            .unwrap()
             .with_endpoint(server.endpoint())
             .unwrap(),
     );
@@ -269,6 +384,7 @@ async fn streams_completed_records_before_rejecting_an_oversized_partial_record(
     let server = FakeOllamaServer::raw_streaming([chunk]).await;
     let model = OllamaLanguageModel::new(
         OllamaConfig::new("test-model")
+            .unwrap()
             .with_endpoint(server.endpoint())
             .unwrap(),
     );
@@ -298,6 +414,7 @@ async fn cancellation_closes_the_stream_before_a_delayed_second_chunk() {
     .await;
     let model = OllamaLanguageModel::new(
         OllamaConfig::new("test-model")
+            .unwrap()
             .with_endpoint(server.endpoint())
             .unwrap(),
     );
@@ -318,15 +435,25 @@ async fn cancellation_closes_the_stream_before_a_delayed_second_chunk() {
 
 #[test]
 fn rejects_empty_models_and_invalid_endpoints() {
-    assert!(std::panic::catch_unwind(|| OllamaConfig::new(" ")).is_err());
+    assert!(OllamaConfig::new(" ").is_err());
     assert!(OllamaConfig::new("test-model")
+        .unwrap()
         .with_endpoint("not a url")
+        .is_err());
+    assert!(OllamaConfig::new("test-model")
+        .unwrap()
+        .with_endpoint("ftp://127.0.0.1:11434")
+        .is_err());
+    assert!(OllamaConfig::new("test-model")
+        .unwrap()
+        .with_max_assistant_content_bytes(0)
         .is_err());
 }
 
 struct FakeOllamaServer {
     endpoint: String,
     request: Arc<Mutex<Option<Value>>>,
+    request_target: Arc<Mutex<Option<String>>>,
 }
 
 impl FakeOllamaServer {
@@ -391,22 +518,37 @@ impl FakeOllamaServer {
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let request = Arc::new(Mutex::new(None));
         let stored_request = request.clone();
+        let request_target = Arc::new(Mutex::new(None));
+        let stored_request_target = request_target.clone();
 
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let request_json = read_request_json(stream, response).await;
+            let (request_json, target) = read_request_json(stream, response).await;
             *stored_request.lock().await = Some(request_json);
+            *stored_request_target.lock().await = Some(target);
         });
 
-        Self { endpoint, request }
+        Self {
+            endpoint,
+            request,
+            request_target,
+        }
     }
 
     fn endpoint(&self) -> &str {
         &self.endpoint
     }
 
+    fn endpoint_with_base_path(&self, path: &str) -> String {
+        format!("{}{path}", self.endpoint)
+    }
+
     async fn request_json(&self) -> Value {
         self.request.lock().await.clone().unwrap()
+    }
+
+    async fn request_target(&self) -> String {
+        self.request_target.lock().await.clone().unwrap()
     }
 }
 
@@ -421,7 +563,7 @@ enum Response {
     },
 }
 
-async fn read_request_json(mut stream: TcpStream, response: Response) -> Value {
+async fn read_request_json(mut stream: TcpStream, response: Response) -> (Value, String) {
     let mut request = Vec::new();
     let mut buffer = [0_u8; 1024];
     let header_end = loop {
@@ -452,6 +594,15 @@ async fn read_request_json(mut stream: TcpStream, response: Response) -> Value {
 
     let request_json =
         serde_json::from_slice(&request[header_end..header_end + content_length]).unwrap();
+    let request_target = std::str::from_utf8(&request[..header_end])
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .to_owned();
 
     match response {
         Response::Streaming { chunks, delay } => {
@@ -477,7 +628,7 @@ async fn read_request_json(mut stream: TcpStream, response: Response) -> Value {
         }
     }
 
-    request_json
+    (request_json, request_target)
 }
 
 fn find_header_end(request: &[u8]) -> Option<usize> {

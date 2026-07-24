@@ -7,6 +7,24 @@ const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:11434";
 const DEFAULT_TEMPERATURE: f32 = 0.7;
 const STREAM_BUFFER_SIZE: usize = 16;
 const MAX_NDJSON_RECORD_BYTES: usize = 64 * 1024;
+const DEFAULT_MAX_ASSISTANT_CONTENT_BYTES: usize = 64 * 1024;
+const MAX_ERROR_BODY_PREFIX_BYTES: usize = 4 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OllamaThinkingLevel {
+    Low,
+    Medium,
+    High,
+    Max,
+}
+
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+#[serde(untagged)]
+enum OllamaThinking {
+    Boolean(bool),
+    Level(OllamaThinkingLevel),
+}
 
 #[derive(Clone, Debug)]
 pub struct OllamaConfig {
@@ -14,19 +32,21 @@ pub struct OllamaConfig {
     model: String,
     system_prompt: Option<String>,
     keep_alive: Option<String>,
-    thinking: Option<bool>,
+    thinking: Option<OllamaThinking>,
     temperature: f32,
+    max_assistant_content_bytes: usize,
 }
 
 impl OllamaConfig {
-    pub fn new(model: impl Into<String>) -> Self {
+    pub fn new(model: impl Into<String>) -> Result<Self, AdapterError> {
         let model = model.into();
-        assert!(
-            !model.trim().is_empty(),
-            "Ollama model identifiers cannot be empty"
-        );
+        if model.trim().is_empty() {
+            return Err(AdapterError::new(
+                "Ollama model identifiers cannot be empty",
+            ));
+        }
 
-        Self {
+        Ok(Self {
             endpoint: reqwest::Url::parse(DEFAULT_ENDPOINT)
                 .expect("default Ollama endpoint is valid"),
             model,
@@ -34,12 +54,20 @@ impl OllamaConfig {
             keep_alive: None,
             thinking: None,
             temperature: DEFAULT_TEMPERATURE,
-        }
+            max_assistant_content_bytes: DEFAULT_MAX_ASSISTANT_CONTENT_BYTES,
+        })
     }
 
     pub fn with_endpoint(mut self, endpoint: impl AsRef<str>) -> Result<Self, AdapterError> {
-        self.endpoint = reqwest::Url::parse(endpoint.as_ref())
+        let endpoint = reqwest::Url::parse(endpoint.as_ref())
             .map_err(|error| AdapterError::new(format!("invalid Ollama endpoint: {error}")))?;
+        if !matches!(endpoint.scheme(), "http" | "https") || endpoint.host_str().is_none() {
+            return Err(AdapterError::new(
+                "Ollama endpoints must be valid HTTP(S) URLs",
+            ));
+        }
+
+        self.endpoint = endpoint;
         Ok(self)
     }
 
@@ -54,13 +82,32 @@ impl OllamaConfig {
     }
 
     pub fn with_thinking(mut self, thinking: bool) -> Self {
-        self.thinking = Some(thinking);
+        self.thinking = Some(OllamaThinking::Boolean(thinking));
+        self
+    }
+
+    pub fn with_thinking_level(mut self, thinking: OllamaThinkingLevel) -> Self {
+        self.thinking = Some(OllamaThinking::Level(thinking));
         self
     }
 
     pub fn with_temperature(mut self, temperature: f32) -> Self {
         self.temperature = temperature;
         self
+    }
+
+    pub fn with_max_assistant_content_bytes(
+        mut self,
+        max_assistant_content_bytes: usize,
+    ) -> Result<Self, AdapterError> {
+        if max_assistant_content_bytes == 0 {
+            return Err(AdapterError::new(
+                "Ollama assistant content byte limit must be non-zero",
+            ));
+        }
+
+        self.max_assistant_content_bytes = max_assistant_content_bytes;
+        Ok(self)
     }
 }
 
@@ -108,10 +155,7 @@ async fn stream_chat(
     cancellation: CancellationToken,
     sender: &mpsc::Sender<Result<String, AdapterError>>,
 ) -> Result<(), AdapterError> {
-    let chat_url = config
-        .endpoint
-        .join("api/chat")
-        .map_err(|error| AdapterError::new(format!("invalid Ollama chat URL: {error}")))?;
+    let chat_url = chat_url(&config.endpoint);
     let chat_request = ChatRequest::new(&config, request.transcript());
     let mut response = tokio::select! {
         biased;
@@ -123,19 +167,15 @@ async fn stream_chat(
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => return Ok(()),
-            result = response.text() => {
-                result.map_err(|error| AdapterError::new(format!("Ollama error response could not be read: {error}")))?
-            }
-        };
+        let (body, truncated) = read_error_body(&mut response, &cancellation).await?;
         return Err(AdapterError::new(format!(
-            "Ollama request failed with status {status}: {body}"
+            "Ollama request failed with status {status}: {body}{}",
+            if truncated { " [truncated]" } else { "" }
         )));
     }
 
     let mut parser = NdjsonResponseParser::new();
+    let mut assistant_content_bytes = 0;
     loop {
         let chunk = tokio::select! {
             biased;
@@ -151,7 +191,15 @@ async fn stream_chat(
 
         let mut remaining = chunk.as_ref();
         while let Some(response) = parser.next_response(&mut remaining)? {
-            if process_response(response, &cancellation, sender).await? {
+            if process_response(
+                response,
+                &cancellation,
+                sender,
+                &mut assistant_content_bytes,
+                config.max_assistant_content_bytes,
+            )
+            .await?
+            {
                 return Ok(());
             }
         }
@@ -162,6 +210,8 @@ async fn process_response(
     response: ChatResponse,
     cancellation: &CancellationToken,
     sender: &mpsc::Sender<Result<String, AdapterError>>,
+    assistant_content_bytes: &mut usize,
+    max_assistant_content_bytes: usize,
 ) -> Result<bool, AdapterError> {
     if let Some(error) = response.error {
         return Err(AdapterError::new(format!(
@@ -170,6 +220,13 @@ async fn process_response(
     }
     if let Some(content) = response.message.and_then(|message| message.content) {
         if !content.is_empty() {
+            if content.len() > max_assistant_content_bytes.saturating_sub(*assistant_content_bytes)
+            {
+                return Err(AdapterError::new(format!(
+                    "Ollama assistant content exceeds the maximum size of {max_assistant_content_bytes} bytes"
+                )));
+            }
+            *assistant_content_bytes += content.len();
             tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => return Ok(true),
@@ -183,6 +240,49 @@ async fn process_response(
     }
 
     Ok(response.done)
+}
+
+fn chat_url(endpoint: &reqwest::Url) -> reqwest::Url {
+    let mut chat_url = endpoint.clone();
+    let base_path = endpoint.path().trim_end_matches('/');
+    let path = if base_path.is_empty() {
+        "/api/chat".to_owned()
+    } else {
+        format!("{base_path}/api/chat")
+    };
+
+    chat_url.set_path(&path);
+    chat_url.set_query(None);
+    chat_url.set_fragment(None);
+    chat_url
+}
+
+async fn read_error_body(
+    response: &mut reqwest::Response,
+    cancellation: &CancellationToken,
+) -> Result<(String, bool), AdapterError> {
+    let mut prefix = Vec::with_capacity(MAX_ERROR_BODY_PREFIX_BYTES);
+
+    loop {
+        let chunk = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Ok((String::new(), false)),
+            result = response.chunk() => {
+                result.map_err(|error| AdapterError::new(format!("Ollama error response could not be read: {error}")))?
+            }
+        };
+        let Some(chunk) = chunk else {
+            return Ok((String::from_utf8_lossy(&prefix).into_owned(), false));
+        };
+
+        let remaining = MAX_ERROR_BODY_PREFIX_BYTES.saturating_sub(prefix.len());
+        if chunk.len() > remaining {
+            prefix.extend_from_slice(&chunk[..remaining]);
+            return Ok((String::from_utf8_lossy(&prefix).into_owned(), true));
+        }
+
+        prefix.extend_from_slice(&chunk);
+    }
 }
 
 async fn send_error(
@@ -209,7 +309,7 @@ struct ChatRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     keep_alive: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    think: Option<bool>,
+    think: Option<OllamaThinking>,
     options: ChatOptions,
 }
 

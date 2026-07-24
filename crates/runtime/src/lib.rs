@@ -10,6 +10,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 
 const EVENT_BUFFER_SIZE: usize = 32;
+const DEFAULT_MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
 #[non_exhaustive]
 pub enum RuntimeCommandResult {
@@ -42,6 +43,7 @@ impl TurnEventStream {
 pub struct ConversationRuntime {
     language_model: Arc<dyn LanguageModel>,
     speech_synthesizer: Arc<dyn SpeechSynthesizer>,
+    max_response_bytes: usize,
     active_turn: Arc<Mutex<Option<ActiveTurn>>>,
     last_started_turn_id: Arc<Mutex<Option<TurnId>>>,
 }
@@ -60,9 +62,26 @@ impl ConversationRuntime {
         Self {
             language_model,
             speech_synthesizer,
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             active_turn: Arc::new(Mutex::new(None)),
             last_started_turn_id: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub fn with_max_response_bytes(
+        mut self,
+        max_response_bytes: usize,
+    ) -> Result<Self, RuntimeError> {
+        if max_response_bytes == 0 {
+            return Err(RuntimeError::new(
+                RuntimeErrorKind::Configuration,
+                RuntimeStage::Runtime,
+                "runtime response byte limit must be non-zero",
+            ));
+        }
+
+        self.max_response_bytes = max_response_bytes;
+        Ok(self)
     }
 
     pub async fn execute(
@@ -123,6 +142,7 @@ impl ConversationRuntime {
             .map_err(|_| runtime_error("turn event stream closed before start"))?;
         let language_model = Arc::clone(&self.language_model);
         let speech_synthesizer = Arc::clone(&self.speech_synthesizer);
+        let max_response_bytes = self.max_response_bytes;
         let active_turn = Arc::clone(&self.active_turn);
 
         tokio::spawn(async move {
@@ -132,6 +152,7 @@ impl ConversationRuntime {
                 transcript,
                 language_model,
                 speech_synthesizer,
+                max_response_bytes,
                 worker_cancellation,
                 &event_sender,
             )
@@ -179,6 +200,7 @@ async fn run_turn(
     transcript: String,
     language_model: Arc<dyn LanguageModel>,
     speech_synthesizer: Arc<dyn SpeechSynthesizer>,
+    max_response_bytes: usize,
     cancellation: CancellationToken,
     events: &mpsc::Sender<RuntimeEvent>,
 ) -> RuntimeEvent {
@@ -197,9 +219,10 @@ async fn run_turn(
     }
 
     let mut response = String::new();
+    let language_model_cancellation = cancellation.child_token();
     let mut deltas = language_model.stream(
         LanguageModelRequest::new(turn_id, transcript),
-        cancellation.child_token(),
+        language_model_cancellation.clone(),
     );
 
     loop {
@@ -211,6 +234,16 @@ async fn run_turn(
             item = deltas.recv() => {
                 match item {
                     Some(Ok(delta)) => {
+                        if delta.len() > max_response_bytes.saturating_sub(response.len()) {
+                            language_model_cancellation.cancel();
+                            return adapter_failure(
+                                turn_id,
+                                RuntimeStage::LanguageModel,
+                                AdapterError::new(format!(
+                                    "language model response exceeds the maximum size of {max_response_bytes} bytes"
+                                )),
+                            );
+                        }
                         response.push_str(&delta);
                         if !send_event(
                             events,

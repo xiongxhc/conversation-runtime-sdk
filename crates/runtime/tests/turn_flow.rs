@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,10 +11,15 @@ use conversation_protocol::{
 };
 use conversation_runtime::{ConversationRuntime, RuntimeCommandResult, TurnEventStream};
 use tokio::sync::mpsc;
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 struct FailingLanguageModel;
 struct FailingSpeechSynthesizer;
+
+struct OverflowingLanguageModel {
+    cancellation_observed: Arc<AtomicBool>,
+}
 
 impl LanguageModel for FailingLanguageModel {
     fn stream(
@@ -27,6 +33,26 @@ impl LanguageModel for FailingLanguageModel {
                 .send(Err(AdapterError::new("language model unavailable")))
                 .await;
         });
+        receiver
+    }
+}
+
+impl LanguageModel for OverflowingLanguageModel {
+    fn stream(
+        &self,
+        _request: LanguageModelRequest,
+        cancellation: CancellationToken,
+    ) -> mpsc::Receiver<Result<String, AdapterError>> {
+        let (sender, receiver) = mpsc::channel(2);
+        let cancellation_observed = Arc::clone(&self.cancellation_observed);
+
+        tokio::spawn(async move {
+            let _ = sender.send(Ok("abc".into())).await;
+            let _ = sender.send(Ok("de".into())).await;
+            cancellation.cancelled().await;
+            cancellation_observed.store(true, Ordering::Release);
+        });
+
         receiver
     }
 }
@@ -111,6 +137,122 @@ async fn reports_language_model_failure_as_the_only_terminal_event() {
             ),
         }]
     );
+}
+
+#[tokio::test]
+async fn bounds_language_model_responses_and_cancels_the_model_child_token() {
+    let cancellation_observed = Arc::new(AtomicBool::new(false));
+    let runtime = ConversationRuntime::new(
+        Arc::new(OverflowingLanguageModel {
+            cancellation_observed: Arc::clone(&cancellation_observed),
+        }),
+        Arc::new(MockSpeechSynthesizer::new([1])),
+    )
+    .with_max_response_bytes(4)
+    .unwrap();
+    let turn_id = TurnId::new(5);
+    let mut events = start_turn(&runtime, turn_id, "bound this").await;
+    let mut observed = Vec::new();
+
+    while let Some(event) = events.recv().await {
+        observed.push(event);
+    }
+
+    assert!(observed.contains(&RuntimeEvent::TextDelta {
+        turn_id,
+        delta: "abc".into(),
+    }));
+    assert!(!observed.contains(&RuntimeEvent::TextDelta {
+        turn_id,
+        delta: "de".into(),
+    }));
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|event| event.is_terminal())
+            .collect::<Vec<_>>(),
+        vec![&RuntimeEvent::TurnFailed {
+            turn_id,
+            error: RuntimeError::new(
+                RuntimeErrorKind::Adapter,
+                RuntimeStage::LanguageModel,
+                "language model response exceeds the maximum size of 4 bytes",
+            ),
+        }]
+    );
+    timeout(Duration::from_secs(1), async {
+        while !cancellation_observed.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("language model child token was not cancelled");
+}
+
+#[tokio::test]
+async fn accepts_exactly_the_default_runtime_response_limit() {
+    let delta = "a".repeat(64 * 1024);
+    let runtime = ConversationRuntime::new(
+        Arc::new(MockLanguageModel::new([delta])),
+        Arc::new(MockSpeechSynthesizer::new([1])),
+    );
+    let turn_id = TurnId::new(6);
+    let mut events = start_turn(&runtime, turn_id, "bound this").await;
+    let mut observed = Vec::new();
+
+    while let Some(event) = events.recv().await {
+        observed.push(event);
+    }
+
+    assert!(observed.contains(&RuntimeEvent::TextDelta {
+        turn_id,
+        delta: "a".repeat(64 * 1024),
+    }));
+    assert!(observed.contains(&RuntimeEvent::TurnCompleted { turn_id }));
+}
+
+#[tokio::test]
+async fn rejects_one_byte_over_the_default_runtime_response_limit() {
+    let runtime = ConversationRuntime::new(
+        Arc::new(MockLanguageModel::new(["a".repeat(64 * 1024 + 1)])),
+        Arc::new(MockSpeechSynthesizer::new([1])),
+    );
+    let turn_id = TurnId::new(7);
+    let mut events = start_turn(&runtime, turn_id, "bound this").await;
+    let mut observed = Vec::new();
+
+    while let Some(event) = events.recv().await {
+        observed.push(event);
+    }
+
+    assert!(!observed.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::TextDelta { turn_id: event_turn_id, .. } if *event_turn_id == turn_id
+    )));
+    assert_eq!(
+        observed
+            .into_iter()
+            .filter(RuntimeEvent::is_terminal)
+            .collect::<Vec<_>>(),
+        vec![RuntimeEvent::TurnFailed {
+            turn_id,
+            error: RuntimeError::new(
+                RuntimeErrorKind::Adapter,
+                RuntimeStage::LanguageModel,
+                "language model response exceeds the maximum size of 65536 bytes",
+            ),
+        }]
+    );
+}
+
+#[test]
+fn rejects_a_zero_runtime_response_limit() {
+    let runtime = ConversationRuntime::new(
+        Arc::new(MockLanguageModel::new(["response"])),
+        Arc::new(MockSpeechSynthesizer::new([1])),
+    );
+
+    assert!(runtime.with_max_response_bytes(0).is_err());
 }
 
 #[tokio::test]

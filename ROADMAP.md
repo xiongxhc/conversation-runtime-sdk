@@ -9,14 +9,20 @@ The first release is not a directory-complete platform. It is one local voice lo
 ## Current State
 
 - The approved architecture and exact initial project map are documented.
-- The Rust workspace source, public protocol, adapter contracts, deterministic mocks, and runtime tests are created.
-- The pinned Rust toolchain compiles the workspace and all deterministic tests pass.
-- Real model, audio, persona, memory, desktop, and client SDK implementations have not started.
+- R1 is complete: the Rust workspace, public protocol, adapter contracts, deterministic mocks, orchestration, and runtime tests are present.
+- The local Ollama adapter and text probe are implemented and tested without exposing Ollama to the public protocol or LAN.
+- Qwen 34.7B, Qwen 27B, and Llama 70B pass bounded local text feasibility at an 8K context. Qwen 34.7B is fastest; Qwen 27B has official Ollama provenance; Llama 70B is viable but uses the largest loaded snapshot and completes most slowly.
+- The next chronological implementation task is local TTS selection and a typed-input-to-audio vertical slice.
+- Microphone capture, ASR, barge-in, persona, SQLite memory, the macOS app, and client SDKs have not started.
 - The 1.2-second time-to-useful-audio goal remains unvalidated.
 
 ## R0 — Toolchain and Feasibility
 
 **Outcome:** Establish one reproducible Apple Silicon development profile and select a viable local model stack before integrating product code.
+
+### Source Status
+
+The toolchain, safe machine profile, bounded Ollama language adapter, reproducible local text probe, model digests, loaded-state snapshots, and first language-model measurements are complete. Qwen 27B is a provisional R2 candidate, not a product default. TTS benchmarking is next; ASR benchmarking follows the typed text-to-audio slice.
 
 ### Deliverables
 
@@ -25,7 +31,7 @@ The first release is not a directory-complete platform. It is one local voice lo
 - Compile the initial workspace and run all deterministic tests.
 - Verify the source and license of each candidate ASR, language, and speech model.
 - Benchmark candidate components independently.
-- Record memory use, real-time factor, first-token latency, first-audio latency, warm-up behavior, and model quality notes.
+- Record memory use, real-time factor, first-text-delta latency, first-audio latency, warm-up behavior, and model quality notes.
 
 ### Exit Criteria
 
@@ -41,7 +47,7 @@ The first release is not a directory-complete platform. It is one local voice lo
 
 ### Source Status
 
-The initial source and deterministic runtime validation for this milestone are present.
+Complete. The initial source and deterministic runtime validation for this milestone are present.
 
 ### Deliverables
 
@@ -64,13 +70,17 @@ The initial source and deterministic runtime validation for this milestone are p
 
 **Outcome:** Replace mocks with one measured local language model and one measured local speech backend while keeping text input.
 
+### Source Status
+
+The configurable Ollama adapter, streamed local text probe, bounded timeout/output behavior, final Ollama metrics, and reproducible language-model feasibility evidence are complete. The next task is to benchmark and select a local TTS backend, then connect phrase-level text streaming to audible output. The integrated voice-loop configuration must preserve the measured inference policy explicitly; it must not inherit model defaults silently.
+
 ### Deliverables
 
 - One Apple Silicon language-model adapter selected by R0.
 - Incremental text streaming into the runtime.
 - One Apple Silicon TTS adapter selected by R0.
 - Sentence or phrase chunking that starts synthesis before the full response completes.
-- Runtime timing events for first token, first synthesis request, and first playable audio.
+- Runtime timing events for first text delta, first synthesis request, and first playable audio.
 - A command-line example that turns typed input into local spoken output.
 
 ### Exit Criteria
@@ -131,6 +141,7 @@ The initial source and deterministic runtime validation for this milestone are p
 ### Deliverables
 
 - SQLite persistence for working, episodic, semantic, identity, and relationship memory.
+- Default macOS database location: `~/Library/Application Support/Conversation Runtime/runtime.sqlite3`.
 - Provenance, confidence, creation time, retention policy, last-use time, and retrieval reason for every memory.
 - Strict context budgets and retrieval traces.
 - Inspection, editing, pinning, expiration, and deletion controls.
@@ -154,6 +165,7 @@ The initial source and deterministic runtime validation for this milestone are p
 - Microphone, playback, interruption, persona, and memory controls.
 - Local model setup and benchmark reporting.
 - Stable client-facing event transport.
+- An application-owned runtime gateway boundary that remains local-only in R6 and can be extended with opt-in LAN binding and pairing in R7.
 - TypeScript SDK generated or maintained from the public protocol.
 - Integration documentation and a second minimal client.
 
@@ -165,7 +177,33 @@ The initial source and deterministic runtime validation for this milestone are p
 - Model and hardware requirements are documented from measured results.
 - Packaging contains no model weights or private local configuration.
 
-## R7 — Cross-Platform Expansion
+## R7 — Paired iPhone LAN Client
+
+**Outcome:** Let an iPhone participate in a conversation while the Mac remains the runtime and memory authority.
+
+### Entry Criteria
+
+- R3 voice-loop and barge-in exits pass on Apple Silicon.
+- R6 exposes a stable application-owned gateway and client event transport.
+- LAN access is opt-in and Ollama remains bound to loopback.
+
+### Deliverables
+
+- Bonjour discovery of an explicitly enabled Mac runtime gateway.
+- Short-lived pairing code and mutually authenticated sessions.
+- TLS-protected control and event transport.
+- Low-latency audio transport selected after evaluating WebRTC.
+- iPhone Keychain storage for pairing credentials.
+- No durable conversation-memory database on the iPhone in the first release.
+
+### Exit Criteria
+
+- A paired iPhone can start, observe, interrupt, and complete a Mac-hosted turn over the LAN.
+- An unpaired device cannot access runtime events, audio, models, or memory.
+- Disabling LAN access closes the gateway without changing Ollama's loopback-only binding.
+- The Mac remains the source of truth for inference and SQLite memory.
+
+## R8 — Linux and Windows Expansion
 
 **Outcome:** Add operating systems only after the first product loop and SDK boundary are proven.
 
@@ -173,14 +211,14 @@ The initial source and deterministic runtime validation for this milestone are p
 
 - R3 voice-loop and barge-in exits pass on Apple Silicon.
 - R6 SDK boundary is used by two clients.
+- R7 validates the gateway boundary with a paired second-device client.
 - Platform demand justifies the audio, inference, packaging, and CI cost.
 
 ### Candidate Order
 
-1. macOS Intel only if hardware demand remains material.
-2. Linux with one documented audio stack and GPU profile.
-3. Windows with one documented audio and acceleration profile.
-4. iOS after desktop interaction and memory behavior are validated.
+1. Linux with one documented audio stack and acceleration profile.
+2. Windows with one documented WASAPI and acceleration profile.
+3. macOS Intel only if hardware demand remains material.
 
 Each platform receives its own measured hardware profile and end-to-end exit criteria. Cross-platform support is not declared from successful compilation alone.
 
@@ -191,7 +229,7 @@ Each platform receives its own measured hardware profile and end-to-end exit cri
 - Hosted inference
 - Multi-agent orchestration
 - Organization or team memory
-- Mobile clients
+- Android and remote-internet mobile clients
 - Separate vector database infrastructure
 
 These capabilities require a demonstrated product need after the local desktop voice loop succeeds.

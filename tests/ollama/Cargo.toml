@@ -1,13 +1,12 @@
 [package]
-name = "conversation-model-adapters"
+name = "conversation-ollama-probe"
 version.workspace = true
 edition.workspace = true
+publish = false
 
 [dependencies]
+conversation-model-adapters.workspace = true
 conversation-protocol.workspace = true
-reqwest.workspace = true
-serde.workspace = true
-serde_json.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 

@@ -123,6 +123,7 @@ The configurable Ollama adapter, streamed local text probe, bounded timeout/outp
 - Response controller for spoken duration, directness, pace, follow-up frequency, and silence.
 - Explicit direct-answer, companionship, brainstorming, and reflective modes.
 - Signals for interruption, “shorter,” rejected questions, hesitation, and rapid topic changes.
+- Affectionate expressions, special moments, and relationship signals derived from shared context, pacing, reciprocity, and rapport rather than hardcoded sequences or frequency targets.
 - On-device timing and correction metrics that exclude transcript content by default.
 - Regression scenarios for verbosity, interruption, silence, rejection, and topic changes.
 
@@ -132,6 +133,7 @@ The configurable Ollama adapter, streamed local text probe, bounded timeout/outp
 - Short prompts default to short spoken answers.
 - Rejected questions are not immediately repeated.
 - Silence does not automatically force filler or a follow-up question.
+- Relationship behavior is explainable from the active context and conversation history rather than an invisible script, unlock flag, or repetition quota.
 - Saved persona remains inspectable and temporary state does not silently overwrite it.
 
 ## R5 — Controlled Memory
@@ -146,6 +148,7 @@ The configurable Ollama adapter, streamed local text probe, bounded timeout/outp
 - Strict context budgets and retrieval traces.
 - Inspection, editing, pinning, expiration, and deletion controls.
 - Conservative promotion rules for identity and relationship memories.
+- Relationship memories may inform context and rapport but never directly command a scripted affectionate expression.
 
 ### Exit Criteria
 

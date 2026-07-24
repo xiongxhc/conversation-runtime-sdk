@@ -17,7 +17,7 @@ The runtime and adapter contracts remain cross-platform. The first validated imp
 The initial repository will contain a compiling Rust workspace with only the boundaries needed to express and test one conversation turn:
 
 - `protocol`: public turn commands, runtime events, identifiers, and error types;
-- `model-adapters`: replaceable ASR, language-model, and TTS contracts plus deterministic mock implementations;
+- `model-adapters`: replaceable language-model and TTS contracts, deterministic mocks, and documentation for the benchmark-gated ASR boundary;
 - `runtime`: cancellation-aware orchestration over those contracts;
 - `configs`: documented example runtime and persona configuration;
 - `models`: model-registry format and local model setup guidance without weights;
@@ -45,6 +45,7 @@ conversation-runtime-sdk/
 ├── crates/
 │   ├── model-adapters/
 │   │   ├── Cargo.toml
+│   │   ├── README.md
 │   │   └── src/
 │   │       ├── language_model.rs
 │   │       ├── lib.rs
@@ -64,6 +65,7 @@ conversation-runtime-sdk/
 │       │   └── lib.rs
 │       └── tests/
 │           ├── cancellation.rs
+│           ├── commands.rs
 │           └── turn_flow.rs
 ├── docs/
 │   ├── architecture.md
@@ -78,14 +80,20 @@ conversation-runtime-sdk/
 │   └── registry.example.toml
 └── tests/
     └── latency/
-        └── README.md
+        ├── Cargo.toml
+        ├── README.md
+        ├── src/
+        │   ├── lib.rs
+        │   └── main.rs
+        └── tests/
+            └── mock_probe.rs
 ```
 
-The root workspace owns shared dependency versions and lint policy. `protocol` has no dependency on runtime or adapters. `model-adapters` depends only on `protocol`. `runtime` depends on both and contains integration tests that exercise public APIs. The desktop boundary remains documentation-only until the runtime passes deterministic turn and cancellation tests.
+The root workspace owns shared dependency versions and lint policy. `protocol` has no dependency on runtime or adapters. `model-adapters` depends only on `protocol`. `runtime` depends on both and contains integration tests that exercise public APIs. The latency harness depends on the three library crates and provides the first runnable probe. The desktop boundary remains documentation-only until the runtime passes deterministic turn and cancellation tests.
 
 ## Architecture
 
-The runtime owns turn lifecycle and coordination. Clients send typed commands and observe typed events through `protocol`. The runtime calls model capabilities only through traits in `model-adapters`. Initial mock adapters make orchestration deterministic and testable without downloading models or requiring audio hardware.
+The runtime owns turn lifecycle and coordination. Clients send typed commands through `ConversationRuntime::execute` and observe typed events through a per-turn stream. The runtime calls model capabilities only through traits in `model-adapters`. Initial mock adapters make orchestration deterministic and testable without downloading models or requiring audio hardware.
 
 The first turn flow is:
 
@@ -106,10 +114,10 @@ The first scaffold defines these concepts without committing to model-vendor typ
 - `TurnId`: stable identifier shared by commands, events, telemetry, and cancellation;
 - `RuntimeCommand`: start a turn or interrupt the active turn;
 - `RuntimeEvent`: lifecycle, transcript, text, speech, completion, cancellation, and failure events;
-- `RuntimeError`: typed adapter, cancellation, configuration, and invalid-state failures;
+- `RuntimeError`: typed adapter, configuration, and invalid-state failures; cancellation is represented by `TurnCancelled`, not as an error;
 - `LanguageModel`: asynchronous streamed text generation;
 - `SpeechSynthesizer`: asynchronous speech generation boundary;
-- `ConversationRuntime`: accepts commands and exposes an event stream.
+- `ConversationRuntime`: accepts `RuntimeCommand` values and returns a per-turn event stream for start commands.
 
 ASR is documented in the adapter package but deferred from the first executable turn because the initial deterministic test seam begins with a completed transcript.
 
@@ -131,7 +139,7 @@ The initial scaffold must pass:
 - unit tests for event ordering and exactly-one terminal event;
 - contract tests proving mock adapters can be replaced behind stable traits;
 - cancellation tests proving interruption stops downstream work;
-- a deterministic latency harness that records timing fields without claiming the 1.2-second product target has been achieved.
+- a deterministic mock latency probe that records lifecycle timing fields without claiming the 1.2-second product target has been achieved.
 
 Real microphone, ASR, LLM, TTS, and barge-in behavior require end-to-end validation on the documented Apple Silicon hardware profile in later milestones.
 

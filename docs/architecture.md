@@ -15,6 +15,7 @@ protocol <- model-adapters <- runtime
 ## Initial Turn Flow
 
 1. A client starts one turn with a completed transcript.
+   The client sends `RuntimeCommand::StartTurn` through `ConversationRuntime::execute`.
 2. The runtime emits `TurnStarted` and `TranscriptFinal`.
 3. The language-model adapter streams text deltas.
 4. The runtime forwards every delta and accumulates the final response.
@@ -34,6 +35,10 @@ ASR begins in the feasibility and voice-loop milestones. Starting the determinis
 ## Cancellation
 
 The runtime uses a cancellation token for the active turn and child tokens for adapter calls. Every long-running adapter stage participates in `tokio::select!` with cancellation. Cancelling a turn therefore stops generation and synthesis work instead of merely hiding its output.
+
+Per-turn lifecycle events use an unbounded channel so an undrained client cannot suspend runtime finalization between a cancellation decision and its terminal event. Terminal selection, publication, and removal of the active turn are serialized by the active-turn lock: if interruption returns accepted, that turn cannot later complete successfully.
+
+The unbounded stream is appropriate for the deterministic scaffold, whose event volume is controlled. Before real high-rate partial transcripts or audio events are introduced, those streams require explicit aggregation or a separate bounded media transport; lifecycle finalization must remain independent of consumer backpressure.
 
 Real audio playback must adopt the same token and prove bounded cancellation latency before the barge-in milestone can pass.
 

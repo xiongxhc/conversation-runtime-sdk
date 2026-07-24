@@ -5,9 +5,10 @@ use tokio_util::sync::CancellationToken;
 use crate::AdapterError;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct LanguageModelRequest {
-    pub turn_id: TurnId,
-    pub transcript: String,
+    turn_id: TurnId,
+    transcript: String,
 }
 
 impl LanguageModelRequest {
@@ -16,6 +17,14 @@ impl LanguageModelRequest {
             turn_id,
             transcript: transcript.into(),
         }
+    }
+
+    pub const fn turn_id(&self) -> TurnId {
+        self.turn_id
+    }
+
+    pub fn transcript(&self) -> &str {
+        &self.transcript
     }
 }
 

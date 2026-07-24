@@ -4,9 +4,10 @@ use tokio_util::sync::CancellationToken;
 use crate::AdapterFuture;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct SpeechRequest {
-    pub turn_id: TurnId,
-    pub text: String,
+    turn_id: TurnId,
+    text: String,
 }
 
 impl SpeechRequest {
@@ -15,6 +16,14 @@ impl SpeechRequest {
             turn_id,
             text: text.into(),
         }
+    }
+
+    pub const fn turn_id(&self) -> TurnId {
+        self.turn_id
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
     }
 }
 

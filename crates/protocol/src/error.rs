@@ -2,6 +2,7 @@ use std::error::Error;
 use std::fmt;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum RuntimeStage {
     Runtime,
     LanguageModel,
@@ -9,6 +10,7 @@ pub enum RuntimeStage {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum RuntimeErrorKind {
     Adapter,
     Configuration,
@@ -16,10 +18,11 @@ pub enum RuntimeErrorKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct RuntimeError {
-    pub kind: RuntimeErrorKind,
-    pub stage: RuntimeStage,
-    pub message: String,
+    kind: RuntimeErrorKind,
+    stage: RuntimeStage,
+    message: String,
 }
 
 impl RuntimeError {
@@ -29,6 +32,18 @@ impl RuntimeError {
             stage,
             message: message.into(),
         }
+    }
+
+    pub const fn kind(&self) -> RuntimeErrorKind {
+        self.kind
+    }
+
+    pub const fn stage(&self) -> RuntimeStage {
+        self.stage
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
     }
 }
 

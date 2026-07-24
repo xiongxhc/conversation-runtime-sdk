@@ -14,7 +14,8 @@ The repository contains the initial deterministic runtime scaffold:
 - cancellation-aware language-model and speech-synthesis adapter contracts;
 - deterministic mock adapters that require no downloaded models;
 - single-active-turn orchestration with exactly one terminal event;
-- integration tests for successful completion and interruption.
+- integration tests for completion, interruption races, adapter failures, synthesis cancellation, and runtime reuse;
+- a runnable mock latency probe that records lifecycle checkpoints.
 
 Real audio capture, ASR, model backends, persona, memory, and the desktop app are deliberately staged in [ROADMAP.md](ROADMAP.md).
 
@@ -38,9 +39,12 @@ Install a Rust toolchain, then run:
 ```bash
 cargo fmt --all -- --check
 cargo test --workspace
+cargo run -p conversation-latency-harness -- "hello runtime"
 ```
 
 The workspace is verified with the toolchain pinned in `rust-toolchain.toml`.
+
+The latency probe uses deterministic mock adapters. It verifies runtime flow and prints timing fields, but it is not evidence that the product latency target has been met.
 
 ## Design Constraints
 

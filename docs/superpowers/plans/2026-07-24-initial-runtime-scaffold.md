@@ -4,7 +4,7 @@
 
 **Goal:** Create a minimal Rust workspace that proves typed conversation events, replaceable model adapters, deterministic turn orchestration, and interruption semantics.
 
-**Architecture:** Keep the public protocol independent, place model capabilities behind asynchronous adapter traits, and let the runtime coordinate one active turn through bounded Tokio channels and a `CancellationToken`. Use deterministic mock adapters so the first test seam requires no microphone, model download, or model-specific runtime.
+**Architecture:** Keep the public protocol independent, place model capabilities behind asynchronous adapter traits, and let the runtime coordinate one active turn through Tokio channels and a `CancellationToken`. Use deterministic mock adapters so the first test seam requires no microphone, model download, or model-specific runtime. Lifecycle events use an unbounded per-turn stream so consumer backpressure cannot deadlock cancellation finalization.
 
 **Tech Stack:** Rust 2021 edition, Tokio, Tokio Util, standard Rust tests, TOML configuration examples.
 
@@ -205,7 +205,7 @@ Expected after implementation: all adapter tests pass.
 
 **Interfaces:**
 - Consumes: `LanguageModel`, `SpeechSynthesizer`, `TurnId`, `RuntimeEvent`, and Tokio `CancellationToken`.
-- Produces: `ConversationRuntime::new`, `ConversationRuntime::start_turn`, and `ConversationRuntime::interrupt`.
+- Produces: `ConversationRuntime::new`, `ConversationRuntime::execute`, and `RuntimeCommandResult`.
 
 - [ ] **Step 1: Add the successful-turn integration test**
 
@@ -293,7 +293,7 @@ Expected before implementation: compilation fails because `ConversationRuntime` 
 
 - [ ] **Step 4: Implement single-active-turn orchestration**
 
-`start_turn` creates a bounded event channel, stores the active turn's cancellation token, and spawns the worker. The worker emits start and transcript events, forwards language-model deltas, synthesizes the accumulated response, and emits exactly one terminal event. Every awaited adapter stage is paired with `cancellation.cancelled()` in `tokio::select!`. `interrupt` validates the turn identifier and calls `cancel()` on the active token.
+`execute` accepts typed start and interrupt commands. A start command creates an unbounded lifecycle event channel, stores the active turn's cancellation token, and spawns the worker. The worker emits start and transcript events, forwards language-model deltas, synthesizes the accumulated response, and emits exactly one terminal event. Every awaited adapter stage is paired with `cancellation.cancelled()` in `tokio::select!`. Terminal selection, publication, and active-turn removal are serialized so an accepted interruption cannot race with successful completion.
 
 - [ ] **Step 5: Run runtime and workspace tests**
 

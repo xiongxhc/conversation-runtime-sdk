@@ -1,6 +1,7 @@
 use crate::{RuntimeError, TurnId};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum RuntimeEvent {
     TurnStarted {
         turn_id: TurnId,

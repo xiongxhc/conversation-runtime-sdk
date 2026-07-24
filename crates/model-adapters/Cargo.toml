@@ -5,6 +5,9 @@ edition.workspace = true
 
 [dependencies]
 conversation-protocol.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 

@@ -16,8 +16,8 @@ The repository now contains the deterministic runtime foundation plus a reviewed
 - single-active-turn orchestration with exactly one terminal event;
 - integration tests for completion, interruption races, adapter failures, synthesis cancellation, and runtime reuse;
 - a streaming Ollama adapter with bounded NDJSON framing, cancellation, and configurable thinking;
-- a runnable local text probe that can use any installed Ollama model by exact identifier;
-- feasibility results for three models present on the 2026-07-24 benchmark machine, including one incomplete load attempt.
+- a runnable local text probe that selects an installed Ollama model by exact identifier, subject to that model supporting the fixed probe policy;
+- reproducible feasibility results for Qwen 34.7B, Qwen 27B, and Llama 70B under one bounded 8K-context profile.
 
 The probe exercises the adapter directly; Ollama is not yet wired through `ConversationRuntime`. The path is text-only. Real TTS, audio playback, microphone capture, ASR, persona, SQLite memory, the macOS app, and iPhone LAN access remain staged in [ROADMAP.md](ROADMAP.md).
 
@@ -33,7 +33,7 @@ cargo run --locked -p conversation-ollama-probe -- \
 
 The response streams to standard output. The exact model identifier, first text-delta time, and total time are written to standard error. The probe uses `http://127.0.0.1:11434` by default and accepts another endpoint through `OLLAMA_ENDPOINT`.
 
-The probe explicitly sets `think: false` to measure latency to useful spoken text. It does not persist prompts or responses. See [docs/model-benchmarks.md](docs/model-benchmarks.md) for measured results and limitations.
+The probe explicitly sets `think: false`, temperature `0`, seed `42`, a 128-token output cap, and an 8K context window. It performs no prompt or response file writes itself; prompts passed as arguments can still appear in shell history or process inspection. See [docs/model-benchmarks.md](docs/model-benchmarks.md) for measured results and limitations.
 
 ## Project Layout
 

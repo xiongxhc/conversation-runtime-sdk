@@ -255,21 +255,94 @@ run_with_timeout 300 "$cargo_binary" build --locked -p conversation-ollama-probe
 probe_binary="$repo_root/target/debug/conversation-ollama-probe"
 probe_sha256="$(shasum -a 256 "$probe_binary" | awk '{print $1}')"
 tags_json="$(curl_json "$api_base/api/tags")"
-model_digests="$(
+matching_tags="$(
   printf '%s' "$tags_json" |
-    jq -r --arg model "$model" \
-      '.models[]? | select(.name == $model or .model == $model) | (.digest // empty)'
+    jq -c --arg model "$model" \
+      '[.models[]? | select(.name == $model or .model == $model)]'
 )"
-model_digest_count="$(
-  printf '%s\n' "$model_digests" |
-    awk 'NF { count += 1 } END { print count + 0 }'
-)"
-
-if [[ "$model_digest_count" -ne 1 ]]; then
-  echo "Expected exactly one installed digest for model, found $model_digest_count: $model" >&2
+if ! printf '%s' "$matching_tags" |
+  jq -e '
+    def optional_string($key):
+      (has($key) | not) or (.[$key] | type == "string");
+    def optional_number($key):
+      (has($key) | not) or (.[$key] | type == "number");
+    length == 1 and
+    (.[0] |
+      type == "object" and
+      optional_string("name") and
+      optional_string("model") and
+      (has("name") or has("model")) and
+      (.digest | type == "string" and length > 0) and
+      (.size | type == "number") and
+      (.details | type == "object") and
+      (.details |
+        optional_string("format") and
+        optional_string("family") and
+        optional_string("parameter_size") and
+        optional_string("quantization_level") and
+        optional_number("context_length") and
+        ((has("families") | not) or
+          (.families | type == "array" and all(.[]; type == "string")))))
+  ' >/dev/null; then
+  echo "Expected exactly one installed model entry with safe metadata: $model" >&2
   exit 1
 fi
-model_digest="$(printf '%s\n' "$model_digests" | awk 'NF { print; exit }')"
+model_digest="$(printf '%s' "$matching_tags" | jq -r '.[0].digest')"
+printf '%s' "$matching_tags" |
+  jq '.[0] | {
+    name: (.name // ""),
+    model: (.model // ""),
+    digest,
+    size,
+    details: {
+      format: (.details.format // ""),
+      family: (.details.family // ""),
+      families: (.details.families // []),
+      parameter_size: (.details.parameter_size // ""),
+      quantization_level: (.details.quantization_level // ""),
+      context_length: (.details.context_length // null)
+    }
+  }' >"$output_directory/installed-state.json"
+show_request="$(jq -cn --arg model "$model" '{model:$model}')"
+show_json="$(
+  curl_json \
+    -H "Content-Type: application/json" \
+    -d "$show_request" \
+    "$api_base/api/show"
+)"
+if ! printf '%s' "$show_json" |
+  jq -e '
+    def optional_string($key):
+      (has($key) | not) or (.[$key] | type == "string");
+    optional_string("license") and
+    optional_string("parameters") and
+    ((has("capabilities") | not) or
+      (.capabilities | type == "array" and all(.[]; type == "string"))) and
+    (.details | type == "object") and
+    (.details |
+      optional_string("format") and
+      optional_string("family") and
+      optional_string("parameter_size") and
+      optional_string("quantization_level") and
+      ((has("families") | not) or
+        (.families | type == "array" and all(.[]; type == "string"))))
+  ' >/dev/null; then
+  echo "Ollama show response did not match the expected metadata schema." >&2
+  exit 1
+fi
+printf '%s' "$show_json" |
+  jq '{
+    license: (.license // ""),
+    details: {
+      format: (.details.format // ""),
+      family: (.details.family // ""),
+      families: (.details.families // []),
+      parameter_size: (.details.parameter_size // ""),
+      quantization_level: (.details.quantization_level // "")
+    },
+    capabilities: (.capabilities // []),
+    parameters: (.parameters // "")
+  }' >"$output_directory/model-show.json"
 
 cat >"$output_directory/manifest.txt" <<EOF
 timestamp_utc=$timestamp

@@ -45,8 +45,9 @@ Metric fields read `unavailable` only when the server omits them.
 
 For an identifiable, repeatable local benchmark, use the repository script from a clean Git tree.
 It verifies that the selected model is unloaded, records one cold warm-up plus three warm measured
-runs, captures the loaded model state, model digest, source commit, lockfile and binary hashes, and
-toolchain versions, and writes raw metrics and responses under ignored `artifacts/ollama/`:
+runs, captures sanitized installed/show metadata, the loaded model state, model digest, source
+commit, lockfile and binary hashes, and toolchain versions, and writes raw metrics and responses
+under ignored `artifacts/ollama/`:
 
 ```bash
 tests/ollama/benchmark-local.sh "qwen3.6:27b-q8_0"

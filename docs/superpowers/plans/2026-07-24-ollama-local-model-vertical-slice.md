@@ -14,7 +14,7 @@
 - Ollama-specific types remain private to `conversation-model-adapters`.
 - The exact model identifier is configuration, never a hardcoded product default.
 - Deterministic tests require no Ollama process, model download, internet access, or audio device.
-- Prompt and response content are printed by the explicit probe only and are never persisted.
+- The probe performs no prompt or response file writes. The explicit benchmark harness may persist its fixed prompt, responses, and metrics only under ignored local artifacts for reproducibility.
 - SQLite, the Mac app, iPhone gateway, TTS, ASR, and real audio remain outside this implementation plan.
 
 ---
@@ -232,11 +232,11 @@ git commit -m "feat: add local Ollama benchmark probe"
 
 Before recording final measurements, add a focused follow-up discovered by the initial live run:
 
-- add `OllamaConfig::with_thinking(bool)` behind a failing serialization test;
+- add explicit thinking configuration behind a failing serialization test;
 - serialize it as the optional top-level Ollama `think` field;
 - leave the generic adapter default unset;
 - make the spoken-latency probe call `.with_thinking(false)`;
-- rerun the Qwen measurements with thinking disabled.
+- rerun all installed models with thinking disabled, fixed generation options, and an 8K context.
 
 **Files:**
 - Modify: `docs/model-benchmarks.md`
@@ -295,7 +295,7 @@ license_status = "review-required"
 enabled = false
 ```
 
-Use `benchmark_status = "measured"` only for completed Qwen measurements and `benchmark_status = "attempt-failed"` for the incomplete Llama attempt. Preserve an upstream `provenance` URL for every entry.
+Use `benchmark_status = "measured"` for all three final 8K-context measurements. Preserve an immutable digest and upstream `provenance` URL for every entry.
 
 - [ ] **Step 5: Commit benchmark evidence**
 

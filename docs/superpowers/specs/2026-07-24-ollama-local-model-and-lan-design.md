@@ -4,7 +4,7 @@
 
 ## Problem
 
-The deterministic runtime is validated, but it still uses mock language and speech adapters. The next chronological task is to connect the existing local Ollama installation without coupling the public protocol or runtime to Ollama, then measure the installed models before selecting a default for the audible voice loop.
+At the start of this milestone, the deterministic runtime was validated but still used mock language and speech adapters. This design connected the existing local Ollama installation without coupling the public protocol or runtime to Ollama and measured the installed models. With that slice complete, local TTS is the next chronological task.
 
 The longer-term product must present as a custom macOS application and allow an iPhone to participate over the local network without exposing Ollama directly or duplicating private memory across devices prematurely.
 
@@ -27,11 +27,11 @@ The currently installed models are:
 
 | Model | Parameters | Quantization | Local size |
 |---|---:|---|---:|
-| `hf.co/mradermacher/Qwen3.6-35B-A3B-abliterated-GGUF:Q6_K` | 34.7B MoE | reported as unknown by Ollama | 28.5 GB |
+| `hf.co/mradermacher/Qwen3.6-35B-A3B-abliterated-GGUF:Q6_K` | 34.7B MoE | identifier and `ollama show`: Q6_K; API detail: unknown | 28.5 GB |
 | `qwen3.6:27b-q8_0` | 27.8B | Q8_0 | 30.0 GB |
 | `hf.co/mradermacher/Llama-3.3-70B-Instruct-abliterated-i1-GGUF:Q4_K_M` | 70.6B | Q4_K_M | 42.5 GB |
 
-No model is selected as the product default until the benchmark probe records first text delta, total generation time, and output quality notes, and separate instrumentation records load time and memory. Community `abliterated` variants remain development candidates rather than implicit production defaults.
+The final 8K-context benchmark shows all three models complete locally. Qwen 34.7B is fastest, Qwen 27B is the provisional official-provenance R2 candidate, and Llama 70B is viable but largest and slowest. No model is selected as the product default until source/license and broader behavior review are complete. Community `abliterated` variants remain development candidates rather than implicit production defaults.
 
 ## Ollama Adapter
 
@@ -44,7 +44,8 @@ Configuration contains:
 - optional system prompt;
 - optional keep-alive duration;
 - optional thinking enablement;
-- generation temperature.
+- generation temperature, deterministic seed, prediction limit, and context window;
+- cumulative assistant-content byte limit.
 
 The adapter calls `POST /api/chat` with streaming enabled and one user message containing the completed transcript. Ollama returns newline-delimited JSON objects. Each non-empty assistant content field becomes one language-model delta. The final `done` record closes the stream.
 
@@ -67,7 +68,7 @@ It prints the streamed response to standard output and emits machine-readable ti
 - completed response;
 - total elapsed time.
 
-The probe explicitly disables model thinking because it measures latency to useful spoken text. The generic adapter leaves thinking unset unless a caller configures it. The probe is a feasibility tool, not a product client. It does not persist prompts or responses. Deterministic tests use a local fake HTTP server; one manual live run validates the installed Ollama service.
+The probe uses a fixed thinking, temperature, seed, prediction-limit, and context-window policy because it measures a repeatable path to useful spoken text. The generic adapter defaults temperature to `0.7`; thinking, seed, prediction limit, and context window remain unset unless a caller configures them. The probe is a feasibility tool, not a product client, and performs no prompt or response file writes itself. The benchmark script explicitly persists fixed-prompt artifacts under the ignored `artifacts/` directory. Deterministic tests use a local fake HTTP server; bounded live runs validate installed models.
 
 ## macOS Application and SQLite
 
@@ -132,7 +133,7 @@ The adapter milestone must include:
 
 ## Exit Criteria
 
-- Any installed Ollama model can be selected by exact identifier without code changes.
+- Any installed Ollama model that supports the configured probe policy can be selected by exact identifier without code changes.
 - The probe streams real local model output and records first-delta and completion timing.
 - Cancellation stops adapter stream processing.
 - Ollama types do not enter `conversation-protocol` or `conversation-runtime`.

@@ -11,7 +11,7 @@ The first release is not a directory-complete platform. It is one local voice lo
 - The approved architecture and exact initial project map are documented.
 - R1 is complete: the Rust workspace, public protocol, adapter contracts, deterministic mocks, orchestration, and runtime tests are present.
 - The local Ollama adapter and text probe are implemented and tested without exposing Ollama to the public protocol or LAN.
-- Qwen 34.7B and Qwen 27B pass local text feasibility with explicit `think: false`; the installed Llama 70B checkpoint is impractical on the current 64 GB profile.
+- Qwen 34.7B, Qwen 27B, and Llama 70B pass bounded local text feasibility at an 8K context. Qwen 34.7B is fastest; Qwen 27B has official Ollama provenance; Llama 70B is viable but uses the largest loaded snapshot and completes most slowly.
 - The next chronological implementation task is local TTS selection and a typed-input-to-audio vertical slice.
 - Microphone capture, ASR, barge-in, persona, SQLite memory, the macOS app, and client SDKs have not started.
 - The 1.2-second time-to-useful-audio goal remains unvalidated.
@@ -22,7 +22,7 @@ The first release is not a directory-complete platform. It is one local voice lo
 
 ### Source Status
 
-The toolchain, safe machine profile, Ollama language adapter, local text probe, and first language-model measurements are complete. Qwen 27B is a provisional R2 candidate, not a product default. TTS benchmarking is next; ASR benchmarking follows the typed text-to-audio slice.
+The toolchain, safe machine profile, bounded Ollama language adapter, reproducible local text probe, model digests, loaded-state snapshots, and first language-model measurements are complete. Qwen 27B is a provisional R2 candidate, not a product default. TTS benchmarking is next; ASR benchmarking follows the typed text-to-audio slice.
 
 ### Deliverables
 
@@ -31,7 +31,7 @@ The toolchain, safe machine profile, Ollama language adapter, local text probe, 
 - Compile the initial workspace and run all deterministic tests.
 - Verify the source and license of each candidate ASR, language, and speech model.
 - Benchmark candidate components independently.
-- Record memory use, real-time factor, first-token latency, first-audio latency, warm-up behavior, and model quality notes.
+- Record memory use, real-time factor, first-text-delta latency, first-audio latency, warm-up behavior, and model quality notes.
 
 ### Exit Criteria
 
@@ -72,7 +72,7 @@ Complete. The initial source and deterministic runtime validation for this miles
 
 ### Source Status
 
-The configurable Ollama adapter, streamed local text probe, cancellation behavior, and language-model feasibility evidence are complete. The next task is to benchmark and select a local TTS backend, then connect phrase-level text streaming to audible output. The integrated voice-loop configuration must explicitly set `think: false`; it must not inherit a model default silently.
+The configurable Ollama adapter, streamed local text probe, bounded timeout/output behavior, final Ollama metrics, and reproducible language-model feasibility evidence are complete. The next task is to benchmark and select a local TTS backend, then connect phrase-level text streaming to audible output. The integrated voice-loop configuration must preserve the measured inference policy explicitly; it must not inherit model defaults silently.
 
 ### Deliverables
 
@@ -80,7 +80,7 @@ The configurable Ollama adapter, streamed local text probe, cancellation behavio
 - Incremental text streaming into the runtime.
 - One Apple Silicon TTS adapter selected by R0.
 - Sentence or phrase chunking that starts synthesis before the full response completes.
-- Runtime timing events for first token, first synthesis request, and first playable audio.
+- Runtime timing events for first text delta, first synthesis request, and first playable audio.
 - A command-line example that turns typed input into local spoken output.
 
 ### Exit Criteria

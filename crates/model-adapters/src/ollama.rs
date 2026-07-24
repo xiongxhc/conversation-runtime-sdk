@@ -6,6 +6,7 @@ use crate::{AdapterError, LanguageModel, LanguageModelRequest};
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:11434";
 const DEFAULT_TEMPERATURE: f32 = 0.7;
 const STREAM_BUFFER_SIZE: usize = 16;
+const MAX_NDJSON_RECORD_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct OllamaConfig {
@@ -127,7 +128,7 @@ async fn stream_chat(
         )));
     }
 
-    let mut buffer = Vec::new();
+    let mut records = NdjsonRecordBuffer::new();
     loop {
         let chunk = tokio::select! {
             biased;
@@ -137,22 +138,12 @@ async fn stream_chat(
             }
         };
         let Some(chunk) = chunk else {
-            return Ok(());
+            records.finish()?;
+            return Err(AdapterError::new("Ollama response ended before done: true"));
         };
 
-        buffer.extend_from_slice(&chunk);
-        while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
-            let line: Vec<u8> = buffer.drain(..=newline).collect();
-            let line = std::str::from_utf8(&line)
-                .map_err(|error| {
-                    AdapterError::new(format!("Ollama response is malformed: {error}"))
-                })?
-                .trim();
-            if line.is_empty() {
-                continue;
-            }
-
-            let response: ChatResponse = serde_json::from_str(line).map_err(|error| {
+        for line in records.feed(&chunk)? {
+            let response: ChatResponse = serde_json::from_str(&line).map_err(|error| {
                 AdapterError::new(format!("Ollama response is malformed: {error}"))
             })?;
             if let Some(error) = response.error {
@@ -264,4 +255,77 @@ struct ChatResponse {
 #[derive(serde::Deserialize)]
 struct ChatResponseMessage {
     content: Option<String>,
+}
+
+struct NdjsonRecordBuffer {
+    bytes: Vec<u8>,
+}
+
+impl NdjsonRecordBuffer {
+    fn new() -> Self {
+        Self { bytes: Vec::new() }
+    }
+
+    fn feed(&mut self, chunk: &[u8]) -> Result<Vec<String>, AdapterError> {
+        self.bytes.extend_from_slice(chunk);
+        let mut records = Vec::new();
+
+        while let Some(newline) = self.bytes.iter().position(|byte| *byte == b'\n') {
+            if newline > MAX_NDJSON_RECORD_BYTES {
+                return Err(record_size_error());
+            }
+
+            let line: Vec<u8> = self.bytes.drain(..=newline).collect();
+            let line = std::str::from_utf8(&line)
+                .map_err(|error| {
+                    AdapterError::new(format!("Ollama response is malformed: {error}"))
+                })?
+                .trim();
+            if !line.is_empty() {
+                records.push(line.to_owned());
+            }
+        }
+
+        if self.bytes.len() > MAX_NDJSON_RECORD_BYTES {
+            return Err(record_size_error());
+        }
+
+        Ok(records)
+    }
+
+    fn finish(&self) -> Result<(), AdapterError> {
+        if self.bytes.is_empty() {
+            Ok(())
+        } else {
+            Err(AdapterError::new(
+                "Ollama response ended with an unterminated NDJSON record",
+            ))
+        }
+    }
+}
+
+fn record_size_error() -> AdapterError {
+    AdapterError::new(format!(
+        "Ollama response record exceeds the maximum size of {MAX_NDJSON_RECORD_BYTES} bytes"
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NdjsonRecordBuffer;
+
+    #[test]
+    fn reassembles_a_record_from_explicit_fragments() {
+        let mut buffer = NdjsonRecordBuffer::new();
+
+        assert!(buffer
+            .feed(br#"{"message":{"content":"hel"#)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            buffer.feed(b"lo\"},\"done\":false}\n").unwrap(),
+            vec![r#"{"message":{"content":"hello"},"done":false}"#]
+        );
+        buffer.finish().unwrap();
+    }
 }

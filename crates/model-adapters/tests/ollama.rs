@@ -128,6 +128,75 @@ async fn reports_one_error_for_ollama_error_records() {
 }
 
 #[tokio::test]
+async fn reports_one_error_for_an_unterminated_final_record() {
+    let server = FakeOllamaServer::raw_streaming([
+        r#"{"message":{"role":"assistant","content":"partial"},"done":false}"#,
+    ])
+    .await;
+    let model = OllamaLanguageModel::new(
+        OllamaConfig::new("test-model")
+            .with_endpoint(server.endpoint())
+            .unwrap(),
+    );
+    let mut output = model.stream(
+        LanguageModelRequest::new(TurnId::new(1), "hi"),
+        CancellationToken::new(),
+    );
+
+    let error = output.recv().await.unwrap().unwrap_err();
+
+    assert!(error.message().contains("unterminated"));
+    assert!(output.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn reports_one_error_when_a_newline_terminated_stream_omits_done() {
+    let server = FakeOllamaServer::streaming([
+        r#"{"message":{"role":"assistant","content":"partial"},"done":false}"#,
+    ])
+    .await;
+    let model = OllamaLanguageModel::new(
+        OllamaConfig::new("test-model")
+            .with_endpoint(server.endpoint())
+            .unwrap(),
+    );
+    let mut output = model.stream(
+        LanguageModelRequest::new(TurnId::new(1), "hi"),
+        CancellationToken::new(),
+    );
+
+    assert_eq!(output.recv().await.unwrap().unwrap(), "partial");
+    let error = output.recv().await.unwrap().unwrap_err();
+
+    assert!(error.message().contains("done: true"));
+    assert!(output.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn reports_one_error_for_an_oversized_ndjson_record() {
+    let oversized_content = "x".repeat(128 * 1024);
+    let mut record = format!(
+        r#"{{"message":{{"role":"assistant","content":"{oversized_content}"}},"done":true}}"#
+    );
+    record.push('\n');
+    let server = FakeOllamaServer::raw_streaming([record]).await;
+    let model = OllamaLanguageModel::new(
+        OllamaConfig::new("test-model")
+            .with_endpoint(server.endpoint())
+            .unwrap(),
+    );
+    let mut output = model.stream(
+        LanguageModelRequest::new(TurnId::new(1), "hi"),
+        CancellationToken::new(),
+    );
+
+    let error = output.recv().await.unwrap().unwrap_err();
+
+    assert!(error.message().contains("maximum size"));
+    assert!(output.recv().await.is_none());
+}
+
+#[tokio::test]
 async fn cancellation_closes_the_stream_before_a_delayed_second_chunk() {
     let server = FakeOllamaServer::delayed_streaming(
         [
@@ -177,7 +246,11 @@ impl FakeOllamaServer {
         S: Into<String>,
     {
         Self::start(Response::Streaming {
-            lines: lines.into_iter().map(Into::into).collect(),
+            chunks: lines
+                .into_iter()
+                .map(Into::into)
+                .map(|line: String| format!("{line}\n").into_bytes())
+                .collect(),
             delay: Duration::ZERO,
         })
         .await
@@ -189,8 +262,28 @@ impl FakeOllamaServer {
         S: Into<String>,
     {
         Self::start(Response::Streaming {
-            lines: lines.into_iter().map(Into::into).collect(),
+            chunks: lines
+                .into_iter()
+                .map(Into::into)
+                .map(|line: String| format!("{line}\n").into_bytes())
+                .collect(),
             delay,
+        })
+        .await
+    }
+
+    async fn raw_streaming<I, S>(chunks: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self::start(Response::Streaming {
+            chunks: chunks
+                .into_iter()
+                .map(Into::into)
+                .map(String::into_bytes)
+                .collect(),
+            delay: Duration::ZERO,
         })
         .await
     }
@@ -228,8 +321,14 @@ impl FakeOllamaServer {
 }
 
 enum Response {
-    Streaming { lines: Vec<String>, delay: Duration },
-    Failure { status: u16, body: String },
+    Streaming {
+        chunks: Vec<Vec<u8>>,
+        delay: Duration,
+    },
+    Failure {
+        status: u16,
+        body: String,
+    },
 }
 
 async fn read_request_json(mut stream: TcpStream, response: Response) -> Value {
@@ -265,22 +364,18 @@ async fn read_request_json(mut stream: TcpStream, response: Response) -> Value {
         serde_json::from_slice(&request[header_end..header_end + content_length]).unwrap();
 
     match response {
-        Response::Streaming { lines, delay } => {
+        Response::Streaming { chunks, delay } => {
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\n\r\n")
                 .await
                 .unwrap();
 
-            for (index, line) in lines.iter().enumerate() {
+            for (index, chunk) in chunks.iter().enumerate() {
                 if index > 0 && !delay.is_zero() {
                     sleep(delay).await;
                 }
 
-                let split_at = line.len() / 2;
-                let line = line.as_bytes();
-                stream.write_all(&line[..split_at]).await.unwrap();
-                stream.write_all(&line[split_at..]).await.unwrap();
-                stream.write_all(b"\n").await.unwrap();
+                stream.write_all(chunk).await.unwrap();
             }
         }
         Response::Failure { status, body } => {

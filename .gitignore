@@ -1,0 +1,14 @@
+/target/
+.DS_Store
+.env
+.env.*
+!.env.example
+
+# Local model artifacts
+/models/local/
+*.bin
+*.gguf
+*.safetensors
+
+# Local benchmark output
+/artifacts/

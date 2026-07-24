@@ -1,0 +1,17 @@
+schema_version = 1
+
+[[models]]
+id = "example-language-model"
+capability = "language-model"
+source = "example-only"
+license_status = "unreviewed"
+benchmark_status = "not-run"
+enabled = false
+
+[[models]]
+id = "example-speech-synthesizer"
+capability = "speech-synthesis"
+source = "example-only"
+license_status = "unreviewed"
+benchmark_status = "not-run"
+enabled = false

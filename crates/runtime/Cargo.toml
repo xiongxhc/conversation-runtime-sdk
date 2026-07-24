@@ -1,0 +1,10 @@
+[package]
+name = "conversation-runtime"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+conversation-model-adapters.workspace = true
+conversation-protocol.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true

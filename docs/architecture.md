@@ -1,0 +1,42 @@
+# Architecture
+
+## Dependency Direction
+
+```text
+protocol <- model-adapters <- runtime
+```
+
+`protocol` defines client-visible commands, events, identifiers, and failures. It has no dependency on Tokio, model implementations, or runtime internals.
+
+`model-adapters` defines the capabilities required from language and speech models. Its mock implementations are deterministic test doubles, not product backends.
+
+`runtime` owns turn state, adapter coordination, event ordering, and cancellation. Clients should not depend on adapter implementation details.
+
+## Initial Turn Flow
+
+1. A client starts one turn with a completed transcript.
+2. The runtime emits `TurnStarted` and `TranscriptFinal`.
+3. The language-model adapter streams text deltas.
+4. The runtime forwards every delta and accumulates the final response.
+5. The speech adapter synthesizes the response.
+6. The runtime emits one terminal event.
+
+ASR begins in the feasibility and voice-loop milestones. Starting the deterministic seam at a completed transcript isolates orchestration behavior from microphone and model availability.
+
+## Runtime Invariants
+
+- A runtime instance owns at most one active turn.
+- Every observed turn ends with exactly one of `TurnCompleted`, `TurnCancelled`, or `TurnFailed`.
+- Interruption cancels the active token shared with downstream adapter work.
+- Events from an interrupted turn retain their `TurnId` and cannot become events for a later turn.
+- Adapter errors cross the runtime boundary with their failing stage intact.
+
+## Cancellation
+
+The runtime uses a cancellation token for the active turn and child tokens for adapter calls. Every long-running adapter stage participates in `tokio::select!` with cancellation. Cancelling a turn therefore stops generation and synthesis work instead of merely hiding its output.
+
+Real audio playback must adopt the same token and prove bounded cancellation latency before the barge-in milestone can pass.
+
+## Why the Desktop Shell Is Deferred
+
+Creating the Tauri and React application before runtime contracts exist would couple the first protocol to desktop UI needs. The current boundary is documentation-only until deterministic turn and cancellation tests pass and the feasibility benchmark selects concrete local backends.

@@ -1,0 +1,14 @@
+[turn]
+event_buffer_size = 32
+maximum_spoken_seconds = 20
+allow_silence = true
+ask_follow_up_by_default = false
+
+[context]
+maximum_tokens = 4096
+reserve_response_tokens = 512
+
+[telemetry]
+store_on_device = true
+record_transcript_content = false
+record_timing_metrics = true

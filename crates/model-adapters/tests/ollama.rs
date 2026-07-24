@@ -70,7 +70,7 @@ async fn serializes_optional_configuration() {
 }
 
 #[tokio::test]
-async fn serializes_thinking_only_when_configured() {
+async fn serializes_each_configured_thinking_value_and_omits_defaults() {
     let default_server = FakeOllamaServer::streaming([
         r#"{"message":{"role":"assistant","content":""},"done":true}"#,
     ])
@@ -105,6 +105,24 @@ async fn serializes_thinking_only_when_configured() {
 
     assert!(configured_output.recv().await.is_none());
     assert_eq!(configured_server.request_json().await["think"], false);
+
+    let enabled_server = FakeOllamaServer::streaming([
+        r#"{"message":{"role":"assistant","content":""},"done":true}"#,
+    ])
+    .await;
+    let enabled_model = OllamaLanguageModel::new(
+        OllamaConfig::new("test-model")
+            .with_endpoint(enabled_server.endpoint())
+            .unwrap()
+            .with_thinking(true),
+    );
+    let mut enabled_output = enabled_model.stream(
+        LanguageModelRequest::new(TurnId::new(1), "hi"),
+        CancellationToken::new(),
+    );
+
+    assert!(enabled_output.recv().await.is_none());
+    assert_eq!(enabled_server.request_json().await["think"], true);
 }
 
 #[tokio::test]

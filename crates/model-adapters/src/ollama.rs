@@ -261,7 +261,7 @@ async fn read_error_body(
     response: &mut reqwest::Response,
     cancellation: &CancellationToken,
 ) -> Result<(String, bool), AdapterError> {
-    let mut prefix = Vec::with_capacity(MAX_ERROR_BODY_PREFIX_BYTES);
+    let mut prefix = ErrorBodyPrefix::new();
 
     loop {
         let chunk = tokio::select! {
@@ -272,16 +272,39 @@ async fn read_error_body(
             }
         };
         let Some(chunk) = chunk else {
-            return Ok((String::from_utf8_lossy(&prefix).into_owned(), false));
+            return Ok((prefix.into_string(), false));
         };
 
-        let remaining = MAX_ERROR_BODY_PREFIX_BYTES.saturating_sub(prefix.len());
+        if prefix.append(&chunk) {
+            return Ok((prefix.into_string(), true));
+        }
+    }
+}
+
+struct ErrorBodyPrefix {
+    bytes: Vec<u8>,
+}
+
+impl ErrorBodyPrefix {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::with_capacity(MAX_ERROR_BODY_PREFIX_BYTES),
+        }
+    }
+
+    fn append(&mut self, chunk: &[u8]) -> bool {
+        let remaining = MAX_ERROR_BODY_PREFIX_BYTES.saturating_sub(self.bytes.len());
         if chunk.len() > remaining {
-            prefix.extend_from_slice(&chunk[..remaining]);
-            return Ok((String::from_utf8_lossy(&prefix).into_owned(), true));
+            self.bytes.extend_from_slice(&chunk[..remaining]);
+            return true;
         }
 
-        prefix.extend_from_slice(&chunk);
+        self.bytes.extend_from_slice(chunk);
+        false
+    }
+
+    fn into_string(self) -> String {
+        String::from_utf8_lossy(&self.bytes).into_owned()
     }
 }
 
@@ -464,7 +487,44 @@ fn record_size_error() -> AdapterError {
 
 #[cfg(test)]
 mod tests {
-    use super::NdjsonResponseParser;
+    use super::{ErrorBodyPrefix, NdjsonResponseParser, MAX_ERROR_BODY_PREFIX_BYTES};
+
+    #[test]
+    fn error_body_prefix_truncates_a_forced_oversized_chunk() {
+        let mut prefix = ErrorBodyPrefix::new();
+        let chunk = vec![b'a'; MAX_ERROR_BODY_PREFIX_BYTES + 1];
+
+        assert!(prefix.append(&chunk));
+        assert_eq!(
+            prefix.into_string(),
+            "a".repeat(MAX_ERROR_BODY_PREFIX_BYTES)
+        );
+    }
+
+    #[test]
+    fn error_body_prefix_preserves_an_exact_limit_chunk() {
+        let mut prefix = ErrorBodyPrefix::new();
+        let chunk = vec![b'a'; MAX_ERROR_BODY_PREFIX_BYTES];
+
+        assert!(!prefix.append(&chunk));
+        assert_eq!(
+            prefix.into_string(),
+            "a".repeat(MAX_ERROR_BODY_PREFIX_BYTES)
+        );
+    }
+
+    #[test]
+    fn error_body_prefix_truncates_across_chunks() {
+        let mut prefix = ErrorBodyPrefix::new();
+        let first_chunk = vec![b'a'; MAX_ERROR_BODY_PREFIX_BYTES - 1];
+
+        assert!(!prefix.append(&first_chunk));
+        assert!(prefix.append(b"bc"));
+        assert_eq!(
+            prefix.into_string(),
+            format!("{}b", "a".repeat(MAX_ERROR_BODY_PREFIX_BYTES - 1))
+        );
+    }
 
     #[test]
     fn reassembles_a_record_from_explicit_fragments() {

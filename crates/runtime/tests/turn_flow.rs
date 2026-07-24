@@ -189,6 +189,62 @@ async fn bounds_language_model_responses_and_cancels_the_model_child_token() {
     .expect("language model child token was not cancelled");
 }
 
+#[tokio::test]
+async fn accepts_exactly_the_default_runtime_response_limit() {
+    let delta = "a".repeat(64 * 1024);
+    let runtime = ConversationRuntime::new(
+        Arc::new(MockLanguageModel::new([delta])),
+        Arc::new(MockSpeechSynthesizer::new([1])),
+    );
+    let turn_id = TurnId::new(6);
+    let mut events = start_turn(&runtime, turn_id, "bound this").await;
+    let mut observed = Vec::new();
+
+    while let Some(event) = events.recv().await {
+        observed.push(event);
+    }
+
+    assert!(observed.contains(&RuntimeEvent::TextDelta {
+        turn_id,
+        delta: "a".repeat(64 * 1024),
+    }));
+    assert!(observed.contains(&RuntimeEvent::TurnCompleted { turn_id }));
+}
+
+#[tokio::test]
+async fn rejects_one_byte_over_the_default_runtime_response_limit() {
+    let runtime = ConversationRuntime::new(
+        Arc::new(MockLanguageModel::new(["a".repeat(64 * 1024 + 1)])),
+        Arc::new(MockSpeechSynthesizer::new([1])),
+    );
+    let turn_id = TurnId::new(7);
+    let mut events = start_turn(&runtime, turn_id, "bound this").await;
+    let mut observed = Vec::new();
+
+    while let Some(event) = events.recv().await {
+        observed.push(event);
+    }
+
+    assert!(!observed.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::TextDelta { turn_id: event_turn_id, .. } if *event_turn_id == turn_id
+    )));
+    assert_eq!(
+        observed
+            .into_iter()
+            .filter(RuntimeEvent::is_terminal)
+            .collect::<Vec<_>>(),
+        vec![RuntimeEvent::TurnFailed {
+            turn_id,
+            error: RuntimeError::new(
+                RuntimeErrorKind::Adapter,
+                RuntimeStage::LanguageModel,
+                "language model response exceeds the maximum size of 65536 bytes",
+            ),
+        }]
+    );
+}
+
 #[test]
 fn rejects_a_zero_runtime_response_limit() {
     let runtime = ConversationRuntime::new(

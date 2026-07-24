@@ -256,6 +256,58 @@ async fn rejects_cumulative_assistant_content_before_forwarding_the_overflowing_
 }
 
 #[tokio::test]
+async fn accepts_exactly_the_default_assistant_content_limit() {
+    let delta = "a".repeat(32 * 1024);
+    let server = FakeOllamaServer::streaming([
+        format!(r#"{{"message":{{"content":"{delta}"}},"done":false}}"#),
+        format!(r#"{{"message":{{"content":"{delta}"}},"done":true}}"#),
+    ])
+    .await;
+    let model = OllamaLanguageModel::new(
+        OllamaConfig::new("test-model")
+            .unwrap()
+            .with_endpoint(server.endpoint())
+            .unwrap(),
+    );
+    let mut output = model.stream(
+        LanguageModelRequest::new(TurnId::new(1), "hi"),
+        CancellationToken::new(),
+    );
+
+    assert_eq!(output.recv().await.unwrap().unwrap().len(), 32 * 1024);
+    assert_eq!(output.recv().await.unwrap().unwrap().len(), 32 * 1024);
+    assert!(output.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn rejects_one_byte_over_the_default_assistant_content_limit() {
+    let delta = "a".repeat(32 * 1024);
+    let server = FakeOllamaServer::streaming([
+        format!(r#"{{"message":{{"content":"{delta}"}},"done":false}}"#),
+        format!(r#"{{"message":{{"content":"{delta}"}},"done":false}}"#),
+        r#"{"message":{"content":"b"},"done":true}"#.to_owned(),
+    ])
+    .await;
+    let model = OllamaLanguageModel::new(
+        OllamaConfig::new("test-model")
+            .unwrap()
+            .with_endpoint(server.endpoint())
+            .unwrap(),
+    );
+    let mut output = model.stream(
+        LanguageModelRequest::new(TurnId::new(1), "hi"),
+        CancellationToken::new(),
+    );
+
+    assert_eq!(output.recv().await.unwrap().unwrap().len(), 32 * 1024);
+    assert_eq!(output.recv().await.unwrap().unwrap().len(), 32 * 1024);
+    let error = output.recv().await.unwrap().unwrap_err();
+
+    assert!(error.message().contains("65536 bytes"));
+    assert!(output.recv().await.is_none());
+}
+
+#[tokio::test]
 async fn reports_one_error_for_malformed_ndjson() {
     let server = FakeOllamaServer::streaming(["not json"]).await;
     let model = OllamaLanguageModel::new(

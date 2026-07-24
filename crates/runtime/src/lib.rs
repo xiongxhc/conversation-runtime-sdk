@@ -32,7 +32,9 @@ impl TurnEventStream {
             self.events_closed = true;
         }
 
-        self.terminal.take()?.await.ok()
+        let terminal_event = self.terminal.as_mut()?.await.ok();
+        self.terminal = None;
+        terminal_event
     }
 }
 
@@ -284,4 +286,41 @@ fn runtime_error(message: impl Into<String>) -> RuntimeError {
         RuntimeStage::Runtime,
         message,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use conversation_protocol::{RuntimeEvent, TurnId};
+    use tokio::sync::{mpsc, oneshot};
+    use tokio::time::timeout;
+
+    use super::TurnEventStream;
+
+    #[tokio::test]
+    async fn cancelled_terminal_receive_can_be_retried() {
+        let (event_sender, event_receiver) = mpsc::channel(1);
+        let (terminal_sender, terminal_receiver) = oneshot::channel();
+        drop(event_sender);
+        let mut events = TurnEventStream {
+            events: event_receiver,
+            terminal: Some(terminal_receiver),
+            events_closed: false,
+        };
+        let turn_id = TurnId::new(1);
+
+        assert!(timeout(Duration::from_millis(1), events.recv())
+            .await
+            .is_err());
+        terminal_sender
+            .send(RuntimeEvent::TurnCompleted { turn_id })
+            .unwrap();
+
+        assert_eq!(
+            events.recv().await,
+            Some(RuntimeEvent::TurnCompleted { turn_id })
+        );
+        assert_eq!(events.recv().await, None);
+    }
 }

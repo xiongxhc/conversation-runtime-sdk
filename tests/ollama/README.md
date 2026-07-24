@@ -7,8 +7,8 @@ not persist prompts or responses.
 Run it against the default local endpoint:
 
 ```bash
-cargo run --locked -p conversation-ollama-probe -- \\
-  "qwen3.6:27b-q8_0" \\
+cargo run --locked -p conversation-ollama-probe -- \
+  "qwen3.6:27b-q8_0" \
   "Answer briefly: hello"
 ```
 

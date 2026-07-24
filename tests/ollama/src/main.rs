@@ -37,8 +37,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let completed_at = Instant::now();
-    let first_delta_ms = first_delta_at
-        .unwrap_or(completed_at)
+    let first_delta_ms = require_first_delta(first_delta_at)
+        .map_err(io::Error::other)?
         .duration_since(started_at);
     let total_ms = completed_at.duration_since(started_at);
 
@@ -71,9 +71,13 @@ fn usage_error() -> String {
     "Usage: conversation-ollama-probe <model> <prompt...>".into()
 }
 
+fn require_first_delta(first_delta_at: Option<Instant>) -> Result<Instant, &'static str> {
+    first_delta_at.ok_or("Ollama response completed without a text delta")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_arguments;
+    use super::{parse_arguments, require_first_delta};
 
     #[test]
     fn parses_exact_model_identifier_and_remaining_prompt_words() {
@@ -107,5 +111,12 @@ mod tests {
 
             assert!(error.starts_with("Usage:"));
         }
+    }
+
+    #[test]
+    fn rejects_a_completed_stream_without_a_text_delta() {
+        let error = require_first_delta(None).unwrap_err();
+
+        assert_eq!(error, "Ollama response completed without a text delta");
     }
 }

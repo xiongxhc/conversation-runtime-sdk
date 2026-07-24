@@ -21,7 +21,7 @@ digest = "cd0210c667bffa98ad702668d05fda1f340bcbb0a2c769bd389670d19ad1441b"
 license_status = "review-required"
 benchmark_status = "measured"
 benchmark_profile = "think-false-temp-0-seed-42-num-predict-128-num-ctx-8192"
-loaded_size_bytes = 28798657493
+loaded_size_bytes = 28958062017
 enabled = false
 
 [[models]]

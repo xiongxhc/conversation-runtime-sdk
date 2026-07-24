@@ -21,9 +21,9 @@ The exact source identity, model digests, raw samples, final Ollama metrics, loa
 
 | Exact model | Quantization evidence | Installed size | Loaded snapshot | Cold load | Warm first-delta samples | Median first delta | Warm total samples | Median total | Result |
 |---|---|---:|---:|---:|---|---:|---|---:|---|
-| `hf.co/mradermacher/Qwen3.6-35B-A3B-abliterated-GGUF:Q6_K` | identifier and `ollama show`: Q6_K; API detail: unknown | 28.51 GB | 28.90 GB | 5.26 s | 170, 150, 155 ms | **155 ms** | 630, 609, 615 ms | **615 ms** | Fastest measured development candidate |
-| `qwen3.6:27b-q8_0` | Q8_0 | 29.97 GB | 28.80 GB | 7.04 s | 274, 270, 263 ms | **270 ms** | 2,902, 2,919, 2,892 ms | **2,902 ms** | Official-provenance provisional R2 candidate |
-| `hf.co/mradermacher/Llama-3.3-70B-Instruct-abliterated-i1-GGUF:Q4_K_M` | identifier and `ollama show`: Q4_K_M; loaded detail: unknown | 42.52 GB | 45.42 GB | 9.74 s | 265, 266, 253 ms | **265 ms** | 7,086, 7,157, 7,125 ms | **7,125 ms** | Feasibility pass at 8K context; largest and slowest completion |
+| `hf.co/mradermacher/Qwen3.6-35B-A3B-abliterated-GGUF:Q6_K` | identifier and `ollama show`: Q6_K; API detail: unknown | 28.51 GB | 28.90 GB | 6.04 s | 164, 149, 158 ms | **158 ms** | 647, 618, 628 ms | **628 ms** | Fastest measured development candidate |
+| `qwen3.6:27b-q8_0` | Q8_0 | 29.97 GB | 28.96 GB | 7.05 s | 286, 264, 268 ms | **268 ms** | 2,968, 2,939, 2,945 ms | **2,945 ms** | Official-provenance provisional R2 candidate |
+| `hf.co/mradermacher/Llama-3.3-70B-Instruct-abliterated-i1-GGUF:Q4_K_M` | identifier and `ollama show`: Q4_K_M; loaded detail: unknown | 42.52 GB | 45.42 GB | 15.07 s | 278, 258, 253 ms | **258 ms** | 7,323, 7,225, 7,227 ms | **7,227 ms** | Feasibility pass at 8K context; largest and slowest completion |
 
 All three fixed-policy responses were relevant, grammatical, and followed the requested two-sentence format. That narrow observation is backed by retained identical seeded output in the evidence file; it is not a behavior or safety review.
 
@@ -31,9 +31,9 @@ The two community `abliterated` checkpoints remain development candidates only. 
 
 ## Current Decision
 
-- **Provisional R2 integration candidate:** `qwen3.6:27b-q8_0`, because it has official Ollama provenance, locally reported Apache-2.0 metadata, a 28.80 GB loaded snapshot, and a measured 270 ms median first text delta.
-- **Fast local development candidate:** Qwen 34.7B Q6_K, with a 155 ms median first text delta and 615 ms median completion, pending community-checkpoint review.
-- **Viable comparison, not preferred:** Llama 70B Q4_K_M now passes at 8K context, but uses a 45.42 GB loaded snapshot and needs 7.125 seconds median to complete this short response.
+- **Provisional R2 integration candidate:** `qwen3.6:27b-q8_0`, because it has official Ollama provenance, locally reported Apache-2.0 metadata, a 28.96 GB loaded snapshot, and a measured 268 ms median first text delta.
+- **Fast local development candidate:** Qwen 34.7B Q6_K, with a 158 ms median first text delta and 628 ms median completion, pending community-checkpoint review.
+- **Viable comparison, not preferred:** Llama 70B Q4_K_M now passes at 8K context, but uses a 45.42 GB loaded snapshot and needs 7.227 seconds median to complete this short response.
 
 No model is a permanent product default. Qwen 27B is not admitted to the voice loop until source/license review is complete and TTS measures time to the first playable phrase under the same explicit inference policy.
 
@@ -42,7 +42,7 @@ No model is a permanent product default. Qwen 27B is not admitted to the voice l
 | Layer | Candidate | License reviewed | Loaded memory | Real-time factor | First text delta | First audio | Result |
 |---|---|---|---:|---:|---:|---:|---|
 | ASR | Not selected | No | Not measured | Not measured | Not applicable | Not applicable | Pending benchmark |
-| LLM | `qwen3.6:27b-q8_0` provisional R2 candidate | Partial; local Apache-2.0 metadata only | 28.80 GB snapshot | Not applicable | 270 ms median | Not applicable | Conditional text feasibility pass |
+| LLM | `qwen3.6:27b-q8_0` provisional R2 candidate | Partial; local Apache-2.0 metadata only | 28.96 GB snapshot | Not applicable | 268 ms median | Not applicable | Conditional text feasibility pass |
 | TTS | Not selected | No | Not measured | Not measured | Not applicable | Not measured | Next chronological benchmark |
 
 ## Selection Rule

@@ -4,9 +4,9 @@ This file preserves the non-sensitive evidence behind `docs/model-benchmarks.md`
 
 ## Execution Identity
 
-- Source commit: `415fccabf179f2ac78f913599b5b71cc5bfb932d`
+- Source commit: `d66b347a491edde31e49df32ce50fb97e25f8461`
 - Git tree: clean
-- Probe SHA-256: `20f9bcea6a098cdef56080fe8ccf82579826ea2c7d53e10dd3b9561329f3d74c`
+- Probe SHA-256: `c1a097b9507a263cc08f58e7982ca9ec3f1cea122c79cde372b2d1791b004eef`
 - `Cargo.lock` SHA-256: `cc41b402ec5f2b9c901d5fae7e3fef0651f7affa1704cb094be91508d0ed41e2`
 - Cargo: 1.97.1
 - Rust: 1.97.1
@@ -70,16 +70,16 @@ The exact identifier and `ollama show` report Q6_K. The `/api/tags` and loaded-s
 
 | Run | First delta | Wall total | Ollama load | Eval count | Eval duration |
 |---|---:|---:|---:|---:|---:|
-| Cold warm-up | 5,385 ms | 5,844 ms | 5,257,599,375 ns | 31 | 460,114,000 ns |
-| Measured 1 | 170 ms | 630 ms | 128,785,667 ns | 31 | 459,823,000 ns |
-| Measured 2 | 150 ms | 609 ms | 116,021,167 ns | 31 | 459,260,000 ns |
-| Measured 3 | 155 ms | 615 ms | 116,382,708 ns | 31 | 460,768,000 ns |
+| Cold warm-up | 6,161 ms | 6,642 ms | 6,038,466,375 ns | 31 | 481,578,000 ns |
+| Measured 1 | 164 ms | 647 ms | 121,300,458 ns | 31 | 483,455,000 ns |
+| Measured 2 | 149 ms | 618 ms | 114,589,292 ns | 31 | 469,289,000 ns |
+| Measured 3 | 158 ms | 628 ms | 122,798,083 ns | 31 | 469,830,000 ns |
 
 Warm medians:
 
 ```text
-first_delta_ms=155
-total_ms=615
+first_delta_ms=158
+total_ms=628
 ```
 
 All four seeded runs returned the same response:
@@ -94,24 +94,24 @@ Provenance reference: `https://huggingface.co/mradermacher/Qwen3.6-35B-A3B-ablit
 model=qwen3.6:27b-q8_0
 digest=cd0210c667bffa98ad702668d05fda1f340bcbb0a2c769bd389670d19ad1441b
 installed_size_bytes=29970392417
-loaded_size_bytes=28798657493
-loaded_size_vram_bytes=28798657493
+loaded_size_bytes=28958062017
+loaded_size_vram_bytes=28958062017
 loaded_context_length=8192
 embedded_license=Apache-2.0
 ```
 
 | Run | First delta | Wall total | Ollama load | Eval count | Eval duration |
 |---|---:|---:|---:|---:|---:|
-| Cold warm-up | 7,434 ms | 10,057 ms | 7,038,902,791 ns | 26 | 2,621,466,000 ns |
-| Measured 1 | 274 ms | 2,902 ms | 150,845,792 ns | 26 | 2,628,608,000 ns |
-| Measured 2 | 270 ms | 2,919 ms | 143,580,250 ns | 26 | 2,648,576,000 ns |
-| Measured 3 | 263 ms | 2,892 ms | 139,909,708 ns | 26 | 2,629,096,000 ns |
+| Cold warm-up | 7,453 ms | 10,129 ms | 7,046,914,916 ns | 26 | 2,673,202,000 ns |
+| Measured 1 | 286 ms | 2,968 ms | 160,214,875 ns | 26 | 2,682,050,000 ns |
+| Measured 2 | 264 ms | 2,939 ms | 139,176,625 ns | 26 | 2,675,129,000 ns |
+| Measured 3 | 268 ms | 2,945 ms | 143,328,333 ns | 26 | 2,676,952,000 ns |
 
 Warm medians:
 
 ```text
-first_delta_ms=270
-total_ms=2902
+first_delta_ms=268
+total_ms=2945
 ```
 
 All four seeded runs returned the same response:
@@ -133,16 +133,16 @@ loaded_context_length=8192
 
 | Run | First delta | Wall total | Ollama load | Eval count | Eval duration |
 |---|---:|---:|---:|---:|---:|
-| Cold warm-up | 10,461 ms | 17,311 ms | 9,744,144,333 ns | 45 | 6,848,929,000 ns |
-| Measured 1 | 265 ms | 7,086 ms | 102,200,584 ns | 45 | 6,821,407,000 ns |
-| Measured 2 | 266 ms | 7,157 ms | 108,260,333 ns | 45 | 6,888,481,000 ns |
-| Measured 3 | 253 ms | 7,125 ms | 96,115,542 ns | 45 | 6,870,133,000 ns |
+| Cold warm-up | 15,799 ms | 22,792 ms | 15,071,085,250 ns | 45 | 6,991,229,000 ns |
+| Measured 1 | 278 ms | 7,323 ms | 113,521,625 ns | 45 | 7,043,385,000 ns |
+| Measured 2 | 258 ms | 7,225 ms | 97,921,500 ns | 45 | 6,965,986,000 ns |
+| Measured 3 | 253 ms | 7,227 ms | 92,638,916 ns | 45 | 6,973,021,000 ns |
 
 Warm medians:
 
 ```text
-first_delta_ms=265
-total_ms=7125
+first_delta_ms=258
+total_ms=7227
 ```
 
 All four seeded runs returned the same response:

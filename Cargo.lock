@@ -132,6 +132,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "conversation-ollama-probe"
+version = "0.1.0"
+dependencies = [
+ "conversation-model-adapters",
+ "conversation-protocol",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "conversation-protocol"
 version = "0.1.0"
 

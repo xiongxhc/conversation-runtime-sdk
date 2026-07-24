@@ -1,0 +1,14 @@
+[package]
+name = "conversation-ollama-probe"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+conversation-model-adapters.workspace = true
+conversation-protocol.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[lints]
+workspace = true

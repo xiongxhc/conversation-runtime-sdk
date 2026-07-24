@@ -71,6 +71,7 @@ The latency probe uses deterministic mock adapters. It verifies runtime flow and
 - One terminal event per turn: completed, cancelled, or failed.
 - Interruption cancels downstream work; it is not a playback mute.
 - The protocol does not depend on adapters or runtime internals.
+- Relationship behavior emerges from context and conversation state rather than fixed scripts: earned behavior is often more memorable than configurable behavior.
 - Model files, private paths, credentials, and local benchmark artifacts stay outside version control.
 
 See [docs/architecture.md](docs/architecture.md) for the current boundaries, [docs/superpowers/specs/2026-07-24-conversation-runtime-sdk-design.md](docs/superpowers/specs/2026-07-24-conversation-runtime-sdk-design.md) for the approved initial design, and [docs/superpowers/specs/2026-07-24-ollama-local-model-and-lan-design.md](docs/superpowers/specs/2026-07-24-ollama-local-model-and-lan-design.md) for the Mac, SQLite, LAN, and future-platform architecture.

@@ -43,6 +43,12 @@ Terminal selection, publication, and removal of the active turn are serialized b
 
 Real audio playback must adopt the same token and prove bounded cancellation latency before the barge-in milestone can pass.
 
+## Relationship Behavior
+
+Model relationships through context and conversation state rather than fixed scripts. Earned behavior is often more memorable than configurable behavior.
+
+Affectionate expressions, special moments, and relationship signals must emerge from shared context, pacing, reciprocity, and rapport. They are not triggered by canned sequences, invisible unlock flags, frequency quotas, or a durable memory record that directly commands an expression. Persona and memory may shape the context available to the response controller, but the current conversational state remains authoritative.
+
 ## Why the Desktop Shell Is Deferred
 
 Creating the Tauri and React application before runtime contracts exist would couple the first protocol to desktop UI needs. The current boundary is documentation-only until deterministic turn and cancellation tests pass and the feasibility benchmark selects concrete local backends.

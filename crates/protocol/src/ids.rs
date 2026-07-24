@@ -4,6 +4,10 @@ use std::fmt;
 pub struct TurnId(u64);
 
 impl TurnId {
+    /// Creates a turn identifier.
+    ///
+    /// Clients must provide values that increase strictly for each runtime
+    /// instance. The runtime rejects reused or lower identifiers.
     pub const fn new(value: u64) -> Self {
         Self(value)
     }

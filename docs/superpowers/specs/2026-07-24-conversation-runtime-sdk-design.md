@@ -111,7 +111,7 @@ Streaming ASR and real microphone input are introduced after independent hardwar
 
 The first scaffold defines these concepts without committing to model-vendor types:
 
-- `TurnId`: stable identifier shared by commands, events, telemetry, and cancellation;
+- `TurnId`: stable, client-assigned identifier that increases strictly per runtime instance and is shared by commands, events, telemetry, and cancellation;
 - `RuntimeCommand`: start a turn or interrupt the active turn;
 - `RuntimeEvent`: lifecycle, transcript, text, speech, completion, cancellation, and failure events;
 - `RuntimeError`: typed adapter, configuration, and invalid-state failures; cancellation is represented by `TurnCancelled`, not as an error;

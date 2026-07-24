@@ -3,14 +3,57 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use conversation_model_adapters::{
-    AdapterFuture, MockLanguageModel, MockSpeechSynthesizer, SpeechRequest, SpeechSynthesizer,
+    AdapterError, AdapterFuture, LanguageModel, LanguageModelRequest, MockLanguageModel,
+    MockSpeechSynthesizer, SpeechRequest, SpeechSynthesizer,
 };
 use conversation_protocol::{RuntimeCommand, RuntimeErrorKind, RuntimeEvent, TurnId};
 use conversation_runtime::{ConversationRuntime, RuntimeCommandResult, TurnEventStream};
+use tokio::sync::mpsc;
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 struct CompletionSignallingSpeech {
     completed: Arc<AtomicBool>,
+}
+
+struct CancellationSignallingLanguageModel {
+    started: Arc<AtomicBool>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl LanguageModel for CancellationSignallingLanguageModel {
+    fn stream(
+        &self,
+        _request: LanguageModelRequest,
+        cancellation: CancellationToken,
+    ) -> mpsc::Receiver<Result<String, AdapterError>> {
+        let (sender, receiver) = mpsc::channel(1);
+        self.started.store(true, Ordering::Release);
+        let cancelled = Arc::clone(&self.cancelled);
+
+        tokio::spawn(async move {
+            cancellation.cancelled().await;
+            cancelled.store(true, Ordering::Release);
+            drop(sender);
+        });
+
+        receiver
+    }
+}
+
+struct InvocationTrackingSpeech {
+    invoked: Arc<AtomicBool>,
+}
+
+impl SpeechSynthesizer for InvocationTrackingSpeech {
+    fn synthesize<'a>(
+        &'a self,
+        _request: SpeechRequest,
+        _cancellation: CancellationToken,
+    ) -> AdapterFuture<'a, Vec<u8>> {
+        self.invoked.store(true, Ordering::Release);
+        Box::pin(async { Ok(Vec::new()) })
+    }
 }
 
 impl SpeechSynthesizer for CompletionSignallingSpeech {
@@ -24,6 +67,69 @@ impl SpeechSynthesizer for CompletionSignallingSpeech {
             Ok(Vec::new())
         })
     }
+}
+
+#[tokio::test]
+async fn interruption_reaches_generation_and_skips_synthesis() {
+    let generation_started = Arc::new(AtomicBool::new(false));
+    let generation_cancelled = Arc::new(AtomicBool::new(false));
+    let synthesis_invoked = Arc::new(AtomicBool::new(false));
+    let runtime = ConversationRuntime::new(
+        Arc::new(CancellationSignallingLanguageModel {
+            started: Arc::clone(&generation_started),
+            cancelled: Arc::clone(&generation_cancelled),
+        }),
+        Arc::new(InvocationTrackingSpeech {
+            invoked: Arc::clone(&synthesis_invoked),
+        }),
+    );
+    let turn_id = TurnId::new(6);
+    let mut events = start_turn(&runtime, turn_id, "stop generation").await;
+
+    assert_eq!(
+        events.recv().await,
+        Some(RuntimeEvent::TurnStarted { turn_id })
+    );
+    timeout(Duration::from_secs(1), async {
+        while !generation_started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("generation did not start");
+    interrupt(&runtime, turn_id).await.unwrap();
+
+    while events.recv().await.is_some() {}
+
+    timeout(Duration::from_secs(1), async {
+        while !generation_cancelled.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("generation did not observe cancellation");
+    assert!(!synthesis_invoked.load(Ordering::Acquire));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn immediate_interruption_preserves_the_started_event() {
+    let runtime = ConversationRuntime::new(
+        Arc::new(MockLanguageModel::delayed(["late"], Duration::from_secs(5))),
+        Arc::new(MockSpeechSynthesizer::new([1])),
+    );
+    let turn_id = TurnId::new(8);
+    let mut events = start_turn(&runtime, turn_id, "interrupt immediately").await;
+
+    interrupt(&runtime, turn_id).await.unwrap();
+
+    assert_eq!(
+        events.recv().await,
+        Some(RuntimeEvent::TurnStarted { turn_id })
+    );
+    assert_eq!(
+        events.recv().await,
+        Some(RuntimeEvent::TurnCancelled { turn_id })
+    );
 }
 
 #[tokio::test]
@@ -52,6 +158,31 @@ async fn interruption_emits_one_cancelled_terminal_event() {
         terminal_events,
         vec![RuntimeEvent::TurnCancelled { turn_id }]
     );
+}
+
+#[tokio::test]
+async fn rejects_a_reused_turn_id() {
+    let runtime = ConversationRuntime::new(
+        Arc::new(MockLanguageModel::new(["response"])),
+        Arc::new(MockSpeechSynthesizer::new([1])),
+    );
+    let turn_id = TurnId::new(13);
+    let mut events = start_turn(&runtime, turn_id, "first").await;
+
+    while events.recv().await.is_some() {}
+
+    let error = match runtime
+        .execute(RuntimeCommand::StartTurn {
+            turn_id,
+            transcript: "reused".into(),
+        })
+        .await
+    {
+        Ok(_) => panic!("a reused turn identifier must be rejected"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.kind(), RuntimeErrorKind::InvalidState);
 }
 
 #[tokio::test]

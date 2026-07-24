@@ -27,6 +27,7 @@ ASR begins in the feasibility and voice-loop milestones. Starting the determinis
 ## Runtime Invariants
 
 - A runtime instance owns at most one active turn.
+- Clients assign strictly increasing turn identifiers per runtime instance.
 - Every observed turn ends with exactly one of `TurnCompleted`, `TurnCancelled`, or `TurnFailed`.
 - Interruption cancels the active token shared with downstream adapter work.
 - Events from an interrupted turn retain their `TurnId` and cannot become events for a later turn.

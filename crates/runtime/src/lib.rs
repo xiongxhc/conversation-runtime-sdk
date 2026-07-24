@@ -43,6 +43,7 @@ pub struct ConversationRuntime {
     language_model: Arc<dyn LanguageModel>,
     speech_synthesizer: Arc<dyn SpeechSynthesizer>,
     active_turn: Arc<Mutex<Option<ActiveTurn>>>,
+    last_started_turn_id: Arc<Mutex<Option<TurnId>>>,
 }
 
 #[derive(Clone)]
@@ -60,6 +61,7 @@ impl ConversationRuntime {
             language_model,
             speech_synthesizer,
             active_turn: Arc::new(Mutex::new(None)),
+            last_started_turn_id: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -99,6 +101,14 @@ impl ConversationRuntime {
                     active.turn_id
                 )));
             }
+            let mut last_started_turn_id = self.last_started_turn_id.lock().await;
+            if last_started_turn_id.is_some_and(|last_turn_id| turn_id <= last_turn_id) {
+                return Err(runtime_error(format!(
+                    "turn {} must be greater than the last started turn",
+                    turn_id
+                )));
+            }
+            *last_started_turn_id = Some(turn_id);
             *active_turn = Some(ActiveTurn {
                 turn_id,
                 cancellation: cancellation.clone(),
@@ -107,6 +117,10 @@ impl ConversationRuntime {
 
         let (event_sender, event_receiver) = mpsc::channel(EVENT_BUFFER_SIZE);
         let (terminal_sender, terminal_receiver) = oneshot::channel();
+        event_sender
+            .send(RuntimeEvent::TurnStarted { turn_id })
+            .await
+            .map_err(|_| runtime_error("turn event stream closed before start"))?;
         let language_model = Arc::clone(&self.language_model);
         let speech_synthesizer = Arc::clone(&self.speech_synthesizer);
         let active_turn = Arc::clone(&self.active_turn);
@@ -168,11 +182,6 @@ async fn run_turn(
     cancellation: CancellationToken,
     events: &mpsc::Sender<RuntimeEvent>,
 ) -> RuntimeEvent {
-    if !send_event(events, RuntimeEvent::TurnStarted { turn_id }, &cancellation).await {
-        cancellation.cancel();
-        return RuntimeEvent::TurnCancelled { turn_id };
-    }
-
     if !send_event(
         events,
         RuntimeEvent::TranscriptFinal {

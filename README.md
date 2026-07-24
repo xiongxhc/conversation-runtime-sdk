@@ -49,6 +49,7 @@ The latency probe uses deterministic mock adapters. It verifies runtime flow and
 ## Design Constraints
 
 - One active turn per runtime instance.
+- Turn identifiers increase strictly per runtime instance.
 - One terminal event per turn: completed, cancelled, or failed.
 - Interruption cancels downstream work; it is not a playback mute.
 - The protocol does not depend on adapters or runtime internals.

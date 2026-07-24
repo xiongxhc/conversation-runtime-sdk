@@ -1,0 +1,25 @@
+[workspace]
+members = [
+    "crates/model-adapters",
+    "crates/protocol",
+    "crates/runtime",
+    "tests/latency",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+conversation-model-adapters = { path = "crates/model-adapters" }
+conversation-protocol = { path = "crates/protocol" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"

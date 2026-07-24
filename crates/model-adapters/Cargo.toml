@@ -1,0 +1,12 @@
+[package]
+name = "conversation-model-adapters"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+conversation-protocol.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[lints]
+workspace = true

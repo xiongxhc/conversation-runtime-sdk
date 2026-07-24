@@ -1,0 +1,14 @@
+[package]
+name = "conversation-latency-harness"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+conversation-model-adapters.workspace = true
+conversation-protocol.workspace = true
+conversation-runtime = { path = "../../crates/runtime" }
+tokio.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,9 @@
+[package]
+name = "conversation-protocol"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

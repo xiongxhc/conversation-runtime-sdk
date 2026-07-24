@@ -1,12 +1,13 @@
 use std::env;
 use std::future::Future;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::time::Instant;
 
 use conversation_model_adapters::{
     LanguageModelRequest, OllamaChatMetrics, OllamaConfig, OllamaLanguageModel,
 };
 use conversation_protocol::TurnId;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_FIRST_DELTA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
@@ -38,15 +39,27 @@ async fn run_probe(arguments: ProbeArguments, endpoint: &str) -> Result<(), Prob
     let request_started_at = Instant::now();
     let timeouts = ProbeTimeouts::from_environment()
         .map_err(|error| ProbeFailure::configuration(error, request_started_at.elapsed()))?;
-    run_probe_with_timeouts(arguments, endpoint, timeouts, request_started_at).await
+    let mut standard_output = tokio::io::stdout();
+    run_probe_with_timeouts(
+        arguments,
+        endpoint,
+        timeouts,
+        request_started_at,
+        &mut standard_output,
+    )
+    .await
 }
 
-async fn run_probe_with_timeouts(
+async fn run_probe_with_timeouts<W>(
     arguments: ProbeArguments,
     endpoint: &str,
     timeouts: ProbeTimeouts,
     request_started_at: Instant,
-) -> Result<(), ProbeFailure> {
+    output: &mut W,
+) -> Result<(), ProbeFailure>
+where
+    W: AsyncWrite + Unpin,
+{
     let model = OllamaLanguageModel::new(
         OllamaConfig::new(arguments.model.clone())
             .map_err(|error| ProbeFailure::configuration(error, request_started_at.elapsed()))?
@@ -102,10 +115,20 @@ async fn run_probe_with_timeouts(
             ReceiveOutcome::Delta(delta) => match delta {
                 Some(Ok(delta)) => {
                     first_delta_at.get_or_insert_with(Instant::now);
-                    print!("{delta}");
-                    io::stdout().flush().map_err(|error| {
-                        ProbeFailure::output(error, request_started_at.elapsed())
-                    })?;
+                    match write_delta(output, &delta, total_deadline).await {
+                        Ok(()) => {}
+                        Err(OutputFailure::Timeout) => {
+                            cancellation.cancel();
+                            return Err(ProbeFailure::timeout(
+                                TimeoutStage::Total,
+                                request_started_at.elapsed(),
+                            ));
+                        }
+                        Err(OutputFailure::Io(error)) => {
+                            cancellation.cancel();
+                            return Err(ProbeFailure::output(error, request_started_at.elapsed()));
+                        }
+                    }
                 }
                 Some(Err(error)) => {
                     return Err(ProbeFailure::adapter(error, request_started_at.elapsed()));
@@ -120,10 +143,19 @@ async fn run_probe_with_timeouts(
         .map_err(|error| ProbeFailure::adapter(error, request_started_at.elapsed()))?
         .duration_since(request_started_at);
     let total_ms = completed_at.duration_since(request_started_at);
-    let metrics = stream
-        .final_metrics()
-        .await
-        .map_err(|error| ProbeFailure::adapter(error, request_started_at.elapsed()))?;
+    let metrics = tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(total_deadline) => {
+            cancellation.cancel();
+            return Err(ProbeFailure::timeout(
+                TimeoutStage::Total,
+                request_started_at.elapsed(),
+            ));
+        }
+        result = stream.final_metrics() => {
+            result.map_err(|error| ProbeFailure::adapter(error, request_started_at.elapsed()))?
+        }
+    };
 
     eprintln!(
         "{}",
@@ -131,6 +163,31 @@ async fn run_probe_with_timeouts(
     );
 
     Ok(())
+}
+
+enum OutputFailure {
+    Timeout,
+    Io(io::Error),
+}
+
+async fn write_delta<W>(
+    output: &mut W,
+    delta: &str,
+    total_deadline: tokio::time::Instant,
+) -> Result<(), OutputFailure>
+where
+    W: AsyncWrite + Unpin,
+{
+    let write = async {
+        output.write_all(delta.as_bytes()).await?;
+        output.flush().await
+    };
+
+    tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(total_deadline) => Err(OutputFailure::Timeout),
+        result = write => result.map_err(OutputFailure::Io),
+    }
 }
 
 fn parse_arguments(

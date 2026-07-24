@@ -4,6 +4,8 @@ use std::process::{Command, Output, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
+#[cfg(unix)]
+use std::{os::fd::OwnedFd, os::unix::net::UnixStream};
 
 #[test]
 fn exits_non_zero_with_structured_first_delta_timeout() {
@@ -56,10 +58,79 @@ fn rejects_control_character_model_identifiers_without_breaking_structured_outpu
     assert!(stderr.contains("status=error\nstage=arguments\n"));
 }
 
+#[test]
+#[cfg(unix)]
+fn total_timeout_covers_a_blocked_stdout_pipe() {
+    let server = RespondingOllamaServer::start();
+    let (mut child_stdout, _blocked_stdout_reader) = UnixStream::pair().unwrap();
+    child_stdout.set_nonblocking(true).unwrap();
+    let filler = [0_u8; 4096];
+    loop {
+        match child_stdout.write(&filler) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => panic!("could not prefill blocked stdout socket: {error}"),
+        }
+    }
+    child_stdout.set_nonblocking(false).unwrap();
+    let child_stdout: OwnedFd = child_stdout.into();
+    let output = run_probe_with_stdout(
+        Command::new(env!("CARGO_BIN_EXE_conversation-ollama-probe"))
+            .args(["test-model", "prompt"])
+            .env("OLLAMA_ENDPOINT", server.endpoint())
+            .env("OLLAMA_FIRST_DELTA_TIMEOUT_MS", "500")
+            .env("OLLAMA_IDLE_TIMEOUT_MS", "500")
+            .env("OLLAMA_TOTAL_TIMEOUT_MS", "100"),
+        Stdio::from(child_stdout),
+    );
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("status=timeout\n"), "{stderr}");
+    assert!(stderr.contains("timeout_stage=total\n"), "{stderr}");
+    server.finish();
+}
+
 struct StalledOllamaServer {
     endpoint: String,
     worker: thread::JoinHandle<()>,
     completed: mpsc::Receiver<std::io::Result<()>>,
+}
+
+struct RespondingOllamaServer {
+    endpoint: String,
+    worker: thread::JoinHandle<()>,
+    completed: mpsc::Receiver<std::io::Result<()>>,
+}
+
+impl RespondingOllamaServer {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (completed_sender, completed) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let result = accept_and_respond(listener);
+            let _ = completed_sender.send(result);
+        });
+
+        Self {
+            endpoint,
+            worker,
+            completed,
+        }
+    }
+
+    fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    fn finish(self) {
+        self.completed
+            .recv_timeout(Duration::from_secs(1))
+            .expect("responding server must finish within its deadline")
+            .unwrap();
+        self.worker.join().unwrap();
+    }
 }
 
 impl StalledOllamaServer {
@@ -93,8 +164,12 @@ impl StalledOllamaServer {
 }
 
 fn run_probe(command: &mut Command) -> Output {
+    run_probe_with_stdout(command, Stdio::piped())
+}
+
+fn run_probe_with_stdout(command: &mut Command, stdout: Stdio) -> Output {
     let mut child = command
-        .stdout(Stdio::piped())
+        .stdout(stdout)
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
@@ -138,6 +213,20 @@ fn accept_and_stall(listener: TcpListener) -> std::io::Result<()> {
     )?;
     thread::sleep(Duration::from_millis(250));
     Ok(())
+}
+
+fn accept_and_respond(listener: TcpListener) -> std::io::Result<()> {
+    let (mut stream, _) = listener.accept()?;
+    stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(1)))?;
+    read_request(&mut stream)?;
+
+    let body = "{\"message\":{\"content\":\"hello\"},\"done\":true}\n";
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
 }
 
 fn read_request(stream: &mut TcpStream) -> std::io::Result<()> {

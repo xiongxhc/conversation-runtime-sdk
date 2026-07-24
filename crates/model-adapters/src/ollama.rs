@@ -7,6 +7,7 @@ const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:11434";
 const DEFAULT_TEMPERATURE: f32 = 0.7;
 const STREAM_BUFFER_SIZE: usize = 16;
 const MAX_NDJSON_RECORD_BYTES: usize = 64 * 1024;
+const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_MAX_ASSISTANT_CONTENT_BYTES: usize = 64 * 1024;
 const MAX_ERROR_BODY_PREFIX_BYTES: usize = 4 * 1024;
 
@@ -156,7 +157,10 @@ pub struct OllamaLanguageModel {
 impl OllamaLanguageModel {
     pub fn new(config: OllamaConfig) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("Ollama HTTP client configuration is valid"),
             config,
         }
     }
@@ -293,6 +297,7 @@ async fn run_chat(
 
     let mut parser = NdjsonResponseParser::new();
     let mut assistant_content_bytes = 0;
+    let mut response_bytes = 0_usize;
     loop {
         let chunk = tokio::select! {
             biased;
@@ -305,6 +310,12 @@ async fn run_chat(
             parser.finish()?;
             return Err(AdapterError::new("Ollama response ended before done: true"));
         };
+        if chunk.len() > MAX_RESPONSE_BYTES.saturating_sub(response_bytes) {
+            return Err(AdapterError::new(format!(
+                "Ollama response exceeds the maximum size of {MAX_RESPONSE_BYTES} bytes"
+            )));
+        }
+        response_bytes += chunk.len();
 
         let mut remaining = chunk.as_ref();
         while let Some(response) = parser.next_response(&mut remaining)? {

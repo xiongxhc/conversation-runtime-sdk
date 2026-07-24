@@ -64,6 +64,30 @@ async fn preserves_reverse_proxy_base_paths_when_posting_chat_requests() {
 }
 
 #[tokio::test]
+async fn rejects_redirects_without_forwarding_the_prompt() {
+    let redirected_server = FakeOllamaServer::streaming([
+        r#"{"message":{"role":"assistant","content":""},"done":true}"#,
+    ])
+    .await;
+    let redirecting_server = FakeOllamaServer::redirect(redirected_server.endpoint()).await;
+    let model = OllamaLanguageModel::new(
+        OllamaConfig::new("test-model")
+            .unwrap()
+            .with_endpoint(redirecting_server.endpoint())
+            .unwrap(),
+    );
+    let mut output = model.stream(
+        LanguageModelRequest::new(TurnId::new(1), "private prompt"),
+        CancellationToken::new(),
+    );
+
+    let error = output.recv().await.unwrap().unwrap_err();
+    assert!(error.message().contains("307"), "{}", error.message());
+    assert!(output.recv().await.is_none());
+    assert!(!redirected_server.request_received().await);
+}
+
+#[tokio::test]
 async fn serializes_optional_configuration() {
     let server = FakeOllamaServer::streaming([
         r#"{"message":{"role":"assistant","content":""},"done":true}"#,
@@ -291,6 +315,35 @@ async fn rejects_cumulative_assistant_content_before_forwarding_the_overflowing_
     let error = output.recv().await.unwrap().unwrap_err();
 
     assert!(error.message().contains("assistant content"));
+    assert!(output.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn rejects_an_oversized_stream_of_ignored_records() {
+    let ignored_payload = "x".repeat(63 * 1024);
+    let records = (0..140).map(|_| {
+        format!(r#"{{"thinking":"{ignored_payload}","message":{{"content":""}},"done":false}}"#)
+    });
+    let server = FakeOllamaServer::streaming(records).await;
+    let model = OllamaLanguageModel::new(
+        OllamaConfig::new("test-model")
+            .unwrap()
+            .with_endpoint(server.endpoint())
+            .unwrap(),
+    );
+    let mut output = model.stream(
+        LanguageModelRequest::new(TurnId::new(1), "hi"),
+        CancellationToken::new(),
+    );
+
+    let error = output.recv().await.unwrap().unwrap_err();
+    assert!(
+        error
+            .message()
+            .contains("response exceeds the maximum size"),
+        "{}",
+        error.message()
+    );
     assert!(output.recv().await.is_none());
 }
 
@@ -646,6 +699,13 @@ impl FakeOllamaServer {
         .await
     }
 
+    async fn redirect(location: impl Into<String>) -> Self {
+        Self::start(Response::Redirect {
+            location: location.into(),
+        })
+        .await
+    }
+
     async fn start(response: Response) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -683,6 +743,10 @@ impl FakeOllamaServer {
     async fn request_target(&self) -> String {
         self.request_target.lock().await.clone().unwrap()
     }
+
+    async fn request_received(&self) -> bool {
+        self.request.lock().await.is_some()
+    }
 }
 
 enum Response {
@@ -693,6 +757,9 @@ enum Response {
     Failure {
         status: u16,
         body: String,
+    },
+    Redirect {
+        location: String,
     },
 }
 
@@ -756,6 +823,12 @@ async fn read_request_json(mut stream: TcpStream, response: Response) -> (Value,
             let response = format!(
                 "HTTP/1.1 {status} Internal Server Error\r\nContent-Length: {}\r\n\r\n{body}",
                 body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        }
+        Response::Redirect { location } => {
+            let response = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n"
             );
             stream.write_all(response.as_bytes()).await.unwrap();
         }

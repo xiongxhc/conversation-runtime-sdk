@@ -37,7 +37,8 @@ delta, and 120 seconds total time. Override these for controlled experiments wit
 millisecond values in `OLLAMA_FIRST_DELTA_TIMEOUT_MS`, `OLLAMA_IDLE_TIMEOUT_MS`, and
 `OLLAMA_TOTAL_TIMEOUT_MS`. A timeout exits non-zero and reports `status=timeout`,
 `timeout_stage`, and `elapsed_ms`; configuration or adapter failures exit non-zero with
-`status=error`, `stage`, `elapsed_ms`, and a sanitized single-line `error`.
+`status=error`, `stage`, `elapsed_ms`, and a sanitized single-line `error`. The total deadline
+also covers streamed standard-output writes and collection of final Ollama metrics.
 
 Successful reports include `model`, `status=ok`, wall-clock `first_delta_ms` and `total_ms`, the
 benchmark policy, and Ollama's final total/load/prompt-evaluation/response-evaluation metrics.

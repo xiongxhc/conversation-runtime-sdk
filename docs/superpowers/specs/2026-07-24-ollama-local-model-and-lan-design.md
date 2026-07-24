@@ -11,6 +11,8 @@ The longer-term product must present as a custom macOS application and allow an 
 ## Approved Decisions
 
 - Build a configurable Ollama language-model adapter and text benchmark probe before integrating speech.
+- Keep Ollama thinking configurable; disable it in the spoken-latency probe so hidden reasoning does not delay the first useful text.
+- Require the R2 voice-loop configuration to set thinking explicitly and match the benchmarked policy; it must not inherit a model default silently.
 - Keep Ollama bound to loopback. Future LAN clients communicate with an application-owned runtime gateway, never directly with Ollama.
 - Use the Mac as the initial runtime and memory authority.
 - Store the future SQLite memory database under the macOS application-data directory, outside the repository.
@@ -29,7 +31,7 @@ The currently installed models are:
 | `qwen3.6:27b-q8_0` | 27.8B | Q8_0 | 30.0 GB |
 | `hf.co/mradermacher/Llama-3.3-70B-Instruct-abliterated-i1-GGUF:Q4_K_M` | 70.6B | Q4_K_M | 42.5 GB |
 
-No model is selected as the product default until the benchmark probe records load time, first text delta, total generation time, and output quality notes. Community `abliterated` variants remain development candidates rather than implicit production defaults.
+No model is selected as the product default until the benchmark probe records first text delta, total generation time, and output quality notes, and separate instrumentation records load time and memory. Community `abliterated` variants remain development candidates rather than implicit production defaults.
 
 ## Ollama Adapter
 
@@ -41,6 +43,7 @@ Configuration contains:
 - exact model identifier;
 - optional system prompt;
 - optional keep-alive duration;
+- optional thinking enablement;
 - generation temperature.
 
 The adapter calls `POST /api/chat` with streaming enabled and one user message containing the completed transcript. Ollama returns newline-delimited JSON objects. Each non-empty assistant content field becomes one language-model delta. The final `done` record closes the stream.
@@ -64,7 +67,7 @@ It prints the streamed response to standard output and emits machine-readable ti
 - completed response;
 - total elapsed time.
 
-The probe is a feasibility tool, not a product client. It does not persist prompts or responses. Deterministic tests use a local fake HTTP server; one manual live run validates the installed Ollama service.
+The probe explicitly disables model thinking because it measures latency to useful spoken text. The generic adapter leaves thinking unset unless a caller configures it. The probe is a feasibility tool, not a product client. It does not persist prompts or responses. Deterministic tests use a local fake HTTP server; one manual live run validates the installed Ollama service.
 
 ## macOS Application and SQLite
 

@@ -230,8 +230,17 @@ git commit -m "feat: add local Ollama benchmark probe"
 
 ### Task 3: Benchmark Installed Models
 
+Before recording final measurements, add a focused follow-up discovered by the initial live run:
+
+- add `OllamaConfig::with_thinking(bool)` behind a failing serialization test;
+- serialize it as the optional top-level Ollama `think` field;
+- leave the generic adapter default unset;
+- make the spoken-latency probe call `.with_thinking(false)`;
+- rerun the Qwen measurements with thinking disabled.
+
 **Files:**
 - Modify: `docs/model-benchmarks.md`
+- Create: `docs/benchmarks/2026-07-24-ollama-local.md`
 - Modify: `models/registry.example.toml`
 
 **Interfaces:**
@@ -283,14 +292,15 @@ Add all three model identifiers with:
 capability = "language-model"
 source = "ollama-local"
 license_status = "review-required"
-benchmark_status = "measured"
 enabled = false
 ```
+
+Use `benchmark_status = "measured"` only for completed Qwen measurements and `benchmark_status = "attempt-failed"` for the incomplete Llama attempt. Preserve an upstream `provenance` URL for every entry.
 
 - [ ] **Step 5: Commit benchmark evidence**
 
 ```bash
-git add docs/model-benchmarks.md models/registry.example.toml
+git add docs/model-benchmarks.md docs/benchmarks/2026-07-24-ollama-local.md models/registry.example.toml
 git commit -m "docs: record local Ollama feasibility results"
 ```
 

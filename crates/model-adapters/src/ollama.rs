@@ -1,4 +1,4 @@
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::{AdapterError, LanguageModel, LanguageModelRequest};
@@ -34,6 +34,9 @@ pub struct OllamaConfig {
     keep_alive: Option<String>,
     thinking: Option<OllamaThinking>,
     temperature: f32,
+    seed: Option<u64>,
+    num_predict: Option<usize>,
+    num_ctx: Option<usize>,
     max_assistant_content_bytes: usize,
 }
 
@@ -54,6 +57,9 @@ impl OllamaConfig {
             keep_alive: None,
             thinking: None,
             temperature: DEFAULT_TEMPERATURE,
+            seed: None,
+            num_predict: None,
+            num_ctx: None,
             max_assistant_content_bytes: DEFAULT_MAX_ASSISTANT_CONTENT_BYTES,
         })
     }
@@ -96,6 +102,31 @@ impl OllamaConfig {
         self
     }
 
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.seed = Some(seed);
+        self
+    }
+
+    pub fn with_num_predict(mut self, num_predict: usize) -> Result<Self, AdapterError> {
+        if num_predict == 0 {
+            return Err(AdapterError::new(
+                "Ollama prediction limit must be non-zero",
+            ));
+        }
+
+        self.num_predict = Some(num_predict);
+        Ok(self)
+    }
+
+    pub fn with_num_ctx(mut self, num_ctx: usize) -> Result<Self, AdapterError> {
+        if num_ctx == 0 {
+            return Err(AdapterError::new("Ollama context window must be non-zero"));
+        }
+
+        self.num_ctx = Some(num_ctx);
+        Ok(self)
+    }
+
     pub fn with_max_assistant_content_bytes(
         mut self,
         max_assistant_content_bytes: usize,
@@ -124,6 +155,94 @@ impl OllamaLanguageModel {
             config,
         }
     }
+
+    pub fn stream_chat(
+        &self,
+        request: LanguageModelRequest,
+        cancellation: CancellationToken,
+    ) -> OllamaChatStream {
+        let (sender, receiver) = mpsc::channel(STREAM_BUFFER_SIZE);
+        let (metrics_sender, metrics_receiver) = oneshot::channel();
+        let client = self.client.clone();
+        let config = self.config.clone();
+
+        tokio::spawn(async move {
+            match run_chat(client, config, request, cancellation.clone(), &sender).await {
+                Ok(Some(metrics)) => {
+                    let _ = metrics_sender.send(Ok(metrics));
+                }
+                Ok(None) => {
+                    let _ = metrics_sender.send(Err(AdapterError::new("Ollama request cancelled")));
+                }
+                Err(error) => {
+                    send_error(error.clone(), cancellation, &sender).await;
+                    let _ = metrics_sender.send(Err(error));
+                }
+            }
+        });
+
+        OllamaChatStream {
+            receiver,
+            metrics_receiver,
+        }
+    }
+}
+
+pub struct OllamaChatStream {
+    receiver: mpsc::Receiver<Result<String, AdapterError>>,
+    metrics_receiver: oneshot::Receiver<Result<OllamaChatMetrics, AdapterError>>,
+}
+
+impl OllamaChatStream {
+    pub async fn recv_delta(&mut self) -> Option<Result<String, AdapterError>> {
+        self.receiver.recv().await
+    }
+
+    pub async fn final_metrics(self) -> Result<OllamaChatMetrics, AdapterError> {
+        self.metrics_receiver
+            .await
+            .map_err(|_| AdapterError::new("Ollama stream ended before final metrics"))?
+    }
+
+    fn into_delta_receiver(self) -> mpsc::Receiver<Result<String, AdapterError>> {
+        self.receiver
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct OllamaChatMetrics {
+    total_duration_ns: Option<u64>,
+    load_duration_ns: Option<u64>,
+    prompt_eval_count: Option<u64>,
+    prompt_eval_duration_ns: Option<u64>,
+    eval_count: Option<u64>,
+    eval_duration_ns: Option<u64>,
+}
+
+impl OllamaChatMetrics {
+    pub const fn total_duration_ns(&self) -> Option<u64> {
+        self.total_duration_ns
+    }
+
+    pub const fn load_duration_ns(&self) -> Option<u64> {
+        self.load_duration_ns
+    }
+
+    pub const fn prompt_eval_count(&self) -> Option<u64> {
+        self.prompt_eval_count
+    }
+
+    pub const fn prompt_eval_duration_ns(&self) -> Option<u64> {
+        self.prompt_eval_duration_ns
+    }
+
+    pub const fn eval_count(&self) -> Option<u64> {
+        self.eval_count
+    }
+
+    pub const fn eval_duration_ns(&self) -> Option<u64> {
+        self.eval_duration_ns
+    }
 }
 
 impl LanguageModel for OllamaLanguageModel {
@@ -132,34 +251,23 @@ impl LanguageModel for OllamaLanguageModel {
         request: LanguageModelRequest,
         cancellation: CancellationToken,
     ) -> mpsc::Receiver<Result<String, AdapterError>> {
-        let (sender, receiver) = mpsc::channel(STREAM_BUFFER_SIZE);
-        let client = self.client.clone();
-        let config = self.config.clone();
-
-        tokio::spawn(async move {
-            if let Err(error) =
-                stream_chat(client, config, request, cancellation.clone(), &sender).await
-            {
-                send_error(error, cancellation, &sender).await;
-            }
-        });
-
-        receiver
+        self.stream_chat(request, cancellation)
+            .into_delta_receiver()
     }
 }
 
-async fn stream_chat(
+async fn run_chat(
     client: reqwest::Client,
     config: OllamaConfig,
     request: LanguageModelRequest,
     cancellation: CancellationToken,
     sender: &mpsc::Sender<Result<String, AdapterError>>,
-) -> Result<(), AdapterError> {
+) -> Result<Option<OllamaChatMetrics>, AdapterError> {
     let chat_url = chat_url(&config.endpoint);
     let chat_request = ChatRequest::new(&config, request.transcript());
     let mut response = tokio::select! {
         biased;
-        _ = cancellation.cancelled() => return Ok(()),
+        _ = cancellation.cancelled() => return Ok(None),
         result = client.post(chat_url).json(&chat_request).send() => {
             result.map_err(|error| AdapterError::new(format!("Ollama request failed: {error}")))?
         }
@@ -179,7 +287,7 @@ async fn stream_chat(
     loop {
         let chunk = tokio::select! {
             biased;
-            _ = cancellation.cancelled() => return Ok(()),
+            _ = cancellation.cancelled() => return Ok(None),
             result = response.chunk() => {
                 result.map_err(|error| AdapterError::new(format!("Ollama response could not be read: {error}")))?
             }
@@ -191,6 +299,7 @@ async fn stream_chat(
 
         let mut remaining = chunk.as_ref();
         while let Some(response) = parser.next_response(&mut remaining)? {
+            let metrics = response.metrics();
             if process_response(
                 response,
                 &cancellation,
@@ -200,7 +309,7 @@ async fn stream_chat(
             )
             .await?
             {
-                return Ok(());
+                return Ok(Some(metrics));
             }
         }
     }
@@ -352,6 +461,9 @@ impl<'a> ChatRequest<'a> {
             think: config.thinking,
             options: ChatOptions {
                 temperature: config.temperature,
+                seed: config.seed,
+                num_predict: config.num_predict,
+                num_ctx: config.num_ctx,
             },
         }
     }
@@ -382,6 +494,12 @@ impl<'a> ChatMessage<'a> {
 #[derive(serde::Serialize)]
 struct ChatOptions {
     temperature: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_predict: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_ctx: Option<usize>,
 }
 
 #[derive(serde::Deserialize)]
@@ -390,6 +508,25 @@ struct ChatResponse {
     #[serde(default)]
     done: bool,
     error: Option<String>,
+    total_duration: Option<u64>,
+    load_duration: Option<u64>,
+    prompt_eval_count: Option<u64>,
+    prompt_eval_duration: Option<u64>,
+    eval_count: Option<u64>,
+    eval_duration: Option<u64>,
+}
+
+impl ChatResponse {
+    fn metrics(&self) -> OllamaChatMetrics {
+        OllamaChatMetrics {
+            total_duration_ns: self.total_duration,
+            load_duration_ns: self.load_duration,
+            prompt_eval_count: self.prompt_eval_count,
+            prompt_eval_duration_ns: self.prompt_eval_duration,
+            eval_count: self.eval_count,
+            eval_duration_ns: self.eval_duration,
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]

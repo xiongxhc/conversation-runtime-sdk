@@ -10,7 +10,9 @@ use std::pin::Pin;
 
 pub use language_model::{LanguageModel, LanguageModelRequest};
 pub use mock::{MockLanguageModel, MockSpeechSynthesizer};
-pub use ollama::{OllamaConfig, OllamaLanguageModel, OllamaThinkingLevel};
+pub use ollama::{
+    OllamaChatMetrics, OllamaChatStream, OllamaConfig, OllamaLanguageModel, OllamaThinkingLevel,
+};
 pub use speech::{SpeechRequest, SpeechSynthesizer};
 
 pub type AdapterFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, AdapterError>> + Send + 'a>>;

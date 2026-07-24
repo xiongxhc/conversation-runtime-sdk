@@ -1,13 +1,16 @@
 use std::env;
-use std::error::Error;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::time::Instant;
 
 use conversation_model_adapters::{
-    LanguageModel, LanguageModelRequest, OllamaConfig, OllamaLanguageModel,
+    LanguageModelRequest, OllamaChatMetrics, OllamaConfig, OllamaLanguageModel,
 };
 use conversation_protocol::TurnId;
 use tokio_util::sync::CancellationToken;
+
+const DEFAULT_FIRST_DELTA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const DEFAULT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const DEFAULT_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 #[derive(Debug, Eq, PartialEq)]
 struct ProbeArguments {
@@ -16,55 +19,126 @@ struct ProbeArguments {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    let arguments = parse_arguments(env::args()).map_err(io::Error::other)?;
+async fn main() {
+    let started_at = Instant::now();
+    let arguments = match parse_arguments(env::args(), io::stdin().lock()) {
+        Ok(arguments) => arguments,
+        Err(error) => exit_with_failure("unavailable", started_at, ProbeFailure::arguments(error)),
+    };
     let endpoint = env::var("OLLAMA_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:11434".into());
-    run_probe(arguments, &endpoint).await
+    let model = arguments.model.clone();
+
+    if let Err(failure) = run_probe(arguments, &endpoint).await {
+        exit_with_failure(&model, started_at, failure);
+    }
 }
 
-async fn run_probe(arguments: ProbeArguments, endpoint: &str) -> Result<(), Box<dyn Error>> {
+async fn run_probe(arguments: ProbeArguments, endpoint: &str) -> Result<(), ProbeFailure> {
+    let timeouts = ProbeTimeouts::from_environment().map_err(ProbeFailure::configuration)?;
+    run_probe_with_timeouts(arguments, endpoint, timeouts).await
+}
+
+async fn run_probe_with_timeouts(
+    arguments: ProbeArguments,
+    endpoint: &str,
+    timeouts: ProbeTimeouts,
+) -> Result<(), ProbeFailure> {
     let model = OllamaLanguageModel::new(
-        OllamaConfig::new(arguments.model.clone())?
-            .with_endpoint(endpoint)?
-            .with_thinking(false),
+        OllamaConfig::new(arguments.model.clone())
+            .map_err(ProbeFailure::configuration)?
+            .with_endpoint(endpoint)
+            .map_err(ProbeFailure::configuration)?
+            .with_thinking(false)
+            .with_temperature(0.0)
+            .with_seed(42)
+            .with_num_predict(128)
+            .map_err(ProbeFailure::configuration)?
+            .with_num_ctx(8192)
+            .map_err(ProbeFailure::configuration)?,
     );
     let started_at = Instant::now();
-    let mut stream = model.stream(
+    let cancellation = CancellationToken::new();
+    let mut stream = model.stream_chat(
         LanguageModelRequest::new(TurnId::new(1), arguments.prompt),
-        CancellationToken::new(),
+        cancellation.clone(),
     );
     let mut first_delta_at = None;
 
-    while let Some(delta) = stream.recv().await {
-        let delta = delta?;
-        first_delta_at.get_or_insert_with(Instant::now);
-        print!("{delta}");
-        io::stdout().flush()?;
+    loop {
+        let stage = if first_delta_at.is_some() {
+            TimeoutStage::Idle
+        } else {
+            TimeoutStage::FirstDelta
+        };
+        let stage_timeout = match stage {
+            TimeoutStage::FirstDelta => timeouts.first_delta,
+            TimeoutStage::Idle => timeouts.idle,
+            TimeoutStage::Total => unreachable!("total timeout uses a shared deadline"),
+        };
+        let stage_timer = tokio::time::sleep(stage_timeout);
+        let total_timer =
+            tokio::time::sleep_until(tokio::time::Instant::from_std(started_at + timeouts.total));
+        tokio::pin!(stage_timer);
+        tokio::pin!(total_timer);
+
+        tokio::select! {
+            _ = &mut total_timer => {
+                cancellation.cancel();
+                return Err(ProbeFailure::timeout(TimeoutStage::Total));
+            }
+            _ = &mut stage_timer => {
+                cancellation.cancel();
+                return Err(ProbeFailure::timeout(stage));
+            }
+            delta = stream.recv_delta() => match delta {
+                Some(Ok(delta)) => {
+                    first_delta_at.get_or_insert_with(Instant::now);
+                    print!("{delta}");
+                    io::stdout().flush().map_err(|error| ProbeFailure::output(error.to_string()))?;
+                }
+                Some(Err(error)) => return Err(ProbeFailure::adapter(error.to_string())),
+                None => break,
+            },
+        }
     }
 
     let completed_at = Instant::now();
     let first_delta_ms = require_first_delta(first_delta_at)
-        .map_err(io::Error::other)?
+        .map_err(ProbeFailure::adapter)?
         .duration_since(started_at);
     let total_ms = completed_at.duration_since(started_at);
+    let metrics = stream
+        .final_metrics()
+        .await
+        .map_err(|error| ProbeFailure::adapter(error.to_string()))?;
 
     eprintln!(
-        "model={}\nfirst_delta_ms={}\ntotal_ms={}",
-        arguments.model,
-        first_delta_ms.as_millis(),
-        total_ms.as_millis(),
+        "{}",
+        format_success_report(&arguments.model, first_delta_ms, total_ms, &metrics)
     );
 
     Ok(())
 }
 
-fn parse_arguments(arguments: impl IntoIterator<Item = String>) -> Result<ProbeArguments, String> {
+fn parse_arguments(
+    arguments: impl IntoIterator<Item = String>,
+    mut standard_input: impl Read,
+) -> Result<ProbeArguments, String> {
     let mut arguments = arguments.into_iter();
     let _program = arguments.next();
     let Some(model) = arguments.next().filter(|model| !model.trim().is_empty()) else {
         return Err(usage_error());
     };
     let prompt = arguments.collect::<Vec<_>>().join(" ");
+    let prompt = if prompt.trim().is_empty() {
+        let mut standard_input_prompt = String::new();
+        standard_input
+            .read_to_string(&mut standard_input_prompt)
+            .map_err(|error| format!("could not read prompt from standard input: {error}"))?;
+        standard_input_prompt.trim().to_owned()
+    } else {
+        prompt
+    };
 
     if prompt.trim().is_empty() {
         return Err(usage_error());
@@ -81,11 +155,190 @@ fn require_first_delta(first_delta_at: Option<Instant>) -> Result<Instant, &'sta
     first_delta_at.ok_or("Ollama response completed without a text delta")
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProbeTimeouts {
+    first_delta: std::time::Duration,
+    idle: std::time::Duration,
+    total: std::time::Duration,
+}
+
+impl ProbeTimeouts {
+    const fn defaults() -> Self {
+        Self {
+            first_delta: DEFAULT_FIRST_DELTA_TIMEOUT,
+            idle: DEFAULT_IDLE_TIMEOUT,
+            total: DEFAULT_TOTAL_TIMEOUT,
+        }
+    }
+
+    fn from_environment() -> Result<Self, String> {
+        Self::from_millis(
+            env::var("OLLAMA_FIRST_DELTA_TIMEOUT_MS").ok().as_deref(),
+            env::var("OLLAMA_IDLE_TIMEOUT_MS").ok().as_deref(),
+            env::var("OLLAMA_TOTAL_TIMEOUT_MS").ok().as_deref(),
+        )
+    }
+
+    fn from_millis(
+        first_delta: Option<&str>,
+        idle: Option<&str>,
+        total: Option<&str>,
+    ) -> Result<Self, String> {
+        let defaults = Self::defaults();
+        Ok(Self {
+            first_delta: parse_timeout(
+                "OLLAMA_FIRST_DELTA_TIMEOUT_MS",
+                first_delta,
+                defaults.first_delta,
+            )?,
+            idle: parse_timeout("OLLAMA_IDLE_TIMEOUT_MS", idle, defaults.idle)?,
+            total: parse_timeout("OLLAMA_TOTAL_TIMEOUT_MS", total, defaults.total)?,
+        })
+    }
+}
+
+fn parse_timeout(
+    name: &str,
+    milliseconds: Option<&str>,
+    default: std::time::Duration,
+) -> Result<std::time::Duration, String> {
+    let Some(milliseconds) = milliseconds else {
+        return Ok(default);
+    };
+    let milliseconds = milliseconds
+        .parse::<u64>()
+        .map_err(|_| format!("{name} must be a non-zero number of milliseconds"))?;
+    if milliseconds == 0 {
+        return Err(format!("{name} must be a non-zero number of milliseconds"));
+    }
+
+    Ok(std::time::Duration::from_millis(milliseconds))
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TimeoutStage {
+    FirstDelta,
+    Idle,
+    Total,
+}
+
+impl TimeoutStage {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::FirstDelta => "first_delta",
+            Self::Idle => "idle",
+            Self::Total => "total",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ProbeFailure {
+    stage: &'static str,
+    error: String,
+    timeout_stage: Option<TimeoutStage>,
+}
+
+impl ProbeFailure {
+    fn arguments(error: String) -> Self {
+        Self::new("arguments", error)
+    }
+
+    fn configuration(error: impl ToString) -> Self {
+        Self::new("configuration", error.to_string())
+    }
+
+    fn adapter(error: impl Into<String>) -> Self {
+        Self::new("adapter", error.into())
+    }
+
+    fn output(error: impl Into<String>) -> Self {
+        Self::new("output", error.into())
+    }
+
+    fn timeout(stage: TimeoutStage) -> Self {
+        Self {
+            stage: "timeout",
+            error: String::new(),
+            timeout_stage: Some(stage),
+        }
+    }
+
+    fn new(stage: &'static str, error: String) -> Self {
+        Self {
+            stage,
+            error,
+            timeout_stage: None,
+        }
+    }
+}
+
+fn exit_with_failure(model: &str, started_at: Instant, failure: ProbeFailure) -> ! {
+    let elapsed_ms = started_at.elapsed().as_millis();
+    match failure.timeout_stage {
+        Some(timeout_stage) => eprintln!(
+            "model={model}\nstatus=timeout\ntimeout_stage={}\nelapsed_ms={elapsed_ms}",
+            timeout_stage.as_str(),
+        ),
+        None => eprintln!(
+            "model={model}\nstatus=error\nstage={}\nelapsed_ms={elapsed_ms}\nerror={}",
+            failure.stage,
+            sanitize_error(&failure.error),
+        ),
+    }
+    std::process::exit(1);
+}
+
+fn sanitize_error(error: &str) -> String {
+    error
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+fn format_success_report(
+    model: &str,
+    first_delta: std::time::Duration,
+    total: std::time::Duration,
+    metrics: &OllamaChatMetrics,
+) -> String {
+    format!(
+        "model={model}\nstatus=ok\nfirst_delta_ms={}\ntotal_ms={}\nthink=false\ntemperature=0\nseed=42\nnum_predict=128\nnum_ctx=8192\nollama_total_duration_ns={}\nollama_load_duration_ns={}\nollama_prompt_eval_count={}\nollama_prompt_eval_duration_ns={}\nollama_eval_count={}\nollama_eval_duration_ns={}",
+        first_delta.as_millis(),
+        total.as_millis(),
+        format_metric(metrics.total_duration_ns()),
+        format_metric(metrics.load_duration_ns()),
+        format_metric(metrics.prompt_eval_count()),
+        format_metric(metrics.prompt_eval_duration_ns()),
+        format_metric(metrics.eval_count()),
+        format_metric(metrics.eval_duration_ns()),
+    )
+}
+
+fn format_metric(value: Option<u64>) -> String {
+    value.map_or_else(|| "unavailable".to_owned(), |value| value.to_string())
+}
+
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
     use std::sync::Arc;
+    use std::time::Duration;
 
-    use super::{parse_arguments, require_first_delta, run_probe, ProbeArguments};
+    use conversation_model_adapters::OllamaChatMetrics;
+
+    use super::{
+        format_success_report, parse_arguments, require_first_delta, run_probe, ProbeArguments,
+        ProbeTimeouts,
+    };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::Mutex;
@@ -100,7 +353,7 @@ mod tests {
             "hello".to_owned(),
         ];
 
-        let parsed = parse_arguments(arguments).unwrap();
+        let parsed = parse_arguments(arguments, Cursor::new("")).unwrap();
 
         assert_eq!(
             parsed.model,
@@ -110,7 +363,22 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_model_or_prompt_with_usage_error() {
+    fn reads_a_non_empty_prompt_from_standard_input_when_arguments_omit_it() {
+        let parsed = parse_arguments(
+            [
+                "conversation-ollama-probe".to_owned(),
+                "qwen3.6:27b-q8_0".to_owned(),
+            ],
+            Cursor::new("Answer privately.\n"),
+        )
+        .unwrap();
+
+        assert_eq!(parsed.model, "qwen3.6:27b-q8_0");
+        assert_eq!(parsed.prompt, "Answer privately.");
+    }
+
+    #[test]
+    fn rejects_missing_model_or_an_empty_standard_input_prompt_with_usage_error() {
         for arguments in [
             vec!["conversation-ollama-probe".to_owned()],
             vec![
@@ -118,10 +386,56 @@ mod tests {
                 "qwen3.6:27b-q8_0".to_owned(),
             ],
         ] {
-            let error = parse_arguments(arguments).unwrap_err();
+            let error = parse_arguments(arguments, Cursor::new(" \n")).unwrap_err();
 
             assert!(error.starts_with("Usage:"));
         }
+    }
+
+    #[test]
+    fn uses_non_zero_timeout_defaults_and_validates_overrides() {
+        assert_eq!(
+            ProbeTimeouts::defaults(),
+            ProbeTimeouts {
+                first_delta: Duration::from_secs(60),
+                idle: Duration::from_secs(30),
+                total: Duration::from_secs(120),
+            }
+        );
+        assert_eq!(
+            ProbeTimeouts::from_millis(Some("1"), Some("2"), Some("3")).unwrap(),
+            ProbeTimeouts {
+                first_delta: Duration::from_millis(1),
+                idle: Duration::from_millis(2),
+                total: Duration::from_millis(3),
+            }
+        );
+        assert!(ProbeTimeouts::from_millis(Some("0"), None, None).is_err());
+        assert!(ProbeTimeouts::from_millis(Some("invalid"), None, None).is_err());
+    }
+
+    #[test]
+    fn formats_success_with_policy_and_unavailable_metrics() {
+        let report = format_success_report(
+            "test-model",
+            Duration::from_millis(12),
+            Duration::from_millis(34),
+            &OllamaChatMetrics::default(),
+        );
+
+        assert_eq!(
+            report,
+            concat!(
+                "model=test-model\nstatus=ok\nfirst_delta_ms=12\ntotal_ms=34\n",
+                "think=false\ntemperature=0\nseed=42\nnum_predict=128\nnum_ctx=8192\n",
+                "ollama_total_duration_ns=unavailable\n",
+                "ollama_load_duration_ns=unavailable\n",
+                "ollama_prompt_eval_count=unavailable\n",
+                "ollama_prompt_eval_duration_ns=unavailable\n",
+                "ollama_eval_count=unavailable\n",
+                "ollama_eval_duration_ns=unavailable"
+            )
+        );
     }
 
     #[test]
@@ -148,6 +462,10 @@ mod tests {
         let request_body = server.request_body().await;
 
         assert!(has_top_level_boolean_field(&request_body, "think", false));
+        assert!(request_body.contains(r#""temperature":0.0"#));
+        assert!(request_body.contains(r#""seed":42"#));
+        assert!(request_body.contains(r#""num_predict":128"#));
+        assert!(request_body.contains(r#""num_ctx":8192"#));
     }
 
     struct FakeOllamaServer {

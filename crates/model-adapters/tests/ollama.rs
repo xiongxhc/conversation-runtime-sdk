@@ -76,7 +76,12 @@ async fn serializes_optional_configuration() {
             .unwrap()
             .with_system_prompt("Be concise.")
             .with_keep_alive("5m")
-            .with_temperature(0.25),
+            .with_temperature(0.25)
+            .with_seed(42)
+            .with_num_predict(128)
+            .unwrap()
+            .with_num_ctx(8192)
+            .unwrap(),
     );
     let mut output = model.stream(
         LanguageModelRequest::new(TurnId::new(1), "hi"),
@@ -86,6 +91,9 @@ async fn serializes_optional_configuration() {
     assert!(output.recv().await.is_none());
     assert_eq!(server.request_json().await["keep_alive"], "5m");
     assert_eq!(server.request_json().await["options"]["temperature"], 0.25);
+    assert_eq!(server.request_json().await["options"]["seed"], 42);
+    assert_eq!(server.request_json().await["options"]["num_predict"], 128);
+    assert_eq!(server.request_json().await["options"]["num_ctx"], 8192);
     assert_eq!(server.request_json().await["messages"][0]["role"], "system");
     assert_eq!(
         server.request_json().await["messages"][0]["content"],
@@ -93,6 +101,37 @@ async fn serializes_optional_configuration() {
     );
     assert_eq!(server.request_json().await["messages"][1]["role"], "user");
     assert_eq!(server.request_json().await["messages"][1]["content"], "hi");
+}
+
+#[tokio::test]
+async fn streams_immediate_deltas_and_returns_final_ollama_metrics() {
+    let server = FakeOllamaServer::streaming([
+        r#"{"message":{"content":"hello"},"done":false}"#,
+        r#"{"message":{"content":" world"},"done":true,"total_duration":101,"load_duration":102,"prompt_eval_count":103,"prompt_eval_duration":104,"eval_count":105,"eval_duration":106}"#,
+    ])
+    .await;
+    let model = OllamaLanguageModel::new(
+        OllamaConfig::new("test-model")
+            .unwrap()
+            .with_endpoint(server.endpoint())
+            .unwrap(),
+    );
+    let mut stream = model.stream_chat(
+        LanguageModelRequest::new(TurnId::new(1), "hi"),
+        CancellationToken::new(),
+    );
+
+    assert_eq!(stream.recv_delta().await.unwrap().unwrap(), "hello");
+    assert_eq!(stream.recv_delta().await.unwrap().unwrap(), " world");
+    assert!(stream.recv_delta().await.is_none());
+
+    let metrics = stream.final_metrics().await.unwrap();
+    assert_eq!(metrics.total_duration_ns(), Some(101));
+    assert_eq!(metrics.load_duration_ns(), Some(102));
+    assert_eq!(metrics.prompt_eval_count(), Some(103));
+    assert_eq!(metrics.prompt_eval_duration_ns(), Some(104));
+    assert_eq!(metrics.eval_count(), Some(105));
+    assert_eq!(metrics.eval_duration_ns(), Some(106));
 }
 
 #[tokio::test]
@@ -499,6 +538,14 @@ fn rejects_empty_models_and_invalid_endpoints() {
     assert!(OllamaConfig::new("test-model")
         .unwrap()
         .with_max_assistant_content_bytes(0)
+        .is_err());
+    assert!(OllamaConfig::new("test-model")
+        .unwrap()
+        .with_num_predict(0)
+        .is_err());
+    assert!(OllamaConfig::new("test-model")
+        .unwrap()
+        .with_num_ctx(0)
         .is_err());
 }
 

@@ -1,4 +1,5 @@
 use std::env;
+use std::future::Future;
 use std::io::{self, Read, Write};
 use std::time::Instant;
 
@@ -11,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 const DEFAULT_FIRST_DELTA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const DEFAULT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const DEFAULT_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const MAX_TIMEOUT_MILLISECONDS: u64 = u32::MAX as u64 * 1_000;
 
 #[derive(Debug, Eq, PartialEq)]
 struct ProbeArguments {
@@ -20,43 +22,53 @@ struct ProbeArguments {
 
 #[tokio::main]
 async fn main() {
-    let started_at = Instant::now();
     let arguments = match parse_arguments(env::args(), io::stdin().lock()) {
         Ok(arguments) => arguments,
-        Err(error) => exit_with_failure("unavailable", started_at, ProbeFailure::arguments(error)),
+        Err(error) => exit_with_failure("unavailable", ProbeFailure::arguments(error)),
     };
     let endpoint = env::var("OLLAMA_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:11434".into());
     let model = arguments.model.clone();
 
     if let Err(failure) = run_probe(arguments, &endpoint).await {
-        exit_with_failure(&model, started_at, failure);
+        exit_with_failure(&model, failure);
     }
 }
 
 async fn run_probe(arguments: ProbeArguments, endpoint: &str) -> Result<(), ProbeFailure> {
-    let timeouts = ProbeTimeouts::from_environment().map_err(ProbeFailure::configuration)?;
-    run_probe_with_timeouts(arguments, endpoint, timeouts).await
+    let request_started_at = Instant::now();
+    let timeouts = ProbeTimeouts::from_environment()
+        .map_err(|error| ProbeFailure::configuration(error, request_started_at.elapsed()))?;
+    run_probe_with_timeouts(arguments, endpoint, timeouts, request_started_at).await
 }
 
 async fn run_probe_with_timeouts(
     arguments: ProbeArguments,
     endpoint: &str,
     timeouts: ProbeTimeouts,
+    request_started_at: Instant,
 ) -> Result<(), ProbeFailure> {
     let model = OllamaLanguageModel::new(
         OllamaConfig::new(arguments.model.clone())
-            .map_err(ProbeFailure::configuration)?
+            .map_err(|error| ProbeFailure::configuration(error, request_started_at.elapsed()))?
             .with_endpoint(endpoint)
-            .map_err(ProbeFailure::configuration)?
+            .map_err(|error| ProbeFailure::configuration(error, request_started_at.elapsed()))?
             .with_thinking(false)
             .with_temperature(0.0)
             .with_seed(42)
             .with_num_predict(128)
-            .map_err(ProbeFailure::configuration)?
+            .map_err(|error| ProbeFailure::configuration(error, request_started_at.elapsed()))?
             .with_num_ctx(8192)
-            .map_err(ProbeFailure::configuration)?,
+            .map_err(|error| ProbeFailure::configuration(error, request_started_at.elapsed()))?,
     );
-    let started_at = Instant::now();
+    let total_deadline = request_started_at
+        .checked_add(timeouts.total)
+        .map(tokio::time::Instant::from_std)
+        .ok_or_else(|| {
+            ProbeFailure::configuration(
+                "OLLAMA_TOTAL_TIMEOUT_MS exceeds the supported deadline range",
+                request_started_at.elapsed(),
+            )
+        })?;
     let cancellation = CancellationToken::new();
     let mut stream = model.stream_chat(
         LanguageModelRequest::new(TurnId::new(1), arguments.prompt),
@@ -75,28 +87,29 @@ async fn run_probe_with_timeouts(
             TimeoutStage::Idle => timeouts.idle,
             TimeoutStage::Total => unreachable!("total timeout uses a shared deadline"),
         };
-        let stage_timer = tokio::time::sleep(stage_timeout);
-        let total_timer =
-            tokio::time::sleep_until(tokio::time::Instant::from_std(started_at + timeouts.total));
-        tokio::pin!(stage_timer);
-        tokio::pin!(total_timer);
-
-        tokio::select! {
-            _ = &mut total_timer => {
+        match await_next_delta(stream.recv_delta(), total_deadline, stage_timeout, stage).await {
+            ReceiveOutcome::Timeout(TimeoutStage::Total) => {
                 cancellation.cancel();
-                return Err(ProbeFailure::timeout(TimeoutStage::Total));
+                return Err(ProbeFailure::timeout(
+                    TimeoutStage::Total,
+                    request_started_at.elapsed(),
+                ));
             }
-            _ = &mut stage_timer => {
+            ReceiveOutcome::Timeout(stage) => {
                 cancellation.cancel();
-                return Err(ProbeFailure::timeout(stage));
+                return Err(ProbeFailure::timeout(stage, request_started_at.elapsed()));
             }
-            delta = stream.recv_delta() => match delta {
+            ReceiveOutcome::Delta(delta) => match delta {
                 Some(Ok(delta)) => {
                     first_delta_at.get_or_insert_with(Instant::now);
                     print!("{delta}");
-                    io::stdout().flush().map_err(|error| ProbeFailure::output(error.to_string()))?;
+                    io::stdout().flush().map_err(|error| {
+                        ProbeFailure::output(error, request_started_at.elapsed())
+                    })?;
                 }
-                Some(Err(error)) => return Err(ProbeFailure::adapter(error.to_string())),
+                Some(Err(error)) => {
+                    return Err(ProbeFailure::adapter(error, request_started_at.elapsed()));
+                }
                 None => break,
             },
         }
@@ -104,13 +117,13 @@ async fn run_probe_with_timeouts(
 
     let completed_at = Instant::now();
     let first_delta_ms = require_first_delta(first_delta_at)
-        .map_err(ProbeFailure::adapter)?
-        .duration_since(started_at);
-    let total_ms = completed_at.duration_since(started_at);
+        .map_err(|error| ProbeFailure::adapter(error, request_started_at.elapsed()))?
+        .duration_since(request_started_at);
+    let total_ms = completed_at.duration_since(request_started_at);
     let metrics = stream
         .final_metrics()
         .await
-        .map_err(|error| ProbeFailure::adapter(error.to_string()))?;
+        .map_err(|error| ProbeFailure::adapter(error, request_started_at.elapsed()))?;
 
     eprintln!(
         "{}",
@@ -129,6 +142,9 @@ fn parse_arguments(
     let Some(model) = arguments.next().filter(|model| !model.trim().is_empty()) else {
         return Err(usage_error());
     };
+    if model.chars().any(char::is_control) {
+        return Err("Ollama model identifiers cannot contain control characters".into());
+    }
     let prompt = arguments.collect::<Vec<_>>().join(" ");
     let prompt = if prompt.trim().is_empty() {
         let mut standard_input_prompt = String::new();
@@ -211,15 +227,51 @@ fn parse_timeout(
     if milliseconds == 0 {
         return Err(format!("{name} must be a non-zero number of milliseconds"));
     }
+    if milliseconds > MAX_TIMEOUT_MILLISECONDS {
+        return Err(format!("{name} exceeds the supported deadline range"));
+    }
 
-    Ok(std::time::Duration::from_millis(milliseconds))
+    let timeout = std::time::Duration::from_millis(milliseconds);
+    if Instant::now().checked_add(timeout).is_none() {
+        return Err(format!("{name} exceeds the supported deadline range"));
+    }
+
+    Ok(timeout)
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TimeoutStage {
     FirstDelta,
     Idle,
     Total,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ReceiveOutcome {
+    Delta(Option<Result<String, conversation_model_adapters::AdapterError>>),
+    Timeout(TimeoutStage),
+}
+
+async fn await_next_delta<F>(
+    next_delta: F,
+    total_deadline: tokio::time::Instant,
+    stage_timeout: std::time::Duration,
+    stage: TimeoutStage,
+) -> ReceiveOutcome
+where
+    F: Future<Output = Option<Result<String, conversation_model_adapters::AdapterError>>>,
+{
+    let total_timer = tokio::time::sleep_until(total_deadline);
+    let stage_timer = tokio::time::sleep(stage_timeout);
+    tokio::pin!(total_timer);
+    tokio::pin!(stage_timer);
+
+    tokio::select! {
+        biased;
+        _ = &mut total_timer => ReceiveOutcome::Timeout(TimeoutStage::Total),
+        _ = &mut stage_timer => ReceiveOutcome::Timeout(stage),
+        delta = next_delta => ReceiveOutcome::Delta(delta),
+    }
 }
 
 impl TimeoutStage {
@@ -237,56 +289,66 @@ struct ProbeFailure {
     stage: &'static str,
     error: String,
     timeout_stage: Option<TimeoutStage>,
+    elapsed: Option<std::time::Duration>,
 }
 
 impl ProbeFailure {
     fn arguments(error: String) -> Self {
-        Self::new("arguments", error)
+        Self::new("arguments", error, None)
     }
 
-    fn configuration(error: impl ToString) -> Self {
-        Self::new("configuration", error.to_string())
+    fn configuration(error: impl ToString, elapsed: std::time::Duration) -> Self {
+        Self::new("configuration", error.to_string(), Some(elapsed))
     }
 
-    fn adapter(error: impl Into<String>) -> Self {
-        Self::new("adapter", error.into())
+    fn adapter(error: impl ToString, elapsed: std::time::Duration) -> Self {
+        Self::new("adapter", error.to_string(), Some(elapsed))
     }
 
-    fn output(error: impl Into<String>) -> Self {
-        Self::new("output", error.into())
+    fn output(error: impl ToString, elapsed: std::time::Duration) -> Self {
+        Self::new("output", error.to_string(), Some(elapsed))
     }
 
-    fn timeout(stage: TimeoutStage) -> Self {
+    fn timeout(stage: TimeoutStage, elapsed: std::time::Duration) -> Self {
         Self {
             stage: "timeout",
             error: String::new(),
             timeout_stage: Some(stage),
+            elapsed: Some(elapsed),
         }
     }
 
-    fn new(stage: &'static str, error: String) -> Self {
+    fn new(stage: &'static str, error: String, elapsed: Option<std::time::Duration>) -> Self {
         Self {
             stage,
             error,
             timeout_stage: None,
+            elapsed,
         }
     }
 }
 
-fn exit_with_failure(model: &str, started_at: Instant, failure: ProbeFailure) -> ! {
-    let elapsed_ms = started_at.elapsed().as_millis();
+fn exit_with_failure(model: &str, failure: ProbeFailure) -> ! {
+    eprintln!("{}", format_failure_report(model, failure));
+    std::process::exit(1);
+}
+
+fn format_failure_report(model: &str, failure: ProbeFailure) -> String {
+    let elapsed_ms = failure.elapsed.map_or_else(
+        || "unavailable".to_owned(),
+        |elapsed| elapsed.as_millis().to_string(),
+    );
     match failure.timeout_stage {
-        Some(timeout_stage) => eprintln!(
+        Some(timeout_stage) => format!(
             "model={model}\nstatus=timeout\ntimeout_stage={}\nelapsed_ms={elapsed_ms}",
             timeout_stage.as_str(),
         ),
-        None => eprintln!(
+        None => format!(
             "model={model}\nstatus=error\nstage={}\nelapsed_ms={elapsed_ms}\nerror={}",
             failure.stage,
             sanitize_error(&failure.error),
         ),
     }
-    std::process::exit(1);
 }
 
 fn sanitize_error(error: &str) -> String {
@@ -333,15 +395,16 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use conversation_model_adapters::OllamaChatMetrics;
+    use conversation_model_adapters::{AdapterError, OllamaChatMetrics};
 
     use super::{
-        format_success_report, parse_arguments, require_first_delta, run_probe, ProbeArguments,
-        ProbeTimeouts,
+        await_next_delta, format_failure_report, format_success_report, parse_arguments,
+        require_first_delta, run_probe, ProbeArguments, ProbeFailure, ProbeTimeouts,
+        ReceiveOutcome, TimeoutStage,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
-    use tokio::sync::Mutex;
+    use tokio::sync::{mpsc, Mutex};
 
     #[test]
     fn parses_exact_model_identifier_and_remaining_prompt_words() {
@@ -393,6 +456,21 @@ mod tests {
     }
 
     #[test]
+    fn rejects_model_identifiers_with_control_characters() {
+        let error = parse_arguments(
+            [
+                "conversation-ollama-probe".to_owned(),
+                "test\nmodel".to_owned(),
+                "hi".to_owned(),
+            ],
+            Cursor::new(""),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("control characters"));
+    }
+
+    #[test]
     fn uses_non_zero_timeout_defaults_and_validates_overrides() {
         assert_eq!(
             ProbeTimeouts::defaults(),
@@ -412,6 +490,65 @@ mod tests {
         );
         assert!(ProbeTimeouts::from_millis(Some("0"), None, None).is_err());
         assert!(ProbeTimeouts::from_millis(Some("invalid"), None, None).is_err());
+        assert!(ProbeTimeouts::from_millis(Some("18446744073709551615"), None, None).is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn prioritizes_total_timeout_when_total_stage_and_delta_are_ready() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        sender.send(Ok("delta".to_owned())).await.unwrap();
+
+        let outcome = await_next_delta(
+            async { receiver.recv().await },
+            tokio::time::Instant::now(),
+            Duration::ZERO,
+            TimeoutStage::FirstDelta,
+        )
+        .await;
+
+        assert_eq!(outcome, ReceiveOutcome::Timeout(TimeoutStage::Total));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn prioritizes_stage_timeout_over_a_ready_delta_when_total_is_pending() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        sender.send(Ok("delta".to_owned())).await.unwrap();
+
+        let outcome = await_next_delta(
+            async { receiver.recv().await },
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            Duration::ZERO,
+            TimeoutStage::Idle,
+        )
+        .await;
+
+        assert_eq!(outcome, ReceiveOutcome::Timeout(TimeoutStage::Idle));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn returns_a_ready_delta_when_both_deadlines_are_pending() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        sender.send(Ok("delta".to_owned())).await.unwrap();
+
+        let outcome = await_next_delta(
+            async { receiver.recv().await },
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            Duration::from_secs(1),
+            TimeoutStage::FirstDelta,
+        )
+        .await;
+
+        assert_eq!(outcome, ReceiveOutcome::Delta(Some(Ok("delta".to_owned()))));
+    }
+
+    #[test]
+    fn formats_request_relative_failure_elapsed_time() {
+        let report = format_failure_report(
+            "test-model",
+            ProbeFailure::adapter(AdapterError::new("failed"), Duration::from_millis(7)),
+        );
+
+        assert!(report.contains("status=error\nstage=adapter\nelapsed_ms=7\n"));
     }
 
     #[test]

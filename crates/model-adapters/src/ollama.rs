@@ -48,6 +48,11 @@ impl OllamaConfig {
                 "Ollama model identifiers cannot be empty",
             ));
         }
+        if model.chars().any(char::is_control) {
+            return Err(AdapterError::new(
+                "Ollama model identifiers cannot contain control characters",
+            ));
+        }
 
         Ok(Self {
             endpoint: reqwest::Url::parse(DEFAULT_ENDPOINT)
@@ -168,11 +173,15 @@ impl OllamaLanguageModel {
 
         tokio::spawn(async move {
             match run_chat(client, config, request, cancellation.clone(), &sender).await {
-                Ok(Some(metrics)) => {
+                Ok(ChatOutcome::Completed(metrics)) if !cancellation.is_cancelled() => {
                     let _ = metrics_sender.send(Ok(metrics));
                 }
-                Ok(None) => {
+                Ok(ChatOutcome::Completed(_)) | Ok(ChatOutcome::Cancelled) => {
                     let _ = metrics_sender.send(Err(AdapterError::new("Ollama request cancelled")));
+                }
+                Ok(ChatOutcome::ReceiverClosed) => {
+                    let _ = metrics_sender
+                        .send(Err(AdapterError::new("Ollama stream receiver closed")));
                 }
                 Err(error) => {
                     send_error(error.clone(), cancellation, &sender).await;
@@ -262,12 +271,12 @@ async fn run_chat(
     request: LanguageModelRequest,
     cancellation: CancellationToken,
     sender: &mpsc::Sender<Result<String, AdapterError>>,
-) -> Result<Option<OllamaChatMetrics>, AdapterError> {
+) -> Result<ChatOutcome, AdapterError> {
     let chat_url = chat_url(&config.endpoint);
     let chat_request = ChatRequest::new(&config, request.transcript());
     let mut response = tokio::select! {
         biased;
-        _ = cancellation.cancelled() => return Ok(None),
+        _ = cancellation.cancelled() => return Ok(ChatOutcome::Cancelled),
         result = client.post(chat_url).json(&chat_request).send() => {
             result.map_err(|error| AdapterError::new(format!("Ollama request failed: {error}")))?
         }
@@ -287,7 +296,7 @@ async fn run_chat(
     loop {
         let chunk = tokio::select! {
             biased;
-            _ = cancellation.cancelled() => return Ok(None),
+            _ = cancellation.cancelled() => return Ok(ChatOutcome::Cancelled),
             result = response.chunk() => {
                 result.map_err(|error| AdapterError::new(format!("Ollama response could not be read: {error}")))?
             }
@@ -300,7 +309,7 @@ async fn run_chat(
         let mut remaining = chunk.as_ref();
         while let Some(response) = parser.next_response(&mut remaining)? {
             let metrics = response.metrics();
-            if process_response(
+            match process_response(
                 response,
                 &cancellation,
                 sender,
@@ -309,7 +318,10 @@ async fn run_chat(
             )
             .await?
             {
-                return Ok(Some(metrics));
+                RecordOutcome::Continue => {}
+                RecordOutcome::Completed => return Ok(ChatOutcome::Completed(metrics)),
+                RecordOutcome::Cancelled => return Ok(ChatOutcome::Cancelled),
+                RecordOutcome::ReceiverClosed => return Ok(ChatOutcome::ReceiverClosed),
             }
         }
     }
@@ -321,7 +333,7 @@ async fn process_response(
     sender: &mpsc::Sender<Result<String, AdapterError>>,
     assistant_content_bytes: &mut usize,
     max_assistant_content_bytes: usize,
-) -> Result<bool, AdapterError> {
+) -> Result<RecordOutcome, AdapterError> {
     if let Some(error) = response.error {
         return Err(AdapterError::new(format!(
             "Ollama returned an error: {error}"
@@ -338,17 +350,37 @@ async fn process_response(
             *assistant_content_bytes += content.len();
             tokio::select! {
                 biased;
-                _ = cancellation.cancelled() => return Ok(true),
+                _ = cancellation.cancelled() => return Ok(RecordOutcome::Cancelled),
                 result = sender.send(Ok(content)) => {
                     if result.is_err() {
-                        return Ok(true);
+                        return Ok(RecordOutcome::ReceiverClosed);
                     }
                 }
             }
         }
     }
 
-    Ok(response.done)
+    if cancellation.is_cancelled() {
+        return Ok(RecordOutcome::Cancelled);
+    }
+    if response.done {
+        Ok(RecordOutcome::Completed)
+    } else {
+        Ok(RecordOutcome::Continue)
+    }
+}
+
+enum ChatOutcome {
+    Completed(OllamaChatMetrics),
+    Cancelled,
+    ReceiverClosed,
+}
+
+enum RecordOutcome {
+    Continue,
+    Completed,
+    Cancelled,
+    ReceiverClosed,
 }
 
 fn chat_url(endpoint: &reqwest::Url) -> reqwest::Url {

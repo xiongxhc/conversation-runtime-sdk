@@ -524,9 +524,43 @@ async fn cancellation_closes_the_stream_before_a_delayed_second_chunk() {
         .is_none());
 }
 
+#[tokio::test]
+async fn cancelling_a_backpressured_chat_stream_never_returns_metrics() {
+    let server = FakeOllamaServer::streaming((0..32).map(|index| {
+        format!(
+            r#"{{"message":{{"content":"{index}"}},"done":{}}}"#,
+            index == 31
+        )
+    }))
+    .await;
+    let model = OllamaLanguageModel::new(
+        OllamaConfig::new("test-model")
+            .unwrap()
+            .with_endpoint(server.endpoint())
+            .unwrap(),
+    );
+    let cancellation = CancellationToken::new();
+    let stream = model.stream_chat(
+        LanguageModelRequest::new(TurnId::new(1), "hi"),
+        cancellation.clone(),
+    );
+
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    sleep(Duration::from_millis(20)).await;
+    cancellation.cancel();
+
+    let error = timeout(Duration::from_millis(100), stream.final_metrics())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(error.message().contains("cancelled"));
+}
+
 #[test]
 fn rejects_empty_models_and_invalid_endpoints() {
     assert!(OllamaConfig::new(" ").is_err());
+    assert!(OllamaConfig::new("model\nidentifier").is_err());
     assert!(OllamaConfig::new("test-model")
         .unwrap()
         .with_endpoint("not a url")

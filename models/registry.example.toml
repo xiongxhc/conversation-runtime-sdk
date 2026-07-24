@@ -21,7 +21,7 @@ digest = "cd0210c667bffa98ad702668d05fda1f340bcbb0a2c769bd389670d19ad1441b"
 license_status = "review-required"
 benchmark_status = "measured"
 benchmark_profile = "think-false-temp-0-seed-42-num-predict-128-num-ctx-8192"
-loaded_size_bytes = 28958062017
+loaded_size_bytes = 28798657493
 enabled = false
 
 [[models]]
@@ -33,7 +33,7 @@ digest = "6847e511be1feba3e59b4bae991824f9abbd76229f04b32f4c18f5b9c40fc4b8"
 license_status = "review-required"
 benchmark_status = "measured"
 benchmark_profile = "think-false-temp-0-seed-42-num-predict-128-num-ctx-8192"
-loaded_size_bytes = 44823992073
+loaded_size_bytes = 45415000964
 enabled = false
 
 [[models]]

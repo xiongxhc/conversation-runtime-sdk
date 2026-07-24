@@ -128,7 +128,7 @@ async fn stream_chat(
         )));
     }
 
-    let mut records = NdjsonRecordBuffer::new();
+    let mut parser = NdjsonResponseParser::new();
     loop {
         let chunk = tokio::select! {
             biased;
@@ -138,37 +138,44 @@ async fn stream_chat(
             }
         };
         let Some(chunk) = chunk else {
-            records.finish()?;
+            parser.finish()?;
             return Err(AdapterError::new("Ollama response ended before done: true"));
         };
 
-        for line in records.feed(&chunk)? {
-            let response: ChatResponse = serde_json::from_str(&line).map_err(|error| {
-                AdapterError::new(format!("Ollama response is malformed: {error}"))
-            })?;
-            if let Some(error) = response.error {
-                return Err(AdapterError::new(format!(
-                    "Ollama returned an error: {error}"
-                )));
-            }
-            if let Some(content) = response.message.and_then(|message| message.content) {
-                if !content.is_empty() {
-                    tokio::select! {
-                        biased;
-                        _ = cancellation.cancelled() => return Ok(()),
-                        result = sender.send(Ok(content)) => {
-                            if result.is_err() {
-                                return Ok(());
-                            }
-                        }
-                    }
-                }
-            }
-            if response.done {
+        let mut remaining = chunk.as_ref();
+        while let Some(response) = parser.next_response(&mut remaining)? {
+            if process_response(response, &cancellation, sender).await? {
                 return Ok(());
             }
         }
     }
+}
+
+async fn process_response(
+    response: ChatResponse,
+    cancellation: &CancellationToken,
+    sender: &mpsc::Sender<Result<String, AdapterError>>,
+) -> Result<bool, AdapterError> {
+    if let Some(error) = response.error {
+        return Err(AdapterError::new(format!(
+            "Ollama returned an error: {error}"
+        )));
+    }
+    if let Some(content) = response.message.and_then(|message| message.content) {
+        if !content.is_empty() {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Ok(true),
+                result = sender.send(Ok(content)) => {
+                    if result.is_err() {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(response.done)
 }
 
 async fn send_error(
@@ -257,44 +264,53 @@ struct ChatResponseMessage {
     content: Option<String>,
 }
 
-struct NdjsonRecordBuffer {
-    bytes: Vec<u8>,
+struct NdjsonResponseParser {
+    partial_record: Vec<u8>,
 }
 
-impl NdjsonRecordBuffer {
+impl NdjsonResponseParser {
     fn new() -> Self {
-        Self { bytes: Vec::new() }
+        Self {
+            partial_record: Vec::new(),
+        }
     }
 
-    fn feed(&mut self, chunk: &[u8]) -> Result<Vec<String>, AdapterError> {
-        self.bytes.extend_from_slice(chunk);
-        let mut records = Vec::new();
-
-        while let Some(newline) = self.bytes.iter().position(|byte| *byte == b'\n') {
-            if newline > MAX_NDJSON_RECORD_BYTES {
-                return Err(record_size_error());
+    fn next_response(
+        &mut self,
+        remaining: &mut &[u8],
+    ) -> Result<Option<ChatResponse>, AdapterError> {
+        loop {
+            if remaining.is_empty() {
+                return Ok(None);
             }
 
-            let line: Vec<u8> = self.bytes.drain(..=newline).collect();
-            let line = std::str::from_utf8(&line)
-                .map_err(|error| {
-                    AdapterError::new(format!("Ollama response is malformed: {error}"))
-                })?
-                .trim();
-            if !line.is_empty() {
-                records.push(line.to_owned());
+            let chunk = *remaining;
+            if let Some(newline) = chunk.iter().position(|byte| *byte == b'\n') {
+                let (segment, rest) = chunk.split_at(newline);
+                *remaining = &rest[1..];
+
+                if self.partial_record.is_empty() {
+                    if let Some(response) = parse_response(segment)? {
+                        return Ok(Some(response));
+                    }
+                } else {
+                    self.append_partial(segment)?;
+                    let response = parse_response(&self.partial_record)?;
+                    self.partial_record.clear();
+                    if let Some(response) = response {
+                        return Ok(Some(response));
+                    }
+                }
+            } else {
+                self.append_partial(chunk)?;
+                *remaining = &[];
+                return Ok(None);
             }
         }
-
-        if self.bytes.len() > MAX_NDJSON_RECORD_BYTES {
-            return Err(record_size_error());
-        }
-
-        Ok(records)
     }
 
     fn finish(&self) -> Result<(), AdapterError> {
-        if self.bytes.is_empty() {
+        if self.partial_record.is_empty() {
             Ok(())
         } else {
             Err(AdapterError::new(
@@ -302,6 +318,32 @@ impl NdjsonRecordBuffer {
             ))
         }
     }
+
+    fn append_partial(&mut self, segment: &[u8]) -> Result<(), AdapterError> {
+        if segment.len() > MAX_NDJSON_RECORD_BYTES.saturating_sub(self.partial_record.len()) {
+            return Err(record_size_error());
+        }
+
+        self.partial_record.extend_from_slice(segment);
+        Ok(())
+    }
+}
+
+fn parse_response(record: &[u8]) -> Result<Option<ChatResponse>, AdapterError> {
+    if record.len() > MAX_NDJSON_RECORD_BYTES {
+        return Err(record_size_error());
+    }
+
+    let record = std::str::from_utf8(record)
+        .map_err(|error| AdapterError::new(format!("Ollama response is malformed: {error}")))?
+        .trim();
+    if record.is_empty() {
+        return Ok(None);
+    }
+
+    serde_json::from_str(record)
+        .map(Some)
+        .map_err(|error| AdapterError::new(format!("Ollama response is malformed: {error}")))
 }
 
 fn record_size_error() -> AdapterError {
@@ -312,20 +354,55 @@ fn record_size_error() -> AdapterError {
 
 #[cfg(test)]
 mod tests {
-    use super::NdjsonRecordBuffer;
+    use super::NdjsonResponseParser;
 
     #[test]
     fn reassembles_a_record_from_explicit_fragments() {
-        let mut buffer = NdjsonRecordBuffer::new();
+        let mut parser = NdjsonResponseParser::new();
+        let mut first_fragment = br#"{"message":{"content":"hel"#.as_slice();
 
-        assert!(buffer
-            .feed(br#"{"message":{"content":"hel"#)
-            .unwrap()
-            .is_empty());
-        assert_eq!(
-            buffer.feed(b"lo\"},\"done\":false}\n").unwrap(),
-            vec![r#"{"message":{"content":"hello"},"done":false}"#]
-        );
-        buffer.finish().unwrap();
+        assert!(parser.next_response(&mut first_fragment).unwrap().is_none());
+
+        let mut second_fragment = b"lo\"},\"done\":false}\n".as_slice();
+        let response = parser.next_response(&mut second_fragment).unwrap().unwrap();
+
+        assert_eq!(response.message.unwrap().content.as_deref(), Some("hello"));
+        assert!(!response.done);
+        parser.finish().unwrap();
+    }
+
+    #[test]
+    fn processes_completed_records_before_rejecting_an_oversized_partial_record() {
+        let mut chunk = String::new();
+        for index in 0..8 {
+            chunk.push_str(&format!(
+                r#"{{"message":{{"content":"{index}"}},"done":false}}"#
+            ));
+            chunk.push('\n');
+        }
+        chunk.push_str(&format!(
+            r#"{{"message":{{"content":"{}"}},"done":false}}"#,
+            "x".repeat(128 * 1024)
+        ));
+
+        let mut parser = NdjsonResponseParser::new();
+        let mut remaining = chunk.as_bytes();
+
+        for index in 0..8 {
+            let response = parser.next_response(&mut remaining).unwrap().unwrap();
+            let expected = index.to_string();
+
+            assert_eq!(
+                response.message.unwrap().content.as_deref(),
+                Some(expected.as_str())
+            );
+        }
+
+        let error = match parser.next_response(&mut remaining) {
+            Err(error) => error,
+            Ok(_) => panic!("oversized partial record must fail"),
+        };
+
+        assert!(error.message().contains("maximum size"));
     }
 }

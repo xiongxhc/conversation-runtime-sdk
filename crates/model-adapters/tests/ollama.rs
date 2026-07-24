@@ -197,6 +197,40 @@ async fn reports_one_error_for_an_oversized_ndjson_record() {
 }
 
 #[tokio::test]
+async fn streams_completed_records_before_rejecting_an_oversized_partial_record() {
+    let mut chunk = String::new();
+    for index in 0..8 {
+        chunk.push_str(&format!(
+            r#"{{"message":{{"role":"assistant","content":"{index}"}},"done":false}}"#
+        ));
+        chunk.push('\n');
+    }
+    chunk.push_str(&format!(
+        r#"{{"message":{{"role":"assistant","content":"{}"}},"done":false}}"#,
+        "x".repeat(128 * 1024)
+    ));
+
+    let server = FakeOllamaServer::raw_streaming([chunk]).await;
+    let model = OllamaLanguageModel::new(
+        OllamaConfig::new("test-model")
+            .with_endpoint(server.endpoint())
+            .unwrap(),
+    );
+    let mut output = model.stream(
+        LanguageModelRequest::new(TurnId::new(1), "hi"),
+        CancellationToken::new(),
+    );
+
+    for index in 0..8 {
+        assert_eq!(output.recv().await.unwrap().unwrap(), index.to_string());
+    }
+    let error = output.recv().await.unwrap().unwrap_err();
+
+    assert!(error.message().contains("maximum size"));
+    assert!(output.recv().await.is_none());
+}
+
+#[tokio::test]
 async fn cancellation_closes_the_stream_before_a_delayed_second_chunk() {
     let server = FakeOllamaServer::delayed_streaming(
         [

@@ -14,6 +14,7 @@ pub struct OllamaConfig {
     model: String,
     system_prompt: Option<String>,
     keep_alive: Option<String>,
+    thinking: Option<bool>,
     temperature: f32,
 }
 
@@ -31,6 +32,7 @@ impl OllamaConfig {
             model,
             system_prompt: None,
             keep_alive: None,
+            thinking: None,
             temperature: DEFAULT_TEMPERATURE,
         }
     }
@@ -48,6 +50,11 @@ impl OllamaConfig {
 
     pub fn with_keep_alive(mut self, keep_alive: impl Into<String>) -> Self {
         self.keep_alive = Some(keep_alive.into());
+        self
+    }
+
+    pub fn with_thinking(mut self, thinking: bool) -> Self {
+        self.thinking = Some(thinking);
         self
     }
 
@@ -201,6 +208,8 @@ struct ChatRequest<'a> {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     keep_alive: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    think: Option<bool>,
     options: ChatOptions,
 }
 
@@ -217,6 +226,7 @@ impl<'a> ChatRequest<'a> {
             messages,
             stream: true,
             keep_alive: config.keep_alive.as_deref(),
+            think: config.thinking,
             options: ChatOptions {
                 temperature: config.temperature,
             },

@@ -70,6 +70,44 @@ async fn serializes_optional_configuration() {
 }
 
 #[tokio::test]
+async fn serializes_thinking_only_when_configured() {
+    let default_server = FakeOllamaServer::streaming([
+        r#"{"message":{"role":"assistant","content":""},"done":true}"#,
+    ])
+    .await;
+    let default_model = OllamaLanguageModel::new(
+        OllamaConfig::new("test-model")
+            .with_endpoint(default_server.endpoint())
+            .unwrap(),
+    );
+    let mut default_output = default_model.stream(
+        LanguageModelRequest::new(TurnId::new(1), "hi"),
+        CancellationToken::new(),
+    );
+
+    assert!(default_output.recv().await.is_none());
+    assert!(default_server.request_json().await.get("think").is_none());
+
+    let configured_server = FakeOllamaServer::streaming([
+        r#"{"message":{"role":"assistant","content":""},"done":true}"#,
+    ])
+    .await;
+    let configured_model = OllamaLanguageModel::new(
+        OllamaConfig::new("test-model")
+            .with_endpoint(configured_server.endpoint())
+            .unwrap()
+            .with_thinking(false),
+    );
+    let mut configured_output = configured_model.stream(
+        LanguageModelRequest::new(TurnId::new(1), "hi"),
+        CancellationToken::new(),
+    );
+
+    assert!(configured_output.recv().await.is_none());
+    assert_eq!(configured_server.request_json().await["think"], false);
+}
+
+#[tokio::test]
 async fn reports_one_error_for_http_failures() {
     let server = FakeOllamaServer::failure(500, "model unavailable").await;
     let model = OllamaLanguageModel::new(

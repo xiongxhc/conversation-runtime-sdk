@@ -20,7 +20,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let arguments = parse_arguments(env::args()).map_err(io::Error::other)?;
     let endpoint = env::var("OLLAMA_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:11434".into());
     let model = OllamaLanguageModel::new(
-        OllamaConfig::new(arguments.model.clone()).with_endpoint(endpoint)?,
+        OllamaConfig::new(arguments.model.clone())
+            .with_endpoint(endpoint)?
+            .with_thinking(false),
     );
     let started_at = Instant::now();
     let mut stream = model.stream(

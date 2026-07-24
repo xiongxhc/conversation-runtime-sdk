@@ -4,7 +4,7 @@
 
 **Goal:** Create a minimal Rust workspace that proves typed conversation events, replaceable model adapters, deterministic turn orchestration, and interruption semantics.
 
-**Architecture:** Keep the public protocol independent, place model capabilities behind asynchronous adapter traits, and let the runtime coordinate one active turn through Tokio channels and a `CancellationToken`. Use deterministic mock adapters so the first test seam requires no microphone, model download, or model-specific runtime. Lifecycle events use an unbounded per-turn stream so consumer backpressure cannot deadlock cancellation finalization.
+**Architecture:** Keep the public protocol independent, place model capabilities behind asynchronous adapter traits, and let the runtime coordinate one active turn through Tokio channels and a `CancellationToken`. Use deterministic mock adapters so the first test seam requires no microphone, model download, or model-specific runtime. `TurnEventStream` combines bounded nonterminal data with an independent terminal path so consumer backpressure cannot deadlock cancellation finalization.
 
 **Tech Stack:** Rust 2021 edition, Tokio, Tokio Util, standard Rust tests, TOML configuration examples.
 
@@ -217,15 +217,21 @@ async fn emits_an_ordered_completed_turn() {
         Arc::new(MockSpeechSynthesizer::new([1, 2, 3])),
     );
     let turn_id = TurnId::new(1);
-    let mut events = runtime.start_turn(turn_id, "hi").await.unwrap();
+    let mut events = match runtime
+        .execute(RuntimeCommand::StartTurn {
+            turn_id,
+            transcript: "hi".into(),
+        })
+        .await
+        .unwrap()
+    {
+        RuntimeCommandResult::TurnStarted { events } => events,
+        _ => panic!("start command must return a turn event stream"),
+    };
     let mut observed = Vec::new();
 
     while let Some(event) = events.recv().await {
-        let terminal = event.is_terminal();
         observed.push(event);
-        if terminal {
-            break;
-        }
     }
 
     assert_eq!(
@@ -249,6 +255,10 @@ async fn emits_an_ordered_completed_turn() {
             RuntimeEvent::TurnCompleted { turn_id },
         ]
     );
+    assert_eq!(
+        observed.iter().filter(|event| event.is_terminal()).count(),
+        1
+    );
 }
 ```
 
@@ -262,19 +272,34 @@ async fn interruption_emits_one_cancelled_terminal_event() {
         Arc::new(MockSpeechSynthesizer::new([1])),
     );
     let turn_id = TurnId::new(7);
-    let mut events = runtime.start_turn(turn_id, "stop").await.unwrap();
+    let mut events = match runtime
+        .execute(RuntimeCommand::StartTurn {
+            turn_id,
+            transcript: "stop".into(),
+        })
+        .await
+        .unwrap()
+    {
+        RuntimeCommandResult::TurnStarted { events } => events,
+        _ => panic!("start command must return a turn event stream"),
+    };
 
     assert!(matches!(
         events.recv().await,
         Some(RuntimeEvent::TurnStarted { .. })
     ));
-    runtime.interrupt(turn_id).await.unwrap();
+    assert!(matches!(
+        runtime
+            .execute(RuntimeCommand::Interrupt { turn_id })
+            .await
+            .unwrap(),
+        RuntimeCommandResult::InterruptAccepted
+    ));
 
     let mut terminal_events = Vec::new();
     while let Some(event) = events.recv().await {
         if event.is_terminal() {
             terminal_events.push(event);
-            break;
         }
     }
 
@@ -293,7 +318,7 @@ Expected before implementation: compilation fails because `ConversationRuntime` 
 
 - [ ] **Step 4: Implement single-active-turn orchestration**
 
-`execute` accepts typed start and interrupt commands. A start command creates an unbounded lifecycle event channel, stores the active turn's cancellation token, and spawns the worker. The worker emits start and transcript events, forwards language-model deltas, synthesizes the accumulated response, and emits exactly one terminal event. Every awaited adapter stage is paired with `cancellation.cancelled()` in `tokio::select!`. Terminal selection, publication, and active-turn removal are serialized so an accepted interruption cannot race with successful completion.
+`execute` accepts typed start and interrupt commands. A start command creates `TurnEventStream`, stores the active turn's cancellation token, and spawns the worker. The stream uses bounded nonterminal data plus an independent terminal channel. The worker emits start and transcript events, forwards language-model deltas, synthesizes the accumulated response, and emits exactly one terminal event. Every awaited adapter stage is paired with `cancellation.cancelled()` in `tokio::select!`. Terminal selection, publication, and active-turn removal are serialized so an accepted interruption cannot race with successful completion.
 
 - [ ] **Step 5: Run runtime and workspace tests**
 

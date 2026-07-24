@@ -6,7 +6,7 @@ use conversation_model_adapters::{
     AdapterFuture, MockLanguageModel, MockSpeechSynthesizer, SpeechRequest, SpeechSynthesizer,
 };
 use conversation_protocol::{RuntimeCommand, RuntimeErrorKind, RuntimeEvent, TurnId};
-use conversation_runtime::{ConversationRuntime, RuntimeCommandResult};
+use conversation_runtime::{ConversationRuntime, RuntimeCommandResult, TurnEventStream};
 use tokio_util::sync::CancellationToken;
 
 struct CompletionSignallingSpeech {
@@ -116,11 +116,42 @@ async fn interruption_result_matches_the_terminal_event_at_synthesis_boundary() 
     }
 }
 
+#[tokio::test]
+async fn interruption_finalizes_when_the_event_consumer_is_backpressured() {
+    let synthesis_completed = Arc::new(AtomicBool::new(false));
+    let runtime = ConversationRuntime::new(
+        Arc::new(MockLanguageModel::new(vec!["x"; 29])),
+        Arc::new(CompletionSignallingSpeech {
+            completed: Arc::clone(&synthesis_completed),
+        }),
+    );
+    let turn_id = TurnId::new(12);
+    let mut events = start_turn(&runtime, turn_id, "fill the event buffer").await;
+
+    while !synthesis_completed.load(Ordering::Acquire) {
+        tokio::task::yield_now().await;
+    }
+
+    interrupt(&runtime, turn_id).await.unwrap();
+
+    let mut terminal_events = Vec::new();
+    while let Some(event) = events.recv().await {
+        if event.is_terminal() {
+            terminal_events.push(event);
+        }
+    }
+
+    assert_eq!(
+        terminal_events,
+        vec![RuntimeEvent::TurnCancelled { turn_id }]
+    );
+}
+
 async fn start_turn(
     runtime: &ConversationRuntime,
     turn_id: TurnId,
     transcript: &str,
-) -> tokio::sync::mpsc::UnboundedReceiver<RuntimeEvent> {
+) -> TurnEventStream {
     match runtime
         .execute(RuntimeCommand::StartTurn {
             turn_id,

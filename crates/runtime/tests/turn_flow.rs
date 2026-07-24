@@ -2,16 +2,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use conversation_model_adapters::{
-    AdapterError, LanguageModel, LanguageModelRequest, MockLanguageModel, MockSpeechSynthesizer,
+    AdapterError, AdapterFuture, LanguageModel, LanguageModelRequest, MockLanguageModel,
+    MockSpeechSynthesizer, SpeechRequest, SpeechSynthesizer,
 };
 use conversation_protocol::{
     RuntimeCommand, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage, TurnId,
 };
-use conversation_runtime::{ConversationRuntime, RuntimeCommandResult};
+use conversation_runtime::{ConversationRuntime, RuntimeCommandResult, TurnEventStream};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 struct FailingLanguageModel;
+struct FailingSpeechSynthesizer;
 
 impl LanguageModel for FailingLanguageModel {
     fn stream(
@@ -26,6 +28,16 @@ impl LanguageModel for FailingLanguageModel {
                 .await;
         });
         receiver
+    }
+}
+
+impl SpeechSynthesizer for FailingSpeechSynthesizer {
+    fn synthesize<'a>(
+        &'a self,
+        _request: SpeechRequest,
+        _cancellation: CancellationToken,
+    ) -> AdapterFuture<'a, Vec<u8>> {
+        Box::pin(async { Err(AdapterError::new("speech synthesizer unavailable")) })
     }
 }
 
@@ -102,6 +114,35 @@ async fn reports_language_model_failure_as_the_only_terminal_event() {
 }
 
 #[tokio::test]
+async fn reports_speech_failure_with_the_synthesis_stage() {
+    let runtime = ConversationRuntime::new(
+        Arc::new(MockLanguageModel::new(["response"])),
+        Arc::new(FailingSpeechSynthesizer),
+    );
+    let turn_id = TurnId::new(4);
+    let mut events = start_turn(&runtime, turn_id, "fail speech").await;
+    let mut terminal_events = Vec::new();
+
+    while let Some(event) = events.recv().await {
+        if event.is_terminal() {
+            terminal_events.push(event);
+        }
+    }
+
+    assert_eq!(
+        terminal_events,
+        vec![RuntimeEvent::TurnFailed {
+            turn_id,
+            error: RuntimeError::new(
+                RuntimeErrorKind::Adapter,
+                RuntimeStage::SpeechSynthesizer,
+                "speech synthesizer unavailable",
+            ),
+        }]
+    );
+}
+
+#[tokio::test]
 async fn cancels_during_speech_synthesis() {
     let runtime = ConversationRuntime::new(
         Arc::new(MockLanguageModel::new(["response"])),
@@ -158,7 +199,7 @@ async fn start_turn(
     runtime: &ConversationRuntime,
     turn_id: TurnId,
     transcript: &str,
-) -> tokio::sync::mpsc::UnboundedReceiver<RuntimeEvent> {
+) -> TurnEventStream {
     match runtime
         .execute(RuntimeCommand::StartTurn {
             turn_id,

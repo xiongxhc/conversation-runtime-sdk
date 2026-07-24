@@ -29,7 +29,7 @@ crates/model-adapters/ Replaceable model contracts and test doubles
 crates/runtime/        Turn orchestration and interruption behavior
 docs/                  Architecture, design, and benchmark guidance
 models/                Registry schema and local model instructions
-tests/latency/         Latency metric definitions and future harness
+tests/latency/         Runnable mock latency probe and metric definitions
 ```
 
 ## Development

@@ -6,15 +6,34 @@ use conversation_model_adapters::{
 use conversation_protocol::{
     RuntimeCommand, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage, TurnId,
 };
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
+
+const EVENT_BUFFER_SIZE: usize = 32;
 
 #[non_exhaustive]
 pub enum RuntimeCommandResult {
-    TurnStarted {
-        events: mpsc::UnboundedReceiver<RuntimeEvent>,
-    },
+    TurnStarted { events: TurnEventStream },
     InterruptAccepted,
+}
+
+pub struct TurnEventStream {
+    events: mpsc::Receiver<RuntimeEvent>,
+    terminal: Option<oneshot::Receiver<RuntimeEvent>>,
+    events_closed: bool,
+}
+
+impl TurnEventStream {
+    pub async fn recv(&mut self) -> Option<RuntimeEvent> {
+        if !self.events_closed {
+            if let Some(event) = self.events.recv().await {
+                return Some(event);
+            }
+            self.events_closed = true;
+        }
+
+        self.terminal.take()?.await.ok()
+    }
 }
 
 #[derive(Clone)]
@@ -66,7 +85,7 @@ impl ConversationRuntime {
         &self,
         turn_id: TurnId,
         transcript: impl Into<String>,
-    ) -> Result<mpsc::UnboundedReceiver<RuntimeEvent>, RuntimeError> {
+    ) -> Result<TurnEventStream, RuntimeError> {
         let transcript = transcript.into();
         let cancellation = CancellationToken::new();
 
@@ -84,7 +103,8 @@ impl ConversationRuntime {
             });
         }
 
-        let (event_sender, event_receiver) = mpsc::unbounded_channel();
+        let (event_sender, event_receiver) = mpsc::channel(EVENT_BUFFER_SIZE);
+        let (terminal_sender, terminal_receiver) = oneshot::channel();
         let language_model = Arc::clone(&self.language_model);
         let speech_synthesizer = Arc::clone(&self.speech_synthesizer);
         let active_turn = Arc::clone(&self.active_turn);
@@ -100,6 +120,7 @@ impl ConversationRuntime {
                 &event_sender,
             )
             .await;
+            drop(event_sender);
 
             let mut active = active_turn.lock().await;
             let terminal_event = if cancellation.is_cancelled() {
@@ -107,14 +128,18 @@ impl ConversationRuntime {
             } else {
                 terminal_event
             };
-            let _ = event_sender.send(terminal_event);
+            let _ = terminal_sender.send(terminal_event);
 
             if active.as_ref().map(|current| current.turn_id) == Some(turn_id) {
                 *active = None;
             }
         });
 
-        Ok(event_receiver)
+        Ok(TurnEventStream {
+            events: event_receiver,
+            terminal: Some(terminal_receiver),
+            events_closed: false,
+        })
     }
 
     async fn interrupt(&self, turn_id: TurnId) -> Result<(), RuntimeError> {
@@ -139,9 +164,9 @@ async fn run_turn(
     language_model: Arc<dyn LanguageModel>,
     speech_synthesizer: Arc<dyn SpeechSynthesizer>,
     cancellation: CancellationToken,
-    events: &mpsc::UnboundedSender<RuntimeEvent>,
+    events: &mpsc::Sender<RuntimeEvent>,
 ) -> RuntimeEvent {
-    if !send_event(events, RuntimeEvent::TurnStarted { turn_id }) {
+    if !send_event(events, RuntimeEvent::TurnStarted { turn_id }, &cancellation).await {
         cancellation.cancel();
         return RuntimeEvent::TurnCancelled { turn_id };
     }
@@ -152,7 +177,10 @@ async fn run_turn(
             turn_id,
             text: transcript.clone(),
         },
-    ) {
+        &cancellation,
+    )
+    .await
+    {
         cancellation.cancel();
         return RuntimeEvent::TurnCancelled { turn_id };
     }
@@ -176,7 +204,8 @@ async fn run_turn(
                         if !send_event(
                             events,
                             RuntimeEvent::TextDelta { turn_id, delta },
-                        ) {
+                            &cancellation,
+                        ).await {
                             cancellation.cancel();
                             return RuntimeEvent::TurnCancelled { turn_id };
                         }
@@ -190,7 +219,13 @@ async fn run_turn(
         }
     }
 
-    if !send_event(events, RuntimeEvent::SpeechStarted { turn_id }) {
+    if !send_event(
+        events,
+        RuntimeEvent::SpeechStarted { turn_id },
+        &cancellation,
+    )
+    .await
+    {
         cancellation.cancel();
         return RuntimeEvent::TurnCancelled { turn_id };
     }
@@ -210,7 +245,13 @@ async fn run_turn(
         return adapter_failure(turn_id, RuntimeStage::SpeechSynthesizer, error);
     }
 
-    if !send_event(events, RuntimeEvent::SpeechCompleted { turn_id }) {
+    if !send_event(
+        events,
+        RuntimeEvent::SpeechCompleted { turn_id },
+        &cancellation,
+    )
+    .await
+    {
         cancellation.cancel();
         return RuntimeEvent::TurnCancelled { turn_id };
     }
@@ -218,8 +259,16 @@ async fn run_turn(
     RuntimeEvent::TurnCompleted { turn_id }
 }
 
-fn send_event(events: &mpsc::UnboundedSender<RuntimeEvent>, event: RuntimeEvent) -> bool {
-    events.send(event).is_ok()
+async fn send_event(
+    events: &mpsc::Sender<RuntimeEvent>,
+    event: RuntimeEvent,
+    cancellation: &CancellationToken,
+) -> bool {
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => false,
+        result = events.send(event) => result.is_ok(),
+    }
 }
 
 fn adapter_failure(turn_id: TurnId, stage: RuntimeStage, error: AdapterError) -> RuntimeEvent {

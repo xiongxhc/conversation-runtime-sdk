@@ -24,7 +24,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_VOICE_LIST_BYTES: usize = 64 * 1024;
 const USAGE: &str = "Usage: conversation-tts-probe [OPTIONS] [--] [TEXT ...]\n\
 Options:\n\
-  --voice <name>       Select an exact installed macOS voice\n\
+  --voice <name>       Select an exact voice for the selected backend\n\
   --rate <wpm>         Set a non-zero speaking rate\n\
   --config <path>      Load profiles from an absolute TOML file\n\
   --profile <id>       Select a configured profile\n\
@@ -53,8 +53,6 @@ enum ProbeAction {
 
 #[derive(Debug)]
 struct ProbeConfig {
-    speech: MacOsSystemSpeechConfig,
-    player: PlayerConfig,
     timeout: Duration,
 }
 
@@ -69,16 +67,6 @@ impl ProbeConfig {
     where
         F: Fn(&str) -> Option<String>,
     {
-        let speech = match lookup("CONVERSATION_TTS_SAY_PATH") {
-            Some(path) => MacOsSystemSpeechConfig::new(path),
-            None => MacOsSystemSpeechConfig::system_default(),
-        }
-        .map_err(adapter_message)?;
-
-        let player = match lookup("CONVERSATION_TTS_PLAYER_PATH") {
-            Some(path) => PlayerConfig::new(path),
-            None => PlayerConfig::system_default(),
-        }?;
         let timeout = match lookup("CONVERSATION_TTS_TIMEOUT_MS") {
             Some(milliseconds) => {
                 let milliseconds = milliseconds.parse::<u64>().map_err(|_| {
@@ -92,11 +80,7 @@ impl ProbeConfig {
             None => DEFAULT_TIMEOUT,
         };
 
-        Ok(Self {
-            speech,
-            player,
-            timeout,
-        })
+        Ok(Self { timeout })
     }
 }
 
@@ -195,11 +179,11 @@ fn validate_speech_settings(voice: Option<&str>, rate_wpm: Option<u32>) -> Resul
 
 fn configured_synthesizer(
     profile: SpeechProfile,
-    macos_config: MacOsSystemSpeechConfig,
+    lookup: impl Fn(&str) -> Option<String>,
 ) -> Result<Arc<dyn SpeechSynthesizer>, String> {
     match profile {
         SpeechProfile::MacOsSystem { voice, rate_wpm } => {
-            let mut config = macos_config;
+            let mut config = macos_speech_config_from_lookup(lookup)?;
             if let Some(voice) = voice {
                 config = config.with_voice(voice).map_err(adapter_message)?;
             }
@@ -249,6 +233,16 @@ fn configured_synthesizer(
     }
 }
 
+fn macos_speech_config_from_lookup(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<MacOsSystemSpeechConfig, String> {
+    match lookup("CONVERSATION_TTS_SAY_PATH") {
+        Some(path) => MacOsSystemSpeechConfig::new(path),
+        None => MacOsSystemSpeechConfig::system_default(),
+    }
+    .map_err(adapter_message)
+}
+
 #[derive(Clone, Debug)]
 struct PlayerConfig {
     executable: PathBuf,
@@ -256,6 +250,13 @@ struct PlayerConfig {
 }
 
 impl PlayerConfig {
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        match lookup("CONVERSATION_TTS_PLAYER_PATH") {
+            Some(path) => Self::new(path),
+            None => Self::system_default(),
+        }
+    }
+
     fn new(executable: impl AsRef<Path>) -> Result<Self, String> {
         let executable = executable.as_ref();
         if !executable.is_absolute() {
@@ -325,7 +326,7 @@ impl ProbeFailure {
 async fn run_probe(
     arguments: ProbeArguments,
     synthesizer: Arc<dyn SpeechSynthesizer>,
-    player: PlayerConfig,
+    player: Option<PlayerConfig>,
     cancellation: CancellationToken,
 ) -> Result<ProbeReport, ProbeFailure> {
     let started_at = Instant::now();
@@ -345,6 +346,12 @@ async fn run_probe(
     }
 
     let playback_launched_ms = if arguments.play {
+        let player = player.ok_or_else(|| {
+            ProbeFailure::new(
+                "configuration",
+                "audio player configuration was unavailable",
+            )
+        })?;
         Some(
             play_audio(&audio, &player, cancellation.clone())
                 .await
@@ -378,12 +385,29 @@ async fn persist_audio(
     audio: &SynthesizedAudio,
     cancellation: &CancellationToken,
 ) -> Result<(), String> {
+    validate_output_path(output, audio.format())?;
     tokio::select! {
         biased;
         _ = cancellation.cancelled() => Err("probe cancelled".to_owned()),
         result = tokio::fs::write(output, audio.bytes()) => {
             result.map_err(|_| "failed to write requested audio output".to_owned())
         }
+    }
+}
+
+fn validate_output_path(output: &Path, format: AudioFormat) -> Result<(), String> {
+    let extension = output
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    match format {
+        AudioFormat::Wav if extension.as_deref() == Some("wav") => Ok(()),
+        AudioFormat::Aiff if matches!(extension.as_deref(), Some("aiff" | "aif")) => Ok(()),
+        AudioFormat::Wav => Err("requested audio output must use .wav for WAV audio".to_owned()),
+        AudioFormat::Aiff => {
+            Err("requested audio output must use .aiff or .aif for AIFF audio".to_owned())
+        }
+        _ => Err("unsupported audio format for output persistence".to_owned()),
     }
 }
 
@@ -764,8 +788,12 @@ async fn main() {
             arguments.rate,
         )?;
 
-        let synthesizer = configured_synthesizer(settings, config.speech)?;
-        Ok::<_, String>((synthesizer, config.player, config.timeout))
+        let synthesizer = configured_synthesizer(settings, |key| std::env::var(key).ok())?;
+        let player = arguments
+            .play
+            .then(|| PlayerConfig::from_lookup(|key| std::env::var(key).ok()))
+            .transpose()?;
+        Ok::<_, String>((synthesizer, player, config.timeout))
     })() {
         Ok(config) => config,
         Err(message) => exit_with_failure("configuration", started_at, message),
@@ -862,8 +890,9 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        environment_speech_settings, monitor_stop, parse_arguments, persist_audio, play_audio,
-        resolve_speech_settings, run_probe, PlayerConfig, ProbeAction, ProbeArguments, ProbeConfig,
+        environment_speech_settings, macos_speech_config_from_lookup, monitor_stop,
+        parse_arguments, persist_audio, play_audio, resolve_speech_settings, run_probe,
+        PlayerConfig, ProbeAction, ProbeArguments, ProbeConfig, DEFAULT_TIMEOUT,
     };
     use crate::profile::SpeechProfile;
 
@@ -915,6 +944,19 @@ mod tests {
             SpeechProfile::MacOsSystem { voice: Some(voice), rate_wpm: Some(200) }
                 if voice == "Samantha"
         ));
+    }
+
+    #[test]
+    fn generic_probe_configuration_does_not_read_macos_settings() {
+        let config = ProbeConfig::from_lookup(|key| match key {
+            "CONVERSATION_TTS_SAY_PATH" | "CONVERSATION_TTS_PLAYER_PATH" => {
+                panic!("generic probe configuration read {key}")
+            }
+            _ => None,
+        })
+        .unwrap();
+
+        assert_eq!(config.timeout, DEFAULT_TIMEOUT);
     }
 
     #[test]
@@ -1106,10 +1148,13 @@ mod tests {
     fn parses_optional_environment_overrides() {
         let root = std::env::current_dir().unwrap();
         let speech = root.join("fake-say");
-        let player = root.join("fake-player");
+        let player_path = root.join("fake-player");
         let values = std::collections::HashMap::from([
             ("CONVERSATION_TTS_SAY_PATH", speech.display().to_string()),
-            ("CONVERSATION_TTS_PLAYER_PATH", player.display().to_string()),
+            (
+                "CONVERSATION_TTS_PLAYER_PATH",
+                player_path.display().to_string(),
+            ),
             ("CONVERSATION_TTS_VOICE", "Example Voice".to_owned()),
             ("CONVERSATION_TTS_RATE", "210".to_owned()),
             ("CONVERSATION_TTS_TIMEOUT_MS", "1500".to_owned()),
@@ -1117,11 +1162,13 @@ mod tests {
 
         let config = ProbeConfig::from_lookup(|key| values.get(key).cloned()).unwrap();
         let environment = environment_speech_settings(|key| values.get(key).cloned()).unwrap();
+        let macos_speech = macos_speech_config_from_lookup(|key| values.get(key).cloned()).unwrap();
+        let player = PlayerConfig::from_lookup(|key| values.get(key).cloned()).unwrap();
 
-        assert_eq!(config.speech.executable(), speech);
+        assert_eq!(macos_speech.executable(), speech);
         assert_eq!(environment.voice.as_deref(), Some("Example Voice"));
         assert_eq!(environment.rate_wpm, Some(210));
-        assert_eq!(config.player.executable(), player);
+        assert_eq!(player.executable(), player_path);
         assert_eq!(config.timeout, std::time::Duration::from_millis(1500));
     }
 
@@ -1147,6 +1194,12 @@ mod tests {
             let result = match key {
                 "CONVERSATION_TTS_RATE" => {
                     environment_speech_settings(|name| values.get(name).cloned()).map(|_| ())
+                }
+                "CONVERSATION_TTS_SAY_PATH" => {
+                    macos_speech_config_from_lookup(|name| values.get(name).cloned()).map(|_| ())
+                }
+                "CONVERSATION_TTS_PLAYER_PATH" => {
+                    PlayerConfig::from_lookup(|name| values.get(name).cloned()).map(|_| ())
                 }
                 _ => ProbeConfig::from_lookup(|name| values.get(name).cloned()).map(|_| ()),
             };
@@ -1293,7 +1346,7 @@ mod tests {
                 profile_id: None,
             },
             synthesizer,
-            player,
+            Some(player),
             CancellationToken::new(),
         )
         .await
@@ -1352,6 +1405,46 @@ mod tests {
 
         assert_eq!(error, "probe cancelled");
         assert!(!output.exists());
+    }
+
+    #[tokio::test]
+    async fn persistence_requires_an_extension_matching_the_audio_format() {
+        let fixture = tempfile::tempdir().unwrap();
+        let cancellation = CancellationToken::new();
+        let wav = SynthesizedAudio::new(b"RIFF-output".to_vec(), AudioFormat::Wav);
+        let aiff = SynthesizedAudio::new(b"FORM-output".to_vec(), AudioFormat::Aiff);
+
+        for (output, audio) in [
+            (fixture.path().join("speech.wav"), &wav),
+            (fixture.path().join("speech.aiff"), &aiff),
+            (fixture.path().join("speech.aif"), &aiff),
+        ] {
+            persist_audio(&output, audio, &cancellation).await.unwrap();
+            assert_eq!(std::fs::read(output).unwrap(), audio.bytes());
+        }
+
+        for (output, audio, error) in [
+            (
+                fixture.path().join("speech.aiff"),
+                &wav,
+                "requested audio output must use .wav for WAV audio",
+            ),
+            (
+                fixture.path().join("speech.wav"),
+                &aiff,
+                "requested audio output must use .aiff or .aif for AIFF audio",
+            ),
+        ] {
+            std::fs::write(&output, b"existing output").unwrap();
+
+            assert_eq!(
+                persist_audio(&output, audio, &cancellation)
+                    .await
+                    .unwrap_err(),
+                error
+            );
+            assert_eq!(std::fs::read(output).unwrap(), b"existing output");
+        }
     }
 
     #[tokio::test]

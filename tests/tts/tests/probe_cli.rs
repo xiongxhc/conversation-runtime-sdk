@@ -96,14 +96,6 @@ repetition_penalty = 1.05
         ),
     )
     .unwrap();
-    let fake_say = fixture.path().join("fake-say");
-    std::fs::write(
-        &fake_say,
-        "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = '-o' ]; then shift; output=\"$1\"; fi\n  shift\ndone\nprintf 'FORM-fallback-aiff' > \"$output\"\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&fake_say, std::fs::Permissions::from_mode(0o700)).unwrap();
-
     let output = Command::new(env!("CARGO_BIN_EXE_conversation-tts-probe"))
         .args([
             "--config",
@@ -113,7 +105,8 @@ repetition_penalty = 1.05
             "--no-play",
             "hello from the probe",
         ])
-        .env("CONVERSATION_TTS_SAY_PATH", &fake_say)
+        .env_remove("CONVERSATION_TTS_SAY_PATH")
+        .env_remove("CONVERSATION_TTS_PLAYER_PATH")
         .output()
         .unwrap();
 

@@ -182,9 +182,12 @@ repetition_penalty = {repetition_penalty}
 
     #[test]
     fn rejects_backend_incompatible_profile_fields() {
-        for (backend, field) in [
+        for (backend, fields) in [
             ("macos-system", "speed = 1.0"),
-            ("openai-compatible", "rate_wpm = 180"),
+            (
+                "openai-compatible",
+                "endpoint = \"http://127.0.0.1:8000/v1\"\nmodel = \"local-model\"\nrate_wpm = 180",
+            ),
         ] {
             let file = write_profile(&format!(
                 r#"
@@ -193,9 +196,7 @@ default_profile = "selected"
 
 [profiles.selected]
 backend = "{backend}"
-endpoint = "http://127.0.0.1:8000/v1"
-model = "local-model"
-{field}
+{fields}
 "#,
             ));
 

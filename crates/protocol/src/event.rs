@@ -1,5 +1,13 @@
 use crate::{RuntimeError, TurnId};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum RuntimeTimingMilestone {
+    FirstTextDelta,
+    FirstSynthesisRequest,
+    FirstPlayableAudio,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum RuntimeEvent {
@@ -13,6 +21,11 @@ pub enum RuntimeEvent {
     TextDelta {
         turn_id: TurnId,
         delta: String,
+    },
+    Timing {
+        turn_id: TurnId,
+        milestone: RuntimeTimingMilestone,
+        elapsed_ms: u64,
     },
     SpeechStarted {
         turn_id: TurnId,
@@ -38,6 +51,7 @@ impl RuntimeEvent {
             Self::TurnStarted { turn_id }
             | Self::TranscriptFinal { turn_id, .. }
             | Self::TextDelta { turn_id, .. }
+            | Self::Timing { turn_id, .. }
             | Self::SpeechStarted { turn_id }
             | Self::SpeechCompleted { turn_id }
             | Self::TurnCompleted { turn_id }
@@ -56,8 +70,7 @@ impl RuntimeEvent {
 
 #[cfg(test)]
 mod tests {
-    use super::RuntimeEvent;
-    use crate::TurnId;
+    use crate::{RuntimeEvent, RuntimeTimingMilestone, TurnId};
 
     #[test]
     fn only_terminal_events_report_terminal_state() {
@@ -66,5 +79,25 @@ mod tests {
         assert!(!RuntimeEvent::TurnStarted { turn_id }.is_terminal());
         assert!(RuntimeEvent::TurnCompleted { turn_id }.is_terminal());
         assert!(RuntimeEvent::TurnCancelled { turn_id }.is_terminal());
+    }
+
+    #[test]
+    fn public_timing_events_preserve_turn_and_are_nonterminal() {
+        let turn_id = TurnId::new(9);
+
+        for milestone in [
+            RuntimeTimingMilestone::FirstTextDelta,
+            RuntimeTimingMilestone::FirstSynthesisRequest,
+            RuntimeTimingMilestone::FirstPlayableAudio,
+        ] {
+            let event = RuntimeEvent::Timing {
+                turn_id,
+                milestone,
+                elapsed_ms: 42,
+            };
+
+            assert_eq!(event.turn_id(), turn_id);
+            assert!(!event.is_terminal());
+        }
     }
 }

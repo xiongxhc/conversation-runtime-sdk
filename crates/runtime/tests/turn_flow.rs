@@ -429,6 +429,48 @@ async fn configured_phrase_limits_control_runtime_synthesis_segments() {
     ));
 }
 
+#[tokio::test]
+async fn runtime_never_synthesizes_a_phrase_above_multibyte_boundaries() {
+    let cases = [
+        ("aaaaaaa。", vec!["aaaaaaa", "。"]),
+        ("aaaaaaa，", vec!["aaaaaaa", "，"]),
+        ("aaaaaaa\u{2003}", vec!["aaaaaaa"]),
+    ];
+
+    for (case_index, (input, expected)) in cases.into_iter().enumerate() {
+        let (speech_calls, mut synthesized_text) = mpsc::unbounded_channel();
+        let runtime = ConversationRuntime::new(
+            Arc::new(MockLanguageModel::new([input])),
+            Arc::new(RecordingSpeechSynthesizer {
+                audio: SynthesizedAudio::new(minimal_aiff(), AudioFormat::Aiff),
+                calls: speech_calls,
+            }),
+            Arc::new(DiscardAudioOutput),
+        )
+        .with_phrase_chunking(PhraseChunkingConfig::new(6, 9).unwrap());
+        let turn_id = TurnId::new(40 + case_index as u64);
+        let mut events = start_turn(&runtime, turn_id, "segment").await;
+
+        let observed = drain_events(&mut events).await;
+        let mut phrases = Vec::new();
+        while let Ok(phrase) = synthesized_text.try_recv() {
+            phrases.push(phrase);
+        }
+
+        assert_eq!(phrases, expected, "input: {input:?}");
+        assert!(
+            phrases.iter().all(|phrase| phrase.len() <= 9),
+            "input: {input:?}, phrases: {phrases:?}"
+        );
+        assert!(matches!(
+            observed.last(),
+            Some(RuntimeEvent::TurnCompleted {
+                turn_id: completed_turn
+            }) if *completed_turn == turn_id
+        ));
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn two_item_phrase_queue_backpressures_language_consumption() {
     let (delta_sender, delta_receiver) = mpsc::channel(1);

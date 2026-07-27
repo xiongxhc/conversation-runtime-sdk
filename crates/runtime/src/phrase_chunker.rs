@@ -90,6 +90,9 @@ impl PhraseChunker {
         for (index, character) in self.buffer.char_indices() {
             let end = index + character.len_utf8();
 
+            if end > self.config.hard_limit_bytes {
+                return Some(self.hard_split_end());
+            }
             if character == '\n' || Self::is_sentence_boundary(character) {
                 return Some(end);
             }
@@ -196,6 +199,30 @@ mod tests {
             .iter()
             .all(|phrase| phrase.len() <= config.hard_limit_bytes()));
         assert_eq!(chunker.finish(), None);
+    }
+
+    #[test]
+    fn multibyte_boundaries_never_exceed_the_hard_limit() {
+        let config = PhraseChunkingConfig::new(6, 9).unwrap();
+        let cases = [
+            ("aaaaaaa。", vec!["aaaaaaa", "。"]),
+            ("aaaaaaa，", vec!["aaaaaaa", "，"]),
+            ("aaaaaaa\u{2003}", vec!["aaaaaaa"]),
+        ];
+
+        for (input, expected) in cases {
+            let mut chunker = PhraseChunker::new(config);
+            let mut phrases = chunker.push_delta(input);
+            phrases.extend(chunker.finish());
+
+            assert_eq!(phrases, expected, "input: {input:?}");
+            assert!(
+                phrases
+                    .iter()
+                    .all(|phrase| phrase.len() <= config.hard_limit_bytes()),
+                "input: {input:?}, phrases: {phrases:?}"
+            );
+        }
     }
 
     #[test]

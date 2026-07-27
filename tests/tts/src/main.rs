@@ -1307,9 +1307,16 @@ mod tests {
         std::fs::create_dir(&generated_temp).unwrap();
         std::fs::create_dir(&playback_temp).unwrap();
         let say = fixture.path().join("fake-say");
+        let expected_audio = minimal_aiff();
+        let shell_audio = expected_audio
+            .iter()
+            .map(|byte| format!("\\{byte:03o}"))
+            .collect::<String>();
         std::fs::write(
             &say,
-            "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = '-o' ]; then shift; output=\"$1\"; fi\n  shift\ndone\nprintf 'FORM-probe-aiff' > \"$output\"\n",
+            format!(
+                "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = '-o' ]; then shift; output=\"$1\"; fi\n  shift\ndone\nprintf '{shell_audio}' > \"$output\"\n"
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&say, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1353,9 +1360,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(report.format, "aiff");
-        assert_eq!(report.encoded_bytes, b"FORM-probe-aiff".len());
+        assert_eq!(report.encoded_bytes, expected_audio.len());
         assert!(report.playback_launched_ms.is_some());
-        assert_eq!(std::fs::read(output).unwrap(), b"FORM-probe-aiff");
+        assert_eq!(std::fs::read(output).unwrap(), expected_audio);
         assert!(played.exists());
         assert!(std::fs::read_dir(generated_temp).unwrap().next().is_none());
         assert!(std::fs::read_dir(playback_temp).unwrap().next().is_none());
@@ -1475,5 +1482,18 @@ mod tests {
             max_tokens: Some(128),
             repetition_penalty: Some(1.05),
         }
+    }
+
+    fn minimal_aiff() -> Vec<u8> {
+        let mut bytes = Vec::from(&b"FORM"[..]);
+        bytes.extend_from_slice(&48_u32.to_be_bytes());
+        bytes.extend_from_slice(b"AIFFCOMM");
+        bytes.extend_from_slice(&18_u32.to_be_bytes());
+        bytes.extend_from_slice(&[0; 18]);
+        bytes.extend_from_slice(b"SSND");
+        bytes.extend_from_slice(&9_u32.to_be_bytes());
+        bytes.extend_from_slice(&[0; 8]);
+        bytes.extend_from_slice(&[0x80, 0]);
+        bytes
     }
 }

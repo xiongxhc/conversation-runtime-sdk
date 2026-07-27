@@ -5,6 +5,7 @@ members = [
     "crates/runtime",
     "tests/latency",
     "tests/ollama",
+    "tests/tts",
 ]
 resolver = "2"
 

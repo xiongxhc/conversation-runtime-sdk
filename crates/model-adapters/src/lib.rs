@@ -1,4 +1,5 @@
 mod language_model;
+mod macos_system_speech;
 mod mock;
 mod ollama;
 mod speech;
@@ -9,6 +10,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 pub use language_model::{LanguageModel, LanguageModelRequest};
+pub use macos_system_speech::{MacOsSystemSpeechConfig, MacOsSystemSpeechSynthesizer};
 pub use mock::{MockLanguageModel, MockSpeechSynthesizer};
 pub use ollama::{
     OllamaChatMetrics, OllamaChatStream, OllamaConfig, OllamaLanguageModel, OllamaThinkingLevel,

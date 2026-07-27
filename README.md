@@ -39,14 +39,42 @@ The probe explicitly sets `think: false`, temperature `0`, seed `42`, a 128-toke
 
 ## Test Local Speech
 
-On macOS, run the system-speech reference flow:
+On macOS, list installed system voices:
+
+```bash
+cargo run --locked -p conversation-tts-probe -- --list-voices
+```
+
+Downloaded Apple voices become visible after installation. Voice and profile availability differs by machine. macOS voice selection chooses an installed system voice; it does not provide arbitrary voice cloning.
+
+Run the system-speech reference flow with a selected voice and speaking rate:
+
+```bash
+cargo run --locked -p conversation-tts-probe -- \
+  --voice "Tingting" \
+  --rate 180 \
+  "你好，这是本地中文语音。"
+```
+
+Run a named voice profile from an absolute configuration path:
+
+```bash
+cargo run --locked -p conversation-tts-probe -- \
+  --config "$PWD/configs/speech.example.toml" \
+  --profile mandarin \
+  "你好，这是命名语音配置。"
+```
+
+The original system-speech reference flow remains available:
 
 ```bash
 cargo run --locked -p conversation-tts-probe -- \
   "This is a local system-speech reference adapter."
 ```
 
-Use `--no-play` to synthesize silently and absolute `--output <path>` to retain AIFF explicitly. Optional voice, rate, deadline, speech-executable, and player-executable overrides are documented in [tests/tts/README.md](tests/tts/README.md). Synthesis completion and playback launch are plumbing metrics, not measurements of first audible audio.
+Use `--no-play` to synthesize silently and absolute `--output <path>` to retain AIFF explicitly. Configuration precedence is `CLI > environment > selected profile > macOS system defaults`. Only `backend = "macos-system"` is accepted now. `--config` paths must be absolute and the files are bounded to 64 KiB. Optional environment controls and validation details are documented in [tests/tts/README.md](tests/tts/README.md). Synthesis completion and playback launch are plumbing metrics, not measurements of first audible audio.
+
+Downloadable neural TTS is a separate future adapter milestone. It must establish an exact model revision and digest, complete license review and consent provenance, support cancellation and bounded output, and provide Apple Silicon benchmarks before an adapter or profile backend is considered available. No neural TTS adapter is currently provided.
 
 ## Project Layout
 

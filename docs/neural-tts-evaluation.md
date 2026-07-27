@@ -24,11 +24,11 @@ The first request can download and load model files into the model host's extern
 
 ### Reproduce a Manifest Digest
 
-Run the following from the selected snapshot root without publishing its cache path. It hashes each regular snapshot file, writes sorted `<sha256><two spaces><relative-path>` lines to a temporary manifest, requires the measured 12-file set, then hashes that manifest. `LC_ALL=C` fixes the path ordering.
+Run the following from the selected snapshot root without publishing its cache path. It follows Hugging Face snapshot symlinks to hash each regular snapshot file, writes sorted `<sha256><two spaces><relative-path>` lines to a temporary manifest, requires the measured 12-file set, then hashes that manifest. `LC_ALL=C` fixes the path ordering.
 
 ```bash
 manifest="$(mktemp)"
-find . -type f -print | sed 's#^\./##' | LC_ALL=C sort | \
+find -L . -type f -print | sed 's#^\./##' | LC_ALL=C sort | \
   while IFS= read -r path; do shasum -a 256 "$path"; done > "$manifest"
 test "$(wc -l < "$manifest" | tr -d '[:space:]')" = 12
 shasum -a 256 "$manifest"

@@ -7,6 +7,7 @@ use crate::AdapterFuture;
 #[non_exhaustive]
 pub enum AudioFormat {
     Aiff,
+    Wav,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -1,7 +1,142 @@
 #![cfg(unix)]
 
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
+use std::thread;
+use std::time::{Duration, Instant};
+
+fn spawn_speech_server() -> (u16, thread::JoinHandle<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return Vec::new();
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("failed to accept speech request: {error}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let request = read_http_request(&mut stream);
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: 4\r\nConnection: close\r\n\r\nRIFF",
+            )
+            .unwrap();
+        request
+    });
+
+    (port, server)
+}
+
+fn read_http_request(stream: &mut TcpStream) -> Vec<u8> {
+    let mut request = Vec::new();
+    let mut buffer = [0; 1024];
+    loop {
+        let count = stream.read(&mut buffer).unwrap();
+        assert_ne!(count, 0, "speech request ended before headers");
+        request.extend_from_slice(&buffer[..count]);
+        let Some(headers_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+            continue;
+        };
+        let headers = std::str::from_utf8(&request[..headers_end]).unwrap();
+        let content_length = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length: "))
+            .or_else(|| {
+                headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Content-Length: "))
+            })
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        while request.len() < headers_end + 4 + content_length {
+            let count = stream.read(&mut buffer).unwrap();
+            assert_ne!(count, 0, "speech request ended before body");
+            request.extend_from_slice(&buffer[..count]);
+        }
+        return request;
+    }
+}
+
+#[test]
+fn runs_local_http_profile_and_sends_wav_request() {
+    let fixture = tempfile::tempdir().unwrap();
+    let (port, server) = spawn_speech_server();
+    let profile = fixture.path().join("speech.toml");
+    std::fs::write(
+        &profile,
+        format!(
+            r#"schema_version = 1
+default_profile = "local-neural"
+
+[profiles.local-neural]
+backend = "openai-compatible"
+endpoint = "http://127.0.0.1:{port}/v1"
+model = "local-model"
+voice = "local-voice"
+language = "Chinese"
+instructions = "Warm and calm."
+speed = 1.0
+max_tokens = 128
+repetition_penalty = 1.05
+"#,
+        ),
+    )
+    .unwrap();
+    let fake_say = fixture.path().join("fake-say");
+    std::fs::write(
+        &fake_say,
+        "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = '-o' ]; then shift; output=\"$1\"; fi\n  shift\ndone\nprintf 'FORM-fallback-aiff' > \"$output\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_say, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_conversation-tts-probe"))
+        .args([
+            "--config",
+            profile.to_str().unwrap(),
+            "--profile",
+            "local-neural",
+            "--no-play",
+            "hello from the probe",
+        ])
+        .env("CONVERSATION_TTS_SAY_PATH", &fake_say)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8(output.stdout)
+        .unwrap()
+        .contains("format=wav"));
+    let request = String::from_utf8(server.join().unwrap()).unwrap();
+    assert!(request.starts_with("POST /v1/audio/speech HTTP/1.1\r\n"));
+    for field in [
+        "\"model\":\"local-model\"",
+        "\"input\":\"hello from the probe\"",
+        "\"voice\":\"local-voice\"",
+        "\"speed\":1.0",
+        "\"lang_code\":\"Chinese\"",
+        "\"instruct\":\"Warm and calm.\"",
+        "\"max_tokens\":128",
+        "\"repetition_penalty\":1.05",
+        "\"response_format\":\"wav\"",
+    ] {
+        assert!(request.contains(field), "missing {field} in {request}");
+    }
+}
 
 #[test]
 fn reports_distinct_timeout_after_synthesis_cleanup() {

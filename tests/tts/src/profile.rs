@@ -32,17 +32,175 @@ rate_wpm = 180
 
         assert_eq!(
             SpeechProfile::load(file.path(), None).unwrap(),
-            SpeechProfile {
+            SpeechProfile::MacOsSystem {
                 voice: Some("Daniel".to_owned()),
                 rate_wpm: Some(190),
             }
         );
-        assert_eq!(
-            SpeechProfile::load(file.path(), Some("mandarin"))
-                .unwrap()
-                .voice,
-            Some("Tingting".to_owned())
+        assert!(matches!(
+            SpeechProfile::load(file.path(), Some("mandarin")).unwrap(),
+            SpeechProfile::MacOsSystem { voice: Some(voice), .. } if voice == "Tingting"
+        ));
+    }
+
+    #[test]
+    fn loads_valid_local_http_profile() {
+        let file = write_profile(
+            r#"
+schema_version = 1
+default_profile = "local-neural"
+
+[profiles.local-neural]
+backend = "openai-compatible"
+endpoint = "http://127.0.0.1:8000/v1"
+model = "local-model"
+voice = "local-voice"
+speed = 1.0
+language = "Chinese"
+instructions = "Warm and calm."
+max_tokens = 128
+repetition_penalty = 1.05
+"#,
         );
+
+        assert!(SpeechProfile::load(file.path(), None).is_ok());
+    }
+
+    #[test]
+    fn rejects_local_http_profile_without_model() {
+        let file = write_profile(
+            r#"
+schema_version = 1
+default_profile = "local-neural"
+
+[profiles.local-neural]
+backend = "openai-compatible"
+endpoint = "http://127.0.0.1:8000/v1"
+"#,
+        );
+
+        assert!(SpeechProfile::load(file.path(), None).is_err());
+    }
+
+    #[test]
+    fn rejects_local_http_profile_with_invalid_endpoint() {
+        let file = write_profile(
+            r#"
+schema_version = 1
+default_profile = "local-neural"
+
+[profiles.local-neural]
+backend = "openai-compatible"
+endpoint = "not a URL"
+model = "local-model"
+"#,
+        );
+
+        assert!(SpeechProfile::load(file.path(), None).is_err());
+    }
+
+    #[test]
+    fn rejects_local_http_profile_with_empty_text_fields() {
+        for field in ["voice", "language", "instructions"] {
+            let file = write_profile(&format!(
+                r#"
+schema_version = 1
+default_profile = "local-neural"
+
+[profiles.local-neural]
+backend = "openai-compatible"
+endpoint = "http://127.0.0.1:8000/v1"
+model = "local-model"
+{field} = ""
+"#,
+            ));
+
+            assert!(SpeechProfile::load(file.path(), None).is_err(), "{field}");
+        }
+    }
+
+    #[test]
+    fn rejects_local_http_profile_with_non_positive_speed() {
+        for speed in ["0.0", "-1.0"] {
+            let file = write_profile(&format!(
+                r#"
+schema_version = 1
+default_profile = "local-neural"
+
+[profiles.local-neural]
+backend = "openai-compatible"
+endpoint = "http://127.0.0.1:8000/v1"
+model = "local-model"
+speed = {speed}
+"#,
+            ));
+
+            assert!(SpeechProfile::load(file.path(), None).is_err(), "{speed}");
+        }
+    }
+
+    #[test]
+    fn rejects_local_http_profile_with_zero_generation_token_limit() {
+        let file = write_profile(
+            r#"
+schema_version = 1
+default_profile = "local-neural"
+
+[profiles.local-neural]
+backend = "openai-compatible"
+endpoint = "http://127.0.0.1:8000/v1"
+model = "local-model"
+max_tokens = 0
+"#,
+        );
+
+        assert!(SpeechProfile::load(file.path(), None).is_err());
+    }
+
+    #[test]
+    fn rejects_local_http_profile_with_non_positive_repetition_penalty() {
+        for repetition_penalty in ["0.0", "-1.0"] {
+            let file = write_profile(&format!(
+                r#"
+schema_version = 1
+default_profile = "local-neural"
+
+[profiles.local-neural]
+backend = "openai-compatible"
+endpoint = "http://127.0.0.1:8000/v1"
+model = "local-model"
+repetition_penalty = {repetition_penalty}
+"#,
+            ));
+
+            assert!(
+                SpeechProfile::load(file.path(), None).is_err(),
+                "{repetition_penalty}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_backend_incompatible_profile_fields() {
+        for (backend, field) in [
+            ("macos-system", "speed = 1.0"),
+            ("openai-compatible", "rate_wpm = 180"),
+        ] {
+            let file = write_profile(&format!(
+                r#"
+schema_version = 1
+default_profile = "selected"
+
+[profiles.selected]
+backend = "{backend}"
+endpoint = "http://127.0.0.1:8000/v1"
+model = "local-model"
+{field}
+"#,
+            ));
+
+            assert!(SpeechProfile::load(file.path(), None).is_err(), "{backend}");
+        }
     }
 
     #[test]
@@ -197,6 +355,7 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::Path;
 
+use conversation_model_adapters::OpenAiCompatibleSpeechConfig;
 use serde::Deserialize;
 
 const MAX_PROFILE_BYTES: u64 = 64 * 1024;
@@ -251,23 +410,42 @@ struct SpeechProfilesFile {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawSpeechProfile {
-    backend: SpeechBackend,
-    voice: Option<String>,
-    rate_wpm: Option<u32>,
-}
-
-#[derive(Debug, Deserialize)]
-enum SpeechBackend {
+#[serde(tag = "backend", deny_unknown_fields)]
+enum RawSpeechProfile {
     #[serde(rename = "macos-system")]
-    MacOsSystem,
+    MacOsSystem {
+        voice: Option<String>,
+        rate_wpm: Option<u32>,
+    },
+    #[serde(rename = "openai-compatible")]
+    OpenAiCompatible {
+        endpoint: String,
+        model: String,
+        voice: Option<String>,
+        speed: Option<f32>,
+        language: Option<String>,
+        instructions: Option<String>,
+        max_tokens: Option<usize>,
+        repetition_penalty: Option<f32>,
+    },
 }
 
-#[derive(Debug, Eq, PartialEq)]
-pub(crate) struct SpeechProfile {
-    pub(crate) voice: Option<String>,
-    pub(crate) rate_wpm: Option<u32>,
+#[derive(Debug, PartialEq)]
+pub(crate) enum SpeechProfile {
+    MacOsSystem {
+        voice: Option<String>,
+        rate_wpm: Option<u32>,
+    },
+    OpenAiCompatible {
+        endpoint: String,
+        model: String,
+        voice: Option<String>,
+        speed: Option<f32>,
+        language: Option<String>,
+        instructions: Option<String>,
+        max_tokens: Option<usize>,
+        repetition_penalty: Option<f32>,
+    },
 }
 
 impl SpeechProfile {
@@ -294,31 +472,103 @@ impl SpeechProfile {
         }
 
         let profile_id = selected_id.unwrap_or(&profiles.default_profile);
-        let RawSpeechProfile {
-            backend,
-            voice,
-            rate_wpm,
-        } = profiles
+        let profile = profiles
             .profiles
             .get(profile_id)
             .ok_or_else(|| format!("speech profile was not found: {profile_id}"))?;
-        match backend {
-            SpeechBackend::MacOsSystem => {}
-        }
 
-        if voice
-            .as_deref()
-            .is_some_and(|voice| voice.is_empty() || voice.chars().any(char::is_control))
-        {
-            return Err("voice must be non-empty and contain no control characters".to_owned());
+        match profile {
+            RawSpeechProfile::MacOsSystem { voice, rate_wpm } => {
+                validate_macos_system_profile(voice.as_deref(), *rate_wpm)?;
+                Ok(Self::MacOsSystem {
+                    voice: voice.clone(),
+                    rate_wpm: *rate_wpm,
+                })
+            }
+            RawSpeechProfile::OpenAiCompatible {
+                endpoint,
+                model,
+                voice,
+                speed,
+                language,
+                instructions,
+                max_tokens,
+                repetition_penalty,
+            } => {
+                validate_openai_compatible_profile(
+                    endpoint,
+                    model,
+                    voice.as_deref(),
+                    *speed,
+                    language.as_deref(),
+                    instructions.as_deref(),
+                    *max_tokens,
+                    *repetition_penalty,
+                )?;
+                Ok(Self::OpenAiCompatible {
+                    endpoint: endpoint.clone(),
+                    model: model.clone(),
+                    voice: voice.clone(),
+                    speed: *speed,
+                    language: language.clone(),
+                    instructions: instructions.clone(),
+                    max_tokens: *max_tokens,
+                    repetition_penalty: *repetition_penalty,
+                })
+            }
         }
-        if rate_wpm.is_some_and(|rate| rate == 0) {
-            return Err("rate must be non-zero".to_owned());
-        }
-
-        Ok(Self {
-            voice: voice.clone(),
-            rate_wpm: *rate_wpm,
-        })
     }
+}
+
+fn validate_macos_system_profile(voice: Option<&str>, rate_wpm: Option<u32>) -> Result<(), String> {
+    if voice.is_some_and(|voice| voice.is_empty() || voice.chars().any(char::is_control)) {
+        return Err("voice must be non-empty and contain no control characters".to_owned());
+    }
+    if rate_wpm.is_some_and(|rate| rate == 0) {
+        return Err("rate must be non-zero".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_openai_compatible_profile(
+    endpoint: &str,
+    model: &str,
+    voice: Option<&str>,
+    speed: Option<f32>,
+    language: Option<&str>,
+    instructions: Option<&str>,
+    max_tokens: Option<usize>,
+    repetition_penalty: Option<f32>,
+) -> Result<(), String> {
+    let mut config = OpenAiCompatibleSpeechConfig::new(model).map_err(adapter_message)?;
+    config = config.with_endpoint(endpoint).map_err(adapter_message)?;
+    if let Some(voice) = voice {
+        config = config.with_voice(voice).map_err(adapter_message)?;
+    }
+    if let Some(speed) = speed {
+        config = config.with_speed(speed).map_err(adapter_message)?;
+    }
+    if let Some(language) = language {
+        config = config.with_language(language).map_err(adapter_message)?;
+    }
+    if let Some(instructions) = instructions {
+        config = config
+            .with_instructions(instructions)
+            .map_err(adapter_message)?;
+    }
+    if let Some(max_tokens) = max_tokens {
+        config = config
+            .with_max_tokens(max_tokens)
+            .map_err(adapter_message)?;
+    }
+    if let Some(repetition_penalty) = repetition_penalty {
+        config
+            .with_repetition_penalty(repetition_penalty)
+            .map_err(adapter_message)?;
+    }
+    Ok(())
+}
+
+fn adapter_message(error: conversation_model_adapters::AdapterError) -> String {
+    error.message().to_owned()
 }

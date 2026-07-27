@@ -13,3 +13,27 @@ rate_wpm = 190
 backend = "macos-system"
 voice = "Tingting"
 rate_wpm = 180
+
+# Replace the model and voice with values supported by your loopback host.
+# Exact MLX-Audio and Qwen identifiers are evaluation candidates, not SDK defaults.
+[profiles.local-neural-fast]
+backend = "openai-compatible"
+endpoint = "http://127.0.0.1:8000/v1"
+model = "local-model"
+voice = "local-voice"
+speed = 1.0
+language = "Chinese"
+instructions = "Warm and calm."
+max_tokens = 128
+repetition_penalty = 1.05
+
+[profiles.local-neural-quality]
+backend = "openai-compatible"
+endpoint = "http://127.0.0.1:8000/v1"
+model = "local-model"
+voice = "local-voice"
+speed = 1.0
+language = "Chinese"
+instructions = "Warm and calm."
+max_tokens = 128
+repetition_penalty = 1.05

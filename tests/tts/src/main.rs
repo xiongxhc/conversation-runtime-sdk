@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 
 use conversation_model_adapters::{
     AdapterError, AudioFormat, MacOsSystemSpeechConfig, MacOsSystemSpeechSynthesizer,
-    SpeechRequest, SpeechSynthesizer, SynthesizedAudio,
+    OpenAiCompatibleSpeechConfig, OpenAiCompatibleSpeechSynthesizer, SpeechRequest,
+    SpeechSynthesizer, SynthesizedAudio,
 };
 use conversation_protocol::TurnId;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -29,7 +30,7 @@ Options:\n\
   --profile <id>       Select a configured profile\n\
   --list-voices        List installed macOS voices and exit\n\
   --no-play            Synthesize without playback\n\
-  --output <path>      Persist AIFF to an absolute path\n\
+  --output <path>      Persist audio to an absolute path\n\
   --help               Print this help";
 
 #[derive(Debug, Eq, PartialEq)]
@@ -55,6 +56,12 @@ struct ProbeConfig {
     speech: MacOsSystemSpeechConfig,
     player: PlayerConfig,
     timeout: Duration,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct SpeechSettings {
+    voice: Option<String>,
+    rate_wpm: Option<u32>,
 }
 
 impl ProbeConfig {
@@ -93,7 +100,7 @@ impl ProbeConfig {
     }
 }
 
-fn environment_speech_settings<F>(lookup: F) -> Result<SpeechProfile, String>
+fn environment_speech_settings<F>(lookup: F) -> Result<SpeechSettings, String>
 where
     F: Fn(&str) -> Option<String>,
 {
@@ -115,14 +122,14 @@ where
         return Err("CONVERSATION_TTS_RATE must be a non-zero integer".to_owned());
     }
 
-    Ok(SpeechProfile { voice, rate_wpm })
+    Ok(SpeechSettings { voice, rate_wpm })
 }
 
 fn load_speech_profile(arguments: &ProbeArguments) -> Result<SpeechProfile, String> {
     match (&arguments.config_path, &arguments.profile_id) {
         (Some(path), profile_id) => SpeechProfile::load(path, profile_id.as_deref()),
         (None, Some(_)) => Err("--profile requires --config".to_owned()),
-        (None, None) => Ok(SpeechProfile {
+        (None, None) => Ok(SpeechProfile::MacOsSystem {
             voice: None,
             rate_wpm: None,
         }),
@@ -136,20 +143,110 @@ fn resolve_speech_settings(
     cli_voice: Option<String>,
     cli_rate_wpm: Option<u32>,
 ) -> Result<SpeechProfile, String> {
-    let voice = cli_voice.or(environment_voice).or(profile.voice);
-    let rate_wpm = cli_rate_wpm.or(environment_rate_wpm).or(profile.rate_wpm);
+    match profile {
+        SpeechProfile::MacOsSystem { voice, rate_wpm } => {
+            let voice = cli_voice.or(environment_voice).or(voice);
+            let rate_wpm = cli_rate_wpm.or(environment_rate_wpm).or(rate_wpm);
 
-    if voice
-        .as_deref()
-        .is_some_and(|voice| voice.is_empty() || voice.chars().any(char::is_control))
-    {
+            validate_speech_settings(voice.as_deref(), rate_wpm)?;
+            Ok(SpeechProfile::MacOsSystem { voice, rate_wpm })
+        }
+        SpeechProfile::OpenAiCompatible {
+            endpoint,
+            model,
+            voice,
+            speed,
+            language,
+            instructions,
+            max_tokens,
+            repetition_penalty,
+        } => {
+            if environment_rate_wpm.is_some() || cli_rate_wpm.is_some() {
+                return Err(
+                    "--rate and CONVERSATION_TTS_RATE are only supported by macos-system profiles"
+                        .to_owned(),
+                );
+            }
+            let voice = cli_voice.or(environment_voice).or(voice);
+            validate_speech_settings(voice.as_deref(), None)?;
+            Ok(SpeechProfile::OpenAiCompatible {
+                endpoint,
+                model,
+                voice,
+                speed,
+                language,
+                instructions,
+                max_tokens,
+                repetition_penalty,
+            })
+        }
+    }
+}
+
+fn validate_speech_settings(voice: Option<&str>, rate_wpm: Option<u32>) -> Result<(), String> {
+    if voice.is_some_and(|voice| voice.is_empty() || voice.chars().any(char::is_control)) {
         return Err("voice must be non-empty and contain no control characters".to_owned());
     }
     if rate_wpm.is_some_and(|rate| rate == 0) {
         return Err("rate must be non-zero".to_owned());
     }
+    Ok(())
+}
 
-    Ok(SpeechProfile { voice, rate_wpm })
+fn configured_synthesizer(
+    profile: SpeechProfile,
+    macos_config: MacOsSystemSpeechConfig,
+) -> Result<Arc<dyn SpeechSynthesizer>, String> {
+    match profile {
+        SpeechProfile::MacOsSystem { voice, rate_wpm } => {
+            let mut config = macos_config;
+            if let Some(voice) = voice {
+                config = config.with_voice(voice).map_err(adapter_message)?;
+            }
+            if let Some(rate_wpm) = rate_wpm {
+                config = config.with_rate(rate_wpm).map_err(adapter_message)?;
+            }
+            Ok(Arc::new(MacOsSystemSpeechSynthesizer::new(config)))
+        }
+        SpeechProfile::OpenAiCompatible {
+            endpoint,
+            model,
+            voice,
+            speed,
+            language,
+            instructions,
+            max_tokens,
+            repetition_penalty,
+        } => {
+            let mut config = OpenAiCompatibleSpeechConfig::new(model).map_err(adapter_message)?;
+            config = config.with_endpoint(endpoint).map_err(adapter_message)?;
+            if let Some(voice) = voice {
+                config = config.with_voice(voice).map_err(adapter_message)?;
+            }
+            if let Some(speed) = speed {
+                config = config.with_speed(speed).map_err(adapter_message)?;
+            }
+            if let Some(language) = language {
+                config = config.with_language(language).map_err(adapter_message)?;
+            }
+            if let Some(instructions) = instructions {
+                config = config
+                    .with_instructions(instructions)
+                    .map_err(adapter_message)?;
+            }
+            if let Some(max_tokens) = max_tokens {
+                config = config
+                    .with_max_tokens(max_tokens)
+                    .map_err(adapter_message)?;
+            }
+            if let Some(repetition_penalty) = repetition_penalty {
+                config = config
+                    .with_repetition_penalty(repetition_penalty)
+                    .map_err(adapter_message)?;
+            }
+            Ok(Arc::new(OpenAiCompatibleSpeechSynthesizer::new(config)))
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -227,11 +324,11 @@ impl ProbeFailure {
 
 async fn run_probe(
     arguments: ProbeArguments,
-    config: ProbeConfig,
+    synthesizer: Arc<dyn SpeechSynthesizer>,
+    player: PlayerConfig,
     cancellation: CancellationToken,
 ) -> Result<ProbeReport, ProbeFailure> {
     let started_at = Instant::now();
-    let synthesizer = MacOsSystemSpeechSynthesizer::new(config.speech);
     let audio = synthesizer
         .synthesize(
             SpeechRequest::new(TurnId::new(1), arguments.text),
@@ -249,7 +346,7 @@ async fn run_probe(
 
     let playback_launched_ms = if arguments.play {
         Some(
-            play_audio(&audio, &config.player, cancellation.clone())
+            play_audio(&audio, &player, cancellation.clone())
                 .await
                 .map_err(|error| ProbeFailure::new("playback", error))?
                 .launched_at
@@ -267,6 +364,7 @@ async fn run_probe(
     Ok(ProbeReport {
         format: match audio.format() {
             AudioFormat::Aiff => "aiff",
+            AudioFormat::Wav => "wav",
             _ => "unknown",
         },
         encoded_bytes: audio.bytes().len(),
@@ -298,9 +396,14 @@ async fn play_audio(
         return Err("audio playback cancelled".to_owned());
     }
 
+    let suffix = match audio.format() {
+        AudioFormat::Aiff => ".aiff",
+        AudioFormat::Wav => ".wav",
+        _ => return Err("unsupported audio format for playback".to_owned()),
+    };
     let mut output = tempfile::Builder::new()
         .prefix("conversation-runtime-playback-")
-        .suffix(".aiff")
+        .suffix(suffix)
         .tempfile_in(&config.temp_directory)
         .map_err(|_| "failed to create audio playback file".to_owned())?;
     output
@@ -649,8 +752,8 @@ async fn main() {
         }
         ProbeAction::Run(arguments) => arguments,
     };
-    let config = match (|| {
-        let mut config = ProbeConfig::from_lookup(|key| std::env::var(key).ok())?;
+    let (synthesizer, player, timeout) = match (|| {
+        let config = ProbeConfig::from_lookup(|key| std::env::var(key).ok())?;
         let profile = load_speech_profile(&arguments)?;
         let environment = environment_speech_settings(|key| std::env::var(key).ok())?;
         let settings = resolve_speech_settings(
@@ -661,18 +764,12 @@ async fn main() {
             arguments.rate,
         )?;
 
-        if let Some(voice) = settings.voice {
-            config.speech = config.speech.with_voice(voice).map_err(adapter_message)?;
-        }
-        if let Some(rate) = settings.rate_wpm {
-            config.speech = config.speech.with_rate(rate).map_err(adapter_message)?;
-        }
-        Ok::<_, String>(config)
+        let synthesizer = configured_synthesizer(settings, config.speech)?;
+        Ok::<_, String>((synthesizer, config.player, config.timeout))
     })() {
         Ok(config) => config,
         Err(message) => exit_with_failure("configuration", started_at, message),
     };
-    let timeout = config.timeout;
     let cancellation = CancellationToken::new();
     let monitor_cancellation = cancellation.clone();
     let stop_reason = Arc::new(AtomicU8::new(0));
@@ -684,7 +781,7 @@ async fn main() {
         monitor_reason,
     ));
 
-    let result = run_probe(arguments, config, cancellation).await;
+    let result = run_probe(arguments, synthesizer, player, cancellation).await;
     monitor.abort();
     let _ = monitor.await;
 
@@ -802,7 +899,7 @@ mod tests {
     #[test]
     fn resolves_cli_over_environment_over_profile() {
         let resolved = resolve_speech_settings(
-            SpeechProfile {
+            SpeechProfile::MacOsSystem {
                 voice: Some("Tingting".to_owned()),
                 rate_wpm: Some(180),
             },
@@ -813,8 +910,45 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(resolved.voice.as_deref(), Some("Samantha"));
-        assert_eq!(resolved.rate_wpm, Some(200));
+        assert!(matches!(
+            resolved,
+            SpeechProfile::MacOsSystem { voice: Some(voice), rate_wpm: Some(200) }
+                if voice == "Samantha"
+        ));
+    }
+
+    #[test]
+    fn resolves_cli_voice_for_openai_compatible_profile() {
+        let resolved = resolve_speech_settings(
+            local_neural_profile(),
+            Some("environment-voice".to_owned()),
+            None,
+            Some("cli-voice".to_owned()),
+            None,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            resolved,
+            SpeechProfile::OpenAiCompatible { voice, .. } if voice.as_deref() == Some("cli-voice")
+        ));
+    }
+
+    #[test]
+    fn rejects_words_per_minute_rate_overrides_for_openai_compatible_profile() {
+        for (environment_rate_wpm, cli_rate_wpm) in [(Some(180), None), (None, Some(190))] {
+            assert_eq!(
+                resolve_speech_settings(
+                    local_neural_profile(),
+                    None,
+                    environment_rate_wpm,
+                    None,
+                    cli_rate_wpm,
+                )
+                .unwrap_err(),
+                "--rate and CONVERSATION_TTS_RATE are only supported by macos-system profiles"
+            );
+        }
     }
 
     #[test]
@@ -1135,17 +1269,18 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&player, std::fs::Permissions::from_mode(0o700)).unwrap();
         let output = fixture.path().join("saved.aiff");
-        let config = ProbeConfig {
-            speech: conversation_model_adapters::MacOsSystemSpeechConfig::new(&say)
-                .unwrap()
-                .with_temp_directory(&generated_temp)
-                .unwrap(),
-            player: PlayerConfig::new(&player)
-                .unwrap()
-                .with_temp_directory(&playback_temp)
-                .unwrap(),
-            timeout: std::time::Duration::from_secs(1),
-        };
+        let synthesizer = std::sync::Arc::new(
+            conversation_model_adapters::MacOsSystemSpeechSynthesizer::new(
+                conversation_model_adapters::MacOsSystemSpeechConfig::new(&say)
+                    .unwrap()
+                    .with_temp_directory(&generated_temp)
+                    .unwrap(),
+            ),
+        );
+        let player = PlayerConfig::new(&player)
+            .unwrap()
+            .with_temp_directory(&playback_temp)
+            .unwrap();
 
         let report = run_probe(
             ProbeArguments {
@@ -1157,7 +1292,8 @@ mod tests {
                 config_path: None,
                 profile_id: None,
             },
-            config,
+            synthesizer,
+            player,
             CancellationToken::new(),
         )
         .await
@@ -1170,6 +1306,33 @@ mod tests {
         assert!(played.exists());
         assert!(std::fs::read_dir(generated_temp).unwrap().next().is_none());
         assert!(std::fs::read_dir(playback_temp).unwrap().next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn playback_uses_wav_suffix_for_wav_audio() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let player = fixture.path().join("fake-player");
+        std::fs::write(
+            &player,
+            "#!/bin/sh\ncase \"$1\" in\n  *.wav) exit 0 ;;\n  *) exit 1 ;;\nesac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&player, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = PlayerConfig::new(&player)
+            .unwrap()
+            .with_temp_directory(fixture.path())
+            .unwrap();
+
+        play_audio(
+            &SynthesizedAudio::new(b"RIFF-playback".to_vec(), AudioFormat::Wav),
+            &config,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -1206,5 +1369,18 @@ mod tests {
 
         assert_eq!(reason.load(std::sync::atomic::Ordering::Acquire), 1);
         assert!(cancellation.is_cancelled());
+    }
+
+    fn local_neural_profile() -> SpeechProfile {
+        SpeechProfile::OpenAiCompatible {
+            endpoint: "http://127.0.0.1:8000/v1".to_owned(),
+            model: "local-model".to_owned(),
+            voice: Some("profile-voice".to_owned()),
+            speed: Some(1.0),
+            language: Some("Chinese".to_owned()),
+            instructions: Some("Warm and calm.".to_owned()),
+            max_tokens: Some(128),
+            repetition_penalty: Some(1.05),
+        }
     }
 }

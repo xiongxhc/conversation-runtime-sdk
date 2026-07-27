@@ -6,10 +6,12 @@ Run the deterministic mock probe:
 cargo run -p conversation-latency-harness -- "hello runtime"
 ```
 
-It emits CSV checkpoints for turn start, final transcript, first text delta, speech start, speech completion, and terminal completion. Its sequence is tested, and it uses mock adapters with controlled delays.
+It emits CSV checkpoints for turn start, final transcript, first text delta, speech start, first synthesis request, first playable audio, speech completion, and terminal completion. Its sequence and causal milestone ordering are tested, and it uses mock adapters with controlled delays.
 
-The real voice-loop harness will later add microphone speech-end, first playable audio, interruption-to-generation-stop, interruption-to-playback-stop, and total spoken-duration metrics.
+`first_playable_audio` is the runtime timestamp after typed audio validation and immediately before the output-adapter call. It is not playback-process launch or first audible sound.
 
-Future measurements with real models must include the hardware profile, exact model identifiers, warm or cold start state, and sample count. The harness must store timing values without transcript content by default.
+The integrated `conversation-voice-probe` reports the same three runtime milestones for real configured adapters. Machine-specific evidence can add an external playback-launch observer and total completion timing without changing lifecycle semantics. See [the runtime text-to-audio evaluation](../../docs/runtime-text-to-audio-evaluation.md).
 
-No latency target is considered met until the integrated local voice loop reproduces it on the documented Apple Silicon target.
+Future microphone-to-speaker measurements must add speech-end, first audible, interruption-to-generation-stop, interruption-to-playback-stop, and total spoken-duration metrics. Every real-model record must include the source commit, hardware profile, exact benchmark inputs and digests, warm or cold state, sample count, and cleanup status. Timing storage excludes transcript content by default unless a reproducible benchmark explicitly publishes its prompt.
+
+No latency target is considered met until a representative integrated local voice loop measures first audible output on the documented Apple Silicon target.

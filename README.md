@@ -8,7 +8,7 @@ The SDK is cross-platform by design. The first validated product target is macOS
 
 ## Current Status
 
-The repository now contains the deterministic runtime foundation plus reviewed local text and macOS system-speech reference paths:
+The repository now contains the deterministic runtime foundation plus reviewed local text-to-audio reference paths:
 
 - typed commands, events, turn identifiers, and errors;
 - cancellation-aware language-model and speech-synthesis adapter contracts;
@@ -19,10 +19,14 @@ The repository now contains the deterministic runtime foundation plus reviewed l
 - a runnable local text probe that selects an installed Ollama model by exact identifier, subject to that model supporting the fixed probe policy;
 - reproducible feasibility results for three local checkpoints under one bounded 8K-context profile;
 - typed synthesized audio, cleanup-aware speech cancellation, and a bounded macOS system-speech reference adapter;
-- a runnable typed-text probe with optional AIFF persistence, playback, cancellation, and distinct timeout reporting.
-- a deterministic OpenAI-compatible local HTTP speech adapter and probe profiles for measured neural-TTS evaluation candidates.
+- a runnable typed-text probe with optional AIFF persistence, playback, cancellation, and distinct timeout reporting;
+- a deterministic OpenAI-compatible local HTTP speech adapter and probe profiles for measured neural-TTS evaluation candidates;
+- a generic `AudioOutput` boundary with bounded macOS `afplay` reference output;
+- UTF-8-safe phrase segmentation and a bounded sequential speech queue that starts synthesis before generation completes;
+- runtime timing events for first text delta, first synthesis request, and first playable audio;
+- an integrated voice probe that composes replaceable language, speech, and audio-output adapters behind `ConversationRuntime`.
 
-The probes exercise adapters directly; Ollama is not yet wired through `ConversationRuntime`. Typed text-to-audio plumbing is working on macOS, while phrase streaming, measured first playable audio, integrated runtime speech, microphone capture, ASR, persona, SQLite memory, the desktop app, and iPhone LAN access remain staged in [ROADMAP.md](ROADMAP.md).
+The integrated typed-text-to-audio path is implemented, deterministic-test covered, and measured once on Apple Silicon. The measurement records playback-process launch, not first audible sound. Microphone capture, ASR, first-audible measurement, barge-in, persona, SQLite memory, the desktop app, and iPhone LAN access remain staged in [ROADMAP.md](ROADMAP.md).
 
 ## Test Local Inference
 
@@ -90,6 +94,28 @@ rustup run 1.97.1 cargo run --locked -p conversation-tts-probe -- \
 
 The convenient public profiles use repository IDs that can resolve newer model revisions, so they do not reproduce the recorded benchmarks. They cap generation at `max_tokens = 128` and use `repetition_penalty = 1.05`; an uncapped host default produced impractically long audio during evaluation. See [docs/neural-tts-evaluation.md](docs/neural-tts-evaluation.md) for the exact snapshot download, digest verification, private local-path configuration, measured results, and remaining quality gates. Model files stay outside this repository, and the Rust command uses the pinned project toolchain.
 
+## Run the Integrated Text-to-Audio Probe
+
+Copy the generic reference composition to a private absolute path, then replace its placeholder identifiers and loopback endpoints with installed local services:
+
+```bash
+PRIVATE_VOICE_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/conversation-runtime/voice.toml"
+mkdir -p "$(dirname "$PRIVATE_VOICE_CONFIG")"
+cp configs/voice.example.toml "$PRIVATE_VOICE_CONFIG"
+```
+
+Keep that private file outside version control. Start the configured loopback language and speech services separately, then run one typed turn:
+
+```bash
+cargo run --locked -p conversation-voice-probe -- \
+  --config "$PRIVATE_VOICE_CONFIG" \
+  "Answer in two short sentences: 你好，请简短介绍你自己。"
+```
+
+Text deltas go to standard output. Stable timing milestones and the terminal status go to standard error. `SIGINT` requests runtime interruption and waits for generation, synthesis, queued speech, active playback, and temporary-file cleanup. Use `--no-play` only as a diagnostic path.
+
+The public template demonstrates one reference composition; it does not select a deployment model, voice, or backend policy. See [docs/runtime-text-to-audio-evaluation.md](docs/runtime-text-to-audio-evaluation.md) for deterministic evidence, one machine-specific measurement, timing definitions, and evidence limits.
+
 ## Project Layout
 
 ```text
@@ -103,6 +129,7 @@ models/                Registry schema and local model instructions
 tests/latency/         Runnable mock latency probe and metric definitions
 tests/ollama/          Runnable local Ollama text probe
 tests/tts/             Runnable macOS system-speech and playback probe
+tests/voice/           Integrated typed-turn text-to-audio probe
 ```
 
 ## Development

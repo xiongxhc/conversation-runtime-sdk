@@ -9,7 +9,6 @@ use crate::{
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:8000/v1";
 const DEFAULT_MAX_TEXT_BYTES: usize = 64 * 1024;
 const DEFAULT_MAX_AUDIO_BYTES: usize = 16 * 1024 * 1024;
-const MAX_ERROR_BODY_PREFIX_BYTES: usize = 4 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct OpenAiCompatibleSpeechConfig {
@@ -149,10 +148,8 @@ impl SpeechSynthesizer for OpenAiCompatibleSpeechSynthesizer {
         cancellation: CancellationToken,
     ) -> AdapterFuture<'a, SynthesizedAudio> {
         Box::pin(async move {
+            ensure_not_cancelled(&cancellation)?;
             validate_request(&request, self.config.max_text_bytes)?;
-            if cancellation.is_cancelled() {
-                return Err(cancelled_error());
-            }
 
             let payload = OpenAiCompatibleSpeechRequest::from_config(&self.config, &request);
             let request_future = self
@@ -168,10 +165,13 @@ impl SpeechSynthesizer for OpenAiCompatibleSpeechSynthesizer {
             };
 
             if !response.status().is_success() {
-                return Err(read_http_error(response, &cancellation, request.text()).await);
+                let error = http_error(response.status().as_u16());
+                ensure_not_cancelled(&cancellation)?;
+                return Err(error);
             }
 
             let bytes = read_audio(response, self.config.max_audio_bytes, &cancellation).await?;
+            ensure_not_cancelled(&cancellation)?;
 
             Ok(SynthesizedAudio::new(bytes, AudioFormat::Wav))
         })
@@ -268,79 +268,17 @@ async fn read_audio(
     Ok(bytes)
 }
 
-async fn read_http_error(
-    mut response: reqwest::Response,
-    cancellation: &CancellationToken,
-    request_text: &str,
-) -> AdapterError {
-    let status = response.status().as_u16();
-    let content_length = response.content_length();
-    let mut body = Vec::with_capacity(MAX_ERROR_BODY_PREFIX_BYTES);
-    let mut truncated = content_length.is_some_and(|length| {
-        length > u64::try_from(MAX_ERROR_BODY_PREFIX_BYTES).expect("4 KiB fits in u64")
-    });
-
-    while body.len() < MAX_ERROR_BODY_PREFIX_BYTES {
-        let chunk = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => return cancelled_error(),
-            chunk = response.chunk() => match chunk {
-                Ok(chunk) => chunk,
-                Err(_) => return AdapterError::new("failed to read speech synthesis error response"),
-            },
-        };
-        let Some(chunk) = chunk else {
-            break;
-        };
-
-        let available = MAX_ERROR_BODY_PREFIX_BYTES - body.len();
-        if chunk.len() > available {
-            body.extend_from_slice(&chunk[..available]);
-            truncated = true;
-            break;
-        }
-        body.extend_from_slice(&chunk);
-    }
-
-    if body.len() == MAX_ERROR_BODY_PREFIX_BYTES && content_length.is_none() {
-        let chunk = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => return cancelled_error(),
-            chunk = response.chunk() => match chunk {
-                Ok(chunk) => chunk,
-                Err(_) => return AdapterError::new("failed to read speech synthesis error response"),
-            },
-        };
-        truncated |= chunk.is_some_and(|chunk| !chunk.is_empty());
-    }
-
-    let detail = sanitize_error_body(&body, request_text);
-    let mut message = format!("speech synthesis request failed with HTTP status {status}");
-    if !detail.is_empty() {
-        message.push_str(": ");
-        message.push_str(&detail);
-    }
-    if truncated {
-        message.push_str(" [truncated]");
-    }
-    AdapterError::new(message)
+fn http_error(status: u16) -> AdapterError {
+    AdapterError::new(format!(
+        "speech synthesis request failed with HTTP status {status}"
+    ))
 }
 
-fn sanitize_error_body(body: &[u8], request_text: &str) -> String {
-    String::from_utf8_lossy(body)
-        .replace(request_text, "[redacted]")
-        .chars()
-        .map(|character| {
-            if character.is_control() {
-                ' '
-            } else {
-                character
-            }
-        })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+fn ensure_not_cancelled(cancellation: &CancellationToken) -> Result<(), AdapterError> {
+    if cancellation.is_cancelled() {
+        return Err(cancelled_error());
+    }
+    Ok(())
 }
 
 fn cancelled_error() -> AdapterError {

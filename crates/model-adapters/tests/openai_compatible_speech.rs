@@ -146,6 +146,22 @@ async fn rejects_oversized_text_without_contacting_the_server() {
 }
 
 #[tokio::test]
+async fn pre_cancelled_invalid_text_returns_cancellation_without_contacting_the_server() {
+    let server = FakeSpeechServer::success([1, 2, 3]).await;
+    let speech = synthesizer(server.endpoint());
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+
+    let error = speech
+        .synthesize(SpeechRequest::new(TurnId::new(10), ""), cancellation)
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.message(), "speech synthesis cancelled");
+    assert!(!server.request_received().await);
+}
+
+#[tokio::test]
 async fn rejects_redirects_without_forwarding_text() {
     let redirected_server = FakeSpeechServer::success([1, 2, 3]).await;
     let redirecting_server = FakeSpeechServer::redirect(redirected_server.endpoint()).await;
@@ -206,10 +222,10 @@ async fn rejects_empty_successful_audio() {
 }
 
 #[tokio::test]
-async fn bounds_failure_body_and_removes_request_text() {
-    let private_text = "private prompt must not appear in errors";
+async fn omits_transformed_and_partial_request_echoes_from_http_errors() {
+    let private_text = "private\u{00a0}prompt";
     let body = format!(
-        "model unavailable: {private_text}{}",
+        "model unavailable: private prompt | private\\u00a0prompt | private pro{}",
         " untrusted failure data".repeat(512)
     );
     let server = FakeSpeechServer::failure(500, body).await;
@@ -223,18 +239,14 @@ async fn bounds_failure_body_and_removes_request_text() {
         .await
         .unwrap_err();
 
-    assert!(error.message().contains("500"), "{}", error.message());
-    assert!(
-        error.message().contains("model unavailable"),
-        "{}",
-        error.message()
-    );
-    assert!(
-        error.message().contains("[truncated]"),
-        "{}",
-        error.message()
+    assert_eq!(
+        error.message(),
+        "speech synthesis request failed with HTTP status 500"
     );
     assert!(!error.message().contains(private_text));
+    assert!(!error.message().contains("private prompt"));
+    assert!(!error.message().contains(r"private\u00a0prompt"));
+    assert!(!error.message().contains("private pro"));
 }
 
 #[tokio::test]
@@ -257,6 +269,42 @@ async fn cancellation_resolves_a_stalled_request() {
     })
     .await
     .expect("speech synthesis did not resolve after cancellation");
+
+    assert_eq!(error.message(), "speech synthesis cancelled");
+}
+
+#[tokio::test]
+async fn cancellation_after_completed_success_response_wins() {
+    let cancellation = CancellationToken::new();
+    let server = FakeSpeechServer::success_then_cancelling([1, 2, 3], cancellation.clone()).await;
+    let speech = synthesizer(server.endpoint());
+
+    let error = speech
+        .synthesize(
+            SpeechRequest::new(TurnId::new(11), "cancel completed success"),
+            cancellation,
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.message(), "speech synthesis cancelled");
+}
+
+#[tokio::test]
+async fn cancellation_after_completed_error_response_wins() {
+    let cancellation = CancellationToken::new();
+    let server =
+        FakeSpeechServer::failure_then_cancelling(500, "server failure", cancellation.clone())
+            .await;
+    let speech = synthesizer(server.endpoint());
+
+    let error = speech
+        .synthesize(
+            SpeechRequest::new(TurnId::new(12), "cancel completed error"),
+            cancellation,
+        )
+        .await
+        .unwrap_err();
 
     assert_eq!(error.message(), "speech synthesis cancelled");
 }
@@ -285,6 +333,30 @@ impl FakeSpeechServer {
         Self::start(Response::Failure {
             status,
             body: body.into(),
+        })
+        .await
+    }
+
+    async fn success_then_cancelling(
+        body: impl Into<Vec<u8>>,
+        cancellation: CancellationToken,
+    ) -> Self {
+        Self::start(Response::SuccessThenCancel {
+            body: body.into(),
+            cancellation,
+        })
+        .await
+    }
+
+    async fn failure_then_cancelling(
+        status: u16,
+        body: impl Into<Vec<u8>>,
+        cancellation: CancellationToken,
+    ) -> Self {
+        Self::start(Response::FailureThenCancel {
+            status,
+            body: body.into(),
+            cancellation,
         })
         .await
     }
@@ -351,26 +423,47 @@ impl FakeSpeechServer {
 }
 
 enum Response {
-    Success { body: Vec<u8> },
-    Failure { status: u16, body: Vec<u8> },
-    Redirect { location: String },
+    Success {
+        body: Vec<u8>,
+    },
+    Failure {
+        status: u16,
+        body: Vec<u8>,
+    },
+    SuccessThenCancel {
+        body: Vec<u8>,
+        cancellation: CancellationToken,
+    },
+    FailureThenCancel {
+        status: u16,
+        body: Vec<u8>,
+        cancellation: CancellationToken,
+    },
+    Redirect {
+        location: String,
+    },
     Stalled,
 }
 
 async fn write_response(stream: &mut TcpStream, response: Response) {
     match response {
         Response::Success { body } => {
-            let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
-            stream.write_all(response.as_bytes()).await.unwrap();
-            stream.write_all(&body).await.unwrap();
+            write_success_response(stream, &body).await;
         }
         Response::Failure { status, body } => {
-            let response = format!(
-                "HTTP/1.1 {status} Internal Server Error\r\nContent-Length: {}\r\n\r\n",
-                body.len()
-            );
-            stream.write_all(response.as_bytes()).await.unwrap();
-            stream.write_all(&body).await.unwrap();
+            write_failure_response(stream, status, &body).await;
+        }
+        Response::SuccessThenCancel { body, cancellation } => {
+            write_success_response(stream, &body).await;
+            cancellation.cancel();
+        }
+        Response::FailureThenCancel {
+            status,
+            body,
+            cancellation,
+        } => {
+            write_failure_response(stream, status, &body).await;
+            cancellation.cancel();
         }
         Response::Redirect { location } => {
             let response = format!(
@@ -380,6 +473,21 @@ async fn write_response(stream: &mut TcpStream, response: Response) {
         }
         Response::Stalled => std::future::pending::<()>().await,
     }
+}
+
+async fn write_success_response(stream: &mut TcpStream, body: &[u8]) {
+    let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+    stream.write_all(response.as_bytes()).await.unwrap();
+    stream.write_all(body).await.unwrap();
+}
+
+async fn write_failure_response(stream: &mut TcpStream, status: u16, body: &[u8]) {
+    let response = format!(
+        "HTTP/1.1 {status} Internal Server Error\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).await.unwrap();
+    stream.write_all(body).await.unwrap();
 }
 
 async fn read_request_json(stream: &mut TcpStream) -> (Value, String) {

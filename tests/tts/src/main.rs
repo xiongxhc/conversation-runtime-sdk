@@ -396,10 +396,29 @@ where
                 value if value.starts_with("--") => {
                     return Err(format!("unsupported argument: {value}"));
                 }
+                value if value.starts_with('-') => {
+                    return Err(format!("unsupported argument: {value}"));
+                }
                 _ => parse_flags = false,
             }
         }
         text.push(argument);
+    }
+
+    if let Some(action) = terminal_action {
+        if !text.is_empty() {
+            return Err("terminal actions cannot be combined with text".to_owned());
+        }
+        if output.is_some()
+            || !play
+            || voice.is_some()
+            || rate.is_some()
+            || config_path.is_some()
+            || profile_id.is_some()
+        {
+            return Err("terminal actions cannot be combined with run options".to_owned());
+        }
+        return Ok(action);
     }
 
     let text = if text.is_empty() {
@@ -413,39 +432,7 @@ where
     };
 
     if text.is_empty() {
-        if let Some(action) = terminal_action {
-            if output.is_some()
-                || !play
-                || voice.is_some()
-                || rate.is_some()
-                || config_path.is_some()
-                || profile_id.is_some()
-            {
-                return Err("terminal actions cannot be combined with run options".to_owned());
-            }
-            return Ok(action);
-        }
-        let mut input = String::new();
-        standard_input
-            .read_to_string(&mut input)
-            .map_err(|_| "failed to read text from standard input".to_owned())?;
-        let input = input.trim().to_owned();
-        if input.is_empty() {
-            return Err("speech text must not be empty".to_owned());
-        }
-        return Ok(ProbeAction::Run(ProbeArguments {
-            text: input,
-            output,
-            play,
-            voice,
-            rate,
-            config_path,
-            profile_id,
-        }));
-    }
-
-    if terminal_action.is_some() {
-        return Err("terminal actions cannot be combined with text".to_owned());
+        return Err("speech text must not be empty".to_owned());
     }
 
     Ok(ProbeAction::Run(ProbeArguments {
@@ -716,7 +703,7 @@ async fn monitor_stop<F>(
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
+    use std::io::{self, Cursor, Read};
     use std::path::PathBuf;
 
     use conversation_model_adapters::{AudioFormat, SynthesizedAudio};
@@ -765,6 +752,43 @@ mod tests {
         assert_eq!(
             parse_arguments(["probe", "--list-voices"], Cursor::new(""),).unwrap(),
             ProbeAction::ListVoices
+        );
+    }
+
+    struct ReadMustNotBeCalled;
+
+    impl Read for ReadMustNotBeCalled {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            panic!("terminal action attempted to read standard input");
+        }
+    }
+
+    #[test]
+    fn terminal_actions_do_not_read_standard_input() {
+        assert_eq!(
+            parse_arguments(["probe", "--help"], ReadMustNotBeCalled),
+            Ok(ProbeAction::Help)
+        );
+        assert_eq!(
+            parse_arguments(["probe", "--list-voices"], ReadMustNotBeCalled),
+            Ok(ProbeAction::ListVoices)
+        );
+    }
+
+    #[test]
+    fn rejects_single_dash_options_before_text_mode() {
+        assert!(parse_arguments(["probe", "-x"], Cursor::new("")).is_err());
+        assert_eq!(
+            parse_arguments(["probe", "--", "-x"], Cursor::new("")),
+            Ok(ProbeAction::Run(ProbeArguments {
+                text: "-x".to_owned(),
+                output: None,
+                play: true,
+                voice: None,
+                rate: None,
+                config_path: None,
+                profile_id: None,
+            }))
         );
     }
 

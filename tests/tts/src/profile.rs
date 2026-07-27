@@ -71,7 +71,11 @@ rate_wpm = 180
     fn rejects_malformed_profile_toml() {
         let file = write_profile("schema_version = [");
 
-        assert!(SpeechProfile::load(file.path(), None).is_err());
+        let error = SpeechProfile::load(file.path(), None).unwrap_err();
+
+        assert!(error.starts_with("speech profile file was not valid TOML:"));
+        assert!(error.len() <= 256);
+        assert!(!error.chars().any(char::is_control));
     }
 
     #[test]
@@ -102,7 +106,10 @@ backend = "macos-system"
 "#,
         );
 
-        assert!(SpeechProfile::load(file.path(), None).is_err());
+        let error = SpeechProfile::load(file.path(), None).unwrap_err();
+
+        assert!(error.contains("unknown field `unexpected`"));
+        assert!(!error.chars().any(char::is_control));
     }
 
     #[test]
@@ -147,7 +154,10 @@ backend = "other"
 "#,
         );
 
-        assert!(SpeechProfile::load(file.path(), None).is_err());
+        let error = SpeechProfile::load(file.path(), None).unwrap_err();
+
+        assert!(error.contains("unknown variant `other`"));
+        assert!(!error.chars().any(char::is_control));
     }
 
     #[test]
@@ -190,6 +200,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 const MAX_PROFILE_BYTES: u64 = 64 * 1024;
+const MAX_TOML_ERROR_DETAIL_CHARS: usize = 160;
 
 fn read_profile_contents(reader: impl Read) -> Result<String, String> {
     let mut contents = String::new();
@@ -201,6 +212,34 @@ fn read_profile_contents(reader: impl Read) -> Result<String, String> {
         return Err("speech profile file exceeded 64 KiB".to_owned());
     }
     Ok(contents)
+}
+
+fn sanitized_toml_error_detail(error: toml::de::Error) -> String {
+    let detail = error
+        .to_string()
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut characters = detail.chars();
+    let truncated = characters
+        .by_ref()
+        .take(MAX_TOML_ERROR_DETAIL_CHARS)
+        .collect::<String>();
+
+    if characters.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -244,8 +283,12 @@ impl SpeechProfile {
         let file = std::fs::File::open(path)
             .map_err(|_| "failed to read speech profile file".to_owned())?;
         let contents = read_profile_contents(file)?;
-        let profiles: SpeechProfilesFile = toml::from_str(&contents)
-            .map_err(|_| "speech profile file was not valid TOML".to_owned())?;
+        let profiles: SpeechProfilesFile = toml::from_str(&contents).map_err(|error| {
+            format!(
+                "speech profile file was not valid TOML: {}",
+                sanitized_toml_error_detail(error)
+            )
+        })?;
         if profiles.schema_version != 1 {
             return Err("speech profile schema version must be 1".to_owned());
         }

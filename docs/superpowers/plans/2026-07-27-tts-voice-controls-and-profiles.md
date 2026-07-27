@@ -6,7 +6,7 @@
 
 **Architecture:** Keep the core `SpeechSynthesizer` contract unchanged. Add CLI actions and a probe-local profile loader around the existing macOS adapter, with precedence `CLI > environment > selected profile > system defaults`. Treat downloadable neural models as separate adapters that reuse the profile-selection boundary only after implementation and benchmark validation.
 
-**Tech Stack:** Rust 2024, Tokio, Serde, TOML, macOS `/usr/bin/say`, existing `conversation-model-adapters`.
+**Tech Stack:** Rust 2021, Tokio, Serde, TOML, macOS `/usr/bin/say`, existing `conversation-model-adapters`.
 
 ## Global Constraints
 

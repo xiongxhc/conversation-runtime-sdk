@@ -524,7 +524,7 @@ fn sigint_interrupts_the_runtime_and_cleans_active_playback() {
         .unwrap();
 
     wait_for_path(&player_started);
-    let _player_guard = PlayerGuard::new(&player_pid);
+    let player_guard = PlayerGuard::new(&player_pid);
     send_sigint(&child);
     let output = wait_for_output_with_deadline(child, Duration::from_secs(3));
 
@@ -543,6 +543,7 @@ fn sigint_interrupts_the_runtime_and_cleans_active_playback() {
         ],
     );
     assert_player_cleaned(&player_pid, &playback_temp_directory);
+    player_guard.disarm();
     language.finish();
     speech.finish();
 }
@@ -575,7 +576,7 @@ fn sigint_interrupts_while_stdout_is_blocked_and_cleans_active_playback() {
         .unwrap();
 
     wait_for_path(&player_started);
-    let _player_guard = PlayerGuard::new(&player_pid);
+    let player_guard = PlayerGuard::new(&player_pid);
     send_sigint(&child);
     let output = wait_for_output_with_deadline(child, Duration::from_secs(3));
 
@@ -590,6 +591,7 @@ fn sigint_interrupts_while_stdout_is_blocked_and_cleans_active_playback() {
         ],
     );
     assert_player_cleaned(&player_pid, &playback_temp_directory);
+    player_guard.disarm();
     language.finish();
     speech.finish();
 }
@@ -622,7 +624,7 @@ fn broken_stdout_interrupts_and_drains_active_playback_before_reporting_output_f
         .unwrap();
 
     wait_for_path(&player_started);
-    let _player_guard = PlayerGuard::new(&player_pid);
+    let player_guard = PlayerGuard::new(&player_pid);
     drop(blocked_reader);
     let output = wait_for_output_with_deadline(child, Duration::from_secs(3));
 
@@ -640,6 +642,7 @@ fn broken_stdout_interrupts_and_drains_active_playback_before_reporting_output_f
         ],
     );
     assert_player_cleaned(&player_pid, &playback_temp_directory);
+    player_guard.disarm();
     language.finish();
     speech.finish();
 }
@@ -679,7 +682,7 @@ fn broken_stdout_write_drains_active_playback_before_reporting_output_failure() 
         .unwrap();
 
     wait_for_path(&player_started);
-    let _player_guard = PlayerGuard::new(&player_pid);
+    let player_guard = PlayerGuard::new(&player_pid);
     drop(blocked_reader);
     let output = wait_for_output_with_deadline(child, Duration::from_secs(3));
 
@@ -697,6 +700,7 @@ fn broken_stdout_write_drains_active_playback_before_reporting_output_failure() 
         ],
     );
     assert_player_cleaned(&player_pid, &playback_temp_directory);
+    player_guard.disarm();
     language.finish();
     speech.finish();
 }
@@ -971,20 +975,27 @@ fn assert_player_cleaned(pid_path: &Path, temp_directory: &Path) {
 }
 
 struct PlayerGuard {
-    pid_path: PathBuf,
+    pid_path: Option<PathBuf>,
 }
 
 impl PlayerGuard {
     fn new(pid_path: &Path) -> Self {
         Self {
-            pid_path: pid_path.to_path_buf(),
+            pid_path: Some(pid_path.to_path_buf()),
         }
+    }
+
+    fn disarm(mut self) {
+        self.pid_path = None;
     }
 }
 
 impl Drop for PlayerGuard {
     fn drop(&mut self) {
-        let Ok(pid) = std::fs::read_to_string(&self.pid_path) else {
+        let Some(pid_path) = &self.pid_path else {
+            return;
+        };
+        let Ok(pid) = std::fs::read_to_string(pid_path) else {
             return;
         };
         let _ = Command::new("/bin/kill")

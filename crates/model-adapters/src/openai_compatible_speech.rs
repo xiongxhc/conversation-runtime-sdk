@@ -149,31 +149,33 @@ impl SpeechSynthesizer for OpenAiCompatibleSpeechSynthesizer {
     ) -> AdapterFuture<'a, SynthesizedAudio> {
         Box::pin(async move {
             ensure_not_cancelled(&cancellation)?;
-            validate_request(&request, self.config.max_text_bytes)?;
+            let result = async {
+                validate_request(&request, self.config.max_text_bytes)?;
 
-            let payload = OpenAiCompatibleSpeechRequest::from_config(&self.config, &request);
-            let request_future = self
-                .client
-                .post(speech_endpoint(&self.config.endpoint))
-                .json(&payload)
-                .send();
-            let response = tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => return Err(cancelled_error()),
-                response = request_future => response
-                    .map_err(|_| AdapterError::new("speech synthesis request failed"))?,
-            };
+                let payload = OpenAiCompatibleSpeechRequest::from_config(&self.config, &request);
+                let request_future = self
+                    .client
+                    .post(speech_endpoint(&self.config.endpoint))
+                    .json(&payload)
+                    .send();
+                let response = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => return Err(cancelled_error()),
+                    response = request_future => response
+                        .map_err(|_| AdapterError::new("speech synthesis request failed"))?,
+                };
 
-            if !response.status().is_success() {
-                let error = http_error(response.status().as_u16());
-                ensure_not_cancelled(&cancellation)?;
-                return Err(error);
+                if !response.status().is_success() {
+                    return Err(http_error(response.status().as_u16()));
+                }
+
+                let bytes =
+                    read_audio(response, self.config.max_audio_bytes, &cancellation).await?;
+                Ok(SynthesizedAudio::new(bytes, AudioFormat::Wav))
             }
+            .await;
 
-            let bytes = read_audio(response, self.config.max_audio_bytes, &cancellation).await?;
-            ensure_not_cancelled(&cancellation)?;
-
-            Ok(SynthesizedAudio::new(bytes, AudioFormat::Wav))
+            prioritize_terminal_result(result, &cancellation)
         })
     }
 }
@@ -279,6 +281,14 @@ fn ensure_not_cancelled(cancellation: &CancellationToken) -> Result<(), AdapterE
         return Err(cancelled_error());
     }
     Ok(())
+}
+
+fn prioritize_terminal_result<T>(
+    result: Result<T, AdapterError>,
+    cancellation: &CancellationToken,
+) -> Result<T, AdapterError> {
+    ensure_not_cancelled(cancellation)?;
+    result
 }
 
 fn cancelled_error() -> AdapterError {

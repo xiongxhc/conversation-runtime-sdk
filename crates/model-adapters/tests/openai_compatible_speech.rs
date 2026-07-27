@@ -162,6 +162,29 @@ async fn pre_cancelled_invalid_text_returns_cancellation_without_contacting_the_
 }
 
 #[tokio::test]
+async fn cancellation_prioritizes_an_oversized_text_validation_error() {
+    let server = FakeSpeechServer::success([1, 2, 3]).await;
+    let speech = OpenAiCompatibleSpeechSynthesizer::new(
+        OpenAiCompatibleSpeechConfig::new("local-model")
+            .unwrap()
+            .with_endpoint(server.endpoint())
+            .unwrap()
+            .with_max_text_bytes(4)
+            .unwrap(),
+    );
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+
+    let error = speech
+        .synthesize(SpeechRequest::new(TurnId::new(13), "large"), cancellation)
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.message(), "speech synthesis cancelled");
+    assert!(!server.request_received().await);
+}
+
+#[tokio::test]
 async fn rejects_redirects_without_forwarding_text() {
     let redirected_server = FakeSpeechServer::success([1, 2, 3]).await;
     let redirecting_server = FakeSpeechServer::redirect(redirected_server.endpoint()).await;
@@ -309,6 +332,65 @@ async fn cancellation_after_completed_error_response_wins() {
     assert_eq!(error.message(), "speech synthesis cancelled");
 }
 
+#[tokio::test]
+async fn cancellation_after_completed_transport_error_wins() {
+    let cancellation = CancellationToken::new();
+    let server = FakeSpeechServer::transport_failure_then_cancelling(cancellation.clone()).await;
+    let speech = synthesizer(server.endpoint());
+
+    let error = speech
+        .synthesize(
+            SpeechRequest::new(TurnId::new(14), "cancel completed transport error"),
+            cancellation,
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.message(), "speech synthesis cancelled");
+}
+
+#[tokio::test]
+async fn cancellation_after_completed_oversized_audio_error_wins() {
+    let cancellation = CancellationToken::new();
+    let server =
+        FakeSpeechServer::success_then_cancelling([1, 2, 3, 4], cancellation.clone()).await;
+    let speech = OpenAiCompatibleSpeechSynthesizer::new(
+        OpenAiCompatibleSpeechConfig::new("local-model")
+            .unwrap()
+            .with_endpoint(server.endpoint())
+            .unwrap()
+            .with_max_audio_bytes(3)
+            .unwrap(),
+    );
+
+    let error = speech
+        .synthesize(
+            SpeechRequest::new(TurnId::new(15), "cancel oversized audio"),
+            cancellation,
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.message(), "speech synthesis cancelled");
+}
+
+#[tokio::test]
+async fn cancellation_after_completed_empty_audio_error_wins() {
+    let cancellation = CancellationToken::new();
+    let server = FakeSpeechServer::success_then_cancelling([], cancellation.clone()).await;
+    let speech = synthesizer(server.endpoint());
+
+    let error = speech
+        .synthesize(
+            SpeechRequest::new(TurnId::new(16), "cancel empty audio"),
+            cancellation,
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.message(), "speech synthesis cancelled");
+}
+
 fn synthesizer(endpoint: &str) -> OpenAiCompatibleSpeechSynthesizer {
     OpenAiCompatibleSpeechSynthesizer::new(
         OpenAiCompatibleSpeechConfig::new("local-model")
@@ -359,6 +441,10 @@ impl FakeSpeechServer {
             cancellation,
         })
         .await
+    }
+
+    async fn transport_failure_then_cancelling(cancellation: CancellationToken) -> Self {
+        Self::start(Response::TransportFailureThenCancel { cancellation }).await
     }
 
     async fn redirect(location: impl Into<String>) -> Self {
@@ -439,6 +525,9 @@ enum Response {
         body: Vec<u8>,
         cancellation: CancellationToken,
     },
+    TransportFailureThenCancel {
+        cancellation: CancellationToken,
+    },
     Redirect {
         location: String,
     },
@@ -463,6 +552,10 @@ async fn write_response(stream: &mut TcpStream, response: Response) {
             cancellation,
         } => {
             write_failure_response(stream, status, &body).await;
+            cancellation.cancel();
+        }
+        Response::TransportFailureThenCancel { cancellation } => {
+            stream.shutdown().await.unwrap();
             cancellation.cancel();
         }
         Response::Redirect { location } => {

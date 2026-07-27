@@ -1,10 +1,12 @@
+use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Stdio;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::Command;
+use tokio::process::{Child, ChildStderr, Command};
 use tokio_util::sync::CancellationToken;
 
 use crate::{AdapterError, AdapterFuture, AudioFormat, AudioOutput, AudioOutputRequest};
@@ -30,12 +32,14 @@ impl MacOsAfplayConfig {
     pub fn new(executable: impl AsRef<Path>) -> Result<Self, AdapterError> {
         let executable = executable.as_ref();
         require_absolute_path(executable, "afplay executable")?;
+        let temp_directory = std::env::temp_dir();
+        require_absolute_path(&temp_directory, "temporary directory")?;
 
         Ok(Self {
             executable: executable.to_path_buf(),
             max_audio_bytes: DEFAULT_MAX_AUDIO_BYTES,
             max_stderr_bytes: DEFAULT_MAX_ERROR_BYTES,
-            temp_directory: std::env::temp_dir(),
+            temp_directory,
         })
     }
 
@@ -129,34 +133,110 @@ impl AudioOutput for MacOsAfplayAudioOutput {
             let mut child = command
                 .spawn()
                 .map_err(|_| AdapterError::new("failed to start audio playback"))?;
-            let stderr = child
-                .stderr
-                .take()
-                .ok_or_else(|| AdapterError::new("failed to capture audio playback error"))?;
-            let stderr_limit = self.config.max_stderr_bytes();
-            let mut stderr_task =
-                tokio::spawn(async move { read_bounded_prefix(stderr, stderr_limit).await });
-
-            let status = tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => {
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
-                    let _ = finish_stderr_task(&mut stderr_task).await;
-                    return Err(AdapterError::new("audio playback cancelled"));
-                }
-                status = child.wait() => {
-                    status.map_err(|_| AdapterError::new("failed to wait for audio playback"))?
-                }
-            };
-            finish_stderr_task(&mut stderr_task).await?;
-
-            if !status.success() {
-                return Err(AdapterError::new("audio playback process failed"));
-            }
-
-            Ok(())
+            play_spawned_process(&mut child, cancellation, self.config.max_stderr_bytes()).await
         })
+    }
+}
+
+trait PlaybackProcess {
+    type Stderr: AsyncRead + Unpin + Send + 'static;
+
+    fn take_stderr(&mut self) -> Option<Self::Stderr>;
+    fn start_kill(&mut self) -> std::io::Result<()>;
+    fn wait(&mut self) -> Pin<Box<dyn Future<Output = std::io::Result<bool>> + Send + '_>>;
+}
+
+impl PlaybackProcess for Child {
+    type Stderr = ChildStderr;
+
+    fn take_stderr(&mut self) -> Option<Self::Stderr> {
+        self.stderr.take()
+    }
+
+    fn start_kill(&mut self) -> std::io::Result<()> {
+        Child::start_kill(self)
+    }
+
+    fn wait(&mut self) -> Pin<Box<dyn Future<Output = std::io::Result<bool>> + Send + '_>> {
+        Box::pin(async move { Child::wait(self).await.map(|status| status.success()) })
+    }
+}
+
+enum PlaybackOutcome {
+    Exited(bool),
+    Failed(AdapterError),
+}
+
+impl PlaybackOutcome {
+    const fn requires_termination(&self) -> bool {
+        matches!(self, Self::Failed(_))
+    }
+}
+
+async fn play_spawned_process<P>(
+    process: &mut P,
+    cancellation: CancellationToken,
+    stderr_limit: usize,
+) -> Result<(), AdapterError>
+where
+    P: PlaybackProcess,
+{
+    let Some(stderr) = process.take_stderr() else {
+        return finalize_playback(
+            process,
+            None,
+            PlaybackOutcome::Failed(AdapterError::new("failed to capture audio playback error")),
+        )
+        .await;
+    };
+    let stderr_task = tokio::spawn(async move { read_bounded_prefix(stderr, stderr_limit).await });
+
+    let outcome = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => {
+            PlaybackOutcome::Failed(AdapterError::new("audio playback cancelled"))
+        }
+        status = process.wait() => {
+            match status {
+                Ok(success) => PlaybackOutcome::Exited(success),
+                Err(_) => PlaybackOutcome::Failed(AdapterError::new(
+                    "failed to wait for audio playback",
+                )),
+            }
+        }
+    };
+
+    finalize_playback(process, Some(stderr_task), outcome).await
+}
+
+async fn finalize_playback<P>(
+    process: &mut P,
+    stderr_task: Option<tokio::task::JoinHandle<std::io::Result<Vec<u8>>>>,
+    outcome: PlaybackOutcome,
+) -> Result<(), AdapterError>
+where
+    P: PlaybackProcess,
+{
+    let child_cleanup = if outcome.requires_termination() {
+        let _ = process.start_kill();
+        process
+            .wait()
+            .await
+            .map(|_| ())
+            .map_err(|_| AdapterError::new("failed to wait for audio playback"))
+    } else {
+        Ok(())
+    };
+    let stderr_cleanup = match stderr_task {
+        Some(stderr_task) => finish_stderr_task(stderr_task).await,
+        None => Ok(()),
+    };
+    let cleanup_error = child_cleanup.err().or_else(|| stderr_cleanup.err());
+
+    match outcome {
+        PlaybackOutcome::Exited(true) => cleanup_error.map_or(Ok(()), Err),
+        PlaybackOutcome::Exited(false) => Err(AdapterError::new("audio playback process failed")),
+        PlaybackOutcome::Failed(error) => Err(error),
     }
 }
 
@@ -197,16 +277,22 @@ where
 }
 
 async fn finish_stderr_task(
-    stderr_task: &mut tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+    mut stderr_task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
 ) -> Result<(), AdapterError> {
-    match tokio::time::timeout(STDERR_CLEANUP_GRACE, &mut *stderr_task).await {
+    match tokio::time::timeout(STDERR_CLEANUP_GRACE, &mut stderr_task).await {
         Ok(result) => result
             .map_err(|_| AdapterError::new("failed to read audio playback error"))?
             .map_err(|_| AdapterError::new("failed to read audio playback error"))
             .map(|_| ()),
         Err(_) => {
             stderr_task.abort();
-            Ok(())
+            match stderr_task.await {
+                Err(error) if error.is_cancelled() => Ok(()),
+                Err(_) => Err(AdapterError::new("failed to read audio playback error")),
+                Ok(result) => result
+                    .map_err(|_| AdapterError::new("failed to read audio playback error"))
+                    .map(|_| ()),
+            }
         }
     }
 }
@@ -230,4 +316,136 @@ fn configuration_error(message: impl AsRef<str>) -> AdapterError {
         "invalid macOS afplay configuration: {}",
         message.as_ref()
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+
+    use tokio::io::{AsyncRead, ReadBuf};
+    use tokio_util::sync::CancellationToken;
+
+    use super::{play_spawned_process, PlaybackProcess};
+
+    struct FakePlaybackProcess<R> {
+        stderr: Option<R>,
+        wait_results: VecDeque<std::io::Result<bool>>,
+        kill_calls: usize,
+        wait_calls: usize,
+    }
+
+    impl<R> FakePlaybackProcess<R> {
+        fn new(
+            stderr: Option<R>,
+            wait_results: impl IntoIterator<Item = std::io::Result<bool>>,
+        ) -> Self {
+            Self {
+                stderr,
+                wait_results: wait_results.into_iter().collect(),
+                kill_calls: 0,
+                wait_calls: 0,
+            }
+        }
+    }
+
+    impl<R> PlaybackProcess for FakePlaybackProcess<R>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+    {
+        type Stderr = R;
+
+        fn take_stderr(&mut self) -> Option<Self::Stderr> {
+            self.stderr.take()
+        }
+
+        fn start_kill(&mut self) -> std::io::Result<()> {
+            self.kill_calls += 1;
+            Ok(())
+        }
+
+        fn wait(&mut self) -> Pin<Box<dyn Future<Output = std::io::Result<bool>> + Send + '_>> {
+            self.wait_calls += 1;
+            let result = self
+                .wait_results
+                .pop_front()
+                .expect("fake process wait result exhausted");
+            Box::pin(async move { result })
+        }
+    }
+
+    struct PendingReader {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl AsyncRead for PendingReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            _buffer: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl Drop for PendingReader {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_stderr_capture_kills_and_waits_before_returning_the_primary_error() {
+        let mut process = FakePlaybackProcess::<tokio::io::Empty>::new(None, [Ok(true)]);
+
+        let error = play_spawned_process(&mut process, CancellationToken::new(), 16)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.message(), "failed to capture audio playback error");
+        assert_eq!(process.kill_calls, 1);
+        assert_eq!(process.wait_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn wait_failure_kills_waits_again_and_finishes_stderr_before_returning() {
+        let mut process = FakePlaybackProcess::new(
+            Some(tokio::io::empty()),
+            [
+                Err(std::io::Error::other("injected wait failure")),
+                Ok(true),
+            ],
+        );
+
+        let error = play_spawned_process(&mut process, CancellationToken::new(), 16)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.message(), "failed to wait for audio playback");
+        assert_eq!(process.kill_calls, 1);
+        assert_eq!(process.wait_calls, 2);
+    }
+
+    #[tokio::test]
+    async fn timed_out_stderr_reader_is_terminated_before_returning() {
+        let stderr_dropped = Arc::new(AtomicBool::new(false));
+        let mut process = FakePlaybackProcess::new(
+            Some(PendingReader {
+                dropped: Arc::clone(&stderr_dropped),
+            }),
+            [Ok(true)],
+        );
+
+        play_spawned_process(&mut process, CancellationToken::new(), 16)
+            .await
+            .unwrap();
+
+        assert!(stderr_dropped.load(Ordering::Acquire));
+        assert_eq!(process.kill_calls, 0);
+        assert_eq!(process.wait_calls, 1);
+    }
 }

@@ -26,6 +26,33 @@ fn rejects_relative_executable_and_temporary_paths() {
 }
 
 #[test]
+fn default_temporary_directory_must_be_absolute() {
+    const CHILD_MARKER: &str = "CONVERSATION_AFPLAY_RELATIVE_TMPDIR_TEST";
+
+    if std::env::var_os(CHILD_MARKER).is_some() {
+        let error = MacOsAfplayConfig::new(absolute_test_path("fake-afplay")).unwrap_err();
+        assert_eq!(
+            error.message(),
+            "invalid macOS afplay configuration: temporary directory must be absolute"
+        );
+        return;
+    }
+
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "default_temporary_directory_must_be_absolute",
+            "--nocapture",
+        ])
+        .env(CHILD_MARKER, "1")
+        .env("TMPDIR", "relative-temp")
+        .status()
+        .unwrap();
+
+    assert!(status.success());
+}
+
+#[test]
 fn rejects_zero_limits() {
     let executable = absolute_test_path("fake-afplay");
 
@@ -296,8 +323,6 @@ async fn returns_a_static_non_zero_exit_error_without_child_stderr() {
 #[cfg(unix)]
 #[tokio::test]
 async fn completed_child_does_not_wait_for_a_descendant_holding_stderr() {
-    use std::time::{Duration, Instant};
-
     let fixture = tempfile::tempdir().unwrap();
     let playback_directory = create_playback_directory(&fixture);
     let descendant_pid_path = fixture.path().join("descendant.pid");
@@ -321,15 +346,19 @@ exit 0
             .unwrap(),
     );
 
-    let started_at = Instant::now();
     output
         .play(wav_request(10), CancellationToken::new())
         .await
         .unwrap();
 
-    let elapsed = started_at.elapsed();
-    assert!(elapsed < Duration::from_secs(2), "elapsed: {elapsed:?}");
     let descendant_pid = std::fs::read_to_string(descendant_pid_path).unwrap();
+    assert!(std::process::Command::new("/bin/kill")
+        .args(["-0", descendant_pid.trim()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success());
     let _ = std::process::Command::new("/bin/kill")
         .arg(descendant_pid.trim())
         .status();

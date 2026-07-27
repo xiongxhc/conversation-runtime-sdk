@@ -7,6 +7,7 @@ pub enum RuntimeStage {
     Runtime,
     LanguageModel,
     SpeechSynthesizer,
+    AudioOutput,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

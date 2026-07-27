@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use conversation_model_adapters::{
-    AdapterError, LanguageModel, LanguageModelRequest, SpeechRequest, SpeechSynthesizer,
+    AdapterError, AudioOutput, LanguageModel, LanguageModelRequest, SpeechRequest,
+    SpeechSynthesizer,
 };
 use conversation_protocol::{
     RuntimeCommand, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage, TurnId,
@@ -43,6 +44,7 @@ impl TurnEventStream {
 pub struct ConversationRuntime {
     language_model: Arc<dyn LanguageModel>,
     speech_synthesizer: Arc<dyn SpeechSynthesizer>,
+    audio_output: Arc<dyn AudioOutput>,
     max_response_bytes: usize,
     active_turn: Arc<Mutex<Option<ActiveTurn>>>,
     last_started_turn_id: Arc<Mutex<Option<TurnId>>>,
@@ -58,10 +60,12 @@ impl ConversationRuntime {
     pub fn new(
         language_model: Arc<dyn LanguageModel>,
         speech_synthesizer: Arc<dyn SpeechSynthesizer>,
+        audio_output: Arc<dyn AudioOutput>,
     ) -> Self {
         Self {
             language_model,
             speech_synthesizer,
+            audio_output,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             active_turn: Arc::new(Mutex::new(None)),
             last_started_turn_id: Arc::new(Mutex::new(None)),
@@ -142,6 +146,7 @@ impl ConversationRuntime {
             .map_err(|_| runtime_error("turn event stream closed before start"))?;
         let language_model = Arc::clone(&self.language_model);
         let speech_synthesizer = Arc::clone(&self.speech_synthesizer);
+        let audio_output = Arc::clone(&self.audio_output);
         let max_response_bytes = self.max_response_bytes;
         let active_turn = Arc::clone(&self.active_turn);
 
@@ -152,6 +157,7 @@ impl ConversationRuntime {
                 transcript,
                 language_model,
                 speech_synthesizer,
+                audio_output,
                 max_response_bytes,
                 worker_cancellation,
                 &event_sender,
@@ -200,6 +206,7 @@ async fn run_turn(
     transcript: String,
     language_model: Arc<dyn LanguageModel>,
     speech_synthesizer: Arc<dyn SpeechSynthesizer>,
+    _audio_output: Arc<dyn AudioOutput>,
     max_response_bytes: usize,
     cancellation: CancellationToken,
     events: &mpsc::Sender<RuntimeEvent>,

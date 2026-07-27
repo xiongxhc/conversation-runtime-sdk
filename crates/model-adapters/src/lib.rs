@@ -1,3 +1,4 @@
+mod audio_output;
 mod language_model;
 mod macos_system_speech;
 mod mock;
@@ -10,9 +11,10 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 
+pub use audio_output::{AudioOutput, AudioOutputRequest, DiscardAudioOutput};
 pub use language_model::{LanguageModel, LanguageModelRequest};
 pub use macos_system_speech::{MacOsSystemSpeechConfig, MacOsSystemSpeechSynthesizer};
-pub use mock::{MockLanguageModel, MockSpeechSynthesizer};
+pub use mock::{MockAudioOutput, MockLanguageModel, MockSpeechSynthesizer};
 pub use ollama::{
     OllamaChatMetrics, OllamaChatStream, OllamaConfig, OllamaLanguageModel, OllamaThinkingLevel,
 };

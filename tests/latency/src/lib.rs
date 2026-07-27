@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use conversation_model_adapters::{MockLanguageModel, MockSpeechSynthesizer};
+use conversation_model_adapters::{DiscardAudioOutput, MockLanguageModel, MockSpeechSynthesizer};
 use conversation_protocol::{
     RuntimeCommand, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage, TurnId,
 };
@@ -33,6 +33,7 @@ pub async fn measure_mock_turn(transcript: &str) -> Result<Vec<TimingSample>, Ru
             [1, 2, 3],
             Duration::from_millis(5),
         )),
+        Arc::new(DiscardAudioOutput),
     );
     let started = Instant::now();
     let result = runtime

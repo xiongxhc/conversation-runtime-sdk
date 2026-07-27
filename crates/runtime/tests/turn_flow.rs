@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use conversation_model_adapters::{
-    AdapterError, AdapterFuture, LanguageModel, LanguageModelRequest, MockLanguageModel,
-    MockSpeechSynthesizer, SpeechRequest, SpeechSynthesizer, SynthesizedAudio,
+    AdapterError, AdapterFuture, DiscardAudioOutput, LanguageModel, LanguageModelRequest,
+    MockLanguageModel, MockSpeechSynthesizer, SpeechRequest, SpeechSynthesizer, SynthesizedAudio,
 };
 use conversation_protocol::{
     RuntimeCommand, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage, TurnId,
@@ -72,6 +72,7 @@ async fn emits_an_ordered_completed_turn() {
     let runtime = ConversationRuntime::new(
         Arc::new(MockLanguageModel::new(["hello", " there"])),
         Arc::new(MockSpeechSynthesizer::new([1, 2, 3])),
+        Arc::new(DiscardAudioOutput),
     );
     let turn_id = TurnId::new(1);
     let mut events = start_turn(&runtime, turn_id, "hi").await;
@@ -113,6 +114,7 @@ async fn reports_language_model_failure_as_the_only_terminal_event() {
     let runtime = ConversationRuntime::new(
         Arc::new(FailingLanguageModel),
         Arc::new(MockSpeechSynthesizer::new([1])),
+        Arc::new(DiscardAudioOutput),
     );
     let turn_id = TurnId::new(2);
     let mut events = start_turn(&runtime, turn_id, "fail").await;
@@ -147,6 +149,7 @@ async fn bounds_language_model_responses_and_cancels_the_model_child_token() {
             cancellation_observed: Arc::clone(&cancellation_observed),
         }),
         Arc::new(MockSpeechSynthesizer::new([1])),
+        Arc::new(DiscardAudioOutput),
     )
     .with_max_response_bytes(4)
     .unwrap();
@@ -195,6 +198,7 @@ async fn accepts_exactly_the_default_runtime_response_limit() {
     let runtime = ConversationRuntime::new(
         Arc::new(MockLanguageModel::new([delta])),
         Arc::new(MockSpeechSynthesizer::new([1])),
+        Arc::new(DiscardAudioOutput),
     );
     let turn_id = TurnId::new(6);
     let mut events = start_turn(&runtime, turn_id, "bound this").await;
@@ -216,6 +220,7 @@ async fn rejects_one_byte_over_the_default_runtime_response_limit() {
     let runtime = ConversationRuntime::new(
         Arc::new(MockLanguageModel::new(["a".repeat(64 * 1024 + 1)])),
         Arc::new(MockSpeechSynthesizer::new([1])),
+        Arc::new(DiscardAudioOutput),
     );
     let turn_id = TurnId::new(7);
     let mut events = start_turn(&runtime, turn_id, "bound this").await;
@@ -250,6 +255,7 @@ fn rejects_a_zero_runtime_response_limit() {
     let runtime = ConversationRuntime::new(
         Arc::new(MockLanguageModel::new(["response"])),
         Arc::new(MockSpeechSynthesizer::new([1])),
+        Arc::new(DiscardAudioOutput),
     );
 
     assert!(runtime.with_max_response_bytes(0).is_err());
@@ -260,6 +266,7 @@ async fn reports_speech_failure_with_the_synthesis_stage() {
     let runtime = ConversationRuntime::new(
         Arc::new(MockLanguageModel::new(["response"])),
         Arc::new(FailingSpeechSynthesizer),
+        Arc::new(DiscardAudioOutput),
     );
     let turn_id = TurnId::new(4);
     let mut events = start_turn(&runtime, turn_id, "fail speech").await;
@@ -289,6 +296,7 @@ async fn cancels_during_speech_synthesis() {
     let runtime = ConversationRuntime::new(
         Arc::new(MockLanguageModel::new(["response"])),
         Arc::new(MockSpeechSynthesizer::delayed([1], Duration::from_secs(5))),
+        Arc::new(DiscardAudioOutput),
     );
     let turn_id = TurnId::new(3);
     let mut events = start_turn(&runtime, turn_id, "speak").await;
@@ -317,6 +325,7 @@ async fn reuses_runtime_after_a_completed_turn() {
     let runtime = ConversationRuntime::new(
         Arc::new(MockLanguageModel::new(["response"])),
         Arc::new(MockSpeechSynthesizer::new([1])),
+        Arc::new(DiscardAudioOutput),
     );
 
     for turn_number in [10, 11] {

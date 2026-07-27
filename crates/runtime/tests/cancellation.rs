@@ -3,8 +3,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use conversation_model_adapters::{
-    AdapterError, AdapterFuture, AudioFormat, LanguageModel, LanguageModelRequest,
-    MockLanguageModel, MockSpeechSynthesizer, SpeechRequest, SpeechSynthesizer, SynthesizedAudio,
+    AdapterError, AdapterFuture, AudioFormat, DiscardAudioOutput, LanguageModel,
+    LanguageModelRequest, MockLanguageModel, MockSpeechSynthesizer, SpeechRequest,
+    SpeechSynthesizer, SynthesizedAudio,
 };
 use conversation_protocol::{RuntimeCommand, RuntimeErrorKind, RuntimeEvent, TurnId};
 use conversation_runtime::{ConversationRuntime, RuntimeCommandResult, TurnEventStream};
@@ -103,6 +104,7 @@ async fn interruption_reaches_generation_and_skips_synthesis() {
         Arc::new(InvocationTrackingSpeech {
             invoked: Arc::clone(&synthesis_invoked),
         }),
+        Arc::new(DiscardAudioOutput),
     );
     let turn_id = TurnId::new(6);
     let mut events = start_turn(&runtime, turn_id, "stop generation").await;
@@ -137,6 +139,7 @@ async fn immediate_interruption_preserves_the_started_event() {
     let runtime = ConversationRuntime::new(
         Arc::new(MockLanguageModel::delayed(["late"], Duration::from_secs(5))),
         Arc::new(MockSpeechSynthesizer::new([1])),
+        Arc::new(DiscardAudioOutput),
     );
     let turn_id = TurnId::new(8);
     let mut events = start_turn(&runtime, turn_id, "interrupt immediately").await;
@@ -158,6 +161,7 @@ async fn interruption_emits_one_cancelled_terminal_event() {
     let runtime = ConversationRuntime::new(
         Arc::new(MockLanguageModel::delayed(["late"], Duration::from_secs(5))),
         Arc::new(MockSpeechSynthesizer::new([1])),
+        Arc::new(DiscardAudioOutput),
     );
     let turn_id = TurnId::new(7);
     let mut events = start_turn(&runtime, turn_id, "stop").await;
@@ -191,6 +195,7 @@ async fn waits_for_speech_cleanup_before_cancellation_completes() {
             started: Arc::clone(&synthesis_started),
             cleanup_completed: Arc::clone(&cleanup_completed),
         }),
+        Arc::new(DiscardAudioOutput),
     );
     let turn_id = TurnId::new(14);
     let mut events = start_turn(&runtime, turn_id, "cancel during speech").await;
@@ -224,6 +229,7 @@ async fn rejects_a_reused_turn_id() {
     let runtime = ConversationRuntime::new(
         Arc::new(MockLanguageModel::new(["response"])),
         Arc::new(MockSpeechSynthesizer::new([1])),
+        Arc::new(DiscardAudioOutput),
     );
     let turn_id = TurnId::new(13);
     let mut events = start_turn(&runtime, turn_id, "first").await;
@@ -249,6 +255,7 @@ async fn rejects_a_second_active_turn() {
     let runtime = ConversationRuntime::new(
         Arc::new(MockLanguageModel::delayed(["late"], Duration::from_secs(5))),
         Arc::new(MockSpeechSynthesizer::new([1])),
+        Arc::new(DiscardAudioOutput),
     );
     let first_turn = TurnId::new(1);
     let second_turn = TurnId::new(2);
@@ -277,6 +284,7 @@ async fn interruption_result_matches_the_terminal_event_at_synthesis_boundary() 
         Arc::new(CompletionSignallingSpeech {
             completed: Arc::clone(&synthesis_completed),
         }),
+        Arc::new(DiscardAudioOutput),
     );
     let turn_id = TurnId::new(9);
     let mut events = start_turn(&runtime, turn_id, "fill the event buffer").await;
@@ -314,6 +322,7 @@ async fn interruption_finalizes_when_the_event_consumer_is_backpressured() {
         Arc::new(CompletionSignallingSpeech {
             completed: Arc::clone(&synthesis_completed),
         }),
+        Arc::new(DiscardAudioOutput),
     );
     let turn_id = TurnId::new(12);
     let mut events = start_turn(&runtime, turn_id, "fill the event buffer").await;

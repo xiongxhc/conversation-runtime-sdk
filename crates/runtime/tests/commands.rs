@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use conversation_model_adapters::{MockLanguageModel, MockSpeechSynthesizer};
+use conversation_model_adapters::{DiscardAudioOutput, MockLanguageModel, MockSpeechSynthesizer};
 use conversation_protocol::{RuntimeCommand, RuntimeEvent, TurnId};
 use conversation_runtime::{ConversationRuntime, RuntimeCommandResult, TurnEventStream};
 
@@ -10,6 +10,7 @@ async fn executes_typed_start_and_interrupt_commands() {
     let runtime = ConversationRuntime::new(
         Arc::new(MockLanguageModel::delayed(["late"], Duration::from_secs(5))),
         Arc::new(MockSpeechSynthesizer::new([1])),
+        Arc::new(DiscardAudioOutput),
     );
     let turn_id = TurnId::new(1);
 

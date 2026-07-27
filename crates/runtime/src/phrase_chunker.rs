@@ -2,6 +2,7 @@ use conversation_protocol::{RuntimeError, RuntimeErrorKind, RuntimeStage};
 
 const DEFAULT_SOFT_LIMIT_BYTES: usize = 96;
 const DEFAULT_HARD_LIMIT_BYTES: usize = 192;
+const MAX_UTF8_SCALAR_BYTES: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PhraseChunkingConfig {
@@ -24,6 +25,11 @@ impl PhraseChunkingConfig {
         if soft_limit_bytes > hard_limit_bytes {
             return Err(configuration_error(
                 "phrase soft byte limit must not exceed hard byte limit",
+            ));
+        }
+        if hard_limit_bytes < MAX_UTF8_SCALAR_BYTES {
+            return Err(configuration_error(
+                "phrase hard byte limit must be at least 4 to preserve UTF-8 scalar boundaries",
             ));
         }
 
@@ -51,11 +57,13 @@ impl Default for PhraseChunkingConfig {
     }
 }
 
+#[allow(dead_code)]
 struct PhraseChunker {
     config: PhraseChunkingConfig,
     buffer: String,
 }
 
+#[allow(dead_code)]
 impl PhraseChunker {
     fn new(config: PhraseChunkingConfig) -> Self {
         Self {
@@ -84,10 +92,10 @@ impl PhraseChunker {
         for (index, character) in self.buffer.char_indices() {
             let end = index + character.len_utf8();
 
-            if character == '\n' || is_sentence_boundary(character) {
+            if character == '\n' || Self::is_sentence_boundary(character) {
                 return Some(end);
             }
-            if end >= self.config.soft_limit_bytes && is_soft_boundary(character) {
+            if end >= self.config.soft_limit_bytes && Self::is_soft_boundary(character) {
                 return Some(end);
             }
             if end >= self.config.hard_limit_bytes {
@@ -126,20 +134,20 @@ impl PhraseChunker {
         let segment = segment.trim();
         (!segment.is_empty()).then(|| segment.to_owned())
     }
+
+    fn is_sentence_boundary(character: char) -> bool {
+        matches!(character, '.' | '!' | '?' | '。' | '！' | '？')
+    }
+
+    fn is_soft_boundary(character: char) -> bool {
+        character.is_whitespace() || matches!(character, ',' | ':' | ';' | '，' | '：' | '；')
+    }
 }
 
 impl Default for PhraseChunker {
     fn default() -> Self {
         Self::new(PhraseChunkingConfig::default())
     }
-}
-
-fn is_sentence_boundary(character: char) -> bool {
-    matches!(character, '.' | '!' | '?' | '。' | '！' | '？')
-}
-
-fn is_soft_boundary(character: char) -> bool {
-    character.is_whitespace() || matches!(character, ',' | ':' | ';' | '，' | '：' | '；')
 }
 
 fn configuration_error(message: impl Into<String>) -> RuntimeError {
@@ -152,6 +160,8 @@ fn configuration_error(message: impl Into<String>) -> RuntimeError {
 
 #[cfg(test)]
 mod tests {
+    use conversation_protocol::{RuntimeErrorKind, RuntimeStage};
+
     use super::{PhraseChunker, PhraseChunkingConfig};
 
     #[test]
@@ -174,6 +184,19 @@ mod tests {
     fn hard_limit_keeps_a_multibyte_phrase_at_an_exact_boundary() {
         let mut chunker = PhraseChunker::new(PhraseChunkingConfig::new(6, 6).unwrap());
         assert_eq!(chunker.push_delta("你好"), vec!["你好"]);
+        assert_eq!(chunker.finish(), None);
+    }
+
+    #[test]
+    fn hard_limit_supports_any_utf8_scalar_without_exceeding_it() {
+        let config = PhraseChunkingConfig::new(1, 4).unwrap();
+        let mut chunker = PhraseChunker::new(config);
+        let phrases = chunker.push_delta("😀");
+
+        assert_eq!(phrases, vec!["😀"]);
+        assert!(phrases
+            .iter()
+            .all(|phrase| phrase.len() <= config.hard_limit_bytes()));
         assert_eq!(chunker.finish(), None);
     }
 
@@ -234,6 +257,19 @@ mod tests {
         assert!(PhraseChunkingConfig::new(0, 1).is_err());
         assert!(PhraseChunkingConfig::new(1, 0).is_err());
         assert!(PhraseChunkingConfig::new(9, 6).is_err());
+    }
+
+    #[test]
+    fn configuration_requires_a_hard_limit_for_any_utf8_scalar() {
+        let error = PhraseChunkingConfig::new(1, 3).unwrap_err();
+        assert_eq!(error.kind(), RuntimeErrorKind::Configuration);
+        assert_eq!(error.stage(), RuntimeStage::Runtime);
+        assert_eq!(
+            error.message(),
+            "phrase hard byte limit must be at least 4 to preserve UTF-8 scalar boundaries"
+        );
+
+        assert!(PhraseChunkingConfig::new(1, 4).is_ok());
     }
 
     #[test]

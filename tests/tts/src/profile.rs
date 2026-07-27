@@ -431,6 +431,17 @@ enum RawSpeechProfile {
     },
 }
 
+struct OpenAiCompatibleProfileInput<'a> {
+    endpoint: &'a str,
+    model: &'a str,
+    voice: Option<&'a str>,
+    speed: Option<f32>,
+    language: Option<&'a str>,
+    instructions: Option<&'a str>,
+    max_tokens: Option<usize>,
+    repetition_penalty: Option<f32>,
+}
+
 #[derive(Debug, PartialEq)]
 pub(crate) enum SpeechProfile {
     MacOsSystem {
@@ -496,16 +507,17 @@ impl SpeechProfile {
                 max_tokens,
                 repetition_penalty,
             } => {
-                validate_openai_compatible_profile(
+                let input = OpenAiCompatibleProfileInput {
                     endpoint,
                     model,
-                    voice.as_deref(),
-                    *speed,
-                    language.as_deref(),
-                    instructions.as_deref(),
-                    *max_tokens,
-                    *repetition_penalty,
-                )?;
+                    voice: voice.as_deref(),
+                    speed: *speed,
+                    language: language.as_deref(),
+                    instructions: instructions.as_deref(),
+                    max_tokens: *max_tokens,
+                    repetition_penalty: *repetition_penalty,
+                };
+                validate_openai_compatible_profile(&input)?;
                 Ok(Self::OpenAiCompatible {
                     endpoint: endpoint.clone(),
                     model: model.clone(),
@@ -532,37 +544,32 @@ fn validate_macos_system_profile(voice: Option<&str>, rate_wpm: Option<u32>) -> 
 }
 
 fn validate_openai_compatible_profile(
-    endpoint: &str,
-    model: &str,
-    voice: Option<&str>,
-    speed: Option<f32>,
-    language: Option<&str>,
-    instructions: Option<&str>,
-    max_tokens: Option<usize>,
-    repetition_penalty: Option<f32>,
+    input: &OpenAiCompatibleProfileInput<'_>,
 ) -> Result<(), String> {
-    let mut config = OpenAiCompatibleSpeechConfig::new(model).map_err(adapter_message)?;
-    config = config.with_endpoint(endpoint).map_err(adapter_message)?;
-    if let Some(voice) = voice {
+    let mut config = OpenAiCompatibleSpeechConfig::new(input.model).map_err(adapter_message)?;
+    config = config
+        .with_endpoint(input.endpoint)
+        .map_err(adapter_message)?;
+    if let Some(voice) = input.voice {
         config = config.with_voice(voice).map_err(adapter_message)?;
     }
-    if let Some(speed) = speed {
+    if let Some(speed) = input.speed {
         config = config.with_speed(speed).map_err(adapter_message)?;
     }
-    if let Some(language) = language {
+    if let Some(language) = input.language {
         config = config.with_language(language).map_err(adapter_message)?;
     }
-    if let Some(instructions) = instructions {
+    if let Some(instructions) = input.instructions {
         config = config
             .with_instructions(instructions)
             .map_err(adapter_message)?;
     }
-    if let Some(max_tokens) = max_tokens {
+    if let Some(max_tokens) = input.max_tokens {
         config = config
             .with_max_tokens(max_tokens)
             .map_err(adapter_message)?;
     }
-    if let Some(repetition_penalty) = repetition_penalty {
+    if let Some(repetition_penalty) = input.repetition_penalty {
         config
             .with_repetition_penalty(repetition_penalty)
             .map_err(adapter_message)?;

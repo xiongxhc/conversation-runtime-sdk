@@ -13,7 +13,7 @@ Run it against the default local endpoint:
 
 ```bash
 cargo run --locked -p conversation-ollama-probe -- \
-  "qwen3.6:27b-q8_0" \
+  "<installed-model-id>" \
   "Answer briefly: hello"
 ```
 
@@ -29,7 +29,7 @@ arguments and provide a non-empty prompt on standard input:
 
 ```bash
 printf '%s\n' 'Answer briefly: hello' | \
-  cargo run --locked -p conversation-ollama-probe -- "qwen3.6:27b-q8_0"
+  cargo run --locked -p conversation-ollama-probe -- "<installed-model-id>"
 ```
 
 The probe bounds each request with 60 seconds to first text delta, 30 seconds idle time after a
@@ -45,13 +45,13 @@ benchmark policy, and Ollama's final total/load/prompt-evaluation/response-evalu
 Metric fields read `unavailable` only when the server omits them.
 
 For an identifiable, repeatable local benchmark, use the repository script from a clean Git tree.
-It verifies that the selected model is unloaded, records one cold warm-up plus three warm measured
+It verifies that the requested model is unloaded, records one cold warm-up plus three warm measured
 runs, captures sanitized installed/show metadata, the loaded model state, model digest, source
 commit, lockfile and binary hashes, and toolchain versions, and writes raw metrics and responses
 under ignored `artifacts/ollama/`:
 
 ```bash
-tests/ollama/benchmark-local.sh "qwen3.6:27b-q8_0"
+tests/ollama/benchmark-local.sh "<installed-model-id>"
 ```
 
 The optional second argument is a new direct child name under `artifacts/ollama/`; parent

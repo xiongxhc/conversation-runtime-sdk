@@ -17,7 +17,7 @@ The repository now contains the deterministic runtime foundation plus a reviewed
 - integration tests for completion, interruption races, adapter failures, synthesis cancellation, and runtime reuse;
 - a streaming Ollama adapter with bounded NDJSON framing, cancellation, and configurable thinking;
 - a runnable local text probe that selects an installed Ollama model by exact identifier, subject to that model supporting the fixed probe policy;
-- reproducible feasibility results for Qwen 34.7B, Qwen 27B, and Llama 70B under one bounded 8K-context profile.
+- reproducible feasibility results for three local checkpoints under one bounded 8K-context profile.
 
 The probe exercises the adapter directly; Ollama is not yet wired through `ConversationRuntime`. The path is text-only. Real TTS, audio playback, microphone capture, ASR, persona, SQLite memory, the macOS app, and iPhone LAN access remain staged in [ROADMAP.md](ROADMAP.md).
 
@@ -27,7 +27,7 @@ Start Ollama, then run the reviewed probe against an installed model:
 
 ```bash
 cargo run --locked -p conversation-ollama-probe -- \
-  "qwen3.6:27b-q8_0" \
+  "<installed-model-id>" \
   "Answer briefly: hello"
 ```
 
@@ -73,5 +73,6 @@ The latency probe uses deterministic mock adapters. It verifies runtime flow and
 - The protocol does not depend on adapters or runtime internals.
 - Relationship behavior emerges from context and conversation state rather than fixed scripts: earned behavior is often more memorable than configurable behavior.
 - Model files, private paths, credentials, and local benchmark artifacts stay outside version control.
+- Public SDK content remains backend-neutral. Exact deployment-model choices and venture-specific routing policy stay in private configuration outside this repository.
 
 See [docs/architecture.md](docs/architecture.md) for the current boundaries, [docs/superpowers/specs/2026-07-24-conversation-runtime-sdk-design.md](docs/superpowers/specs/2026-07-24-conversation-runtime-sdk-design.md) for the approved initial design, and [docs/superpowers/specs/2026-07-24-ollama-local-model-and-lan-design.md](docs/superpowers/specs/2026-07-24-ollama-local-model-and-lan-design.md) for the Mac, SQLite, LAN, and future-platform architecture.

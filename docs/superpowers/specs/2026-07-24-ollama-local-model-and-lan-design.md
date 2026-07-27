@@ -31,7 +31,7 @@ The currently installed models are:
 | `qwen3.6:27b-q8_0` | 27.8B | Q8_0 | 30.0 GB |
 | `hf.co/mradermacher/Llama-3.3-70B-Instruct-abliterated-i1-GGUF:Q4_K_M` | 70.6B | Q4_K_M | 42.5 GB |
 
-The final 8K-context benchmark shows all three models complete locally. Qwen 34.7B is fastest, Qwen 27B is the provisional official-provenance R2 candidate, and Llama 70B is viable but largest and slowest. No model is selected as the product default until source/license and broader behavior review are complete. Community `abliterated` variants remain development candidates rather than implicit production defaults.
+The final 8K-context benchmark shows all three models complete locally and records their latency and loaded-state differences. These exact checkpoints are historical evidence, not SDK recommendations. Source, license, behavior, and deployment selection belong to the consuming application; community `abliterated` variants require additional review.
 
 ## Ollama Adapter
 

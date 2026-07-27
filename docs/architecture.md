@@ -8,7 +8,7 @@ protocol <- model-adapters <- runtime
 
 `protocol` defines client-visible commands, events, identifiers, and failures. It has no dependency on Tokio, model implementations, or runtime internals.
 
-`model-adapters` defines the capabilities required from language and speech models. Its mock implementations are deterministic test doubles, not product backends.
+`model-adapters` defines the capabilities required from language and speech models. Its mock implementations are deterministic test doubles, not deployment backends.
 
 `runtime` owns turn state, adapter coordination, event ordering, and cancellation. Clients should not depend on adapter implementation details.
 
@@ -49,6 +49,12 @@ Model relationships through context and conversation state rather than fixed scr
 
 Affectionate expressions, special moments, and relationship signals must emerge from shared context, pacing, reciprocity, and rapport. They are not triggered by canned sequences, invisible unlock flags, frequency quotas, or a durable memory record that directly commands an expression. Persona and memory may shape the context available to the response controller, but the current conversational state remains authoritative.
 
+## Public Repository Boundary
+
+The public SDK defines portable contracts, reference adapters, reproducible evaluation methods, and clearly labeled historical measurements. It does not encode the venture's preferred models, voices, routing thresholds, personas, or deployment policy.
+
+Exact checkpoint identifiers may appear only when required to reproduce benchmark evidence. They are measurements, not endorsements. Public examples use generic identifiers, while private deployment configuration and venture decisions remain outside this repository.
+
 ## Why the Desktop Shell Is Deferred
 
-Creating the Tauri and React application before runtime contracts exist would couple the first protocol to desktop UI needs. The current boundary is documentation-only until deterministic turn and cancellation tests pass and the feasibility benchmark selects concrete local backends.
+Creating the Tauri and React application before runtime contracts exist would couple the first protocol to desktop UI needs. The current boundary is documentation-only until deterministic turn and cancellation tests pass and feasibility benchmarks validate concrete reference adapters.

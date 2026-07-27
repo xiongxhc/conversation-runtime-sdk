@@ -171,6 +171,7 @@ impl SpeechSynthesizer for OpenAiCompatibleSpeechSynthesizer {
 
                 let bytes =
                     read_audio(response, self.config.max_audio_bytes, &cancellation).await?;
+                validate_wav(&bytes)?;
                 Ok(SynthesizedAudio::new(bytes, AudioFormat::Wav))
             }
             .await;
@@ -268,6 +269,60 @@ async fn read_audio(
         return Err(AdapterError::new("speech synthesis output was empty"));
     }
     Ok(bytes)
+}
+
+fn validate_wav(bytes: &[u8]) -> Result<(), AdapterError> {
+    if bytes.len() < 12 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return Err(invalid_wav_error());
+    }
+
+    let riff_size = wav_u32(&bytes[4..8])?;
+    if riff_size.checked_add(8) != Some(bytes.len()) {
+        return Err(invalid_wav_error());
+    }
+
+    let mut offset = 12;
+    let mut has_fmt = false;
+    let mut has_data = false;
+    while offset < bytes.len() {
+        let header_end = offset.checked_add(8).ok_or_else(invalid_wav_error)?;
+        if header_end > bytes.len() {
+            return Err(invalid_wav_error());
+        }
+
+        let chunk_size = wav_u32(&bytes[offset + 4..header_end])?;
+        let body_end = header_end
+            .checked_add(chunk_size)
+            .ok_or_else(invalid_wav_error)?;
+        let next_chunk = body_end
+            .checked_add(chunk_size % 2)
+            .ok_or_else(invalid_wav_error)?;
+        if next_chunk > bytes.len() {
+            return Err(invalid_wav_error());
+        }
+
+        match &bytes[offset..offset + 4] {
+            b"fmt " if chunk_size >= 16 => has_fmt = true,
+            b"fmt " => return Err(invalid_wav_error()),
+            b"data" if chunk_size > 0 => has_data = true,
+            _ => {}
+        }
+        offset = next_chunk;
+    }
+
+    if !has_fmt || !has_data {
+        return Err(invalid_wav_error());
+    }
+    Ok(())
+}
+
+fn wav_u32(bytes: &[u8]) -> Result<usize, AdapterError> {
+    let bytes: [u8; 4] = bytes.try_into().map_err(|_| invalid_wav_error())?;
+    usize::try_from(u32::from_le_bytes(bytes)).map_err(|_| invalid_wav_error())
+}
+
+fn invalid_wav_error() -> AdapterError {
+    AdapterError::new("speech synthesis output was not a valid WAV file")
 }
 
 fn http_error(status: u16) -> AdapterError {

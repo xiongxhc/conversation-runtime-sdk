@@ -14,7 +14,8 @@ use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
 async fn posts_openai_compatible_wav_request_with_optional_configuration() {
-    let server = FakeSpeechServer::success([1, 2, 3]).await;
+    let expected_audio = minimal_pcm_wav();
+    let server = FakeSpeechServer::success(expected_audio.clone()).await;
     let speech = OpenAiCompatibleSpeechSynthesizer::new(
         OpenAiCompatibleSpeechConfig::new("local-model")
             .unwrap()
@@ -55,13 +56,13 @@ async fn posts_openai_compatible_wav_request_with_optional_configuration() {
         .await
         .get("repetition_penalty")
         .is_none());
-    assert_eq!(audio.bytes(), &[1, 2, 3]);
+    assert_eq!(audio.bytes(), expected_audio);
     assert_eq!(audio.format(), AudioFormat::Wav);
 }
 
 #[tokio::test]
 async fn serializes_configured_generation_controls() {
-    let server = FakeSpeechServer::success([1, 2, 3]).await;
+    let server = FakeSpeechServer::success(minimal_pcm_wav()).await;
     let speech = OpenAiCompatibleSpeechSynthesizer::new(
         OpenAiCompatibleSpeechConfig::new("local-model")
             .unwrap()
@@ -103,7 +104,7 @@ fn rejects_invalid_generation_controls() {
 
 #[tokio::test]
 async fn rejects_empty_text_without_contacting_the_server() {
-    let server = FakeSpeechServer::success([1, 2, 3]).await;
+    let server = FakeSpeechServer::success(minimal_pcm_wav()).await;
     let speech = synthesizer(server.endpoint());
 
     let error = speech
@@ -120,7 +121,7 @@ async fn rejects_empty_text_without_contacting_the_server() {
 
 #[tokio::test]
 async fn rejects_oversized_text_without_contacting_the_server() {
-    let server = FakeSpeechServer::success([1, 2, 3]).await;
+    let server = FakeSpeechServer::success(minimal_pcm_wav()).await;
     let speech = OpenAiCompatibleSpeechSynthesizer::new(
         OpenAiCompatibleSpeechConfig::new("local-model")
             .unwrap()
@@ -147,7 +148,7 @@ async fn rejects_oversized_text_without_contacting_the_server() {
 
 #[tokio::test]
 async fn pre_cancelled_invalid_text_returns_cancellation_without_contacting_the_server() {
-    let server = FakeSpeechServer::success([1, 2, 3]).await;
+    let server = FakeSpeechServer::success(minimal_pcm_wav()).await;
     let speech = synthesizer(server.endpoint());
     let cancellation = CancellationToken::new();
     cancellation.cancel();
@@ -163,7 +164,7 @@ async fn pre_cancelled_invalid_text_returns_cancellation_without_contacting_the_
 
 #[tokio::test]
 async fn cancellation_prioritizes_an_oversized_text_validation_error() {
-    let server = FakeSpeechServer::success([1, 2, 3]).await;
+    let server = FakeSpeechServer::success(minimal_pcm_wav()).await;
     let speech = OpenAiCompatibleSpeechSynthesizer::new(
         OpenAiCompatibleSpeechConfig::new("local-model")
             .unwrap()
@@ -186,7 +187,7 @@ async fn cancellation_prioritizes_an_oversized_text_validation_error() {
 
 #[tokio::test]
 async fn rejects_redirects_without_forwarding_text() {
-    let redirected_server = FakeSpeechServer::success([1, 2, 3]).await;
+    let redirected_server = FakeSpeechServer::success(minimal_pcm_wav()).await;
     let redirecting_server = FakeSpeechServer::redirect(redirected_server.endpoint()).await;
     let speech = synthesizer(redirecting_server.endpoint());
 
@@ -204,13 +205,15 @@ async fn rejects_redirects_without_forwarding_text() {
 
 #[tokio::test]
 async fn rejects_audio_exceeding_the_configured_limit() {
-    let server = FakeSpeechServer::success([1, 2, 3, 4]).await;
+    let audio = minimal_pcm_wav();
+    let max_audio_bytes = audio.len() - 1;
+    let server = FakeSpeechServer::success(audio).await;
     let speech = OpenAiCompatibleSpeechSynthesizer::new(
         OpenAiCompatibleSpeechConfig::new("local-model")
             .unwrap()
             .with_endpoint(server.endpoint())
             .unwrap()
-            .with_max_audio_bytes(3)
+            .with_max_audio_bytes(max_audio_bytes)
             .unwrap(),
     );
 
@@ -242,6 +245,88 @@ async fn rejects_empty_successful_audio() {
         .unwrap_err();
 
     assert_eq!(error.message(), "speech synthesis output was empty");
+}
+
+#[tokio::test]
+async fn rejects_invalid_wav_containers_with_a_privacy_safe_error() {
+    let valid_wav = minimal_pcm_wav();
+
+    let mut wrong_magic = valid_wav.clone();
+    wrong_magic[..4].copy_from_slice(b"ID3\x04");
+
+    let mut undersized_riff = valid_wav.clone();
+    undersized_riff[4..8].copy_from_slice(&37_u32.to_le_bytes());
+
+    let mut oversized_riff = valid_wav.clone();
+    oversized_riff[4..8].copy_from_slice(&39_u32.to_le_bytes());
+
+    let mut maximal_riff = valid_wav.clone();
+    maximal_riff[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+
+    let mut truncated_chunk_body = Vec::from(&b"fmt "[..]);
+    truncated_chunk_body.extend_from_slice(&16_u32.to_le_bytes());
+    truncated_chunk_body.extend_from_slice(&valid_wav[20..35]);
+
+    let mut truncated_padding = valid_wav[..45].to_vec();
+    set_riff_size(&mut truncated_padding);
+
+    let missing_fmt = riff_with_body(&valid_wav[36..]);
+    let missing_data = riff_with_body(&valid_wav[12..36]);
+
+    let mut empty_data_body = valid_wav[12..36].to_vec();
+    empty_data_body.extend_from_slice(b"data");
+    empty_data_body.extend_from_slice(&0_u32.to_le_bytes());
+
+    let mut short_fmt_body = Vec::from(&b"fmt "[..]);
+    short_fmt_body.extend_from_slice(&15_u32.to_le_bytes());
+    short_fmt_body.extend_from_slice(&valid_wav[20..35]);
+    short_fmt_body.push(0);
+    short_fmt_body.extend_from_slice(&valid_wav[36..]);
+
+    let cases = [
+        ("JSON", br#"{"error":"private server details"}"#.to_vec()),
+        ("MP3 or wrong magic", wrong_magic),
+        ("truncated RIFF header", valid_wav[..11].to_vec()),
+        ("undersized RIFF declaration", undersized_riff),
+        ("oversized RIFF declaration", oversized_riff),
+        ("maximal RIFF declaration", maximal_riff),
+        ("truncated chunk header", riff_with_body(b"fmt ")),
+        (
+            "truncated chunk body",
+            riff_with_body(&truncated_chunk_body),
+        ),
+        ("truncated chunk padding", truncated_padding),
+        ("missing fmt chunk", missing_fmt),
+        ("short fmt chunk", riff_with_body(&short_fmt_body)),
+        ("missing data chunk", missing_data),
+        ("empty data chunk", riff_with_body(&empty_data_body)),
+    ];
+    let mut accepted = Vec::new();
+
+    for (name, body) in cases {
+        let server = FakeSpeechServer::success(body).await;
+        let result = synthesizer(server.endpoint())
+            .synthesize(
+                SpeechRequest::new(TurnId::new(17), "validate returned audio"),
+                CancellationToken::new(),
+            )
+            .await;
+
+        match result {
+            Ok(_) => accepted.push(name),
+            Err(error) => assert_eq!(
+                error.message(),
+                "speech synthesis output was not a valid WAV file",
+                "{name}"
+            ),
+        }
+    }
+
+    assert!(
+        accepted.is_empty(),
+        "accepted invalid WAV responses: {}",
+        accepted.join(", ")
+    );
 }
 
 #[tokio::test]
@@ -299,7 +384,8 @@ async fn cancellation_resolves_a_stalled_request() {
 #[tokio::test]
 async fn cancellation_after_completed_success_response_wins() {
     let cancellation = CancellationToken::new();
-    let server = FakeSpeechServer::success_then_cancelling([1, 2, 3], cancellation.clone()).await;
+    let server =
+        FakeSpeechServer::success_then_cancelling(minimal_pcm_wav(), cancellation.clone()).await;
     let speech = synthesizer(server.endpoint());
 
     let error = speech
@@ -352,14 +438,15 @@ async fn cancellation_after_completed_transport_error_wins() {
 #[tokio::test]
 async fn cancellation_after_completed_oversized_audio_error_wins() {
     let cancellation = CancellationToken::new();
-    let server =
-        FakeSpeechServer::success_then_cancelling([1, 2, 3, 4], cancellation.clone()).await;
+    let audio = minimal_pcm_wav();
+    let max_audio_bytes = audio.len() - 1;
+    let server = FakeSpeechServer::success_then_cancelling(audio, cancellation.clone()).await;
     let speech = OpenAiCompatibleSpeechSynthesizer::new(
         OpenAiCompatibleSpeechConfig::new("local-model")
             .unwrap()
             .with_endpoint(server.endpoint())
             .unwrap()
-            .with_max_audio_bytes(3)
+            .with_max_audio_bytes(max_audio_bytes)
             .unwrap(),
     );
 
@@ -398,6 +485,29 @@ fn synthesizer(endpoint: &str) -> OpenAiCompatibleSpeechSynthesizer {
             .with_endpoint(endpoint)
             .unwrap(),
     )
+}
+
+fn minimal_pcm_wav() -> Vec<u8> {
+    vec![
+        b'R', b'I', b'F', b'F', 38, 0, 0, 0, b'W', b'A', b'V', b'E', b'f', b'm', b't', b' ', 16, 0,
+        0, 0, 1, 0, 1, 0, 0x40, 0x1f, 0, 0, 0x40, 0x1f, 0, 0, 1, 0, 8, 0, b'd', b'a', b't', b'a',
+        1, 0, 0, 0, 0x80, 0,
+    ]
+}
+
+fn riff_with_body(body: &[u8]) -> Vec<u8> {
+    let mut wav = Vec::with_capacity(12 + body.len());
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&0_u32.to_le_bytes());
+    wav.extend_from_slice(b"WAVE");
+    wav.extend_from_slice(body);
+    set_riff_size(&mut wav);
+    wav
+}
+
+fn set_riff_size(wav: &mut [u8]) {
+    let riff_size = u32::try_from(wav.len() - 8).unwrap();
+    wav[4..8].copy_from_slice(&riff_size.to_le_bytes());
 }
 
 struct FakeSpeechServer {

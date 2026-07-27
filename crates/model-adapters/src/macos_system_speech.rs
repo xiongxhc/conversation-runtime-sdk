@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
@@ -12,6 +13,7 @@ use crate::{
 const DEFAULT_MAX_TEXT_BYTES: usize = 64 * 1024;
 const DEFAULT_MAX_AUDIO_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_STDERR_BYTES: usize = 8 * 1024;
+const STDERR_CLEANUP_GRACE: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MacOsSystemSpeechConfig {
@@ -179,7 +181,7 @@ impl SpeechSynthesizer for MacOsSystemSpeechSynthesizer {
                 .take()
                 .ok_or_else(|| AdapterError::new("failed to capture speech synthesis error"))?;
             let stderr_limit = self.config.max_stderr_bytes();
-            let stderr_task =
+            let mut stderr_task =
                 tokio::spawn(async move { read_bounded_prefix(stderr, stderr_limit).await });
 
             let status = tokio::select! {
@@ -187,7 +189,13 @@ impl SpeechSynthesizer for MacOsSystemSpeechSynthesizer {
                 _ = cancellation.cancelled() => {
                     let _ = child.start_kill();
                     let _ = child.wait().await;
-                    let _ = stderr_task.await;
+                    if tokio::time::timeout(STDERR_CLEANUP_GRACE, &mut stderr_task)
+                        .await
+                        .is_err()
+                    {
+                        stderr_task.abort();
+                        let _ = stderr_task.await;
+                    }
                     return Err(AdapterError::new("speech synthesis cancelled"));
                 }
                 status = child.wait() => {

@@ -370,6 +370,52 @@ async fn already_cancelled_request_does_not_start_the_process() {
 }
 
 #[cfg(unix)]
+#[tokio::test]
+async fn cancellation_does_not_wait_for_a_descendant_inheriting_stderr() {
+    use std::time::{Duration, Instant};
+
+    let fixture = tempfile::tempdir().unwrap();
+    let generated_audio = create_generated_directory(&fixture);
+    let pid_path = fixture.path().join("wrapper.pid");
+    let executable = write_script(
+        &fixture,
+        "wrapper-say",
+        &format!(
+            "#!/bin/sh\n/bin/sleep 1 &\nprintf '%s' \"$$\" > '{}'\nexec /bin/sleep 1\n",
+            pid_path.display()
+        ),
+    );
+    let synthesizer = MacOsSystemSpeechSynthesizer::new(
+        MacOsSystemSpeechConfig::new(executable)
+            .unwrap()
+            .with_temp_directory(&generated_audio)
+            .unwrap(),
+    );
+    let cancellation = CancellationToken::new();
+    let synthesis = synthesizer.synthesize(
+        SpeechRequest::new(TurnId::new(9), "cancel wrapper"),
+        cancellation.clone(),
+    );
+    let cancel_after_start = async {
+        while std::fs::read_to_string(&pid_path)
+            .map(|pid| pid.trim().is_empty())
+            .unwrap_or(true)
+        {
+            tokio::task::yield_now().await;
+        }
+        let cancelled_at = Instant::now();
+        cancellation.cancel();
+        cancelled_at
+    };
+
+    let (result, cancelled_at) = tokio::join!(synthesis, cancel_after_start);
+
+    assert_eq!(result.unwrap_err().message(), "speech synthesis cancelled");
+    assert!(cancelled_at.elapsed() < Duration::from_millis(750));
+    assert!(std::fs::read_dir(generated_audio).unwrap().next().is_none());
+}
+
+#[cfg(unix)]
 fn create_generated_directory(fixture: &tempfile::TempDir) -> std::path::PathBuf {
     let generated_audio = fixture.path().join("generated");
     std::fs::create_dir(&generated_audio).unwrap();

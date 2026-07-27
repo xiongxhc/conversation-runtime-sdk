@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -164,14 +165,14 @@ async fn run_probe(
     let synthesis_completed_ms = started_at.elapsed().as_millis();
 
     if let Some(output) = arguments.output {
-        tokio::fs::write(output, audio.bytes())
+        persist_audio(&output, &audio, &cancellation)
             .await
-            .map_err(|_| ProbeFailure::new("output", "failed to write requested audio output"))?;
+            .map_err(|error| ProbeFailure::new("output", error))?;
     }
 
     let playback_launched_ms = if arguments.play {
         Some(
-            play_audio(&audio, &config.player, cancellation)
+            play_audio(&audio, &config.player, cancellation.clone())
                 .await
                 .map_err(|error| ProbeFailure::new("playback", error))?
                 .launched_at
@@ -182,6 +183,10 @@ async fn run_probe(
         None
     };
 
+    if cancellation.is_cancelled() {
+        return Err(ProbeFailure::new("cancelled", "probe cancelled"));
+    }
+
     Ok(ProbeReport {
         format: match audio.format() {
             AudioFormat::Aiff => "aiff",
@@ -191,6 +196,20 @@ async fn run_probe(
         synthesis_completed_ms,
         playback_launched_ms,
     })
+}
+
+async fn persist_audio(
+    output: &Path,
+    audio: &SynthesizedAudio,
+    cancellation: &CancellationToken,
+) -> Result<(), String> {
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err("probe cancelled".to_owned()),
+        result = tokio::fs::write(output, audio.bytes()) => {
+            result.map_err(|_| "failed to write requested audio output".to_owned())
+        }
+    }
 }
 
 async fn play_audio(
@@ -331,25 +350,21 @@ async fn main() {
     let monitor_cancellation = cancellation.clone();
     let stop_reason = Arc::new(AtomicU8::new(0));
     let monitor_reason = Arc::clone(&stop_reason);
-    let monitor = tokio::spawn(async move {
-        tokio::select! {
-            _ = tokio::time::sleep(timeout) => {
-                monitor_reason.store(1, Ordering::Release);
-                monitor_cancellation.cancel();
-            }
-            _ = tokio::signal::ctrl_c() => {
-                monitor_reason.store(2, Ordering::Release);
-                monitor_cancellation.cancel();
-            }
-        }
-    });
+    let monitor = tokio::spawn(monitor_stop(
+        timeout,
+        tokio::signal::ctrl_c(),
+        monitor_cancellation,
+        monitor_reason,
+    ));
 
     let result = run_probe(arguments, config, cancellation).await;
     monitor.abort();
     let _ = monitor.await;
 
-    match result {
-        Ok(report) => {
+    match (result, stop_reason.load(Ordering::Acquire)) {
+        (_, 1) => exit_with_failure("timeout", started_at, "probe deadline exceeded"),
+        (_, 2) => exit_with_failure("interrupted", started_at, "probe interrupted"),
+        (Ok(report), _) => {
             println!(
                 "status=ok format={} encoded_bytes={} synthesis_completed_ms={} playback_launched_ms={}",
                 report.format,
@@ -360,11 +375,7 @@ async fn main() {
                     .map_or_else(|| "unavailable".to_owned(), |value| value.to_string())
             );
         }
-        Err(failure) => match stop_reason.load(Ordering::Acquire) {
-            1 => exit_with_failure("timeout", started_at, "probe deadline exceeded"),
-            2 => exit_with_failure("interrupted", started_at, "probe interrupted"),
-            _ => exit_with_failure(failure.stage, started_at, failure.message),
-        },
+        (Err(failure), _) => exit_with_failure(failure.stage, started_at, failure.message),
     }
 }
 
@@ -394,6 +405,30 @@ fn sanitize_message(message: &str) -> String {
         .join(" ")
 }
 
+async fn monitor_stop<F>(
+    timeout: Duration,
+    signal: F,
+    cancellation: CancellationToken,
+    reason: Arc<AtomicU8>,
+) where
+    F: Future<Output = std::io::Result<()>>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    let stop_reason = tokio::select! {
+        _ = tokio::time::sleep_until(deadline) => 1,
+        result = signal => {
+            if result.is_ok() {
+                2
+            } else {
+                tokio::time::sleep_until(deadline).await;
+                1
+            }
+        }
+    };
+    reason.store(stop_reason, Ordering::Release);
+    cancellation.cancel();
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
@@ -403,7 +438,8 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        parse_arguments, play_audio, run_probe, PlayerConfig, ProbeArguments, ProbeConfig,
+        monitor_stop, parse_arguments, persist_audio, play_audio, run_probe, PlayerConfig,
+        ProbeArguments, ProbeConfig,
     };
 
     #[test]
@@ -656,5 +692,41 @@ mod tests {
         assert!(played.exists());
         assert!(std::fs::read_dir(generated_temp).unwrap().next().is_none());
         assert!(std::fs::read_dir(playback_temp).unwrap().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelled_persistence_does_not_create_output() {
+        let fixture = tempfile::tempdir().unwrap();
+        let output = fixture.path().join("cancelled.aiff");
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let error = persist_audio(
+            &output,
+            &SynthesizedAudio::new(b"FORM-output".to_vec(), AudioFormat::Aiff),
+            &cancellation,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error, "probe cancelled");
+        assert!(!output.exists());
+    }
+
+    #[tokio::test]
+    async fn signal_registration_failure_falls_back_to_timeout() {
+        let cancellation = CancellationToken::new();
+        let reason = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+
+        monitor_stop(
+            std::time::Duration::from_millis(1),
+            async { Err(std::io::Error::other("signal unavailable")) },
+            cancellation.clone(),
+            std::sync::Arc::clone(&reason),
+        )
+        .await;
+
+        assert_eq!(reason.load(std::sync::atomic::Ordering::Acquire), 1);
+        assert!(cancellation.is_cancelled());
     }
 }

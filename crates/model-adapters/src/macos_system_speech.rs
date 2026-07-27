@@ -218,7 +218,9 @@ impl SpeechSynthesizer for MacOsSystemSpeechSynthesizer {
             }
 
             let bytes = read_audio(output.path(), self.config.max_audio_bytes()).await?;
-            Ok(SynthesizedAudio::new(bytes, AudioFormat::Aiff))
+            let audio = SynthesizedAudio::new(bytes, AudioFormat::Aiff);
+            audio.validate()?;
+            Ok(audio)
         })
     }
 }

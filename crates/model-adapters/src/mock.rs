@@ -110,7 +110,7 @@ impl SpeechSynthesizer for MockSpeechSynthesizer {
             }
 
             if self.delay.is_zero() {
-                return Ok(SynthesizedAudio::new(self.audio.clone(), AudioFormat::Aiff));
+                return self.synthesized_audio();
             }
 
             tokio::select! {
@@ -118,12 +118,17 @@ impl SpeechSynthesizer for MockSpeechSynthesizer {
                 _ = cancellation.cancelled() => {
                     Err(AdapterError::new("speech synthesis cancelled"))
                 }
-                _ = sleep(self.delay) => Ok(SynthesizedAudio::new(
-                    self.audio.clone(),
-                    AudioFormat::Aiff,
-                )),
+                _ = sleep(self.delay) => self.synthesized_audio(),
             }
         })
+    }
+}
+
+impl MockSpeechSynthesizer {
+    fn synthesized_audio(&self) -> Result<SynthesizedAudio, AdapterError> {
+        let audio = SynthesizedAudio::new(self.audio.clone(), AudioFormat::Aiff);
+        audio.validate()?;
+        Ok(audio)
     }
 }
 
@@ -214,7 +219,8 @@ mod tests {
 
     #[tokio::test]
     async fn mock_speech_synthesizer_returns_typed_aiff_audio() {
-        let speech = MockSpeechSynthesizer::new([1, 2, 3]);
+        let expected_audio = minimal_aiff();
+        let speech = MockSpeechSynthesizer::new(expected_audio.clone());
         let audio = speech
             .synthesize(
                 SpeechRequest::new(TurnId::new(1), "hello"),
@@ -223,7 +229,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(audio.bytes(), &[1, 2, 3]);
+        assert_eq!(audio.bytes(), expected_audio);
         assert_eq!(audio.format(), AudioFormat::Aiff);
     }
 
@@ -286,5 +292,18 @@ mod tests {
             .unwrap();
 
         assert_eq!(output.requests(), vec![request]);
+    }
+
+    fn minimal_aiff() -> Vec<u8> {
+        let mut bytes = Vec::from(&b"FORM"[..]);
+        bytes.extend_from_slice(&48_u32.to_be_bytes());
+        bytes.extend_from_slice(b"AIFFCOMM");
+        bytes.extend_from_slice(&18_u32.to_be_bytes());
+        bytes.extend_from_slice(&[0; 18]);
+        bytes.extend_from_slice(b"SSND");
+        bytes.extend_from_slice(&9_u32.to_be_bytes());
+        bytes.extend_from_slice(&[0; 8]);
+        bytes.extend_from_slice(&[0x80, 0]);
+        bytes
     }
 }

@@ -13,6 +13,19 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
+fn minimal_aiff() -> Vec<u8> {
+    let mut bytes = Vec::from(&b"FORM"[..]);
+    bytes.extend_from_slice(&48_u32.to_be_bytes());
+    bytes.extend_from_slice(b"AIFFCOMM");
+    bytes.extend_from_slice(&18_u32.to_be_bytes());
+    bytes.extend_from_slice(&[0; 18]);
+    bytes.extend_from_slice(b"SSND");
+    bytes.extend_from_slice(&9_u32.to_be_bytes());
+    bytes.extend_from_slice(&[0; 8]);
+    bytes.extend_from_slice(&[0x80, 0]);
+    bytes
+}
+
 struct CompletionSignallingSpeech {
     completed: Arc<AtomicBool>,
 }
@@ -58,7 +71,7 @@ impl SpeechSynthesizer for InvocationTrackingSpeech {
         _cancellation: CancellationToken,
     ) -> AdapterFuture<'a, SynthesizedAudio> {
         self.invoked.store(true, Ordering::Release);
-        Box::pin(async { Ok(SynthesizedAudio::new([], AudioFormat::Aiff)) })
+        Box::pin(async { Ok(SynthesizedAudio::new(minimal_aiff(), AudioFormat::Aiff)) })
     }
 }
 
@@ -70,7 +83,7 @@ impl SpeechSynthesizer for CompletionSignallingSpeech {
     ) -> AdapterFuture<'a, SynthesizedAudio> {
         Box::pin(async move {
             self.completed.store(true, Ordering::Release);
-            Ok(SynthesizedAudio::new([], AudioFormat::Aiff))
+            Ok(SynthesizedAudio::new(minimal_aiff(), AudioFormat::Aiff))
         })
     }
 }
@@ -138,7 +151,7 @@ async fn interruption_reaches_generation_and_skips_synthesis() {
 async fn immediate_interruption_preserves_the_started_event() {
     let runtime = ConversationRuntime::new(
         Arc::new(MockLanguageModel::delayed(["late"], Duration::from_secs(5))),
-        Arc::new(MockSpeechSynthesizer::new([1])),
+        Arc::new(MockSpeechSynthesizer::new(minimal_aiff())),
         Arc::new(DiscardAudioOutput),
     );
     let turn_id = TurnId::new(8);
@@ -160,7 +173,7 @@ async fn immediate_interruption_preserves_the_started_event() {
 async fn interruption_emits_one_cancelled_terminal_event() {
     let runtime = ConversationRuntime::new(
         Arc::new(MockLanguageModel::delayed(["late"], Duration::from_secs(5))),
-        Arc::new(MockSpeechSynthesizer::new([1])),
+        Arc::new(MockSpeechSynthesizer::new(minimal_aiff())),
         Arc::new(DiscardAudioOutput),
     );
     let turn_id = TurnId::new(7);
@@ -228,7 +241,7 @@ async fn waits_for_speech_cleanup_before_cancellation_completes() {
 async fn rejects_a_reused_turn_id() {
     let runtime = ConversationRuntime::new(
         Arc::new(MockLanguageModel::new(["response"])),
-        Arc::new(MockSpeechSynthesizer::new([1])),
+        Arc::new(MockSpeechSynthesizer::new(minimal_aiff())),
         Arc::new(DiscardAudioOutput),
     );
     let turn_id = TurnId::new(13);
@@ -254,7 +267,7 @@ async fn rejects_a_reused_turn_id() {
 async fn rejects_a_second_active_turn() {
     let runtime = ConversationRuntime::new(
         Arc::new(MockLanguageModel::delayed(["late"], Duration::from_secs(5))),
-        Arc::new(MockSpeechSynthesizer::new([1])),
+        Arc::new(MockSpeechSynthesizer::new(minimal_aiff())),
         Arc::new(DiscardAudioOutput),
     );
     let first_turn = TurnId::new(1);

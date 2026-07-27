@@ -14,6 +14,19 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
+fn minimal_aiff() -> Vec<u8> {
+    let mut bytes = Vec::from(&b"FORM"[..]);
+    bytes.extend_from_slice(&48_u32.to_be_bytes());
+    bytes.extend_from_slice(b"AIFFCOMM");
+    bytes.extend_from_slice(&18_u32.to_be_bytes());
+    bytes.extend_from_slice(&[0; 18]);
+    bytes.extend_from_slice(b"SSND");
+    bytes.extend_from_slice(&9_u32.to_be_bytes());
+    bytes.extend_from_slice(&[0; 8]);
+    bytes.extend_from_slice(&[0x80, 0]);
+    bytes
+}
+
 struct FailingLanguageModel;
 struct FailingSpeechSynthesizer;
 
@@ -71,7 +84,7 @@ impl SpeechSynthesizer for FailingSpeechSynthesizer {
 async fn emits_an_ordered_completed_turn() {
     let runtime = ConversationRuntime::new(
         Arc::new(MockLanguageModel::new(["hello", " there"])),
-        Arc::new(MockSpeechSynthesizer::new([1, 2, 3])),
+        Arc::new(MockSpeechSynthesizer::new(minimal_aiff())),
         Arc::new(DiscardAudioOutput),
     );
     let turn_id = TurnId::new(1);
@@ -113,7 +126,7 @@ async fn emits_an_ordered_completed_turn() {
 async fn reports_language_model_failure_as_the_only_terminal_event() {
     let runtime = ConversationRuntime::new(
         Arc::new(FailingLanguageModel),
-        Arc::new(MockSpeechSynthesizer::new([1])),
+        Arc::new(MockSpeechSynthesizer::new(minimal_aiff())),
         Arc::new(DiscardAudioOutput),
     );
     let turn_id = TurnId::new(2);
@@ -148,7 +161,7 @@ async fn bounds_language_model_responses_and_cancels_the_model_child_token() {
         Arc::new(OverflowingLanguageModel {
             cancellation_observed: Arc::clone(&cancellation_observed),
         }),
-        Arc::new(MockSpeechSynthesizer::new([1])),
+        Arc::new(MockSpeechSynthesizer::new(minimal_aiff())),
         Arc::new(DiscardAudioOutput),
     )
     .with_max_response_bytes(4)
@@ -197,7 +210,7 @@ async fn accepts_exactly_the_default_runtime_response_limit() {
     let delta = "a".repeat(64 * 1024);
     let runtime = ConversationRuntime::new(
         Arc::new(MockLanguageModel::new([delta])),
-        Arc::new(MockSpeechSynthesizer::new([1])),
+        Arc::new(MockSpeechSynthesizer::new(minimal_aiff())),
         Arc::new(DiscardAudioOutput),
     );
     let turn_id = TurnId::new(6);
@@ -219,7 +232,7 @@ async fn accepts_exactly_the_default_runtime_response_limit() {
 async fn rejects_one_byte_over_the_default_runtime_response_limit() {
     let runtime = ConversationRuntime::new(
         Arc::new(MockLanguageModel::new(["a".repeat(64 * 1024 + 1)])),
-        Arc::new(MockSpeechSynthesizer::new([1])),
+        Arc::new(MockSpeechSynthesizer::new(minimal_aiff())),
         Arc::new(DiscardAudioOutput),
     );
     let turn_id = TurnId::new(7);
@@ -254,7 +267,7 @@ async fn rejects_one_byte_over_the_default_runtime_response_limit() {
 fn rejects_a_zero_runtime_response_limit() {
     let runtime = ConversationRuntime::new(
         Arc::new(MockLanguageModel::new(["response"])),
-        Arc::new(MockSpeechSynthesizer::new([1])),
+        Arc::new(MockSpeechSynthesizer::new(minimal_aiff())),
         Arc::new(DiscardAudioOutput),
     );
 
@@ -295,7 +308,10 @@ async fn reports_speech_failure_with_the_synthesis_stage() {
 async fn cancels_during_speech_synthesis() {
     let runtime = ConversationRuntime::new(
         Arc::new(MockLanguageModel::new(["response"])),
-        Arc::new(MockSpeechSynthesizer::delayed([1], Duration::from_secs(5))),
+        Arc::new(MockSpeechSynthesizer::delayed(
+            minimal_aiff(),
+            Duration::from_secs(5),
+        )),
         Arc::new(DiscardAudioOutput),
     );
     let turn_id = TurnId::new(3);
@@ -324,7 +340,7 @@ async fn cancels_during_speech_synthesis() {
 async fn reuses_runtime_after_a_completed_turn() {
     let runtime = ConversationRuntime::new(
         Arc::new(MockLanguageModel::new(["response"])),
-        Arc::new(MockSpeechSynthesizer::new([1])),
+        Arc::new(MockSpeechSynthesizer::new(minimal_aiff())),
         Arc::new(DiscardAudioOutput),
     );
 

@@ -7,6 +7,19 @@ use conversation_protocol::{
 };
 use conversation_runtime::{ConversationRuntime, RuntimeCommandResult};
 
+fn minimal_aiff() -> Vec<u8> {
+    let mut bytes = Vec::from(&b"FORM"[..]);
+    bytes.extend_from_slice(&48_u32.to_be_bytes());
+    bytes.extend_from_slice(b"AIFFCOMM");
+    bytes.extend_from_slice(&18_u32.to_be_bytes());
+    bytes.extend_from_slice(&[0; 18]);
+    bytes.extend_from_slice(b"SSND");
+    bytes.extend_from_slice(&9_u32.to_be_bytes());
+    bytes.extend_from_slice(&[0; 8]);
+    bytes.extend_from_slice(&[0x80, 0]);
+    bytes
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TimingSample {
     label: &'static str,
@@ -30,7 +43,7 @@ pub async fn measure_mock_turn(transcript: &str) -> Result<Vec<TimingSample>, Ru
             Duration::from_millis(5),
         )),
         Arc::new(MockSpeechSynthesizer::delayed(
-            [1, 2, 3],
+            minimal_aiff(),
             Duration::from_millis(5),
         )),
         Arc::new(DiscardAudioOutput),

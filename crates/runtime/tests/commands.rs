@@ -5,11 +5,24 @@ use conversation_model_adapters::{DiscardAudioOutput, MockLanguageModel, MockSpe
 use conversation_protocol::{RuntimeCommand, RuntimeEvent, TurnId};
 use conversation_runtime::{ConversationRuntime, RuntimeCommandResult, TurnEventStream};
 
+fn minimal_aiff() -> Vec<u8> {
+    let mut bytes = Vec::from(&b"FORM"[..]);
+    bytes.extend_from_slice(&48_u32.to_be_bytes());
+    bytes.extend_from_slice(b"AIFFCOMM");
+    bytes.extend_from_slice(&18_u32.to_be_bytes());
+    bytes.extend_from_slice(&[0; 18]);
+    bytes.extend_from_slice(b"SSND");
+    bytes.extend_from_slice(&9_u32.to_be_bytes());
+    bytes.extend_from_slice(&[0; 8]);
+    bytes.extend_from_slice(&[0x80, 0]);
+    bytes
+}
+
 #[tokio::test]
 async fn executes_typed_start_and_interrupt_commands() {
     let runtime = ConversationRuntime::new(
         Arc::new(MockLanguageModel::delayed(["late"], Duration::from_secs(5))),
-        Arc::new(MockSpeechSynthesizer::new([1])),
+        Arc::new(MockSpeechSynthesizer::new(minimal_aiff())),
         Arc::new(DiscardAudioOutput),
     );
     let turn_id = TurnId::new(1);

@@ -113,6 +113,11 @@ async fn synthesizes_aiff_without_shell_interpretation() {
     fs::create_dir(&generated_audio).unwrap();
     let capture_path = fixture.path().join("arguments.txt");
     let executable = fixture.path().join("fake-say");
+    let expected_audio = minimal_aiff();
+    let shell_audio = expected_audio
+        .iter()
+        .map(|byte| format!("\\{byte:03o}"))
+        .collect::<String>();
     let script = format!(
         "#!/bin/sh\n\
          : > '{}'\n\
@@ -127,12 +132,13 @@ async fn synthesizes_aiff_without_shell_interpretation() {
            shift\n\
          done\n\
          for argument in \"$@\"; do printf '%s\\n' \"$argument\" >> '{}'; done\n\
-         printf 'FORM-fake-aiff' > \"$output\"\n",
+         printf '{}' > \"$output\"\n",
         capture_path.display(),
         capture_path.display(),
         capture_path.display(),
         capture_path.display(),
         capture_path.display(),
+        shell_audio,
     );
     fs::write(&executable, script).unwrap();
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
@@ -158,7 +164,7 @@ async fn synthesizes_aiff_without_shell_interpretation() {
         .unwrap();
 
     assert_eq!(audio.format(), AudioFormat::Aiff);
-    assert_eq!(audio.bytes(), b"FORM-fake-aiff");
+    assert_eq!(audio.bytes(), expected_audio);
     assert!(!marker.exists());
 
     let captured = fs::read_to_string(capture_path).unwrap();
@@ -430,4 +436,18 @@ fn write_script(fixture: &tempfile::TempDir, name: &str, contents: &str) -> std:
     std::fs::write(&executable, contents).unwrap();
     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
     executable
+}
+
+#[cfg(unix)]
+fn minimal_aiff() -> Vec<u8> {
+    let mut bytes = Vec::from(&b"FORM"[..]);
+    bytes.extend_from_slice(&48_u32.to_be_bytes());
+    bytes.extend_from_slice(b"AIFFCOMM");
+    bytes.extend_from_slice(&18_u32.to_be_bytes());
+    bytes.extend_from_slice(&[0; 18]);
+    bytes.extend_from_slice(b"SSND");
+    bytes.extend_from_slice(&9_u32.to_be_bytes());
+    bytes.extend_from_slice(&[0; 8]);
+    bytes.extend_from_slice(&[0x80, 0]);
+    bytes
 }

@@ -11,16 +11,39 @@ use conversation_model_adapters::{
     SpeechRequest, SpeechSynthesizer, SynthesizedAudio,
 };
 use conversation_protocol::TurnId;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_VOICE_LIST_BYTES: usize = 64 * 1024;
+const USAGE: &str = "Usage: conversation-tts-probe [OPTIONS] [--] [TEXT ...]\n\
+Options:\n\
+  --voice <name>       Select an exact installed macOS voice\n\
+  --rate <wpm>         Set a non-zero speaking rate\n\
+  --config <path>      Load profiles from an absolute TOML file\n\
+  --profile <id>       Select a configured profile\n\
+  --list-voices        List installed macOS voices and exit\n\
+  --no-play            Synthesize without playback\n\
+  --output <path>      Persist AIFF to an absolute path\n\
+  --help               Print this help";
 
 #[derive(Debug, Eq, PartialEq)]
 struct ProbeArguments {
     text: String,
     output: Option<PathBuf>,
     play: bool,
+    voice: Option<String>,
+    rate: Option<u32>,
+    config_path: Option<PathBuf>,
+    profile_id: Option<String>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ProbeAction {
+    Run(ProbeArguments),
+    ListVoices,
+    Help,
 }
 
 #[derive(Debug)]
@@ -264,7 +287,7 @@ fn adapter_message(error: AdapterError) -> String {
     error.message().to_owned()
 }
 
-fn parse_arguments<I, S, R>(arguments: I, mut standard_input: R) -> Result<ProbeArguments, String>
+fn parse_arguments<I, S, R>(arguments: I, mut standard_input: R) -> Result<ProbeAction, String>
 where
     I: IntoIterator<Item = S>,
     S: Into<String>,
@@ -275,6 +298,11 @@ where
     let mut output = None;
     let mut play = true;
     let mut no_play_seen = false;
+    let mut voice = None;
+    let mut rate = None;
+    let mut config_path = None;
+    let mut profile_id = None;
+    let mut terminal_action = None;
     let mut text = Vec::new();
     let mut parse_flags = true;
 
@@ -291,6 +319,63 @@ where
                     }
                     no_play_seen = true;
                     play = false;
+                    continue;
+                }
+                "--voice" => {
+                    if voice.is_some() {
+                        return Err("the --voice flag may be provided only once".to_owned());
+                    }
+                    voice = Some(next_option_value(&mut arguments, "--voice")?);
+                    continue;
+                }
+                "--rate" => {
+                    if rate.is_some() {
+                        return Err("the --rate flag may be provided only once".to_owned());
+                    }
+                    let value = next_option_value(&mut arguments, "--rate")?;
+                    let parsed = value
+                        .parse::<u32>()
+                        .map_err(|_| "the --rate value must be a non-zero integer".to_owned())?;
+                    if parsed == 0 {
+                        return Err("the --rate value must be a non-zero integer".to_owned());
+                    }
+                    rate = Some(parsed);
+                    continue;
+                }
+                "--config" => {
+                    if config_path.is_some() {
+                        return Err("the --config flag may be provided only once".to_owned());
+                    }
+                    let path = PathBuf::from(next_option_value(&mut arguments, "--config")?);
+                    if !path.is_absolute() {
+                        return Err("the --config path must be absolute".to_owned());
+                    }
+                    config_path = Some(path);
+                    continue;
+                }
+                "--profile" => {
+                    if profile_id.is_some() {
+                        return Err("the --profile flag may be provided only once".to_owned());
+                    }
+                    let value = next_option_value(&mut arguments, "--profile")?;
+                    if value.is_empty() {
+                        return Err("the --profile value must not be empty".to_owned());
+                    }
+                    profile_id = Some(value);
+                    continue;
+                }
+                "--list-voices" => {
+                    if terminal_action.is_some() {
+                        return Err("terminal actions may be provided only once".to_owned());
+                    }
+                    terminal_action = Some(ProbeAction::ListVoices);
+                    continue;
+                }
+                "--help" => {
+                    if terminal_action.is_some() {
+                        return Err("terminal actions may be provided only once".to_owned());
+                    }
+                    terminal_action = Some(ProbeAction::Help);
                     continue;
                 }
                 "--output" => {
@@ -328,21 +413,221 @@ where
     };
 
     if text.is_empty() {
-        return Err("speech text must not be empty".to_owned());
+        if let Some(action) = terminal_action {
+            if output.is_some()
+                || !play
+                || voice.is_some()
+                || rate.is_some()
+                || config_path.is_some()
+                || profile_id.is_some()
+            {
+                return Err("terminal actions cannot be combined with run options".to_owned());
+            }
+            return Ok(action);
+        }
+        let mut input = String::new();
+        standard_input
+            .read_to_string(&mut input)
+            .map_err(|_| "failed to read text from standard input".to_owned())?;
+        let input = input.trim().to_owned();
+        if input.is_empty() {
+            return Err("speech text must not be empty".to_owned());
+        }
+        return Ok(ProbeAction::Run(ProbeArguments {
+            text: input,
+            output,
+            play,
+            voice,
+            rate,
+            config_path,
+            profile_id,
+        }));
     }
 
-    Ok(ProbeArguments { text, output, play })
+    if terminal_action.is_some() {
+        return Err("terminal actions cannot be combined with text".to_owned());
+    }
+
+    Ok(ProbeAction::Run(ProbeArguments {
+        text,
+        output,
+        play,
+        voice,
+        rate,
+        config_path,
+        profile_id,
+    }))
+}
+
+fn next_option_value<I>(arguments: &mut I, option: &str) -> Result<String, String>
+where
+    I: Iterator<Item = String>,
+{
+    let value = arguments
+        .next()
+        .ok_or_else(|| format!("{option} requires a value"))?;
+    if value.starts_with("--") {
+        return Err(format!("{option} requires a value"));
+    }
+    Ok(value)
+}
+
+fn speech_executable<F>(lookup: F) -> Result<PathBuf, String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let executable = match lookup("CONVERSATION_TTS_SAY_PATH") {
+        Some(path) => PathBuf::from(path),
+        None => {
+            #[cfg(target_os = "macos")]
+            {
+                PathBuf::from("/usr/bin/say")
+            }
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                return Err("macOS system speech is unavailable on this platform".to_owned());
+            }
+        }
+    };
+    if !executable.is_absolute() {
+        return Err("speech executable must be absolute".to_owned());
+    }
+    Ok(executable)
+}
+
+async fn read_bounded<R>(mut reader: R, limit: usize) -> Result<Vec<u8>, String>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut bytes = Vec::new();
+    let mut buffer = [0; 8192];
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .await
+            .map_err(|_| "failed to read installed voices".to_owned())?;
+        if count == 0 {
+            return Ok(bytes);
+        }
+        if bytes.len() + count > limit {
+            return Err("installed voice list exceeded 64 KiB".to_owned());
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+}
+
+async fn drain<R>(mut reader: R) -> Result<(), String>
+where
+    R: AsyncRead + Unpin,
+{
+    tokio::io::copy(&mut reader, &mut tokio::io::sink())
+        .await
+        .map(|_| ())
+        .map_err(|_| "failed to read installed voice errors".to_owned())
+}
+
+async fn list_voices(executable: &Path) -> Result<Vec<u8>, String> {
+    let mut command = Command::new(executable);
+    command
+        .args(["-v", "?"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .map_err(|_| "failed to start voice discovery".to_owned())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "failed to capture installed voices".to_owned())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "failed to capture voice discovery errors".to_owned())?;
+    let mut stdout_task = tokio::spawn(read_bounded(stdout, MAX_VOICE_LIST_BYTES));
+    let stderr_task = tokio::spawn(drain(stderr));
+
+    let (voices, status) = tokio::select! {
+        result = &mut stdout_task => {
+            let voices = result
+                .map_err(|_| "failed to read installed voices".to_owned())??;
+            let status = child
+                .wait()
+                .await
+                .map_err(|_| "failed to wait for voice discovery".to_owned())?;
+            (voices, status)
+        }
+        result = child.wait() => {
+            let status = result
+                .map_err(|_| "failed to wait for voice discovery".to_owned())?;
+            let voices = stdout_task
+                .await
+                .map_err(|_| "failed to read installed voices".to_owned())??;
+            (voices, status)
+        }
+    };
+    let _ = stderr_task.await;
+
+    if !status.success() {
+        return Err("voice discovery process failed".to_owned());
+    }
+    Ok(voices)
 }
 
 #[tokio::main]
 async fn main() {
     let started_at = Instant::now();
-    let arguments = match parse_arguments(std::env::args(), std::io::stdin().lock()) {
-        Ok(arguments) => arguments,
+    let action = match parse_arguments(std::env::args(), std::io::stdin().lock()) {
+        Ok(action) => action,
         Err(message) => exit_with_failure("arguments", started_at, message),
     };
+    let arguments = match action {
+        ProbeAction::Help => {
+            print!("{USAGE}");
+            return;
+        }
+        ProbeAction::ListVoices => {
+            let executable = match speech_executable(|key| std::env::var(key).ok()) {
+                Ok(executable) => executable,
+                Err(message) => exit_with_failure("voice-discovery", started_at, message),
+            };
+            let voices = match list_voices(&executable).await {
+                Ok(voices) => voices,
+                Err(message) => exit_with_failure("voice-discovery", started_at, message),
+            };
+            if let Err(error) = std::io::stdout().write_all(&voices) {
+                exit_with_failure(
+                    "voice-discovery",
+                    started_at,
+                    format!("failed to write installed voices: {error}"),
+                );
+            }
+            return;
+        }
+        ProbeAction::Run(arguments) => arguments,
+    };
     let config = match ProbeConfig::from_lookup(|key| std::env::var(key).ok()) {
-        Ok(config) => config,
+        Ok(mut config) => {
+            if let Some(voice) = arguments.voice.as_deref() {
+                config.speech = match config.speech.with_voice(voice) {
+                    Ok(speech) => speech,
+                    Err(error) => {
+                        exit_with_failure("configuration", started_at, adapter_message(error))
+                    }
+                };
+            }
+            if let Some(rate) = arguments.rate {
+                config.speech = match config.speech.with_rate(rate) {
+                    Ok(speech) => speech,
+                    Err(error) => {
+                        exit_with_failure("configuration", started_at, adapter_message(error))
+                    }
+                };
+            }
+            config
+        }
         Err(message) => exit_with_failure("configuration", started_at, message),
     };
     let timeout = config.timeout;
@@ -439,8 +724,84 @@ mod tests {
 
     use super::{
         monitor_stop, parse_arguments, persist_audio, play_audio, run_probe, PlayerConfig,
-        ProbeArguments, ProbeConfig,
+        ProbeAction, ProbeArguments, ProbeConfig,
     };
+
+    #[test]
+    fn parses_voice_rate_and_text() {
+        let action = parse_arguments(
+            [
+                "conversation-tts-probe",
+                "--voice",
+                "Daniel",
+                "--rate",
+                "190",
+                "hello",
+            ],
+            Cursor::new(""),
+        )
+        .unwrap();
+
+        assert_eq!(
+            action,
+            ProbeAction::Run(ProbeArguments {
+                text: "hello".to_owned(),
+                output: None,
+                play: true,
+                voice: Some("Daniel".to_owned()),
+                rate: Some(190),
+                config_path: None,
+                profile_id: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_help_and_list_voices_without_text() {
+        assert_eq!(
+            parse_arguments(["probe", "--help"], Cursor::new("")).unwrap(),
+            ProbeAction::Help
+        );
+        assert_eq!(
+            parse_arguments(["probe", "--list-voices"], Cursor::new(""),).unwrap(),
+            ProbeAction::ListVoices
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_cli_combinations() {
+        let cases = [
+            vec!["probe", "--voice", "Daniel", "--voice", "Karen", "hello"],
+            vec!["probe", "--rate", "190", "--rate", "200", "hello"],
+            vec![
+                "probe",
+                "--config",
+                "/tmp/one.toml",
+                "--config",
+                "/tmp/two.toml",
+            ],
+            vec!["probe", "--profile", "one", "--profile", "two"],
+            vec!["probe", "--list-voices", "--no-play"],
+            vec!["probe", "--help", "hello"],
+            vec!["probe", "--list-voices", "hello"],
+            vec!["probe", "--voice"],
+            vec!["probe", "--rate"],
+            vec!["probe", "--config"],
+            vec!["probe", "--profile"],
+            vec!["probe", "--rate", "0", "hello"],
+            vec!["probe", "--rate", "fast", "hello"],
+            vec!["probe", "--help", "--output", "/tmp/out.aiff"],
+            vec!["probe", "--list-voices", "--voice", "Daniel"],
+            vec!["probe", "--unknown", "hello"],
+        ];
+
+        for arguments in cases {
+            assert!(
+                parse_arguments(arguments, Cursor::new("")).is_err(),
+                "arguments should be rejected"
+            );
+        }
+    }
 
     #[test]
     fn parses_text_playback_and_absolute_output() {
@@ -458,11 +819,15 @@ mod tests {
 
         assert_eq!(
             parsed,
-            ProbeArguments {
+            ProbeAction::Run(ProbeArguments {
                 text: "hello locally".to_owned(),
                 output: Some(output),
                 play: false,
-            }
+                voice: None,
+                rate: None,
+                config_path: None,
+                profile_id: None,
+            })
         );
     }
 
@@ -474,6 +839,9 @@ mod tests {
         )
         .unwrap();
 
+        let ProbeAction::Run(parsed) = parsed else {
+            panic!("expected run action");
+        };
         assert_eq!(parsed.text, "hello privately");
         assert!(parsed.output.is_none());
         assert!(parsed.play);
@@ -678,6 +1046,10 @@ mod tests {
                 text: "hello locally".to_owned(),
                 output: Some(output.clone()),
                 play: true,
+                voice: None,
+                rate: None,
+                config_path: None,
+                profile_id: None,
             },
             config,
             CancellationToken::new(),

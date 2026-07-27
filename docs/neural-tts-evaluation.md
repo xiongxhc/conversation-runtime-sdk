@@ -43,6 +43,17 @@ After sequential 0.6B and 1.7B loading, the observed process had a 7.1 GB physic
 
 The host's uncapped backend default, `max_tokens = 1200`, generated 96.0 s of WAV in 41.92 s for one short Mandarin sentence. The runnable profiles therefore set `max_tokens = 128` and `repetition_penalty = 1.05`.
 
+## Rust Probe End-to-End Evidence
+
+The controller completed the following runs through the actual Rust probe against MLX-Audio at `127.0.0.1`. These measurements prove complete-response synthesis and, where noted, the launch of local playback; they do not measure first playable or first audible audio.
+
+| Profile | Text | Playback | Result | Encoded WAV | Synthesis completed | Playback launched | Audio metadata |
+| --- | --- | --- | --- | ---: | ---: | ---: | --- |
+| `local-neural-quality` | `你好，这是 Conversation Runtime SDK 的本地神经语音测试。` | `--no-play`, explicit WAV output | `status=ok format=wav` | 268,844 bytes | 2.194 s | unavailable | 24 kHz mono PCM; 5.60 s |
+| `local-neural-quality` | `你好，Chris。这是现在接入 SDK 的本地神经语音。` | `afplay` | `status=ok format=wav` | 491,564 bytes | 3.908 s | 3.910 s | Not captured |
+
+The `afplay` value records process launch, not a verified audible-output time. First playable audio, first audible audio, and user listening or subjective quality verdicts remain pending.
+
 ## Required Decision Evidence
 
 Record these fields for every candidate and comparison before selecting a consuming deployment's model or voice:

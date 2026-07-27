@@ -44,7 +44,7 @@ Runtime timing events share one monotonic origin captured at `TurnStarted`:
 
 - `FirstTextDelta` is observed immediately before the first text delta;
 - `FirstSynthesisRequest` is observed immediately before the first speech-adapter call;
-- `FirstPlayableAudio` is observed after typed audio validation and immediately before the first output-adapter call.
+- `FirstPlayableAudio` is timestamped after typed-audio validation and before lifecycle publication and output handoff. It causally precedes the first output-adapter call.
 
 First playable audio means validated encoded bytes are ready for output. It is not a claim that an output process has launched or that a physical speaker has become audible.
 

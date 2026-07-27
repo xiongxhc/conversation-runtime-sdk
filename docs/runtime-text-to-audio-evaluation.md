@@ -95,17 +95,26 @@ The generated text was:
 
 ### Results
 
-| Measurement | Elapsed from probe start |
+Runtime milestones use the monotonic origin captured inside the runtime when
+the turn starts:
+
+| Runtime milestone | Elapsed from runtime turn start |
 | --- | ---: |
 | First text delta | 8,966 ms |
 | First synthesis request | 8,982 ms |
 | First playable audio | 15,317 ms |
+
+The wrapper and controller values use the separate shell timestamp captured
+immediately before the probe process was launched:
+
+| External observation | Elapsed from process launch |
+| --- | ---: |
 | Wrapper-observed playback-process launch | 16,456.780 ms |
 | Total turn completion | 39,812.784 ms |
 
-`FirstPlayableAudio` means the first non-empty encoded segment passed typed-audio validation and was ready for the output adapter. Playback-process launch occurred 1,139.780 ms later. Neither value is first audible sound. Total completion includes sequential synthesis and playback for all response segments plus owned cleanup.
+`FirstPlayableAudio` means the first non-empty encoded segment passed typed-audio validation. Its timestamp is captured before lifecycle publication and output handoff, and it causally precedes the first output-adapter call. The runtime-turn and process-launch origins have no recorded offset, so values from the two tables cannot be subtracted to establish an interval. Neither first playable nor playback-process launch is first audible sound. Total completion includes sequential synthesis and playback for all response segments plus owned cleanup.
 
-This cold cached run does not validate the roadmap's 1.2-second time-to-useful-audio goal. It is one sample, both readiness proxies exceed that target, and the required first-audible measurement is still absent.
+This cold cached run does not validate the roadmap's 1.2-second time-to-useful-audio goal. It is one sample, its timing origins do not match a measured speech-end-to-audible interval, and the required first-audible measurement is absent.
 
 ## Cleanup Evidence
 

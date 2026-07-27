@@ -8,7 +8,7 @@ cargo run -p conversation-latency-harness -- "hello runtime"
 
 It emits CSV checkpoints for turn start, final transcript, first text delta, speech start, first synthesis request, first playable audio, speech completion, and terminal completion. Its sequence and causal milestone ordering are tested, and it uses mock adapters with controlled delays.
 
-`first_playable_audio` is the runtime timestamp after typed audio validation and immediately before the output-adapter call. It is not playback-process launch or first audible sound.
+`first_playable_audio` is timestamped after typed-audio validation and before lifecycle publication and output handoff. It causally precedes the first output-adapter call; it is not playback-process launch or first audible sound.
 
 The integrated `conversation-voice-probe` reports the same three runtime milestones for real configured adapters. Machine-specific evidence can add an external playback-launch observer and total completion timing without changing lifecycle semantics. See [the runtime text-to-audio evaluation](../../docs/runtime-text-to-audio-evaluation.md).
 

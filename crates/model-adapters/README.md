@@ -25,3 +25,7 @@ The Ollama-specific `stream_chat` path additionally exposes final load, prompt-e
 `OpenAiCompatibleSpeechConfig` requires a model identifier and accepts an endpoint, voice, speed, language, delivery instructions, generation-token limit, repetition penalty, text-byte limit, and encoded-audio-byte limit. The request is sent to `/v1/audio/speech` with `response_format = "wav"`. The adapter disables redirects, propagates cancellation, bounds input and returned audio, and returns typed WAV bytes without exposing host-specific request types to protocol or runtime crates.
 
 The repository includes generic local profiles and a separate MLX-Audio evaluation example. Neither selects a backend or model for SDK consumers. Exact candidate revisions, machine measurements, license and consent evidence, first-playable-audio timing, and subjective quality evaluation belong in [docs/neural-tts-evaluation.md](../../docs/neural-tts-evaluation.md).
+
+## macOS Audio Output
+
+`MacOsAfplayAudioOutput` plays validated typed AIFF or WAV audio through an explicitly configured absolute executable path. It writes a format-suffixed temporary input, invokes the executable directly without a shell, drains bounded standard error, observes cancellation by killing and awaiting the child process, and removes the temporary input on every outcome. `MacOsAfplayConfig::system_default` uses `/usr/bin/afplay` only on macOS; other platforms receive an explicit unavailable error.

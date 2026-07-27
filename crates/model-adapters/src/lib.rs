@@ -1,5 +1,6 @@
 mod audio_output;
 mod language_model;
+mod macos_afplay;
 mod macos_system_speech;
 mod mock;
 mod ollama;
@@ -13,6 +14,7 @@ use std::pin::Pin;
 
 pub use audio_output::{AudioOutput, AudioOutputRequest, DiscardAudioOutput};
 pub use language_model::{LanguageModel, LanguageModelRequest};
+pub use macos_afplay::{MacOsAfplayAudioOutput, MacOsAfplayConfig};
 pub use macos_system_speech::{MacOsSystemSpeechConfig, MacOsSystemSpeechSynthesizer};
 pub use mock::{MockAudioOutput, MockLanguageModel, MockSpeechSynthesizer};
 pub use ollama::{

@@ -170,6 +170,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "conversation-voice-probe"
+version = "0.1.0"
+dependencies = [
+ "conversation-model-adapters",
+ "conversation-protocol",
+ "conversation-runtime",
+ "reqwest",
+ "serde",
+ "tempfile",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

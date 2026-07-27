@@ -1,0 +1,30 @@
+schema_version = 1
+
+[language]
+endpoint = "http://127.0.0.1:11434"
+model = "replace-with-installed-model-id"
+thinking = false
+temperature = 0.0
+seed = 42
+num_predict = 128
+num_ctx = 8192
+max_assistant_content_bytes = 65536
+
+[speech]
+endpoint = "http://127.0.0.1:8000/v1"
+model = "replace-with-local-speech-model"
+voice = "replace-with-local-voice"
+speed = 1.0
+language = "replace-with-language-hint"
+instructions = "Speak naturally and clearly."
+max_tokens = 128
+repetition_penalty = 1.05
+max_text_bytes = 4096
+max_audio_bytes = 8388608
+
+[audio]
+backend = "macos-afplay"
+executable = "/usr/bin/afplay"
+temp_directory = "/private/tmp"
+max_audio_bytes = 8388608
+max_error_bytes = 4096

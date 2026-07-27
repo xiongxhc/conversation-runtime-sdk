@@ -6,6 +6,7 @@ members = [
     "tests/latency",
     "tests/ollama",
     "tests/tts",
+    "tests/voice",
 ]
 resolver = "2"
 

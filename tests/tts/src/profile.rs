@@ -1,9 +1,9 @@
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
+    use std::io::{Cursor, Write};
     use std::path::Path;
 
-    use super::SpeechProfile;
+    use super::{read_profile_contents, SpeechProfile, MAX_PROFILE_BYTES};
 
     fn write_profile(contents: &str) -> tempfile::NamedTempFile {
         let mut file = tempfile::NamedTempFile::new().unwrap();
@@ -55,6 +55,16 @@ rate_wpm = 180
         let file = write_profile(&format!("{}\n", "#".repeat(64 * 1024)));
 
         assert!(SpeechProfile::load(file.path(), None).is_err());
+    }
+
+    #[test]
+    fn rejects_reader_larger_than_64_kib() {
+        let contents = vec![b'#'; (MAX_PROFILE_BYTES + 1) as usize];
+
+        assert_eq!(
+            read_profile_contents(Cursor::new(contents)).unwrap_err(),
+            "speech profile file exceeded 64 KiB"
+        );
     }
 
     #[test]
@@ -174,11 +184,24 @@ rate_wpm = 0
 }
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::Path;
 
 use serde::Deserialize;
 
 const MAX_PROFILE_BYTES: u64 = 64 * 1024;
+
+fn read_profile_contents(reader: impl Read) -> Result<String, String> {
+    let mut contents = String::new();
+    reader
+        .take(MAX_PROFILE_BYTES + 1)
+        .read_to_string(&mut contents)
+        .map_err(|_| "failed to read speech profile file".to_owned())?;
+    if contents.len() as u64 > MAX_PROFILE_BYTES {
+        return Err("speech profile file exceeded 64 KiB".to_owned());
+    }
+    Ok(contents)
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -218,8 +241,9 @@ impl SpeechProfile {
         if metadata.len() > MAX_PROFILE_BYTES {
             return Err("speech profile file exceeded 64 KiB".to_owned());
         }
-        let contents = std::fs::read_to_string(path)
+        let file = std::fs::File::open(path)
             .map_err(|_| "failed to read speech profile file".to_owned())?;
+        let contents = read_profile_contents(file)?;
         let profiles: SpeechProfilesFile = toml::from_str(&contents)
             .map_err(|_| "speech profile file was not valid TOML".to_owned())?;
         if profiles.schema_version != 1 {

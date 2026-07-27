@@ -76,7 +76,23 @@ language=Chinese
 speed=1.0
 max_tokens=128
 repetition_penalty=1.05
+response_format=wav
 ```
+
+Runtime speech pipeline:
+
+```text
+phrase_soft_limit_bytes=96
+phrase_hard_limit_bytes=192
+phrase_queue_capacity=2
+```
+
+The surviving benchmark evidence does not retain the private configuration's
+exact speech `instructions`, `max_text_bytes`, or speech-response
+`max_audio_bytes`, and no sanitized effective-config digest was recorded. The
+public example template cannot establish those measured values. Exact replay of
+the effective speech request is therefore not possible from the retained
+evidence.
 
 The private configuration used the absolute installed speech snapshot and an absolute playback wrapper path outside the repository. No private path is retained in this record.
 

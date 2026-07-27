@@ -274,16 +274,16 @@ async fn run_turn(
         return RuntimeEvent::TurnCancelled { turn_id };
     }
 
-    let speech_result = tokio::select! {
-        biased;
-        _ = cancellation.cancelled() => {
-            return RuntimeEvent::TurnCancelled { turn_id };
-        }
-        result = speech_synthesizer.synthesize(
+    let speech_result = speech_synthesizer
+        .synthesize(
             SpeechRequest::new(turn_id, response),
             cancellation.child_token(),
-        ) => result,
-    };
+        )
+        .await;
+
+    if cancellation.is_cancelled() {
+        return RuntimeEvent::TurnCancelled { turn_id };
+    }
 
     if let Err(error) = speech_result {
         return adapter_failure(turn_id, RuntimeStage::SpeechSynthesizer, error);

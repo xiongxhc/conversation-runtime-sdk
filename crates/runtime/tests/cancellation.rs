@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use conversation_model_adapters::{
-    AdapterError, AdapterFuture, LanguageModel, LanguageModelRequest, MockLanguageModel,
-    MockSpeechSynthesizer, SpeechRequest, SpeechSynthesizer,
+    AdapterError, AdapterFuture, AudioFormat, LanguageModel, LanguageModelRequest,
+    MockLanguageModel, MockSpeechSynthesizer, SpeechRequest, SpeechSynthesizer, SynthesizedAudio,
 };
 use conversation_protocol::{RuntimeCommand, RuntimeErrorKind, RuntimeEvent, TurnId};
 use conversation_runtime::{ConversationRuntime, RuntimeCommandResult, TurnEventStream};
@@ -14,6 +14,11 @@ use tokio_util::sync::CancellationToken;
 
 struct CompletionSignallingSpeech {
     completed: Arc<AtomicBool>,
+}
+
+struct CleanupAwareSpeech {
+    started: Arc<AtomicBool>,
+    cleanup_completed: Arc<AtomicBool>,
 }
 
 struct CancellationSignallingLanguageModel {
@@ -50,9 +55,9 @@ impl SpeechSynthesizer for InvocationTrackingSpeech {
         &'a self,
         _request: SpeechRequest,
         _cancellation: CancellationToken,
-    ) -> AdapterFuture<'a, Vec<u8>> {
+    ) -> AdapterFuture<'a, SynthesizedAudio> {
         self.invoked.store(true, Ordering::Release);
-        Box::pin(async { Ok(Vec::new()) })
+        Box::pin(async { Ok(SynthesizedAudio::new([], AudioFormat::Aiff)) })
     }
 }
 
@@ -61,10 +66,26 @@ impl SpeechSynthesizer for CompletionSignallingSpeech {
         &'a self,
         _request: SpeechRequest,
         _cancellation: CancellationToken,
-    ) -> AdapterFuture<'a, Vec<u8>> {
+    ) -> AdapterFuture<'a, SynthesizedAudio> {
         Box::pin(async move {
             self.completed.store(true, Ordering::Release);
-            Ok(Vec::new())
+            Ok(SynthesizedAudio::new([], AudioFormat::Aiff))
+        })
+    }
+}
+
+impl SpeechSynthesizer for CleanupAwareSpeech {
+    fn synthesize<'a>(
+        &'a self,
+        _request: SpeechRequest,
+        cancellation: CancellationToken,
+    ) -> AdapterFuture<'a, SynthesizedAudio> {
+        Box::pin(async move {
+            self.started.store(true, Ordering::Release);
+            cancellation.cancelled().await;
+            tokio::task::yield_now().await;
+            self.cleanup_completed.store(true, Ordering::Release);
+            Err(AdapterError::new("speech synthesis cancelled"))
         })
     }
 }
@@ -154,6 +175,44 @@ async fn interruption_emits_one_cancelled_terminal_event() {
         }
     }
 
+    assert_eq!(
+        terminal_events,
+        vec![RuntimeEvent::TurnCancelled { turn_id }]
+    );
+}
+
+#[tokio::test]
+async fn waits_for_speech_cleanup_before_cancellation_completes() {
+    let synthesis_started = Arc::new(AtomicBool::new(false));
+    let cleanup_completed = Arc::new(AtomicBool::new(false));
+    let runtime = ConversationRuntime::new(
+        Arc::new(MockLanguageModel::new(["response"])),
+        Arc::new(CleanupAwareSpeech {
+            started: Arc::clone(&synthesis_started),
+            cleanup_completed: Arc::clone(&cleanup_completed),
+        }),
+    );
+    let turn_id = TurnId::new(14);
+    let mut events = start_turn(&runtime, turn_id, "cancel during speech").await;
+
+    timeout(Duration::from_secs(1), async {
+        while !synthesis_started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("speech synthesis did not start");
+
+    interrupt(&runtime, turn_id).await.unwrap();
+
+    let mut terminal_events = Vec::new();
+    while let Some(event) = events.recv().await {
+        if event.is_terminal() {
+            terminal_events.push(event);
+        }
+    }
+
+    assert!(cleanup_completed.load(Ordering::Acquire));
     assert_eq!(
         terminal_events,
         vec![RuntimeEvent::TurnCancelled { turn_id }]

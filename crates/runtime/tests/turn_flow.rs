@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use conversation_model_adapters::{
     AdapterError, AdapterFuture, LanguageModel, LanguageModelRequest, MockLanguageModel,
-    MockSpeechSynthesizer, SpeechRequest, SpeechSynthesizer,
+    MockSpeechSynthesizer, SpeechRequest, SpeechSynthesizer, SynthesizedAudio,
 };
 use conversation_protocol::{
     RuntimeCommand, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage, TurnId,
@@ -62,7 +62,7 @@ impl SpeechSynthesizer for FailingSpeechSynthesizer {
         &'a self,
         _request: SpeechRequest,
         _cancellation: CancellationToken,
-    ) -> AdapterFuture<'a, Vec<u8>> {
+    ) -> AdapterFuture<'a, SynthesizedAudio> {
         Box::pin(async { Err(AdapterError::new("speech synthesizer unavailable")) })
     }
 }

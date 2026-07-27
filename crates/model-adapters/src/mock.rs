@@ -5,8 +5,8 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    AdapterError, AdapterFuture, LanguageModel, LanguageModelRequest, SpeechRequest,
-    SpeechSynthesizer,
+    AdapterError, AdapterFuture, AudioFormat, LanguageModel, LanguageModelRequest, SpeechRequest,
+    SpeechSynthesizer, SynthesizedAudio,
 };
 
 #[derive(Clone, Debug)]
@@ -102,14 +102,14 @@ impl SpeechSynthesizer for MockSpeechSynthesizer {
         &'a self,
         _request: SpeechRequest,
         cancellation: CancellationToken,
-    ) -> AdapterFuture<'a, Vec<u8>> {
+    ) -> AdapterFuture<'a, SynthesizedAudio> {
         Box::pin(async move {
             if cancellation.is_cancelled() {
                 return Err(AdapterError::new("speech synthesis cancelled"));
             }
 
             if self.delay.is_zero() {
-                return Ok(self.audio.clone());
+                return Ok(SynthesizedAudio::new(self.audio.clone(), AudioFormat::Aiff));
             }
 
             tokio::select! {
@@ -117,7 +117,10 @@ impl SpeechSynthesizer for MockSpeechSynthesizer {
                 _ = cancellation.cancelled() => {
                     Err(AdapterError::new("speech synthesis cancelled"))
                 }
-                _ = sleep(self.delay) => Ok(self.audio.clone()),
+                _ = sleep(self.delay) => Ok(SynthesizedAudio::new(
+                    self.audio.clone(),
+                    AudioFormat::Aiff,
+                )),
             }
         })
     }
@@ -128,8 +131,10 @@ mod tests {
     use conversation_protocol::TurnId;
     use tokio_util::sync::CancellationToken;
 
-    use super::MockLanguageModel;
-    use crate::{LanguageModel, LanguageModelRequest};
+    use super::{MockLanguageModel, MockSpeechSynthesizer};
+    use crate::{
+        AudioFormat, LanguageModel, LanguageModelRequest, SpeechRequest, SpeechSynthesizer,
+    };
 
     #[tokio::test]
     async fn mock_language_model_streams_configured_deltas() {
@@ -142,5 +147,20 @@ mod tests {
         assert_eq!(stream.recv().await.unwrap().unwrap(), "hello");
         assert_eq!(stream.recv().await.unwrap().unwrap(), " there");
         assert!(stream.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn mock_speech_synthesizer_returns_typed_aiff_audio() {
+        let speech = MockSpeechSynthesizer::new([1, 2, 3]);
+        let audio = speech
+            .synthesize(
+                SpeechRequest::new(TurnId::new(1), "hello"),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(audio.bytes(), &[1, 2, 3]);
+        assert_eq!(audio.format(), AudioFormat::Aiff);
     }
 }

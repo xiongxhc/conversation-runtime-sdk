@@ -13,7 +13,7 @@ pub use mock::{MockLanguageModel, MockSpeechSynthesizer};
 pub use ollama::{
     OllamaChatMetrics, OllamaChatStream, OllamaConfig, OllamaLanguageModel, OllamaThinkingLevel,
 };
-pub use speech::{SpeechRequest, SpeechSynthesizer};
+pub use speech::{AudioFormat, SpeechRequest, SpeechSynthesizer, SynthesizedAudio};
 
 pub type AdapterFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, AdapterError>> + Send + 'a>>;
 

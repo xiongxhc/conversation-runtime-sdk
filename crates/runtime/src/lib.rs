@@ -10,6 +10,10 @@ use conversation_protocol::{
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 
+mod phrase_chunker;
+
+pub use phrase_chunker::PhraseChunkingConfig;
+
 const EVENT_BUFFER_SIZE: usize = 32;
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
@@ -46,6 +50,7 @@ pub struct ConversationRuntime {
     speech_synthesizer: Arc<dyn SpeechSynthesizer>,
     audio_output: Arc<dyn AudioOutput>,
     max_response_bytes: usize,
+    phrase_chunking: PhraseChunkingConfig,
     active_turn: Arc<Mutex<Option<ActiveTurn>>>,
     last_started_turn_id: Arc<Mutex<Option<TurnId>>>,
 }
@@ -67,6 +72,7 @@ impl ConversationRuntime {
             speech_synthesizer,
             audio_output,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+            phrase_chunking: PhraseChunkingConfig::default(),
             active_turn: Arc::new(Mutex::new(None)),
             last_started_turn_id: Arc::new(Mutex::new(None)),
         }
@@ -86,6 +92,11 @@ impl ConversationRuntime {
 
         self.max_response_bytes = max_response_bytes;
         Ok(self)
+    }
+
+    pub fn with_phrase_chunking(mut self, config: PhraseChunkingConfig) -> Self {
+        self.phrase_chunking = config;
+        self
     }
 
     pub async fn execute(

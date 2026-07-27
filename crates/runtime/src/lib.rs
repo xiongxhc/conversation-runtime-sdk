@@ -212,6 +212,7 @@ impl ConversationRuntime {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_turn(
     turn_id: TurnId,
     transcript: String,

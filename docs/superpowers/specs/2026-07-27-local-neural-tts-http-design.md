@@ -38,10 +38,12 @@ The adapter accepts:
 - an optional positive speed multiplier;
 - an optional language hint;
 - optional style or delivery instructions;
+- an optional non-zero generation-token limit;
+- an optional positive finite repetition penalty;
 - a non-zero text byte limit;
 - a non-zero encoded-audio byte limit.
 
-The request uses `model`, `input`, optional `voice`, optional `speed`, and `response_format = "wav"`. Language and style use the common local-server extensions `lang_code` and `instruct` only when configured. Runtime and protocol types remain unaware of these fields.
+The request uses `model`, `input`, optional `voice`, optional `speed`, and `response_format = "wav"`. Language, style, generation-token limit, and repetition penalty use the common local-server extensions `lang_code`, `instruct`, `max_tokens`, and `repetition_penalty` only when configured. Runtime and protocol types remain unaware of these fields. These generation controls are necessary because a model host's permissive defaults can produce impractically long audio while remaining below the encoded-byte limit.
 
 ### Safety
 
@@ -62,11 +64,11 @@ Extend the existing `conversation-tts-probe` rather than creating a second binar
 Profiles gain a tagged backend:
 
 - `backend = "macos-system"` keeps the existing voice and words-per-minute fields.
-- `backend = "openai-compatible"` requires endpoint and model, accepts voice, speed, language, and instructions, and synthesizes WAV.
+- `backend = "openai-compatible"` requires endpoint and model, accepts voice, speed, language, instructions, generation-token limit, and repetition penalty, and synthesizes WAV.
 
 The probe resolves one profile into one backend-specific synthesizer. macOS voice discovery remains system-speech-only. Playback and output persistence select the temporary filename suffix from the typed audio format, so both AIFF and WAV are supported.
 
-The example configuration remains public and neutral. It includes generic local neural profiles plus commented MLX-Audio evaluation commands. Exact model revisions, digests, machine measurements, and quality judgments belong in benchmark evidence after a real local run.
+The generic example configuration remains public and backend-neutral. A separate `speech.mlx-audio.example.toml` provides runnable, explicitly labeled evaluation-candidate profiles without making either model an SDK default. Exact model revisions, digests, machine measurements, and quality judgments belong in benchmark evidence after a real local run.
 
 ## Data Flow
 

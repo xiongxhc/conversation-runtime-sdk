@@ -49,11 +49,15 @@ let speech = OpenAiCompatibleSpeechSynthesizer::new(
         .with_language("Chinese")
         .unwrap()
         .with_instructions("Warm and calm.")
+        .unwrap()
+        .with_max_tokens(128)
+        .unwrap()
+        .with_repetition_penalty(1.05)
         .unwrap(),
 );
 ```
 
-Assert the request target is `/v1/audio/speech`, the literal JSON fields are `model`, `input`, `voice`, `speed`, `lang_code`, `instruct`, and `response_format = "wav"`, and the returned bytes are typed as `AudioFormat::Wav`.
+Assert the request target is `/v1/audio/speech`, the literal JSON fields are `model`, `input`, `voice`, `speed`, `lang_code`, `instruct`, `max_tokens`, `repetition_penalty`, and `response_format = "wav"`, and the returned bytes are typed as `AudioFormat::Wav`.
 
 - [ ] **Step 2: Run tests and verify RED**
 
@@ -77,6 +81,8 @@ pub struct OpenAiCompatibleSpeechConfig {
     speed: Option<f32>,
     language: Option<String>,
     instructions: Option<String>,
+    max_tokens: Option<usize>,
+    repetition_penalty: Option<f32>,
     max_text_bytes: usize,
     max_audio_bytes: usize,
 }
@@ -158,11 +164,13 @@ enum SpeechProfile {
         speed: Option<f32>,
         language: Option<String>,
         instructions: Option<String>,
+        max_tokens: Option<usize>,
+        repetition_penalty: Option<f32>,
     },
 }
 ```
 
-Add tests for one valid local HTTP profile and rejections for missing model, invalid endpoint, empty voice/language/instructions, non-positive speed, and backend-incompatible fields.
+Add tests for one valid local HTTP profile and rejections for missing model, invalid endpoint, empty voice/language/instructions, non-positive speed, zero generation-token limit, non-positive repetition penalty, and backend-incompatible fields.
 
 - [ ] **Step 2: Run profile tests and verify RED**
 
@@ -195,6 +203,8 @@ voice = "local-voice"
 language = "Chinese"
 instructions = "Warm and calm."
 speed = 1.0
+max_tokens = 128
+repetition_penalty = 1.05
 ```
 
 Run the probe with `--no-play`, assert success, assert `format=wav`, and inspect the captured request JSON.
@@ -237,6 +247,7 @@ git commit -m "feat: support local neural TTS profiles"
 - Modify: `ROADMAP.md`
 - Modify: `tests/tts/README.md`
 - Modify: `crates/model-adapters/README.md`
+- Create: `configs/speech.mlx-audio.example.toml`
 - Create: `docs/neural-tts-evaluation.md`
 
 **Interfaces:**
@@ -248,15 +259,22 @@ git commit -m "feat: support local neural TTS profiles"
 Document:
 
 ```bash
-uv tool install --force "mlx-audio[server]"
+uv tool install --force "mlx-audio[server]" --prerelease=allow
 mlx_audio.server --host 127.0.0.1 --port 8000
 rustup run 1.97.1 cargo run --locked -p conversation-tts-probe -- \
-  --config "$PWD/configs/speech.example.toml" \
+  --config "$PWD/configs/speech.mlx-audio.example.toml" \
   --profile local-neural-fast \
   "你好，这是本地神经语音测试。"
 ```
 
 State that the first request downloads and loads model files into the model host's external cache, not the repository. Keep host binding at `127.0.0.1`.
+
+Create `configs/speech.mlx-audio.example.toml` with two explicitly labeled evaluation candidates:
+
+- `local-neural-fast`: `mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-bf16`, voice `vivian`;
+- `local-neural-quality`: `mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-6bit`, voice `vivian`.
+
+Both profiles use `language = "Chinese"`, `max_tokens = 128`, and `repetition_penalty = 1.05`. The quality profile includes a conversational delivery instruction. Comments must state that these are measured Apple Silicon candidates, not SDK defaults.
 
 - [ ] **Step 2: Add objective evaluation gates**
 
@@ -280,7 +298,7 @@ Expected: no whitespace errors and no placeholders.
 - [ ] **Step 5: Commit documentation scope**
 
 ```bash
-git add README.md ROADMAP.md tests/tts/README.md crates/model-adapters/README.md docs/neural-tts-evaluation.md
+git add README.md ROADMAP.md tests/tts/README.md crates/model-adapters/README.md configs/speech.mlx-audio.example.toml docs/neural-tts-evaluation.md
 git commit -m "docs: explain local neural TTS setup"
 ```
 

@@ -1,0 +1,15 @@
+schema_version = 1
+default_profile = "system-default"
+
+[profiles.system-default]
+backend = "macos-system"
+
+[profiles.british-english]
+backend = "macos-system"
+voice = "Daniel"
+rate_wpm = 190
+
+[profiles.mandarin]
+backend = "macos-system"
+voice = "Tingting"
+rate_wpm = 180

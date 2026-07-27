@@ -15,6 +15,10 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
+mod profile;
+
+use profile::SpeechProfile;
+
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_VOICE_LIST_BYTES: usize = 64 * 1024;
 const USAGE: &str = "Usage: conversation-tts-probe [OPTIONS] [--] [TEXT ...]\n\
@@ -58,20 +62,11 @@ impl ProbeConfig {
     where
         F: Fn(&str) -> Option<String>,
     {
-        let mut speech = match lookup("CONVERSATION_TTS_SAY_PATH") {
+        let speech = match lookup("CONVERSATION_TTS_SAY_PATH") {
             Some(path) => MacOsSystemSpeechConfig::new(path),
             None => MacOsSystemSpeechConfig::system_default(),
         }
         .map_err(adapter_message)?;
-        if let Some(voice) = lookup("CONVERSATION_TTS_VOICE") {
-            speech = speech.with_voice(voice).map_err(adapter_message)?;
-        }
-        if let Some(rate) = lookup("CONVERSATION_TTS_RATE") {
-            let rate = rate
-                .parse::<u32>()
-                .map_err(|_| "CONVERSATION_TTS_RATE must be a non-zero integer".to_owned())?;
-            speech = speech.with_rate(rate).map_err(adapter_message)?;
-        }
 
         let player = match lookup("CONVERSATION_TTS_PLAYER_PATH") {
             Some(path) => PlayerConfig::new(path),
@@ -96,6 +91,65 @@ impl ProbeConfig {
             timeout,
         })
     }
+}
+
+fn environment_speech_settings<F>(lookup: F) -> Result<SpeechProfile, String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let voice = lookup("CONVERSATION_TTS_VOICE");
+    if voice
+        .as_deref()
+        .is_some_and(|voice| voice.is_empty() || voice.chars().any(char::is_control))
+    {
+        return Err("voice must be non-empty and contain no control characters".to_owned());
+    }
+
+    let rate_wpm = lookup("CONVERSATION_TTS_RATE")
+        .map(|rate| {
+            rate.parse::<u32>()
+                .map_err(|_| "CONVERSATION_TTS_RATE must be a non-zero integer".to_owned())
+        })
+        .transpose()?;
+    if rate_wpm.is_some_and(|rate| rate == 0) {
+        return Err("CONVERSATION_TTS_RATE must be a non-zero integer".to_owned());
+    }
+
+    Ok(SpeechProfile { voice, rate_wpm })
+}
+
+fn load_speech_profile(arguments: &ProbeArguments) -> Result<SpeechProfile, String> {
+    match (&arguments.config_path, &arguments.profile_id) {
+        (Some(path), profile_id) => SpeechProfile::load(path, profile_id.as_deref()),
+        (None, Some(_)) => Err("--profile requires --config".to_owned()),
+        (None, None) => Ok(SpeechProfile {
+            voice: None,
+            rate_wpm: None,
+        }),
+    }
+}
+
+fn resolve_speech_settings(
+    profile: SpeechProfile,
+    environment_voice: Option<String>,
+    environment_rate_wpm: Option<u32>,
+    cli_voice: Option<String>,
+    cli_rate_wpm: Option<u32>,
+) -> Result<SpeechProfile, String> {
+    let voice = cli_voice.or(environment_voice).or(profile.voice);
+    let rate_wpm = cli_rate_wpm.or(environment_rate_wpm).or(profile.rate_wpm);
+
+    if voice
+        .as_deref()
+        .is_some_and(|voice| voice.is_empty() || voice.chars().any(char::is_control))
+    {
+        return Err("voice must be non-empty and contain no control characters".to_owned());
+    }
+    if rate_wpm.is_some_and(|rate| rate == 0) {
+        return Err("rate must be non-zero".to_owned());
+    }
+
+    Ok(SpeechProfile { voice, rate_wpm })
 }
 
 #[derive(Clone, Debug)]
@@ -595,26 +649,27 @@ async fn main() {
         }
         ProbeAction::Run(arguments) => arguments,
     };
-    let config = match ProbeConfig::from_lookup(|key| std::env::var(key).ok()) {
-        Ok(mut config) => {
-            if let Some(voice) = arguments.voice.as_deref() {
-                config.speech = match config.speech.with_voice(voice) {
-                    Ok(speech) => speech,
-                    Err(error) => {
-                        exit_with_failure("configuration", started_at, adapter_message(error))
-                    }
-                };
-            }
-            if let Some(rate) = arguments.rate {
-                config.speech = match config.speech.with_rate(rate) {
-                    Ok(speech) => speech,
-                    Err(error) => {
-                        exit_with_failure("configuration", started_at, adapter_message(error))
-                    }
-                };
-            }
-            config
+    let config = match (|| {
+        let mut config = ProbeConfig::from_lookup(|key| std::env::var(key).ok())?;
+        let profile = load_speech_profile(&arguments)?;
+        let environment = environment_speech_settings(|key| std::env::var(key).ok())?;
+        let settings = resolve_speech_settings(
+            profile,
+            environment.voice,
+            environment.rate_wpm,
+            arguments.voice.clone(),
+            arguments.rate,
+        )?;
+
+        if let Some(voice) = settings.voice {
+            config.speech = config.speech.with_voice(voice).map_err(adapter_message)?;
         }
+        if let Some(rate) = settings.rate_wpm {
+            config.speech = config.speech.with_rate(rate).map_err(adapter_message)?;
+        }
+        Ok::<_, String>(config)
+    })() {
+        Ok(config) => config,
         Err(message) => exit_with_failure("configuration", started_at, message),
     };
     let timeout = config.timeout;
@@ -710,9 +765,10 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        monitor_stop, parse_arguments, persist_audio, play_audio, run_probe, PlayerConfig,
-        ProbeAction, ProbeArguments, ProbeConfig,
+        environment_speech_settings, monitor_stop, parse_arguments, persist_audio, play_audio,
+        resolve_speech_settings, run_probe, PlayerConfig, ProbeAction, ProbeArguments, ProbeConfig,
     };
+    use crate::profile::SpeechProfile;
 
     #[test]
     fn parses_voice_rate_and_text() {
@@ -741,6 +797,24 @@ mod tests {
                 profile_id: None,
             })
         );
+    }
+
+    #[test]
+    fn resolves_cli_over_environment_over_profile() {
+        let resolved = resolve_speech_settings(
+            SpeechProfile {
+                voice: Some("Tingting".to_owned()),
+                rate_wpm: Some(180),
+            },
+            Some("Daniel".to_owned()),
+            Some(190),
+            Some("Samantha".to_owned()),
+            Some(200),
+        )
+        .unwrap();
+
+        assert_eq!(resolved.voice.as_deref(), Some("Samantha"));
+        assert_eq!(resolved.rate_wpm, Some(200));
     }
 
     #[test]
@@ -908,10 +982,11 @@ mod tests {
         ]);
 
         let config = ProbeConfig::from_lookup(|key| values.get(key).cloned()).unwrap();
+        let environment = environment_speech_settings(|key| values.get(key).cloned()).unwrap();
 
         assert_eq!(config.speech.executable(), speech);
-        assert_eq!(config.speech.voice(), Some("Example Voice"));
-        assert_eq!(config.speech.rate(), Some(210));
+        assert_eq!(environment.voice.as_deref(), Some("Example Voice"));
+        assert_eq!(environment.rate_wpm, Some(210));
         assert_eq!(config.player.executable(), player);
         assert_eq!(config.timeout, std::time::Duration::from_millis(1500));
     }
@@ -935,7 +1010,14 @@ mod tests {
                 (key, value.to_owned()),
             ]);
 
-            assert!(ProbeConfig::from_lookup(|name| values.get(name).cloned()).is_err());
+            let result = match key {
+                "CONVERSATION_TTS_RATE" => {
+                    environment_speech_settings(|name| values.get(name).cloned()).map(|_| ())
+                }
+                _ => ProbeConfig::from_lookup(|name| values.get(name).cloned()).map(|_| ()),
+            };
+
+            assert!(result.is_err());
         }
     }
 

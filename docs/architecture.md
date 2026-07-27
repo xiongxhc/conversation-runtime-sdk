@@ -35,13 +35,19 @@ ASR begins in the feasibility and voice-loop milestones. Starting the determinis
 
 ## Cancellation
 
-The runtime uses a cancellation token for the active turn and child tokens for adapter calls. Every long-running adapter stage participates in `tokio::select!` with cancellation. Cancelling a turn therefore stops generation and synthesis work instead of merely hiding its output.
+The runtime uses a cancellation token for the active turn and child tokens for adapter calls. Language streaming races event work against cancellation. Speech implementations must observe their child token and resolve only after owned cleanup completes; the runtime awaits that cleanup before publishing terminal cancellation. A non-cooperative third-party speech implementation can therefore delay cancellation.
 
 `TurnEventStream` hides the transport implementation from SDK consumers. Nonterminal lifecycle data uses a bounded channel with cancellation-aware sends, while the terminal event uses an independent one-shot channel. An undrained client therefore applies bounded backpressure without preventing interruption from finalizing the turn.
 
 Terminal selection, publication, and removal of the active turn are serialized by the active-turn lock: if interruption returns accepted, that turn cannot later complete successfully. Real high-rate partial transcripts or audio require explicit aggregation or a separate media transport; lifecycle finalization remains independent of consumer backpressure.
 
 Real audio playback must adopt the same token and prove bounded cancellation latency before the barge-in milestone can pass.
+
+## macOS System-Speech Reference
+
+`MacOsSystemSpeechSynthesizer` implements `SpeechSynthesizer` without changing protocol types. Its public configuration types compile across supported development platforms, while `/usr/bin/say` and `/usr/bin/afplay` defaults are macOS-gated.
+
+The adapter invokes the configured executable directly, bounds text, audio, and captured error output, returns typed AIFF bytes, kills and awaits cancelled child processes, and removes temporary synthesis files on every path. `conversation-tts-probe` owns explicit output persistence and playback; neither operating-system commands nor audio bytes enter `conversation-protocol`.
 
 ## Relationship Behavior
 

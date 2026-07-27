@@ -8,7 +8,7 @@ The SDK is cross-platform by design. The first validated product target is macOS
 
 ## Current Status
 
-The repository now contains the deterministic runtime foundation plus a reviewed local Ollama adapter and direct text probe:
+The repository now contains the deterministic runtime foundation plus reviewed local text and macOS system-speech reference paths:
 
 - typed commands, events, turn identifiers, and errors;
 - cancellation-aware language-model and speech-synthesis adapter contracts;
@@ -17,9 +17,11 @@ The repository now contains the deterministic runtime foundation plus a reviewed
 - integration tests for completion, interruption races, adapter failures, synthesis cancellation, and runtime reuse;
 - a streaming Ollama adapter with bounded NDJSON framing, cancellation, and configurable thinking;
 - a runnable local text probe that selects an installed Ollama model by exact identifier, subject to that model supporting the fixed probe policy;
-- reproducible feasibility results for three local checkpoints under one bounded 8K-context profile.
+- reproducible feasibility results for three local checkpoints under one bounded 8K-context profile;
+- typed synthesized audio, cleanup-aware speech cancellation, and a bounded macOS system-speech reference adapter;
+- a runnable typed-text probe with optional AIFF persistence, playback, cancellation, and distinct timeout reporting.
 
-The probe exercises the adapter directly; Ollama is not yet wired through `ConversationRuntime`. The path is text-only. Real TTS, audio playback, microphone capture, ASR, persona, SQLite memory, the macOS app, and iPhone LAN access remain staged in [ROADMAP.md](ROADMAP.md).
+The probes exercise adapters directly; Ollama is not yet wired through `ConversationRuntime`. Typed text-to-audio plumbing is working on macOS, while phrase streaming, measured first audible audio, microphone capture, ASR, persona, SQLite memory, the desktop app, and iPhone LAN access remain staged in [ROADMAP.md](ROADMAP.md).
 
 ## Test Local Inference
 
@@ -35,6 +37,17 @@ The response streams to standard output. The exact model identifier, first text-
 
 The probe explicitly sets `think: false`, temperature `0`, seed `42`, a 128-token output cap, and an 8K context window. It performs no prompt or response file writes itself; prompts passed as arguments can still appear in shell history or process inspection. See [docs/model-benchmarks.md](docs/model-benchmarks.md) for measured results and limitations.
 
+## Test Local Speech
+
+On macOS, run the system-speech reference flow:
+
+```bash
+cargo run --locked -p conversation-tts-probe -- \
+  "This is a local system-speech reference adapter."
+```
+
+Use `--no-play` to synthesize silently and absolute `--output <path>` to retain AIFF explicitly. Optional voice, rate, deadline, speech-executable, and player-executable overrides are documented in [tests/tts/README.md](tests/tts/README.md). Synthesis completion and playback launch are plumbing metrics, not measurements of first audible audio.
+
 ## Project Layout
 
 ```text
@@ -47,6 +60,7 @@ docs/                  Architecture, design, and benchmark guidance
 models/                Registry schema and local model instructions
 tests/latency/         Runnable mock latency probe and metric definitions
 tests/ollama/          Runnable local Ollama text probe
+tests/tts/             Runnable macOS system-speech and playback probe
 ```
 
 ## Development

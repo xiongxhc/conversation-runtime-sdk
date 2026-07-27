@@ -12,7 +12,8 @@ The first release is not a directory-complete platform. It is one local voice lo
 - R1 is complete: the Rust workspace, public protocol, adapter contracts, deterministic mocks, orchestration, and runtime tests are present.
 - The local Ollama adapter and text probe are implemented and tested without exposing Ollama to the public protocol or LAN.
 - Three local checkpoints pass bounded text feasibility at an 8K context. The measurements establish adapter viability, not an SDK recommendation or deployment selection.
-- The next chronological implementation task is a local TTS reference adapter and a typed-input-to-audio vertical slice.
+- Typed audio, cleanup-aware synthesis cancellation, a macOS system-speech reference adapter, and a typed-input-to-audio playback probe are implemented and tested.
+- The next chronological task is phrase-level language-to-speech integration and timing instrumentation; ASR benchmarking follows.
 - Microphone capture, ASR, barge-in, persona, SQLite memory, the macOS app, and client SDKs have not started.
 - The 1.2-second time-to-useful-audio goal remains unvalidated.
 
@@ -22,7 +23,7 @@ The first release is not a directory-complete platform. It is one local voice lo
 
 ### Source Status
 
-The toolchain, safe machine profile, bounded Ollama language adapter, reproducible local text probe, model digests, loaded-state snapshots, and first language-model measurements are complete. Backend selection belongs to the consuming deployment and remains outside the public SDK roadmap. TTS benchmarking is next; ASR benchmarking follows the typed text-to-audio slice.
+The toolchain, safe machine profile, bounded Ollama language adapter, reproducible local text probe, model digests, loaded-state snapshots, and first language-model measurements are complete. The macOS system-speech reference adapter has an audible plumbing pass, but formal TTS quality, real-time factor, and first-audio benchmarking remain pending. Backend selection belongs to the consuming deployment and remains outside the public SDK roadmap. ASR benchmarking follows phrase-level text-to-audio integration.
 
 ### Deliverables
 
@@ -72,7 +73,7 @@ Complete. The initial source and deterministic runtime validation for this miles
 
 ### Source Status
 
-The configurable Ollama adapter, streamed local text probe, bounded timeout/output behavior, final Ollama metrics, and reproducible language-model feasibility evidence are complete. The next task is to benchmark a local TTS reference adapter, then connect phrase-level text streaming to audible output. Each consuming deployment must preserve its measured inference policy explicitly rather than inheriting model defaults silently.
+The configurable Ollama adapter, streamed local text probe, bounded timeout/output behavior, final Ollama metrics, reproducible language-model feasibility evidence, typed audio contract, macOS system-speech reference adapter, and typed-text playback probe are complete. The next task is to connect phrase-level text streaming to audible output and add runtime timing events. Each consuming deployment must preserve its measured inference policy explicitly rather than inheriting model defaults silently.
 
 ### Deliverables
 

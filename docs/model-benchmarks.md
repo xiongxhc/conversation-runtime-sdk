@@ -1,6 +1,6 @@
 # Local Model Benchmark Matrix
 
-**Status:** Reproducible local language-model feasibility measured on 2026-07-24. ASR, TTS, audio, and end-to-end voice latency remain unmeasured.
+**Status:** Reproducible local language-model feasibility measured on 2026-07-24. A macOS system-speech plumbing check passed on 2026-07-27; ASR, formal TTS evaluation, first audible audio, and end-to-end voice latency remain unmeasured.
 
 The 1.2-second time-to-useful-audio goal is a runtime target, not a measured result. These measurements cover text generation only.
 
@@ -37,13 +37,19 @@ The two community `abliterated` checkpoints require provenance, license-chain, a
 
 These observations validate the adapter and benchmark method only. The public SDK does not select a model. A consuming deployment owns model admission, source and license review, behavioral evaluation, and the inference policy paired with TTS.
 
+## System-Speech Plumbing Check
+
+One bounded manual macOS reference check produced a valid 131,430-byte AIFF in 974 ms of synthesis completion time. A separate run completed audible playback and reported playback launch after synthesis. Temporary audio cleanup was verified.
+
+This is a plumbing pass, not a comparative TTS benchmark. It does not measure first audible audio, real-time factor, voice quality, warm-up distribution, memory use, or neural TTS suitability, and it does not select a deployment voice or backend.
+
 ## Remaining Capability Matrix
 
 | Layer | Implementation | License review | Loaded memory | Real-time factor | First text delta | First audio | Result |
 |---|---|---|---:|---:|---:|---:|---|
 | ASR | Not evaluated | Not started | Not measured | Not measured | Not applicable | Not applicable | Pending benchmark |
 | LLM | Deployment-configured | Deployment-owned | Benchmark required | Not applicable | Benchmark required | Not applicable | Reference adapter ready |
-| TTS | Reference adapter planned | System component | Not measured | Not measured | Not applicable | Not measured | Next chronological benchmark |
+| TTS | macOS system-speech reference | System component | Not measured | Not measured | Not applicable | Not measured | Audible plumbing pass |
 
 ## Deployment Admission Evidence
 

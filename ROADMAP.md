@@ -13,8 +13,9 @@ The first release is not a directory-complete platform. It is one local voice lo
 - The local Ollama adapter and text probe are implemented and tested without exposing Ollama to the public protocol or LAN.
 - Three local checkpoints pass bounded text feasibility at an 8K context. The measurements establish adapter viability, not an SDK recommendation or deployment selection.
 - Typed audio, cleanup-aware synthesis cancellation, a macOS system-speech reference adapter, and a typed-input-to-audio playback probe are implemented and tested.
-- The TTS probe supports installed-voice discovery, direct voice and rate controls, and bounded named profiles. Profile precedence is `CLI > environment > selected profile > macOS system defaults`, and only `backend = "macos-system"` is accepted.
-- The next chronological task is phrase-level language-to-speech integration and timing instrumentation; ASR benchmarking follows.
+- The deterministic OpenAI-compatible local HTTP speech adapter and bounded neural-TTS probe profiles are implemented and test-covered. The measured MLX-Audio profiles are evaluation candidates, not an SDK default or a selected model.
+- The TTS probe supports installed-voice discovery, direct voice and rate controls, and bounded named profiles. Profile precedence is `CLI > environment > selected profile > macOS system defaults`; supported backends are `macos-system` and `openai-compatible`.
+- Phrase-level language-to-speech integration, first-playable-audio timing, integrated runtime speech, and model-quality selection remain pending; ASR benchmarking follows.
 - Microphone capture, ASR, barge-in, persona, SQLite memory, the macOS app, and client SDKs have not started.
 - The 1.2-second time-to-useful-audio goal remains unvalidated.
 
@@ -24,13 +25,13 @@ The first release is not a directory-complete platform. It is one local voice lo
 
 ### Source Status
 
-The toolchain, safe machine profile, bounded Ollama language adapter, reproducible local text probe, model digests, loaded-state snapshots, and first language-model measurements are complete. The macOS system-speech reference adapter has an audible plumbing pass, but formal TTS quality, real-time factor, and first-audio benchmarking remain pending. Backend selection belongs to the consuming deployment and remains outside the public SDK roadmap. ASR benchmarking follows phrase-level text-to-audio integration.
+The toolchain, safe machine profile, bounded Ollama language adapter, reproducible local text probe, model digests, loaded-state snapshots, and first language-model measurements are complete. The macOS system-speech reference adapter and deterministic local HTTP speech adapter have typed-text probe coverage. MLX-Audio candidate measurements record synthesis duration and real-time factor, but first-playable-audio timing, integrated runtime speech, and subjective model-quality selection remain pending. Backend selection belongs to the consuming deployment and remains outside the public SDK roadmap. ASR benchmarking follows phrase-level text-to-audio integration.
 
 ### TTS Adapter Boundary
 
-The current profile boundary accepts only `backend = "macos-system"`. Configuration files use absolute paths and are bounded to 64 KiB; voice and rate resolution follows `CLI > environment > selected profile > macOS system defaults`.
+The profile boundary accepts `backend = "macos-system"` and `backend = "openai-compatible"`. Configuration files use absolute paths and are bounded to 64 KiB; voice and rate resolution follows `CLI > environment > selected profile > macOS system defaults`. The local HTTP adapter uses a loopback default endpoint, disables redirects, supports cancellation and bounded output, and requires explicit model-host configuration.
 
-Downloadable neural TTS remains a separate future adapter milestone. It requires an exact model revision and digest, license review, consent provenance, cancellation, bounded output, and Apple Silicon benchmarks before implementation or profile exposure. No neural TTS adapter is currently available, and the public SDK does not prescribe a neural model or provider. Any candidate implementations remain evaluation candidates until those checks are complete.
+The documented MLX-Audio examples are measured Apple Silicon candidates only. They require an exact model revision and digest, license review, consent provenance, first-playable-audio measurement, and subjective quality evaluation before any consuming deployment selects one. The public SDK does not prescribe a neural model or provider.
 
 ### Deliverables
 
@@ -80,7 +81,7 @@ Complete. The initial source and deterministic runtime validation for this miles
 
 ### Source Status
 
-The configurable Ollama adapter, streamed local text probe, bounded timeout/output behavior, final Ollama metrics, reproducible language-model feasibility evidence, typed audio contract, macOS system-speech reference adapter, and typed-text playback probe are complete. The next task is to connect phrase-level text streaming to audible output and add runtime timing events. Each consuming deployment must preserve its measured inference policy explicitly rather than inheriting model defaults silently.
+The configurable Ollama adapter, streamed local text probe, bounded timeout/output behavior, final Ollama metrics, reproducible language-model feasibility evidence, typed audio contract, macOS system-speech reference adapter, deterministic local HTTP speech adapter, and typed-text playback probe are complete. The next task is to connect phrase-level text streaming to audible output and add runtime timing events. Each consuming deployment must preserve its measured inference policy explicitly rather than inheriting model defaults silently.
 
 ### Deliverables
 

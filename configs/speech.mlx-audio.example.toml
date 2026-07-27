@@ -1,0 +1,26 @@
+schema_version = 1
+default_profile = "local-neural-fast"
+
+# Measured Apple Silicon evaluation candidates, not SDK defaults or a model selection.
+# Run the host on loopback: mlx_audio.server --host 127.0.0.1 --port 8000
+[profiles.local-neural-fast]
+backend = "openai-compatible"
+endpoint = "http://127.0.0.1:8000/v1"
+model = "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-bf16"
+voice = "vivian"
+speed = 1.0
+language = "Chinese"
+max_tokens = 128
+repetition_penalty = 1.05
+
+# Measured Apple Silicon evaluation candidate, not an SDK default or model selection.
+[profiles.local-neural-quality]
+backend = "openai-compatible"
+endpoint = "http://127.0.0.1:8000/v1"
+model = "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-6bit"
+voice = "vivian"
+speed = 1.0
+language = "Chinese"
+instructions = "Speak conversationally, warmly, and naturally."
+max_tokens = 128
+repetition_penalty = 1.05

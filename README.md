@@ -20,8 +20,9 @@ The repository now contains the deterministic runtime foundation plus reviewed l
 - reproducible feasibility results for three local checkpoints under one bounded 8K-context profile;
 - typed synthesized audio, cleanup-aware speech cancellation, and a bounded macOS system-speech reference adapter;
 - a runnable typed-text probe with optional AIFF persistence, playback, cancellation, and distinct timeout reporting.
+- a deterministic OpenAI-compatible local HTTP speech adapter and probe profiles for measured neural-TTS evaluation candidates.
 
-The probes exercise adapters directly; Ollama is not yet wired through `ConversationRuntime`. Typed text-to-audio plumbing is working on macOS, while phrase streaming, measured first audible audio, microphone capture, ASR, persona, SQLite memory, the desktop app, and iPhone LAN access remain staged in [ROADMAP.md](ROADMAP.md).
+The probes exercise adapters directly; Ollama is not yet wired through `ConversationRuntime`. Typed text-to-audio plumbing is working on macOS, while phrase streaming, measured first playable audio, integrated runtime speech, microphone capture, ASR, persona, SQLite memory, the desktop app, and iPhone LAN access remain staged in [ROADMAP.md](ROADMAP.md).
 
 ## Test Local Inference
 
@@ -72,9 +73,22 @@ cargo run --locked -p conversation-tts-probe -- \
   "This is a local system-speech reference adapter."
 ```
 
-Use `--no-play` to synthesize silently and absolute `--output <path>` to retain AIFF explicitly. Configuration precedence is `CLI > environment > selected profile > macOS system defaults`. Only `backend = "macos-system"` is accepted now. `--config` paths must be absolute and the files are bounded to 64 KiB. Optional environment controls and validation details are documented in [tests/tts/README.md](tests/tts/README.md). Synthesis completion and playback launch are plumbing metrics, not measurements of first audible audio.
+Use `--no-play` to synthesize silently and absolute `--output <path>` to retain audio explicitly (AIFF for macOS system speech, WAV for the local HTTP adapter). Configuration precedence is `CLI > environment > selected profile > macOS system defaults`. Configuration supports `backend = "macos-system"` and `backend = "openai-compatible"`. `--config` paths must be absolute and the files are bounded to 64 KiB. Optional environment controls and validation details are documented in [tests/tts/README.md](tests/tts/README.md). Synthesis completion and playback launch are plumbing metrics, not measurements of first playable audio.
 
-Downloadable neural TTS is a separate future adapter milestone. It must establish an exact model revision and digest, complete license review and consent provenance, support cancellation and bounded output, and provide Apple Silicon benchmarks before an adapter or profile backend is considered available. No neural TTS adapter is currently provided.
+### Evaluate Local Neural TTS
+
+The local HTTP adapter is deterministic and test-covered, but its MLX-Audio profiles are evaluation candidates rather than SDK defaults or a model selection. Install the verified MLX-Audio server tool, keep it bound to loopback, and run the fast candidate:
+
+```bash
+uv tool install --force "mlx-audio[server]" --prerelease=allow
+mlx_audio.server --host 127.0.0.1 --port 8000
+rustup run 1.97.1 cargo run --locked -p conversation-tts-probe -- \
+  --config "$PWD/configs/speech.mlx-audio.example.toml" \
+  --profile local-neural-fast \
+  "你好，这是本地神经语音测试。"
+```
+
+The first request downloads and loads model files into the model host's external cache, not this repository. The evaluation profiles cap generation at `max_tokens = 128` and use `repetition_penalty = 1.05`; an uncapped host default produced impractically long audio during evaluation. See [docs/neural-tts-evaluation.md](docs/neural-tts-evaluation.md) for exact revisions, measured results, and remaining quality gates. If an already-open shell cannot find `cargo`, run `source ~/.zshrc` or open a new terminal; a fresh login zsh resolves it through `/opt/homebrew/opt/rustup/bin`.
 
 ## Project Layout
 
@@ -103,6 +117,8 @@ cargo run -p conversation-latency-harness -- "hello runtime"
 ```
 
 The workspace is verified with the toolchain pinned in `rust-toolchain.toml`.
+
+In a fresh login zsh, `cargo` is available through `/opt/homebrew/opt/rustup/bin`. If an existing shell reports `cargo: command not found`, run `source ~/.zshrc` or open a new terminal.
 
 The latency probe uses deterministic mock adapters. It verifies runtime flow and prints timing fields, but it is not evidence that the product latency target has been met.
 

@@ -88,7 +88,7 @@ rustup run 1.97.1 cargo run --locked -p conversation-tts-probe -- \
   "你好，这是本地神经语音测试。"
 ```
 
-The first request downloads and loads model files into the model host's external cache, not this repository. The evaluation profiles cap generation at `max_tokens = 128` and use `repetition_penalty = 1.05`; an uncapped host default produced impractically long audio during evaluation. See [docs/neural-tts-evaluation.md](docs/neural-tts-evaluation.md) for exact revisions, measured results, and remaining quality gates. If an already-open shell cannot find `cargo`, run `source ~/.zshrc` or open a new terminal; a fresh login zsh resolves it through `/opt/homebrew/opt/rustup/bin`.
+The first request downloads and loads model files into the model host's external cache, not this repository. The evaluation profiles cap generation at `max_tokens = 128` and use `repetition_penalty = 1.05`; an uncapped host default produced impractically long audio during evaluation. See [docs/neural-tts-evaluation.md](docs/neural-tts-evaluation.md) for exact revisions, manifest digests, measured results, and remaining quality gates. The command uses the pinned project toolchain.
 
 ## Project Layout
 
@@ -107,7 +107,7 @@ tests/tts/             Runnable macOS system-speech and playback probe
 
 ## Development
 
-Install a Rust toolchain, then run:
+Install Rust with [rustup](https://www.rust-lang.org/tools/install), verify `cargo --version`, then run:
 
 ```bash
 cargo fmt --all -- --check
@@ -116,9 +116,7 @@ cargo test --workspace --locked
 cargo run -p conversation-latency-harness -- "hello runtime"
 ```
 
-The workspace is verified with the toolchain pinned in `rust-toolchain.toml`.
-
-In a fresh login zsh, `cargo` is available through `/opt/homebrew/opt/rustup/bin`. If an existing shell reports `cargo: command not found`, run `source ~/.zshrc` or open a new terminal.
+The workspace commands use the toolchain pinned in `rust-toolchain.toml`.
 
 The latency probe uses deterministic mock adapters. It verifies runtime flow and prints timing fields, but it is not evidence that the product latency target has been met.
 

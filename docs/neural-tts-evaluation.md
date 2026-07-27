@@ -2,9 +2,9 @@
 
 ## Scope
 
-This record evaluates two Apple Silicon MLX-Audio candidates through the local OpenAI-compatible speech endpoint. It is evidence for the listed machine and revisions only; it does not select an SDK default, deployment backend, or application voice.
+This record evaluates two Apple Silicon MLX-Audio candidates through the local OpenAI-compatible speech endpoint. It is evidence for the listed machine, snapshot revisions, and manifest digests only; it does not select an SDK default, deployment backend, or application voice.
 
-- Server: MLX-Audio `0.4.6`, installed as a uv tool with the `server` extra. The package version is recorded; an upstream source commit was not captured.
+- Server: MLX-Audio `0.4.6`, installed as a uv tool with the `server` extra. In the verified `0.4.6` package, the base MLX-Audio install does not include the server runtime dependency `uvicorn`, so the extra is required. The package version is recorded; an upstream source commit was not captured.
 - Verified installation: `uv tool install --force 'mlx-audio[server]' --prerelease=allow`.
 - Verified health endpoint: `127.0.0.1:8000`.
 - Upstream references: [MLX-Audio](https://github.com/Blaizzy/mlx-audio) and [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS).
@@ -13,14 +13,29 @@ This record evaluates two Apple Silicon MLX-Audio candidates through the local O
 
 The first request can download and load model files into the model host's external cache. It does not write model files into this repository. Run the server on `127.0.0.1`, not a network-facing address.
 
-## Candidate Evidence
+## Candidate Identity and Evidence
 
-| Candidate only | Cached snapshot | License | Input | State | Synthesis | WAV duration | RTF |
-| --- | --- | --- | --- | --- | ---: | ---: | ---: |
-| `mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-bf16` | `6415d95f88be018ff9e46813119dc3bc12261328` | Apache-2.0 | Mandarin | Warm | 1.84 s | 4.24 s | about 0.43 |
-| `mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-6bit` | `1c6c0ff58c43afa8df571facde2efa077efd85e2` | Apache-2.0 | Mandarin | Warm | 1.38 s | 4.24 s | about 0.33 |
-| `mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-6bit` | `1c6c0ff58c43afa8df571facde2efa077efd85e2` | Apache-2.0 | English | Warm | 1.36 s | 4.00 s | 0.34 |
-| `mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-6bit` | `1c6c0ff58c43afa8df571facde2efa077efd85e2` | Apache-2.0 | Cached cold start | 1.7B restarted, no download | 3.06 s | 3.76 s | about 0.81 |
+| Candidate only | Snapshot revision | Manifest SHA-256 | License | Input | State | Synthesis | WAV duration | RTF |
+| --- | --- | --- | --- | --- | --- | ---: | ---: | ---: |
+| `mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-bf16` | `6415d95f88be018ff9e46813119dc3bc12261328` | `231d4108164d6bf4418c997a312b8071a12f3f393144d4314084b6999656f9dd` | Apache-2.0 | Mandarin | Warm | 1.84 s | 4.24 s | about 0.43 |
+| `mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-6bit` | `1c6c0ff58c43afa8df571facde2efa077efd85e2` | `16a8e49ec64f87318d647dbd2b9d03bd83b3bc1246d7da27650410f176be14e4` | Apache-2.0 | Mandarin | Warm | 1.38 s | 4.24 s | about 0.33 |
+| `mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-6bit` | `1c6c0ff58c43afa8df571facde2efa077efd85e2` | `16a8e49ec64f87318d647dbd2b9d03bd83b3bc1246d7da27650410f176be14e4` | Apache-2.0 | English | Warm | 1.36 s | 4.00 s | 0.34 |
+| `mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-6bit` | `1c6c0ff58c43afa8df571facde2efa077efd85e2` | `16a8e49ec64f87318d647dbd2b9d03bd83b3bc1246d7da27650410f176be14e4` | Apache-2.0 | Cached cold start | 1.7B restarted, no download | 3.06 s | 3.76 s | about 0.81 |
+
+### Reproduce a Manifest Digest
+
+Run the following from the selected snapshot root without publishing its cache path. It hashes each regular snapshot file, writes sorted `<sha256><two spaces><relative-path>` lines to a temporary manifest, requires the measured 12-file set, then hashes that manifest. `LC_ALL=C` fixes the path ordering.
+
+```bash
+manifest="$(mktemp)"
+find . -type f -print | sed 's#^\./##' | LC_ALL=C sort | \
+  while IFS= read -r path; do shasum -a 256 "$path"; done > "$manifest"
+test "$(wc -l < "$manifest" | tr -d '[:space:]')" = 12
+shasum -a 256 "$manifest"
+rm -f "$manifest"
+```
+
+Record both the exact snapshot revision and the final manifest SHA-256. Do not substitute one for the other.
 
 The first 1.7B request took 38.62 s while downloading and loading. It is not a clean cold-start latency measurement. After fully stopping and restarting MLX-Audio with the 1.7B 6-bit model already cached, its first request completed in 3.06 s and produced 3.76 s of audio. This is the cached cold start (model load plus generation, no download).
 
@@ -35,7 +50,7 @@ Record these fields for every candidate and comparison before selecting a consum
 | Evidence gate | Record |
 | --- | --- |
 | Server revision | Package version, source revision when available, installation command, endpoint, and server configuration. |
-| Model identity | Full identifier, exact cached revision or digest, quantization, and cache location outside the repository. |
+| Model identity | Full identifier, exact snapshot revision, defined manifest SHA-256, quantization, and cache policy without publishing private paths. |
 | License review | License text/source, obligations, reviewer, review date, and approved use scope. |
 | Voice and reference consent | Voice name, source/reference provenance, consent or license evidence, reviewer, and approved use scope. |
 | Machine profile | Hardware model, chip, core count, memory, OS, audio route, toolchain, and loaded-state sequence. |

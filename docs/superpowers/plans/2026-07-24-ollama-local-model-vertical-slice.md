@@ -12,7 +12,7 @@
 
 - Ollama remains bound to `127.0.0.1`; no task exposes it directly to the LAN.
 - Ollama-specific types remain private to `conversation-model-adapters`.
-- The exact model identifier is configuration, never a hardcoded product default.
+- The exact model identifier is deployment configuration, never a hardcoded SDK default.
 - Deterministic tests require no Ollama process, model download, internet access, or audio device.
 - The probe performs no prompt or response file writes. The explicit benchmark harness may persist its fixed prompt, responses, and metrics only under ignored local artifacts for reproducibility.
 - SQLite, the Mac app, iPhone gateway, TTS, ASR, and real audio remain outside this implementation plan.
@@ -282,7 +282,7 @@ Capture first-delta and total milliseconds. Stop and record a failure rather tha
 
 For each model, record exact identifier, provenance, reported license status, quantization, local size, warm/cold state, first-delta samples, total-time samples, median values, and concise quality notes.
 
-Do not declare a product default from latency alone. Mark community `abliterated` models as requiring provenance and behavior review.
+Do not interpret latency alone as an SDK recommendation. Mark community `abliterated` models as requiring provenance and behavior review.
 
 - [ ] **Step 4: Add disabled registry examples**
 
@@ -323,7 +323,7 @@ Add:
 
 ```bash
 cargo run --locked -p conversation-ollama-probe -- \
-  "qwen3.6:27b-q8_0" \
+  "<installed-model-id>" \
   "Answer briefly: hello"
 ```
 
@@ -335,7 +335,7 @@ Mark:
 
 - R1 complete;
 - Ollama adapter and probe as the first completed part of R0/R2 feasibility;
-- local TTS selection and text-to-audio as the next task;
+- a local TTS reference adapter and text-to-audio as the next task;
 - microphone/ASR/barge-in after text-to-audio;
 - macOS app after the voice loop;
 - paired iPhone LAN client after the app gateway;
@@ -350,7 +350,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 cargo run --locked -p conversation-ollama-probe -- \
-  "qwen3.6:27b-q8_0" \
+  "<installed-model-id>" \
   "Answer in one short sentence: confirm local inference."
 git diff --check
 ```

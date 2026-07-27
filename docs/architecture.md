@@ -8,7 +8,7 @@ protocol <- model-adapters <- runtime
 
 `protocol` defines client-visible commands, events, identifiers, and failures. It has no dependency on Tokio, model implementations, or runtime internals.
 
-`model-adapters` defines the capabilities required from language and speech models. Its mock implementations are deterministic test doubles, not product backends.
+`model-adapters` defines the capabilities required from language and speech models. Its mock implementations are deterministic test doubles, not deployment backends.
 
 `runtime` owns turn state, adapter coordination, event ordering, and cancellation. Clients should not depend on adapter implementation details.
 
@@ -35,7 +35,7 @@ ASR begins in the feasibility and voice-loop milestones. Starting the determinis
 
 ## Cancellation
 
-The runtime uses a cancellation token for the active turn and child tokens for adapter calls. Every long-running adapter stage participates in `tokio::select!` with cancellation. Cancelling a turn therefore stops generation and synthesis work instead of merely hiding its output.
+The runtime uses a cancellation token for the active turn and child tokens for adapter calls. Language streaming races event work against cancellation. Speech implementations must observe their child token and resolve only after owned cleanup completes; the runtime awaits that cleanup before publishing terminal cancellation. A non-cooperative third-party speech implementation can therefore delay cancellation.
 
 `TurnEventStream` hides the transport implementation from SDK consumers. Nonterminal lifecycle data uses a bounded channel with cancellation-aware sends, while the terminal event uses an independent one-shot channel. An undrained client therefore applies bounded backpressure without preventing interruption from finalizing the turn.
 
@@ -43,12 +43,24 @@ Terminal selection, publication, and removal of the active turn are serialized b
 
 Real audio playback must adopt the same token and prove bounded cancellation latency before the barge-in milestone can pass.
 
+## macOS System-Speech Reference
+
+`MacOsSystemSpeechSynthesizer` implements `SpeechSynthesizer` without changing protocol types. Its public configuration types compile across supported development platforms, while `/usr/bin/say` and `/usr/bin/afplay` defaults are macOS-gated.
+
+The adapter invokes the configured executable directly, bounds text, audio, and captured error output, returns typed AIFF bytes, kills and awaits cancelled child processes, and removes temporary synthesis files on every path. `conversation-tts-probe` owns explicit output persistence and playback; neither operating-system commands nor audio bytes enter `conversation-protocol`.
+
 ## Relationship Behavior
 
 Model relationships through context and conversation state rather than fixed scripts. Earned behavior is often more memorable than configurable behavior.
 
 Affectionate expressions, special moments, and relationship signals must emerge from shared context, pacing, reciprocity, and rapport. They are not triggered by canned sequences, invisible unlock flags, frequency quotas, or a durable memory record that directly commands an expression. Persona and memory may shape the context available to the response controller, but the current conversational state remains authoritative.
 
+## Public Repository Boundary
+
+The public SDK defines portable contracts, reference adapters, reproducible evaluation methods, and clearly labeled historical measurements. It does not encode an application's models, voices, routing thresholds, personas, or deployment policy.
+
+Exact checkpoint identifiers may appear only when required to reproduce benchmark evidence. They are measurements, not endorsements. Public examples use generic identifiers, while application configuration and deployment decisions remain outside this repository.
+
 ## Why the Desktop Shell Is Deferred
 
-Creating the Tauri and React application before runtime contracts exist would couple the first protocol to desktop UI needs. The current boundary is documentation-only until deterministic turn and cancellation tests pass and the feasibility benchmark selects concrete local backends.
+Creating the Tauri and React application before runtime contracts exist would couple the first protocol to desktop UI needs. The current boundary is documentation-only until deterministic turn and cancellation tests pass and feasibility benchmarks validate concrete reference adapters.

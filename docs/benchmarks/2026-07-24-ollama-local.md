@@ -2,6 +2,8 @@
 
 This file preserves the non-sensitive evidence behind `docs/model-benchmarks.md`. The ignored raw artifacts were produced by `tests/ollama/benchmark-local.sh`; the safe evidence needed to audit the summary is retained here.
 
+The exact checkpoints below identify a historical measurement and do not represent an SDK recommendation, application default, or deployment choice.
+
 ## Execution Identity
 
 - Source commit: `d66b347a491edde31e49df32ce50fb97e25f8461`
@@ -46,7 +48,7 @@ The committed script:
 1. verified a clean source tree;
 2. built the exact probe;
 3. captured a sanitized installed-model record and `ollama show` metadata;
-4. unloaded the selected model and verified its absence;
+4. unloaded the requested model and verified its absence;
 5. ran one cold warm-up;
 6. captured Ollama's loaded-state snapshot;
 7. ran three warm measured requests;

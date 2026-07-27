@@ -467,7 +467,7 @@ mod tests {
     fn parses_exact_model_identifier_and_remaining_prompt_words() {
         let arguments = vec![
             "conversation-ollama-probe".to_owned(),
-            "hf.co/mradermacher/Qwen3.6-35B-A3B-abliterated-GGUF:Q6_K".to_owned(),
+            "registry.example/model-family:quantization".to_owned(),
             "Answer".to_owned(),
             "briefly:".to_owned(),
             "hello".to_owned(),
@@ -475,10 +475,7 @@ mod tests {
 
         let parsed = parse_arguments(arguments, Cursor::new("")).unwrap();
 
-        assert_eq!(
-            parsed.model,
-            "hf.co/mradermacher/Qwen3.6-35B-A3B-abliterated-GGUF:Q6_K"
-        );
+        assert_eq!(parsed.model, "registry.example/model-family:quantization");
         assert_eq!(parsed.prompt, "Answer briefly: hello");
     }
 
@@ -487,13 +484,13 @@ mod tests {
         let parsed = parse_arguments(
             [
                 "conversation-ollama-probe".to_owned(),
-                "qwen3.6:27b-q8_0".to_owned(),
+                "example-local-language-model".to_owned(),
             ],
             Cursor::new("Answer privately.\n"),
         )
         .unwrap();
 
-        assert_eq!(parsed.model, "qwen3.6:27b-q8_0");
+        assert_eq!(parsed.model, "example-local-language-model");
         assert_eq!(parsed.prompt, "Answer privately.");
     }
 
@@ -503,7 +500,7 @@ mod tests {
             vec!["conversation-ollama-probe".to_owned()],
             vec![
                 "conversation-ollama-probe".to_owned(),
-                "qwen3.6:27b-q8_0".to_owned(),
+                "example-local-language-model".to_owned(),
             ],
         ] {
             let error = parse_arguments(arguments, Cursor::new(" \n")).unwrap_err();

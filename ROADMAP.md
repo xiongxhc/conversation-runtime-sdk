@@ -2,7 +2,7 @@
 
 ## Product Direction
 
-Build a reusable, local-first conversation runtime and prove it through a desktop voice companion. Keep runtime contracts cross-platform while validating the first complete product loop on macOS Apple Silicon.
+Build a reusable, local-first conversation runtime and prove it through a desktop voice reference application. Keep runtime contracts cross-platform while validating the first complete reference loop on macOS Apple Silicon.
 
 The first release is not a directory-complete platform. It is one local voice loop that responds quickly, supports natural interruption, follows visible persona and verbosity controls, and exposes an SDK boundary that is independent of the desktop app.
 
@@ -11,26 +11,27 @@ The first release is not a directory-complete platform. It is one local voice lo
 - The approved architecture and exact initial project map are documented.
 - R1 is complete: the Rust workspace, public protocol, adapter contracts, deterministic mocks, orchestration, and runtime tests are present.
 - The local Ollama adapter and text probe are implemented and tested without exposing Ollama to the public protocol or LAN.
-- Qwen 34.7B, Qwen 27B, and Llama 70B pass bounded local text feasibility at an 8K context. Qwen 34.7B is fastest; Qwen 27B has official Ollama provenance; Llama 70B is viable but uses the largest loaded snapshot and completes most slowly.
-- The next chronological implementation task is local TTS selection and a typed-input-to-audio vertical slice.
+- Three local checkpoints pass bounded text feasibility at an 8K context. The measurements establish adapter viability, not an SDK recommendation or deployment selection.
+- Typed audio, cleanup-aware synthesis cancellation, a macOS system-speech reference adapter, and a typed-input-to-audio playback probe are implemented and tested.
+- The next chronological task is phrase-level language-to-speech integration and timing instrumentation; ASR benchmarking follows.
 - Microphone capture, ASR, barge-in, persona, SQLite memory, the macOS app, and client SDKs have not started.
 - The 1.2-second time-to-useful-audio goal remains unvalidated.
 
 ## R0 — Toolchain and Feasibility
 
-**Outcome:** Establish one reproducible Apple Silicon development profile and select a viable local model stack before integrating product code.
+**Outcome:** Establish one reproducible Apple Silicon development profile and evaluate a viable local model stack before integration.
 
 ### Source Status
 
-The toolchain, safe machine profile, bounded Ollama language adapter, reproducible local text probe, model digests, loaded-state snapshots, and first language-model measurements are complete. Qwen 27B is a provisional R2 candidate, not a product default. TTS benchmarking is next; ASR benchmarking follows the typed text-to-audio slice.
+The toolchain, safe machine profile, bounded Ollama language adapter, reproducible local text probe, model digests, loaded-state snapshots, and first language-model measurements are complete. The macOS system-speech reference adapter has an audible plumbing pass, but formal TTS quality, real-time factor, and first-audio benchmarking remain pending. Backend selection belongs to the consuming deployment and remains outside the public SDK roadmap. ASR benchmarking follows phrase-level text-to-audio integration.
 
 ### Deliverables
 
 - Maintain the pinned Rust toolchain required by the workspace.
 - Record the exact Mac model, chip, memory, operating system, and audio devices.
 - Compile the initial workspace and run all deterministic tests.
-- Verify the source and license of each candidate ASR, language, and speech model.
-- Benchmark candidate components independently.
+- Verify the source and license of each evaluated ASR, language, and speech implementation.
+- Benchmark evaluated components independently.
 - Record memory use, real-time factor, first-text-delta latency, first-audio latency, warm-up behavior, and model quality notes.
 
 ### Exit Criteria
@@ -38,8 +39,8 @@ The toolchain, safe machine profile, bounded Ollama language adapter, reproducib
 - `cargo fmt --all -- --check` passes.
 - `cargo test --workspace` passes.
 - [docs/model-benchmarks.md](docs/model-benchmarks.md) contains measured results from the target machine.
-- One ASR, one language model, and one TTS backend are selected for the first integration.
-- The selected combination has a documented path toward the product latency target; no component is chosen only by reputation.
+- One ASR, one language-model implementation, and one TTS implementation pass the reference integration.
+- The measured combination has a documented path toward the runtime latency target; the public SDK does not prescribe a deployment backend.
 
 ## R1 — Deterministic Runtime Foundation
 
@@ -68,17 +69,17 @@ Complete. The initial source and deterministic runtime validation for this miles
 
 ## R2 — Local Text-to-Audio Vertical Slice
 
-**Outcome:** Replace mocks with one measured local language model and one measured local speech backend while keeping text input.
+**Outcome:** Replace mocks with measured local language-model and speech reference implementations while keeping text input.
 
 ### Source Status
 
-The configurable Ollama adapter, streamed local text probe, bounded timeout/output behavior, final Ollama metrics, and reproducible language-model feasibility evidence are complete. The next task is to benchmark and select a local TTS backend, then connect phrase-level text streaming to audible output. The integrated voice-loop configuration must preserve the measured inference policy explicitly; it must not inherit model defaults silently.
+The configurable Ollama adapter, streamed local text probe, bounded timeout/output behavior, final Ollama metrics, reproducible language-model feasibility evidence, typed audio contract, macOS system-speech reference adapter, and typed-text playback probe are complete. The next task is to connect phrase-level text streaming to audible output and add runtime timing events. Each consuming deployment must preserve its measured inference policy explicitly rather than inheriting model defaults silently.
 
 ### Deliverables
 
-- One Apple Silicon language-model adapter selected by R0.
+- One measured Apple Silicon language-model adapter configured by the reference application.
 - Incremental text streaming into the runtime.
-- One Apple Silicon TTS adapter selected by R0.
+- One measured Apple Silicon TTS reference adapter.
 - Sentence or phrase chunking that starts synthesis before the full response completes.
 - Runtime timing events for first text delta, first synthesis request, and first playable audio.
 - A command-line example that turns typed input into local spoken output.
@@ -208,7 +209,7 @@ The configurable Ollama adapter, streamed local text probe, bounded timeout/outp
 
 ## R8 — Linux and Windows Expansion
 
-**Outcome:** Add operating systems only after the first product loop and SDK boundary are proven.
+**Outcome:** Add operating systems only after the first reference loop and SDK boundary are proven.
 
 ### Entry Criteria
 

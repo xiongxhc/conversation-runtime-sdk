@@ -262,7 +262,7 @@ async fn reports_spawn_failure_and_removes_temporary_file() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn bounds_and_sanitizes_non_zero_exit_stderr() {
+async fn returns_a_static_non_zero_exit_error_without_child_stderr() {
     let fixture = tempfile::tempdir().unwrap();
     let playback_directory = create_playback_directory(&fixture);
     let executable = write_script(
@@ -284,10 +284,55 @@ async fn bounds_and_sanitizes_non_zero_exit_stderr() {
         .await
         .unwrap_err();
 
-    assert_eq!(
-        error.message(),
-        "audio playback process failed: failure-line wit"
+    assert_eq!(error.message(), "audio playback process failed");
+    assert!(!error.message().contains("failure-line"));
+    assert!(!error.message().contains("with-control"));
+    assert!(std::fs::read_dir(playback_directory)
+        .unwrap()
+        .next()
+        .is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn completed_child_does_not_wait_for_a_descendant_holding_stderr() {
+    use std::time::{Duration, Instant};
+
+    let fixture = tempfile::tempdir().unwrap();
+    let playback_directory = create_playback_directory(&fixture);
+    let descendant_pid_path = fixture.path().join("descendant.pid");
+    let executable = write_script(
+        &fixture,
+        "completed-wrapper-afplay",
+        &format!(
+            r#"#!/bin/sh
+/bin/sh -c 'printf "%s" "$$" > "{}"; exec /bin/sleep 5' &
+while [ ! -f "{}" ]; do :; done
+exit 0
+"#,
+            descendant_pid_path.display(),
+            descendant_pid_path.display()
+        ),
     );
+    let output = MacOsAfplayAudioOutput::new(
+        MacOsAfplayConfig::new(executable)
+            .unwrap()
+            .with_temp_directory(&playback_directory)
+            .unwrap(),
+    );
+
+    let started_at = Instant::now();
+    output
+        .play(wav_request(10), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let elapsed = started_at.elapsed();
+    assert!(elapsed < Duration::from_secs(2), "elapsed: {elapsed:?}");
+    let descendant_pid = std::fs::read_to_string(descendant_pid_path).unwrap();
+    let _ = std::process::Command::new("/bin/kill")
+        .arg(descendant_pid.trim())
+        .status();
     assert!(std::fs::read_dir(playback_directory)
         .unwrap()
         .next()

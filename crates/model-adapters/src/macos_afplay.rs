@@ -142,32 +142,17 @@ impl AudioOutput for MacOsAfplayAudioOutput {
                 _ = cancellation.cancelled() => {
                     let _ = child.start_kill();
                     let _ = child.wait().await;
-                    if tokio::time::timeout(STDERR_CLEANUP_GRACE, &mut stderr_task)
-                        .await
-                        .is_err()
-                    {
-                        stderr_task.abort();
-                        let _ = stderr_task.await;
-                    }
+                    let _ = finish_stderr_task(&mut stderr_task).await;
                     return Err(AdapterError::new("audio playback cancelled"));
                 }
                 status = child.wait() => {
                     status.map_err(|_| AdapterError::new("failed to wait for audio playback"))?
                 }
             };
-            let stderr = stderr_task
-                .await
-                .map_err(|_| AdapterError::new("failed to read audio playback error"))?
-                .map_err(|_| AdapterError::new("failed to read audio playback error"))?;
+            finish_stderr_task(&mut stderr_task).await?;
 
             if !status.success() {
-                let detail = sanitize_stderr(&stderr);
-                let message = if detail.is_empty() {
-                    "audio playback process failed".to_owned()
-                } else {
-                    format!("audio playback process failed: {detail}")
-                };
-                return Err(AdapterError::new(message));
+                return Err(AdapterError::new("audio playback process failed"));
             }
 
             Ok(())
@@ -211,20 +196,19 @@ where
     }
 }
 
-fn sanitize_stderr(stderr: &[u8]) -> String {
-    String::from_utf8_lossy(stderr)
-        .chars()
-        .map(|character| {
-            if character.is_control() {
-                ' '
-            } else {
-                character
-            }
-        })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+async fn finish_stderr_task(
+    stderr_task: &mut tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+) -> Result<(), AdapterError> {
+    match tokio::time::timeout(STDERR_CLEANUP_GRACE, &mut *stderr_task).await {
+        Ok(result) => result
+            .map_err(|_| AdapterError::new("failed to read audio playback error"))?
+            .map_err(|_| AdapterError::new("failed to read audio playback error"))
+            .map(|_| ()),
+        Err(_) => {
+            stderr_task.abort();
+            Ok(())
+        }
+    }
 }
 
 fn require_absolute_path(path: &Path, field: &str) -> Result<(), AdapterError> {

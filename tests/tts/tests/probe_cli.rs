@@ -7,6 +7,12 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
+const MINIMAL_PCM_WAV: &[u8] = &[
+    b'R', b'I', b'F', b'F', 38, 0, 0, 0, b'W', b'A', b'V', b'E', b'f', b'm', b't', b' ', 16, 0, 0,
+    0, 1, 0, 1, 0, 0x40, 0x1f, 0, 0, 0x40, 0x1f, 0, 0, 1, 0, 8, 0, b'd', b'a', b't', b'a', 1, 0, 0,
+    0, 0x80, 0,
+];
+
 fn spawn_speech_server() -> (u16, thread::JoinHandle<Vec<u8>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -29,11 +35,13 @@ fn spawn_speech_server() -> (u16, thread::JoinHandle<Vec<u8>>) {
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         let request = read_http_request(&mut stream);
-        stream
-            .write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: 4\r\nConnection: close\r\n\r\nRIFF",
-            )
-            .unwrap();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            MINIMAL_PCM_WAV.len()
+        )
+        .unwrap();
+        stream.write_all(MINIMAL_PCM_WAV).unwrap();
         request
     });
 

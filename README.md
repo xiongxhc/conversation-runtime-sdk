@@ -73,6 +73,6 @@ The latency probe uses deterministic mock adapters. It verifies runtime flow and
 - The protocol does not depend on adapters or runtime internals.
 - Relationship behavior emerges from context and conversation state rather than fixed scripts: earned behavior is often more memorable than configurable behavior.
 - Model files, private paths, credentials, and local benchmark artifacts stay outside version control.
-- Public SDK content remains backend-neutral. Exact deployment-model choices and venture-specific routing policy stay in private configuration outside this repository.
+- Public SDK content remains backend-neutral. Exact deployment-model choices and application-specific routing policy stay in deployment configuration outside this repository.
 
 See [docs/architecture.md](docs/architecture.md) for the current boundaries, [docs/superpowers/specs/2026-07-24-conversation-runtime-sdk-design.md](docs/superpowers/specs/2026-07-24-conversation-runtime-sdk-design.md) for the approved initial design, and [docs/superpowers/specs/2026-07-24-ollama-local-model-and-lan-design.md](docs/superpowers/specs/2026-07-24-ollama-local-model-and-lan-design.md) for the Mac, SQLite, LAN, and future-platform architecture.

@@ -83,6 +83,8 @@ impl SpeechRequest {
 }
 
 pub trait SpeechSynthesizer: Send + Sync {
+    /// Implementations must observe `cancellation` and resolve only after
+    /// cleaning up work owned by the request.
     fn synthesize<'a>(
         &'a self,
         request: SpeechRequest,

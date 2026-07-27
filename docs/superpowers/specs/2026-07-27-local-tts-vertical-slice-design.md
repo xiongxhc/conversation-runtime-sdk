@@ -4,7 +4,7 @@
 
 ## Problem
 
-The runtime has a backend-neutral `SpeechSynthesizer` contract, but only a deterministic mock implements it. The public repository needs one testable, local typed-text-to-audio path without turning a reference backend or the venture's private voice choice into an SDK recommendation.
+The runtime has a backend-neutral `SpeechSynthesizer` contract, but only a deterministic mock implements it. The public repository needs one testable, local typed-text-to-audio path without turning a reference backend or an application's voice choice into an SDK recommendation.
 
 The first slice must prove synthesis, audio-file handling, playback, cancellation, and timing boundaries on the validated macOS target. It must not claim streaming first-audio performance, neural-voice quality, or cross-platform support that has not been measured.
 
@@ -13,7 +13,7 @@ The first slice must prove synthesis, audio-file handling, playback, cancellatio
 - Public protocol and runtime types remain independent of any TTS vendor, model, voice, or operating-system command.
 - A macOS system-speech implementation is a reference adapter, not a preferred deployment backend.
 - Public examples use generic backend and voice identifiers.
-- Exact venture model and voice choices, routing thresholds, and deployment policy stay in private configuration outside this repository.
+- Exact model and voice choices, routing thresholds, and deployment policy stay in application configuration outside this repository.
 - Exact identifiers may appear in retained benchmark evidence only when required for reproducibility and must be labeled as measurements rather than recommendations.
 
 ## Approaches Considered
@@ -52,7 +52,7 @@ The public protocol continues to expose lifecycle events only. High-rate audio b
 
 ### `MacOsSystemSpeechSynthesizer`
 
-- Available only on macOS.
+- Public types compile on every supported development platform; only the macOS system default and live playback are platform-gated.
 - Accepts explicit executable paths through validated configuration, defaulting to the fixed system speech executable.
 - Accepts an optional voice identifier and speaking rate as deployment configuration.
 - Rejects empty text, control characters in the voice identifier, zero limits, and text above the configured byte cap.
@@ -75,7 +75,7 @@ The public protocol continues to expose lifecycle events only. High-rate audio b
 
 The runtime continues to call `SpeechSynthesizer` after language generation completes. Phrase-level chunking and overlapping generation with synthesis remain a separate change because the current lifecycle has one synthesis request per turn.
 
-This slice updates the runtime only for the typed audio result. It does not emit audio bytes as lifecycle events and does not claim phrase streaming.
+This slice updates the runtime for the typed audio result and awaits a cancellation-aware synthesizer so cleanup completes before terminal cancellation publication. `SpeechSynthesizer` implementations must observe cancellation and resolve only after owned work is cleaned up; a non-cooperative third-party implementation can delay cancellation. The runtime does not emit audio bytes as lifecycle events and does not claim phrase streaming.
 
 ## Data Flow
 
@@ -93,7 +93,7 @@ Private applications may replace either adapter or player without changing proto
 
 ## Error and Cancellation Rules
 
-- Missing executable, rejected configuration, spawn failure, non-zero exit, oversized output, empty output, timeout, and playback failure are distinct sanitized errors.
+- Missing executable, rejected configuration, spawn failure, non-zero exit, oversized output, empty output, timeout, user interruption, and playback failure are distinct sanitized errors.
 - Prompt text and generated audio are excluded from structured error output.
 - Cancellation wins over process completion when both are ready.
 - Every spawned child is awaited after termination so no zombie process remains.
@@ -113,9 +113,9 @@ Private applications may replace either adapter or player without changing proto
 
 ## Documentation and Neutrality
 
-The public README describes a macOS reference adapter and generic backend substitution. It does not name a venture-selected TTS model or voice. Benchmark guidance defines what to measure: source, license status, digest or system version, synthesis latency, playback-launch latency, real-time factor when available, output format, memory, warm-up behavior, and quality notes.
+The public README describes a macOS reference adapter and generic backend substitution. It does not name an application-selected TTS model or voice. Benchmark guidance defines what to measure: source, license status, digest or system version, synthesis latency, playback-launch latency, real-time factor when available, output format, memory, warm-up behavior, and quality notes.
 
-Private venture configuration is not created in this repository.
+Application-specific deployment configuration is not created in this repository.
 
 ## Exit Criteria
 
@@ -124,5 +124,5 @@ Private venture configuration is not created in this repository.
 - Cancellation terminates synthesis and playback work and removes temporary files.
 - Deterministic tests require no audio hardware, TTS model, network, or macOS speech process.
 - Timing distinguishes synthesis completion from playback launch and does not mislabel either as first audible audio.
-- Public documentation remains backend-neutral and contains no venture model or voice selection.
+- Public documentation remains backend-neutral and contains no application-specific model or voice selection.
 - The roadmap still reserves streaming first-audio measurement, neural TTS evaluation, microphone input, ASR, and barge-in for later validated work.

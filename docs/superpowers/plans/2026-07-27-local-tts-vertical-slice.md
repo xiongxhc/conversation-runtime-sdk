@@ -13,7 +13,8 @@
 - Public protocol and runtime types remain independent of any TTS vendor, model, voice, or operating-system command.
 - The macOS system-speech implementation is a reference adapter, not a preferred deployment backend.
 - Public examples use generic backend and voice identifiers.
-- Venture model and voice choices, routing thresholds, and deployment policy remain outside this repository.
+- Application model and voice choices, routing thresholds, and deployment policy remain outside this repository.
+- Public adapter and configuration types compile on macOS, Linux, and Windows; only system defaults, Unix fake-process tests, and live playback are platform-gated.
 - Exact identifiers appear only in clearly labeled reproducibility evidence.
 - Child processes are started directly without a shell.
 - Cancellation wins when cancellation and process completion are simultaneously ready.
@@ -174,6 +175,8 @@ if cancellation.is_cancelled() {
 
 Only report an adapter failure when the parent turn was not cancelled. Update custom test synthesizers to return `SynthesizedAudio`.
 
+Document on `SpeechSynthesizer` that implementations must observe cancellation and resolve only after owned cleanup completes. A non-cooperative third-party implementation can delay terminal cancellation; this initial slice accepts that contract limitation rather than dropping cleanup futures.
+
 - [ ] **Step 8: Run runtime tests and verify GREEN**
 
 Run:
@@ -216,22 +219,24 @@ Enable Tokio `fs`, `process`, and `signal` features in the workspace dependency.
 Create `crates/model-adapters/tests/macos_system_speech.rs` with tests requiring:
 
 ```rust
+let absolute_executable = std::env::current_dir().unwrap().join("fake-say");
+
 assert!(MacOsSystemSpeechConfig::new("relative/say").is_err());
-assert!(MacOsSystemSpeechConfig::new("/absolute/say")
+assert!(MacOsSystemSpeechConfig::new(&absolute_executable)
     .unwrap()
     .with_voice("bad\nvoice")
     .is_err());
-assert!(MacOsSystemSpeechConfig::new("/absolute/say")
+assert!(MacOsSystemSpeechConfig::new(&absolute_executable)
     .unwrap()
     .with_rate(0)
     .is_err());
-assert!(MacOsSystemSpeechConfig::new("/absolute/say")
+assert!(MacOsSystemSpeechConfig::new(&absolute_executable)
     .unwrap()
     .with_max_text_bytes(0)
     .is_err());
 ```
 
-Also assert that `system_default()` resolves to `/usr/bin/say` on macOS and returns a platform error elsewhere.
+Also assert that `system_default()` resolves to `/usr/bin/say` on macOS and returns a platform error elsewhere. Keep the public types compiled on every platform. Gate shell-script integration tests with `#[cfg(unix)]`; the later Windows implementation will use platform-native fake executables.
 
 - [ ] **Step 3: Run configuration tests and verify RED**
 
@@ -386,7 +391,7 @@ conversation-tts-probe [--no-play] [--output <absolute-path>] [text...]
 
 If `text...` is absent, read one non-empty text value from standard input. Reject an empty input, a relative output path, duplicate flags, missing output values, and control characters in environment voice configuration.
 
-Require these environment variables:
+Support these optional environment overrides:
 
 ```text
 CONVERSATION_TTS_VOICE
@@ -396,7 +401,7 @@ CONVERSATION_TTS_SAY_PATH
 CONVERSATION_TTS_PLAYER_PATH
 ```
 
-The executable overrides must be absolute. The default timeout is 30 seconds.
+The executable overrides must be absolute. The default timeout is 30 seconds. Test unset overrides, malformed rate and timeout values, relative executable overrides, and unsupported-platform system defaults.
 
 - [ ] **Step 2: Run CLI argument tests and verify RED**
 
@@ -486,7 +491,7 @@ Expected: the success report or full cleanup assertion fails until orchestration
 
 - [ ] **Step 11: Implement probe orchestration and deadline cancellation**
 
-Build system defaults from `/usr/bin/say` and `/usr/bin/afplay` on macOS. Start one monitor task that cancels the shared token on the configured deadline or `tokio::signal::ctrl_c()`. Await synthesis and playback cleanup directly; never wrap them in a timeout that drops their futures. Abort the monitor only after all owned work completes.
+Build system defaults from `/usr/bin/say` and `/usr/bin/afplay` on macOS. Start one monitor task that stores `ProbeStopReason::Timeout` or `ProbeStopReason::Interrupted` before cancelling the shared token. Await synthesis and playback cleanup directly; never wrap them in a timeout that drops their futures. After cleanup, map the stored reason to a distinct timeout or interruption failure. Abort the monitor only after all owned work completes.
 
 Report synthesis completion separately from playback launch and explicitly avoid naming either value “first audible audio.”
 
@@ -578,10 +583,10 @@ Expected: the Mac plays the sentence once, the report distinguishes synthesis co
 
 - [ ] **Step 6: Review public neutrality**
 
-Search public files for venture-selected model or voice language and specific identifiers outside retained benchmark evidence:
+Search public files for application-specific model or voice language and specific identifiers outside retained benchmark evidence:
 
 ```bash
-grep -RInE 'preferred model|preferred voice|product default|venture.*(model|voice|routing)' README.md ROADMAP.md docs models tests crates
+grep -RInE 'preferred model|preferred voice|product default|application-specific.*(model|voice|routing)' README.md ROADMAP.md docs models tests crates
 ```
 
 Expected: only explicit neutrality statements or historical benchmark labels remain.

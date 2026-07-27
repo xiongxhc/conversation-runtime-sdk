@@ -51,9 +51,9 @@ Affectionate expressions, special moments, and relationship signals must emerge 
 
 ## Public Repository Boundary
 
-The public SDK defines portable contracts, reference adapters, reproducible evaluation methods, and clearly labeled historical measurements. It does not encode the venture's preferred models, voices, routing thresholds, personas, or deployment policy.
+The public SDK defines portable contracts, reference adapters, reproducible evaluation methods, and clearly labeled historical measurements. It does not encode an application's models, voices, routing thresholds, personas, or deployment policy.
 
-Exact checkpoint identifiers may appear only when required to reproduce benchmark evidence. They are measurements, not endorsements. Public examples use generic identifiers, while private deployment configuration and venture decisions remain outside this repository.
+Exact checkpoint identifiers may appear only when required to reproduce benchmark evidence. They are measurements, not endorsements. Public examples use generic identifiers, while application configuration and deployment decisions remain outside this repository.
 
 ## Why the Desktop Shell Is Deferred
 

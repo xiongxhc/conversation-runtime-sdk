@@ -2,7 +2,7 @@
 
 This file preserves the non-sensitive evidence behind `docs/model-benchmarks.md`. The ignored raw artifacts were produced by `tests/ollama/benchmark-local.sh`; the safe evidence needed to audit the summary is retained here.
 
-The exact checkpoints below identify a historical measurement and do not represent an SDK recommendation, product default, or venture deployment choice.
+The exact checkpoints below identify a historical measurement and do not represent an SDK recommendation, application default, or deployment choice.
 
 ## Execution Identity
 

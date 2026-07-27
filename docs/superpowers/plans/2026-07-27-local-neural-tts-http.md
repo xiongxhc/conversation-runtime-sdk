@@ -259,7 +259,7 @@ git commit -m "feat: support local neural TTS profiles"
 Document:
 
 ```bash
-uv tool install --force "mlx-audio[server]" --prerelease=allow
+uv tool install --force "mlx-audio[server]==0.4.6" --prerelease=allow
 mlx_audio.server --host 127.0.0.1 --port 8000
 rustup run 1.97.1 cargo run --locked -p conversation-tts-probe -- \
   --config "$PWD/configs/speech.mlx-audio.example.toml" \

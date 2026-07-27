@@ -80,7 +80,7 @@ Use `--no-play` to synthesize silently and absolute `--output <path>` to retain 
 The local HTTP adapter is deterministic and test-covered, but its MLX-Audio profiles are evaluation candidates rather than SDK defaults or a model selection. Install the verified MLX-Audio server tool, keep it bound to loopback, and run the fast candidate:
 
 ```bash
-uv tool install --force "mlx-audio[server]" --prerelease=allow
+uv tool install --force "mlx-audio[server]==0.4.6" --prerelease=allow
 mlx_audio.server --host 127.0.0.1 --port 8000
 rustup run 1.97.1 cargo run --locked -p conversation-tts-probe -- \
   --config "$PWD/configs/speech.mlx-audio.example.toml" \
@@ -88,7 +88,7 @@ rustup run 1.97.1 cargo run --locked -p conversation-tts-probe -- \
   "你好，这是本地神经语音测试。"
 ```
 
-The first request downloads and loads model files into the model host's external cache, not this repository. The evaluation profiles cap generation at `max_tokens = 128` and use `repetition_penalty = 1.05`; an uncapped host default produced impractically long audio during evaluation. See [docs/neural-tts-evaluation.md](docs/neural-tts-evaluation.md) for exact revisions, manifest digests, measured results, and remaining quality gates. The command uses the pinned project toolchain.
+The convenient public profiles use repository IDs that can resolve newer model revisions, so they do not reproduce the recorded benchmarks. They cap generation at `max_tokens = 128` and use `repetition_penalty = 1.05`; an uncapped host default produced impractically long audio during evaluation. See [docs/neural-tts-evaluation.md](docs/neural-tts-evaluation.md) for the exact snapshot download, digest verification, private local-path configuration, measured results, and remaining quality gates. Model files stay outside this repository, and the Rust command uses the pinned project toolchain.
 
 ## Project Layout
 

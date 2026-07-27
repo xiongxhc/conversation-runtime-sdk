@@ -1,8 +1,14 @@
 schema_version = 1
 default_profile = "local-neural-fast"
 
-# Measured Apple Silicon evaluation candidates, not SDK defaults or a model selection.
+# Convenient Apple Silicon evaluation candidates, not SDK defaults or a model selection.
+# Repository IDs resolve current revisions and do not reproduce measured benchmarks.
+# For exact reproduction, download the listed revision outside this repository and
+# set model to its absolute snapshot directory in a private TOML copy. See
+# docs/neural-tts-evaluation.md.
 # Run the host on loopback: mlx_audio.server --host 127.0.0.1 --port 8000
+# Measured revision: 6415d95f88be018ff9e46813119dc3bc12261328
+# Measured manifest SHA-256: 231d4108164d6bf4418c997a312b8071a12f3f393144d4314084b6999656f9dd
 [profiles.local-neural-fast]
 backend = "openai-compatible"
 endpoint = "http://127.0.0.1:8000/v1"
@@ -13,7 +19,10 @@ language = "Chinese"
 max_tokens = 128
 repetition_penalty = 1.05
 
-# Measured Apple Silicon evaluation candidate, not an SDK default or model selection.
+# Convenient Apple Silicon evaluation candidate, not an SDK default or model selection.
+# Repository IDs resolve current revisions and do not reproduce measured benchmarks.
+# Measured revision: 1c6c0ff58c43afa8df571facde2efa077efd85e2
+# Measured manifest SHA-256: 16a8e49ec64f87318d647dbd2b9d03bd83b3bc1246d7da27650410f176be14e4
 [profiles.local-neural-quality]
 backend = "openai-compatible"
 endpoint = "http://127.0.0.1:8000/v1"

@@ -59,7 +59,7 @@ CLI > environment > selected profile > macOS system defaults
 Start the verified MLX-Audio server on loopback only:
 
 ```bash
-uv tool install --force "mlx-audio[server]" --prerelease=allow
+uv tool install --force "mlx-audio[server]==0.4.6" --prerelease=allow
 mlx_audio.server --host 127.0.0.1 --port 8000
 ```
 
@@ -72,6 +72,6 @@ rustup run 1.97.1 cargo run --locked -p conversation-tts-probe -- \
   "你好，这是本地神经语音测试。"
 ```
 
-`configs/speech.mlx-audio.example.toml` contains two measured Apple Silicon candidates, not SDK defaults. Both constrain `max_tokens` to `128` and set `repetition_penalty` to `1.05`, because the host's uncapped default produced impractically long output in evaluation. The first request downloads and loads model files into the model host's external cache, not this repository.
+`configs/speech.mlx-audio.example.toml` contains two convenient Apple Silicon candidates, not SDK defaults. Its repository IDs resolve the model host's current revisions and therefore do not reproduce the recorded benchmarks. Both constrain `max_tokens` to `128` and set `repetition_penalty` to `1.05`, because the host's uncapped default produced impractically long output in evaluation. Model files stay outside this repository.
 
-The report distinguishes synthesis completion from playback launch. Neither value is a measurement of first playable audio. The system-speech and local HTTP paths are replaceable reference adapters, not a neural-TTS recommendation, application voice selection, or model-quality decision. Exact measurements and remaining evidence gates are in [docs/neural-tts-evaluation.md](../../docs/neural-tts-evaluation.md).
+The report distinguishes synthesis completion from playback launch. Neither value is a measurement of first playable audio. The system-speech and local HTTP paths are replaceable reference adapters, not a neural-TTS recommendation, application voice selection, or model-quality decision. Exact snapshot reproduction, measurements, and remaining evidence gates are in [docs/neural-tts-evaluation.md](../../docs/neural-tts-evaluation.md).

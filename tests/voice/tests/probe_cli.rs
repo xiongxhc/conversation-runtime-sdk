@@ -2,7 +2,9 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::thread;
@@ -55,15 +57,23 @@ fn composes_runtime_with_generic_identifiers_and_reports_observable_milestones()
 
     assert!(output.status.success(), "{output:?}");
     assert_eq!(
-        String::from_utf8(output.stdout).unwrap(),
+        String::from_utf8(output.stdout.clone()).unwrap(),
         "First sentence. Second sentence."
     );
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("milestone=first_text_delta elapsed_ms="));
-    assert!(stderr.contains("milestone=first_synthesis_request elapsed_ms="));
-    assert!(stderr.contains("milestone=first_playable_audio elapsed_ms="));
-    assert!(stderr.contains("status=completed"));
-    assert_eq!(std::fs::read_dir(&capture_directory).unwrap().count(), 2);
+    assert_stderr(
+        &output,
+        &[
+            milestone("first_text_delta"),
+            milestone("first_synthesis_request"),
+            milestone("first_playable_audio"),
+            StderrLine::Status("completed".to_owned()),
+        ],
+    );
+    let captures = read_directory_files(&capture_directory);
+    assert_eq!(captures.len(), 2);
+    for capture in captures {
+        assert_eq!(capture, MINIMAL_PCM_WAV);
+    }
     assert_eq!(
         std::fs::read_dir(&playback_temp_directory).unwrap().count(),
         0
@@ -140,10 +150,19 @@ fn reads_a_non_empty_prompt_from_standard_input() {
     let output = wait_for_output(child);
 
     assert!(output.status.success(), "{output:?}");
-    assert_eq!(String::from_utf8(output.stdout).unwrap(), "Input response.");
-    assert!(String::from_utf8(output.stderr)
-        .unwrap()
-        .contains("status=completed"));
+    assert_eq!(
+        String::from_utf8(output.stdout.clone()).unwrap(),
+        "Input response."
+    );
+    assert_stderr(
+        &output,
+        &[
+            milestone("first_text_delta"),
+            milestone("first_synthesis_request"),
+            milestone("first_playable_audio"),
+            StderrLine::Status("completed".to_owned()),
+        ],
+    );
     let requests = language.finish();
     assert!(requests[0].contains("\"content\":\"prompt from stdin\""));
     speech.finish();
@@ -176,9 +195,15 @@ fn no_play_uses_discard_output_without_launching_the_configured_player() {
 
     assert!(output.status.success(), "{output:?}");
     assert!(!player_marker.exists());
-    assert!(String::from_utf8(output.stderr)
-        .unwrap()
-        .contains("milestone=first_playable_audio"));
+    assert_stderr(
+        &output,
+        &[
+            milestone("first_text_delta"),
+            milestone("first_synthesis_request"),
+            milestone("first_playable_audio"),
+            StderrLine::Status("completed".to_owned()),
+        ],
+    );
     language.finish();
     speech.finish();
 }
@@ -329,16 +354,8 @@ fn rejects_unbounded_or_ambiguous_configuration_before_network_access() {
             "--no-play",
             "prompt",
         ]));
-        let stderr = String::from_utf8(output.stderr.clone()).unwrap();
         assert!(!output.status.success(), "{name}: {output:?}");
-        assert!(
-            stderr.contains("status=error stage=configuration error="),
-            "{name}: {stderr}"
-        );
-        assert!(
-            !stderr.trim_end().chars().any(char::is_control),
-            "{name}: {stderr:?}"
-        );
+        assert_single_error(&output, "configuration");
     }
 }
 
@@ -396,7 +413,7 @@ fn reports_language_speech_and_audio_http_pipeline_failures_by_stage() {
         "--no-play",
         "prompt",
     ]));
-    assert_runtime_failure(&output, "language_model");
+    assert_runtime_failure(&output, &[], "language_model");
     language_failure.finish();
 
     let language = FixtureServer::start(vec![HttpResponse::ndjson(ONE_SENTENCE_NDJSON)]);
@@ -417,7 +434,11 @@ fn reports_language_speech_and_audio_http_pipeline_failures_by_stage() {
         "--no-play",
         "prompt",
     ]));
-    assert_runtime_failure(&output, "speech_synthesizer");
+    assert_runtime_failure(
+        &output,
+        &["first_text_delta", "first_synthesis_request"],
+        "speech_synthesizer",
+    );
     language.finish();
     speech_failure.finish();
 
@@ -439,7 +460,15 @@ fn reports_language_speech_and_audio_http_pipeline_failures_by_stage() {
         config.to_str().unwrap(),
         "prompt",
     ]));
-    assert_runtime_failure(&output, "audio_output");
+    assert_runtime_failure(
+        &output,
+        &[
+            "first_text_delta",
+            "first_synthesis_request",
+            "first_playable_audio",
+        ],
+        "audio_output",
+    );
     language.finish();
     speech.finish();
 }
@@ -465,9 +494,7 @@ fn rejects_empty_input_without_contacting_backends() {
     );
 
     assert!(!output.status.success());
-    assert!(String::from_utf8(output.stderr)
-        .unwrap()
-        .contains("status=error stage=input error="));
+    assert_single_error(&output, "input");
 }
 
 #[test]
@@ -497,29 +524,230 @@ fn sigint_interrupts_the_runtime_and_cleans_active_playback() {
         .unwrap();
 
     wait_for_path(&player_started);
-    assert!(Command::new("/bin/kill")
-        .args(["-INT", &child.id().to_string()])
-        .status()
-        .unwrap()
-        .success());
+    let _player_guard = PlayerGuard::new(&player_pid);
+    send_sigint(&child);
     let output = wait_for_output_with_deadline(child, Duration::from_secs(3));
 
     assert!(!output.status.success());
-    assert_eq!(String::from_utf8(output.stdout).unwrap(), "Input response.");
-    assert!(String::from_utf8(output.stderr)
-        .unwrap()
-        .contains("status=cancelled"));
-    let player_pid = std::fs::read_to_string(player_pid).unwrap();
-    assert!(!Command::new("/bin/kill")
-        .args(["-0", player_pid.trim()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .unwrap()
-        .success());
     assert_eq!(
-        std::fs::read_dir(&playback_temp_directory).unwrap().count(),
-        0
+        String::from_utf8(output.stdout.clone()).unwrap(),
+        "Input response."
+    );
+    assert_stderr(
+        &output,
+        &[
+            milestone("first_text_delta"),
+            milestone("first_synthesis_request"),
+            milestone("first_playable_audio"),
+            StderrLine::Status("cancelled".to_owned()),
+        ],
+    );
+    assert_player_cleaned(&player_pid, &playback_temp_directory);
+    language.finish();
+    speech.finish();
+}
+
+#[test]
+fn sigint_interrupts_while_stdout_is_blocked_and_cleans_active_playback() {
+    let fixture = tempfile::tempdir().unwrap();
+    let playback_temp_directory = fixture.path().join("playback");
+    std::fs::create_dir(&playback_temp_directory).unwrap();
+    let player_started = fixture.path().join("player-started");
+    let player_pid = fixture.path().join("player.pid");
+    let player = write_blocking_player(fixture.path(), &player_started, &player_pid);
+    let language = FixtureServer::start(vec![HttpResponse::ndjson(ONE_SENTENCE_NDJSON)]);
+    let speech = FixtureServer::start(vec![HttpResponse::wav(MINIMAL_PCM_WAV)]);
+    let config = write_config(
+        fixture.path(),
+        &valid_config(
+            language.endpoint(),
+            speech.endpoint_with_path("/v1"),
+            &player,
+            &playback_temp_directory,
+        ),
+    );
+    let (stdout, _blocked_reader) = blocked_stdout();
+    let child = Command::new(probe_binary())
+        .args(["--config", config.to_str().unwrap(), "interrupt", "blocked"])
+        .stdout(stdout)
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    wait_for_path(&player_started);
+    let _player_guard = PlayerGuard::new(&player_pid);
+    send_sigint(&child);
+    let output = wait_for_output_with_deadline(child, Duration::from_secs(3));
+
+    assert!(!output.status.success());
+    assert_stderr(
+        &output,
+        &[
+            milestone("first_text_delta"),
+            milestone("first_synthesis_request"),
+            milestone("first_playable_audio"),
+            StderrLine::Status("cancelled".to_owned()),
+        ],
+    );
+    assert_player_cleaned(&player_pid, &playback_temp_directory);
+    language.finish();
+    speech.finish();
+}
+
+#[test]
+fn broken_stdout_interrupts_and_drains_active_playback_before_reporting_output_failure() {
+    let fixture = tempfile::tempdir().unwrap();
+    let playback_temp_directory = fixture.path().join("playback");
+    std::fs::create_dir(&playback_temp_directory).unwrap();
+    let player_started = fixture.path().join("player-started");
+    let player_pid = fixture.path().join("player.pid");
+    let player = write_blocking_player(fixture.path(), &player_started, &player_pid);
+    let language = FixtureServer::start(vec![HttpResponse::ndjson(ONE_SENTENCE_NDJSON)]);
+    let speech = FixtureServer::start(vec![HttpResponse::wav(MINIMAL_PCM_WAV)]);
+    let config = write_config(
+        fixture.path(),
+        &valid_config(
+            language.endpoint(),
+            speech.endpoint_with_path("/v1"),
+            &player,
+            &playback_temp_directory,
+        ),
+    );
+    let (stdout, blocked_reader) = blocked_stdout();
+    let child = Command::new(probe_binary())
+        .args(["--config", config.to_str().unwrap(), "break", "stdout"])
+        .stdout(stdout)
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    wait_for_path(&player_started);
+    let _player_guard = PlayerGuard::new(&player_pid);
+    drop(blocked_reader);
+    let output = wait_for_output_with_deadline(child, Duration::from_secs(3));
+
+    assert!(!output.status.success());
+    assert_stderr(
+        &output,
+        &[
+            milestone("first_text_delta"),
+            milestone("first_synthesis_request"),
+            milestone("first_playable_audio"),
+            StderrLine::Error {
+                stage: "output".to_owned(),
+                message: "failed to flush text output".to_owned(),
+            },
+        ],
+    );
+    assert_player_cleaned(&player_pid, &playback_temp_directory);
+    language.finish();
+    speech.finish();
+}
+
+#[test]
+fn broken_stdout_write_drains_active_playback_before_reporting_output_failure() {
+    let fixture = tempfile::tempdir().unwrap();
+    let playback_temp_directory = fixture.path().join("playback");
+    std::fs::create_dir(&playback_temp_directory).unwrap();
+    let player_started = fixture.path().join("player-started");
+    let player_pid = fixture.path().join("player.pid");
+    let player = write_blocking_player(fixture.path(), &player_started, &player_pid);
+    let response = large_sentence_ndjson();
+    let language = FixtureServer::start(vec![HttpResponse::ndjson(&response)]);
+    let speech = FixtureServer::start(vec![HttpResponse::wav(MINIMAL_PCM_WAV)]);
+    let config = write_config(
+        fixture.path(),
+        &valid_config(
+            language.endpoint(),
+            speech.endpoint_with_path("/v1"),
+            &player,
+            &playback_temp_directory,
+        ),
+    );
+    let (stdout, blocked_reader) = blocked_stdout();
+    let child = Command::new(probe_binary())
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "break",
+            "large",
+            "stdout",
+        ])
+        .stdout(stdout)
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    wait_for_path(&player_started);
+    let _player_guard = PlayerGuard::new(&player_pid);
+    drop(blocked_reader);
+    let output = wait_for_output_with_deadline(child, Duration::from_secs(3));
+
+    assert!(!output.status.success());
+    assert_stderr(
+        &output,
+        &[
+            milestone("first_text_delta"),
+            milestone("first_synthesis_request"),
+            milestone("first_playable_audio"),
+            StderrLine::Error {
+                stage: "output".to_owned(),
+                message: "failed to write text output".to_owned(),
+            },
+        ],
+    );
+    assert_player_cleaned(&player_pid, &playback_temp_directory);
+    language.finish();
+    speech.finish();
+}
+
+#[test]
+fn sigint_after_playback_completion_drains_the_already_queued_terminal() {
+    let fixture = tempfile::tempdir().unwrap();
+    let playback_temp_directory = fixture.path().join("playback");
+    std::fs::create_dir(&playback_temp_directory).unwrap();
+    let player_completed = fixture.path().join("player-completed");
+    let player = write_completion_player(fixture.path(), &player_completed);
+    let language = FixtureServer::start(vec![HttpResponse::ndjson(ONE_SENTENCE_NDJSON)]);
+    let speech = FixtureServer::start(vec![HttpResponse::wav(MINIMAL_PCM_WAV)]);
+    let config = write_config(
+        fixture.path(),
+        &valid_config(
+            language.endpoint(),
+            speech.endpoint_with_path("/v1"),
+            &player,
+            &playback_temp_directory,
+        ),
+    );
+    let (stdout, _blocked_reader) = blocked_stdout();
+    let child = Command::new(probe_binary())
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "finish",
+            "the",
+            "turn",
+        ])
+        .stdout(stdout)
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    wait_for_path(&player_completed);
+    wait_for_directory_empty(&playback_temp_directory);
+    thread::sleep(Duration::from_millis(50));
+    send_sigint(&child);
+    let output = wait_for_output_with_deadline(child, Duration::from_secs(3));
+
+    assert!(output.status.success(), "{output:?}");
+    assert_stderr(
+        &output,
+        &[
+            milestone("first_text_delta"),
+            milestone("first_synthesis_request"),
+            milestone("first_playable_audio"),
+            StderrLine::Status("completed".to_owned()),
+        ],
     );
     language.finish();
     speech.finish();
@@ -527,6 +755,14 @@ fn sigint_interrupts_the_runtime_and_cleans_active_playback() {
 
 fn probe_binary() -> &'static str {
     env!("CARGO_BIN_EXE_conversation-voice-probe")
+}
+
+fn large_sentence_ndjson() -> Vec<u8> {
+    format!(
+        "{{\"message\":{{\"content\":\"{}.\"}},\"done\":true}}\n",
+        "x".repeat(16 * 1024)
+    )
+    .into_bytes()
 }
 
 fn valid_config(
@@ -624,6 +860,13 @@ fn write_blocking_player(directory: &Path, started: &Path, pid: &Path) -> PathBu
     )
 }
 
+fn write_completion_player(directory: &Path, completed: &Path) -> PathBuf {
+    write_executable(
+        directory.join("completion-player"),
+        &format!("#!/bin/sh\nset -eu\n: > {}\n", shell_quote(completed)),
+    )
+}
+
 fn write_executable(path: PathBuf, contents: &str) -> PathBuf {
     std::fs::write(&path, contents).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -648,6 +891,22 @@ fn run_probe(command: &mut Command) -> Output {
     wait_for_output(command.spawn().unwrap())
 }
 
+fn blocked_stdout() -> (Stdio, UnixStream) {
+    let (mut child_stdout, blocked_reader) = UnixStream::pair().unwrap();
+    child_stdout.set_nonblocking(true).unwrap();
+    let filler = [0_u8; 4096];
+    loop {
+        match child_stdout.write(&filler) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => panic!("could not prefill blocked stdout socket: {error}"),
+        }
+    }
+    child_stdout.set_nonblocking(false).unwrap();
+    let child_stdout: OwnedFd = child_stdout.into();
+    (Stdio::from(child_stdout), blocked_reader)
+}
+
 fn wait_for_output(child: Child) -> Output {
     wait_for_output_with_deadline(child, Duration::from_secs(5))
 }
@@ -667,8 +926,16 @@ fn wait_for_output_with_deadline(mut child: Child, timeout: Duration) -> Output 
     }
 }
 
+fn send_sigint(child: &Child) {
+    assert!(Command::new("/bin/kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap()
+        .success());
+}
+
 fn wait_for_path(path: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(8);
     while !path.exists() {
         assert!(
             Instant::now() < deadline,
@@ -679,23 +946,179 @@ fn wait_for_path(path: &Path) {
     }
 }
 
-fn assert_configuration_failure(output: &Output, expected: &str) {
-    assert!(!output.status.success(), "{output:?}");
-    let stderr = String::from_utf8(output.stderr.clone()).unwrap();
-    assert!(
-        stderr.contains("status=error stage=configuration error="),
-        "{stderr}"
-    );
-    assert!(stderr.contains(expected), "{stderr}");
+fn wait_for_directory_empty(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while std::fs::read_dir(path).unwrap().next().is_some() {
+        assert!(
+            Instant::now() < deadline,
+            "fixture directory did not become empty: {}",
+            path.display()
+        );
+        thread::yield_now();
+    }
 }
 
-fn assert_runtime_failure(output: &Output, stage: &str) {
-    assert!(!output.status.success(), "{output:?}");
+fn assert_player_cleaned(pid_path: &Path, temp_directory: &Path) {
+    let player_pid = std::fs::read_to_string(pid_path).unwrap();
+    assert!(!Command::new("/bin/kill")
+        .args(["-0", player_pid.trim()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap()
+        .success());
+    assert_eq!(std::fs::read_dir(temp_directory).unwrap().count(), 0);
+}
+
+struct PlayerGuard {
+    pid_path: PathBuf,
+}
+
+impl PlayerGuard {
+    fn new(pid_path: &Path) -> Self {
+        Self {
+            pid_path: pid_path.to_path_buf(),
+        }
+    }
+}
+
+impl Drop for PlayerGuard {
+    fn drop(&mut self) {
+        let Ok(pid) = std::fs::read_to_string(&self.pid_path) else {
+            return;
+        };
+        let _ = Command::new("/bin/kill")
+            .args(["-KILL", pid.trim()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+fn read_directory_files(path: &Path) -> Vec<Vec<u8>> {
+    let mut files = std::fs::read_dir(path)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    files.sort();
+    files
+        .into_iter()
+        .map(|file| std::fs::read(file).unwrap())
+        .collect()
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum StderrLine {
+    Milestone { name: String, elapsed_ms: u64 },
+    Status(String),
+    Error { stage: String, message: String },
+}
+
+fn milestone(name: &str) -> StderrLine {
+    StderrLine::Milestone {
+        name: name.to_owned(),
+        elapsed_ms: 0,
+    }
+}
+
+fn parse_stderr(output: &Output) -> Vec<StderrLine> {
     let stderr = String::from_utf8(output.stderr.clone()).unwrap();
+    assert!(!stderr.is_empty(), "structured stderr must not be empty");
+    assert!(stderr.ends_with('\n'), "stderr must end after a full line");
+    stderr.lines().map(parse_stderr_line).collect()
+}
+
+fn parse_stderr_line(line: &str) -> StderrLine {
     assert!(
-        stderr.contains(&format!("status=error stage={stage} error=")),
-        "{stderr}"
+        !line.chars().any(char::is_control),
+        "stderr line contained a control character: {line:?}"
     );
+    if let Some(fields) = line.strip_prefix("milestone=") {
+        let (name, elapsed_ms) = fields
+            .split_once(" elapsed_ms=")
+            .unwrap_or_else(|| panic!("malformed milestone line: {line}"));
+        assert!(!name.is_empty(), "milestone name must not be empty");
+        assert!(
+            !elapsed_ms.contains(' '),
+            "unexpected milestone fields: {line}"
+        );
+        return StderrLine::Milestone {
+            name: name.to_owned(),
+            elapsed_ms: elapsed_ms.parse().unwrap(),
+        };
+    }
+    if let Some(status) = line.strip_prefix("status=") {
+        if let Some(fields) = status.strip_prefix("error stage=") {
+            let (stage, message) = fields
+                .split_once(" error=")
+                .unwrap_or_else(|| panic!("malformed error line: {line}"));
+            assert!(!stage.is_empty(), "error stage must not be empty");
+            assert!(!message.is_empty(), "error message must not be empty");
+            return StderrLine::Error {
+                stage: stage.to_owned(),
+                message: message.to_owned(),
+            };
+        }
+        assert!(
+            matches!(status, "completed" | "cancelled"),
+            "unknown terminal status: {line}"
+        );
+        return StderrLine::Status(status.to_owned());
+    }
+    panic!("unexpected stderr line: {line}");
+}
+
+fn assert_stderr(output: &Output, expected: &[StderrLine]) {
+    let mut actual = parse_stderr(output);
+    for line in &mut actual {
+        if let StderrLine::Milestone { elapsed_ms, .. } = line {
+            *elapsed_ms = 0;
+        }
+    }
+    assert_eq!(actual, expected);
+}
+
+fn assert_configuration_failure(output: &Output, expected: &str) {
+    assert!(!output.status.success(), "{output:?}");
+    let lines = parse_stderr(output);
+    assert_eq!(lines.len(), 1);
+    let StderrLine::Error { stage, message } = &lines[0] else {
+        panic!("expected one structured configuration failure: {lines:?}");
+    };
+    assert_eq!(stage, "configuration");
+    assert!(message.contains(expected), "{message}");
+}
+
+fn assert_single_error(output: &Output, stage: &str) {
+    assert!(!output.status.success(), "{output:?}");
+    let lines = parse_stderr(output);
+    assert_eq!(lines.len(), 1);
+    assert!(matches!(
+        &lines[0],
+        StderrLine::Error {
+            stage: actual_stage,
+            message,
+        } if actual_stage == stage && !message.is_empty()
+    ));
+}
+
+fn assert_runtime_failure(output: &Output, milestones: &[&str], stage: &str) {
+    assert!(!output.status.success(), "{output:?}");
+    let lines = parse_stderr(output);
+    assert_eq!(lines.len(), milestones.len() + 1, "{lines:?}");
+    for (line, expected) in lines.iter().zip(milestones) {
+        assert!(matches!(
+            line,
+            StderrLine::Milestone { name, .. } if name == expected
+        ));
+    }
+    assert!(matches!(
+        lines.last().unwrap(),
+        StderrLine::Error {
+            stage: actual_stage,
+            message,
+        } if actual_stage == stage && !message.is_empty()
+    ));
 }
 
 struct FixtureServer {
@@ -709,7 +1132,7 @@ impl FixtureServer {
         listener.set_nonblocking(true).unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let worker = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(4);
+            let deadline = Instant::now() + Duration::from_secs(8);
             let mut requests = Vec::with_capacity(responses.len());
             for response in responses {
                 let mut stream = loop {

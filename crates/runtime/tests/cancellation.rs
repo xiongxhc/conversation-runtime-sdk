@@ -76,6 +76,21 @@ struct SaturatingLanguageModel {
     cleanup_completed: Arc<AtomicBool>,
 }
 
+struct DropAwareLanguageModel {
+    started: mpsc::UnboundedSender<()>,
+    cleanup_completed: mpsc::UnboundedSender<()>,
+}
+
+struct DropAwareSpeech {
+    started: mpsc::UnboundedSender<()>,
+    cleanup_completed: mpsc::UnboundedSender<()>,
+}
+
+struct DropAwareOutput {
+    started: mpsc::UnboundedSender<()>,
+    cleanup_completed: mpsc::UnboundedSender<()>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReuseOutcome {
     Completion,
@@ -176,6 +191,28 @@ impl LanguageModel for SaturatingLanguageModel {
     }
 }
 
+impl LanguageModel for DropAwareLanguageModel {
+    fn stream(
+        &self,
+        request: LanguageModelRequest,
+        cancellation: CancellationToken,
+    ) -> mpsc::Receiver<Result<String, AdapterError>> {
+        if request.turn_id() != TurnId::new(30) {
+            return MockLanguageModel::new(["recovered."]).stream(request, cancellation);
+        }
+
+        let (sender, receiver) = mpsc::channel(1);
+        let _ = self.started.send(());
+        let cleanup_completed = self.cleanup_completed.clone();
+        tokio::spawn(async move {
+            cancellation.cancelled().await;
+            let _ = cleanup_completed.send(());
+            drop(sender);
+        });
+        receiver
+    }
+}
+
 impl LanguageModel for ReusableLanguageModel {
     fn stream(
         &self,
@@ -252,6 +289,27 @@ impl SpeechSynthesizer for ReusableSpeech {
     }
 }
 
+impl SpeechSynthesizer for DropAwareSpeech {
+    fn synthesize<'a>(
+        &'a self,
+        request: SpeechRequest,
+        cancellation: CancellationToken,
+    ) -> AdapterFuture<'a, SynthesizedAudio> {
+        if request.turn_id() != TurnId::new(30) {
+            return Box::pin(async {
+                Ok(SynthesizedAudio::new(minimal_aiff(), AudioFormat::Aiff))
+            });
+        }
+
+        let _ = self.started.send(());
+        Box::pin(async move {
+            cancellation.cancelled().await;
+            let _ = self.cleanup_completed.send(());
+            Err(AdapterError::new("speech synthesis cancelled"))
+        })
+    }
+}
+
 impl AudioOutput for CleanupBlockingOutput {
     fn play<'a>(
         &'a self,
@@ -307,6 +365,25 @@ impl AudioOutput for ReusableOutput {
             } else {
                 Ok(())
             }
+        })
+    }
+}
+
+impl AudioOutput for DropAwareOutput {
+    fn play<'a>(
+        &'a self,
+        request: AudioOutputRequest,
+        cancellation: CancellationToken,
+    ) -> AdapterFuture<'a, ()> {
+        if request.turn_id() != TurnId::new(30) {
+            return Box::pin(async { Ok(()) });
+        }
+
+        let _ = self.started.send(());
+        Box::pin(async move {
+            cancellation.cancelled().await;
+            let _ = self.cleanup_completed.send(());
+            Err(AdapterError::new("audio output cancelled"))
         })
     }
 }
@@ -506,6 +583,87 @@ async fn waits_for_speech_cleanup_before_cancellation_completes() {
         terminal_events,
         vec![RuntimeEvent::TurnCancelled { turn_id }]
     );
+}
+
+#[tokio::test]
+async fn dropped_event_stream_cleans_stalled_language_and_allows_reuse() {
+    let (started, mut started_receiver) = mpsc::unbounded_channel();
+    let (cleanup_completed, mut cleanup_receiver) = mpsc::unbounded_channel();
+    let runtime = ConversationRuntime::new(
+        Arc::new(DropAwareLanguageModel {
+            started,
+            cleanup_completed,
+        }),
+        Arc::new(MockSpeechSynthesizer::new(minimal_aiff())),
+        Arc::new(DiscardAudioOutput),
+    );
+    let events = start_turn(&runtime, TurnId::new(30), "drop language").await;
+
+    timeout(Duration::from_secs(1), started_receiver.recv())
+        .await
+        .expect("language model did not start")
+        .expect("language start channel closed");
+    drop(events);
+
+    timeout(Duration::from_secs(1), cleanup_receiver.recv())
+        .await
+        .expect("dropped stream did not clean language work")
+        .expect("language cleanup channel closed");
+    assert_reusable_after_stream_drop(&runtime).await;
+}
+
+#[tokio::test]
+async fn dropped_event_stream_cleans_stalled_synthesis_and_allows_reuse() {
+    let (started, mut started_receiver) = mpsc::unbounded_channel();
+    let (cleanup_completed, mut cleanup_receiver) = mpsc::unbounded_channel();
+    let runtime = ConversationRuntime::new(
+        Arc::new(MockLanguageModel::new(["Speak."])),
+        Arc::new(DropAwareSpeech {
+            started,
+            cleanup_completed,
+        }),
+        Arc::new(DiscardAudioOutput),
+    );
+    let events = start_turn(&runtime, TurnId::new(30), "drop synthesis").await;
+
+    timeout(Duration::from_secs(1), started_receiver.recv())
+        .await
+        .expect("speech synthesizer did not start")
+        .expect("speech start channel closed");
+    drop(events);
+
+    timeout(Duration::from_secs(1), cleanup_receiver.recv())
+        .await
+        .expect("dropped stream did not clean synthesis work")
+        .expect("speech cleanup channel closed");
+    assert_reusable_after_stream_drop(&runtime).await;
+}
+
+#[tokio::test]
+async fn dropped_event_stream_cleans_stalled_output_and_allows_reuse() {
+    let (started, mut started_receiver) = mpsc::unbounded_channel();
+    let (cleanup_completed, mut cleanup_receiver) = mpsc::unbounded_channel();
+    let runtime = ConversationRuntime::new(
+        Arc::new(MockLanguageModel::new(["Speak."])),
+        Arc::new(MockSpeechSynthesizer::new(minimal_aiff())),
+        Arc::new(DropAwareOutput {
+            started,
+            cleanup_completed,
+        }),
+    );
+    let events = start_turn(&runtime, TurnId::new(30), "drop output").await;
+
+    timeout(Duration::from_secs(1), started_receiver.recv())
+        .await
+        .expect("audio output did not start")
+        .expect("output start channel closed");
+    drop(events);
+
+    timeout(Duration::from_secs(1), cleanup_receiver.recv())
+        .await
+        .expect("dropped stream did not clean output work")
+        .expect("output cleanup channel closed");
+    assert_reusable_after_stream_drop(&runtime).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1113,4 +1271,41 @@ async fn drain_events(events: &mut TurnEventStream) -> Vec<RuntimeEvent> {
         observed.push(event);
     }
     observed
+}
+
+async fn assert_reusable_after_stream_drop(runtime: &ConversationRuntime) {
+    let mut events = timeout(Duration::from_secs(1), async {
+        loop {
+            match runtime
+                .execute(RuntimeCommand::StartTurn {
+                    turn_id: TurnId::new(31),
+                    transcript: "reuse".into(),
+                })
+                .await
+            {
+                Ok(RuntimeCommandResult::TurnStarted { events }) => break events,
+                Err(error) if error.kind() == RuntimeErrorKind::InvalidState => {
+                    tokio::task::yield_now().await;
+                }
+                Ok(RuntimeCommandResult::InterruptAccepted) => {
+                    panic!("start command returned interrupt result")
+                }
+                Ok(_) => panic!("start command returned unknown result"),
+                Err(error) => panic!("reuse failed with unexpected error: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("runtime active turn was not cleared after stream drop");
+
+    assert_eq!(
+        drain_events(&mut events)
+            .await
+            .into_iter()
+            .filter(RuntimeEvent::is_terminal)
+            .collect::<Vec<_>>(),
+        [RuntimeEvent::TurnCompleted {
+            turn_id: TurnId::new(31)
+        }]
+    );
 }

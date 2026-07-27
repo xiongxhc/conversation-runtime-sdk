@@ -28,6 +28,10 @@ impl LanguageModelRequest {
     }
 }
 
+/// Streams generated text deltas for a runtime turn.
+///
+/// Producers must observe `cancellation`, stop work owned by the request, and
+/// close the returned receiver so runtime draining can complete.
 pub trait LanguageModel: Send + Sync {
     fn stream(
         &self,

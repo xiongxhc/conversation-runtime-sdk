@@ -4,9 +4,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use conversation_model_adapters::{
-    AdapterError, AdapterFuture, AudioFormat, DiscardAudioOutput, LanguageModel,
-    LanguageModelRequest, MockAudioOutput, MockLanguageModel, MockSpeechSynthesizer, SpeechRequest,
-    SpeechSynthesizer, SynthesizedAudio,
+    AdapterError, AdapterFuture, AudioFormat, AudioOutput, AudioOutputRequest, DiscardAudioOutput,
+    LanguageModel, LanguageModelRequest, MockAudioOutput, MockLanguageModel, MockSpeechSynthesizer,
+    SpeechRequest, SpeechSynthesizer, SynthesizedAudio,
 };
 use conversation_protocol::{
     RuntimeCommand, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage,
@@ -52,6 +52,10 @@ struct BlockingSpeechSynthesizer {
     started: mpsc::UnboundedSender<String>,
     release: Mutex<Option<oneshot::Receiver<()>>>,
 }
+
+struct PanickingLanguageModel;
+struct PanickingSpeechSynthesizer;
+struct PanickingAudioOutput;
 
 impl ControlledLanguageModel {
     fn new(receiver: mpsc::Receiver<Result<String, AdapterError>>) -> Self {
@@ -111,6 +115,47 @@ impl SpeechSynthesizer for BlockingSpeechSynthesizer {
                     Ok(SynthesizedAudio::new(minimal_aiff(), AudioFormat::Aiff))
                 }
             }
+        })
+    }
+}
+
+impl LanguageModel for PanickingLanguageModel {
+    fn stream(
+        &self,
+        request: LanguageModelRequest,
+        _cancellation: CancellationToken,
+    ) -> mpsc::Receiver<Result<String, AdapterError>> {
+        assert_ne!(request.turn_id(), TurnId::new(30), "language model panic");
+        MockLanguageModel::new(["recovered."]).stream(request, CancellationToken::new())
+    }
+}
+
+impl SpeechSynthesizer for PanickingSpeechSynthesizer {
+    fn synthesize<'a>(
+        &'a self,
+        request: SpeechRequest,
+        _cancellation: CancellationToken,
+    ) -> AdapterFuture<'a, SynthesizedAudio> {
+        Box::pin(async move {
+            assert_ne!(
+                request.turn_id(),
+                TurnId::new(30),
+                "speech synthesizer panic"
+            );
+            Ok(SynthesizedAudio::new(minimal_aiff(), AudioFormat::Aiff))
+        })
+    }
+}
+
+impl AudioOutput for PanickingAudioOutput {
+    fn play<'a>(
+        &'a self,
+        request: AudioOutputRequest,
+        _cancellation: CancellationToken,
+    ) -> AdapterFuture<'a, ()> {
+        Box::pin(async move {
+            assert_ne!(request.turn_id(), TurnId::new(30), "audio output panic");
+            Ok(())
         })
     }
 }
@@ -751,6 +796,88 @@ async fn reuses_runtime_after_a_completed_turn() {
             vec![RuntimeEvent::TurnCompleted { turn_id }]
         );
     }
+}
+
+#[tokio::test]
+async fn language_model_stream_panic_fails_at_language_stage_and_allows_reuse() {
+    let runtime = ConversationRuntime::new(
+        Arc::new(PanickingLanguageModel),
+        Arc::new(MockSpeechSynthesizer::new(minimal_aiff())),
+        Arc::new(DiscardAudioOutput),
+    );
+
+    assert_panicking_turn_and_reuse(
+        &runtime,
+        RuntimeStage::LanguageModel,
+        "language model adapter panicked",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn speech_panic_fails_at_synthesis_stage_and_allows_reuse() {
+    let runtime = ConversationRuntime::new(
+        Arc::new(MockLanguageModel::new(["Speak."])),
+        Arc::new(PanickingSpeechSynthesizer),
+        Arc::new(DiscardAudioOutput),
+    );
+
+    assert_panicking_turn_and_reuse(
+        &runtime,
+        RuntimeStage::SpeechSynthesizer,
+        "speech synthesizer adapter panicked",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn output_panic_fails_at_output_stage_and_allows_reuse() {
+    let runtime = ConversationRuntime::new(
+        Arc::new(MockLanguageModel::new(["Speak."])),
+        Arc::new(MockSpeechSynthesizer::new(minimal_aiff())),
+        Arc::new(PanickingAudioOutput),
+    );
+
+    assert_panicking_turn_and_reuse(
+        &runtime,
+        RuntimeStage::AudioOutput,
+        "audio output adapter panicked",
+    )
+    .await;
+}
+
+async fn assert_panicking_turn_and_reuse(
+    runtime: &ConversationRuntime,
+    expected_stage: RuntimeStage,
+    expected_message: &str,
+) {
+    let first_turn = TurnId::new(30);
+    let mut first_events = start_turn(runtime, first_turn, "panic").await;
+    let first_observed = drain_events(&mut first_events).await;
+
+    assert_eq!(
+        first_observed
+            .into_iter()
+            .filter(RuntimeEvent::is_terminal)
+            .collect::<Vec<_>>(),
+        [RuntimeEvent::TurnFailed {
+            turn_id: first_turn,
+            error: RuntimeError::new(RuntimeErrorKind::Adapter, expected_stage, expected_message,),
+        }]
+    );
+
+    let second_turn = TurnId::new(31);
+    let mut second_events = start_turn(runtime, second_turn, "reuse").await;
+    assert_eq!(
+        drain_events(&mut second_events)
+            .await
+            .into_iter()
+            .filter(RuntimeEvent::is_terminal)
+            .collect::<Vec<_>>(),
+        [RuntimeEvent::TurnCompleted {
+            turn_id: second_turn
+        }]
+    );
 }
 
 async fn start_turn(

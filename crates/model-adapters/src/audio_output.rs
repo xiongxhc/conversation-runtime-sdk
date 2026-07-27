@@ -32,6 +32,10 @@ impl AudioOutputRequest {
     }
 }
 
+/// Plays synthesized audio for a runtime turn.
+///
+/// Implementations must observe `cancellation` and resolve only after cleanup
+/// for work owned by the request has completed.
 pub trait AudioOutput: Send + Sync {
     fn play<'a>(
         &'a self,

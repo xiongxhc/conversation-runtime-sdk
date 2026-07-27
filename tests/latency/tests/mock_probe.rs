@@ -18,7 +18,16 @@ async fn records_the_expected_mock_turn_checkpoints() {
             "turn_completed",
         ]
     );
-    assert!(samples
+    let milestone_samples: Vec<_> = samples
+        .iter()
+        .filter(|sample| {
+            matches!(
+                sample.label(),
+                "first_text_delta" | "first_synthesis_request" | "first_playable_audio"
+            )
+        })
+        .collect();
+    assert!(milestone_samples
         .windows(2)
         .all(|pair| pair[0].elapsed() <= pair[1].elapsed()));
 }

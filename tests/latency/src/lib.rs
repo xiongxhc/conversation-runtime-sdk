@@ -101,15 +101,36 @@ pub async fn measure_mock_turn(transcript: &str) -> Result<Vec<TimingSample>, Ru
         };
 
         if let Some((label, runtime_elapsed)) = checkpoint {
-            let measured_elapsed = runtime_elapsed.unwrap_or_else(|| started.elapsed());
-            let elapsed = samples
-                .last()
-                .map_or(measured_elapsed, |sample: &TimingSample| {
-                    sample.elapsed.max(measured_elapsed)
-                });
-            samples.push(TimingSample { label, elapsed });
+            record_sample(
+                &mut samples,
+                label,
+                runtime_elapsed.unwrap_or_else(|| started.elapsed()),
+            );
         }
     }
 
     Ok(samples)
+}
+
+fn record_sample(samples: &mut Vec<TimingSample>, label: &'static str, elapsed: Duration) {
+    samples.push(TimingSample { label, elapsed });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{record_sample, TimingSample};
+
+    #[test]
+    fn timing_samples_preserve_raw_elapsed_values() {
+        let mut samples = vec![TimingSample {
+            label: "local",
+            elapsed: Duration::from_millis(10),
+        }];
+
+        record_sample(&mut samples, "runtime", Duration::from_millis(5));
+
+        assert_eq!(samples[1].elapsed(), Duration::from_millis(5));
+    }
 }

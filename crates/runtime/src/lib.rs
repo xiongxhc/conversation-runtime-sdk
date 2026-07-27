@@ -1,5 +1,4 @@
-use std::future::Future;
-use std::pin::Pin;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -11,6 +10,7 @@ use conversation_protocol::{
     RuntimeTimingMilestone, TurnId,
 };
 use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::task::{JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 mod phrase_chunker;
@@ -280,25 +280,41 @@ async fn run_turn(task: TurnTask, events: &mpsc::Sender<RuntimeEvent>) -> Runtim
 
     let (phrase_sender, phrase_receiver) = mpsc::channel(PHRASE_QUEUE_CAPACITY);
     let mut phrase_sender = Some(phrase_sender);
-    let speech_worker = SpeechWorker::new(SpeechWorkerContext {
-        turn_id,
-        speech_synthesizer,
-        audio_output,
-        segments: phrase_receiver,
-        events: events.clone(),
-        event_gate: Arc::clone(&event_gate),
-        started_at,
-        external_interruption: external_interruption.clone(),
-        work_cancellation: work_cancellation.clone(),
-    })
-    .run();
-    tokio::pin!(speech_worker);
+    let mut speech_worker = tokio::spawn(
+        SpeechWorker::new(SpeechWorkerContext {
+            turn_id,
+            speech_synthesizer,
+            audio_output,
+            segments: phrase_receiver,
+            events: events.clone(),
+            event_gate: Arc::clone(&event_gate),
+            started_at,
+            external_interruption: external_interruption.clone(),
+            work_cancellation: work_cancellation.clone(),
+        })
+        .run(),
+    );
 
     let language_model_cancellation = work_cancellation.child_token();
-    let mut deltas = language_model.stream(
-        LanguageModelRequest::new(turn_id, transcript),
-        language_model_cancellation.clone(),
-    );
+    let deltas = catch_unwind(AssertUnwindSafe(|| {
+        language_model.stream(
+            LanguageModelRequest::new(turn_id, transcript),
+            language_model_cancellation.clone(),
+        )
+    }));
+    let mut deltas = match deltas {
+        Ok(deltas) => deltas,
+        Err(_) => {
+            work_cancellation.cancel();
+            phrase_sender.take();
+            let _ = (&mut speech_worker).await;
+            return adapter_failure(
+                turn_id,
+                RuntimeStage::LanguageModel,
+                AdapterError::new("language model adapter panicked"),
+            );
+        }
+    };
     let mut chunker = PhraseChunker::new(phrase_chunking);
     let mut response_bytes = 0_usize;
     let mut emitted_first_text_timing = false;
@@ -313,20 +329,31 @@ async fn run_turn(task: TurnTask, events: &mpsc::Sender<RuntimeEvent>) -> Runtim
                     &language_model_cancellation,
                     &work_cancellation,
                     &mut deltas,
-                    speech_worker.as_mut(),
+                    &mut speech_worker,
                 ).await;
                 return RuntimeEvent::TurnCancelled { turn_id };
             }
-            _ = work_cancellation.cancelled() => {
-                let worker_outcome = speech_worker.as_mut().await;
-                phrase_sender.take();
-                cleanup_language_model(&language_model_cancellation, &mut deltas).await;
-                return terminal_from_worker(turn_id, worker_outcome);
+            _ = events.closed() => {
+                stop_pipeline(
+                    &mut phrase_sender,
+                    &language_model_cancellation,
+                    &work_cancellation,
+                    &mut deltas,
+                    &mut speech_worker,
+                ).await;
+                return runtime_failure(turn_id, "turn event stream closed during generation");
             }
-            worker_outcome = speech_worker.as_mut() => {
+            _ = work_cancellation.cancelled() => {
+                let worker_outcome = (&mut speech_worker).await;
                 phrase_sender.take();
                 cleanup_language_model(&language_model_cancellation, &mut deltas).await;
-                return terminal_from_worker(turn_id, worker_outcome);
+                return terminal_from_worker_result(turn_id, worker_outcome);
+            }
+            worker_outcome = &mut speech_worker => {
+                work_cancellation.cancel();
+                phrase_sender.take();
+                cleanup_language_model(&language_model_cancellation, &mut deltas).await;
+                return terminal_from_worker_result(turn_id, worker_outcome);
             }
             item = deltas.recv() => {
                 item
@@ -348,36 +375,51 @@ async fn run_turn(task: TurnTask, events: &mpsc::Sender<RuntimeEvent>) -> Runtim
                         &language_model_cancellation,
                         &work_cancellation,
                         &mut deltas,
-                        speech_worker.as_mut(),
+                        &mut speech_worker,
                     )
                     .await;
                     return terminal;
                 }
                 response_bytes += delta.len();
 
-                let mut text_events = Vec::with_capacity(2);
-                if !emitted_first_text_timing {
-                    text_events.push(timing_event(
-                        turn_id,
-                        RuntimeTimingMilestone::FirstTextDelta,
-                        started_at,
-                    ));
-                    emitted_first_text_timing = true;
-                }
-                text_events.push(RuntimeEvent::TextDelta {
-                    turn_id,
-                    delta: delta.clone(),
-                });
-                match send_events_while_worker_active(
-                    events,
-                    &event_gate,
-                    text_events,
-                    &external_interruption,
-                    &work_cancellation,
-                    speech_worker.as_mut(),
-                )
-                .await
-                {
+                let send_result = if emitted_first_text_timing {
+                    send_event_while_worker_active(
+                        events,
+                        &event_gate,
+                        RuntimeEvent::TextDelta {
+                            turn_id,
+                            delta: delta.clone(),
+                        },
+                        &external_interruption,
+                        &work_cancellation,
+                        &mut speech_worker,
+                    )
+                    .await
+                } else {
+                    let delta_for_event = delta.clone();
+                    send_required_pair_while_worker_active(
+                        events,
+                        &event_gate,
+                        || {
+                            [
+                                timing_event(
+                                    turn_id,
+                                    RuntimeTimingMilestone::FirstTextDelta,
+                                    started_at,
+                                ),
+                                RuntimeEvent::TextDelta {
+                                    turn_id,
+                                    delta: delta_for_event,
+                                },
+                            ]
+                        },
+                        &external_interruption,
+                        &work_cancellation,
+                        &mut speech_worker,
+                    )
+                    .await
+                };
+                match send_result {
                     PipelineSend::Sent => {}
                     PipelineSend::Interrupted => {
                         stop_pipeline(
@@ -385,15 +427,16 @@ async fn run_turn(task: TurnTask, events: &mpsc::Sender<RuntimeEvent>) -> Runtim
                             &language_model_cancellation,
                             &work_cancellation,
                             &mut deltas,
-                            speech_worker.as_mut(),
+                            &mut speech_worker,
                         )
                         .await;
                         return RuntimeEvent::TurnCancelled { turn_id };
                     }
                     PipelineSend::WorkerFinished(worker_outcome) => {
+                        work_cancellation.cancel();
                         phrase_sender.take();
                         cleanup_language_model(&language_model_cancellation, &mut deltas).await;
-                        return terminal_from_worker(turn_id, worker_outcome);
+                        return terminal_from_worker_result(turn_id, worker_outcome);
                     }
                     PipelineSend::Closed => {
                         stop_pipeline(
@@ -401,7 +444,7 @@ async fn run_turn(task: TurnTask, events: &mpsc::Sender<RuntimeEvent>) -> Runtim
                             &language_model_cancellation,
                             &work_cancellation,
                             &mut deltas,
-                            speech_worker.as_mut(),
+                            &mut speech_worker,
                         )
                         .await;
                         return runtime_failure(
@@ -410,6 +453,7 @@ async fn run_turn(task: TurnTask, events: &mpsc::Sender<RuntimeEvent>) -> Runtim
                         );
                     }
                 }
+                emitted_first_text_timing = true;
 
                 for text in chunker.push_delta(&delta) {
                     let segment = SpeechSegment {
@@ -422,9 +466,10 @@ async fn run_turn(task: TurnTask, events: &mpsc::Sender<RuntimeEvent>) -> Runtim
                             .as_ref()
                             .expect("phrase sender exists while generation is active"),
                         segment,
+                        events,
                         &external_interruption,
                         &work_cancellation,
-                        speech_worker.as_mut(),
+                        &mut speech_worker,
                     )
                     .await
                     {
@@ -435,15 +480,16 @@ async fn run_turn(task: TurnTask, events: &mpsc::Sender<RuntimeEvent>) -> Runtim
                                 &language_model_cancellation,
                                 &work_cancellation,
                                 &mut deltas,
-                                speech_worker.as_mut(),
+                                &mut speech_worker,
                             )
                             .await;
                             return RuntimeEvent::TurnCancelled { turn_id };
                         }
                         PipelineSend::WorkerFinished(worker_outcome) => {
+                            work_cancellation.cancel();
                             phrase_sender.take();
                             cleanup_language_model(&language_model_cancellation, &mut deltas).await;
-                            return terminal_from_worker(turn_id, worker_outcome);
+                            return terminal_from_worker_result(turn_id, worker_outcome);
                         }
                         PipelineSend::Closed => {
                             stop_pipeline(
@@ -451,7 +497,7 @@ async fn run_turn(task: TurnTask, events: &mpsc::Sender<RuntimeEvent>) -> Runtim
                                 &language_model_cancellation,
                                 &work_cancellation,
                                 &mut deltas,
-                                speech_worker.as_mut(),
+                                &mut speech_worker,
                             )
                             .await;
                             return runtime_failure(turn_id, "speech phrase queue closed early");
@@ -466,7 +512,7 @@ async fn run_turn(task: TurnTask, events: &mpsc::Sender<RuntimeEvent>) -> Runtim
                     &language_model_cancellation,
                     &work_cancellation,
                     &mut deltas,
-                    speech_worker.as_mut(),
+                    &mut speech_worker,
                 )
                 .await;
                 return terminal;
@@ -485,9 +531,10 @@ async fn run_turn(task: TurnTask, events: &mpsc::Sender<RuntimeEvent>) -> Runtim
                 .as_ref()
                 .expect("phrase sender exists before final worker drain"),
             segment,
+            events,
             &external_interruption,
             &work_cancellation,
-            speech_worker.as_mut(),
+            &mut speech_worker,
         )
         .await
         {
@@ -498,14 +545,16 @@ async fn run_turn(task: TurnTask, events: &mpsc::Sender<RuntimeEvent>) -> Runtim
                     &language_model_cancellation,
                     &work_cancellation,
                     &mut deltas,
-                    speech_worker.as_mut(),
+                    &mut speech_worker,
                 )
                 .await;
                 return RuntimeEvent::TurnCancelled { turn_id };
             }
             PipelineSend::WorkerFinished(worker_outcome) => {
+                work_cancellation.cancel();
                 phrase_sender.take();
-                return terminal_from_worker(turn_id, worker_outcome);
+                cleanup_language_model(&language_model_cancellation, &mut deltas).await;
+                return terminal_from_worker_result(turn_id, worker_outcome);
             }
             PipelineSend::Closed => {
                 stop_pipeline(
@@ -513,7 +562,7 @@ async fn run_turn(task: TurnTask, events: &mpsc::Sender<RuntimeEvent>) -> Runtim
                     &language_model_cancellation,
                     &work_cancellation,
                     &mut deltas,
-                    speech_worker.as_mut(),
+                    &mut speech_worker,
                 )
                 .await;
                 return runtime_failure(turn_id, "speech phrase queue closed before final segment");
@@ -522,7 +571,31 @@ async fn run_turn(task: TurnTask, events: &mpsc::Sender<RuntimeEvent>) -> Runtim
     }
 
     phrase_sender.take();
-    terminal_from_worker(turn_id, speech_worker.await)
+    let worker_outcome = tokio::select! {
+        biased;
+        _ = external_interruption.cancelled() => {
+            stop_pipeline(
+                &mut phrase_sender,
+                &language_model_cancellation,
+                &work_cancellation,
+                &mut deltas,
+                &mut speech_worker,
+            ).await;
+            return RuntimeEvent::TurnCancelled { turn_id };
+        }
+        _ = events.closed() => {
+            stop_pipeline(
+                &mut phrase_sender,
+                &language_model_cancellation,
+                &work_cancellation,
+                &mut deltas,
+                &mut speech_worker,
+            ).await;
+            return runtime_failure(turn_id, "turn event stream closed during speech drain");
+        }
+        worker_outcome = &mut speech_worker => worker_outcome,
+    };
+    terminal_from_worker_result(turn_id, worker_outcome)
 }
 
 async fn send_event_before_worker(
@@ -540,6 +613,9 @@ async fn send_event_before_worker(
         _ = work_cancellation.cancelled() => {
             return InitialSend::Interrupted;
         }
+        _ = events.closed() => {
+            return InitialSend::Closed;
+        }
         event_guard = event_gate.lock() => event_guard,
     };
 
@@ -551,6 +627,9 @@ async fn send_event_before_worker(
         _ = work_cancellation.cancelled() => {
             return InitialSend::Interrupted;
         }
+        _ = events.closed() => {
+            return InitialSend::Closed;
+        }
         result = events.send(event) => result,
     };
     if result.is_ok() {
@@ -560,70 +639,131 @@ async fn send_event_before_worker(
     }
 }
 
-async fn send_events_while_worker_active<F>(
+async fn send_event_while_worker_active(
     events: &mpsc::Sender<RuntimeEvent>,
     event_gate: &Mutex<()>,
-    pending_events: Vec<RuntimeEvent>,
+    event: RuntimeEvent,
     external_interruption: &CancellationToken,
     work_cancellation: &CancellationToken,
-    mut speech_worker: Pin<&mut F>,
-) -> PipelineSend
-where
-    F: Future<Output = SpeechWorkerOutcome>,
-{
+    speech_worker: &mut JoinHandle<SpeechWorkerOutcome>,
+) -> PipelineSend {
     let _event_guard = tokio::select! {
         biased;
         _ = external_interruption.cancelled() => {
             return PipelineSend::Interrupted;
         }
         _ = work_cancellation.cancelled() => {
-            return PipelineSend::WorkerFinished(speech_worker.await);
+            return PipelineSend::WorkerFinished((&mut *speech_worker).await);
         }
-        worker_outcome = speech_worker.as_mut() => {
+        _ = events.closed() => {
+            return PipelineSend::Closed;
+        }
+        worker_outcome = &mut *speech_worker => {
             return PipelineSend::WorkerFinished(worker_outcome);
         }
         event_guard = event_gate.lock() => event_guard,
     };
 
-    for event in pending_events {
-        let result = tokio::select! {
-            biased;
-            _ = external_interruption.cancelled() => {
-                return PipelineSend::Interrupted;
-            }
-            _ = work_cancellation.cancelled() => {
-                return PipelineSend::WorkerFinished(speech_worker.await);
-            }
-            worker_outcome = speech_worker.as_mut() => {
-                return PipelineSend::WorkerFinished(worker_outcome);
-            }
-            result = events.send(event) => result,
-        };
-        if result.is_err() {
+    let result = tokio::select! {
+        biased;
+        _ = external_interruption.cancelled() => {
+            return PipelineSend::Interrupted;
+        }
+        _ = work_cancellation.cancelled() => {
+            return PipelineSend::WorkerFinished((&mut *speech_worker).await);
+        }
+        _ = events.closed() => {
             return PipelineSend::Closed;
         }
+        worker_outcome = &mut *speech_worker => {
+            return PipelineSend::WorkerFinished(worker_outcome);
+        }
+        result = events.send(event) => result,
+    };
+    if result.is_err() {
+        PipelineSend::Closed
+    } else {
+        PipelineSend::Sent
     }
+}
 
+async fn send_required_pair_while_worker_active(
+    events: &mpsc::Sender<RuntimeEvent>,
+    event_gate: &Mutex<()>,
+    build_pair: impl FnOnce() -> [RuntimeEvent; 2],
+    external_interruption: &CancellationToken,
+    work_cancellation: &CancellationToken,
+    speech_worker: &mut JoinHandle<SpeechWorkerOutcome>,
+) -> PipelineSend {
+    let _event_guard = tokio::select! {
+        biased;
+        _ = external_interruption.cancelled() => {
+            return PipelineSend::Interrupted;
+        }
+        _ = work_cancellation.cancelled() => {
+            return PipelineSend::WorkerFinished((&mut *speech_worker).await);
+        }
+        _ = events.closed() => {
+            return PipelineSend::Closed;
+        }
+        worker_outcome = &mut *speech_worker => {
+            return PipelineSend::WorkerFinished(worker_outcome);
+        }
+        event_guard = event_gate.lock() => event_guard,
+    };
+
+    let mut permits = tokio::select! {
+        biased;
+        _ = external_interruption.cancelled() => {
+            return PipelineSend::Interrupted;
+        }
+        _ = work_cancellation.cancelled() => {
+            return PipelineSend::WorkerFinished((&mut *speech_worker).await);
+        }
+        _ = events.closed() => {
+            return PipelineSend::Closed;
+        }
+        worker_outcome = &mut *speech_worker => {
+            return PipelineSend::WorkerFinished(worker_outcome);
+        }
+        permits = events.reserve_many(2) => {
+            match permits {
+                Ok(permits) => permits,
+                Err(_) => return PipelineSend::Closed,
+            }
+        }
+    };
+
+    let [first, second] = build_pair();
+    permits
+        .next()
+        .expect("two event permits were reserved")
+        .send(first);
+    permits
+        .next()
+        .expect("two event permits were reserved")
+        .send(second);
     PipelineSend::Sent
 }
 
-async fn send_phrase_while_worker_active<F>(
+async fn send_phrase_while_worker_active(
     phrases: &mpsc::Sender<SpeechSegment>,
     segment: SpeechSegment,
+    events: &mpsc::Sender<RuntimeEvent>,
     external_interruption: &CancellationToken,
     work_cancellation: &CancellationToken,
-    mut speech_worker: Pin<&mut F>,
-) -> PipelineSend
-where
-    F: Future<Output = SpeechWorkerOutcome>,
-{
+    speech_worker: &mut JoinHandle<SpeechWorkerOutcome>,
+) -> PipelineSend {
     tokio::select! {
         biased;
         _ = external_interruption.cancelled() => PipelineSend::Interrupted,
         _ = work_cancellation.cancelled() => {
-            PipelineSend::WorkerFinished(speech_worker.await)
+            PipelineSend::WorkerFinished((&mut *speech_worker).await)
         }
-        worker_outcome = speech_worker.as_mut() => {
+        _ = events.closed() => {
+            PipelineSend::Closed
+        }
+        worker_outcome = &mut *speech_worker => {
             PipelineSend::WorkerFinished(worker_outcome)
         }
         result = phrases.send(segment) => {
@@ -636,21 +776,17 @@ where
     }
 }
 
-async fn stop_pipeline<F>(
+async fn stop_pipeline(
     phrase_sender: &mut Option<mpsc::Sender<SpeechSegment>>,
     language_model_cancellation: &CancellationToken,
     work_cancellation: &CancellationToken,
     deltas: &mut mpsc::Receiver<Result<String, AdapterError>>,
-    mut speech_worker: Pin<&mut F>,
-) -> SpeechWorkerOutcome
-where
-    F: Future<Output = SpeechWorkerOutcome>,
-{
+    speech_worker: &mut JoinHandle<SpeechWorkerOutcome>,
+) {
     work_cancellation.cancel();
     language_model_cancellation.cancel();
     phrase_sender.take();
-    let (_, worker_outcome) = tokio::join!(drain_language_model(deltas), speech_worker.as_mut());
-    worker_outcome
+    let (_, _) = tokio::join!(drain_language_model(deltas), &mut *speech_worker);
 }
 
 async fn cleanup_language_model(
@@ -665,7 +801,14 @@ async fn drain_language_model(deltas: &mut mpsc::Receiver<Result<String, Adapter
     while deltas.recv().await.is_some() {}
 }
 
-fn terminal_from_worker(turn_id: TurnId, outcome: SpeechWorkerOutcome) -> RuntimeEvent {
+fn terminal_from_worker_result(
+    turn_id: TurnId,
+    outcome: Result<SpeechWorkerOutcome, JoinError>,
+) -> RuntimeEvent {
+    let Ok(outcome) = outcome else {
+        return runtime_failure(turn_id, "speech worker task failed");
+    };
+
     match outcome {
         SpeechWorkerOutcome::Completed => RuntimeEvent::TurnCompleted { turn_id },
         SpeechWorkerOutcome::Interrupted => RuntimeEvent::TurnCancelled { turn_id },
@@ -722,7 +865,7 @@ enum InitialSend {
 enum PipelineSend {
     Sent,
     Interrupted,
-    WorkerFinished(SpeechWorkerOutcome),
+    WorkerFinished(Result<SpeechWorkerOutcome, JoinError>),
     Closed,
 }
 
@@ -736,13 +879,22 @@ fn runtime_error(message: impl Into<String>) -> RuntimeError {
 
 #[cfg(test)]
 mod tests {
+    use std::future::{pending, ready};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
 
-    use conversation_protocol::{RuntimeEvent, TurnId};
-    use tokio::sync::{mpsc, oneshot};
+    use conversation_protocol::{
+        RuntimeErrorKind, RuntimeEvent, RuntimeStage, RuntimeTimingMilestone, TurnId,
+    };
+    use tokio::sync::{mpsc, oneshot, Mutex};
     use tokio::time::timeout;
+    use tokio_util::sync::CancellationToken;
 
-    use super::TurnEventStream;
+    use super::{
+        send_required_pair_while_worker_active, terminal_from_worker_result, PipelineSend,
+        SpeechWorkerOutcome, TurnEventStream,
+    };
 
     #[tokio::test]
     async fn cancelled_terminal_receive_can_be_retried() {
@@ -768,5 +920,166 @@ mod tests {
             Some(RuntimeEvent::TurnCompleted { turn_id })
         );
         assert_eq!(events.recv().await, None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn first_text_pair_waits_for_two_slots_before_sampling_or_publication() {
+        let (event_sender, mut event_receiver) = mpsc::channel(2);
+        let turn_id = TurnId::new(2);
+        event_sender
+            .send(RuntimeEvent::TurnStarted { turn_id })
+            .await
+            .unwrap();
+        let event_gate = Mutex::new(());
+        let external_interruption = CancellationToken::new();
+        let work_cancellation = CancellationToken::new();
+        let timing_sampled = Arc::new(AtomicBool::new(false));
+        let timing_sampled_for_pair = Arc::clone(&timing_sampled);
+        let build_pair = move || {
+            timing_sampled_for_pair.store(true, Ordering::Release);
+            [
+                RuntimeEvent::Timing {
+                    turn_id,
+                    milestone: RuntimeTimingMilestone::FirstTextDelta,
+                    elapsed_ms: 1,
+                },
+                RuntimeEvent::TextDelta {
+                    turn_id,
+                    delta: "hello".into(),
+                },
+            ]
+        };
+        let mut speech_worker = tokio::spawn(pending::<SpeechWorkerOutcome>());
+        let send_pair = send_required_pair_while_worker_active(
+            &event_sender,
+            &event_gate,
+            build_pair,
+            &external_interruption,
+            &work_cancellation,
+            &mut speech_worker,
+        );
+        tokio::pin!(send_pair);
+
+        tokio::select! {
+            biased;
+            result = &mut send_pair => {
+                panic!("pair send resolved before two slots were available: {}", matches!(result, PipelineSend::Sent));
+            }
+            _ = ready(()) => {}
+        }
+
+        assert!(
+            !timing_sampled.load(Ordering::Acquire),
+            "timing was sampled before two event slots were reserved"
+        );
+        external_interruption.cancel();
+        assert!(matches!(
+            send_pair.as_mut().await,
+            PipelineSend::Interrupted
+        ));
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(RuntimeEvent::TurnStarted { turn_id })
+        );
+        assert!(
+            event_receiver.try_recv().is_err(),
+            "interruption exposed half of the required event pair"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn first_text_pair_is_not_sampled_or_published_when_saturated() {
+        let (event_sender, mut event_receiver) = mpsc::channel(2);
+        let turn_id = TurnId::new(4);
+        event_sender
+            .send(RuntimeEvent::TurnStarted { turn_id })
+            .await
+            .unwrap();
+        event_sender
+            .send(RuntimeEvent::TranscriptFinal {
+                turn_id,
+                text: "prefill".into(),
+            })
+            .await
+            .unwrap();
+        let event_gate = Mutex::new(());
+        let external_interruption = CancellationToken::new();
+        let work_cancellation = CancellationToken::new();
+        let timing_sampled = Arc::new(AtomicBool::new(false));
+        let timing_sampled_for_pair = Arc::clone(&timing_sampled);
+        let mut speech_worker = tokio::spawn(pending::<SpeechWorkerOutcome>());
+        let send_pair = send_required_pair_while_worker_active(
+            &event_sender,
+            &event_gate,
+            move || {
+                timing_sampled_for_pair.store(true, Ordering::Release);
+                [
+                    RuntimeEvent::Timing {
+                        turn_id,
+                        milestone: RuntimeTimingMilestone::FirstTextDelta,
+                        elapsed_ms: 1,
+                    },
+                    RuntimeEvent::TextDelta {
+                        turn_id,
+                        delta: "hello".into(),
+                    },
+                ]
+            },
+            &external_interruption,
+            &work_cancellation,
+            &mut speech_worker,
+        );
+        tokio::pin!(send_pair);
+
+        tokio::select! {
+            biased;
+            result = &mut send_pair => {
+                panic!("saturated pair send resolved before interruption: {}", matches!(result, PipelineSend::Sent));
+            }
+            _ = ready(()) => {}
+        }
+        assert!(!timing_sampled.load(Ordering::Acquire));
+
+        external_interruption.cancel();
+        assert!(matches!(
+            send_pair.as_mut().await,
+            PipelineSend::Interrupted
+        ));
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(RuntimeEvent::TurnStarted { turn_id })
+        );
+        assert_eq!(
+            event_receiver.recv().await,
+            Some(RuntimeEvent::TranscriptFinal {
+                turn_id,
+                text: "prefill".into(),
+            })
+        );
+        assert!(event_receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn unexpected_speech_worker_join_error_is_a_runtime_failure() {
+        let turn_id = TurnId::new(3);
+        let worker_error = tokio::spawn(async {
+            panic!("unexpected speech worker panic");
+        })
+        .await
+        .unwrap_err();
+
+        let terminal = terminal_from_worker_result(turn_id, Err(worker_error));
+
+        let RuntimeEvent::TurnFailed {
+            turn_id: failed_turn_id,
+            error,
+        } = terminal
+        else {
+            panic!("unexpected terminal: {terminal:?}");
+        };
+        assert_eq!(failed_turn_id, turn_id);
+        assert_eq!(error.kind(), RuntimeErrorKind::InvalidState);
+        assert_eq!(error.stage(), RuntimeStage::Runtime);
+        assert_eq!(error.message(), "speech worker task failed");
     }
 }

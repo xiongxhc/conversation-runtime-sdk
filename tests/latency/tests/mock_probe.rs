@@ -12,8 +12,13 @@ async fn records_the_expected_mock_turn_checkpoints() {
             "transcript_final",
             "first_text_delta",
             "speech_started",
+            "first_synthesis_request",
+            "first_playable_audio",
             "speech_completed",
             "turn_completed",
         ]
     );
+    assert!(samples
+        .windows(2)
+        .all(|pair| pair[0].elapsed() <= pair[1].elapsed()));
 }

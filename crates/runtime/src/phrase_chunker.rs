@@ -57,22 +57,20 @@ impl Default for PhraseChunkingConfig {
     }
 }
 
-#[allow(dead_code)]
-struct PhraseChunker {
+pub(super) struct PhraseChunker {
     config: PhraseChunkingConfig,
     buffer: String,
 }
 
-#[allow(dead_code)]
 impl PhraseChunker {
-    fn new(config: PhraseChunkingConfig) -> Self {
+    pub(super) fn new(config: PhraseChunkingConfig) -> Self {
         Self {
             config,
             buffer: String::new(),
         }
     }
 
-    fn push_delta(&mut self, delta: &str) -> Vec<String> {
+    pub(super) fn push_delta(&mut self, delta: &str) -> Vec<String> {
         self.buffer.push_str(delta);
 
         let mut phrases = Vec::new();
@@ -84,7 +82,7 @@ impl PhraseChunker {
         phrases
     }
 
-    fn finish(mut self) -> Option<String> {
+    pub(super) fn finish(mut self) -> Option<String> {
         self.drain_segment(self.buffer.len())
     }
 

@@ -1,9 +1,12 @@
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
 
-use conversation_model_adapters::{DiscardAudioOutput, MockLanguageModel, MockSpeechSynthesizer};
+use conversation_model_adapters::{
+    AdapterError, DiscardAudioOutput, LanguageModel, LanguageModelRequest, MockSpeechSynthesizer,
+};
 use conversation_protocol::{RuntimeCommand, RuntimeEvent, TurnId};
 use conversation_runtime::{ConversationRuntime, RuntimeCommandResult, TurnEventStream};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 fn minimal_aiff() -> Vec<u8> {
     let mut bytes = Vec::from(&b"FORM"[..]);
@@ -18,10 +21,31 @@ fn minimal_aiff() -> Vec<u8> {
     bytes
 }
 
+struct ControlledLanguageModel {
+    receiver: Mutex<Option<mpsc::Receiver<Result<String, AdapterError>>>>,
+}
+
+impl LanguageModel for ControlledLanguageModel {
+    fn stream(
+        &self,
+        _request: LanguageModelRequest,
+        _cancellation: CancellationToken,
+    ) -> mpsc::Receiver<Result<String, AdapterError>> {
+        self.receiver
+            .lock()
+            .expect("controlled language receiver lock poisoned")
+            .take()
+            .expect("controlled language model used more than once")
+    }
+}
+
 #[tokio::test]
 async fn executes_typed_start_and_interrupt_commands() {
+    let (_delta_sender, delta_receiver) = mpsc::channel(1);
     let runtime = ConversationRuntime::new(
-        Arc::new(MockLanguageModel::delayed(["late"], Duration::from_secs(5))),
+        Arc::new(ControlledLanguageModel {
+            receiver: Mutex::new(Some(delta_receiver)),
+        }),
         Arc::new(MockSpeechSynthesizer::new(minimal_aiff())),
         Arc::new(DiscardAudioOutput),
     );

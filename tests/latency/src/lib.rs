@@ -3,7 +3,8 @@ use std::time::{Duration, Instant};
 
 use conversation_model_adapters::{DiscardAudioOutput, MockLanguageModel, MockSpeechSynthesizer};
 use conversation_protocol::{
-    RuntimeCommand, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage, TurnId,
+    RuntimeCommand, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage,
+    RuntimeTimingMilestone, TurnId,
 };
 use conversation_runtime::{ConversationRuntime, RuntimeCommandResult};
 
@@ -74,28 +75,39 @@ pub async fn measure_mock_turn(transcript: &str) -> Result<Vec<TimingSample>, Ru
     };
 
     let mut samples = Vec::new();
-    let mut recorded_first_text_delta = false;
     while let Some(event) = events.recv().await {
-        let label = match event {
-            RuntimeEvent::TurnStarted { .. } => Some("turn_started"),
-            RuntimeEvent::TranscriptFinal { .. } => Some("transcript_final"),
-            RuntimeEvent::TextDelta { .. } if !recorded_first_text_delta => {
-                recorded_first_text_delta = true;
-                Some("first_text_delta")
+        let checkpoint = match event {
+            RuntimeEvent::TurnStarted { .. } => Some(("turn_started", None)),
+            RuntimeEvent::TranscriptFinal { .. } => Some(("transcript_final", None)),
+            RuntimeEvent::Timing {
+                milestone,
+                elapsed_ms,
+                ..
+            } => {
+                let label = match milestone {
+                    RuntimeTimingMilestone::FirstTextDelta => "first_text_delta",
+                    RuntimeTimingMilestone::FirstSynthesisRequest => "first_synthesis_request",
+                    RuntimeTimingMilestone::FirstPlayableAudio => "first_playable_audio",
+                    _ => continue,
+                };
+                Some((label, Some(Duration::from_millis(elapsed_ms))))
             }
-            RuntimeEvent::SpeechStarted { .. } => Some("speech_started"),
-            RuntimeEvent::SpeechCompleted { .. } => Some("speech_completed"),
-            RuntimeEvent::TurnCompleted { .. } => Some("turn_completed"),
-            RuntimeEvent::TurnCancelled { .. } => Some("turn_cancelled"),
-            RuntimeEvent::TurnFailed { .. } => Some("turn_failed"),
+            RuntimeEvent::SpeechStarted { .. } => Some(("speech_started", None)),
+            RuntimeEvent::SpeechCompleted { .. } => Some(("speech_completed", None)),
+            RuntimeEvent::TurnCompleted { .. } => Some(("turn_completed", None)),
+            RuntimeEvent::TurnCancelled { .. } => Some(("turn_cancelled", None)),
+            RuntimeEvent::TurnFailed { .. } => Some(("turn_failed", None)),
             _ => None,
         };
 
-        if let Some(label) = label {
-            samples.push(TimingSample {
-                label,
-                elapsed: started.elapsed(),
-            });
+        if let Some((label, runtime_elapsed)) = checkpoint {
+            let measured_elapsed = runtime_elapsed.unwrap_or_else(|| started.elapsed());
+            let elapsed = samples
+                .last()
+                .map_or(measured_elapsed, |sample: &TimingSample| {
+                    sample.elapsed.max(measured_elapsed)
+                });
+            samples.push(TimingSample { label, elapsed });
         }
     }
 

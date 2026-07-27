@@ -1,7 +1,7 @@
 mod config;
 
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use config::VoiceConfig;
@@ -14,6 +14,7 @@ use tokio::signal::unix::{signal, Signal, SignalKind};
 use tokio::sync::oneshot;
 
 const MAX_PROMPT_BYTES: u64 = 64 * 1024;
+const TERMINAL_QUEUED_TEST_HOOK: &str = "CONVERSATION_VOICE_PROBE_TEST_TERMINAL_QUEUED_FILE";
 
 #[tokio::main]
 async fn main() {
@@ -36,6 +37,7 @@ async fn run() -> Result<i32, ProbeFailure> {
     let config = VoiceConfig::load(&arguments.config_path)
         .map_err(|message| ProbeFailure::new("configuration", message))?;
     let transcript = arguments.transcript()?;
+    let terminal_queued_test_hook = std::env::var_os(TERMINAL_QUEUED_TEST_HOOK).map(PathBuf::from);
 
     let language_model = Arc::new(
         config
@@ -86,7 +88,7 @@ async fn run() -> Result<i32, ProbeFailure> {
             received = interrupts.recv() => {
                 require_interrupt_signal(received)?;
                 let terminal =
-                    interrupt_and_drain(&runtime, &mut events, turn_id).await?;
+                    interrupt_and_drain(&runtime, &mut events, turn_id, None).await?;
                 return report_terminal(terminal);
             }
             event = events.recv() => {
@@ -106,6 +108,7 @@ async fn run() -> Result<i32, ProbeFailure> {
                             &runtime,
                             &mut events,
                             turn_id,
+                            terminal_queued_test_hook.as_deref(),
                         )
                         .await?
                         {
@@ -119,6 +122,7 @@ async fn run() -> Result<i32, ProbeFailure> {
                             &runtime,
                             &mut events,
                             turn_id,
+                            terminal_queued_test_hook.as_deref(),
                         )
                         .await?
                         {
@@ -213,20 +217,66 @@ async fn await_output(
     runtime: &ConversationRuntime,
     events: &mut TurnEventStream,
     turn_id: TurnId,
+    terminal_queued_test_hook: Option<&Path>,
 ) -> Result<Option<i32>, ProbeFailure> {
-    tokio::select! {
-        biased;
-        received = interrupts.recv() => {
-            require_interrupt_signal(received)?;
-            let terminal = interrupt_and_drain(runtime, events, turn_id).await?;
-            report_terminal(terminal).map(Some)
-        }
-        result = completion => {
-            match result {
-                Ok(Ok(())) => Ok(None),
-                Ok(Err(_)) | Err(_) => {
-                    interrupt_and_drain(runtime, events, turn_id).await?;
-                    Err(ProbeFailure::new("output", failure_message))
+    let mut completion = completion;
+    let mut queued_terminal = None;
+
+    loop {
+        tokio::select! {
+            biased;
+            received = interrupts.recv() => {
+                require_interrupt_signal(received)?;
+                let terminal =
+                    interrupt_and_drain(runtime, events, turn_id, queued_terminal.take()).await?;
+                return report_terminal(terminal).map(Some);
+            }
+            result = &mut completion => {
+                return match result {
+                    Ok(Ok(())) => match queued_terminal {
+                        Some(terminal) => report_terminal(terminal).map(Some),
+                        None => Ok(None),
+                    },
+                    Ok(Err(_)) | Err(_) => {
+                        interrupt_and_drain(
+                            runtime,
+                            events,
+                            turn_id,
+                            queued_terminal.take(),
+                        )
+                        .await?;
+                        Err(ProbeFailure::new("output", failure_message))
+                    }
+                };
+            }
+            event = events.recv(),
+                if terminal_queued_test_hook.is_some() && queued_terminal.is_none() =>
+            {
+                let Some(event) = event else {
+                    return Err(ProbeFailure::new(
+                        "runtime",
+                        "runtime event stream ended before a terminal event",
+                    ));
+                };
+                match event {
+                    RuntimeEvent::Timing {
+                        milestone,
+                        elapsed_ms,
+                        ..
+                    } => report_milestone(milestone, elapsed_ms),
+                    RuntimeEvent::TurnCompleted { .. } => {
+                        queued_terminal = Some(Terminal::Completed);
+                        notify_terminal_queued(terminal_queued_test_hook.unwrap())?;
+                    }
+                    RuntimeEvent::TurnCancelled { .. } => {
+                        queued_terminal = Some(Terminal::Cancelled);
+                        notify_terminal_queued(terminal_queued_test_hook.unwrap())?;
+                    }
+                    RuntimeEvent::TurnFailed { error, .. } => {
+                        queued_terminal = Some(Terminal::Failed(error));
+                        notify_terminal_queued(terminal_queued_test_hook.unwrap())?;
+                    }
+                    _ => {}
                 }
             }
         }
@@ -237,6 +287,7 @@ async fn interrupt_and_drain(
     runtime: &ConversationRuntime,
     events: &mut TurnEventStream,
     turn_id: TurnId,
+    queued_terminal: Option<Terminal>,
 ) -> Result<Terminal, ProbeFailure> {
     match runtime.execute(RuntimeCommand::Interrupt { turn_id }).await {
         Ok(RuntimeCommandResult::InterruptAccepted) => {}
@@ -246,10 +297,19 @@ async fn interrupt_and_drain(
                 "runtime did not accept the requested interruption",
             ))
         }
-        Err(error) if terminal_was_already_queued(&error) => {}
+        Err(error) if terminal_was_already_queued(&error) => {
+            if let Some(terminal) = queued_terminal {
+                return Ok(terminal);
+            }
+        }
         Err(error) => return Err(runtime_failure(error)),
     }
     drain_terminal(events).await
+}
+
+fn notify_terminal_queued(path: &Path) -> Result<(), ProbeFailure> {
+    std::fs::write(path, [])
+        .map_err(|_| ProbeFailure::new("runtime", "failed to notify terminal test hook"))
 }
 
 async fn drain_terminal(events: &mut TurnEventStream) -> Result<Terminal, ProbeFailure> {

@@ -711,6 +711,7 @@ fn sigint_after_playback_completion_drains_the_already_queued_terminal() {
     let playback_temp_directory = fixture.path().join("playback");
     std::fs::create_dir(&playback_temp_directory).unwrap();
     let player_completed = fixture.path().join("player-completed");
+    let terminal_queued = fixture.path().join("terminal-queued");
     let player = write_completion_player(fixture.path(), &player_completed);
     let language = FixtureServer::start(vec![HttpResponse::ndjson(ONE_SENTENCE_NDJSON)]);
     let speech = FixtureServer::start(vec![HttpResponse::wav(MINIMAL_PCM_WAV)]);
@@ -724,7 +725,7 @@ fn sigint_after_playback_completion_drains_the_already_queued_terminal() {
         ),
     );
     let (stdout, _blocked_reader) = blocked_stdout();
-    let child = Command::new(probe_binary())
+    let mut child = Command::new(probe_binary())
         .args([
             "--config",
             config.to_str().unwrap(),
@@ -734,12 +735,19 @@ fn sigint_after_playback_completion_drains_the_already_queued_terminal() {
         ])
         .stdout(stdout)
         .stderr(Stdio::piped())
+        .env(
+            "CONVERSATION_VOICE_PROBE_TEST_TERMINAL_QUEUED_FILE",
+            &terminal_queued,
+        )
         .spawn()
         .unwrap();
 
-    wait_for_path(&player_completed);
-    wait_for_directory_empty(&playback_temp_directory);
-    thread::sleep(Duration::from_millis(50));
+    wait_for_path_or_kill(&terminal_queued, &mut child);
+    assert!(player_completed.exists());
+    assert_eq!(
+        std::fs::read_dir(&playback_temp_directory).unwrap().count(),
+        0
+    );
     send_sigint(&child);
     let output = wait_for_output_with_deadline(child, Duration::from_secs(3));
 
@@ -950,15 +958,15 @@ fn wait_for_path(path: &Path) {
     }
 }
 
-fn wait_for_directory_empty(path: &Path) {
+fn wait_for_path_or_kill(path: &Path, child: &mut Child) {
     let deadline = Instant::now() + Duration::from_secs(8);
-    while std::fs::read_dir(path).unwrap().next().is_some() {
-        assert!(
-            Instant::now() < deadline,
-            "fixture directory did not become empty: {}",
-            path.display()
-        );
-        thread::yield_now();
+    while !path.exists() {
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            let _ = child.wait();
+            panic!("fixture path was not created: {}", path.display());
+        }
+        thread::sleep(Duration::from_millis(5));
     }
 }
 

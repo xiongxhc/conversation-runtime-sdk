@@ -38,6 +38,10 @@ impl TurnFinalizer {
     }
 
     pub fn observe_hypothesis(&mut self, value: RecognitionHypothesis, _at_ms: u64) {
+        if value.text().trim().is_empty() {
+            return;
+        }
+
         let segment_id = value.segment_id();
         let text = value.text().to_owned();
 

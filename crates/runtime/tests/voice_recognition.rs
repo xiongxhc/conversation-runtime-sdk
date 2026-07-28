@@ -38,6 +38,26 @@ fn whitespace_engine_final_never_becomes_a_finalized_transcript() {
 }
 
 #[test]
+fn whitespace_segments_do_not_replace_or_reset_a_valid_pending_segment() {
+    let mut finalizer = TurnFinalizer::new(600).unwrap();
+    finalizer.observe_hypothesis(RecognitionHypothesis::engine_final(20, "hello"), 10);
+    finalizer.observe_activity(VoiceActivity::SpeechEnded { at_ms: 20 });
+
+    finalizer.observe_hypothesis(RecognitionHypothesis::partial(21, " \t"), 30);
+    finalizer.observe_hypothesis(RecognitionHypothesis::engine_final(22, "\n "), 40);
+
+    assert_eq!(finalizer.display_text(), Some("hello"));
+    assert_eq!(
+        finalizer.finalize_ready(620),
+        Some(conversation_runtime::FinalizedTranscript {
+            segment_id: 20,
+            text: "hello".to_owned(),
+        })
+    );
+    assert_eq!(finalizer.finalize_ready(u64::MAX), None);
+}
+
+#[test]
 fn speech_resume_cancels_the_silence_deadline() {
     let mut finalizer = TurnFinalizer::new(600).unwrap();
     finalizer.observe_hypothesis(RecognitionHypothesis::engine_final(5, "hello"), 10);

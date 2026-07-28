@@ -10,7 +10,9 @@ use conversation_model_adapters::{
 use conversation_protocol::{
     RuntimeCommand, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage, TurnId,
 };
-use conversation_runtime::{ConversationRuntime, RuntimeCommandResult, TurnEventStream};
+use conversation_runtime::{
+    ConversationRuntime, PhraseChunkingConfig, RuntimeCommandResult, TurnEventStream,
+};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -26,6 +28,10 @@ fn minimal_aiff() -> Vec<u8> {
     bytes.extend_from_slice(&[0; 8]);
     bytes.extend_from_slice(&[0x80, 0]);
     bytes
+}
+
+fn small_phrase_chunking_config() -> PhraseChunkingConfig {
+    PhraseChunkingConfig::new(4, 192).unwrap()
 }
 
 struct CompletionSignallingSpeech {
@@ -679,7 +685,8 @@ async fn interruption_discards_queued_synthesis_after_active_cleanup() {
             cleanup_completed: Arc::clone(&cleanup_completed),
         }),
         Arc::new(DiscardAudioOutput),
-    );
+    )
+    .with_phrase_chunking(small_phrase_chunking_config());
     let turn_id = TurnId::new(15);
     let mut events = start_turn(&runtime, turn_id, "cancel queue").await;
 
@@ -757,7 +764,8 @@ async fn language_failure_retains_its_stage_after_active_speech_cleanup() {
             cleanup_completed: Arc::clone(&cleanup_completed),
         }),
         Arc::new(DiscardAudioOutput),
-    );
+    )
+    .with_phrase_chunking(small_phrase_chunking_config());
     let turn_id = TurnId::new(17);
     let mut events = start_turn(&runtime, turn_id, "language failure").await;
 
@@ -811,7 +819,8 @@ async fn synthesis_failure_cancels_and_cleans_active_generation() {
             started: speech_started,
         }),
         Arc::new(DiscardAudioOutput),
-    );
+    )
+    .with_phrase_chunking(small_phrase_chunking_config());
     let turn_id = TurnId::new(18);
     let mut events = start_turn(&runtime, turn_id, "synthesis failure").await;
 
@@ -855,7 +864,8 @@ async fn output_failure_cancels_generation_discards_queue_and_waits_for_cleanup(
             fail: Mutex::new(Some(output_failure)),
             cleanup_completed: Arc::clone(&output_cleanup),
         }),
-    );
+    )
+    .with_phrase_chunking(small_phrase_chunking_config());
     let turn_id = TurnId::new(19);
     let mut events = start_turn(&runtime, turn_id, "output failure").await;
 
@@ -904,7 +914,8 @@ async fn output_failure_resolves_when_lifecycle_events_are_saturated() {
             fail: Mutex::new(Some(output_failure)),
             cleanup_completed: Arc::clone(&output_cleanup),
         }),
-    );
+    )
+    .with_phrase_chunking(small_phrase_chunking_config());
     let turn_id = TurnId::new(20);
     let mut events = start_turn(&runtime, turn_id, "saturate events").await;
 

@@ -290,7 +290,8 @@ async fn streams_ordered_phrases_to_audio_before_generation_completes() {
         Arc::new(ControlledLanguageModel::new(delta_receiver)),
         speech,
         output.clone(),
-    );
+    )
+    .with_phrase_chunking(PhraseChunkingConfig::new(15, 24).unwrap());
     let turn_id = TurnId::new(20);
     let mut events = start_turn(&runtime, turn_id, "overlap").await;
 
@@ -302,7 +303,7 @@ async fn streams_ordered_phrases_to_audio_before_generation_completes() {
     assert_eq!(first_synthesis, "First sentence.");
 
     delta_sender
-        .send(Ok("Second sentence.".into()))
+        .send(Ok("Third sentence.".into()))
         .await
         .unwrap();
     drop(delta_sender);
@@ -315,7 +316,7 @@ async fn streams_ordered_phrases_to_audio_before_generation_completes() {
     let synthesized_text = vec![first_synthesis, second_synthesis];
     assert_eq!(
         synthesized_text,
-        vec!["First sentence.".to_owned(), "Second sentence.".to_owned()]
+        vec!["First sentence.".to_owned(), "Third sentence.".to_owned()]
     );
     assert!(first_synthesis_started_before_model_release);
 
@@ -403,6 +404,35 @@ async fn streams_ordered_phrases_to_audio_before_generation_completes() {
 }
 
 #[tokio::test]
+async fn short_sentences_are_one_speech_request_without_changing_text_deltas() {
+    let original = "# 问候\n你好。今天很好！*保持自然*";
+    let (speech_calls, mut synthesized_text) = mpsc::unbounded_channel();
+    let runtime = ConversationRuntime::new(
+        Arc::new(MockLanguageModel::new([original])),
+        Arc::new(RecordingSpeechSynthesizer {
+            audio: SynthesizedAudio::new(minimal_aiff(), AudioFormat::Aiff),
+            calls: speech_calls,
+        }),
+        Arc::new(DiscardAudioOutput),
+    );
+    let turn_id = TurnId::new(60);
+    let mut events = start_turn(&runtime, turn_id, "coalesce").await;
+
+    let observed = drain_events(&mut events).await;
+    let deltas = observed
+        .iter()
+        .filter_map(|event| match event {
+            RuntimeEvent::TextDelta { delta, .. } => Some(delta.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+
+    assert_eq!(deltas, original);
+    assert_eq!(synthesized_text.recv().await.as_deref(), Some(original));
+    assert!(synthesized_text.try_recv().is_err());
+}
+
+#[tokio::test]
 async fn configured_phrase_limits_control_runtime_synthesis_segments() {
     let (speech_calls, mut synthesized_text) = mpsc::unbounded_channel();
     let runtime = ConversationRuntime::new(
@@ -484,7 +514,8 @@ async fn two_item_phrase_queue_backpressures_language_consumption() {
             release: Mutex::new(Some(speech_release)),
         }),
         Arc::new(DiscardAudioOutput),
-    );
+    )
+    .with_phrase_chunking(PhraseChunkingConfig::new(6, 12).unwrap());
     let turn_id = TurnId::new(22);
     let mut events = start_turn(&runtime, turn_id, "queue").await;
 

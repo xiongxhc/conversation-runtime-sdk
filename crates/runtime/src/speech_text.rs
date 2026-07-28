@@ -77,15 +77,19 @@ fn strip_paired_delimiters(input: &str) -> String {
             }
         }
 
-        let asterisk_width = [2, 1].into_iter().find(|width| {
-            asterisk_run_length(remaining) == *width && can_open_asterisks(input, cursor, *width)
-        });
-        if let Some(width) = asterisk_width {
-            if let Some(end) = find_closing_asterisks(input, cursor + width, width) {
-                normalized.push_str(&strip_paired_delimiters(&input[cursor + width..end]));
-                cursor = end + width;
-                continue;
+        if remaining.starts_with('*') {
+            let width = asterisk_run_length(remaining);
+            if matches!(width, 1 | 2) && can_open_asterisks(input, cursor, width) {
+                if let Some(end) = find_closing_asterisks(input, cursor + width, width) {
+                    normalized.push_str(&strip_paired_delimiters(&input[cursor + width..end]));
+                    cursor = end + width;
+                    continue;
+                }
             }
+
+            normalized.push_str(&remaining[..width]);
+            cursor += width;
+            continue;
         }
 
         let character = remaining
@@ -102,6 +106,13 @@ fn strip_paired_delimiters(input: &str) -> String {
 fn find_closing_asterisks(input: &str, mut cursor: usize, width: usize) -> Option<usize> {
     while cursor < input.len() {
         let remaining = &input[cursor..];
+        if let Some(rest) = remaining.strip_prefix('`') {
+            if let Some(end) = rest.find('`') {
+                cursor += end + 2;
+                continue;
+            }
+        }
+
         if remaining.starts_with('*') {
             let run_length = asterisk_run_length(remaining);
             if run_length == width && can_close_asterisks(input, cursor) {
@@ -175,10 +186,9 @@ mod tests {
 
     #[test]
     fn preserves_unsupported_inline_asterisk_runs() {
-        assert_eq!(
-            normalize_speech_text("***nested***").as_deref(),
-            Some("***nested***")
-        );
+        for input in ["***nested***", "***nested**", "**unfinished*"] {
+            assert_eq!(normalize_speech_text(input).as_deref(), Some(input));
+        }
     }
 
     #[test]
@@ -186,6 +196,10 @@ mod tests {
         assert_eq!(
             normalize_speech_text("**say `hello`** and *keep **nested** natural*.").as_deref(),
             Some("say hello and keep nested natural.")
+        );
+        assert_eq!(
+            normalize_speech_text("*say `2*3`*").as_deref(),
+            Some("say 2*3")
         );
     }
 

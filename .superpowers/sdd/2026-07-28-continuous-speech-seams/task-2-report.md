@@ -115,3 +115,10 @@ delimiters inside emphasis, and preserves inline-code content without
 reinterpreting literal markers inside that code span. Numeric expressions such
 as `2*3`, unmatched delimiters, unsupported three-asterisk and hash runs, and
 the original emitted text remain unchanged.
+
+The first re-review found that closing-emphasis search still entered paired
+inline-code spans and that failed or unsupported star runs could be retried
+from a shorter suffix. Added regressions failed for ``*say `2*3`*``,
+`***nested**`, and `**unfinished*`. Closing search now skips paired backtick
+spans, and the main scanner preserves a failed or unsupported star run
+atomically before continuing.

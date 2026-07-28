@@ -81,3 +81,51 @@ Result: passed — 75 runtime tests, strict runtime Clippy, formatting check, an
 ## Concern
 
 - Broader cross-stage interruption and failure permutations remain assigned to Task 4; no Task 3 blocker remains.
+
+## Review Fix Round 1/5
+
+### Findings Addressed
+
+- **Important — ready synthesis failure or panic lost to internal stop:** addressed. `wait_for_adapter` now polls the contained adapter result after external interruption and lifecycle closure but before internal stop. A ready adapter error or contained panic therefore retains the synthesis stage. A ready successful synthesis still yields to an already-cancelled internal stop.
+- **Minor — first-playable/output invocation ordering was not proven:** addressed. The overlap regression now fills the lifecycle event buffer before synthesis, waits for the first synthesis future to complete, and proves output has not been invoked while `FirstPlayableAudio` publication is blocked. Draining through the timing event then allows output `0` to start.
+
+### TDD Evidence
+
+Added `ready_synthesis_failure_and_panic_win_over_internal_stop` before changing adapter arbitration.
+
+```bash
+PATH="/opt/homebrew/opt/rustup/bin:$PATH" cargo test --locked -p conversation-runtime ready_synthesis_failure_and_panic_win_over_internal_stop -- --nocapture
+```
+
+RED result: failed with `internal stop masked a ready synthesis failure`.
+
+GREEN result: passed for an immediately ready adapter error and contained poll panic while internal stop was already cancelled. The same test proves a simultaneously ready successful result still returns `Stopped`.
+
+Added `external_interruption_and_lifecycle_closure_keep_priority_over_ready_failure` to prove both higher priorities still win when the adapter failure and internal stop are also ready.
+
+### First-Playable Causality Evidence
+
+The overlap test queues 26 empty deltas plus the required exact speech text without consuming lifecycle events. `TurnStarted`, `TranscriptFinal`, the first-text pair, the remaining empty `TextDelta` events, the exact speech `TextDelta`, and the speech-start pair fill all 32 lifecycle slots. After the first synthesis future reports completion, the test observes no output invocation because `FirstPlayableAudio` cannot yet be published. Output starts only after the test drains through that timing event.
+
+### Verification
+
+```bash
+PATH="/opt/homebrew/opt/rustup/bin:$PATH" cargo test --locked -p conversation-runtime ready_synthesis_failure_and_panic_win_over_internal_stop
+PATH="/opt/homebrew/opt/rustup/bin:$PATH" cargo test --locked -p conversation-runtime external_interruption_and_lifecycle_closure_keep_priority_over_ready_failure
+PATH="/opt/homebrew/opt/rustup/bin:$PATH" cargo test --locked -p conversation-runtime prepares_one_segment_ahead_before_current_audio_finishes
+PATH="/opt/homebrew/opt/rustup/bin:$PATH" cargo test --locked -p conversation-runtime synthesis_failure_during_active_output_keeps_the_synthesis_stage
+PATH="/opt/homebrew/opt/rustup/bin:$PATH" cargo test --locked -p conversation-runtime
+PATH="/opt/homebrew/opt/rustup/bin:$PATH" cargo clippy --locked -p conversation-runtime --all-targets -- -D warnings
+PATH="/opt/homebrew/opt/rustup/bin:$PATH" cargo fmt --all -- --check
+git diff --check
+```
+
+Result: passed — all focused regressions, 77 runtime tests, strict runtime Clippy, formatting check, and whitespace diff check.
+
+### Self-Review
+
+- The exact adapter-wait order is external interruption, lifecycle receiver closure, ready adapter result, then internal stop.
+- Only ready error and panic outcomes outrank internal stop; a ready successful value is discarded when internal stop is already cancelled.
+- External interruption and lifecycle closure are tested with adapter failure and internal stop simultaneously ready.
+- The first-playable gate tests the production sequence without adding a test hook to the runtime.
+- The fix changes no capacity, output ordering, cleanup, `JoinError`, lifecycle pair, or `SpeechCompleted` behavior.

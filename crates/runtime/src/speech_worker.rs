@@ -499,15 +499,16 @@ impl SpeechEventPublisher {
                 let _ = adapter.await;
                 AdapterWait::Closed
             }
-            _ = self.work_cancellation.cancelled() => {
-                let _ = adapter.await;
-                AdapterWait::Stopped
-            }
             result = &mut adapter => {
                 match result {
+                    Ok(Ok(_)) if self.work_cancellation.is_cancelled() => AdapterWait::Stopped,
                     Ok(result) => AdapterWait::Completed(result),
                     Err(()) => AdapterWait::Panicked,
                 }
+            }
+            _ = self.work_cancellation.cancelled() => {
+                let _ = adapter.await;
+                AdapterWait::Stopped
             }
         }
     }
@@ -690,6 +691,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Instant;
 
+    use conversation_model_adapters::{AdapterError, AdapterFuture};
     use conversation_protocol::{RuntimeEvent, RuntimeStage, RuntimeTimingMilestone, TurnId};
     use tokio::sync::{mpsc, Mutex};
     use tokio_util::sync::CancellationToken;
@@ -723,6 +725,85 @@ mod tests {
             }
             _ => panic!("synthesis join error did not produce a synthesis failure"),
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ready_synthesis_failure_and_panic_win_over_internal_stop() {
+        let (event_sender, _event_receiver) = mpsc::channel(1);
+        let work_cancellation = CancellationToken::new();
+        work_cancellation.cancel();
+        let publisher = SpeechEventPublisher {
+            turn_id: TurnId::new(41),
+            events: event_sender,
+            event_gate: Arc::new(Mutex::new(())),
+            started_at: Instant::now(),
+            external_interruption: CancellationToken::new(),
+            work_cancellation,
+        };
+        let failure: AdapterFuture<'_, ()> =
+            Box::pin(async { Err(AdapterError::new("ready synthesis failure")) });
+
+        match publisher.wait_for_adapter(failure).await {
+            super::AdapterWait::Completed(Err(error)) => {
+                assert_eq!(error.message(), "ready synthesis failure");
+            }
+            _ => panic!("internal stop masked a ready synthesis failure"),
+        }
+
+        let panic: AdapterFuture<'_, ()> =
+            Box::pin(async { panic!("ready synthesis panic payload") });
+        assert!(matches!(
+            publisher.wait_for_adapter(panic).await,
+            super::AdapterWait::Panicked
+        ));
+
+        let success: AdapterFuture<'_, ()> = Box::pin(async { Ok(()) });
+        assert!(matches!(
+            publisher.wait_for_adapter(success).await,
+            super::AdapterWait::Stopped
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_interruption_and_lifecycle_closure_keep_priority_over_ready_failure() {
+        let (interrupted_sender, _interrupted_receiver) = mpsc::channel(1);
+        let external_interruption = CancellationToken::new();
+        external_interruption.cancel();
+        let interrupted_work = CancellationToken::new();
+        interrupted_work.cancel();
+        let interrupted = SpeechEventPublisher {
+            turn_id: TurnId::new(42),
+            events: interrupted_sender,
+            event_gate: Arc::new(Mutex::new(())),
+            started_at: Instant::now(),
+            external_interruption,
+            work_cancellation: interrupted_work,
+        };
+        let failure: AdapterFuture<'_, ()> =
+            Box::pin(async { Err(AdapterError::new("ready synthesis failure")) });
+        assert!(matches!(
+            interrupted.wait_for_adapter(failure).await,
+            super::AdapterWait::Interrupted
+        ));
+
+        let (closed_sender, closed_receiver) = mpsc::channel(1);
+        drop(closed_receiver);
+        let closed_work = CancellationToken::new();
+        closed_work.cancel();
+        let closed = SpeechEventPublisher {
+            turn_id: TurnId::new(43),
+            events: closed_sender,
+            event_gate: Arc::new(Mutex::new(())),
+            started_at: Instant::now(),
+            external_interruption: CancellationToken::new(),
+            work_cancellation: closed_work,
+        };
+        let failure: AdapterFuture<'_, ()> =
+            Box::pin(async { Err(AdapterError::new("ready synthesis failure")) });
+        assert!(matches!(
+            closed.wait_for_adapter(failure).await,
+            super::AdapterWait::Closed
+        ));
     }
 
     async fn assert_interrupted_pair_is_absent(prefilled_slots: usize) {

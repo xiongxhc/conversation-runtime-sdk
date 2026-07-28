@@ -182,7 +182,44 @@ suite passed `239` tests with no failures under `--no-fail-fast`; formatting,
 strict all-target workspace Clippy, whitespace validation, incomplete-marker
 scanning, and concrete private-path scanning also passed.
 
-No additional live Apple Silicon listening check was performed for this
-correction. Machine-specific gap and voice-continuity observations remain
-orchestrator-run evidence; until that evidence is recorded, this correction
-makes no new subjective continuity, first-audible, or hardware-latency claim.
+## Continuous-Speech Apple Silicon Check — 2026-07-28
+
+One isolated check ran the committed `conversation-voice-probe` binary at
+`2977023` with SHA-256
+`e97454e8d9a0a5ae763578813b6753d825ac0ff1fb0e76194b0821ddc6a679f3`.
+The Ollama process was running with no model loaded before the check. The
+speech service started cold from a locally verified, cached model snapshot.
+
+The language model returned the exact requested text:
+
+```text
+# 问候
+你好。今天很好！*保持自然*，C# 和 2*3 不变。
+```
+
+The speech service recorded one successful request, the playback wrapper
+recorded one launch, and the probe reported:
+
+| Observation | Result |
+|---|---:|
+| First text delta | 7,912 ms |
+| First synthesis request | 8,295 ms |
+| First playable audio | 14,016 ms |
+| Outer command wall time | 26.16 s |
+| Speech requests | 1 |
+| Playback launches | 1 |
+
+The outer command wall time comes from the command runner rather than a runtime
+milestone. It includes generation, synthesis, playback, and process cleanup.
+It is not a first-audible measurement.
+
+After completion, the playback process was reaped, the audio temporary
+directory was empty, the speech-service listener was stopped, and the model
+loaded by this check was unloaded. The pre-existing Ollama daemon remained
+running.
+
+This sample removes the previous runtime-created seam between independent
+punctuation-triggered speech requests because the full response is synthesized
+and played once. No human listening judgment was captured, so this evidence
+does not claim that punctuation introduced no silence inside the generated
+audio or that subjective voice continuity materially improved.

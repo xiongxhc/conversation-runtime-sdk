@@ -4,7 +4,10 @@
 
 This record separates deterministic repository validation from a historical machine-specific Apple Silicon benchmark and a later isolated process-level continuity check. The exact language and speech models below are reproducible benchmark inputs, not SDK recommendations, deployment defaults, or application voice selections.
 
-The integration begins with typed text. It does not include microphone capture, VAD, ASR, first audible sound, user-speech-driven barge-in, or subjective voice quality.
+The integration begins with typed text. It does not include microphone capture,
+VAD, ASR, first audible sound, or user-speech-driven barge-in. One separately
+labeled listening observation is included; it is not a representative
+subjective voice-quality evaluation.
 
 ## Deterministic Repository Evidence
 

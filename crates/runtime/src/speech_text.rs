@@ -65,54 +65,81 @@ fn is_thematic_break(line: &str) -> bool {
 
 fn strip_paired_delimiters(input: &str) -> String {
     let mut normalized = String::new();
-    let mut remaining = input;
+    let mut cursor = 0;
 
-    while let Some(character) = remaining.chars().next() {
+    while cursor < input.len() {
+        let remaining = &input[cursor..];
         if let Some(rest) = remaining.strip_prefix('`') {
             if let Some(end) = rest.find('`') {
                 normalized.push_str(&rest[..end]);
-                remaining = &rest[end + 1..];
+                cursor += end + 2;
                 continue;
             }
         }
 
-        if let Some(rest) = remaining.strip_prefix("**") {
-            if !is_literal_asterisk_sequence(normalized.chars().last(), rest) {
-                if let Some(end) = rest.find("**") {
-                    normalized.push_str(&rest[..end]);
-                    remaining = &rest[end + 2..];
-                    continue;
-                }
-            }
-
-            normalized.push_str("**");
-            remaining = rest;
-            continue;
-        }
-
-        if let Some(rest) = remaining.strip_prefix('*') {
-            if !is_literal_asterisk_sequence(normalized.chars().last(), rest) {
-                if let Some(end) = rest.find('*') {
-                    normalized.push_str(&rest[..end]);
-                    remaining = &rest[end + 1..];
-                    continue;
-                }
+        let asterisk_width = [2, 1].into_iter().find(|width| {
+            asterisk_run_length(remaining) == *width && can_open_asterisks(input, cursor, *width)
+        });
+        if let Some(width) = asterisk_width {
+            if let Some(end) = find_closing_asterisks(input, cursor + width, width) {
+                normalized.push_str(&strip_paired_delimiters(&input[cursor + width..end]));
+                cursor = end + width;
+                continue;
             }
         }
 
+        let character = remaining
+            .chars()
+            .next()
+            .expect("cursor remains on a character boundary");
         normalized.push(character);
-        remaining = &remaining[character.len_utf8()..];
+        cursor += character.len_utf8();
     }
 
     normalized
 }
 
-fn is_literal_asterisk_sequence(previous: Option<char>, following: &str) -> bool {
-    previous.is_some_and(|character| character.is_ascii_digit())
-        && following
+fn find_closing_asterisks(input: &str, mut cursor: usize, width: usize) -> Option<usize> {
+    while cursor < input.len() {
+        let remaining = &input[cursor..];
+        if remaining.starts_with('*') {
+            let run_length = asterisk_run_length(remaining);
+            if run_length == width && can_close_asterisks(input, cursor) {
+                return Some(cursor);
+            }
+            cursor += run_length;
+            continue;
+        }
+
+        let character = remaining
             .chars()
             .next()
-            .is_some_and(|character| character.is_ascii_digit())
+            .expect("cursor remains on a character boundary");
+        cursor += character.len_utf8();
+    }
+
+    None
+}
+
+fn asterisk_run_length(input: &str) -> usize {
+    input.bytes().take_while(|byte| *byte == b'*').count()
+}
+
+fn can_open_asterisks(input: &str, start: usize, width: usize) -> bool {
+    let previous = input[..start].chars().next_back();
+    let following = input[start + width..].chars().next();
+
+    following.is_some_and(|character| !character.is_whitespace())
+        && !(width == 1
+            && previous.is_some_and(|character| character.is_ascii_digit())
+            && following.is_some_and(|character| character.is_ascii_digit()))
+}
+
+fn can_close_asterisks(input: &str, start: usize) -> bool {
+    input[..start]
+        .chars()
+        .next_back()
+        .is_some_and(|character| !character.is_whitespace())
 }
 
 #[cfg(test)]
@@ -133,6 +160,32 @@ mod tests {
         assert_eq!(
             normalize_speech_text("C#、#topic 和 2*3 保持原样。").as_deref(),
             Some("C#、#topic 和 2*3 保持原样。")
+        );
+    }
+
+    #[test]
+    fn preserves_literal_asterisk_pairs_outside_emphasis_context() {
+        for input in [
+            "Use * as a wildcard and * as a marker.",
+            "使用 * 作为通配符，另一个 * 作为标记。",
+        ] {
+            assert_eq!(normalize_speech_text(input).as_deref(), Some(input));
+        }
+    }
+
+    #[test]
+    fn preserves_unsupported_inline_asterisk_runs() {
+        assert_eq!(
+            normalize_speech_text("***nested***").as_deref(),
+            Some("***nested***")
+        );
+    }
+
+    #[test]
+    fn removes_supported_delimiters_nested_inside_emphasis() {
+        assert_eq!(
+            normalize_speech_text("**say `hello`** and *keep **nested** natural*.").as_deref(),
+            Some("say hello and keep nested natural.")
         );
     }
 

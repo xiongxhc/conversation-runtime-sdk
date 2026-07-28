@@ -99,3 +99,19 @@ Result: passed — 6 normalizer tests, 72 runtime tests, strict Clippy, formatti
 - Unmatched single-star and backtick delimiters continue through the scanner unchanged; their tests assert the delimiter and enclosed text are retained.
 - Only the exact bare `#` fixture is formatting-only. Unsupported runs remain unchanged unless the existing one-to-six-plus-whitespace heading predicate applies.
 - Runtime queue integration, original `TextDelta` handling, segment indexing, and speech lifecycle behavior are unchanged by this repair.
+
+## Final Review Fix
+
+The whole-branch review identified two remaining delimiter cases. Tests were
+added first and failed against the reviewed implementation:
+
+- literal ASCII and multilingual `*` pairs separated from content by
+  whitespace were deleted;
+- inline-code delimiters nested inside emphasis remained in speech input.
+
+The scanner now requires non-whitespace content after an emphasis opener,
+matches exact one- or two-asterisk runs, recursively normalizes supported
+delimiters inside emphasis, and preserves inline-code content without
+reinterpreting literal markers inside that code span. Numeric expressions such
+as `2*3`, unmatched delimiters, unsupported three-asterisk and hash runs, and
+the original emitted text remain unchanged.

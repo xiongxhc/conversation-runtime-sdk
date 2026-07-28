@@ -127,7 +127,10 @@ fn next_segment_end(&self) -> Option<usize> {
         }
 
         if end >= self.config.soft_limit_bytes {
-            if let Some(end) = preferred_end.or(soft_end) {
+            if let Some(end) = preferred_end {
+                return Some(end);
+            }
+            if Self::is_soft_boundary(character) {
                 return Some(end);
             }
         }
@@ -144,7 +147,11 @@ If the exact implementation differs, it must preserve these invariants:
 
 - never return a byte index above `hard_limit_bytes`;
 - prefer the latest sentence/newline boundary seen within the hard limit;
-- use a soft whitespace/punctuation boundary only when no preferred boundary exists;
+- at or after the soft limit, use the current soft whitespace/punctuation
+  boundary only when no preferred boundary exists; do not emit an earlier
+  leading space merely because the buffer later reaches the soft limit;
+- when forced by the hard limit, fall back to the latest soft boundary within
+  the hard limit before using a UTF-8-safe hard split;
 - return `None` below the soft limit;
 - leave `finish` responsible for the final remainder.
 
@@ -396,7 +403,7 @@ Add:
 
 ```rust
 #[tokio::test]
-async fn synthesizes_one_segment_ahead_while_current_audio_is_playing() {
+async fn prepares_one_segment_ahead_before_current_audio_finishes() {
     // Use phrase limits that deterministically create segments 0, 1, and 2.
     // Start the turn and wait until output segment 0 is blocked.
     // Assert synthesis requests for segments 0 and 1 have started.
@@ -421,7 +428,7 @@ Run:
 ```bash
 PATH="/opt/homebrew/opt/rustup/bin:$PATH" \
   cargo test --locked -p conversation-runtime \
-  synthesizes_one_segment_ahead_while_current_audio_is_playing -- --nocapture
+  prepares_one_segment_ahead_before_current_audio_finishes -- --nocapture
 ```
 
 Expected: timeout or assertion failure because the current worker does not start
@@ -444,6 +451,7 @@ enum SynthesisStageOutcome {
     Interrupted,
     Stopped,
     EventStreamClosed,
+    TaskFailed,
     Failed(AdapterError),
 }
 ```
@@ -478,6 +486,18 @@ Keep `wait_for_adapter` or split it into stage-specific helpers only if each
 helper preserves panic containment, cancellation priority, receiver-closure
 handling, and cleanup-before-return.
 
+If active output and the synthesis stage fail in the same poll, use this
+deterministic priority:
+
+1. external interruption;
+2. lifecycle receiver closure;
+3. active output failure or panic;
+4. synthesis failure or synthesis-task `JoinError`;
+5. internal stop cancellation.
+
+Map a synthesis-stage `JoinError` to `RuntimeStage::SpeechSynthesizer` with the
+static message `speech synthesis task failed`. Do not expose panic payloads.
+
 - [ ] **Step 5: Verify timing and capacity behavior**
 
 Extend the overlap test to assert:
@@ -487,6 +507,11 @@ Extend the overlap test to assert:
 - first playable precedes output request `0`;
 - output indices are `[0, 1, 2]`;
 - segment `2` synthesis begins only after output `0` releases capacity.
+
+The test proves that segment `1` is ready before output `0` finishes; it does
+not require segment `1` synthesis to begin strictly after the output adapter's
+start callback. Receiving segment `0` may free the prepared-audio slot
+immediately before `AudioOutput::play(0)` is invoked.
 
 Keep existing atomic pair tests for `SpeechStarted` and
 `FirstSynthesisRequest`. If their helper moves into the synthesis stage, update
@@ -499,7 +524,7 @@ Run:
 ```bash
 PATH="/opt/homebrew/opt/rustup/bin:$PATH" \
   cargo test --locked -p conversation-runtime \
-  synthesizes_one_segment_ahead_while_current_audio_is_playing
+  prepares_one_segment_ahead_before_current_audio_finishes
 PATH="/opt/homebrew/opt/rustup/bin:$PATH" \
   cargo test --locked -p conversation-runtime
 PATH="/opt/homebrew/opt/rustup/bin:$PATH" \

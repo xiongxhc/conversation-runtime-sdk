@@ -774,7 +774,7 @@ async fn language_failure_retains_its_stage_after_active_speech_cleanup() {
             .await
             .expect("speech synthesis did not start")
             .expect("speech start channel closed"),
-        "First."
+        "First. Second. Third."
     );
     delta_sender
         .send(Err(AdapterError::new("language model unavailable")))

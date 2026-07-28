@@ -89,6 +89,7 @@ impl PhraseChunker {
     fn next_segment_end(&self) -> Option<usize> {
         let mut preferred_end = None;
         let mut soft_end = None;
+        let mut eligible_soft_end = None;
 
         for (index, character) in self.buffer.char_indices() {
             let end = index + character.len_utf8();
@@ -103,13 +104,8 @@ impl PhraseChunker {
             }
             if Self::is_soft_boundary(character) {
                 soft_end = Some(end);
-            }
-            if end >= self.config.soft_limit_bytes {
-                if character == '\n' || Self::is_sentence_boundary(character) {
-                    return preferred_end;
-                }
-                if preferred_end.is_none() && Self::is_soft_boundary(character) {
-                    return Some(end);
+                if end >= self.config.soft_limit_bytes {
+                    eligible_soft_end = Some(end);
                 }
             }
             if end >= self.config.hard_limit_bytes {
@@ -119,7 +115,9 @@ impl PhraseChunker {
             }
         }
 
-        None
+        (self.buffer.len() >= self.config.soft_limit_bytes)
+            .then(|| preferred_end.or(eligible_soft_end))
+            .flatten()
     }
 
     fn hard_split_end(&self) -> usize {
@@ -262,6 +260,27 @@ mod tests {
     }
 
     #[test]
+    fn latest_sentence_boundary_is_selected_after_scanning_to_the_hard_cap() {
+        let config = PhraseChunkingConfig::new(5, 24).unwrap();
+        let mut chunker = PhraseChunker::new(config);
+
+        assert_eq!(
+            chunker.push_delta("aaaaa. bbbb. cccc"),
+            vec!["aaaaa. bbbb."]
+        );
+        assert_eq!(chunker.finish().as_deref(), Some("cccc"));
+    }
+
+    #[test]
+    fn latest_newline_boundary_is_selected_after_scanning_to_the_hard_cap() {
+        let config = PhraseChunkingConfig::new(5, 24).unwrap();
+        let mut chunker = PhraseChunker::new(config);
+
+        assert_eq!(chunker.push_delta("aaaaa\nbbbb\ncccc"), vec!["aaaaa\nbbbb"]);
+        assert_eq!(chunker.finish().as_deref(), Some("cccc"));
+    }
+
+    #[test]
     fn short_newlines_are_buffered_but_consumed_at_finish() {
         let mut chunker = PhraseChunker::default();
         assert!(chunker.push_delta("# 标题\n第一行\n第二行").is_empty());
@@ -301,10 +320,10 @@ mod tests {
     fn one_delta_can_flush_multiple_phrases() {
         let mut chunker = PhraseChunker::new(PhraseChunkingConfig::new(12, 24).unwrap());
         assert_eq!(
-            chunker.push_delta("One. Two? Three! Four. Five? Six!"),
-            vec!["One. Two? Three!", "Four. Five?"]
+            chunker.push_delta("One. Two? Three! Four. Five? Six! Seven. Eight!"),
+            vec!["One. Two? Three! Four.", "Five? Six! Seven."]
         );
-        assert_eq!(chunker.finish().as_deref(), Some("Six!"));
+        assert_eq!(chunker.finish().as_deref(), Some("Eight!"));
     }
 
     #[test]

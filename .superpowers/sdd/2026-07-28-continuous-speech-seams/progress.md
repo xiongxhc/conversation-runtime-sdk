@@ -9,6 +9,9 @@ Preflight correction: at the soft limit, a prior soft boundary is retained only 
 Task 1: fix round 1/5 — latest in-cap sentence/newline selection and stale report scope addressed by 50dd6eb; scoped re-review found no new Critical or Important breakage.
 Task 1: complete (commits d398619..50dd6eb, review clean).
 
+Task 2: fix round 1/5 — unmatched delimiter preservation and unsupported hash-run preservation addressed by 284b78f; scoped re-review found no new Critical or Important breakage.
+Task 2: complete (commits 08c3c80..284b78f, review clean).
+
 Task 2: normalized speech-only formatting after phrase selection and before speech segment indexing. Raw `TextDelta` values remain byte-for-byte original; literal `C#`, `#topic`, and `2*3` are preserved; formatting-only output skips speech lifecycle events. TDD red run, focused normalizer/runtime checks, 69 runtime tests, strict runtime Clippy, format check, and diff check pass. Report: `task-2-report.md`.
 
 Task 1 follow-up: expanded ownership only to the five affected cancellation fixtures. Added `small_phrase_chunking_config()` returning `PhraseChunkingConfig::new(4, 192).unwrap()` and applied it only where active synthesis/output must begin before held-open generation. The five fixtures, full runtime suite, strict runtime Clippy, format check, and diff check pass.

@@ -428,8 +428,56 @@ async fn short_sentences_are_one_speech_request_without_changing_text_deltas() {
         .collect::<String>();
 
     assert_eq!(deltas, original);
-    assert_eq!(synthesized_text.recv().await.as_deref(), Some(original));
+    assert_eq!(
+        synthesized_text.recv().await.as_deref(),
+        Some("问候 你好。今天很好！保持自然")
+    );
     assert!(synthesized_text.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn formatting_only_output_preserves_text_deltas_and_skips_speech_lifecycle() {
+    let original = "#\n***\n```";
+    let (speech_calls, mut synthesized_text) = mpsc::unbounded_channel();
+    let runtime = ConversationRuntime::new(
+        Arc::new(MockLanguageModel::new([original])),
+        Arc::new(RecordingSpeechSynthesizer {
+            audio: SynthesizedAudio::new(minimal_aiff(), AudioFormat::Aiff),
+            calls: speech_calls,
+        }),
+        Arc::new(DiscardAudioOutput),
+    );
+    let turn_id = TurnId::new(61);
+    let mut events = start_turn(&runtime, turn_id, "formatting only").await;
+
+    let observed = drain_events(&mut events).await;
+    let deltas = observed
+        .iter()
+        .filter_map(|event| match event {
+            RuntimeEvent::TextDelta { delta, .. } => Some(delta.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+
+    assert_eq!(deltas, original);
+    assert!(synthesized_text.try_recv().is_err());
+    assert!(!observed.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::SpeechStarted { .. }
+            | RuntimeEvent::SpeechCompleted { .. }
+            | RuntimeEvent::Timing {
+                milestone: RuntimeTimingMilestone::FirstSynthesisRequest
+                    | RuntimeTimingMilestone::FirstPlayableAudio,
+                ..
+            }
+    )));
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|event| event.is_terminal())
+            .collect::<Vec<_>>(),
+        [&RuntimeEvent::TurnCompleted { turn_id }]
+    );
 }
 
 #[tokio::test]

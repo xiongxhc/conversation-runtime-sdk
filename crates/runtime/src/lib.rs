@@ -14,11 +14,13 @@ use tokio::task::{JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 mod phrase_chunker;
+mod speech_text;
 mod speech_worker;
 
 pub use phrase_chunker::PhraseChunkingConfig;
 
 use phrase_chunker::PhraseChunker;
+use speech_text::normalize_speech_text;
 use speech_worker::{SpeechSegment, SpeechWorker, SpeechWorkerContext, SpeechWorkerOutcome};
 
 const EVENT_BUFFER_SIZE: usize = 32;
@@ -455,7 +457,10 @@ async fn run_turn(task: TurnTask, events: &mpsc::Sender<RuntimeEvent>) -> Runtim
                 }
                 emitted_first_text_timing = true;
 
-                for text in chunker.push_delta(&delta) {
+                for phrase in chunker.push_delta(&delta) {
+                    let Some(text) = normalize_speech_text(&phrase) else {
+                        continue;
+                    };
                     let segment = SpeechSegment {
                         index: segment_index,
                         text,
@@ -521,7 +526,10 @@ async fn run_turn(task: TurnTask, events: &mpsc::Sender<RuntimeEvent>) -> Runtim
         }
     }
 
-    if let Some(text) = chunker.finish() {
+    if let Some(text) = chunker
+        .finish()
+        .and_then(|phrase| normalize_speech_text(&phrase))
+    {
         let segment = SpeechSegment {
             index: segment_index,
             text,

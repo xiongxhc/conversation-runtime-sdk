@@ -14,10 +14,16 @@ use tokio::task::{JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 mod phrase_chunker;
+mod session_clock;
 mod speech_text;
 mod speech_worker;
+mod turn_finalizer;
+mod voice_privacy;
 
 pub use phrase_chunker::PhraseChunkingConfig;
+pub use session_clock::{SessionClock, TurnFinalizationDeadline};
+pub use turn_finalizer::{FinalizedTranscript, TurnFinalizer};
+pub use voice_privacy::validate_voice_policy;
 
 use phrase_chunker::PhraseChunker;
 use speech_text::normalize_speech_text;

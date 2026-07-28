@@ -732,7 +732,7 @@ async fn short_sentences_are_one_speech_request_without_changing_text_deltas() {
     assert_eq!(deltas, original);
     assert_eq!(
         synthesized_text.recv().await.as_deref(),
-        Some("问候 你好。今天很好！保持自然")
+        Some("问候. 你好。今天很好！保持自然")
     );
     assert!(synthesized_text.try_recv().is_err());
 }

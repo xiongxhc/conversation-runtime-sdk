@@ -170,7 +170,7 @@ The probe proves that standard output remains byte-for-byte unchanged while the
 speech fixture receives exactly one request containing:
 
 ```text
-"input":"问候 你好。今天很好！保持自然，C# 和 2*3 不变。"
+"input":"问候. 你好。今天很好！保持自然，C# 和 2*3 不变。"
 ```
 
 The same deterministic run requires one captured WAV, one fake-player launch,
@@ -180,8 +180,29 @@ also cover short-clause coalescing, speech-only normalization, capacity-one
 synthesized-audio prefetch, ordered playback, cross-stage cleanup, queued-audio
 discard, exactly-one terminal publication, and runtime reuse.
 
-The focused probe CLI suite passed `12` tests. The complete locked workspace
-suite passed `239` tests with no failures under `--no-fail-fast`; formatting,
+An additional loopback regression preserves this story Markdown byte-for-byte
+on standard output:
+
+```text
+### 故事名：《第25小时的雨》
+
+#### 1. 初遇：咖啡馆的旧雨伞
+
+林默是一家专门
+```
+
+Its two bounded speech requests contain:
+
+```text
+故事名，第25小时的雨。 初遇，咖啡馆的旧雨伞。
+林默是一家专门
+```
+
+They contain no heading markers, section numbering, or decorative title
+brackets.
+
+The focused probe CLI suite passed `13` tests. The complete locked workspace
+suite passed `247` tests with no failures under `--no-fail-fast`; formatting,
 strict all-target workspace Clippy, whitespace validation, incomplete-marker
 scanning, and concrete private-path scanning also passed.
 

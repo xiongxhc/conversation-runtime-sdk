@@ -67,6 +67,13 @@ It does not modify `RuntimeEvent::TextDelta`.
 - Remove paired `*` or `**` emphasis delimiters and paired backtick delimiters
   while preserving their enclosed text.
 - Remove triple-backtick fence-only lines.
+- Remove an ASCII section ordinal from a Markdown heading when digits are
+  followed by `.` or `、` and whitespace.
+- Remove decorative CJK title brackets such as `《》`, `「」`, and `【】` from
+  Markdown headings while preserving their enclosed text.
+- Convert the first full-width heading colon to a spoken comma and add a
+  sentence ending when the heading has none, without expanding beyond the
+  source line's byte length. Preserve ASCII colons and non-heading quotations.
 - Collapse formatting-created whitespace and line breaks to a single space.
 - Preserve sentence punctuation and ordinary literal content.
 - Preserve literal uses such as `C#`, `#topic`, and `2*3`.
@@ -111,6 +118,7 @@ Deterministic tests will prove:
 
 - short multilingual sentences remain one speech request across `。！？`;
 - Markdown headings, emphasis, list markers, and code fences are not sent to TTS;
+- story titles and numbered section headings become natural spoken prose;
 - text deltas retain their original formatting;
 - hard limits remain UTF-8 safe and authoritative;
 - synthesis of segment `N + 1` begins while segment `N` is playing;

@@ -20,6 +20,10 @@ const FORMATTED_SPEECH_NDJSON: &[u8] =
     "{\"message\":{\"content\":\"# 问候\\n你好。今天很好！*保持自然*，C# 和 2*3 不变。\"},\"done\":true}\n"
         .as_bytes();
 
+const STORY_HEADING_NDJSON: &[u8] =
+    "{\"message\":{\"content\":\"### 故事名：《第25小时的雨》\\n\\n#### 1. 初遇：咖啡馆的旧雨伞\\n\\n林默是一家专门\"},\"done\":true}\n"
+        .as_bytes();
+
 const ONE_SENTENCE_NDJSON: &[u8] =
     b"{\"message\":{\"content\":\"Input response.\"},\"done\":true}\n";
 
@@ -96,7 +100,7 @@ fn composes_runtime_with_generic_identifiers_and_reports_observable_milestones()
     let speech_requests = speech.finish();
     assert_eq!(speech_requests.len(), 1);
     assert!(speech_requests[0]
-        .contains("\"input\":\"问候 你好。今天很好！保持自然，C# 和 2*3 不变。\""));
+        .contains("\"input\":\"问候. 你好。今天很好！保持自然，C# 和 2*3 不变。\""));
     for request in &speech_requests {
         for field in [
             "\"model\":\"speech-model-id\"",
@@ -111,6 +115,47 @@ fn composes_runtime_with_generic_identifiers_and_reports_observable_milestones()
             assert!(request.contains(field), "missing {field} in {request}");
         }
     }
+}
+
+#[test]
+fn keeps_story_markdown_visible_but_sends_spoken_prose_to_tts() {
+    let fixture = tempfile::tempdir().unwrap();
+    let player = write_exit_player(fixture.path(), 0);
+    let language = FixtureServer::start(vec![HttpResponse::ndjson(STORY_HEADING_NDJSON)]);
+    let speech = FixtureServer::start(vec![
+        HttpResponse::wav(MINIMAL_PCM_WAV),
+        HttpResponse::wav(MINIMAL_PCM_WAV),
+    ]);
+    let config = write_config(
+        fixture.path(),
+        &valid_config(
+            language.endpoint(),
+            speech.endpoint_with_path("/v1"),
+            &player,
+            fixture.path(),
+        ),
+    );
+
+    let output = run_probe(Command::new(probe_binary()).args([
+        "--config",
+        config.to_str().unwrap(),
+        "--no-play",
+        "Tell",
+        "a story",
+    ]));
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "### 故事名：《第25小时的雨》\n\n#### 1. 初遇：咖啡馆的旧雨伞\n\n林默是一家专门"
+    );
+    language.finish();
+    let speech_requests = speech.finish();
+    assert_eq!(speech_requests.len(), 2);
+    assert!(
+        speech_requests[0].contains("\"input\":\"故事名，第25小时的雨。 初遇，咖啡馆的旧雨伞。\"")
+    );
+    assert!(speech_requests[1].contains("\"input\":\"林默是一家专门\""));
 }
 
 #[test]

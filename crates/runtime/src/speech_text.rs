@@ -7,8 +7,9 @@ pub(super) fn normalize_speech_text(input: &str) -> Option<String> {
             continue;
         }
 
-        let line = strip_line_prefixes(trimmed);
+        let (line, is_heading) = strip_line_prefixes(trimmed);
         let line = strip_paired_delimiters(line);
+        let line = normalize_decorative_speech(&line, is_heading, trimmed.len());
         let line = line.trim();
         if !line.is_empty() {
             normalized.push(line.to_owned());
@@ -19,18 +20,18 @@ pub(super) fn normalize_speech_text(input: &str) -> Option<String> {
     (!normalized.is_empty()).then_some(normalized)
 }
 
-fn strip_line_prefixes(line: &str) -> &str {
+fn strip_line_prefixes(line: &str) -> (&str, bool) {
     if line == "#" || is_thematic_break(line) {
-        return "";
+        return ("", false);
     }
 
     let heading_length = line.bytes().take_while(|byte| *byte == b'#').count();
-    let line = if (1..=6).contains(&heading_length)
+    let is_heading = (1..=6).contains(&heading_length)
         && line[heading_length..]
             .chars()
             .next()
-            .is_some_and(char::is_whitespace)
-    {
+            .is_some_and(char::is_whitespace);
+    let line = if is_heading {
         line[heading_length..].trim_start()
     } else {
         line
@@ -38,11 +39,11 @@ fn strip_line_prefixes(line: &str) -> &str {
 
     if let Some(rest) = line.strip_prefix('*') {
         if rest.chars().next().is_some_and(char::is_whitespace) {
-            return rest.trim_start();
+            return (rest.trim_start(), is_heading);
         }
     }
 
-    line
+    (line, is_heading)
 }
 
 fn is_thematic_break(line: &str) -> bool {
@@ -61,6 +62,69 @@ fn is_thematic_break(line: &str) -> bool {
     }
 
     count >= 3
+}
+
+fn normalize_decorative_speech(input: &str, is_heading: bool, source_byte_limit: usize) -> String {
+    let input = if is_heading {
+        strip_heading_ordinal(input)
+    } else {
+        input
+    };
+    let mut normalized = String::with_capacity(input.len());
+    let mut converted_heading_colon = false;
+
+    for character in input.chars() {
+        match character {
+            '《' | '》' | '〈' | '〉' | '「' | '」' | '『' | '』' | '【' | '】' if is_heading =>
+                {}
+            '：' if is_heading && !converted_heading_colon => {
+                normalized.push('，');
+                converted_heading_colon = true;
+            }
+            _ => normalized.push(character),
+        }
+    }
+
+    let normalized = normalized.trim();
+    if is_heading
+        && !normalized.is_empty()
+        && !normalized
+            .chars()
+            .next_back()
+            .is_some_and(is_sentence_ending)
+    {
+        let mut sentence = normalized.to_owned();
+        if sentence.len().saturating_add('。'.len_utf8()) <= source_byte_limit {
+            sentence.push('。');
+        } else if sentence.len().saturating_add(1) <= source_byte_limit {
+            sentence.push('.');
+        }
+        sentence
+    } else {
+        normalized.to_owned()
+    }
+}
+
+fn strip_heading_ordinal(input: &str) -> &str {
+    let digit_count = input.bytes().take_while(u8::is_ascii_digit).count();
+    if digit_count == 0 {
+        return input;
+    }
+
+    let rest = &input[digit_count..];
+    for separator in [".", "、"] {
+        if let Some(rest) = rest.strip_prefix(separator) {
+            if rest.chars().next().is_some_and(char::is_whitespace) {
+                return rest.trim_start();
+            }
+        }
+    }
+
+    input
+}
+
+fn is_sentence_ending(character: char) -> bool {
+    matches!(character, '.' | '!' | '?' | '。' | '！' | '？')
 }
 
 fn strip_paired_delimiters(input: &str) -> String {
@@ -162,8 +226,43 @@ mod tests {
         assert_eq!(
             normalize_speech_text("# 标题\n* 第一项\n这是**重点**，也是`代码`。\n```\n示例\n```")
                 .as_deref(),
-            Some("标题 第一项 这是重点，也是代码。 示例")
+            Some("标题. 第一项 这是重点，也是代码。 示例")
         );
+    }
+
+    #[test]
+    fn converts_story_headings_to_spoken_prose() {
+        assert_eq!(
+            normalize_speech_text(
+                "### 故事名：《第25小时的雨》\n\n#### 1. 初遇：咖啡馆的旧雨伞\n\n林默是一家专门"
+            )
+            .as_deref(),
+            Some("故事名，第25小时的雨。 初遇，咖啡馆的旧雨伞。 林默是一家专门")
+        );
+    }
+
+    #[test]
+    fn preserves_decorative_quotes_outside_markdown_headings() {
+        let input = "他说：「保留 C#」；另见【附录】。";
+
+        assert_eq!(normalize_speech_text(input).as_deref(), Some(input));
+    }
+
+    #[test]
+    fn preserves_literal_ascii_colons_inside_markdown_headings() {
+        assert_eq!(
+            normalize_speech_text("### API: https://host/a at 10:30").as_deref(),
+            Some("API: https://host/a at 10:30。")
+        );
+    }
+
+    #[test]
+    fn heading_normalization_never_expands_past_the_source_byte_length() {
+        let input = "# abcdef";
+        let normalized = normalize_speech_text(input).unwrap();
+
+        assert_eq!(normalized, "abcdef.");
+        assert!(normalized.len() <= input.len());
     }
 
     #[test]
@@ -223,7 +322,7 @@ mod tests {
         assert_eq!(normalize_speech_text("#######").as_deref(), Some("#######"));
         assert_eq!(
             normalize_speech_text("###### 标题").as_deref(),
-            Some("标题")
+            Some("标题。")
         );
     }
 

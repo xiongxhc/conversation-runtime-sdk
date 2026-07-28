@@ -32,6 +32,87 @@ fn pcm16_wav_becomes_ordered_twenty_millisecond_frames() {
 }
 
 #[test]
+fn pcm16_wav_uses_cumulative_boundaries_for_non_divisible_sample_rates() {
+    let samples = (0..11_025).map(|sample| sample as i16).collect();
+    let audio = pcm16_wav(11_025, 1, samples);
+
+    let frames = decode(&audio).unwrap();
+
+    assert_eq!(frames.len(), 50);
+    for (sequence, frame) in frames.iter().enumerate() {
+        assert_eq!(frame.sequence(), sequence as u64);
+        assert_eq!(
+            frame.bytes().len() / 2,
+            if sequence % 2 == 0 { 220 } else { 221 }
+        );
+    }
+}
+
+#[test]
+fn decoder_preserves_order_across_multiple_data_chunks() {
+    let audio = wav_with_chunks([
+        (*b"fmt ", pcm_format_body(1, 24_000, 1, 16)),
+        (*b"data", vec![1, 0, 2, 0]),
+        (*b"data", vec![3, 0, 4, 0]),
+    ]);
+
+    let frames = decode(&audio).unwrap();
+
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].bytes(), &[1, 0, 2, 0, 3, 0, 4, 0]);
+}
+
+#[test]
+fn decoder_accepts_identical_format_chunks_and_preserves_stereo_interleaving() {
+    let stereo_bytes = vec![2, 1, 254, 255, 4, 3, 252, 255];
+    let audio = wav_with_chunks([
+        (*b"fmt ", pcm_format_body(1, 24_000, 2, 16)),
+        (*b"data", stereo_bytes.clone()),
+        (*b"fmt ", pcm_format_body(1, 24_000, 2, 16)),
+    ]);
+
+    let frames = decode(&audio).unwrap();
+
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].format().channels(), 2);
+    assert_eq!(frames[0].bytes(), stereo_bytes);
+}
+
+#[test]
+fn decoder_rejects_checked_riff_and_chunk_boundaries() {
+    let mut declared_size_mismatch = pcm16_wav(24_000, 1, vec![0_i16; 1]).bytes().to_vec();
+    declared_size_mismatch[4..8].copy_from_slice(&1_u32.to_le_bytes());
+
+    let mut missing_odd_padding = wav_with_chunks([
+        (*b"fmt ", pcm_format_body(1, 24_000, 1, 16)),
+        (*b"JUNK", vec![1]),
+        (*b"data", vec![0, 0]),
+    ])
+    .bytes()
+    .to_vec();
+    missing_odd_padding.remove(45);
+    set_riff_size(&mut missing_odd_padding);
+
+    let mut oversized_declared_chunk = Vec::from(&b"RIFF\0\0\0\0WAVE"[..]);
+    append_chunk(
+        &mut oversized_declared_chunk,
+        b"fmt ",
+        &pcm_format_body(1, 24_000, 1, 16),
+    );
+    oversized_declared_chunk.extend_from_slice(b"data");
+    oversized_declared_chunk.extend_from_slice(&u32::MAX.to_le_bytes());
+    set_riff_size(&mut oversized_declared_chunk);
+
+    for bytes in [
+        declared_size_mismatch,
+        missing_odd_padding,
+        oversized_declared_chunk,
+    ] {
+        assert!(decode(&SynthesizedAudio::new(bytes, AudioFormat::Wav)).is_err());
+    }
+}
+
+#[test]
 fn decoder_rejects_malformed_or_unsupported_wav_containers() {
     let valid = pcm16_wav(24_000, 1, vec![0_i16; 1]);
     let mut trailing_chunk = valid.bytes().to_vec();
@@ -102,6 +183,18 @@ fn decoder_rejects_oversized_and_changing_format_wav_chunks() {
     assert_eq!(MAX_PCM_FRAME_BYTES, 64 * 1024);
 }
 
+fn decode(
+    audio: &SynthesizedAudio,
+) -> Result<Vec<conversation_model_adapters::AudioFrame>, conversation_model_adapters::AdapterError>
+{
+    WavPcmDecoder::default().decode(
+        TurnId::new(2),
+        GenerationId::new(3),
+        UtteranceId::new(4),
+        audio,
+    )
+}
+
 fn pcm16_wav(sample_rate_hz: u32, channels: u16, samples: Vec<i16>) -> SynthesizedAudio {
     let mut data = Vec::with_capacity(samples.len() * 2);
     for sample in samples {
@@ -116,15 +209,19 @@ fn pcm16_wav(sample_rate_hz: u32, channels: u16, samples: Vec<i16>) -> Synthesiz
 fn wav_with_chunks<const N: usize>(chunks: [([u8; 4], Vec<u8>); N]) -> SynthesizedAudio {
     let mut bytes = Vec::from(&b"RIFF\0\0\0\0WAVE"[..]);
     for (chunk_id, chunk_body) in chunks {
-        bytes.extend_from_slice(&chunk_id);
-        bytes.extend_from_slice(&u32::try_from(chunk_body.len()).unwrap().to_le_bytes());
-        bytes.extend_from_slice(&chunk_body);
-        if chunk_body.len() % 2 == 1 {
-            bytes.push(0);
-        }
+        append_chunk(&mut bytes, &chunk_id, &chunk_body);
     }
     set_riff_size(&mut bytes);
     SynthesizedAudio::new(bytes, AudioFormat::Wav)
+}
+
+fn append_chunk(bytes: &mut Vec<u8>, chunk_id: &[u8; 4], chunk_body: &[u8]) {
+    bytes.extend_from_slice(chunk_id);
+    bytes.extend_from_slice(&u32::try_from(chunk_body.len()).unwrap().to_le_bytes());
+    bytes.extend_from_slice(chunk_body);
+    if chunk_body.len() % 2 == 1 {
+        bytes.push(0);
+    }
 }
 
 fn pcm_format_body(audio_format: u16, sample_rate_hz: u32, channels: u16, bits: u16) -> Vec<u8> {

@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use conversation_model_adapters::{
@@ -7,7 +7,7 @@ use conversation_model_adapters::{
     SpeechSynthesizer, StreamingSpeechRequest, StreamingSpeechSynthesizer, SynthesizedAudio,
 };
 use conversation_protocol::{GenerationId, TurnId, UtteranceId};
-use tokio::sync::Notify;
+use tokio::sync::{oneshot, watch};
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
@@ -70,6 +70,14 @@ async fn buffered_adapter_cancellation_during_synthesis_closes_after_inner_clean
         .await
         .unwrap();
     cancellation.cancel();
+    timeout(Duration::from_secs(1), inner.wait_for_cleanup_started())
+        .await
+        .unwrap();
+    assert!(!receiver.is_closed());
+    inner.release_cleanup();
+    timeout(Duration::from_secs(1), inner.wait_for_cleanup_completed())
+        .await
+        .unwrap();
 
     assert!(timeout(Duration::from_secs(1), receiver.recv())
         .await
@@ -77,8 +85,8 @@ async fn buffered_adapter_cancellation_during_synthesis_closes_after_inner_clean
         .is_none());
 }
 
-#[tokio::test]
-async fn buffered_adapter_cancellation_breaks_backpressured_frame_emission() {
+#[tokio::test(flavor = "current_thread")]
+async fn buffered_adapter_cancellation_breaks_the_second_capacity_one_send() {
     let inner = Arc::new(MockSpeechSynthesizer::new(pcm16_wav(24_000, 1, 1_440)));
     let adapter = BufferedStreamingSpeechSynthesizer::new(inner.clone());
     let cancellation = CancellationToken::new();
@@ -87,7 +95,13 @@ async fn buffered_adapter_cancellation_breaks_backpressured_frame_emission() {
     timeout(Duration::from_secs(1), inner.wait_for_request())
         .await
         .unwrap();
-    sleep(Duration::from_millis(20)).await;
+    timeout(
+        Duration::from_secs(1),
+        inner.wait_for_synthesis_completion(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(receiver.len(), 1);
     cancellation.cancel();
 
     let first_frame = timeout(Duration::from_secs(1), receiver.recv())
@@ -107,7 +121,12 @@ struct MockSpeechSynthesizer {
     audio: SynthesizedAudio,
     delay: Duration,
     request_count: AtomicUsize,
-    requested: Notify,
+    request_started: watch::Sender<bool>,
+    synthesis_completed: watch::Sender<bool>,
+    cleanup_started: watch::Sender<bool>,
+    cleanup_completed: watch::Sender<bool>,
+    cleanup_release: Mutex<Option<oneshot::Sender<()>>>,
+    cleanup_gate: Mutex<Option<oneshot::Receiver<()>>>,
 }
 
 impl MockSpeechSynthesizer {
@@ -116,11 +135,22 @@ impl MockSpeechSynthesizer {
     }
 
     fn delayed(audio: SynthesizedAudio, delay: Duration) -> Self {
+        let (request_started, _) = watch::channel(false);
+        let (synthesis_completed, _) = watch::channel(false);
+        let (cleanup_started, _) = watch::channel(false);
+        let (cleanup_completed, _) = watch::channel(false);
+        let (cleanup_release, cleanup_gate) = oneshot::channel();
+
         Self {
             audio,
             delay,
             request_count: AtomicUsize::new(0),
-            requested: Notify::new(),
+            request_started,
+            synthesis_completed,
+            cleanup_started,
+            cleanup_completed,
+            cleanup_release: Mutex::new(Some(cleanup_release)),
+            cleanup_gate: Mutex::new(Some(cleanup_gate)),
         }
     }
 
@@ -129,7 +159,45 @@ impl MockSpeechSynthesizer {
     }
 
     async fn wait_for_request(&self) {
-        self.requested.notified().await;
+        wait_for_true(self.request_started.subscribe()).await;
+    }
+
+    async fn wait_for_synthesis_completion(&self) {
+        wait_for_true(self.synthesis_completed.subscribe()).await;
+    }
+
+    async fn wait_for_cleanup_started(&self) {
+        wait_for_true(self.cleanup_started.subscribe()).await;
+    }
+
+    async fn wait_for_cleanup_completed(&self) {
+        wait_for_true(self.cleanup_completed.subscribe()).await;
+    }
+
+    fn release_cleanup(&self) {
+        if let Some(sender) = self
+            .cleanup_release
+            .lock()
+            .expect("mock speech cleanup release lock poisoned")
+            .take()
+        {
+            let _ = sender.send(());
+        }
+    }
+
+    async fn finish_cancellation(&self) -> Result<SynthesizedAudio, AdapterError> {
+        self.cleanup_started.send_replace(true);
+        let cleanup_gate = {
+            self.cleanup_gate
+                .lock()
+                .expect("mock speech cleanup gate lock poisoned")
+                .take()
+        };
+        if let Some(receiver) = cleanup_gate {
+            let _ = receiver.await;
+        }
+        self.cleanup_completed.send_replace(true);
+        Err(AdapterError::new("speech synthesis cancelled"))
     }
 }
 
@@ -141,20 +209,27 @@ impl SpeechSynthesizer for MockSpeechSynthesizer {
     ) -> AdapterFuture<'a, SynthesizedAudio> {
         Box::pin(async move {
             self.request_count.fetch_add(1, Ordering::SeqCst);
-            self.requested.notify_waiters();
+            self.request_started.send_replace(true);
 
             if !self.delay.is_zero() {
                 tokio::select! {
-                    _ = cancellation.cancelled() => return Err(AdapterError::new("speech synthesis cancelled")),
+                    _ = cancellation.cancelled() => return self.finish_cancellation().await,
                     _ = sleep(self.delay) => {}
                 }
             }
 
             if cancellation.is_cancelled() {
-                return Err(AdapterError::new("speech synthesis cancelled"));
+                return self.finish_cancellation().await;
             }
+            self.synthesis_completed.send_replace(true);
             Ok(self.audio.clone())
         })
+    }
+}
+
+async fn wait_for_true(mut receiver: watch::Receiver<bool>) {
+    while !*receiver.borrow_and_update() {
+        receiver.changed().await.unwrap();
     }
 }
 

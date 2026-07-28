@@ -9,6 +9,7 @@ use crate::{
 
 const DEFAULT_MAX_AUDIO_BYTES: usize = 16 * 1024 * 1024;
 const FRAME_DURATION_MILLISECONDS: u64 = 20;
+const MILLISECONDS_PER_SECOND: u64 = 1_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WavPcmDecoder {
@@ -43,12 +44,17 @@ impl WavPcmDecoder {
         }
 
         let (format, data_bytes) = parse_wav(bytes, self.max_audio_bytes)?;
-        let frame_bytes = frame_bytes(format)?;
-        let frame_count = data_bytes
-            .checked_add(frame_bytes - 1)
-            .ok_or_else(invalid_wav_error)?
-            / frame_bytes;
-        let frame_metadata_bytes = frame_count
+        let alignment = format.frame_alignment_bytes()?;
+        if !data_bytes.is_multiple_of(alignment) {
+            return Err(invalid_wav_error());
+        }
+
+        let frame_sample_numerator = frame_sample_numerator(format)?;
+        validate_largest_frame(format, frame_sample_numerator)?;
+        let sample_count = data_bytes / alignment;
+        let frame_count_upper_bound =
+            frame_count_upper_bound(sample_count, frame_sample_numerator)?;
+        let frame_metadata_bytes = frame_count_upper_bound
             .checked_mul(size_of::<AudioFrame>())
             .ok_or_else(invalid_wav_error)?;
         if frame_metadata_bytes > self.max_audio_bytes {
@@ -63,21 +69,33 @@ impl WavPcmDecoder {
             Ok(())
         })?;
 
-        let alignment = format.frame_alignment_bytes()?;
-        if !pcm_bytes.len().is_multiple_of(alignment) {
-            return Err(invalid_wav_error());
-        }
+        let mut frames = Vec::with_capacity(frame_count_upper_bound);
+        let mut previous_sample_boundary = 0_usize;
+        let mut frame_slot = 1_u64;
+        let mut sequence = 0_u64;
+        while previous_sample_boundary < sample_count {
+            let mut sample_boundary = sample_boundary(frame_slot, frame_sample_numerator)?;
+            if sample_boundary <= previous_sample_boundary {
+                frame_slot = next_frame_slot(previous_sample_boundary, frame_sample_numerator)?;
+                continue;
+            }
+            if sample_boundary > sample_count {
+                sample_boundary = sample_count;
+            }
 
-        let mut frames = Vec::with_capacity(frame_count);
-        for (sequence, bytes) in pcm_bytes.chunks(frame_bytes).enumerate() {
+            let start = byte_offset(previous_sample_boundary, alignment)?;
+            let end = byte_offset(sample_boundary, alignment)?;
             frames.push(AudioFrame::new(
                 turn_id,
                 generation_id,
                 utterance_id,
-                u64::try_from(sequence).map_err(|_| invalid_wav_error())?,
+                sequence,
                 format,
-                bytes.to_vec(),
+                pcm_bytes[start..end].to_vec(),
             )?);
+            previous_sample_boundary = sample_boundary;
+            frame_slot = frame_slot.checked_add(1).ok_or_else(invalid_wav_error)?;
+            sequence = sequence.checked_add(1).ok_or_else(invalid_wav_error)?;
         }
 
         Ok(frames)
@@ -161,19 +179,70 @@ fn parse_format(bytes: &[u8]) -> Result<PcmFormat, AdapterError> {
     Ok(format)
 }
 
-fn frame_bytes(format: PcmFormat) -> Result<usize, AdapterError> {
-    let samples_per_frame = u64::from(format.sample_rate_hz())
+fn frame_sample_numerator(format: PcmFormat) -> Result<u64, AdapterError> {
+    u64::from(format.sample_rate_hz())
         .checked_mul(FRAME_DURATION_MILLISECONDS)
+        .ok_or_else(invalid_wav_error)
+}
+
+fn validate_largest_frame(
+    format: PcmFormat,
+    frame_sample_numerator: u64,
+) -> Result<(), AdapterError> {
+    let largest_sample_count = frame_sample_numerator
+        .checked_add(MILLISECONDS_PER_SECOND - 1)
         .ok_or_else(invalid_wav_error)?
-        / 1_000;
-    let frame_bytes = samples_per_frame
+        / MILLISECONDS_PER_SECOND;
+    largest_sample_count
         .checked_mul(
             u64::try_from(format.frame_alignment_bytes()?).map_err(|_| invalid_wav_error())?,
         )
         .and_then(|size| usize::try_from(size).ok())
         .filter(|size| *size > 0 && *size <= MAX_PCM_FRAME_BYTES)
         .ok_or_else(|| AdapterError::new("WAV PCM frame size is unsupported for R3 streaming"))?;
-    Ok(frame_bytes)
+    Ok(())
+}
+
+fn frame_count_upper_bound(
+    sample_count: usize,
+    frame_sample_numerator: u64,
+) -> Result<usize, AdapterError> {
+    let sample_count = u64::try_from(sample_count).map_err(|_| invalid_wav_error())?;
+    let frame_count = sample_count
+        .checked_mul(MILLISECONDS_PER_SECOND)
+        .and_then(|value| value.checked_add(frame_sample_numerator - 1))
+        .map(|value| value / frame_sample_numerator)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(invalid_wav_error)?;
+    Ok(frame_count.min(usize::try_from(sample_count).map_err(|_| invalid_wav_error())?))
+}
+
+fn sample_boundary(frame_slot: u64, frame_sample_numerator: u64) -> Result<usize, AdapterError> {
+    frame_slot
+        .checked_mul(frame_sample_numerator)
+        .map(|value| value / MILLISECONDS_PER_SECOND)
+        .and_then(|boundary| usize::try_from(boundary).ok())
+        .ok_or_else(invalid_wav_error)
+}
+
+fn next_frame_slot(
+    previous_sample_boundary: usize,
+    frame_sample_numerator: u64,
+) -> Result<u64, AdapterError> {
+    u64::try_from(previous_sample_boundary)
+        .map_err(|_| invalid_wav_error())?
+        .checked_add(1)
+        .and_then(|value| value.checked_mul(MILLISECONDS_PER_SECOND))
+        .and_then(|value| value.checked_add(frame_sample_numerator - 1))
+        .map(|value| value / frame_sample_numerator)
+        .filter(|slot| *slot > 0)
+        .ok_or_else(invalid_wav_error)
+}
+
+fn byte_offset(sample_count: usize, alignment: usize) -> Result<usize, AdapterError> {
+    sample_count
+        .checked_mul(alignment)
+        .ok_or_else(invalid_wav_error)
 }
 
 fn walk_chunks(

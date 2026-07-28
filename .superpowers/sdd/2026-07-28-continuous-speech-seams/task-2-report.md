@@ -62,3 +62,40 @@ Result: passed — 69 runtime tests, strict Clippy, formatting check, and whites
 ## Concern
 
 - The normalizer is intentionally not a general Markdown parser; unsupported Markdown syntax remains spoken literally.
+
+## Fix Round 1/5
+
+### Findings Addressed
+
+- **Important — unmatched strong delimiters lose content:** addressed. An unmatched `**` run is preserved as two literal characters and the scanner continues after the run, so it cannot fall through to the single-star branch or pair against its own second star. ASCII and UTF-8 regressions cover unmatched `*`, `**`, and backtick delimiters.
+- **Important — unsupported/bare hash runs are deleted:** addressed. The formatting-only shortcut now matches exactly `#`; `##` and `#######` remain spoken literally, while the supported one-to-six marker plus whitespace rule remains covered at six markers.
+
+### TDD Evidence
+
+Added the unmatched-delimiter and hash-run tests before changing the scanner.
+
+```bash
+PATH="/opt/homebrew/opt/rustup/bin:$PATH" cargo test --locked -p conversation-runtime speech_text::tests
+```
+
+RED result: failed as expected — ASCII and UTF-8 `**unfinished` cases lost the double-star delimiter, and `##` was skipped.
+
+### Verification
+
+```bash
+PATH="/opt/homebrew/opt/rustup/bin:$PATH" cargo fmt --all
+PATH="/opt/homebrew/opt/rustup/bin:$PATH" cargo test --locked -p conversation-runtime speech_text::tests
+PATH="/opt/homebrew/opt/rustup/bin:$PATH" cargo test --locked -p conversation-runtime
+PATH="/opt/homebrew/opt/rustup/bin:$PATH" cargo clippy --locked -p conversation-runtime --all-targets -- -D warnings
+PATH="/opt/homebrew/opt/rustup/bin:$PATH" cargo fmt --all -- --check
+git diff --check
+```
+
+Result: passed — 6 normalizer tests, 72 runtime tests, strict Clippy, formatting check, and whitespace diff check.
+
+### Self-Review
+
+- The unmatched `**` path appends both delimiter bytes and continues before the single-star branch, preserving the reviewed ASCII and UTF-8 cases.
+- Unmatched single-star and backtick delimiters continue through the scanner unchanged; their tests assert the delimiter and enclosed text are retained.
+- Only the exact bare `#` fixture is formatting-only. Unsupported runs remain unchanged unless the existing one-to-six-plus-whitespace heading predicate applies.
+- Runtime queue integration, original `TextDelta` handling, segment indexing, and speech lifecycle behavior are unchanged by this repair.

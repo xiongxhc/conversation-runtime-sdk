@@ -20,7 +20,7 @@ pub(super) fn normalize_speech_text(input: &str) -> Option<String> {
 }
 
 fn strip_line_prefixes(line: &str) -> &str {
-    if line.bytes().all(|byte| byte == b'#') || is_thematic_break(line) {
+    if line == "#" || is_thematic_break(line) {
         return "";
     }
 
@@ -84,6 +84,10 @@ fn strip_paired_delimiters(input: &str) -> String {
                     continue;
                 }
             }
+
+            normalized.push_str("**");
+            remaining = rest;
+            continue;
         }
 
         if let Some(rest) = remaining.strip_prefix('*') {
@@ -129,6 +133,30 @@ mod tests {
         assert_eq!(
             normalize_speech_text("C#、#topic 和 2*3 保持原样。").as_deref(),
             Some("C#、#topic 和 2*3 保持原样。")
+        );
+    }
+
+    #[test]
+    fn preserves_unmatched_delimiters_with_ascii_text() {
+        for input in ["*unfinished", "**unfinished", "`unfinished"] {
+            assert_eq!(normalize_speech_text(input).as_deref(), Some(input));
+        }
+    }
+
+    #[test]
+    fn preserves_unmatched_delimiters_with_utf8_text() {
+        for input in ["你好*未闭合", "你好**未闭合", "你好`未闭合"] {
+            assert_eq!(normalize_speech_text(input).as_deref(), Some(input));
+        }
+    }
+
+    #[test]
+    fn preserves_unsupported_hash_runs_without_heading_whitespace() {
+        assert_eq!(normalize_speech_text("##").as_deref(), Some("##"));
+        assert_eq!(normalize_speech_text("#######").as_deref(), Some("#######"));
+        assert_eq!(
+            normalize_speech_text("###### 标题").as_deref(),
+            Some("标题")
         );
     }
 

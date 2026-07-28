@@ -28,7 +28,7 @@ The repository now contains the deterministic runtime foundation plus reviewed l
 - runtime timing events for first text delta, first synthesis request, and first playable audio;
 - an integrated voice probe that composes replaceable language, speech, and audio-output adapters behind `ConversationRuntime`.
 
-The integrated typed-text-to-audio path is implemented, deterministic-test covered, and measured once on Apple Silicon. The measurement records playback-process launch, not first audible sound. Microphone capture, ASR, first-audible measurement, barge-in, persona, SQLite memory, the desktop app, and iPhone LAN access remain staged in [ROADMAP.md](ROADMAP.md).
+The integrated typed-text-to-audio path is implemented and deterministic-test covered. Apple Silicon evidence includes a historical full-path benchmark and a later isolated continuity check; both record process-level milestones rather than first audible sound. Microphone capture, ASR, first-audible measurement, barge-in, persona, SQLite memory, the desktop app, and iPhone LAN access remain staged in [ROADMAP.md](ROADMAP.md).
 
 ## Test Local Inference
 
@@ -116,7 +116,7 @@ cargo run --locked -p conversation-voice-probe -- \
 
 Text deltas go to standard output unchanged. For speech only, short punctuation-separated clauses are coalesced, supported Markdown formatting markers are removed while their content is retained, and one synthesized segment may be prefetched during playback. Stable timing milestones and the terminal status go to standard error. `SIGINT` requests runtime interruption and waits for generation, synthesis, queued speech, active playback, and temporary-file cleanup. Use `--no-play` only as a diagnostic path.
 
-The public template demonstrates one reference composition; it does not select a deployment model, voice, or backend policy. See [docs/runtime-text-to-audio-evaluation.md](docs/runtime-text-to-audio-evaluation.md) for deterministic evidence, one machine-specific measurement, timing definitions, and evidence limits.
+The public template demonstrates one reference composition; it does not select a deployment model, voice, or backend policy. See [docs/runtime-text-to-audio-evaluation.md](docs/runtime-text-to-audio-evaluation.md) for deterministic evidence, the historical integration benchmark, the later process-level continuity check, timing definitions, and evidence limits.
 
 ## Project Layout
 

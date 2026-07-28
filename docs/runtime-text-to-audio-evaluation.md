@@ -2,7 +2,7 @@
 
 ## Scope
 
-This record separates deterministic repository validation from one machine-specific Apple Silicon integration. The exact language and speech models below are reproducible benchmark inputs, not SDK recommendations, deployment defaults, or application voice selections.
+This record separates deterministic repository validation from a historical machine-specific Apple Silicon benchmark and a later isolated process-level continuity check. The exact language and speech models below are reproducible benchmark inputs, not SDK recommendations, deployment defaults, or application voice selections.
 
 The integration begins with typed text. It does not include microphone capture, VAD, ASR, first audible sound, user-speech-driven barge-in, or subjective voice quality.
 
@@ -205,7 +205,7 @@ recorded one launch, and the probe reported:
 | First text delta | 7,912 ms |
 | First synthesis request | 8,295 ms |
 | First playable audio | 14,016 ms |
-| Outer command wall time | 26.16 s |
+| Outer command wall time | 26.1639 s |
 | Speech requests | 1 |
 | Playback launches | 1 |
 
@@ -214,9 +214,8 @@ milestone. It includes generation, synthesis, playback, and process cleanup.
 It is not a first-audible measurement.
 
 After completion, the playback process was reaped, the audio temporary
-directory was empty, the speech-service listener was stopped, and the model
-loaded by this check was unloaded. The pre-existing Ollama daemon remained
-running.
+directory was empty, port `18000` had no listener, and the Ollama loaded-model
+state was restored to empty. The pre-existing Ollama daemon remained running.
 
 This sample removes the previous runtime-created seam between independent
 punctuation-triggered speech requests because the full response is synthesized

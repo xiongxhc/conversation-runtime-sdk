@@ -17,6 +17,7 @@ The first release is not a directory-complete platform. It is one local voice lo
 - The TTS probe supports installed-voice discovery, direct voice and rate controls, and bounded named profiles. Profile precedence is `CLI > environment > selected profile > macOS system defaults`; supported backends are `macos-system` and `openai-compatible`.
 - Phrase-level language-to-speech integration, first-playable-audio timing, integrated runtime speech, and cancellation through active playback are implemented and deterministic-test covered.
 - One cold cached Apple Silicon run records first text, first synthesis, first playable audio, playback-process launch, total completion, and cleanup. It is machine-specific evidence, not a model or backend selection.
+- A later isolated Apple Silicon continuity check records one speech request, one playback launch, process-level timings, and cleanup for the corrected punctuation/formatting path. It adds no first-audible or subjective-quality claim.
 - Microphone capture, ASR, barge-in, persona, SQLite memory, the macOS app, and client SDKs have not started.
 - First-audible timing, representative warm measurements, subjective English and Chinese quality, and the 1.2-second time-to-useful-audio goal remain unvalidated.
 
@@ -26,7 +27,7 @@ The first release is not a directory-complete platform. It is one local voice lo
 
 ### Source Status
 
-The toolchain, safe machine profile, bounded language adapter, reproducible local text probe, model digests, loaded-state snapshots, and first language-model measurements are complete. The macOS system-speech reference adapter and deterministic local HTTP speech adapter have typed-text probe coverage. One integrated run now records first-playable-audio timing and playback-process launch for exact benchmark inputs. First-audible timing, representative sampling, subjective model-quality selection, and ASR benchmarking remain pending. Backend selection belongs to the consuming deployment and remains outside the public SDK roadmap.
+The toolchain, safe machine profile, bounded language adapter, reproducible local text probe, model digests, loaded-state snapshots, and first language-model measurements are complete. The macOS system-speech reference adapter and deterministic local HTTP speech adapter have typed-text probe coverage. A historical integrated benchmark and later isolated continuity check record first-playable-audio timing and playback-process launch for exact benchmark inputs. First-audible timing, representative sampling, subjective model-quality selection, and ASR benchmarking remain pending. Backend selection belongs to the consuming deployment and remains outside the public SDK roadmap.
 
 ### TTS Adapter Boundary
 
@@ -82,7 +83,7 @@ Complete. The initial source and deterministic runtime validation for this miles
 
 ### Source Status
 
-Complete for the implemented typed-input slice. The configurable language adapter, streamed text probe, bounded timeout/output behavior, typed audio and output contracts, deterministic local speech adapter, UTF-8-safe phrase segmentation, short-clause coalescing, speech-only Markdown normalization with unchanged text events, capacity-one synthesized-audio prefetch, runtime timing events, active-playback cancellation, and integrated voice probe are present. One Apple Silicon run exercised local generation, synthesis, validated audio, playback-process launch, terminal completion, and cleanup. The run does not measure first audible sound or select a deployment stack. Each consuming deployment must preserve its measured inference policy explicitly rather than inheriting model defaults silently.
+Complete for the implemented typed-input slice. The configurable language adapter, streamed text probe, bounded timeout/output behavior, typed audio and output contracts, deterministic local speech adapter, UTF-8-safe phrase segmentation, short-clause coalescing, speech-only Markdown normalization with unchanged text events, capacity-one synthesized-audio prefetch, runtime timing events, active-playback cancellation, and integrated voice probe are present. The historical Apple Silicon benchmark exercised local generation, synthesis, validated audio, playback-process launch, terminal completion, and cleanup; a later isolated check exercised the corrected one-request continuity path. Neither check measures first audible sound or selects a deployment stack. Each consuming deployment must preserve its measured inference policy explicitly rather than inheriting model defaults silently.
 
 ### Deliverables
 
@@ -95,7 +96,7 @@ Complete for the implemented typed-input slice. The configurable language adapte
 - Runtime timing events for first text delta, first synthesis request, and first playable audio.
 - A command-line example that turns typed input into local spoken output.
 
-All listed R2 deliverables are implemented and deterministic-test covered. The reference command has one machine-specific Apple Silicon evidence run; exact benchmark inputs are measurements rather than SDK recommendations.
+All listed R2 deliverables are implemented and deterministic-test covered. The reference command has a historical machine-specific benchmark plus a later isolated process-level continuity check; exact benchmark inputs are measurements rather than SDK recommendations.
 
 ### Exit Criteria
 

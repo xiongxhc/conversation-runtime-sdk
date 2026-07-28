@@ -219,6 +219,15 @@ state was restored to empty. The pre-existing Ollama daemon remained running.
 
 This sample removes the previous runtime-created seam between independent
 punctuation-triggered speech requests because the full response is synthesized
-and played once. No human listening judgment was captured, so this evidence
-does not claim that punctuation introduced no silence inside the generated
-audio or that subjective voice continuity materially improved.
+and played once.
+
+An additional listening check used the prompt `给我讲故事` from the correction
+branch. It reported first text at `186 ms`, first synthesis at `486 ms`, first
+playable audio at `5,328 ms`, and completed successfully. The longer response
+required seven independent speech requests. The listener reported that pauses
+were better and that one voice change remained, describing the result as much
+better overall.
+
+This is one subjective observation, not a deterministic quality guarantee.
+The remaining voice change is consistent with the unresolved boundary between
+independent synthesis requests for responses that exceed one speech segment.

@@ -72,9 +72,11 @@ R3 is intended to remove.
 
 A bundled Swift sidecar owns the Apple full-duplex audio engine, local
 WhisperKit integration, and continuous PCM playback. The Rust CLI starts the
-sidecar as a child process and communicates over bounded framed standard input
-and output. Rust remains authoritative for privacy policy, session state, turn
-finalization, provider coordination, cancellation, and public events.
+sidecar as a child process and communicates over bounded framed child pipes:
+standard input is reserved for control, while an inherited local file descriptor
+carries parent-to-child PCM. Rust remains authoritative for privacy policy,
+session state, turn finalization, provider coordination, cancellation, and
+public events.
 
 This is the selected approach. The sidecar is a replaceable platform adapter,
 not a network service or a second product.
@@ -100,7 +102,7 @@ flowchart LR
     Policy -->|"allow or reject"| CLI
     CLI -->|"owns validated session"| Runtime
     CLI -->|"starts and monitors"| Sidecar
-    Sidecar <-->|"bounded framed child protocol"| Runtime
+    Sidecar <-->|"bounded control and media pipes"| Runtime
     Runtime -->|"final transcript only"| LLM
     LLM -->|"text deltas"| Runtime
     Runtime -->|"semantic utterances"| TTS
@@ -235,23 +237,27 @@ may start a new session explicitly.
 
 ## Child-Process Protocol
 
-The initial macOS transport is a private bidirectional child-process protocol:
+The initial macOS transport is a private child-process protocol with independent
+control and media paths:
 
-- parent-to-child messages use standard input;
-- child-to-parent messages use standard output;
+- parent-to-child control messages use standard input;
+- parent-to-child PCM frames use inherited local file descriptor `3`;
+- child-to-parent events and acknowledgements use standard output;
 - diagnostics use bounded standard error;
 - each frame starts with an eight-byte big-endian header: unsigned
   `version: u16`, `kind: u16`, and `payload_length: u32`;
 - protocol version one is the only accepted initial version;
 - control payloads are UTF-8 JSON bounded to `64 KiB`;
-- audio payloads are interleaved PCM bounded to `64 KiB` per frame;
+- audio payloads contain `48` bytes of metadata plus interleaved PCM; PCM sample
+  bytes are bounded to `64 KiB`, so the complete audio payload is bounded to
+  `65,584` bytes;
 - captured diagnostics retain at most `64 KiB` for one sidecar process;
 - unknown versions, kinds, invalid lengths, malformed JSON, and invalid audio
   metadata fail the session;
 - the parent-to-child media queue holds at most `100` frames or two seconds of
   negotiated PCM, whichever limit is reached first;
-- control and cancellation messages use an independently bounded path so media
-  backpressure cannot block interruption;
+- control and cancellation messages use standard input and cannot be blocked by
+  an in-flight write on the independent PCM descriptor;
 - EOF is a sidecar failure unless shutdown was requested.
 
 The protocol carries session, turn, utterance, and generation identifiers where
@@ -488,8 +494,9 @@ for the initial evaluation.
 - Golden fixtures cover every version-one control and audio frame.
 - Fuzz/property tests reject invalid lengths, unknown kinds, invalid UTF-8,
   unsupported PCM, sequence gaps, and truncated EOF.
-- A fake sidecar deterministically simulates slow reads, blocked writes,
-  out-of-order acknowledgements, crashes, and stale playback.
+- A fake sidecar deterministically simulates slow reads, blocked media writes,
+  control delivery during a blocked media write, out-of-order acknowledgements,
+  crashes, and stale playback.
 - A sidecar harness verifies default-device capture, full-duplex playback,
   engine shutdown, and microphone permission behavior without cloud services.
 

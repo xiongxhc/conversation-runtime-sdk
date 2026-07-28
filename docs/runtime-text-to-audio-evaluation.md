@@ -151,3 +151,38 @@ After the probe completed:
 - Snapshot digest verification proves the measured file set, not model quality or suitability.
 - No subjective English or Chinese listening evaluation was recorded.
 - No first-audible, microphone, ASR, VAD, barge-in, power, thermal, or peak-memory measurement was recorded.
+
+## Continuous-Speech Deterministic Correction — 2026-07-28
+
+This correction preserves the historical measurement above and adds
+deterministic coverage for speech continuity seams. The integrated loopback
+probe now returns the exact model text:
+
+```text
+# 问候
+你好。今天很好！*保持自然*，C# 和 2*3 不变。
+```
+
+The probe proves that standard output remains byte-for-byte unchanged while the
+speech fixture receives exactly one request containing:
+
+```text
+"input":"问候 你好。今天很好！保持自然，C# 和 2*3 不变。"
+```
+
+The same deterministic run requires one captured WAV, one fake-player launch,
+an empty playback temporary directory, exactly one occurrence of each runtime
+milestone in causal order, and a final `status=completed`. Runtime regressions
+also cover short-clause coalescing, speech-only normalization, capacity-one
+synthesized-audio prefetch, ordered playback, cross-stage cleanup, queued-audio
+discard, exactly-one terminal publication, and runtime reuse.
+
+The focused probe CLI suite passed `12` tests. The complete locked workspace
+suite passed `239` tests with no failures under `--no-fail-fast`; formatting,
+strict all-target workspace Clippy, whitespace validation, incomplete-marker
+scanning, and concrete private-path scanning also passed.
+
+No additional live Apple Silicon listening check was performed for this
+correction. Machine-specific gap and voice-continuity observations remain
+orchestrator-run evidence; until that evidence is recorded, this correction
+makes no new subjective continuity, first-audible, or hardware-latency claim.

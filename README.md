@@ -22,7 +22,9 @@ The repository now contains the deterministic runtime foundation plus reviewed l
 - a runnable typed-text probe with optional AIFF persistence, playback, cancellation, and distinct timeout reporting;
 - a deterministic OpenAI-compatible local HTTP speech adapter and probe profiles for measured neural-TTS evaluation candidates;
 - a generic `AudioOutput` boundary with bounded macOS `afplay` reference output;
-- UTF-8-safe phrase segmentation and a bounded sequential speech queue that starts synthesis before generation completes;
+- UTF-8-safe phrase segmentation that coalesces short punctuation-separated clauses while retaining hard byte limits;
+- speech-only Markdown normalization that preserves the original text stream, including literal content such as `C#` and `2*3`;
+- a bounded two-stage speech pipeline that may prefetch exactly one synthesized segment while the current segment plays;
 - runtime timing events for first text delta, first synthesis request, and first playable audio;
 - an integrated voice probe that composes replaceable language, speech, and audio-output adapters behind `ConversationRuntime`.
 
@@ -112,7 +114,7 @@ cargo run --locked -p conversation-voice-probe -- \
   "Answer in two short sentences: 你好，请简短介绍你自己。"
 ```
 
-Text deltas go to standard output. Stable timing milestones and the terminal status go to standard error. `SIGINT` requests runtime interruption and waits for generation, synthesis, queued speech, active playback, and temporary-file cleanup. Use `--no-play` only as a diagnostic path.
+Text deltas go to standard output unchanged. For speech only, short punctuation-separated clauses are coalesced, supported Markdown formatting markers are removed while their content is retained, and one synthesized segment may be prefetched during playback. Stable timing milestones and the terminal status go to standard error. `SIGINT` requests runtime interruption and waits for generation, synthesis, queued speech, active playback, and temporary-file cleanup. Use `--no-play` only as a diagnostic path.
 
 The public template demonstrates one reference composition; it does not select a deployment model, voice, or backend policy. See [docs/runtime-text-to-audio-evaluation.md](docs/runtime-text-to-audio-evaluation.md) for deterministic evidence, one machine-specific measurement, timing definitions, and evidence limits.
 

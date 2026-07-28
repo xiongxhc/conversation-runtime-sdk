@@ -82,14 +82,16 @@ Complete. The initial source and deterministic runtime validation for this miles
 
 ### Source Status
 
-Complete for the implemented typed-input slice. The configurable language adapter, streamed text probe, bounded timeout/output behavior, typed audio and output contracts, deterministic local speech adapter, UTF-8-safe phrase segmentation, bounded concurrent speech pipeline, runtime timing events, active-playback cancellation, and integrated voice probe are present. One Apple Silicon run exercised local generation, synthesis, validated audio, playback-process launch, terminal completion, and cleanup. The run does not measure first audible sound or select a deployment stack. Each consuming deployment must preserve its measured inference policy explicitly rather than inheriting model defaults silently.
+Complete for the implemented typed-input slice. The configurable language adapter, streamed text probe, bounded timeout/output behavior, typed audio and output contracts, deterministic local speech adapter, UTF-8-safe phrase segmentation, short-clause coalescing, speech-only Markdown normalization with unchanged text events, capacity-one synthesized-audio prefetch, runtime timing events, active-playback cancellation, and integrated voice probe are present. One Apple Silicon run exercised local generation, synthesis, validated audio, playback-process launch, terminal completion, and cleanup. The run does not measure first audible sound or select a deployment stack. Each consuming deployment must preserve its measured inference policy explicitly rather than inheriting model defaults silently.
 
 ### Deliverables
 
 - One measured Apple Silicon language-model adapter configured by the reference application.
 - Incremental text streaming into the runtime.
 - One measured Apple Silicon TTS reference adapter.
-- Sentence or phrase chunking that starts synthesis before the full response completes.
+- Sentence or phrase chunking that coalesces short clauses while starting synthesis before the full response completes.
+- Speech-only formatting normalization that preserves the original emitted text.
+- Ordered playback with capacity for exactly one prefetched synthesized segment.
 - Runtime timing events for first text delta, first synthesis request, and first playable audio.
 - A command-line example that turns typed input into local spoken output.
 

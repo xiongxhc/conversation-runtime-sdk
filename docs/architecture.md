@@ -12,6 +12,60 @@ protocol <- model-adapters <- runtime
 
 `runtime` owns turn state, adapter coordination, event ordering, and cancellation. Clients should not depend on adapter implementation details.
 
+## R3 Target: Real-Time Voice Loop
+
+R3 keeps the public runtime backend-neutral while adding one managed macOS
+platform sidecar for the first full-duplex implementation:
+
+```mermaid
+flowchart LR
+    User["User"]
+    Sidecar["Managed macOS voice sidecar"]
+    Audio["Apple voice-processing engine"]
+    ASR["Local WhisperKit"]
+    Runtime["Rust runtime"]
+    Policy["Privacy policy"]
+    LLM["Replaceable LLM"]
+    TTS["Replaceable streaming TTS"]
+
+    User -->|"speech"| Audio
+    Audio -->|"echo-cancelled frames"| ASR
+    ASR -->|"VAD and hypotheses"| Sidecar
+    Sidecar <-->|"bounded framed stdio"| Runtime
+    Policy -->|"validated before microphone access"| Runtime
+    Runtime -->|"final transcript only"| LLM
+    LLM -->|"text deltas"| Runtime
+    Runtime -->|"semantic utterances"| TTS
+    TTS -->|"typed PCM frames"| Runtime
+    Runtime -->|"generation-tagged PCM"| Sidecar
+    Sidecar --> Audio
+    Audio -->|"speech"| User
+```
+
+The sidecar owns capture and playback in the same Apple audio engine so built-in
+echo cancellation can distinguish user speech from speaker output. It also owns
+the first local WhisperKit adapter and the continuous PCM buffer. It binds no
+network port.
+
+Rust remains authoritative for privacy and adapter validation, session and turn
+state, the `600 ms` final-silence rule, generation identifiers, provider
+coordination, cancellation, and lifecycle events. Partial transcripts are
+observable but never reach the language model. During playback, approximately
+`200 ms` of sustained local speech flushes the active sidecar generation and
+cancels language generation, TTS, queued frames, and playback without waiting
+for a transcript.
+
+The session privacy mode and every component's declared local or remote execution
+status are immutable after capture begins. `LocalOnly` rejects remote or
+undeclared STT, LLM, TTS, tools, memory, and telemetry before microphone access.
+There is no silent remote fallback.
+
+See
+[the approved R3 design](superpowers/specs/2026-07-28-r3-real-time-voice-loop-design.md)
+for the protocol, configuration, failure, testing, and acoustic-measurement
+requirements. This section describes the target architecture and is not a claim
+that the R3 loop is already implemented.
+
 ## Runtime Text-to-Audio Flow
 
 1. A client starts one turn with a completed transcript.

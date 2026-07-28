@@ -112,23 +112,42 @@ The first-audible timestamp is intentionally not inferred from playback-process 
 
 **Outcome:** Support a continuous microphone-to-speaker conversation with interruption as a first-class event.
 
+The approved first slice is a macOS Apple Silicon CLI session with a managed
+Swift sidecar. The sidecar owns the full-duplex Apple voice-processing engine,
+local WhisperKit recognition, and continuous playback; Rust owns privacy policy,
+turn finalization, provider coordination, generation safety, and cancellation.
+See
+[the R3 design](docs/superpowers/specs/2026-07-28-r3-real-time-voice-loop-design.md)
+and [the canonical architecture](docs/architecture.md).
+
 ### Deliverables
 
-- Audio capture and playback abstractions.
-- Local VAD and turn segmentation.
-- Streaming or low-latency local ASR adapter.
-- Partial transcript handling with clear finalization rules.
-- Playback cancellation connected to the active turn token.
+- Local-first, backend-neutral session policy with explicit per-component
+  execution location and no silent remote fallback.
+- System-default audio capture and continuous playback abstractions.
+- Managed macOS sidecar with Apple echo cancellation and bounded framed child
+  protocol.
+- Local VAD and WhisperKit ASR adapter.
+- Display-only partial transcripts and finalization after approximately `600 ms`
+  of silence.
+- Generation-tagged playback cancellation after approximately `200 ms` of
+  sustained user speech.
 - Barge-in that stops generation, synthesis, queued audio, and active playback.
 - End-to-end latency and cancellation measurements.
 
 ### Exit Criteria
 
 - A user sustains a ten-minute local voice conversation without manually resetting the pipeline.
-- Speaking during playback stops audible output and downstream work within a measured bound.
+- Speaking during playback stops audible output within `500 ms` p95 over the
+  scripted acoustic set and cancels downstream work.
 - Stale text or audio from a cancelled turn never appears in the next turn.
-- Time from speech end to useful audio is measured over a representative scripted set.
-- Failures identify their stage and leave the runtime ready for a new turn.
+- Time from speech end to first playable and first audible audio is measured
+  separately over a representative scripted set.
+- Failures identify their stage; turn-scoped failures leave the session ready
+  for a new turn, while device, permission, sidecar, framing, and policy failures
+  require a new session.
+- `LocalOnly` rejects remote STT, LLM, TTS, tools, memory, and telemetry before
+  microphone access.
 
 ## R4 — Conversation Quality Controls
 

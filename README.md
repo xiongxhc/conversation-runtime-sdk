@@ -30,6 +30,33 @@ The repository now contains the deterministic runtime foundation plus reviewed l
 
 The integrated typed-text-to-audio path is implemented and deterministic-test covered. Apple Silicon evidence includes a historical full-path benchmark and a later isolated continuity check; both record process-level milestones rather than first audible sound. Microphone capture, ASR, first-audible measurement, barge-in, persona, SQLite memory, the desktop app, and iPhone LAN access remain staged in [ROADMAP.md](ROADMAP.md).
 
+## R3 Target Architecture
+
+```mermaid
+flowchart LR
+    Mic["System-default microphone"] --> Sidecar["Managed macOS voice sidecar"]
+    Sidecar -->|"VAD and local ASR hypotheses"| Runtime["Rust runtime"]
+    Runtime -->|"final transcript only"| LLM["Replaceable LLM"]
+    LLM -->|"text deltas"| Runtime
+    Runtime -->|"semantic utterances"| TTS["Replaceable streaming TTS"]
+    TTS -->|"typed audio frames"| Runtime
+    Runtime -->|"generation-tagged PCM"| Sidecar
+    Sidecar --> Speaker["System-default speaker"]
+```
+
+The first real-time slice keeps capture, Apple echo cancellation, local
+WhisperKit recognition, and continuous playback in one managed macOS audio
+sidecar. Rust enforces the immutable session privacy policy, finalizes a turn
+after approximately `600 ms` of silence, and cancels generation, synthesis,
+queued audio, and playback after approximately `200 ms` of sustained user speech.
+Partial transcripts remain display-only. `LocalOnly` rejects remote or
+undeclared adapters before microphone access and never falls back silently.
+
+This is the approved R3 target, not current implementation status. See
+[docs/architecture.md](docs/architecture.md) for the canonical diagram and
+[the R3 design](docs/superpowers/specs/2026-07-28-r3-real-time-voice-loop-design.md)
+for the complete privacy, protocol, lifecycle, and acceptance rules.
+
 ## Test Local Inference
 
 Start Ollama, then run the reviewed probe against an installed model:

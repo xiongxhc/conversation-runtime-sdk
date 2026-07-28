@@ -5,9 +5,14 @@ use std::fmt;
 #[non_exhaustive]
 pub enum RuntimeStage {
     Runtime,
+    PrivacyPolicy,
+    AudioCapture,
+    SpeechRecognizer,
     LanguageModel,
     SpeechSynthesizer,
     AudioOutput,
+    VoiceSidecar,
+    ContinuousAudioOutput,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

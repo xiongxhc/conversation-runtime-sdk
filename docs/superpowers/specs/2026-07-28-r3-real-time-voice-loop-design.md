@@ -389,10 +389,14 @@ device = "system-default"
 [turn]
 speech_start_ms = 200
 final_silence_ms = 600
+# speech_start_ms must be within 100..=1_000.
+# final_silence_ms must be within 200..=3_000.
 
 [asr]
 backend = "whisperkit"
 execution = "local"
+model_path = "/absolute/path/to/local-asr-model"
+download = false
 
 [language]
 backend = "replaceable-local-adapter"
@@ -405,15 +409,27 @@ execution = "local"
 [audio]
 backend = "managed-sidecar"
 execution = "local"
+
+[[tools]]
+backend = "replaceable-local-adapter"
+execution = "local"
+
+[[memory]]
+backend = "replaceable-local-adapter"
+execution = "local"
+
+[[telemetry]]
+backend = "replaceable-local-adapter"
+execution = "local"
 ```
 
 Concrete model identifiers, voices, endpoints, executable overrides, and secrets
 belong in the user's private file outside the repository. Public examples use
 generic placeholders.
 
-The bundled sidecar is the default. An absolute executable override is allowed
-for development and packaging tests. Relative executable paths and ambient
-`PATH` lookup are rejected.
+The bundled sidecar is the default and resolves adjacent to the CLI executable,
+not through ambient `PATH` lookup. An absolute executable override is allowed
+for development and packaging tests. Relative executable paths are rejected.
 
 Schema version `1` remains valid for the existing typed-input probe. It is not
 silently interpreted as a real-time voice-session configuration. A schema
@@ -445,18 +461,24 @@ diagnostic capture prevents a failed child or provider from exhausting memory.
 
 ## Metrics and Evidence
 
-All runtime timings use one monotonic session clock. R3 records:
+All runtime timings use one monotonic session clock. R3 records these
+content-free metrics:
 
-- physical speech-end marker used by the deterministic harness;
-- transcript finalization;
-- first text delta;
-- first synthesis request;
-- first validated playable frame;
-- first frame accepted by the sidecar;
-- playback render acknowledgement;
-- barge-in speech onset and threshold crossing;
-- playback flush acknowledgement;
-- synthesis duration, queue depth, underruns, cancellation duration, and cleanup.
+```text
+speech_end_ms
+transcript_final_ms
+first_text_delta_ms
+first_synthesis_request_ms
+first_playable_audio_ms
+first_sidecar_accept_ms
+playback_render_ack_ms
+barge_in_onset_ms
+barge_in_threshold_ms
+playback_flush_ack_ms
+queue_depth_frames
+underrun_count
+cleanup_ms
+```
 
 `FirstPlayableAudio` means a validated audio frame is ready. A render callback or
 player launch is not evidence of physical sound.

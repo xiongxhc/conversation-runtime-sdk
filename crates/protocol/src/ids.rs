@@ -22,3 +22,30 @@ impl fmt::Display for TurnId {
         self.0.fmt(formatter)
     }
 }
+
+macro_rules! numeric_id {
+    ($name:ident) => {
+        #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        pub struct $name(u64);
+
+        impl $name {
+            pub const fn new(value: u64) -> Self {
+                Self(value)
+            }
+
+            pub const fn get(self) -> u64 {
+                self.0
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                self.0.fmt(formatter)
+            }
+        }
+    };
+}
+
+numeric_id!(SessionId);
+numeric_id!(GenerationId);
+numeric_id!(UtteranceId);

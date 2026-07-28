@@ -10,6 +10,10 @@ pub enum CaptureEvent {
     Frame(AudioFrame),
 }
 
+/// Streams capture events for one voice session.
+///
+/// Implementations must observe `cancellation`, stop session-owned work, and
+/// close the returned receiver only after cleanup completes.
 pub trait AudioCapture: Send + Sync {
     fn start<'a>(
         &'a self,

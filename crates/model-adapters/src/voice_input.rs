@@ -11,6 +11,10 @@ pub enum VoiceInputEvent {
     Recognition(RecognitionEvent),
 }
 
+/// Streams fused capture and recognition events for one voice session.
+///
+/// Implementations must observe `cancellation`, stop session-owned work, and
+/// close the returned receiver only after cleanup completes.
 pub trait VoiceInput: Send + Sync {
     fn start<'a>(
         &'a self,

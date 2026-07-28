@@ -44,6 +44,10 @@ impl StreamingSpeechRequest {
     }
 }
 
+/// Streams PCM frames for one identity-tagged speech request.
+///
+/// Implementations must observe `cancellation`, stop request-owned work, and
+/// close the returned receiver only after cleanup completes.
 pub trait StreamingSpeechSynthesizer: Send + Sync {
     fn stream(
         &self,

@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use conversation_protocol::{GenerationId, PlaybackState, SessionId};
 use tokio::sync::mpsc;
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -15,6 +16,7 @@ use crate::{
 #[derive(Clone, Debug)]
 pub struct MockAudioCapture {
     events: Vec<CaptureEvent>,
+    scripted_stream: ScriptedStream,
 }
 
 impl MockAudioCapture {
@@ -24,7 +26,12 @@ impl MockAudioCapture {
     {
         Self {
             events: events.into_iter().collect(),
+            scripted_stream: ScriptedStream::default(),
         }
+    }
+
+    pub async fn wait_for_blocked_send(&self) {
+        self.scripted_stream.wait_for_blocked_send().await;
     }
 }
 
@@ -34,13 +41,20 @@ impl AudioCapture for MockAudioCapture {
         _session_id: SessionId,
         cancellation: CancellationToken,
     ) -> AdapterFuture<'a, mpsc::Receiver<Result<CaptureEvent, AdapterError>>> {
-        Box::pin(async move { Ok(scripted_receiver(self.events.clone(), cancellation)) })
+        Box::pin(async move {
+            Ok(scripted_receiver(
+                self.events.clone(),
+                cancellation,
+                self.scripted_stream.clone(),
+            ))
+        })
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct MockSpeechRecognizer {
     events: Vec<RecognitionEvent>,
+    scripted_stream: ScriptedStream,
 }
 
 impl MockSpeechRecognizer {
@@ -50,7 +64,12 @@ impl MockSpeechRecognizer {
     {
         Self {
             events: events.into_iter().collect(),
+            scripted_stream: ScriptedStream::default(),
         }
+    }
+
+    pub async fn wait_for_blocked_send(&self) {
+        self.scripted_stream.wait_for_blocked_send().await;
     }
 }
 
@@ -60,13 +79,20 @@ impl SpeechRecognizer for MockSpeechRecognizer {
         _session_id: SessionId,
         cancellation: CancellationToken,
     ) -> AdapterFuture<'a, mpsc::Receiver<Result<RecognitionEvent, AdapterError>>> {
-        Box::pin(async move { Ok(scripted_receiver(self.events.clone(), cancellation)) })
+        Box::pin(async move {
+            Ok(scripted_receiver(
+                self.events.clone(),
+                cancellation,
+                self.scripted_stream.clone(),
+            ))
+        })
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct MockVoiceInput {
     events: Vec<VoiceInputEvent>,
+    scripted_stream: ScriptedStream,
 }
 
 impl MockVoiceInput {
@@ -76,7 +102,12 @@ impl MockVoiceInput {
     {
         Self {
             events: events.into_iter().collect(),
+            scripted_stream: ScriptedStream::default(),
         }
+    }
+
+    pub async fn wait_for_blocked_send(&self) {
+        self.scripted_stream.wait_for_blocked_send().await;
     }
 }
 
@@ -86,7 +117,13 @@ impl VoiceInput for MockVoiceInput {
         _session_id: SessionId,
         cancellation: CancellationToken,
     ) -> AdapterFuture<'a, mpsc::Receiver<Result<VoiceInputEvent, AdapterError>>> {
-        Box::pin(async move { Ok(scripted_receiver(self.events.clone(), cancellation)) })
+        Box::pin(async move {
+            Ok(scripted_receiver(
+                self.events.clone(),
+                cancellation,
+                self.scripted_stream.clone(),
+            ))
+        })
     }
 }
 
@@ -94,6 +131,7 @@ impl VoiceInput for MockVoiceInput {
 pub struct MockGenerationLanguageModel {
     deltas: Vec<String>,
     requests: Arc<Mutex<Vec<GenerationLanguageRequest>>>,
+    scripted_stream: ScriptedStream,
 }
 
 impl MockGenerationLanguageModel {
@@ -105,6 +143,7 @@ impl MockGenerationLanguageModel {
         Self {
             deltas: deltas.into_iter().map(Into::into).collect(),
             requests: Arc::new(Mutex::new(Vec::new())),
+            scripted_stream: ScriptedStream::default(),
         }
     }
 
@@ -113,6 +152,10 @@ impl MockGenerationLanguageModel {
             .lock()
             .expect("mock generation language requests lock poisoned")
             .clone()
+    }
+
+    pub async fn wait_for_blocked_send(&self) {
+        self.scripted_stream.wait_for_blocked_send().await;
     }
 }
 
@@ -135,7 +178,7 @@ impl GenerationLanguageModel for MockGenerationLanguageModel {
             })
             .collect();
 
-        scripted_receiver(deltas, cancellation)
+        scripted_receiver(deltas, cancellation, self.scripted_stream.clone())
     }
 }
 
@@ -143,6 +186,7 @@ impl GenerationLanguageModel for MockGenerationLanguageModel {
 pub struct MockStreamingSpeechSynthesizer {
     frames: Vec<AudioFrame>,
     requests: Arc<Mutex<Vec<StreamingSpeechRequest>>>,
+    scripted_stream: ScriptedStream,
 }
 
 impl MockStreamingSpeechSynthesizer {
@@ -153,6 +197,7 @@ impl MockStreamingSpeechSynthesizer {
         Self {
             frames: frames.into_iter().collect(),
             requests: Arc::new(Mutex::new(Vec::new())),
+            scripted_stream: ScriptedStream::default(),
         }
     }
 
@@ -161,6 +206,10 @@ impl MockStreamingSpeechSynthesizer {
             .lock()
             .expect("mock streaming speech requests lock poisoned")
             .clone()
+    }
+
+    pub async fn wait_for_blocked_send(&self) {
+        self.scripted_stream.wait_for_blocked_send().await;
     }
 }
 
@@ -174,7 +223,11 @@ impl StreamingSpeechSynthesizer for MockStreamingSpeechSynthesizer {
             .lock()
             .expect("mock streaming speech requests lock poisoned")
             .push(request);
-        scripted_receiver(self.frames.clone(), cancellation)
+        scripted_receiver(
+            self.frames.clone(),
+            cancellation,
+            self.scripted_stream.clone(),
+        )
     }
 }
 
@@ -291,13 +344,18 @@ impl VoiceIoFactory for MockVoiceIoFactory {
 fn scripted_receiver<T>(
     events: Vec<T>,
     cancellation: CancellationToken,
+    scripted_stream: ScriptedStream,
 ) -> mpsc::Receiver<Result<T, AdapterError>>
 where
     T: Send + 'static,
 {
-    let (sender, receiver) = mpsc::channel(events.len().max(1));
+    let (sender, receiver) = mpsc::channel(1);
     tokio::spawn(async move {
         for event in events {
+            if sender.capacity() == 0 {
+                scripted_stream.blocked_sends.fetch_add(1, Ordering::SeqCst);
+                scripted_stream.blocked_send_notify.notify_one();
+            }
             tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => return,
@@ -310,4 +368,22 @@ where
         }
     });
     receiver
+}
+
+#[derive(Clone, Debug, Default)]
+struct ScriptedStream {
+    blocked_sends: Arc<AtomicUsize>,
+    blocked_send_notify: Arc<Notify>,
+}
+
+impl ScriptedStream {
+    async fn wait_for_blocked_send(&self) {
+        loop {
+            let notified = self.blocked_send_notify.notified();
+            if self.blocked_sends.load(Ordering::SeqCst) > 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
 }

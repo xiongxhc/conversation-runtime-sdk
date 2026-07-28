@@ -66,6 +66,10 @@ impl GenerationTextDelta {
     }
 }
 
+/// Streams identity-tagged text deltas for one generation request.
+///
+/// Implementations must observe `cancellation`, stop request-owned work, and
+/// close the returned receiver only after cleanup completes.
 pub trait GenerationLanguageModel: Send + Sync {
     fn stream(
         &self,

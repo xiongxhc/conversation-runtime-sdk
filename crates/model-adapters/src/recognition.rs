@@ -47,6 +47,10 @@ pub enum RecognitionEvent {
     Hypothesis(RecognitionHypothesis),
 }
 
+/// Streams recognition events for one voice session.
+///
+/// Implementations must observe `cancellation`, stop session-owned work, and
+/// close the returned receiver only after cleanup completes.
 pub trait SpeechRecognizer: Send + Sync {
     fn start<'a>(
         &'a self,

@@ -120,6 +120,20 @@ struct ControlledOutput {
     first: FirstOutputBehavior,
 }
 
+struct QueueCompletingSpeech {
+    controlled_turn: TurnId,
+    started: mpsc::UnboundedSender<usize>,
+    completed: mpsc::UnboundedSender<usize>,
+    attempts: AtomicUsize,
+}
+
+struct GatedFirstFailureOutput {
+    controlled_turn: TurnId,
+    started: mpsc::UnboundedSender<u64>,
+    fail_first: Mutex<Option<oneshot::Receiver<()>>>,
+    cleanup: Arc<AtomicBool>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReuseOutcome {
     Completion,
@@ -386,6 +400,28 @@ impl SpeechSynthesizer for TwoStageSpeech {
     }
 }
 
+impl SpeechSynthesizer for QueueCompletingSpeech {
+    fn synthesize<'a>(
+        &'a self,
+        request: SpeechRequest,
+        _cancellation: CancellationToken,
+    ) -> AdapterFuture<'a, SynthesizedAudio> {
+        let attempt = self.attempts.fetch_add(1, Ordering::AcqRel);
+        let controlled = request.turn_id() == self.controlled_turn;
+        if controlled {
+            let _ = self.started.send(attempt);
+        }
+        let completed = self.completed.clone();
+
+        Box::pin(async move {
+            if controlled {
+                let _ = completed.send(attempt);
+            }
+            Ok(SynthesizedAudio::new(minimal_aiff(), AudioFormat::Aiff))
+        })
+    }
+}
+
 impl AudioOutput for ControlledOutput {
     fn play<'a>(
         &'a self,
@@ -428,6 +464,41 @@ impl AudioOutput for ControlledOutput {
                 })
             }
         }
+    }
+}
+
+impl AudioOutput for GatedFirstFailureOutput {
+    fn play<'a>(
+        &'a self,
+        request: AudioOutputRequest,
+        cancellation: CancellationToken,
+    ) -> AdapterFuture<'a, ()> {
+        let turn_id = request.turn_id();
+        let segment_index = request.segment_index();
+        if turn_id == self.controlled_turn {
+            let _ = self.started.send(segment_index);
+        }
+        let fail_first = (turn_id == self.controlled_turn && segment_index == 0).then(|| {
+            self.fail_first
+                .lock()
+                .expect("queued output failure gate lock poisoned")
+                .take()
+                .expect("queued output failure gate used more than once")
+        });
+
+        Box::pin(async move {
+            let Some(fail_first) = fail_first else {
+                return Ok(());
+            };
+
+            let message = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => "audio output cancelled",
+                _ = fail_first => "audio output unavailable",
+            };
+            self.cleanup.store(true, Ordering::Release);
+            Err(AdapterError::new(message))
+        })
     }
 }
 
@@ -1050,6 +1121,122 @@ async fn first_output_failure_cancels_active_next_synthesis_before_turn_failed()
     assert!(
         output_started_receiver.try_recv().is_err(),
         "queued playback started after output failure"
+    );
+}
+
+#[tokio::test]
+async fn output_failure_discards_validated_audio_queued_behind_active_output() {
+    let controlled_turn = TurnId::new(36);
+    let reuse_turn = TurnId::new(37);
+    let (synthesis_started, mut synthesis_started_receiver) = mpsc::unbounded_channel();
+    let (synthesis_completed, mut synthesis_completed_receiver) = mpsc::unbounded_channel();
+    let (output_started, mut output_started_receiver) = mpsc::unbounded_channel();
+    let (fail_first, first_failure) = oneshot::channel();
+    let output_cleanup = Arc::new(AtomicBool::new(false));
+    let runtime = ConversationRuntime::new(
+        Arc::new(MockLanguageModel::new([
+            "First segment. Second segment. Third segment.",
+        ])),
+        Arc::new(QueueCompletingSpeech {
+            controlled_turn,
+            started: synthesis_started,
+            completed: synthesis_completed,
+            attempts: AtomicUsize::new(0),
+        }),
+        Arc::new(GatedFirstFailureOutput {
+            controlled_turn,
+            started: output_started,
+            fail_first: Mutex::new(Some(first_failure)),
+            cleanup: Arc::clone(&output_cleanup),
+        }),
+    )
+    .with_phrase_chunking(PhraseChunkingConfig::new(14, 20).unwrap());
+    let mut events = start_turn(&runtime, controlled_turn, "discard queued audio").await;
+
+    assert_eq!(
+        timeout(Duration::from_secs(1), synthesis_started_receiver.recv())
+            .await
+            .expect("first synthesis did not start")
+            .expect("synthesis start channel closed"),
+        0
+    );
+    assert_eq!(
+        timeout(Duration::from_secs(1), synthesis_completed_receiver.recv())
+            .await
+            .expect("first synthesis did not complete")
+            .expect("synthesis completion channel closed"),
+        0
+    );
+    assert_eq!(
+        timeout(Duration::from_secs(1), output_started_receiver.recv())
+            .await
+            .expect("first output did not start")
+            .expect("output start channel closed"),
+        0
+    );
+    assert_eq!(
+        timeout(Duration::from_secs(1), synthesis_started_receiver.recv())
+            .await
+            .expect("second synthesis did not start during active output")
+            .expect("synthesis start channel closed"),
+        1
+    );
+    assert_eq!(
+        timeout(Duration::from_secs(1), synthesis_completed_receiver.recv())
+            .await
+            .expect("second synthesis did not complete during active output")
+            .expect("synthesis completion channel closed"),
+        1
+    );
+    tokio::task::yield_now().await;
+    assert!(
+        synthesis_started_receiver.try_recv().is_err(),
+        "third synthesis started instead of blocking behind queued segment 1"
+    );
+
+    fail_first
+        .send(())
+        .expect("first output failure receiver dropped");
+
+    let terminal_events = drain_with_cleanup_before_terminal(
+        &mut events,
+        &[(
+            output_cleanup.as_ref(),
+            "turn failure arrived before active output cleanup",
+        )],
+    )
+    .await;
+
+    assert!(
+        output_started_receiver.try_recv().is_err(),
+        "queued segment 1 played after output failure"
+    );
+    assert!(
+        synthesis_started_receiver.try_recv().is_err(),
+        "segment 2 synthesis started after output failure"
+    );
+    assert_eq!(
+        terminal_events,
+        [RuntimeEvent::TurnFailed {
+            turn_id: controlled_turn,
+            error: RuntimeError::new(
+                RuntimeErrorKind::Adapter,
+                RuntimeStage::AudioOutput,
+                "audio output unavailable",
+            ),
+        }]
+    );
+
+    let mut reuse_events = start_turn(&runtime, reuse_turn, "reuse after queued failure").await;
+    assert_eq!(
+        drain_events(&mut reuse_events)
+            .await
+            .into_iter()
+            .filter(RuntimeEvent::is_terminal)
+            .collect::<Vec<_>>(),
+        [RuntimeEvent::TurnCompleted {
+            turn_id: reuse_turn
+        }]
     );
 }
 

@@ -3,9 +3,10 @@
 ## Scope
 
 - Added deterministic cancellation regressions for simultaneous active output segment `0` and active synthesis segment `1`.
-- Proved external interruption awaits both adapter cleanups before exactly one `TurnCancelled`, starts no queued playback, and permits a later turn to complete.
+- Proved external interruption awaits both active adapter cleanups before exactly one `TurnCancelled`, starts no later output invocation in that active-synthesis case, and permits a later turn to complete.
 - Proved second-synthesis failure awaits active output cleanup before `TurnFailed` at `RuntimeStage::SpeechSynthesizer`.
 - Proved first-output failure awaits active synthesis cleanup before `TurnFailed` at `RuntimeStage::AudioOutput`.
+- Proved output failure discards already validated segment `1` audio from the capacity-one prepared queue while output `0` is active.
 - Preserved the reviewed Task 3 worker implementation and priority contract without redundant production refactoring.
 
 ## TDD and Mutation Evidence
@@ -39,7 +40,7 @@ The reviewed worker was restored exactly after the mutation checks. `git diff --
 - requires `InterruptAccepted`;
 - checks both cleanup flags when, not after, accepting the terminal event;
 - accepts exactly one `TurnCancelled`;
-- proves output `1` never starts after cancellation;
+- proves output `1` never starts after cancellation while synthesis `1` is still active and has not produced audio;
 - completes a later turn on the same runtime.
 
 ### Synthesis Failure During Output
@@ -50,7 +51,7 @@ The reviewed worker was restored exactly after the mutation checks. `git diff --
 - checks output cleanup when accepting the terminal;
 - accepts exactly one `TurnFailed`;
 - requires `RuntimeStage::SpeechSynthesizer` and `second synthesis failed`;
-- proves no queued output starts.
+- proves no later output starts in this case, where synthesis `1` fails without producing audio.
 
 ### Output Failure During Synthesis
 
@@ -60,7 +61,20 @@ The reviewed worker was restored exactly after the mutation checks. `git diff --
 - checks synthesis cleanup when accepting the terminal;
 - accepts exactly one `TurnFailed`;
 - requires `RuntimeStage::AudioOutput` and `audio output unavailable`;
-- proves no queued output starts.
+- proves no later output starts in this case, where synthesis `1` is cancelled without producing audio.
+
+### Queued Validated Audio During Output Failure
+
+`output_failure_discards_validated_audio_queued_behind_active_output`:
+
+- uses three deterministic segments with the capacity-one prepared-audio boundary;
+- blocks output `0` on a controlled failure gate;
+- positively observes synthesis `1` complete with valid minimal AIFF;
+- proves synthesis `2` remains blocked because validated segment `1` occupies the only prepared slot;
+- releases output `0` with `audio output unavailable`;
+- checks output cleanup when accepting exactly one `TurnFailed` at `RuntimeStage::AudioOutput`;
+- proves output `1` is never invoked and synthesis `2` never starts after failure;
+- completes a later turn on the same runtime.
 
 ## Preserved Worker Contract
 
@@ -82,13 +96,13 @@ for iteration in 1 2 3 4 5; do
 done
 ```
 
-Result: all five repetitions passed, each with `23 passed; 0 failed`.
+Result before review fix: all five repetitions passed, each with `23 passed; 0 failed`.
 
 ```bash
 PATH="/opt/homebrew/opt/rustup/bin:$PATH" cargo test --locked -p conversation-runtime
 ```
 
-Result: passed — 80 runtime tests total (`34` unit, `23` cancellation, `1` commands, `22` turn-flow), with no failures.
+Result before review fix: passed — 80 runtime tests total (`34` unit, `23` cancellation, `1` commands, `22` turn-flow), with no failures.
 
 ```bash
 PATH="/opt/homebrew/opt/rustup/bin:$PATH" \
@@ -101,4 +115,53 @@ Result: strict runtime Clippy, formatting, and whitespace checks passed.
 
 ## Concern
 
-- None. Task 3 already contained the required cleanup implementation; Task 4 locks it with cross-stage terminal-ordering regressions rather than changing reviewed production behavior.
+- None. Task 3 already contained the required cleanup and queued-audio discard implementation; Task 4 locks it with cross-stage terminal-ordering and capacity-one queue regressions rather than changing reviewed production behavior.
+
+## Review Fix Round 1/5
+
+### Important Finding Addressed
+
+The original three Task 4 regressions held synthesis `1` active until cancellation or failure, so their output `1` assertions did not prove that an already validated `PreparedAudio` item was discarded. Their descriptions above now explicitly limit those assertions to active-synthesis coverage.
+
+Added `output_failure_discards_validated_audio_queued_behind_active_output`. Its controlled synthesizer returns valid minimal AIFF for segments `0` and `1` and positively reports both completions. With output `0` blocked, synthesis `2` remains unable to start, establishing that validated segment `1` occupies the sole prepared-audio slot. Releasing output `0` with a failure produces exactly one `AudioOutput` terminal only after output cleanup; output `1` is never invoked, synthesis `2` never starts, and the runtime completes a later turn.
+
+### Mutation Evidence
+
+Temporarily changed the active-output result arbitration to ignore `AudioOutput` failure and return `Ok(())`, allowing the output loop to continue receiving buffered prepared audio.
+
+```bash
+PATH="/opt/homebrew/opt/rustup/bin:$PATH" \
+  cargo test --locked -p conversation-runtime \
+  output_failure_discards_validated_audio_queued_behind_active_output -- --nocapture
+```
+
+Mutation result: failed with `queued segment 1 played after output failure`. The reviewed worker branch was restored exactly, and `git diff -- crates/runtime/src/speech_worker.rs` was empty before final validation.
+
+### Final Verification
+
+```bash
+PATH="/opt/homebrew/opt/rustup/bin:$PATH" \
+  cargo test --locked -p conversation-runtime \
+  output_failure_discards_validated_audio_queued_behind_active_output -- --nocapture
+```
+
+Result: focused regression passed.
+
+```bash
+for iteration in 1 2 3 4 5; do
+  PATH="/opt/homebrew/opt/rustup/bin:$PATH" \
+    cargo test --locked -p conversation-runtime --test cancellation --quiet
+done
+```
+
+Result: all five repetitions passed, each with `24 passed; 0 failed`.
+
+```bash
+PATH="/opt/homebrew/opt/rustup/bin:$PATH" cargo test --locked -p conversation-runtime
+PATH="/opt/homebrew/opt/rustup/bin:$PATH" \
+  cargo clippy --locked -p conversation-runtime --all-targets -- -D warnings
+PATH="/opt/homebrew/opt/rustup/bin:$PATH" cargo fmt --all -- --check
+git diff --check
+```
+
+Result: passed — 81 runtime tests total (`34` unit, `24` cancellation, `1` commands, `22` turn-flow), strict runtime Clippy, formatting, and whitespace checks.

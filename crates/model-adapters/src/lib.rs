@@ -1,5 +1,6 @@
 mod audio_frame;
 mod audio_output;
+mod buffered_streaming_speech;
 mod capture;
 mod continuous_audio_output;
 mod generation_language;
@@ -15,6 +16,7 @@ mod streaming_speech;
 mod voice_input;
 mod voice_io;
 mod voice_mock;
+mod wav_pcm;
 
 use std::error::Error;
 use std::fmt;
@@ -23,6 +25,7 @@ use std::pin::Pin;
 
 pub use audio_frame::{AudioFrame, PcmFormat, PcmSampleFormat, MAX_PCM_FRAME_BYTES};
 pub use audio_output::{AudioOutput, AudioOutputRequest, DiscardAudioOutput};
+pub use buffered_streaming_speech::BufferedStreamingSpeechSynthesizer;
 pub use capture::{AudioCapture, CaptureEvent};
 pub use continuous_audio_output::{ContinuousAudioOutput, PlaybackReceipt};
 pub use generation_language::{
@@ -47,6 +50,7 @@ pub use voice_mock::{
     MockAudioCapture, MockContinuousAudioOutput, MockGenerationLanguageModel, MockSpeechRecognizer,
     MockStreamingSpeechSynthesizer, MockVoiceInput, MockVoiceIoFactory,
 };
+pub use wav_pcm::WavPcmDecoder;
 
 pub type AdapterFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, AdapterError>> + Send + 'a>>;
 

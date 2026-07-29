@@ -5,7 +5,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use command_fds::{CommandFdExt, FdMapping};
-use conversation_protocol::{GenerationId, PlaybackState, RuntimeStage, SessionId};
+use conversation_protocol::{
+    GenerationId, PlaybackState, RuntimeStage, SessionId, TurnId, UtteranceId,
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
@@ -30,6 +32,8 @@ const TASK_CLEANUP_TIMEOUT: Duration = Duration::from_millis(100);
 const CONTROL_QUEUE_CAPACITY: usize = 16;
 const MEDIA_QUEUE_CAPACITY: usize = 100;
 const INPUT_QUEUE_CAPACITY: usize = 32;
+const RELIABLE_INPUT_QUEUE_CAPACITY: usize = 16;
+const NONTERMINAL_INPUT_QUEUE_CAPACITY: usize = 1;
 const DEFAULT_MAX_STDERR_BYTES: usize = 64 * 1024;
 const MAX_QUEUED_MEDIA_NANOS: u128 = 2_000_000_000;
 
@@ -195,9 +199,18 @@ async fn start_sidecar(
     let (control_sender, control_receiver) = mpsc::channel(CONTROL_QUEUE_CAPACITY);
     let (media_sender, media_receiver) = mpsc::channel(MEDIA_QUEUE_CAPACITY);
     let (input_sender, input_receiver) = mpsc::channel(INPUT_QUEUE_CAPACITY);
+    let (reliable_input_sender, reliable_input_receiver) =
+        mpsc::channel(RELIABLE_INPUT_QUEUE_CAPACITY);
+    let (nonterminal_input_sender, nonterminal_input_receiver) =
+        mpsc::channel(NONTERMINAL_INPUT_QUEUE_CAPACITY);
     let (supervisor_sender, mut supervisor_receiver) = mpsc::unbounded_channel();
     let io_cancellation = CancellationToken::new();
     let media_cancellation = CancellationToken::new();
+    let input_publisher = InputPublisher {
+        reliable: reliable_input_sender,
+        nonterminal: nonterminal_input_sender,
+        supervisor: supervisor_sender.clone(),
+    };
 
     let tasks = ProcessTasks {
         control: tokio::spawn(run_control_writer(
@@ -206,20 +219,27 @@ async fn start_sidecar(
             io_cancellation.clone(),
             supervisor_sender.clone(),
         )),
-        media: tokio::spawn(run_media_writer(
+        media: Some(tokio::spawn(run_media_writer(
             media,
             media_receiver,
             Arc::clone(&shared),
             media_cancellation.clone(),
             io_cancellation.clone(),
             supervisor_sender.clone(),
-        )),
+        ))),
         stdout: tokio::spawn(run_stdout_reader(
             stdout,
             config.max_payload_bytes(),
             session_id,
             Arc::clone(&shared),
-            input_sender.clone(),
+            input_publisher.clone(),
+            io_cancellation.clone(),
+            supervisor_sender.clone(),
+        )),
+        input: tokio::spawn(run_input_dispatcher(
+            reliable_input_receiver,
+            nonterminal_input_receiver,
+            input_sender,
             io_cancellation.clone(),
             supervisor_sender.clone(),
         )),
@@ -287,7 +307,7 @@ async fn start_sidecar(
                     tasks,
                     events: supervisor_receiver,
                     control_sender,
-                    input_sender,
+                    input_publisher,
                     shared: Arc::clone(&shared),
                     session_cancellation: cancellation,
                     media_cancellation,
@@ -473,6 +493,7 @@ impl ContinuousAudioOutput for MacOsContinuousAudioOutput {
                 return Err(AdapterError::new("voice sidecar media enqueue cancelled"));
             }
             self.shared.validate_enqueue(frame.generation_id())?;
+            let identity = MediaIdentity::from(&frame);
             let encoded = encode_frame(&SidecarFrame::audio(self.session_id, frame.clone()))
                 .map_err(|_| AdapterError::new("failed to encode voice sidecar media frame"))?;
             let duration_nanos = frame_duration_nanos(&frame)?;
@@ -498,14 +519,12 @@ impl ContinuousAudioOutput for MacOsContinuousAudioOutput {
                 )
                 .await?;
             let (completion_sender, completion_receiver) = oneshot::channel();
-            let request_id = self.shared.register_media(
-                frame.generation_id(),
-                completion_sender,
-                reservation,
-            )?;
+            let operation_id =
+                self.shared
+                    .register_media(identity, completion_sender, reservation)?;
+            let mut operation = MediaOperationGuard::new(Arc::clone(&self.shared), operation_id);
             let write = MediaWrite {
-                request_id,
-                generation_id: frame.generation_id(),
+                operation_id,
                 bytes: encoded,
             };
 
@@ -516,7 +535,6 @@ impl ContinuousAudioOutput for MacOsContinuousAudioOutput {
                 result = self.media_sender.send(write) => result.is_ok(),
             };
             if !sent {
-                self.shared.remove_media(request_id);
                 return if cancellation.is_cancelled() {
                     Err(AdapterError::new("voice sidecar media enqueue cancelled"))
                 } else if self.session_cancellation.is_cancelled() {
@@ -526,7 +544,7 @@ impl ContinuousAudioOutput for MacOsContinuousAudioOutput {
                 };
             }
 
-            tokio::select! {
+            let result = tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => {
                     Err(AdapterError::new("voice sidecar media enqueue cancelled"))
@@ -539,7 +557,11 @@ impl ContinuousAudioOutput for MacOsContinuousAudioOutput {
                         Err(AdapterError::new("voice sidecar media acknowledgement closed"))
                     })
                 }
+            };
+            if result.is_ok() {
+                operation.disarm();
             }
+            result
         })
     }
 
@@ -555,16 +577,17 @@ impl ContinuousAudioOutput for MacOsContinuousAudioOutput {
             if self.session_cancellation.is_cancelled() {
                 return Err(AdapterError::new("voice sidecar session cancelled"));
             }
-            let completion_receiver = self.shared.register_flush(generation_id)?;
+            let (operation_id, completion_receiver) = self.shared.register_flush(generation_id)?;
+            let mut operation = FlushOperationGuard::new(Arc::clone(&self.shared), operation_id);
             let frame = SidecarFrame::control(SidecarControl::FlushGeneration {
                 session_id,
                 generation_id,
+                operation_id,
             });
             if self.control_sender.send(frame).await.is_err() {
-                self.shared.remove_flush(generation_id);
                 return Err(AdapterError::new("voice sidecar control queue closed"));
             }
-            tokio::select! {
+            let result = tokio::select! {
                 biased;
                 _ = self.session_cancellation.cancelled() => {
                     Err(AdapterError::new("voice sidecar session cancelled"))
@@ -574,16 +597,29 @@ impl ContinuousAudioOutput for MacOsContinuousAudioOutput {
                         Err(AdapterError::new("voice sidecar flush acknowledgement closed"))
                     })
                 }
+            };
+            if result.is_ok() {
+                operation.disarm();
             }
+            result
         })
     }
 }
 
 struct ProcessTasks {
     control: JoinHandle<()>,
-    media: JoinHandle<()>,
+    media: Option<JoinHandle<()>>,
     stdout: JoinHandle<()>,
+    input: JoinHandle<()>,
     stderr: JoinHandle<std::io::Result<Vec<u8>>>,
+}
+
+impl ProcessTasks {
+    async fn close_media(&mut self) {
+        if let Some(task) = self.media.take() {
+            finish_task(task).await;
+        }
+    }
 }
 
 enum StartupOutcome {
@@ -623,7 +659,7 @@ struct ProcessSupervisor {
     tasks: ProcessTasks,
     events: mpsc::UnboundedReceiver<SupervisorEvent>,
     control_sender: mpsc::Sender<SidecarFrame>,
-    input_sender: mpsc::Sender<Result<VoiceInputEvent, AdapterError>>,
+    input_publisher: InputPublisher,
     shared: Arc<SessionShared>,
     session_cancellation: CancellationToken,
     media_cancellation: CancellationToken,
@@ -665,6 +701,7 @@ impl ProcessSupervisor {
 
         if self.session_cancellation.is_cancelled() && !child_reaped {
             self.media_cancellation.cancel();
+            self.tasks.close_media().await;
             child_reaped = graceful_shutdown(
                 &mut self.child,
                 &mut self.events,
@@ -673,7 +710,7 @@ impl ProcessSupervisor {
             )
             .await;
         } else {
-            let _ = self.input_sender.try_send(Err(outcome.clone()));
+            self.input_publisher.publish_reliable(Err(outcome.clone()));
         }
 
         let cleanup = cleanup_process(
@@ -697,13 +734,17 @@ async fn graceful_shutdown(
     shared: &Arc<SessionShared>,
 ) -> bool {
     let graceful = tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, async {
+        let mut _flush_operation = None;
+        let mut _flush_completion = None;
         if let Some(generation_id) = shared.active_generation() {
-            if let Ok(completion) = shared.register_flush(generation_id) {
-                drop(completion);
+            if let Ok((operation_id, completion)) = shared.register_flush(generation_id) {
+                _flush_operation = Some(FlushOperationGuard::new(Arc::clone(shared), operation_id));
+                _flush_completion = Some(completion);
                 control_sender
                     .send(SidecarFrame::control(SidecarControl::FlushGeneration {
                         session_id: shared.session_id,
                         generation_id,
+                        operation_id,
                     }))
                     .await
                     .map_err(|_| ())?;
@@ -741,7 +782,7 @@ async fn graceful_shutdown(
 async fn cleanup_process(
     child: &mut Child,
     child_reaped: bool,
-    tasks: ProcessTasks,
+    mut tasks: ProcessTasks,
     shared: &Arc<SessionShared>,
     media_cancellation: &CancellationToken,
     io_cancellation: &CancellationToken,
@@ -750,6 +791,7 @@ async fn cleanup_process(
     shared.fail(failure);
     media_cancellation.cancel();
     io_cancellation.cancel();
+    tasks.close_media().await;
 
     let child_cleanup = if child_reaped {
         Ok(())
@@ -763,8 +805,8 @@ async fn cleanup_process(
     };
 
     finish_task(tasks.control).await;
-    finish_task(tasks.media).await;
     finish_task(tasks.stdout).await;
+    finish_task(tasks.input).await;
     let stderr_cleanup = finish_stderr_task(tasks.stderr).await;
     child_cleanup.and(stderr_cleanup)
 }
@@ -809,6 +851,74 @@ async fn send_control(
         _ = cancellation.cancelled() => Err(()),
         _ = io_cancellation.cancelled() => Err(()),
         result = sender.send(frame) => result.map_err(|_| ()),
+    }
+}
+
+type InputDelivery = Result<VoiceInputEvent, AdapterError>;
+
+#[derive(Clone)]
+struct InputPublisher {
+    reliable: mpsc::Sender<InputDelivery>,
+    nonterminal: mpsc::Sender<InputDelivery>,
+    supervisor: mpsc::UnboundedSender<SupervisorEvent>,
+}
+
+impl InputPublisher {
+    fn publish_reliable(&self, event: InputDelivery) -> bool {
+        match self.reliable.try_send(event) {
+            Ok(()) => true,
+            Err(_) => {
+                send_fatal(
+                    &self.supervisor,
+                    "voice sidecar reliable input delivery overflowed",
+                );
+                false
+            }
+        }
+    }
+
+    fn publish_nonterminal(&self, event: InputDelivery) {
+        let _ = self.nonterminal.try_send(event);
+    }
+}
+
+async fn run_input_dispatcher(
+    mut reliable: mpsc::Receiver<InputDelivery>,
+    mut nonterminal: mpsc::Receiver<InputDelivery>,
+    output: mpsc::Sender<InputDelivery>,
+    cancellation: CancellationToken,
+    supervisor_sender: mpsc::UnboundedSender<SupervisorEvent>,
+) {
+    let mut reliable_open = true;
+    let mut nonterminal_open = true;
+    while reliable_open || nonterminal_open {
+        let event = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return,
+            event = reliable.recv(), if reliable_open => match event {
+                Some(event) => event,
+                None => {
+                    reliable_open = false;
+                    continue;
+                }
+            },
+            event = nonterminal.recv(), if nonterminal_open => match event {
+                Some(event) => event,
+                None => {
+                    nonterminal_open = false;
+                    continue;
+                }
+            },
+        };
+        let sent = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return,
+            result = output.send(event) => result,
+        };
+        if sent.is_err() {
+            send_fatal(&supervisor_sender, "voice sidecar input consumer closed");
+            return;
+        }
     }
 }
 
@@ -867,8 +977,7 @@ async fn run_media_writer(
                 None => return,
             }
         };
-        if !shared.should_write_media(write.generation_id) {
-            shared.remove_media(write.request_id);
+        if !shared.begin_media_write(write.operation_id) {
             continue;
         }
         let result = tokio::select! {
@@ -881,6 +990,10 @@ async fn run_media_writer(
             send_fatal(&supervisor_sender, "failed to write voice sidecar media");
             return;
         }
+        if let Err(error) = shared.finish_media_write(write.operation_id) {
+            let _ = supervisor_sender.send(SupervisorEvent::Fatal(error));
+            return;
+        }
     }
 }
 
@@ -889,7 +1002,7 @@ async fn run_stdout_reader(
     max_payload_bytes: usize,
     session_id: SessionId,
     shared: Arc<SessionShared>,
-    input_sender: mpsc::Sender<Result<VoiceInputEvent, AdapterError>>,
+    input_publisher: InputPublisher,
     cancellation: CancellationToken,
     supervisor_sender: mpsc::UnboundedSender<SupervisorEvent>,
 ) {
@@ -920,7 +1033,7 @@ async fn run_stdout_reader(
         }
         if let SidecarControl::Failure { stage, code, .. } = control {
             let error = sidecar_failure(stage, code);
-            let _ = input_sender.try_send(Err(error.clone()));
+            input_publisher.publish_reliable(Err(error.clone()));
             let _ = supervisor_sender.send(SupervisorEvent::Fatal(error));
             return;
         }
@@ -939,30 +1052,65 @@ async fn run_stdout_reader(
 
         let input_event = match control {
             SidecarControl::VoiceActivity { activity, .. } => {
-                Some(VoiceInputEvent::Activity(activity))
+                Some((VoiceInputEvent::Activity(activity), true))
             }
-            SidecarControl::TranscriptHypothesis { hypothesis, .. } => Some(
-                VoiceInputEvent::Recognition(RecognitionEvent::Hypothesis(hypothesis)),
-            ),
-            SidecarControl::PlaybackAccepted { generation_id, .. } => {
-                if let Err(error) = shared.resolve_media(generation_id) {
+            SidecarControl::TranscriptHypothesis { hypothesis, .. } => Some((
+                VoiceInputEvent::Recognition(RecognitionEvent::Hypothesis(hypothesis.clone())),
+                hypothesis.is_engine_final(),
+            )),
+            SidecarControl::PlaybackAccepted {
+                turn_id,
+                generation_id,
+                utterance_id,
+                sequence,
+                ..
+            } => {
+                let identity = MediaIdentity {
+                    turn_id,
+                    generation_id,
+                    utterance_id,
+                    sequence,
+                };
+                if let Err(error) = resolve_media_ack(&shared, identity, &cancellation).await {
                     let _ = supervisor_sender.send(SupervisorEvent::Fatal(error));
                     return;
                 }
                 None
             }
-            SidecarControl::PlaybackRendered { generation_id, .. } => {
-                if let Err(error) = shared.validate_render(generation_id) {
-                    let _ = supervisor_sender.send(SupervisorEvent::Fatal(error));
-                    return;
-                }
-                Some(VoiceInputEvent::Playback(PlaybackReceipt::new(
+            SidecarControl::PlaybackRendered {
+                turn_id,
+                generation_id,
+                utterance_id,
+                sequence,
+                ..
+            } => {
+                let identity = MediaIdentity {
+                    turn_id,
                     generation_id,
-                    PlaybackState::Rendered,
-                )))
+                    utterance_id,
+                    sequence,
+                };
+                match shared.resolve_render(identity) {
+                    Ok(true) => Some((
+                        VoiceInputEvent::Playback(PlaybackReceipt::new(
+                            generation_id,
+                            PlaybackState::Rendered,
+                        )),
+                        false,
+                    )),
+                    Ok(false) => None,
+                    Err(error) => {
+                        let _ = supervisor_sender.send(SupervisorEvent::Fatal(error));
+                        return;
+                    }
+                }
             }
-            SidecarControl::PlaybackFlushed { generation_id, .. } => {
-                if let Err(error) = shared.resolve_flush(generation_id) {
+            SidecarControl::PlaybackFlushed {
+                generation_id,
+                operation_id,
+                ..
+            } => {
+                if let Err(error) = shared.resolve_flush(generation_id, operation_id) {
                     let _ = supervisor_sender.send(SupervisorEvent::Fatal(error));
                     return;
                 }
@@ -986,15 +1134,34 @@ async fn run_stdout_reader(
             SidecarControl::Failure { .. } => unreachable!("failure handled before readiness"),
         };
 
-        if let Some(event) = input_event {
-            let sent = tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => return,
-                result = input_sender.send(Ok(event)) => result,
+        if let Some((event, reliable)) = input_event {
+            let published = if reliable {
+                input_publisher.publish_reliable(Ok(event))
+            } else {
+                input_publisher.publish_nonterminal(Ok(event));
+                true
             };
-            if sent.is_err() {
-                send_fatal(&supervisor_sender, "voice sidecar input consumer closed");
+            if !published {
                 return;
+            }
+        }
+    }
+}
+
+async fn resolve_media_ack(
+    shared: &SessionShared,
+    identity: MediaIdentity,
+    cancellation: &CancellationToken,
+) -> Result<(), AdapterError> {
+    loop {
+        match shared.resolve_media(identity)? {
+            ResolveMedia::Complete => return Ok(()),
+            ResolveMedia::WaitForWrite(written) => {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => return Ok(()),
+                    () = written.notified() => {}
+                }
             }
         }
     }
@@ -1163,9 +1330,27 @@ fn sidecar_failure(stage: RuntimeStage, code: SidecarFailureCode) -> AdapterErro
 }
 
 struct MediaWrite {
-    request_id: u64,
-    generation_id: GenerationId,
+    operation_id: u64,
     bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MediaIdentity {
+    turn_id: TurnId,
+    generation_id: GenerationId,
+    utterance_id: UtteranceId,
+    sequence: u64,
+}
+
+impl From<&AudioFrame> for MediaIdentity {
+    fn from(frame: &AudioFrame) -> Self {
+        Self {
+            turn_id: frame.turn_id(),
+            generation_id: frame.generation_id(),
+            utterance_id: frame.utterance_id(),
+            sequence: frame.sequence(),
+        }
+    }
 }
 
 struct SessionShared {
@@ -1174,24 +1359,108 @@ struct SessionShared {
 }
 
 struct SessionState {
-    next_request_id: u64,
+    next_operation_id: u64,
     latest_generation: Option<GenerationId>,
     flushed_through: Option<GenerationId>,
-    pending_media: VecDeque<PendingMedia>,
-    pending_flushes: VecDeque<PendingFlush>,
+    media_operations: VecDeque<MediaOperation>,
+    cancelled_media: VecDeque<CancelledMedia>,
+    flush_operations: VecDeque<FlushOperation>,
+    cancelled_flushes: VecDeque<CancelledFlush>,
     failure: Option<AdapterError>,
 }
 
-struct PendingMedia {
-    request_id: u64,
-    generation_id: GenerationId,
-    completion: oneshot::Sender<Result<PlaybackReceipt, AdapterError>>,
-    _reservation: MediaReservation,
+struct MediaOperation {
+    operation_id: u64,
+    identity: MediaIdentity,
+    write_state: MediaWriteState,
+    write_finished: Arc<Notify>,
+    accepted: bool,
+    completion: Option<oneshot::Sender<Result<PlaybackReceipt, AdapterError>>>,
+    reservation: Option<MediaReservation>,
 }
 
-struct PendingFlush {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MediaWriteState {
+    Queued,
+    Writing,
+    Written,
+}
+
+struct CancelledMedia {
+    identity: MediaIdentity,
+    accepted: bool,
+}
+
+struct FlushOperation {
+    operation_id: u64,
     generation_id: GenerationId,
     completion: oneshot::Sender<Result<PlaybackReceipt, AdapterError>>,
+}
+
+struct CancelledFlush {
+    operation_id: u64,
+    generation_id: GenerationId,
+}
+
+enum ResolveMedia {
+    Complete,
+    WaitForWrite(Arc<Notify>),
+}
+
+struct MediaOperationGuard {
+    shared: Arc<SessionShared>,
+    operation_id: u64,
+    armed: bool,
+}
+
+impl MediaOperationGuard {
+    fn new(shared: Arc<SessionShared>, operation_id: u64) -> Self {
+        Self {
+            shared,
+            operation_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for MediaOperationGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.shared.cancel_media(self.operation_id);
+        }
+    }
+}
+
+struct FlushOperationGuard {
+    shared: Arc<SessionShared>,
+    operation_id: u64,
+    armed: bool,
+}
+
+impl FlushOperationGuard {
+    fn new(shared: Arc<SessionShared>, operation_id: u64) -> Self {
+        Self {
+            shared,
+            operation_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for FlushOperationGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.shared.cancel_flush(self.operation_id);
+        }
+    }
 }
 
 impl SessionShared {
@@ -1199,11 +1468,13 @@ impl SessionShared {
         Self {
             session_id,
             state: Mutex::new(SessionState {
-                next_request_id: 1,
+                next_operation_id: 1,
                 latest_generation: None,
                 flushed_through: None,
-                pending_media: VecDeque::new(),
-                pending_flushes: VecDeque::new(),
+                media_operations: VecDeque::new(),
+                cancelled_media: VecDeque::new(),
+                flush_operations: VecDeque::new(),
+                cancelled_flushes: VecDeque::new(),
                 failure: None,
             }),
         }
@@ -1216,175 +1487,332 @@ impl SessionShared {
 
     fn register_media(
         &self,
-        generation_id: GenerationId,
+        identity: MediaIdentity,
         completion: oneshot::Sender<Result<PlaybackReceipt, AdapterError>>,
         reservation: MediaReservation,
     ) -> Result<u64, AdapterError> {
         let mut state = self.state.lock().expect("sidecar state lock poisoned");
-        validate_generation(&state, generation_id, false)?;
+        validate_generation(&state, identity.generation_id, false)?;
+        if state
+            .media_operations
+            .iter()
+            .any(|operation| operation.identity == identity)
+        {
+            return Err(AdapterError::new(
+                "voice sidecar media frame identity duplicated",
+            ));
+        }
+        if state
+            .latest_generation
+            .is_none_or(|latest| identity.generation_id > latest)
+        {
+            state.latest_generation = Some(identity.generation_id);
+        }
+        let operation_id = state.next_operation_id;
+        state.next_operation_id = state
+            .next_operation_id
+            .checked_add(1)
+            .ok_or_else(|| AdapterError::new("voice sidecar request identity overflowed"))?;
+        state.media_operations.push_back(MediaOperation {
+            operation_id,
+            identity,
+            write_state: MediaWriteState::Queued,
+            write_finished: Arc::new(Notify::new()),
+            accepted: false,
+            completion: Some(completion),
+            reservation: Some(reservation),
+        });
+        Ok(operation_id)
+    }
+
+    fn cancel_media(&self, operation_id: u64) {
+        let mut state = self.state.lock().expect("sidecar state lock poisoned");
+        if let Some(index) = state
+            .media_operations
+            .iter()
+            .position(|operation| operation.operation_id == operation_id)
+        {
+            let operation = state
+                .media_operations
+                .remove(index)
+                .expect("media operation index");
+            if operation.write_state != MediaWriteState::Queued {
+                state.cancelled_media.push_back(CancelledMedia {
+                    identity: operation.identity,
+                    accepted: operation.accepted,
+                });
+            }
+            if let Some(completion) = operation.completion {
+                let _ = completion.send(Err(AdapterError::new("voice sidecar media discarded")));
+            }
+        }
+    }
+
+    fn begin_media_write(&self, operation_id: u64) -> bool {
+        let mut state = self.state.lock().expect("sidecar state lock poisoned");
+        if state.failure.is_some() {
+            return false;
+        }
+        let Some(operation) = state
+            .media_operations
+            .iter_mut()
+            .find(|operation| operation.operation_id == operation_id)
+        else {
+            return false;
+        };
+        if operation.write_state != MediaWriteState::Queued {
+            return false;
+        }
+        operation.write_state = MediaWriteState::Writing;
+        true
+    }
+
+    fn finish_media_write(&self, operation_id: u64) -> Result<(), AdapterError> {
+        let mut state = self.state.lock().expect("sidecar state lock poisoned");
+        let Some(operation) = state
+            .media_operations
+            .iter_mut()
+            .find(|operation| operation.operation_id == operation_id)
+        else {
+            return Ok(());
+        };
+        if operation.write_state != MediaWriteState::Writing {
+            return Err(AdapterError::new(
+                "voice sidecar media write state mismatch",
+            ));
+        }
+        operation.write_state = MediaWriteState::Written;
+        operation.write_finished.notify_one();
+        Ok(())
+    }
+
+    fn resolve_media(&self, identity: MediaIdentity) -> Result<ResolveMedia, AdapterError> {
+        let mut state = self.state.lock().expect("sidecar state lock poisoned");
+        if state
+            .flushed_through
+            .is_some_and(|flushed| identity.generation_id <= flushed)
+        {
+            return Err(AdapterError::new("voice sidecar generation is stale"));
+        }
+        validate_generation(&state, identity.generation_id, true)?;
+        if let Some(operation) = state
+            .media_operations
+            .iter_mut()
+            .find(|operation| operation.identity == identity)
+        {
+            return match operation.write_state {
+                MediaWriteState::Queued => Err(AdapterError::new(
+                    "voice sidecar media acknowledgement preceded its write",
+                )),
+                MediaWriteState::Writing => Ok(ResolveMedia::WaitForWrite(Arc::clone(
+                    &operation.write_finished,
+                ))),
+                MediaWriteState::Written if operation.accepted => Err(AdapterError::new(
+                    "voice sidecar media acknowledgement duplicated",
+                )),
+                MediaWriteState::Written => {
+                    operation.accepted = true;
+                    let generation_id = operation.identity.generation_id;
+                    if let Some(completion) = operation.completion.take() {
+                        let _ = completion.send(Ok(PlaybackReceipt::new(
+                            generation_id,
+                            PlaybackState::Accepted,
+                        )));
+                    }
+                    operation.reservation.take();
+                    Ok(ResolveMedia::Complete)
+                }
+            };
+        }
+        if let Some(cancelled) = state
+            .cancelled_media
+            .iter_mut()
+            .find(|cancelled| cancelled.identity == identity)
+        {
+            if cancelled.accepted {
+                return Err(AdapterError::new(
+                    "voice sidecar media acknowledgement duplicated",
+                ));
+            }
+            cancelled.accepted = true;
+            return Ok(ResolveMedia::Complete);
+        }
+        Err(AdapterError::new(
+            "voice sidecar media acknowledgement mismatch",
+        ))
+    }
+
+    fn resolve_render(&self, identity: MediaIdentity) -> Result<bool, AdapterError> {
+        let mut state = self.state.lock().expect("sidecar state lock poisoned");
+        if state
+            .flushed_through
+            .is_some_and(|flushed| identity.generation_id <= flushed)
+        {
+            return Err(AdapterError::new("voice sidecar generation is stale"));
+        }
+        validate_generation(&state, identity.generation_id, true)?;
+        if let Some(index) = state
+            .media_operations
+            .iter()
+            .position(|operation| operation.identity == identity)
+        {
+            if !state.media_operations[index].accepted {
+                return Err(AdapterError::new(
+                    "voice sidecar rendered media before acceptance",
+                ));
+            }
+            state
+                .media_operations
+                .remove(index)
+                .expect("media operation index");
+            return Ok(true);
+        }
+        if let Some(index) = state
+            .cancelled_media
+            .iter()
+            .position(|cancelled| cancelled.identity == identity)
+        {
+            if !state.cancelled_media[index].accepted {
+                return Err(AdapterError::new(
+                    "voice sidecar rendered media before acceptance",
+                ));
+            }
+            state
+                .cancelled_media
+                .remove(index)
+                .expect("cancelled media index");
+            return Ok(false);
+        }
+        Err(AdapterError::new(
+            "voice sidecar rendered media identity mismatch",
+        ))
+    }
+
+    fn register_flush(
+        &self,
+        generation_id: GenerationId,
+    ) -> Result<
+        (
+            u64,
+            oneshot::Receiver<Result<PlaybackReceipt, AdapterError>>,
+        ),
+        AdapterError,
+    > {
+        let (completion, receiver) = oneshot::channel();
+        let mut state = self.state.lock().expect("sidecar state lock poisoned");
+        validate_flush_request(&state, generation_id)?;
         if state
             .latest_generation
             .is_none_or(|latest| generation_id > latest)
         {
             state.latest_generation = Some(generation_id);
         }
-        let request_id = state.next_request_id;
-        state.next_request_id = state
-            .next_request_id
-            .checked_add(1)
-            .ok_or_else(|| AdapterError::new("voice sidecar request identity overflowed"))?;
-        state.pending_media.push_back(PendingMedia {
-            request_id,
-            generation_id,
-            completion,
-            _reservation: reservation,
-        });
-        Ok(request_id)
-    }
-
-    fn remove_media(&self, request_id: u64) {
-        let mut state = self.state.lock().expect("sidecar state lock poisoned");
-        if let Some(index) = state
-            .pending_media
-            .iter()
-            .position(|pending| pending.request_id == request_id)
-        {
-            let pending = state
-                .pending_media
-                .remove(index)
-                .expect("pending media index");
-            let _ = pending
-                .completion
-                .send(Err(AdapterError::new("voice sidecar media discarded")));
-        }
-    }
-
-    fn should_write_media(&self, generation_id: GenerationId) -> bool {
-        let state = self.state.lock().expect("sidecar state lock poisoned");
-        state.failure.is_none()
-            && state
-                .flushed_through
-                .is_none_or(|flushed| generation_id > flushed)
-    }
-
-    fn resolve_media(&self, generation_id: GenerationId) -> Result<(), AdapterError> {
-        let pending = {
-            let mut state = self.state.lock().expect("sidecar state lock poisoned");
-            if state
-                .flushed_through
-                .is_some_and(|flushed| generation_id <= flushed)
-            {
-                return Ok(());
-            }
-            validate_generation(&state, generation_id, true)?;
-            let index = state
-                .pending_media
-                .iter()
-                .position(|pending| pending.generation_id == generation_id)
-                .ok_or_else(|| AdapterError::new("voice sidecar media acknowledgement mismatch"))?;
-            state
-                .pending_media
-                .remove(index)
-                .expect("pending media index")
-        };
-        let _ = pending.completion.send(Ok(PlaybackReceipt::new(
-            generation_id,
-            PlaybackState::Accepted,
-        )));
-        Ok(())
-    }
-
-    fn validate_render(&self, generation_id: GenerationId) -> Result<(), AdapterError> {
-        let state = self.state.lock().expect("sidecar state lock poisoned");
         if state
             .flushed_through
-            .is_some_and(|flushed| generation_id <= flushed)
+            .is_none_or(|flushed| generation_id > flushed)
         {
-            return Ok(());
+            state.flushed_through = Some(generation_id);
         }
-        validate_generation(&state, generation_id, true)
-    }
-
-    fn register_flush(
-        &self,
-        generation_id: GenerationId,
-    ) -> Result<oneshot::Receiver<Result<PlaybackReceipt, AdapterError>>, AdapterError> {
-        let (completion, receiver) = oneshot::channel();
-        let discarded = {
-            let mut state = self.state.lock().expect("sidecar state lock poisoned");
-            validate_flush_request(&state, generation_id)?;
-            if state
-                .latest_generation
-                .is_none_or(|latest| generation_id > latest)
-            {
-                state.latest_generation = Some(generation_id);
-            }
-            if state
-                .flushed_through
-                .is_none_or(|flushed| generation_id > flushed)
-            {
-                state.flushed_through = Some(generation_id);
-            }
-            let mut discarded = Vec::new();
-            let mut retained = VecDeque::new();
-            while let Some(pending) = state.pending_media.pop_front() {
-                if pending.generation_id <= generation_id {
-                    discarded.push(pending);
-                } else {
-                    retained.push_back(pending);
+        let operation_id = state.next_operation_id;
+        state.next_operation_id = state
+            .next_operation_id
+            .checked_add(1)
+            .ok_or_else(|| AdapterError::new("voice sidecar request identity overflowed"))?;
+        let mut retained = VecDeque::new();
+        while let Some(operation) = state.media_operations.pop_front() {
+            if operation.identity.generation_id <= generation_id {
+                if let Some(completion) = operation.completion {
+                    let _ =
+                        completion.send(Err(AdapterError::new("voice sidecar generation flushed")));
                 }
+            } else {
+                retained.push_back(operation);
             }
-            state.pending_media = retained;
-            state.pending_flushes.push_back(PendingFlush {
-                generation_id,
-                completion,
-            });
-            discarded
-        };
-        for pending in discarded {
-            let _ = pending
-                .completion
-                .send(Err(AdapterError::new("voice sidecar generation flushed")));
         }
-        Ok(receiver)
+        state.media_operations = retained;
+        state
+            .cancelled_media
+            .retain(|cancelled| cancelled.identity.generation_id > generation_id);
+        state.flush_operations.push_back(FlushOperation {
+            operation_id,
+            generation_id,
+            completion,
+        });
+        Ok((operation_id, receiver))
     }
 
-    fn remove_flush(&self, generation_id: GenerationId) {
+    fn cancel_flush(&self, operation_id: u64) {
         let mut state = self.state.lock().expect("sidecar state lock poisoned");
         if let Some(index) = state
-            .pending_flushes
+            .flush_operations
             .iter()
-            .position(|pending| pending.generation_id == generation_id)
+            .position(|operation| operation.operation_id == operation_id)
         {
-            let pending = state
-                .pending_flushes
+            let operation = state
+                .flush_operations
                 .remove(index)
-                .expect("pending flush index");
-            let _ = pending
+                .expect("flush operation index");
+            state.cancelled_flushes.push_back(CancelledFlush {
+                operation_id,
+                generation_id: operation.generation_id,
+            });
+            let _ = operation
                 .completion
                 .send(Err(AdapterError::new("voice sidecar flush discarded")));
         }
     }
 
-    fn resolve_flush(&self, generation_id: GenerationId) -> Result<(), AdapterError> {
-        let pending = {
-            let mut state = self.state.lock().expect("sidecar state lock poisoned");
-            validate_generation(&state, generation_id, true)?;
-            let index = state
-                .pending_flushes
-                .iter()
-                .position(|pending| pending.generation_id == generation_id)
-                .ok_or_else(|| AdapterError::new("voice sidecar flush acknowledgement mismatch"))?;
-            state
-                .pending_flushes
+    fn resolve_flush(
+        &self,
+        generation_id: GenerationId,
+        operation_id: u64,
+    ) -> Result<(), AdapterError> {
+        let mut state = self.state.lock().expect("sidecar state lock poisoned");
+        if let Some(index) = state
+            .flush_operations
+            .iter()
+            .position(|operation| operation.operation_id == operation_id)
+        {
+            if state.flush_operations[index].generation_id != generation_id {
+                return Err(AdapterError::new(
+                    "voice sidecar flush acknowledgement identity mismatch",
+                ));
+            }
+            let operation = state
+                .flush_operations
                 .remove(index)
-                .expect("pending flush index")
-        };
-        let _ = pending.completion.send(Ok(PlaybackReceipt::new(
-            generation_id,
-            PlaybackState::Flushed,
-        )));
-        Ok(())
+                .expect("flush operation index");
+            let _ = operation.completion.send(Ok(PlaybackReceipt::new(
+                generation_id,
+                PlaybackState::Flushed,
+            )));
+            return Ok(());
+        }
+        if let Some(index) = state
+            .cancelled_flushes
+            .iter()
+            .position(|operation| operation.operation_id == operation_id)
+        {
+            if state.cancelled_flushes[index].generation_id != generation_id {
+                return Err(AdapterError::new(
+                    "voice sidecar flush acknowledgement identity mismatch",
+                ));
+            }
+            state
+                .cancelled_flushes
+                .remove(index)
+                .expect("cancelled flush index");
+            return Ok(());
+        }
+        if state
+            .flushed_through
+            .is_some_and(|flushed| generation_id <= flushed)
+        {
+            return Err(AdapterError::new("voice sidecar generation is stale"));
+        }
+        Err(AdapterError::new(
+            "voice sidecar flush acknowledgement mismatch",
+        ))
     }
 
     fn active_generation(&self) -> Option<GenerationId> {
@@ -1400,16 +1828,23 @@ impl SessionShared {
             if state.failure.is_none() {
                 state.failure = Some(error.clone());
             }
+            for operation in &state.media_operations {
+                operation.write_finished.notify_one();
+            }
+            state.cancelled_media.clear();
+            state.cancelled_flushes.clear();
             (
-                state.pending_media.drain(..).collect::<Vec<_>>(),
-                state.pending_flushes.drain(..).collect::<Vec<_>>(),
+                state.media_operations.drain(..).collect::<Vec<_>>(),
+                state.flush_operations.drain(..).collect::<Vec<_>>(),
             )
         };
-        for pending in media {
-            let _ = pending.completion.send(Err(error.clone()));
+        for operation in media {
+            if let Some(completion) = operation.completion {
+                let _ = completion.send(Err(error.clone()));
+            }
         }
-        for pending in flushes {
-            let _ = pending.completion.send(Err(error.clone()));
+        for operation in flushes {
+            let _ = operation.completion.send(Err(error.clone()));
         }
     }
 }

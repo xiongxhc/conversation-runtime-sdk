@@ -107,6 +107,7 @@ pub(crate) enum SidecarControl {
     FlushGeneration {
         session_id: SessionId,
         generation_id: GenerationId,
+        operation_id: u64,
     },
     Shutdown {
         session_id: SessionId,
@@ -124,15 +125,22 @@ pub(crate) enum SidecarControl {
     },
     PlaybackAccepted {
         session_id: SessionId,
+        turn_id: TurnId,
         generation_id: GenerationId,
+        utterance_id: UtteranceId,
+        sequence: u64,
     },
     PlaybackRendered {
         session_id: SessionId,
+        turn_id: TurnId,
         generation_id: GenerationId,
+        utterance_id: UtteranceId,
+        sequence: u64,
     },
     PlaybackFlushed {
         session_id: SessionId,
         generation_id: GenerationId,
+        operation_id: u64,
     },
     Failure {
         session_id: SessionId,
@@ -525,21 +533,36 @@ fn encode_control(control: &SidecarControl) -> Result<Vec<u8>, SidecarCodecError
         SidecarControl::FlushGeneration {
             session_id,
             generation_id,
-        }
-        | SidecarControl::PlaybackAccepted {
-            session_id,
-            generation_id,
-        }
-        | SidecarControl::PlaybackRendered {
-            session_id,
-            generation_id,
+            operation_id,
         }
         | SidecarControl::PlaybackFlushed {
             session_id,
             generation_id,
-        } => serialize(&GenerationDto {
+            operation_id,
+        } => serialize(&FlushIdentityDto {
             session_id: session_id.get(),
             generation_id: generation_id.get(),
+            operation_id: *operation_id,
+        }),
+        SidecarControl::PlaybackAccepted {
+            session_id,
+            turn_id,
+            generation_id,
+            utterance_id,
+            sequence,
+        }
+        | SidecarControl::PlaybackRendered {
+            session_id,
+            turn_id,
+            generation_id,
+            utterance_id,
+            sequence,
+        } => serialize(&MediaIdentityDto {
+            session_id: session_id.get(),
+            turn_id: turn_id.get(),
+            generation_id: generation_id.get(),
+            utterance_id: utterance_id.get(),
+            sequence: *sequence,
         }),
         SidecarControl::VoiceActivity {
             session_id,
@@ -610,29 +633,44 @@ fn decode_control(
                 _ => return Err(SidecarCodecError::InvalidControlJson),
             })
         }
-        SidecarFrameKind::FlushGeneration
-        | SidecarFrameKind::PlaybackAccepted
-        | SidecarFrameKind::PlaybackRendered
-        | SidecarFrameKind::PlaybackFlushed => {
-            let value: GenerationDto = deserialize(json)?;
+        SidecarFrameKind::FlushGeneration | SidecarFrameKind::PlaybackFlushed => {
+            let value: FlushIdentityDto = deserialize(json)?;
             let session_id = SessionId::new(value.session_id);
             let generation_id = GenerationId::new(value.generation_id);
             Ok(match kind {
                 SidecarFrameKind::FlushGeneration => SidecarControl::FlushGeneration {
                     session_id,
                     generation_id,
-                },
-                SidecarFrameKind::PlaybackAccepted => SidecarControl::PlaybackAccepted {
-                    session_id,
-                    generation_id,
-                },
-                SidecarFrameKind::PlaybackRendered => SidecarControl::PlaybackRendered {
-                    session_id,
-                    generation_id,
+                    operation_id: value.operation_id,
                 },
                 SidecarFrameKind::PlaybackFlushed => SidecarControl::PlaybackFlushed {
                     session_id,
                     generation_id,
+                    operation_id: value.operation_id,
+                },
+                _ => return Err(SidecarCodecError::InvalidControlJson),
+            })
+        }
+        SidecarFrameKind::PlaybackAccepted | SidecarFrameKind::PlaybackRendered => {
+            let value: MediaIdentityDto = deserialize(json)?;
+            let session_id = SessionId::new(value.session_id);
+            let turn_id = TurnId::new(value.turn_id);
+            let generation_id = GenerationId::new(value.generation_id);
+            let utterance_id = UtteranceId::new(value.utterance_id);
+            Ok(match kind {
+                SidecarFrameKind::PlaybackAccepted => SidecarControl::PlaybackAccepted {
+                    session_id,
+                    turn_id,
+                    generation_id,
+                    utterance_id,
+                    sequence: value.sequence,
+                },
+                SidecarFrameKind::PlaybackRendered => SidecarControl::PlaybackRendered {
+                    session_id,
+                    turn_id,
+                    generation_id,
+                    utterance_id,
+                    sequence: value.sequence,
                 },
                 _ => return Err(SidecarCodecError::InvalidControlJson),
             })
@@ -719,9 +757,20 @@ struct SessionDto {
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct GenerationDto {
+struct FlushIdentityDto {
     session_id: u64,
     generation_id: u64,
+    operation_id: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct MediaIdentityDto {
+    session_id: u64,
+    turn_id: u64,
+    generation_id: u64,
+    utterance_id: u64,
+    sequence: u64,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]

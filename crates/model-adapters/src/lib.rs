@@ -35,6 +35,7 @@ pub use generation_language::{
 pub use language_model::{LanguageModel, LanguageModelRequest};
 pub use macos_afplay::{MacOsAfplayAudioOutput, MacOsAfplayConfig};
 pub use macos_system_speech::{MacOsSystemSpeechConfig, MacOsSystemSpeechSynthesizer};
+#[cfg(unix)]
 pub use macos_voice_sidecar::{
     MacOsVoiceSidecar, MacOsVoiceSidecarConfig, MacOsVoiceSidecarSession, SystemDevice,
 };

@@ -480,6 +480,7 @@ fn every_control_kind_round_trips_with_exact_identity_fields() {
         SidecarControl::FlushGeneration {
             session_id: SessionId::new(1),
             generation_id: GenerationId::new(2),
+            operation_id: 3,
         },
         SidecarControl::Shutdown {
             session_id: SessionId::new(1),
@@ -489,15 +490,22 @@ fn every_control_kind_round_trips_with_exact_identity_fields() {
         },
         SidecarControl::PlaybackAccepted {
             session_id: SessionId::new(1),
+            turn_id: TurnId::new(2),
             generation_id: GenerationId::new(2),
+            utterance_id: UtteranceId::new(4),
+            sequence: 5,
         },
         SidecarControl::PlaybackRendered {
             session_id: SessionId::new(1),
+            turn_id: TurnId::new(2),
             generation_id: GenerationId::new(2),
+            utterance_id: UtteranceId::new(4),
+            sequence: 5,
         },
         SidecarControl::PlaybackFlushed {
             session_id: SessionId::new(1),
             generation_id: GenerationId::new(2),
+            operation_id: 3,
         },
         SidecarControl::Failure {
             session_id: SessionId::new(1),

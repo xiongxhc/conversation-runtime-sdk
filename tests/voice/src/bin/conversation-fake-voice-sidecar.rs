@@ -34,6 +34,9 @@ const FLUSH_MARKER_ENV: &str = "CONVERSATION_FAKE_VOICE_SIDECAR_FLUSH_MARKER";
 const SHUTDOWN_MARKER_ENV: &str = "CONVERSATION_FAKE_VOICE_SIDECAR_SHUTDOWN_MARKER";
 const MEDIA_BLOCKED_MARKER_ENV: &str = "CONVERSATION_FAKE_VOICE_SIDECAR_MEDIA_BLOCKED_MARKER";
 const DESCENDANT_PID_MARKER_ENV: &str = "CONVERSATION_FAKE_VOICE_SIDECAR_DESCENDANT_PID_MARKER";
+const HELD_MARKER_ENV: &str = "CONVERSATION_FAKE_VOICE_SIDECAR_HELD_MARKER";
+const INPUT_FLOOD_MARKER_ENV: &str = "CONVERSATION_FAKE_VOICE_SIDECAR_INPUT_FLOOD_MARKER";
+const ORDER_MARKER_ENV: &str = "CONVERSATION_FAKE_VOICE_SIDECAR_ORDER_MARKER";
 
 fn main() {
     let result = run();
@@ -85,6 +88,10 @@ fn run() -> Result<(), String> {
     let mut stdout = io::stdout().lock();
     let mut session_id = None;
     let mut ready = false;
+    let mut held_media = None;
+    let mut reversed_media = Vec::new();
+    let mut last_media = None;
+    let mut held_flush = false;
 
     while let Ok(event) = event_receiver.recv() {
         match event {
@@ -172,27 +179,109 @@ fn run() -> Result<(), String> {
                             "at_ms": 200
                         }),
                     )?;
+                } else if scenario == "input-flood" {
+                    write_json_frame(
+                        &mut stdout,
+                        VOICE_ACTIVITY,
+                        json!({
+                            "session_id": session,
+                            "activity": "speech_started",
+                            "at_ms": 300
+                        }),
+                    )?;
+                    for index in 0..256 {
+                        write_json_frame(
+                            &mut stdout,
+                            TRANSCRIPT_HYPOTHESIS,
+                            json!({
+                                "session_id": session,
+                                "segment_id": 8,
+                                "text": format!("partial-{index}"),
+                                "engine_final": false
+                            }),
+                        )?;
+                    }
+                    write_json_frame(
+                        &mut stdout,
+                        TRANSCRIPT_HYPOTHESIS,
+                        json!({
+                            "session_id": session,
+                            "segment_id": 8,
+                            "text": "final",
+                            "engine_final": true
+                        }),
+                    )?;
+                    write_json_frame(
+                        &mut stdout,
+                        VOICE_ACTIVITY,
+                        json!({
+                            "session_id": session,
+                            "activity": "speech_ended",
+                            "at_ms": 400
+                        }),
+                    )?;
+                    write_marker_from_env(INPUT_FLOOD_MARKER_ENV, "flooded", false)?;
                 }
             }
             FakeEvent::Control(ControlFrame::FlushGeneration {
                 session,
                 generation,
+                operation,
             }) if ready => {
+                if scenario == "hold-first-flush-ack" && !held_flush {
+                    held_flush = true;
+                    write_marker_from_env(HELD_MARKER_ENV, "flush-held", false)?;
+                    continue;
+                }
+                if scenario == "shutdown-order" {
+                    wait_for_marker_from_env(ORDER_MARKER_ENV, "media-closed\n")?;
+                }
                 write_marker_from_env(
                     FLUSH_MARKER_ENV,
                     &format!("{session}:{generation}\n"),
                     true,
                 )?;
+                write_marker_from_env(ORDER_MARKER_ENV, "flush\n", true)?;
                 write_json_frame(
                     &mut stdout,
                     PLAYBACK_FLUSHED,
                     json!({
                         "session_id": session,
-                        "generation_id": generation
+                        "generation_id": generation,
+                        "operation_id": operation
                     }),
                 )?;
+                match scenario.as_str() {
+                    "stale-accepted-after-flush" => {
+                        write_media_event(
+                            &mut stdout,
+                            PLAYBACK_ACCEPTED,
+                            last_media.ok_or_else(|| "missing stale media".to_owned())?,
+                        )?;
+                    }
+                    "stale-rendered-after-flush" => {
+                        write_media_event(
+                            &mut stdout,
+                            PLAYBACK_RENDERED,
+                            last_media.ok_or_else(|| "missing stale media".to_owned())?,
+                        )?;
+                    }
+                    "stale-flushed-after-flush" => {
+                        write_json_frame(
+                            &mut stdout,
+                            PLAYBACK_FLUSHED,
+                            json!({
+                                "session_id": session,
+                                "generation_id": generation,
+                                "operation_id": operation
+                            }),
+                        )?;
+                    }
+                    _ => {}
+                }
             }
             FakeEvent::Control(ControlFrame::Shutdown { session }) if ready => {
+                write_marker_from_env(ORDER_MARKER_ENV, "shutdown\n", true)?;
                 write_marker_from_env(SHUTDOWN_MARKER_ENV, &session.to_string(), false)?;
                 write_json_frame(
                     &mut stdout,
@@ -201,37 +290,39 @@ fn run() -> Result<(), String> {
                 )?;
                 return Ok(());
             }
-            FakeEvent::Audio {
-                session,
-                generation,
-            } if ready => {
-                let acknowledged_generation = if scenario == "stale-generation" {
-                    generation.saturating_sub(1)
-                } else {
-                    generation
-                };
-                write_json_frame(
-                    &mut stdout,
-                    PLAYBACK_ACCEPTED,
-                    json!({
-                        "session_id": session,
-                        "generation_id": acknowledged_generation
-                    }),
-                )?;
-                if scenario != "stale-generation" {
-                    write_json_frame(
-                        &mut stdout,
-                        PLAYBACK_RENDERED,
-                        json!({
-                            "session_id": session,
-                            "generation_id": generation
-                        }),
-                    )?;
+            FakeEvent::Audio(identity) if ready => {
+                last_media = Some(identity);
+                match scenario.as_str() {
+                    "reverse-acknowledgements" => {
+                        reversed_media.push(identity);
+                        if reversed_media.len() == 2 {
+                            acknowledge_media(&mut stdout, reversed_media[1])?;
+                            thread::sleep(Duration::from_millis(100));
+                            acknowledge_media(&mut stdout, reversed_media[0])?;
+                        }
+                    }
+                    "hold-first-media-ack" if held_media.is_none() => {
+                        held_media = Some(identity);
+                        write_marker_from_env(HELD_MARKER_ENV, "media-held", false)?;
+                    }
+                    "stale-accepted-after-flush"
+                    | "stale-rendered-after-flush"
+                    | "stale-flushed-after-flush" => {
+                        write_media_event(&mut stdout, PLAYBACK_ACCEPTED, identity)?;
+                    }
+                    "stale-generation" => {
+                        let stale = MediaFrame {
+                            generation: identity.generation.saturating_sub(1),
+                            ..identity
+                        };
+                        write_media_event(&mut stdout, PLAYBACK_ACCEPTED, stale)?;
+                    }
+                    _ => acknowledge_media(&mut stdout, identity)?,
                 }
             }
             FakeEvent::Control(ControlFrame::Unexpected)
             | FakeEvent::Control(_)
-            | FakeEvent::Audio { .. } => return Err("unexpected fake-sidecar input".to_owned()),
+            | FakeEvent::Audio(_) => return Err("unexpected fake-sidecar input".to_owned()),
             FakeEvent::Eof => return Ok(()),
             FakeEvent::ReadFailed => return Err("failed to read parent frame".to_owned()),
         }
@@ -310,19 +401,21 @@ fn spawn_media_reader(media: File, sender: mpsc::Sender<FakeEvent>) {
         loop {
             match read_frame(&mut media) {
                 Ok(Some((AUDIO_FRAME, payload))) if payload.len() >= AUDIO_METADATA_BYTES => {
-                    let session = read_u64(&payload, 0);
-                    let generation = read_u64(&payload, 16);
-                    if sender
-                        .send(FakeEvent::Audio {
-                            session,
-                            generation,
-                        })
-                        .is_err()
-                    {
+                    let identity = MediaFrame {
+                        session: read_u64(&payload, 0),
+                        turn: read_u64(&payload, 8),
+                        generation: read_u64(&payload, 16),
+                        utterance: read_u64(&payload, 24),
+                        sequence: read_u64(&payload, 32),
+                    };
+                    if sender.send(FakeEvent::Audio(identity)).is_err() {
                         return;
                     }
                 }
-                Ok(None) => return,
+                Ok(None) => {
+                    let _ = write_marker_from_env(ORDER_MARKER_ENV, "media-closed\n", true);
+                    return;
+                }
                 Ok(Some(_)) | Err(_) => {
                     let _ = sender.send(FakeEvent::ReadFailed);
                     return;
@@ -369,6 +462,7 @@ fn decode_control(kind: u16, payload: &[u8]) -> Option<ControlFrame> {
         FLUSH_GENERATION => Some(ControlFrame::FlushGeneration {
             session,
             generation: value.get("generation_id")?.as_u64()?,
+            operation: value.get("operation_id")?.as_u64()?,
         }),
         SHUTDOWN => Some(ControlFrame::Shutdown { session }),
         _ => Some(ControlFrame::Unexpected),
@@ -389,6 +483,29 @@ fn write_json_frame(
     writer
         .flush()
         .map_err(|_| "failed to flush fake frame".to_owned())
+}
+
+fn acknowledge_media(writer: &mut impl Write, identity: MediaFrame) -> Result<(), String> {
+    write_media_event(writer, PLAYBACK_ACCEPTED, identity)?;
+    write_media_event(writer, PLAYBACK_RENDERED, identity)
+}
+
+fn write_media_event(
+    writer: &mut impl Write,
+    kind: u16,
+    identity: MediaFrame,
+) -> Result<(), String> {
+    write_json_frame(
+        writer,
+        kind,
+        json!({
+            "session_id": identity.session,
+            "turn_id": identity.turn,
+            "generation_id": identity.generation,
+            "utterance_id": identity.utterance,
+            "sequence": identity.sequence
+        }),
+    )
 }
 
 fn write_header(writer: &mut impl Write, kind: u16, length: usize) -> Result<(), String> {
@@ -425,6 +542,24 @@ fn write_marker_from_env(name: &str, contents: &str, append: bool) -> Result<(),
         .map_err(|_| "failed to write marker".to_owned())
 }
 
+fn wait_for_marker_from_env(name: &str, expected: &str) -> Result<(), String> {
+    let Some(value) = std::env::var_os(name) else {
+        return Err("missing order marker".to_owned());
+    };
+    let path = PathBuf::from(value);
+    require_absolute(&path)?;
+    for _ in 0..100 {
+        if std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .contains(expected)
+        {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    Err("media descriptor did not close before control".to_owned())
+}
+
 fn spawn_stderr_descendant() -> Result<(), String> {
     let Some(value) = std::env::var_os(DESCENDANT_PID_MARKER_ENV) else {
         return Ok(());
@@ -452,15 +587,34 @@ fn require_absolute(path: &Path) -> Result<(), String> {
 
 enum FakeEvent {
     Control(ControlFrame),
-    Audio { session: u64, generation: u64 },
+    Audio(MediaFrame),
     Eof,
     ReadFailed,
 }
 
 enum ControlFrame {
-    StartSession { session: u64 },
-    StartCapture { session: u64 },
-    FlushGeneration { session: u64, generation: u64 },
-    Shutdown { session: u64 },
+    StartSession {
+        session: u64,
+    },
+    StartCapture {
+        session: u64,
+    },
+    FlushGeneration {
+        session: u64,
+        generation: u64,
+        operation: u64,
+    },
+    Shutdown {
+        session: u64,
+    },
     Unexpected,
+}
+
+#[derive(Clone, Copy)]
+struct MediaFrame {
+    session: u64,
+    turn: u64,
+    generation: u64,
+    utterance: u64,
+    sequence: u64,
 }

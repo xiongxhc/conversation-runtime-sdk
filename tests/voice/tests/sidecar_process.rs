@@ -28,6 +28,9 @@ const FLUSH_MARKER_ENV: &str = "CONVERSATION_FAKE_VOICE_SIDECAR_FLUSH_MARKER";
 const SHUTDOWN_MARKER_ENV: &str = "CONVERSATION_FAKE_VOICE_SIDECAR_SHUTDOWN_MARKER";
 const MEDIA_BLOCKED_MARKER_ENV: &str = "CONVERSATION_FAKE_VOICE_SIDECAR_MEDIA_BLOCKED_MARKER";
 const DESCENDANT_PID_MARKER_ENV: &str = "CONVERSATION_FAKE_VOICE_SIDECAR_DESCENDANT_PID_MARKER";
+const HELD_MARKER_ENV: &str = "CONVERSATION_FAKE_VOICE_SIDECAR_HELD_MARKER";
+const INPUT_FLOOD_MARKER_ENV: &str = "CONVERSATION_FAKE_VOICE_SIDECAR_INPUT_FLOOD_MARKER";
+const ORDER_MARKER_ENV: &str = "CONVERSATION_FAKE_VOICE_SIDECAR_ORDER_MARKER";
 
 #[test]
 fn configuration_rejects_relative_paths_invalid_devices_and_downloads() {
@@ -110,6 +113,7 @@ fn configuration_rejects_missing_executable_thresholds_and_zero_limits() {
 
 #[test]
 fn validated_configuration_is_unstarted_and_exposes_bounded_values() {
+    let _lock = environment_lock().blocking_lock();
     let fixture = TempDir::new().unwrap();
     let model = fixture.path().join("model");
     std::fs::create_dir(&model).unwrap();
@@ -199,20 +203,31 @@ async fn voice_input_receives_activity_and_partial_final_hypotheses() {
         recv_with_timeout(&mut input).await,
         VoiceInputEvent::Activity(VoiceActivity::SpeechStarted { at_ms: 10 })
     ));
-    assert!(matches!(
-        recv_with_timeout(&mut input).await,
-        VoiceInputEvent::Recognition(RecognitionEvent::Hypothesis(value))
-            if value.segment_id() == 4 && value.text() == "hel" && !value.is_engine_final()
-    ));
-    assert!(matches!(
-        recv_with_timeout(&mut input).await,
-        VoiceInputEvent::Recognition(RecognitionEvent::Hypothesis(value))
-            if value.segment_id() == 4 && value.text() == "hello" && value.is_engine_final()
-    ));
-    assert!(matches!(
-        recv_with_timeout(&mut input).await,
-        VoiceInputEvent::Activity(VoiceActivity::SpeechEnded { at_ms: 20 })
-    ));
+    let mut saw_final = false;
+    let mut saw_ended = false;
+    for _ in 0..3 {
+        match recv_with_timeout(&mut input).await {
+            VoiceInputEvent::Recognition(RecognitionEvent::Hypothesis(value))
+                if value.is_engine_final() =>
+            {
+                assert_eq!(value.segment_id(), 4);
+                assert_eq!(value.text(), "hello");
+                saw_final = true;
+            }
+            VoiceInputEvent::Recognition(RecognitionEvent::Hypothesis(value)) => {
+                assert_eq!(value.segment_id(), 4);
+                assert_eq!(value.text(), "hel");
+            }
+            VoiceInputEvent::Activity(VoiceActivity::SpeechEnded { at_ms: 20 }) => {
+                saw_ended = true;
+            }
+            event => panic!("unexpected voice input event: {event:?}"),
+        }
+        if saw_final && saw_ended {
+            break;
+        }
+    }
+    assert!(saw_final && saw_ended);
 
     cancellation.cancel();
     assert!(await_completion(session.completion).await.is_err());
@@ -405,6 +420,263 @@ async fn blocked_media_does_not_block_flush_and_cancellation_drains_full_queue()
 }
 
 #[tokio::test]
+async fn concurrent_same_generation_enqueues_resolve_the_exact_reversed_acknowledgement() {
+    let harness = FakeSidecarHarness::new("reverse-acknowledgements");
+    let cancellation = CancellationToken::new();
+    let session = harness.start(cancellation.clone()).await.unwrap();
+    let (finished_sender, mut finished_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let mut enqueues = Vec::new();
+
+    for sequence in 0..2 {
+        let output = Arc::clone(&session.output);
+        let finished_sender = finished_sender.clone();
+        enqueues.push(tokio::spawn(async move {
+            let result = output
+                .enqueue(
+                    frame(GenerationId::new(12), sequence),
+                    CancellationToken::new(),
+                )
+                .await;
+            let _ = finished_sender.send((sequence, result));
+        }));
+    }
+    drop(finished_sender);
+
+    let first = tokio::time::timeout(Duration::from_secs(1), finished_receiver.recv())
+        .await
+        .expect("first reversed acknowledgement timed out")
+        .expect("enqueue completion channel closed");
+    assert_eq!(first.0, 1);
+    assert_eq!(first.1.unwrap().state(), PlaybackState::Accepted);
+    let second = tokio::time::timeout(Duration::from_secs(1), finished_receiver.recv())
+        .await
+        .expect("second reversed acknowledgement timed out")
+        .expect("enqueue completion channel closed");
+    assert_eq!(second.0, 0);
+    assert_eq!(second.1.unwrap().state(), PlaybackState::Accepted);
+
+    for enqueue in enqueues {
+        enqueue.await.unwrap();
+    }
+    cancellation.cancel();
+    assert!(await_completion(session.completion).await.is_err());
+    harness.assert_process_gone().await;
+}
+
+#[tokio::test]
+async fn dropped_enqueue_releases_its_exact_two_second_reservation_for_retry() {
+    let harness = FakeSidecarHarness::new("hold-first-media-ack");
+    let cancellation = CancellationToken::new();
+    let session = harness.start(cancellation.clone()).await.unwrap();
+    let output = Arc::clone(&session.output);
+    let dropped = tokio::spawn(async move {
+        output
+            .enqueue(
+                two_second_frame(GenerationId::new(13), 0),
+                CancellationToken::new(),
+            )
+            .await
+    });
+    harness.wait_for_marker(harness.held_marker()).await;
+
+    dropped.abort();
+    assert!(dropped.await.unwrap_err().is_cancelled());
+    let retried = tokio::time::timeout(
+        Duration::from_secs(1),
+        session
+            .output
+            .enqueue(frame(GenerationId::new(13), 1), CancellationToken::new()),
+    )
+    .await
+    .expect("retry remained blocked by dropped enqueue reservation")
+    .unwrap();
+    assert_eq!(retried.state(), PlaybackState::Accepted);
+
+    cancellation.cancel();
+    assert!(await_completion(session.completion).await.is_err());
+    harness.assert_process_gone().await;
+}
+
+#[tokio::test]
+async fn cancelled_enqueue_removes_only_its_operation_and_allows_retry() {
+    let harness = FakeSidecarHarness::new("hold-first-media-ack");
+    let cancellation = CancellationToken::new();
+    let session = harness.start(cancellation.clone()).await.unwrap();
+    let operation_cancellation = CancellationToken::new();
+    let output = Arc::clone(&session.output);
+    let operation_cancellation_for_task = operation_cancellation.clone();
+    let cancelled = tokio::spawn(async move {
+        output
+            .enqueue(
+                frame(GenerationId::new(14), 0),
+                operation_cancellation_for_task,
+            )
+            .await
+    });
+    harness.wait_for_marker(harness.held_marker()).await;
+
+    operation_cancellation.cancel();
+    assert!(cancelled.await.unwrap().is_err());
+    let retried = tokio::time::timeout(
+        Duration::from_secs(1),
+        session
+            .output
+            .enqueue(frame(GenerationId::new(14), 1), CancellationToken::new()),
+    )
+    .await
+    .expect("retry consumed the cancelled enqueue acknowledgement")
+    .unwrap();
+    assert_eq!(retried.state(), PlaybackState::Accepted);
+
+    cancellation.cancel();
+    assert!(await_completion(session.completion).await.is_err());
+    harness.assert_process_gone().await;
+}
+
+#[tokio::test]
+async fn dropped_flush_removes_its_exact_operation_and_allows_retry() {
+    let harness = FakeSidecarHarness::new("hold-first-flush-ack");
+    let cancellation = CancellationToken::new();
+    let session = harness.start(cancellation.clone()).await.unwrap();
+    let output = Arc::clone(&session.output);
+    let dropped =
+        tokio::spawn(async move { output.flush(SESSION_ID, GenerationId::new(15)).await });
+    harness.wait_for_marker(harness.held_marker()).await;
+
+    dropped.abort();
+    assert!(dropped.await.unwrap_err().is_cancelled());
+    let retried = tokio::time::timeout(
+        Duration::from_secs(1),
+        session.output.flush(SESSION_ID, GenerationId::new(15)),
+    )
+    .await
+    .expect("retry consumed the dropped flush acknowledgement")
+    .unwrap();
+    assert_eq!(retried.state(), PlaybackState::Flushed);
+
+    cancellation.cancel();
+    assert!(await_completion(session.completion).await.is_err());
+    harness.assert_process_gone().await;
+}
+
+#[tokio::test]
+async fn post_flush_accepted_rendered_and_flushed_events_fail_the_session() {
+    for scenario in [
+        "stale-accepted-after-flush",
+        "stale-rendered-after-flush",
+        "stale-flushed-after-flush",
+    ] {
+        let harness = FakeSidecarHarness::new(scenario);
+        let cancellation = CancellationToken::new();
+        let session = harness.start(cancellation).await.unwrap();
+        let mut input = session
+            .input
+            .start(SESSION_ID, CancellationToken::new())
+            .await
+            .unwrap();
+        session
+            .output
+            .enqueue(frame(GenerationId::new(16), 0), CancellationToken::new())
+            .await
+            .unwrap();
+        session
+            .output
+            .flush(SESSION_ID, GenerationId::new(16))
+            .await
+            .unwrap();
+
+        assert!(await_completion(session.completion).await.is_err());
+        while let Ok(Some(event)) =
+            tokio::time::timeout(Duration::from_millis(50), input.recv()).await
+        {
+            assert!(!matches!(
+                event,
+                Ok(VoiceInputEvent::Playback(receipt))
+                    if receipt.state() == PlaybackState::Rendered
+            ));
+        }
+        harness.assert_process_gone().await;
+    }
+}
+
+#[tokio::test]
+async fn cancellation_closes_media_before_flush_and_shutdown_controls() {
+    let harness = FakeSidecarHarness::new("shutdown-order");
+    let cancellation = CancellationToken::new();
+    let session = harness.start(cancellation.clone()).await.unwrap();
+    session
+        .output
+        .enqueue(frame(GenerationId::new(17), 0), CancellationToken::new())
+        .await
+        .unwrap();
+
+    cancellation.cancel();
+    assert!(await_completion(session.completion).await.is_err());
+    harness.assert_process_gone().await;
+    assert_eq!(
+        std::fs::read_to_string(harness.order_marker()).unwrap(),
+        "media-closed\nflush\nshutdown\n"
+    );
+}
+
+#[tokio::test]
+async fn full_input_consumer_does_not_block_playback_flush_or_shutdown_acknowledgements() {
+    let harness = FakeSidecarHarness::new("input-flood");
+    let cancellation = CancellationToken::new();
+    let session = harness.start(cancellation.clone()).await.unwrap();
+    let mut input = session
+        .input
+        .start(SESSION_ID, CancellationToken::new())
+        .await
+        .unwrap();
+    harness.wait_for_marker(harness.input_flood_marker()).await;
+
+    let accepted = tokio::time::timeout(
+        Duration::from_secs(1),
+        session
+            .output
+            .enqueue(frame(GenerationId::new(18), 0), CancellationToken::new()),
+    )
+    .await
+    .expect("playback acknowledgement was blocked by input delivery")
+    .unwrap();
+    assert_eq!(accepted.state(), PlaybackState::Accepted);
+    let flushed = tokio::time::timeout(
+        Duration::from_secs(1),
+        session.output.flush(SESSION_ID, GenerationId::new(18)),
+    )
+    .await
+    .expect("flush acknowledgement was blocked by input delivery")
+    .unwrap();
+    assert_eq!(flushed.state(), PlaybackState::Flushed);
+
+    let mut saw_started = false;
+    let mut saw_final = false;
+    let mut saw_ended = false;
+    for _ in 0..64 {
+        let event = recv_with_timeout(&mut input).await;
+        match event {
+            VoiceInputEvent::Activity(VoiceActivity::SpeechStarted { .. }) => saw_started = true,
+            VoiceInputEvent::Recognition(RecognitionEvent::Hypothesis(value))
+                if value.is_engine_final() =>
+            {
+                saw_final = true;
+            }
+            VoiceInputEvent::Activity(VoiceActivity::SpeechEnded { .. }) => saw_ended = true,
+            _ => {}
+        }
+        if saw_started && saw_final && saw_ended {
+            break;
+        }
+    }
+    assert!(saw_started && saw_final && saw_ended);
+
+    cancellation.cancel();
+    assert!(await_completion(session.completion).await.is_err());
+    harness.assert_process_gone().await;
+}
+
+#[tokio::test]
 async fn flush_accepts_a_new_generation_before_its_first_media_frame() {
     let harness = FakeSidecarHarness::new("ready");
     let cancellation = CancellationToken::new();
@@ -550,6 +822,18 @@ fn large_fast_frame(generation_id: GenerationId, sequence: u64) -> AudioFrame {
     .unwrap()
 }
 
+fn two_second_frame(generation_id: GenerationId, sequence: u64) -> AudioFrame {
+    AudioFrame::new(
+        TurnId::new(generation_id.get()),
+        generation_id,
+        UtteranceId::new(generation_id.get()),
+        sequence,
+        PcmFormat::new(12_000, 1, PcmSampleFormat::Signed16LittleEndian).unwrap(),
+        vec![0; 48_000],
+    )
+    .unwrap()
+}
+
 async fn recv_with_timeout(
     receiver: &mut tokio::sync::mpsc::Receiver<
         Result<VoiceInputEvent, conversation_model_adapters::AdapterError>,
@@ -580,6 +864,9 @@ struct FakeSidecarHarness {
     flush_marker: PathBuf,
     shutdown_marker: PathBuf,
     media_blocked_marker: PathBuf,
+    held_marker: PathBuf,
+    input_flood_marker: PathBuf,
+    order_marker: PathBuf,
     descendant_pid_marker: Option<PathBuf>,
 }
 
@@ -595,6 +882,9 @@ impl FakeSidecarHarness {
             flush_marker: fixture.path().join("flush"),
             shutdown_marker: fixture.path().join("shutdown"),
             media_blocked_marker: fixture.path().join("media-blocked"),
+            held_marker: fixture.path().join("held"),
+            input_flood_marker: fixture.path().join("input-flood"),
+            order_marker: fixture.path().join("order"),
             descendant_pid_marker: None,
             fixture,
             scenario,
@@ -624,6 +914,9 @@ impl FakeSidecarHarness {
                 MEDIA_BLOCKED_MARKER_ENV,
                 self.media_blocked_marker.as_os_str(),
             ),
+            (HELD_MARKER_ENV, self.held_marker.as_os_str()),
+            (INPUT_FLOOD_MARKER_ENV, self.input_flood_marker.as_os_str()),
+            (ORDER_MARKER_ENV, self.order_marker.as_os_str()),
         ];
         if let Some(marker) = &self.descendant_pid_marker {
             values.push((DESCENDANT_PID_MARKER_ENV, marker.as_os_str()));
@@ -651,6 +944,18 @@ impl FakeSidecarHarness {
 
     fn media_blocked_marker(&self) -> &Path {
         &self.media_blocked_marker
+    }
+
+    fn held_marker(&self) -> &Path {
+        &self.held_marker
+    }
+
+    fn input_flood_marker(&self) -> &Path {
+        &self.input_flood_marker
+    }
+
+    fn order_marker(&self) -> &Path {
+        &self.order_marker
     }
 
     async fn wait_for_marker(&self, marker: &Path) {

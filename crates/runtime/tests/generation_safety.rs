@@ -443,6 +443,14 @@ async fn cancelled_generation_cannot_publish_late_text_or_audio() {
     assert!(!first_events.iter().chain(&second_events).any(|event| {
         matches!(event, RuntimeEvent::TextDelta { delta, .. } if delta == "late-first")
     }));
+    assert!(!first_events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Playback {
+            generation_id,
+            state: PlaybackState::Accepted,
+            ..
+        } if *generation_id == first_generation
+    )));
     assert_eq!(
         output
             .frames()

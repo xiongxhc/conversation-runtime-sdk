@@ -224,6 +224,17 @@ async fn first_playable_publication_precedes_frame_enqueue_under_backpressure() 
             .is_empty(),
         "first enqueue completed before the retained release"
     );
+    assert!(
+        !observed.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::Playback {
+                generation_id: observed_generation,
+                state: PlaybackState::Accepted,
+                ..
+            } if *observed_generation == generation_id
+        )),
+        "acceptance was published before the enqueue receipt"
+    );
 
     release_sender
         .send(true)
@@ -238,6 +249,38 @@ async fn first_playable_publication_precedes_frame_enqueue_under_backpressure() 
             .as_slice(),
         &[0, 1]
     );
+    let accepted = observed
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                RuntimeEvent::Playback {
+                    turn_id: observed_turn,
+                    generation_id: observed_generation,
+                    state: PlaybackState::Accepted,
+                } if *observed_turn == turn_id && *observed_generation == generation_id
+            )
+        })
+        .expect("real enqueue acceptance was not published");
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|event| matches!(
+                event,
+                RuntimeEvent::Playback {
+                    generation_id: observed_generation,
+                    state: PlaybackState::Accepted,
+                    ..
+                } if *observed_generation == generation_id
+            ))
+            .count(),
+        1
+    );
+    let speech_completed = observed
+        .iter()
+        .position(|event| matches!(event, RuntimeEvent::SpeechCompleted { .. }))
+        .expect("speech completion was not published");
+    assert!(accepted < speech_completed);
     assert_eq!(
         observed
             .iter()

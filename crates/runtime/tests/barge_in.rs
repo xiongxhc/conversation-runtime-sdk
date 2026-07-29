@@ -441,6 +441,13 @@ fn assert_no_late_generation_work(observed: &[VoiceSessionEvent]) {
             ..
         } if delta == "late-cancelled-generation"
     )));
+    assert!(!observed.iter().any(|event| matches!(
+        event,
+        VoiceSessionEvent::Playback {
+            state: PlaybackState::Accepted,
+            ..
+        }
+    )));
 }
 
 fn assert_new_session_cleanup_timeout(observed: &[VoiceSessionEvent]) {

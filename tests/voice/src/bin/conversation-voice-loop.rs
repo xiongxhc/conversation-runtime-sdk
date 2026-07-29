@@ -344,9 +344,6 @@ impl PlaybackRenderer {
                 }
             }
             PlaybackState::Rendered => {
-                if self.accepted.insert(generation) {
-                    eprintln!("generation={generation} playback=accepted");
-                }
                 if self.rendered.insert(generation) {
                     eprintln!("generation={generation} playback=rendered");
                 }
@@ -631,5 +628,15 @@ mod tests {
 
         assert_eq!(failure.stage, "speech_recognizer");
         assert_eq!(failure.message, "recognition failed before shutdown");
+    }
+
+    #[test]
+    fn rendered_playback_does_not_fabricate_acceptance() {
+        let mut renderer = PlaybackRenderer::default();
+
+        renderer.render(GenerationId::new(7), PlaybackState::Rendered);
+
+        assert!(renderer.accepted.is_empty());
+        assert_eq!(renderer.rendered, BTreeSet::from([7]));
     }
 }

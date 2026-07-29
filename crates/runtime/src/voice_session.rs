@@ -5,12 +5,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use conversation_model_adapters::{
-    AdapterError, ContinuousAudioOutput, GenerationLanguageModel, RecognitionEvent,
-    StreamingSpeechSynthesizer, VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
+    AdapterError, ContinuousAudioOutput, GenerationLanguageModel, PlaybackReceipt,
+    RecognitionEvent, StreamingSpeechSynthesizer, VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
 };
 use conversation_protocol::{
-    GenerationId, RecoveryDisposition, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage,
-    RuntimeTimingMilestone, SessionId, TurnId, VoiceActivity, VoiceSessionEvent,
+    GenerationId, PlaybackState, RecoveryDisposition, RuntimeError, RuntimeErrorKind, RuntimeEvent,
+    RuntimeStage, RuntimeTimingMilestone, SessionId, TurnId, VoiceActivity, VoiceSessionEvent,
     VoiceSessionPolicy, VoiceTimingMilestone,
 };
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -314,6 +314,8 @@ struct VoiceLoop {
     next_generation_id: u64,
     reliable_events: VecDeque<VoiceSessionEvent>,
     partials: BTreeMap<u64, String>,
+    accepted_generation: Option<GenerationId>,
+    deferred_rendered: Option<PlaybackReceipt>,
 }
 
 impl VoiceLoop {
@@ -352,6 +354,8 @@ impl VoiceLoop {
             next_generation_id: 1,
             reliable_events: VecDeque::new(),
             partials: BTreeMap::new(),
+            accepted_generation: None,
+            deferred_rendered: None,
         }
     }
 
@@ -485,6 +489,16 @@ impl VoiceLoop {
                 None
             }
             Some(Ok(VoiceInputEvent::Playback(receipt))) => {
+                let awaiting_acceptance = matches!(
+                    self.state,
+                    VoiceLoopState::Responding { generation_id, .. }
+                        if generation_id == receipt.generation_id()
+                ) && self.accepted_generation
+                    != Some(receipt.generation_id());
+                if receipt.state() == PlaybackState::Rendered && awaiting_acceptance {
+                    self.deferred_rendered = Some(receipt);
+                    return None;
+                }
                 if !self.publish_best_effort(VoiceSessionEvent::Playback {
                     session_id: self.session_id,
                     generation_id: receipt.generation_id(),
@@ -632,6 +646,8 @@ impl VoiceLoop {
             turn_id,
             generation_id,
         };
+        self.accepted_generation = None;
+        self.deferred_rendered = None;
         self.next_turn_id = next_turn_id;
         self.next_generation_id = next_generation_id;
         Ok(())
@@ -657,6 +673,8 @@ impl VoiceLoop {
         if terminal {
             self.turn_events.take();
             self.state = VoiceLoopState::Listening;
+            self.accepted_generation = None;
+            self.deferred_rendered = None;
             if let Some(error) = failure {
                 if !self
                     .publish_reliable(VoiceSessionEvent::SessionFailed {
@@ -715,6 +733,8 @@ impl VoiceLoop {
         else {
             return Ok(());
         };
+        self.accepted_generation = None;
+        self.deferred_rendered = None;
 
         let interrupt_result = cleanup_with_timeout(
             "streaming turn interruption",
@@ -790,7 +810,17 @@ impl VoiceLoop {
                 RuntimeEvent::TurnCancelled { turn_id } if turn_id == expected_turn_id
             );
             self.publish_runtime_timing(&event);
-            let published = self.publish_turn_event(event).await;
+            let published = if matches!(
+                event,
+                RuntimeEvent::Playback {
+                    state: PlaybackState::Accepted,
+                    ..
+                }
+            ) {
+                true
+            } else {
+                self.publish_turn_event(event).await
+            };
             delivery_open &= published;
             if terminal {
                 self.turn_events.take();
@@ -861,6 +891,35 @@ impl VoiceLoop {
     }
 
     async fn publish_turn_event(&mut self, event: RuntimeEvent) -> bool {
+        if let RuntimeEvent::Playback {
+            generation_id,
+            state: PlaybackState::Accepted,
+            ..
+        } = event
+        {
+            let published = self
+                .publish_reliable(VoiceSessionEvent::Playback {
+                    session_id: self.session_id,
+                    generation_id,
+                    state: PlaybackState::Accepted,
+                })
+                .await;
+            if !published {
+                return false;
+            }
+            self.accepted_generation = Some(generation_id);
+            let Some(rendered) = self
+                .deferred_rendered
+                .take_if(|receipt| receipt.generation_id() == generation_id)
+            else {
+                return true;
+            };
+            return self.publish_best_effort(VoiceSessionEvent::Playback {
+                session_id: self.session_id,
+                generation_id: rendered.generation_id(),
+                state: rendered.state(),
+            });
+        }
         let reliable = event.is_terminal();
         let event = VoiceSessionEvent::Turn {
             session_id: self.session_id,

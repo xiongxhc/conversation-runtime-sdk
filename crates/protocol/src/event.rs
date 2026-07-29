@@ -1,4 +1,4 @@
-use crate::{RuntimeError, TurnId};
+use crate::{GenerationId, PlaybackState, RuntimeError, TurnId};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -33,6 +33,11 @@ pub enum RuntimeEvent {
     SpeechCompleted {
         turn_id: TurnId,
     },
+    Playback {
+        turn_id: TurnId,
+        generation_id: GenerationId,
+        state: PlaybackState,
+    },
     TurnCompleted {
         turn_id: TurnId,
     },
@@ -54,6 +59,7 @@ impl RuntimeEvent {
             | Self::Timing { turn_id, .. }
             | Self::SpeechStarted { turn_id }
             | Self::SpeechCompleted { turn_id }
+            | Self::Playback { turn_id, .. }
             | Self::TurnCompleted { turn_id }
             | Self::TurnCancelled { turn_id }
             | Self::TurnFailed { turn_id, .. } => *turn_id,
@@ -70,7 +76,7 @@ impl RuntimeEvent {
 
 #[cfg(test)]
 mod tests {
-    use crate::{RuntimeEvent, RuntimeTimingMilestone, TurnId};
+    use crate::{GenerationId, PlaybackState, RuntimeEvent, RuntimeTimingMilestone, TurnId};
 
     #[test]
     fn only_terminal_events_report_terminal_state() {
@@ -99,5 +105,19 @@ mod tests {
             assert_eq!(event.turn_id(), turn_id);
             assert!(!event.is_terminal());
         }
+    }
+
+    #[test]
+    fn playback_acceptance_preserves_turn_and_generation_identity() {
+        let turn_id = TurnId::new(9);
+        let generation_id = GenerationId::new(10);
+        let event = RuntimeEvent::Playback {
+            turn_id,
+            generation_id,
+            state: PlaybackState::Accepted,
+        };
+
+        assert_eq!(event.turn_id(), turn_id);
+        assert!(!event.is_terminal());
     }
 }

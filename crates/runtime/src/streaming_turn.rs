@@ -10,7 +10,7 @@ use conversation_model_adapters::{
     StreamingSpeechSynthesizer,
 };
 use conversation_protocol::{
-    GenerationId, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage,
+    GenerationId, PlaybackState, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage,
     RuntimeTimingMilestone, SessionId, TurnId, UtteranceId,
 };
 use tokio::sync::{mpsc, oneshot, Mutex, Notify};
@@ -747,6 +747,7 @@ async fn run_streaming_speech(task: StreamingSpeechTask) -> SpeechOutcome {
     } = task;
     let mut emitted_speech_started = false;
     let mut emitted_first_playable = false;
+    let mut emitted_first_accepted = false;
     let mut negotiated_format = None;
 
     loop {
@@ -935,8 +936,8 @@ async fn run_streaming_speech(task: StreamingSpeechTask) -> SpeechOutcome {
                 }
                 receipt = &mut enqueue => receipt,
             };
-            match receipt {
-                Ok(receipt) if receipt.generation_id() == generation_id => {}
+            let receipt = match receipt {
+                Ok(receipt) if receipt.generation_id() == generation_id => receipt,
                 Ok(_) => {
                     cleanup_frame_stream(&speech_cancellation, &mut frames).await;
                     return SpeechOutcome::Failed {
@@ -956,6 +957,39 @@ async fn run_streaming_speech(task: StreamingSpeechTask) -> SpeechOutcome {
                         stage: RuntimeStage::ContinuousAudioOutput,
                         error,
                     };
+                }
+            };
+            if receipt.state() != PlaybackState::Accepted {
+                cleanup_frame_stream(&speech_cancellation, &mut frames).await;
+                return SpeechOutcome::Failed {
+                    stage: RuntimeStage::ContinuousAudioOutput,
+                    error: AdapterError::new(
+                        "continuous audio enqueue did not return playback acceptance",
+                    ),
+                };
+            }
+            if !emitted_first_accepted {
+                match send_event(
+                    &events,
+                    RuntimeEvent::Playback {
+                        turn_id,
+                        generation_id,
+                        state: receipt.state(),
+                    },
+                    &external_interruption,
+                    &work_cancellation,
+                )
+                .await
+                {
+                    SendOutcome::Sent => emitted_first_accepted = true,
+                    SendOutcome::Interrupted | SendOutcome::Stale => {
+                        cleanup_frame_stream(&speech_cancellation, &mut frames).await;
+                        return SpeechOutcome::Interrupted;
+                    }
+                    SendOutcome::Closed => {
+                        cleanup_frame_stream(&speech_cancellation, &mut frames).await;
+                        return SpeechOutcome::EventStreamClosed;
+                    }
                 }
             }
         }

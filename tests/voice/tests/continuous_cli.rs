@@ -220,8 +220,18 @@ fn once_mode_runs_one_private_voice_turn_and_cleans_every_process() {
     assert_eq!(speech_payload["repetition_penalty"], 1.05);
     assert_eq!(speech_payload["response_format"], "wav");
     assert!(stderr.contains("privacy=local-only"));
-    let accepted = stderr.find("playback=accepted").unwrap();
-    let rendered = stderr.find("playback=rendered").unwrap();
+    let accepted_lines = stderr
+        .lines()
+        .filter(|line| line.contains("playback=accepted"))
+        .collect::<Vec<_>>();
+    let rendered_lines = stderr
+        .lines()
+        .filter(|line| line.contains("playback=rendered"))
+        .collect::<Vec<_>>();
+    assert_eq!(accepted_lines, ["generation=1 playback=accepted"]);
+    assert_eq!(rendered_lines, ["generation=1 playback=rendered"]);
+    let accepted = stderr.find(accepted_lines[0]).unwrap();
+    let rendered = stderr.find(rendered_lines[0]).unwrap();
     let turn_completed = stderr.find("turn=1 status=completed").unwrap();
     let terminal_status = stderr.rfind("status=completed").unwrap();
     assert!(accepted < rendered);

@@ -237,6 +237,37 @@ async fn voice_input_receives_activity_and_partial_final_hypotheses() {
 }
 
 #[tokio::test]
+async fn recognition_failure_keeps_real_factory_completion_alive() {
+    let harness = FakeSidecarHarness::new("recognition-failure-nonfatal");
+    let cancellation = CancellationToken::new();
+    let session = harness.start(cancellation.clone()).await.unwrap();
+    let mut input = session
+        .input
+        .start(SESSION_ID, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let error = tokio::time::timeout(Duration::from_secs(1), input.recv())
+        .await
+        .expect("recognition failure timeout")
+        .expect("voice input closed")
+        .expect_err("recognition failure was accepted");
+    assert_eq!(error.message(), "voice sidecar recognition failed");
+    assert!(matches!(
+        recv_with_timeout(&mut input).await,
+        VoiceInputEvent::Activity(VoiceActivity::SpeechStarted { at_ms: 10 })
+    ));
+    assert!(
+        !session.completion.is_finished(),
+        "recoverable recognition failure ended sidecar completion"
+    );
+
+    cancellation.cancel();
+    assert!(await_completion(session.completion).await.is_err());
+    harness.assert_process_gone().await;
+}
+
+#[tokio::test]
 async fn startup_timeout_kills_and_reaps_child() {
     let fixture = TempDir::new().unwrap();
     let model = fixture.path().join("model");

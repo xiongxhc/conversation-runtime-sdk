@@ -1033,6 +1033,10 @@ async fn run_stdout_reader(
         }
         if let SidecarControl::Failure { stage, code, .. } = control {
             let error = sidecar_failure(stage, code);
+            if code == SidecarFailureCode::RecognitionFailed {
+                input_publisher.publish_reliable(Err(error));
+                continue;
+            }
             input_publisher.publish_reliable(Err(error.clone()));
             let _ = supervisor_sender.send(SupervisorEvent::Fatal(error));
             return;

@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::future::pending;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -57,6 +58,45 @@ async fn sidecar_barge_in_flushes_and_cancels_all_generation_work() {
         1
     );
     assert_no_late_generation_work(&observed);
+    harness.shutdown(&mut events).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn flush_waking_pending_enqueue_still_yields_exact_cancellation() {
+    let harness = VoiceSessionHarness::speaking_generations([GenerationId::new(1)])
+        .with_flush_waking_enqueue_failure();
+    let mut events = harness.start().await;
+    harness
+        .start_speaking_generation(&mut events, GenerationId::new(1))
+        .await;
+
+    harness
+        .emit_barge_in(TurnId::new(1), GenerationId::new(1))
+        .await;
+    let observed = drain_until_turn_terminal(&mut events).await;
+
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|event| matches!(
+                event,
+                VoiceSessionEvent::Turn {
+                    event: RuntimeEvent::TurnCancelled {
+                        turn_id,
+                    },
+                    ..
+                } if *turn_id == TurnId::new(1)
+            ))
+            .count(),
+        1
+    );
+    assert!(!observed.iter().any(|event| matches!(
+        event,
+        VoiceSessionEvent::Turn {
+            event: RuntimeEvent::TurnCompleted { .. } | RuntimeEvent::TurnFailed { .. },
+            ..
+        }
+    )));
     harness.shutdown(&mut events).await;
 }
 
@@ -233,6 +273,64 @@ async fn flush_failure_still_cleans_the_turn_then_ends_the_session() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn stalled_flush_times_out_to_one_new_session_terminal() {
+    let harness =
+        VoiceSessionHarness::speaking_generations([GenerationId::new(1)]).with_stalled_flush();
+    let mut events = harness.start().await;
+    harness
+        .start_speaking_generation(&mut events, GenerationId::new(1))
+        .await;
+
+    harness
+        .emit_barge_in(TurnId::new(1), GenerationId::new(1))
+        .await;
+    tokio::time::advance(Duration::from_secs(2)).await;
+    let observed = drain_until_session_terminal(&mut events).await;
+
+    assert_new_session_cleanup_timeout(&observed);
+    assert!(harness.language.cleanup_finished(GenerationId::new(1)));
+    assert!(harness.speech.cleanup_finished(GenerationId::new(1)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_turn_drain_times_out_to_one_new_session_terminal() {
+    let harness = VoiceSessionHarness::speaking_generations([GenerationId::new(1)])
+        .with_stalled_turn_cleanup();
+    let mut events = harness.start().await;
+    harness
+        .start_speaking_generation(&mut events, GenerationId::new(1))
+        .await;
+
+    harness
+        .emit_barge_in(TurnId::new(1), GenerationId::new(1))
+        .await;
+    tokio::time::advance(Duration::from_secs(2)).await;
+    let observed = drain_until_session_terminal(&mut events).await;
+
+    assert_new_session_cleanup_timeout(&observed);
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_sidecar_completion_is_aborted_after_cleanup_timeout() {
+    let harness = VoiceSessionHarness::speaking_generations([]).with_stalled_completion();
+    let mut events = harness.start().await;
+    let runtime = harness.runtime.clone();
+    let shutdown = tokio::spawn(async move { runtime.shutdown().await });
+    tokio::task::yield_now().await;
+
+    tokio::time::advance(Duration::from_secs(2)).await;
+    timeout(Duration::from_secs(1), shutdown)
+        .await
+        .expect("sidecar completion cleanup did not time out")
+        .expect("shutdown task panicked")
+        .expect("shutdown command failed");
+    let observed = drain_until_session_terminal(&mut events).await;
+
+    assert_new_session_cleanup_timeout(&observed);
+    assert!(harness.factory.completion_finished.load(Ordering::Acquire));
+}
+
+#[tokio::test(start_paused = true)]
 async fn recognition_failure_recovers_to_listening() {
     let harness = VoiceSessionHarness::speaking_generations([]);
     let mut events = harness.start().await;
@@ -341,6 +439,25 @@ fn assert_no_late_generation_work(observed: &[VoiceSessionEvent]) {
     )));
 }
 
+fn assert_new_session_cleanup_timeout(observed: &[VoiceSessionEvent]) {
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|event| event.is_session_terminal())
+            .count(),
+        1
+    );
+    assert!(observed.iter().any(|event| matches!(
+        event,
+        VoiceSessionEvent::SessionFailed {
+            error,
+            recovery: RecoveryDisposition::NewSession,
+            ..
+        } if error.stage() == RuntimeStage::Runtime
+            && error.message().contains("cleanup timed out")
+    )));
+}
+
 struct VoiceSessionHarness {
     runtime: VoiceSessionRuntime,
     factory: Arc<TestVoiceIoFactory>,
@@ -356,19 +473,31 @@ impl VoiceSessionHarness {
     where
         I: IntoIterator<Item = GenerationId>,
     {
-        Self::with_active_generations_and_flush(active_generations, false)
+        Self::configured(active_generations, FlushBehavior::Succeed, false, false)
     }
 
-    fn with_active_generations_and_flush<I>(active_generations: I, fail_flush: bool) -> Self
+    fn configured<I>(
+        active_generations: I,
+        flush_behavior: FlushBehavior,
+        stall_language_cleanup: bool,
+        stall_completion: bool,
+    ) -> Self
     where
         I: IntoIterator<Item = GenerationId>,
     {
         let active_generations: BTreeSet<_> = active_generations.into_iter().collect();
         let (input, input_receiver) = mpsc::channel(64);
-        let output = Arc::new(CancellableOutput::new(fail_flush));
-        let language = Arc::new(CancellableLanguage::new(active_generations.clone()));
+        let output = Arc::new(CancellableOutput::new(flush_behavior));
+        let language = Arc::new(CancellableLanguage::new(
+            active_generations.clone(),
+            stall_language_cleanup,
+        ));
         let speech = Arc::new(CancellableSpeech::new(active_generations));
-        let factory = Arc::new(TestVoiceIoFactory::new(input_receiver, output.clone()));
+        let factory = Arc::new(TestVoiceIoFactory::new(
+            input_receiver,
+            output.clone(),
+            stall_completion,
+        ));
         let runtime = VoiceSessionRuntime::new(VoiceSessionAdapters::new(
             factory.clone(),
             language.clone(),
@@ -386,8 +515,46 @@ impl VoiceSessionHarness {
     }
 
     fn with_flush_failure(self) -> Self {
-        Self::with_active_generations_and_flush(
+        Self::configured(
             self.language.active_generations.iter().copied(),
+            FlushBehavior::Fail,
+            false,
+            false,
+        )
+    }
+
+    fn with_flush_waking_enqueue_failure(self) -> Self {
+        Self::configured(
+            self.language.active_generations.iter().copied(),
+            FlushBehavior::WakeEnqueueFailure,
+            false,
+            false,
+        )
+    }
+
+    fn with_stalled_flush(self) -> Self {
+        Self::configured(
+            self.language.active_generations.iter().copied(),
+            FlushBehavior::Stall,
+            false,
+            false,
+        )
+    }
+
+    fn with_stalled_turn_cleanup(self) -> Self {
+        Self::configured(
+            self.language.active_generations.iter().copied(),
+            FlushBehavior::Succeed,
+            true,
+            false,
+        )
+    }
+
+    fn with_stalled_completion(self) -> Self {
+        Self::configured(
+            self.language.active_generations.iter().copied(),
+            FlushBehavior::Succeed,
+            false,
             true,
         )
     }
@@ -498,13 +665,15 @@ impl VoiceSessionHarness {
 
 struct CancellableLanguage {
     active_generations: BTreeSet<GenerationId>,
+    stall_cleanup: bool,
     cleaned: Arc<Mutex<BTreeSet<GenerationId>>>,
 }
 
 impl CancellableLanguage {
-    fn new(active_generations: BTreeSet<GenerationId>) -> Self {
+    fn new(active_generations: BTreeSet<GenerationId>, stall_cleanup: bool) -> Self {
         Self {
             active_generations,
+            stall_cleanup,
             cleaned: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
@@ -529,6 +698,7 @@ impl GenerationLanguageModel for CancellableLanguage {
         }
 
         let cleaned = Arc::clone(&self.cleaned);
+        let stall_cleanup = self.stall_cleanup;
         tokio::spawn(async move {
             for _ in 0..128 {
                 if sender
@@ -544,6 +714,9 @@ impl GenerationLanguageModel for CancellableLanguage {
                 }
             }
             cancellation.cancelled().await;
+            if stall_cleanup {
+                pending::<()>().await;
+            }
             let _ = sender
                 .send(Ok(GenerationTextDelta::new(
                     request.turn_id(),
@@ -608,22 +781,32 @@ impl StreamingSpeechSynthesizer for CancellableSpeech {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FlushBehavior {
+    Succeed,
+    Fail,
+    WakeEnqueueFailure,
+    Stall,
+}
+
 struct CancellableOutput {
-    fail_flush: bool,
+    flush_behavior: FlushBehavior,
     frames: Mutex<Vec<AudioFrame>>,
     flushes: Mutex<Vec<GenerationId>>,
     enqueue_count: AtomicUsize,
     enqueue_notify: Notify,
+    flush_wakeup: Notify,
 }
 
 impl CancellableOutput {
-    fn new(fail_flush: bool) -> Self {
+    fn new(flush_behavior: FlushBehavior) -> Self {
         Self {
-            fail_flush,
+            flush_behavior,
             frames: Mutex::new(Vec::new()),
             flushes: Mutex::new(Vec::new()),
             enqueue_count: AtomicUsize::new(0),
             enqueue_notify: Notify::new(),
+            flush_wakeup: Notify::new(),
         }
     }
 
@@ -655,7 +838,17 @@ impl ContinuousAudioOutput for CancellableOutput {
                 .push(frame.clone());
             self.enqueue_count.fetch_add(1, Ordering::AcqRel);
             self.enqueue_notify.notify_waiters();
-            cancellation.cancelled().await;
+            if self.flush_behavior == FlushBehavior::WakeEnqueueFailure {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => {}
+                    _ = self.flush_wakeup.notified() => {
+                        return Err(AdapterError::new("media enqueue failed during flush"));
+                    }
+                }
+            } else {
+                cancellation.cancelled().await;
+            }
             self.frames
                 .lock()
                 .expect("frame lock poisoned")
@@ -678,10 +871,19 @@ impl ContinuousAudioOutput for CancellableOutput {
                 .lock()
                 .expect("frame lock poisoned")
                 .retain(|frame| frame.generation_id() != generation_id);
-            if self.fail_flush {
-                Err(AdapterError::new("output flush failed"))
-            } else {
-                Ok(PlaybackReceipt::new(generation_id, PlaybackState::Flushed))
+            match self.flush_behavior {
+                FlushBehavior::Succeed => {
+                    Ok(PlaybackReceipt::new(generation_id, PlaybackState::Flushed))
+                }
+                FlushBehavior::Fail => Err(AdapterError::new("output flush failed")),
+                FlushBehavior::WakeEnqueueFailure => {
+                    self.flush_wakeup.notify_one();
+                    for _ in 0..128 {
+                        tokio::task::yield_now().await;
+                    }
+                    Ok(PlaybackReceipt::new(generation_id, PlaybackState::Flushed))
+                }
+                FlushBehavior::Stall => pending().await,
             }
         })
     }
@@ -693,12 +895,14 @@ struct TestVoiceIoFactory {
     completion_failure: mpsc::Sender<AdapterError>,
     completion_receiver: Mutex<Option<mpsc::Receiver<AdapterError>>>,
     completion_finished: Arc<AtomicBool>,
+    stall_completion: bool,
 }
 
 impl TestVoiceIoFactory {
     fn new(
         input: mpsc::Receiver<Result<VoiceInputEvent, AdapterError>>,
         output: Arc<CancellableOutput>,
+        stall_completion: bool,
     ) -> Self {
         let (completion_failure, completion_receiver) = mpsc::channel(1);
         Self {
@@ -711,6 +915,7 @@ impl TestVoiceIoFactory {
             completion_failure,
             completion_receiver: Mutex::new(Some(completion_receiver)),
             completion_finished: Arc::new(AtomicBool::new(false)),
+            stall_completion,
         }
     }
 
@@ -750,10 +955,15 @@ impl VoiceIoFactory for TestVoiceIoFactory {
                 .take()
                 .ok_or_else(|| AdapterError::new("voice factory already started"))?;
             let completion_finished = Arc::clone(&self.completion_finished);
+            let stall_completion = self.stall_completion;
             Ok(VoiceIoSession {
                 input: self.input.clone(),
                 output: self.output.clone(),
                 completion: tokio::spawn(async move {
+                    let _finished = CompletionFinished(completion_finished);
+                    if stall_completion {
+                        pending::<()>().await;
+                    }
                     let outcome = tokio::select! {
                         biased;
                         _ = cancellation.cancelled() => Ok(()),
@@ -763,11 +973,18 @@ impl VoiceIoFactory for TestVoiceIoFactory {
                             }))
                         }
                     };
-                    completion_finished.store(true, Ordering::Release);
                     outcome
                 }),
             })
         })
+    }
+}
+
+struct CompletionFinished(Arc<AtomicBool>);
+
+impl Drop for CompletionFinished {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
     }
 }
 

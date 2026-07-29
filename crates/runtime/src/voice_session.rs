@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
-use std::future::pending;
+use std::future::{pending, Future};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,6 +25,9 @@ use crate::{
 const SESSION_EVENT_BUFFER_SIZE: usize = 32;
 const SESSION_COMMAND_BUFFER_SIZE: usize = 8;
 const RELIABLE_EVENT_RESERVE: usize = 4;
+const MAX_PENDING_RELIABLE_EVENTS: usize = SESSION_EVENT_BUFFER_SIZE;
+const MAX_PENDING_PARTIAL_SEGMENTS: usize = SESSION_EVENT_BUFFER_SIZE;
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 pub struct VoiceSessionAdapters {
@@ -231,7 +234,7 @@ async fn run_voice_session(
     let VoiceIoSession {
         input,
         output,
-        mut completion,
+        completion,
     } = match adapters
         .voice_io
         .start(session_id, cancellation.clone())
@@ -250,7 +253,9 @@ async fn run_voice_session(
         Ok(input_events) => input_events,
         Err(error) => {
             cancellation.cancel();
-            let _ = (&mut completion).await;
+            if let Err(cleanup_error) = await_completion_cleanup(completion).await {
+                return session_failure(session_id, cleanup_error);
+            }
             return session_failure(
                 session_id,
                 adapter_runtime_error(RuntimeStage::AudioCapture, error),
@@ -352,24 +357,34 @@ impl VoiceLoop {
 
     async fn run(mut self) -> VoiceSessionEvent {
         let exit = self.run_until_exit().await;
-        self.cleanup_active_turn().await;
+        let mut cleanup_error = self.cleanup_active_turn().await.err();
         self.state = VoiceLoopState::Ending;
         self.cancellation.cancel();
         if let Some(completion) = self.completion.take() {
-            let _ = completion.await;
+            if let Err(error) = await_completion_cleanup(completion).await {
+                cleanup_error.get_or_insert(error);
+            }
         }
 
         match exit {
             LoopExit::Shutdown(completion) => {
                 let _ = completion.send(());
-                VoiceSessionEvent::SessionEnded {
-                    session_id: self.session_id,
+                match cleanup_error {
+                    Some(error) => session_failure(self.session_id, error),
+                    None => VoiceSessionEvent::SessionEnded {
+                        session_id: self.session_id,
+                    },
                 }
             }
-            LoopExit::ConsumerDropped => VoiceSessionEvent::SessionEnded {
-                session_id: self.session_id,
+            LoopExit::ConsumerDropped => match cleanup_error {
+                Some(error) => session_failure(self.session_id, error),
+                None => VoiceSessionEvent::SessionEnded {
+                    session_id: self.session_id,
+                },
             },
-            LoopExit::Fatal(error) => session_failure(self.session_id, error),
+            LoopExit::Fatal(error) => {
+                session_failure(self.session_id, cleanup_error.unwrap_or(error))
+            }
         }
     }
 
@@ -378,7 +393,10 @@ impl VoiceLoop {
             if !self.flush_pending_events() {
                 return LoopExit::ConsumerDropped;
             }
-            let pending_delivery = self.has_pending_events();
+            let pending_delivery = self.pending_delivery();
+            let has_pending_delivery = pending_delivery.is_some();
+            let poll_producers = self.reliable_events.len()
+                < MAX_PENDING_RELIABLE_EVENTS.saturating_sub(RELIABLE_EVENT_RESERVE);
             let signal = tokio::select! {
                 biased;
                 _ = self.cancellation.cancelled() => LoopSignal::ConsumerDropped,
@@ -386,12 +404,17 @@ impl VoiceLoop {
                 command = self.commands.recv() => LoopSignal::Command(command),
                 completion = wait_for_completion(&mut self.completion),
                     if self.completion.is_some() => LoopSignal::Completion(completion),
-                input = self.input.recv() => LoopSignal::Input(input),
+                input = self.input.recv(),
+                    if poll_producers => LoopSignal::Input(input),
                 turn = recv_turn_event(&mut self.turn_events),
-                    if self.turn_events.is_some() => LoopSignal::Turn(turn),
-                _ = self.deadline.wait() => LoopSignal::Deadline,
-                permit = reserve_event(self.events.clone()),
-                    if pending_delivery => LoopSignal::Permit(permit),
+                    if poll_producers && self.turn_events.is_some() => LoopSignal::Turn(turn),
+                _ = self.deadline.wait(),
+                    if poll_producers => LoopSignal::Deadline,
+                delivery = deliver_pending_event(
+                    self.events.clone(),
+                    self.session_id,
+                    pending_delivery,
+                ), if has_pending_delivery => LoopSignal::Delivery(delivery),
             };
 
             let exit = match signal {
@@ -404,9 +427,9 @@ impl VoiceLoop {
                 LoopSignal::Input(input) => self.handle_input(input).await,
                 LoopSignal::Turn(turn) => self.handle_turn_event(turn).await,
                 LoopSignal::Deadline => self.handle_deadline().await,
-                LoopSignal::Permit(permit) => {
-                    if let Some(permit) = permit {
-                        self.send_pending_event(permit);
+                LoopSignal::Delivery(delivery) => {
+                    if let Some(delivery) = delivery {
+                        self.remove_pending_delivery(delivery);
                         None
                     } else {
                         Some(LoopExit::ConsumerDropped)
@@ -485,11 +508,14 @@ impl VoiceLoop {
                 self.finalizer = TurnFinalizer::new(self.final_silence_ms)
                     .expect("session final silence remains valid");
                 self.active_segment_id = None;
-                if !self.publish_reliable(VoiceSessionEvent::SessionFailed {
-                    session_id: self.session_id,
-                    error: adapter_runtime_error(RuntimeStage::SpeechRecognizer, error),
-                    recovery: RecoveryDisposition::ContinueSession,
-                }) {
+                if !self
+                    .publish_reliable(VoiceSessionEvent::SessionFailed {
+                        session_id: self.session_id,
+                        error: adapter_runtime_error(RuntimeStage::SpeechRecognizer, error),
+                        recovery: RecoveryDisposition::ContinueSession,
+                    })
+                    .await
+                {
                     return Some(LoopExit::ConsumerDropped);
                 }
                 None
@@ -503,7 +529,13 @@ impl VoiceLoop {
     }
 
     async fn handle_activity(&mut self, activity: VoiceActivity) -> Option<LoopExit> {
-        self.finalizer.observe_activity(activity);
+        let finalizer_activity = match activity {
+            VoiceActivity::SpeechEnded { .. } => VoiceActivity::SpeechEnded {
+                at_ms: self.clock.now_ms(),
+            },
+            _ => activity,
+        };
+        self.finalizer.observe_activity(finalizer_activity);
         if !self.publish_best_effort(VoiceSessionEvent::VoiceActivity {
             session_id: self.session_id,
             activity,
@@ -568,11 +600,14 @@ impl VoiceLoop {
             .checked_add(1)
             .ok_or_else(|| runtime_error("voice generation identifier overflowed"))?;
 
-        if !self.publish_reliable(VoiceSessionEvent::TranscriptFinal {
-            session_id: self.session_id,
-            turn_id,
-            text: finalized.text.clone(),
-        }) {
+        if !self
+            .publish_reliable(VoiceSessionEvent::TranscriptFinal {
+                session_id: self.session_id,
+                turn_id,
+                text: finalized.text.clone(),
+            })
+            .await
+        {
             return Err(runtime_error(
                 "voice session event stream closed during finalization",
             ));
@@ -615,7 +650,7 @@ impl VoiceLoop {
             _ => None,
         };
         self.publish_runtime_timing(&event);
-        if !self.publish_turn_event(event) {
+        if !self.publish_turn_event(event).await {
             return Some(LoopExit::ConsumerDropped);
         }
 
@@ -623,11 +658,14 @@ impl VoiceLoop {
             self.turn_events.take();
             self.state = VoiceLoopState::Listening;
             if let Some(error) = failure {
-                if !self.publish_reliable(VoiceSessionEvent::SessionFailed {
-                    session_id: self.session_id,
-                    error,
-                    recovery: RecoveryDisposition::ContinueSession,
-                }) {
+                if !self
+                    .publish_reliable(VoiceSessionEvent::SessionFailed {
+                        session_id: self.session_id,
+                        error,
+                        recovery: RecoveryDisposition::ContinueSession,
+                    })
+                    .await
+                {
                     return Some(LoopExit::ConsumerDropped);
                 }
             }
@@ -653,11 +691,14 @@ impl VoiceLoop {
         {
             return Ok(());
         }
-        if !self.publish_reliable(VoiceSessionEvent::BargeIn {
-            session_id: self.session_id,
-            turn_id,
-            generation_id,
-        }) {
+        if !self
+            .publish_reliable(VoiceSessionEvent::BargeIn {
+                session_id: self.session_id,
+                turn_id,
+                generation_id,
+            })
+            .await
+        {
             return Err(runtime_error(
                 "voice session event stream closed during barge-in",
             ));
@@ -674,17 +715,33 @@ impl VoiceLoop {
         else {
             return Ok(());
         };
-        let flush_result = self.output.flush(self.session_id, generation_id).await;
-        let interrupt_result = self.turn_runtime.interrupt(turn_id, generation_id).await;
-        let saw_terminal = self.drain_interrupted_turn().await;
+
+        let interrupt_result = cleanup_with_timeout(
+            "streaming turn interruption",
+            self.turn_runtime.interrupt(turn_id, generation_id),
+        )
+        .await;
+        match interrupt_result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) | Err(error) => {
+                self.turn_events.take();
+                self.state = VoiceLoopState::Listening;
+                return Err(error);
+            }
+        }
+
+        let flush_result = cleanup_with_timeout(
+            "continuous audio flush",
+            self.output.flush(self.session_id, generation_id),
+        )
+        .await;
+        let drain_result =
+            cleanup_with_timeout("streaming turn drain", self.drain_interrupted_turn(turn_id))
+                .await;
         self.state = VoiceLoopState::Listening;
 
-        if !saw_terminal {
-            return Err(interrupt_result.err().unwrap_or_else(|| {
-                runtime_error("interrupted turn ended without a terminal event")
-            }));
-        }
-        if let Err(error) = flush_result {
+        drain_result??;
+        if let Err(error) = flush_result? {
             return Err(adapter_runtime_error(
                 RuntimeStage::ContinuousAudioOutput,
                 error,
@@ -693,33 +750,50 @@ impl VoiceLoop {
         Ok(())
     }
 
-    async fn drain_interrupted_turn(&mut self) -> bool {
+    async fn drain_interrupted_turn(
+        &mut self,
+        expected_turn_id: TurnId,
+    ) -> Result<(), RuntimeError> {
         let Some(mut turn_events) = self.turn_events.take() else {
-            return false;
+            return Err(runtime_error(
+                "interrupted turn ended without an event stream",
+            ));
         };
+        let mut delivery_open = true;
         while let Some(event) = turn_events.recv().await {
             let terminal = event.is_terminal();
+            let matching_cancellation = matches!(
+                event,
+                RuntimeEvent::TurnCancelled { turn_id } if turn_id == expected_turn_id
+            );
             self.publish_runtime_timing(&event);
-            if !self.publish_turn_event(event) {
-                return terminal;
-            }
+            let published = self.publish_turn_event(event).await;
+            delivery_open &= published;
             if terminal {
-                return true;
+                if !matching_cancellation {
+                    return Err(runtime_error(format!(
+                        "interrupted turn {expected_turn_id} ended without its matching cancellation"
+                    )));
+                }
+                return if delivery_open {
+                    Ok(())
+                } else {
+                    Err(runtime_error(
+                        "voice session event stream closed during turn cancellation",
+                    ))
+                };
             }
         }
-        false
+        Err(runtime_error(
+            "interrupted turn ended without a terminal event",
+        ))
     }
 
-    async fn cleanup_active_turn(&mut self) {
-        let VoiceLoopState::Responding {
-            turn_id,
-            generation_id,
-        } = self.state
-        else {
-            return;
-        };
-        let _ = self.turn_runtime.interrupt(turn_id, generation_id).await;
-        let _ = self.drain_interrupted_turn().await;
+    async fn cleanup_active_turn(&mut self) -> Result<(), RuntimeError> {
+        if !matches!(self.state, VoiceLoopState::Responding { .. }) {
+            return Ok(());
+        }
+        self.interrupt_current_turn().await
     }
 
     fn publish_runtime_timing(&mut self, event: &RuntimeEvent) {
@@ -745,21 +819,30 @@ impl VoiceLoop {
         });
     }
 
-    fn publish_turn_event(&mut self, event: RuntimeEvent) -> bool {
+    async fn publish_turn_event(&mut self, event: RuntimeEvent) -> bool {
         let reliable = event.is_terminal();
         let event = VoiceSessionEvent::Turn {
             session_id: self.session_id,
             event,
         };
         if reliable {
-            self.publish_reliable(event)
+            self.publish_reliable(event).await
         } else {
             self.publish_best_effort(event)
         }
     }
 
-    fn publish_reliable(&mut self, event: VoiceSessionEvent) -> bool {
+    async fn publish_reliable(&mut self, event: VoiceSessionEvent) -> bool {
         if !self.reliable_events.is_empty() {
+            if self.reliable_events.len() >= MAX_PENDING_RELIABLE_EVENTS {
+                let oldest = self
+                    .reliable_events
+                    .pop_front()
+                    .expect("full reliable queue contains an oldest event");
+                if self.events.send(oldest).await.is_err() {
+                    return false;
+                }
+            }
             self.reliable_events.push_back(event);
             return !self.events.is_closed();
         }
@@ -788,11 +871,11 @@ impl VoiceLoop {
 
     fn publish_partial(&mut self, segment_id: u64, text: String) -> bool {
         if !self.reliable_events.is_empty() {
-            self.partials.insert(segment_id, text);
+            self.store_partial(segment_id, text);
             return !self.events.is_closed();
         }
         if self.events.capacity() <= RELIABLE_EVENT_RESERVE {
-            self.partials.insert(segment_id, text);
+            self.store_partial(segment_id, text);
             return !self.events.is_closed();
         }
         let event = VoiceSessionEvent::TranscriptPartial {
@@ -807,7 +890,7 @@ impl VoiceLoop {
                 text,
                 ..
             })) => {
-                self.partials.insert(segment_id, text);
+                self.store_partial(segment_id, text);
                 true
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -815,6 +898,15 @@ impl VoiceLoop {
             }
             Err(mpsc::error::TrySendError::Closed(_)) => false,
         }
+    }
+
+    fn store_partial(&mut self, segment_id: u64, text: String) {
+        if !self.partials.contains_key(&segment_id)
+            && self.partials.len() >= MAX_PENDING_PARTIAL_SEGMENTS
+        {
+            self.partials.pop_first();
+        }
+        self.partials.insert(segment_id, text);
     }
 
     fn flush_pending_events(&mut self) -> bool {
@@ -847,22 +939,28 @@ impl VoiceLoop {
         true
     }
 
-    fn has_pending_events(&self) -> bool {
-        !self.reliable_events.is_empty()
-            || (!self.partials.is_empty() && self.events.capacity() > RELIABLE_EVENT_RESERVE)
+    fn pending_delivery(&self) -> Option<PendingDelivery> {
+        if let Some(event) = self.reliable_events.front() {
+            return Some(PendingDelivery::Reliable(event.clone()));
+        }
+        self.partials
+            .first_key_value()
+            .map(|(&segment_id, text)| PendingDelivery::Partial {
+                segment_id,
+                text: text.clone(),
+            })
     }
 
-    fn send_pending_event(&mut self, permit: mpsc::OwnedPermit<VoiceSessionEvent>) {
-        if let Some(event) = self.reliable_events.pop_front() {
-            permit.send(event);
-            return;
-        }
-        if let Some((segment_id, text)) = self.partials.pop_first() {
-            permit.send(VoiceSessionEvent::TranscriptPartial {
-                session_id: self.session_id,
-                segment_id,
-                text,
-            });
+    fn remove_pending_delivery(&mut self, delivery: PendingDelivery) {
+        match delivery {
+            PendingDelivery::Reliable(_) => {
+                self.reliable_events.pop_front();
+            }
+            PendingDelivery::Partial { segment_id, text } => {
+                if self.partials.get(&segment_id) == Some(&text) {
+                    self.partials.remove(&segment_id);
+                }
+            }
         }
     }
 }
@@ -874,7 +972,7 @@ enum LoopSignal {
     Input(Option<Result<VoiceInputEvent, AdapterError>>),
     Turn(Option<RuntimeEvent>),
     Deadline,
-    Permit(Option<mpsc::OwnedPermit<VoiceSessionEvent>>),
+    Delivery(Option<PendingDelivery>),
 }
 
 enum LoopExit {
@@ -899,10 +997,58 @@ async fn recv_turn_event(events: &mut Option<StreamingTurnEventStream>) -> Optio
     }
 }
 
-async fn reserve_event(
+#[derive(Clone)]
+enum PendingDelivery {
+    Reliable(VoiceSessionEvent),
+    Partial { segment_id: u64, text: String },
+}
+
+async fn deliver_pending_event(
     events: mpsc::Sender<VoiceSessionEvent>,
-) -> Option<mpsc::OwnedPermit<VoiceSessionEvent>> {
-    events.reserve_owned().await.ok()
+    session_id: SessionId,
+    delivery: Option<PendingDelivery>,
+) -> Option<PendingDelivery> {
+    let delivery = delivery?;
+    let event = match &delivery {
+        PendingDelivery::Reliable(event) => event.clone(),
+        PendingDelivery::Partial { segment_id, text } => VoiceSessionEvent::TranscriptPartial {
+            session_id,
+            segment_id: *segment_id,
+            text: text.clone(),
+        },
+    };
+    if matches!(&delivery, PendingDelivery::Reliable(_)) {
+        events.reserve().await.ok()?.send(event);
+    } else {
+        let mut permits = events.reserve_many(RELIABLE_EVENT_RESERVE + 1).await.ok()?;
+        permits
+            .next()
+            .expect("partial delivery reserved one usable permit")
+            .send(event);
+    }
+    Some(delivery)
+}
+
+async fn cleanup_with_timeout<T>(
+    operation: &'static str,
+    future: impl Future<Output = T>,
+) -> Result<T, RuntimeError> {
+    tokio::time::timeout(CLEANUP_TIMEOUT, future)
+        .await
+        .map_err(|_| cleanup_timeout_error(operation))
+}
+
+async fn await_completion_cleanup(
+    mut completion: JoinHandle<Result<(), AdapterError>>,
+) -> Result<(), RuntimeError> {
+    match cleanup_with_timeout("voice sidecar completion", &mut completion).await {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            completion.abort();
+            let _ = completion.await;
+            Err(error)
+        }
+    }
 }
 
 fn active_turn_id(state: VoiceLoopState) -> Option<TurnId> {
@@ -963,6 +1109,12 @@ fn runtime_error(message: impl Into<String>) -> RuntimeError {
         RuntimeStage::Runtime,
         message,
     )
+}
+
+fn cleanup_timeout_error(operation: &'static str) -> RuntimeError {
+    runtime_error(format!(
+        "voice session cleanup timed out during {operation}"
+    ))
 }
 
 fn closed_completion() -> oneshot::Sender<()> {

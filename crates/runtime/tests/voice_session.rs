@@ -81,6 +81,22 @@ async fn deadline_fires_without_any_subsequent_input_event() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn sidecar_timestamp_skew_does_not_move_the_session_deadline() {
+    let harness = VoiceSessionHarness::new();
+    let mut events = harness.start().await;
+    assert_session_started(events.recv().await);
+
+    tokio::time::advance(Duration::from_millis(250)).await;
+    harness.engine_final(4, "clock domain").await;
+    harness.speech_ended(9_000_000).await;
+    tokio::time::advance(Duration::from_millis(600)).await;
+
+    let observed = drain_until_turn_terminal(&mut events).await;
+    assert_final_and_completed(&observed, TurnId::new(1), "clock domain");
+    harness.shutdown(&mut events).await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn resumed_speech_disarms_and_rearms_the_deadline() {
     let harness = VoiceSessionHarness::new();
     let mut events = harness.start().await;
@@ -179,6 +195,105 @@ async fn rejected_policy_never_starts_the_voice_factory() {
     assert!(!harness.factory.input_started.load(Ordering::Acquire));
 }
 
+#[tokio::test(start_paused = true)]
+async fn unique_partial_coalescing_remains_bounded_under_stalled_delivery() {
+    let harness = VoiceSessionHarness::new();
+    let mut events = harness.start().await;
+    assert_session_started(events.recv().await);
+
+    for segment_id in 1..=96 {
+        harness
+            .partial(segment_id, &format!("unique-{segment_id}"))
+            .await;
+    }
+
+    for _ in 0..60 {
+        assert!(matches!(
+            events.recv().await,
+            Some(VoiceSessionEvent::TranscriptPartial { .. })
+        ));
+    }
+    tokio::select! {
+        event = events.recv() => panic!("partial pending state exceeded its bound: {event:?}"),
+        _ = tokio::time::sleep(Duration::from_millis(1)) => {}
+    }
+
+    harness.shutdown(&mut events).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_consumer_backpressures_sustained_multi_turn_reliable_events() {
+    let harness = VoiceSessionHarness::new();
+    let mut events = harness.start().await;
+    assert_session_started(events.recv().await);
+
+    for segment_id in 1..=4 {
+        harness
+            .partial(segment_id, &format!("partial-{segment_id}"))
+            .await;
+        harness
+            .engine_final(segment_id, &format!("final-{segment_id}"))
+            .await;
+        harness.speech_ended((segment_id - 1) * 600).await;
+        tokio::time::advance(Duration::from_millis(600)).await;
+        harness.wait_for_request_count(segment_id as usize).await;
+    }
+
+    for segment_id in 100..196 {
+        harness
+            .input
+            .send(Ok(VoiceInputEvent::Recognition(
+                conversation_model_adapters::RecognitionEvent::Hypothesis(
+                    conversation_model_adapters::RecognitionHypothesis::partial(
+                        segment_id,
+                        format!("unique-{segment_id}"),
+                    ),
+                ),
+            )))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+    }
+
+    let mut saw_backpressure = false;
+    for segment_id in 1_000..2_000 {
+        let input = if segment_id % 2 == 0 {
+            Err(AdapterError::new("voice sidecar recognition failed"))
+        } else {
+            Ok(VoiceInputEvent::Recognition(
+                conversation_model_adapters::RecognitionEvent::Hypothesis(
+                    conversation_model_adapters::RecognitionHypothesis::partial(
+                        segment_id,
+                        format!("saturated-{segment_id}"),
+                    ),
+                ),
+            ))
+        };
+        match harness.input.try_send(input) {
+            Ok(()) => tokio::task::yield_now().await,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                saw_backpressure = true;
+                break;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                panic!("voice input closed before saturation")
+            }
+        }
+    }
+
+    assert!(
+        saw_backpressure,
+        "stalled event delivery did not backpressure reliable producers"
+    );
+    drop(events);
+    timeout(
+        Duration::from_secs(1),
+        harness.factory.wait_for_completion(),
+    )
+    .await
+    .expect("saturated session did not clean up");
+}
+
 struct VoiceSessionHarness {
     runtime: VoiceSessionRuntime,
     factory: Arc<TestVoiceIoFactory>,
@@ -251,6 +366,16 @@ impl VoiceSessionHarness {
         tokio::task::yield_now().await;
     }
 
+    async fn wait_for_request_count(&self, expected: usize) {
+        for _ in 0..128 {
+            if self.language.requests().len() >= expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("language request {expected} did not start");
+    }
+
     async fn shutdown(&self, events: &mut VoiceSessionEventStream) {
         self.runtime.shutdown().await.unwrap();
         let terminal = timeout(Duration::from_secs(1), async {
@@ -307,6 +432,12 @@ impl TestVoiceIoFactory {
     async fn wait_for_input_start(&self) {
         while !self.input_started.load(Ordering::Acquire) {
             self.input.started_notify.notified().await;
+        }
+    }
+
+    async fn wait_for_completion(&self) {
+        while !self.completion_finished.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
         }
     }
 }

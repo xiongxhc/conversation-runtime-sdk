@@ -140,6 +140,25 @@ fn run() -> Result<(), String> {
                             .ok_or_else(|| "missing held media".to_owned())?,
                     )?;
                     held_media_released_on_capture = true;
+                } else if scenario == "recognition-failure-nonfatal" {
+                    write_json_frame(
+                        &mut stdout,
+                        FAILURE,
+                        json!({
+                            "session_id": session,
+                            "stage": "speech_recognizer",
+                            "code": "recognition_failed"
+                        }),
+                    )?;
+                    write_json_frame(
+                        &mut stdout,
+                        VOICE_ACTIVITY,
+                        json!({
+                            "session_id": session,
+                            "activity": "speech_started",
+                            "at_ms": 10
+                        }),
+                    )?;
                 } else if scenario == "partial-final" {
                     write_json_frame(
                         &mut stdout,

@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use std::ffi::{OsStr, OsString};
 use std::future::Future;
 use std::os::unix::fs::PermissionsExt;
@@ -464,8 +466,8 @@ async fn concurrent_same_generation_enqueues_resolve_the_exact_reversed_acknowle
 }
 
 #[tokio::test]
-async fn dropped_enqueue_releases_its_exact_two_second_reservation_for_retry() {
-    let harness = FakeSidecarHarness::new("hold-first-media-ack");
+async fn dropped_enqueue_retains_its_two_second_reservation_until_exact_ack() {
+    let harness = FakeSidecarHarness::new("release-held-media-on-capture");
     let cancellation = CancellationToken::new();
     let session = harness.start(cancellation.clone()).await.unwrap();
     let output = Arc::clone(&session.output);
@@ -481,16 +483,83 @@ async fn dropped_enqueue_releases_its_exact_two_second_reservation_for_retry() {
 
     dropped.abort();
     assert!(dropped.await.unwrap_err().is_cancelled());
-    let retried = tokio::time::timeout(
-        Duration::from_secs(1),
-        session
-            .output
-            .enqueue(frame(GenerationId::new(13), 1), CancellationToken::new()),
-    )
-    .await
-    .expect("retry remained blocked by dropped enqueue reservation")
-    .unwrap();
+    let retry_output = Arc::clone(&session.output);
+    let mut retried = tokio::spawn(async move {
+        retry_output
+            .enqueue(frame(GenerationId::new(13), 1), CancellationToken::new())
+            .await
+    });
+    let retry_was_blocked = tokio::time::timeout(Duration::from_millis(100), &mut retried)
+        .await
+        .is_err();
+    if !retry_was_blocked {
+        cancellation.cancel();
+        let _ = await_completion(session.completion).await;
+        harness.assert_process_gone().await;
+        panic!("retry bypassed the cancelled in-flight duration reservation");
+    }
+    assert_eq!(harness.marker_line_count(harness.held_marker()), 1);
+
+    let _input = session
+        .input
+        .start(SESSION_ID, CancellationToken::new())
+        .await
+        .unwrap();
+    let retried = tokio::time::timeout(Duration::from_secs(1), retried)
+        .await
+        .expect("retry remained blocked after exact old acknowledgement")
+        .unwrap()
+        .unwrap();
     assert_eq!(retried.state(), PlaybackState::Accepted);
+
+    cancellation.cancel();
+    assert!(await_completion(session.completion).await.is_err());
+    harness.assert_process_gone().await;
+}
+
+#[tokio::test]
+async fn same_exact_identity_retry_waits_until_late_old_ack_is_consumed() {
+    let harness = FakeSidecarHarness::new("late-old-ack-on-next-media");
+    let cancellation = CancellationToken::new();
+    let session = harness.start(cancellation.clone()).await.unwrap();
+    let operation_cancellation = CancellationToken::new();
+    let output = Arc::clone(&session.output);
+    let operation_cancellation_for_task = operation_cancellation.clone();
+    let cancelled = tokio::spawn(async move {
+        output
+            .enqueue(
+                frame(GenerationId::new(19), 0),
+                operation_cancellation_for_task,
+            )
+            .await
+    });
+    harness.wait_for_marker(harness.held_marker()).await;
+
+    operation_cancellation.cancel();
+    assert!(cancelled.await.unwrap().is_err());
+    let same_identity = session
+        .output
+        .enqueue(frame(GenerationId::new(19), 0), CancellationToken::new())
+        .await;
+    if same_identity.is_ok() {
+        cancellation.cancel();
+        let _ = await_completion(session.completion).await;
+        harness.assert_process_gone().await;
+        panic!("same identity was reused while an old acknowledgement remained possible");
+    }
+
+    let trigger = session
+        .output
+        .enqueue(frame(GenerationId::new(19), 1), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(trigger.state(), PlaybackState::Accepted);
+    let safe_retry = session
+        .output
+        .enqueue(frame(GenerationId::new(19), 0), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(safe_retry.state(), PlaybackState::Accepted);
 
     cancellation.cancel();
     assert!(await_completion(session.completion).await.is_err());
@@ -531,6 +600,53 @@ async fn cancelled_enqueue_removes_only_its_operation_and_allows_retry() {
     cancellation.cancel();
     assert!(await_completion(session.completion).await.is_err());
     harness.assert_process_gone().await;
+}
+
+#[tokio::test]
+async fn repeated_cancelled_written_media_remains_bounded_by_existing_limits() {
+    let harness = FakeSidecarHarness::new("withhold-media-acks");
+    let cancellation = CancellationToken::new();
+    let session = harness.start(cancellation.clone()).await.unwrap();
+
+    for sequence in 0..100 {
+        let operation_cancellation = CancellationToken::new();
+        let output = Arc::clone(&session.output);
+        let operation_cancellation_for_task = operation_cancellation.clone();
+        let enqueue = tokio::spawn(async move {
+            output
+                .enqueue(
+                    frame(GenerationId::new(20), sequence),
+                    operation_cancellation_for_task,
+                )
+                .await
+        });
+        harness
+            .wait_for_marker_lines(harness.held_marker(), sequence as usize + 1)
+            .await;
+        operation_cancellation.cancel();
+        assert!(enqueue.await.unwrap().is_err());
+    }
+
+    let blocked_output = Arc::clone(&session.output);
+    let blocked = tokio::spawn(async move {
+        blocked_output
+            .enqueue(frame(GenerationId::new(20), 100), CancellationToken::new())
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let held_line_count = harness.marker_line_count(harness.held_marker());
+    let final_enqueue_was_blocked = !blocked.is_finished();
+
+    cancellation.cancel();
+    assert!(blocked.await.unwrap().is_err());
+    assert!(await_completion(session.completion).await.is_err());
+    harness.assert_process_gone().await;
+
+    assert_eq!(held_line_count, 100);
+    assert!(
+        final_enqueue_was_blocked,
+        "the 101st cancelled in-flight frame reached the fake child"
+    );
 }
 
 #[tokio::test]
@@ -958,10 +1074,25 @@ impl FakeSidecarHarness {
         &self.order_marker
     }
 
+    fn marker_line_count(&self, marker: &Path) -> usize {
+        std::fs::read_to_string(marker)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    }
+
     async fn wait_for_marker(&self, marker: &Path) {
         wait_until(Duration::from_secs(1), || marker.exists())
             .await
             .expect("fake-sidecar marker timeout");
+    }
+
+    async fn wait_for_marker_lines(&self, marker: &Path, lines: usize) {
+        wait_until(Duration::from_secs(1), || {
+            self.marker_line_count(marker) >= lines
+        })
+        .await
+        .expect("fake-sidecar marker line timeout");
     }
 
     async fn assert_process_gone(&self) {

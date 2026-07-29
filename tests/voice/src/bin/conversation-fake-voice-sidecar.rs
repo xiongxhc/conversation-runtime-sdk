@@ -89,6 +89,8 @@ fn run() -> Result<(), String> {
     let mut session_id = None;
     let mut ready = false;
     let mut held_media = None;
+    let mut held_media_released_on_capture = false;
+    let mut late_old_ack_released = false;
     let mut reversed_media = Vec::new();
     let mut last_media = None;
     let mut held_flush = false;
@@ -130,7 +132,15 @@ fn run() -> Result<(), String> {
                 }
             }
             FakeEvent::Control(ControlFrame::StartCapture { session }) if ready => {
-                if scenario == "partial-final" {
+                if scenario == "release-held-media-on-capture" {
+                    acknowledge_media(
+                        &mut stdout,
+                        held_media
+                            .take()
+                            .ok_or_else(|| "missing held media".to_owned())?,
+                    )?;
+                    held_media_released_on_capture = true;
+                } else if scenario == "partial-final" {
                     write_json_frame(
                         &mut stdout,
                         VOICE_ACTIVITY,
@@ -304,6 +314,35 @@ fn run() -> Result<(), String> {
                     "hold-first-media-ack" if held_media.is_none() => {
                         held_media = Some(identity);
                         write_marker_from_env(HELD_MARKER_ENV, "media-held", false)?;
+                    }
+                    "release-held-media-on-capture" if !held_media_released_on_capture => {
+                        held_media = Some(identity);
+                        write_marker_from_env(HELD_MARKER_ENV, "media-held\n", true)?;
+                    }
+                    "late-old-ack-on-next-media" if !late_old_ack_released => {
+                        if held_media.is_some() {
+                            acknowledge_media(
+                                &mut stdout,
+                                held_media
+                                    .take()
+                                    .ok_or_else(|| "missing held media".to_owned())?,
+                            )?;
+                            acknowledge_media(&mut stdout, identity)?;
+                            late_old_ack_released = true;
+                            continue;
+                        }
+                        held_media = Some(identity);
+                        write_marker_from_env(HELD_MARKER_ENV, "media-held\n", true)?;
+                    }
+                    "late-old-ack-on-next-media" => {
+                        acknowledge_media(&mut stdout, identity)?;
+                    }
+                    "withhold-media-acks" => {
+                        write_marker_from_env(
+                            HELD_MARKER_ENV,
+                            &format!("{}\n", identity.sequence),
+                            true,
+                        )?;
                     }
                     "stale-accepted-after-flush"
                     | "stale-rendered-after-flush"

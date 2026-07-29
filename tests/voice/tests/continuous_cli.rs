@@ -90,6 +90,36 @@ fn local_only_rejects_every_remote_component_before_sidecar_spawn() {
 }
 
 #[test]
+fn non_local_privacy_modes_reject_local_adapters_before_sidecar_spawn() {
+    for mode in ["hybrid", "cloud"] {
+        let harness = CliHarness::new("ready");
+        let config = harness
+            .valid_config("http://127.0.0.1:9", "http://127.0.0.1:9/v1")
+            .replacen("mode = \"local-only\"", &format!("mode = \"{mode}\""), 1);
+
+        let output = harness.run_once(&config);
+
+        assert!(!output.status.success(), "{mode}: {output:?}");
+        assert!(
+            output.stderr_text().contains("stage=configuration"),
+            "{mode}: {}",
+            output.stderr_text()
+        );
+        assert!(
+            output
+                .stderr_text()
+                .contains("privacy mode requires unavailable execution-specific adapters"),
+            "{mode}: {}",
+            output.stderr_text()
+        );
+        assert!(
+            !harness.spawn_marker().exists(),
+            "{mode} spawned local sidecar"
+        );
+    }
+}
+
+#[test]
 fn missing_local_asr_model_directory_is_rejected_before_sidecar_spawn() {
     let harness = CliHarness::new("ready");
     let missing_model = harness.fixture_path("missing-asr-model");
@@ -161,19 +191,46 @@ fn once_mode_runs_one_private_voice_turn_and_cleans_every_process() {
     let config = harness.valid_config(language.endpoint(), &speech.endpoint_with_path("/v1"));
 
     let output = harness.run_once(&config);
+    let language_request = language.finish_with_request();
+    let speech_request = speech.finish_with_request();
+    let language_payload = request_json(&language_request);
+    let speech_payload = request_json(&speech_request);
+    let stderr = output.stderr_text();
 
     assert!(output.status.success(), "{output:?}");
-    assert!(output.stdout_text().contains("partial=hel"));
-    assert!(output.stdout_text().contains("final=hello"));
-    assert!(output.stderr_text().contains("privacy=local-only"));
-    assert!(output.stderr_text().contains("turn=1 status=completed"));
-    assert!(output.stderr_text().contains("status=completed"));
-    assert!(!output.stderr_text().contains("hello"));
-    assert!(!output.stderr_text().contains("Fixture response."));
+    assert_eq!(output.stdout_text(), "partial=hel\nfinal=hello\n");
+    assert_eq!(request_target(&language_request), "/api/chat");
+    assert_eq!(language_payload["model"], "local-language-model");
+    assert_eq!(language_payload["messages"][0]["role"], "user");
+    assert_eq!(language_payload["messages"][0]["content"], "hello");
+    assert_eq!(language_payload["stream"], true);
+    assert_eq!(language_payload["think"], false);
+    assert_eq!(language_payload["options"]["temperature"], 0.0);
+    assert_eq!(language_payload["options"]["seed"], 42);
+    assert_eq!(language_payload["options"]["num_predict"], 128);
+    assert_eq!(language_payload["options"]["num_ctx"], 8192);
+    assert_eq!(request_target(&speech_request), "/v1/audio/speech");
+    assert_eq!(speech_payload["model"], "local-speech-model");
+    assert_eq!(speech_payload["input"], "Fixture response.");
+    assert_eq!(speech_payload["voice"], "local-voice");
+    assert_eq!(speech_payload["speed"], 1.0);
+    assert_eq!(speech_payload["lang_code"], "auto");
+    assert_eq!(speech_payload["instruct"], "Speak naturally and clearly.");
+    assert_eq!(speech_payload["max_tokens"], 128);
+    assert_eq!(speech_payload["repetition_penalty"], 1.05);
+    assert_eq!(speech_payload["response_format"], "wav");
+    assert!(stderr.contains("privacy=local-only"));
+    let accepted = stderr.find("playback=accepted").unwrap();
+    let rendered = stderr.find("playback=rendered").unwrap();
+    let turn_completed = stderr.find("turn=1 status=completed").unwrap();
+    let terminal_status = stderr.rfind("status=completed").unwrap();
+    assert!(accepted < rendered);
+    assert!(rendered < terminal_status);
+    assert!(turn_completed < terminal_status);
+    assert!(!stderr.contains("hello"));
+    assert!(!stderr.contains("Fixture response."));
     assert!(harness.shutdown_marker().exists());
     harness.assert_sidecar_reaped();
-    language.finish();
-    speech.finish();
 }
 
 #[test]
@@ -188,6 +245,25 @@ fn sigint_during_listening_cleans_the_sidecar() {
 
     assert_cancelled(&output);
     assert!(harness.shutdown_marker().exists());
+    harness.assert_sidecar_reaped();
+}
+
+#[test]
+fn sigint_cleanup_failure_uses_the_terminal_error_status() {
+    let harness = CliHarness::new("slow-stdin");
+    let config = harness.valid_config("http://127.0.0.1:9", "http://127.0.0.1:9/v1");
+    let mut child = harness.spawn(&config, false, Stdio::piped());
+    wait_for_path_or_kill(harness.held_marker(), &mut child);
+
+    send_sigint(&child);
+    let output = CliOutput(wait_for_output(child));
+    let stderr = output.stderr_text();
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(stderr.contains("status=error stage=runtime"));
+    assert!(stderr.contains("voice session cleanup timed out during voice sidecar completion"));
+    assert!(!stderr.contains("status=cancelled"));
+    assert!(!stderr.contains("status=completed"));
     harness.assert_sidecar_reaped();
 }
 
@@ -540,7 +616,7 @@ impl CliOutput {
 struct FixtureServer {
     endpoint: String,
     request_marker: PathBuf,
-    worker: Option<thread::JoinHandle<()>>,
+    worker: Option<thread::JoinHandle<String>>,
 }
 
 impl FixtureServer {
@@ -565,7 +641,7 @@ impl FixtureServer {
         let marker = request_marker.clone();
         let worker = thread::spawn(move || {
             let mut stream = accept_with_deadline(listener);
-            read_http_request(&mut stream);
+            let request = read_http_request(&mut stream);
             std::fs::write(marker, []).unwrap();
             match response {
                 FixtureResponse::Immediate { content_type, body } => {
@@ -579,6 +655,7 @@ impl FixtureServer {
                 }
                 FixtureResponse::Stalled => wait_for_disconnect(&mut stream),
             }
+            request
         });
         Self {
             endpoint,
@@ -600,7 +677,11 @@ impl FixtureServer {
     }
 
     fn finish(mut self) {
-        self.worker.take().unwrap().join().unwrap();
+        let _ = self.worker.take().unwrap().join().unwrap();
+    }
+
+    fn finish_with_request(mut self) -> String {
+        self.worker.take().unwrap().join().unwrap()
     }
 }
 
@@ -705,7 +786,10 @@ fn accept_with_deadline(listener: TcpListener) -> TcpStream {
     let deadline = Instant::now() + Duration::from_secs(8);
     loop {
         match listener.accept() {
-            Ok((stream, _)) => return stream,
+            Ok((stream, _)) => {
+                stream.set_nonblocking(false).unwrap();
+                return stream;
+            }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 assert!(
                     Instant::now() < deadline,
@@ -718,7 +802,7 @@ fn accept_with_deadline(listener: TcpListener) -> TcpStream {
     }
 }
 
-fn read_http_request(stream: &mut TcpStream) {
+fn read_http_request(stream: &mut TcpStream) -> String {
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
@@ -747,6 +831,20 @@ fn read_http_request(stream: &mut TcpStream) {
         assert_ne!(count, 0, "request ended before body");
         request.extend_from_slice(&buffer[..count]);
     }
+    String::from_utf8(request[..header_end + content_length].to_vec()).unwrap()
+}
+
+fn request_target(request: &str) -> &str {
+    request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap()
+}
+
+fn request_json(request: &str) -> serde_json::Value {
+    let (_, body) = request.split_once("\r\n\r\n").unwrap();
+    serde_json::from_str(body).unwrap()
 }
 
 fn wait_for_disconnect(stream: &mut TcpStream) {

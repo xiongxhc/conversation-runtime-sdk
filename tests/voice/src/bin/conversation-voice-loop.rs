@@ -1,11 +1,12 @@
 #![cfg(unix)]
 
+use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::PathBuf;
 
 use conversation_protocol::{
-    PlaybackState, PrivacyMode, RecoveryDisposition, RuntimeError, RuntimeErrorKind, RuntimeEvent,
-    RuntimeStage, RuntimeTimingMilestone, VoiceSessionEvent, VoiceTimingMilestone,
+    GenerationId, PlaybackState, PrivacyMode, RecoveryDisposition, RuntimeError, RuntimeErrorKind,
+    RuntimeEvent, RuntimeStage, RuntimeTimingMilestone, VoiceSessionEvent, VoiceTimingMilestone,
 };
 use conversation_runtime::{VoiceSessionEventStream, VoiceSessionRuntime};
 use conversation_voice_probe::session_config::SessionConfig;
@@ -45,13 +46,15 @@ async fn run() -> Result<i32, CliFailure> {
         .map_err(|_| CliFailure::new("signal", "failed to listen for SIGINT"))?;
     let mut events = runtime.start(policy).await.map_err(runtime_failure)?;
     let stdout = StdoutWriter::new();
+    let mut playback = PlaybackRenderer::default();
+    let mut once_turn_completed = false;
 
     loop {
         let event = tokio::select! {
             biased;
             received = interrupts.recv() => {
                 require_interrupt(received)?;
-                shutdown_and_drain(&runtime, &mut events).await?;
+                shutdown_and_drain(&runtime, &mut events, &mut playback).await?;
                 eprintln!("status=cancelled");
                 return Ok(130);
             }
@@ -84,6 +87,7 @@ async fn run() -> Result<i32, CliFailure> {
                     &mut interrupts,
                     &runtime,
                     &mut events,
+                    &mut playback,
                 )
                 .await?
                 {
@@ -98,6 +102,7 @@ async fn run() -> Result<i32, CliFailure> {
                     &mut interrupts,
                     &runtime,
                     &mut events,
+                    &mut playback,
                 )
                 .await?
                 {
@@ -119,9 +124,12 @@ async fn run() -> Result<i32, CliFailure> {
             }
             VoiceSessionEvent::Turn { event, .. } => {
                 if render_turn_event(&event) && arguments.once {
-                    shutdown_and_drain(&runtime, &mut events).await?;
-                    eprintln!("status=completed");
-                    return Ok(0);
+                    once_turn_completed = true;
+                    if playback.has_rendered() {
+                        shutdown_and_drain(&runtime, &mut events, &mut playback).await?;
+                        eprintln!("status=completed");
+                        return Ok(0);
+                    }
                 }
             }
             VoiceSessionEvent::Timing {
@@ -141,11 +149,13 @@ async fn run() -> Result<i32, CliFailure> {
                 state,
                 ..
             } => {
-                eprintln!(
-                    "generation={} playback={}",
-                    generation_id.get(),
-                    playback_state_name(state)
-                );
+                playback.render(generation_id, state);
+                if arguments.once && once_turn_completed && matches!(state, PlaybackState::Rendered)
+                {
+                    shutdown_and_drain(&runtime, &mut events, &mut playback).await?;
+                    eprintln!("status=completed");
+                    return Ok(0);
+                }
             }
             VoiceSessionEvent::SessionFailed {
                 error, recovery, ..
@@ -223,20 +233,21 @@ async fn write_transcript(
     interrupts: &mut Signal,
     runtime: &VoiceSessionRuntime,
     events: &mut VoiceSessionEventStream,
+    playback: &mut PlaybackRenderer,
 ) -> Result<bool, CliFailure> {
     let mut completion = stdout.write(line.into_bytes());
     tokio::select! {
         biased;
         received = interrupts.recv() => {
             require_interrupt(received)?;
-            shutdown_and_drain(runtime, events).await?;
+            shutdown_and_drain(runtime, events, playback).await?;
             Ok(true)
         }
         result = &mut completion => {
             match result {
                 Ok(Ok(())) => Ok(false),
                 Ok(Err(_)) | Err(_) => {
-                    shutdown_and_drain(runtime, events).await?;
+                    shutdown_and_drain(runtime, events, playback).await?;
                     Err(CliFailure::new("output", "failed to write transcript output"))
                 }
             }
@@ -247,13 +258,22 @@ async fn write_transcript(
 async fn shutdown_and_drain(
     runtime: &VoiceSessionRuntime,
     events: &mut VoiceSessionEventStream,
+    playback: &mut PlaybackRenderer,
 ) -> Result<(), CliFailure> {
     let shutdown = runtime.shutdown().await;
+    let mut drained = Vec::new();
     while let Some(event) = events.recv().await {
-        if event.is_session_terminal() {
-            break;
+        if let VoiceSessionEvent::Playback {
+            generation_id,
+            state,
+            ..
+        } = &event
+        {
+            playback.render(*generation_id, *state);
         }
+        drained.push(event);
     }
+    require_session_ended(drained)?;
     match shutdown {
         Ok(()) => Ok(()),
         Err(error) if session_already_ended(&error) => Ok(()),
@@ -261,8 +281,91 @@ async fn shutdown_and_drain(
     }
 }
 
+fn require_session_ended(
+    events: impl IntoIterator<Item = VoiceSessionEvent>,
+) -> Result<(), CliFailure> {
+    let mut terminal_count = 0_u8;
+    let mut ended = false;
+    let mut failure = None;
+    for event in events {
+        match event {
+            VoiceSessionEvent::SessionEnded { .. } => {
+                terminal_count = terminal_count.saturating_add(1);
+                ended = true;
+            }
+            VoiceSessionEvent::SessionFailed {
+                error, recovery, ..
+            } => {
+                if matches!(recovery, RecoveryDisposition::NewSession) {
+                    terminal_count = terminal_count.saturating_add(1);
+                }
+                if failure.is_none() {
+                    failure = Some(runtime_failure(error));
+                }
+            }
+            _ => {}
+        }
+    }
+    if terminal_count > 1 {
+        return Err(CliFailure::new(
+            "runtime",
+            "voice session event stream emitted multiple terminal events",
+        ));
+    }
+    if let Some(failure) = failure {
+        return Err(failure);
+    }
+    if terminal_count == 1 && ended {
+        return Ok(());
+    }
+    Err(CliFailure::new(
+        "runtime",
+        "voice session event stream ended before a terminal event",
+    ))
+}
+
 fn session_already_ended(error: &RuntimeError) -> bool {
     error.stage() == RuntimeStage::Runtime && error.message() == "there is no active voice session"
+}
+
+#[derive(Default)]
+struct PlaybackRenderer {
+    accepted: BTreeSet<u64>,
+    rendered: BTreeSet<u64>,
+}
+
+impl PlaybackRenderer {
+    fn render(&mut self, generation_id: GenerationId, state: PlaybackState) {
+        let generation = generation_id.get();
+        match state {
+            PlaybackState::Accepted => {
+                if self.accepted.insert(generation) {
+                    eprintln!("generation={generation} playback=accepted");
+                }
+            }
+            PlaybackState::Rendered => {
+                if self.accepted.insert(generation) {
+                    eprintln!("generation={generation} playback=accepted");
+                }
+                if self.rendered.insert(generation) {
+                    eprintln!("generation={generation} playback=rendered");
+                }
+            }
+            PlaybackState::Flushed => {
+                eprintln!("generation={generation} playback=flushed");
+            }
+            _ => {
+                eprintln!(
+                    "generation={generation} playback={}",
+                    playback_state_name(state)
+                );
+            }
+        }
+    }
+
+    fn has_rendered(&self) -> bool {
+        !self.rendered.is_empty()
+    }
 }
 
 struct StdoutWriter {
@@ -452,4 +555,81 @@ fn sanitize(message: &str) -> String {
         }
     }
     sanitized.trim().to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use conversation_protocol::SessionId;
+
+    use super::*;
+
+    #[test]
+    fn shutdown_terminal_requires_one_session_ended_event() {
+        assert!(require_session_ended(vec![VoiceSessionEvent::SessionEnded {
+            session_id: SessionId::new(1),
+        }])
+        .is_ok());
+
+        let missing = require_session_ended(Vec::new()).unwrap_err();
+        assert_eq!(missing.stage, "runtime");
+        assert_eq!(
+            missing.message,
+            "voice session event stream ended before a terminal event"
+        );
+
+        let duplicate = require_session_ended(vec![
+            VoiceSessionEvent::SessionEnded {
+                session_id: SessionId::new(1),
+            },
+            VoiceSessionEvent::SessionEnded {
+                session_id: SessionId::new(1),
+            },
+        ])
+        .unwrap_err();
+        assert_eq!(duplicate.stage, "runtime");
+        assert_eq!(
+            duplicate.message,
+            "voice session event stream emitted multiple terminal events"
+        );
+    }
+
+    #[test]
+    fn shutdown_terminal_propagates_session_failure_without_sensitive_detail() {
+        let failure = require_session_ended(vec![VoiceSessionEvent::SessionFailed {
+            session_id: SessionId::new(1),
+            error: RuntimeError::new(
+                RuntimeErrorKind::Adapter,
+                RuntimeStage::VoiceSidecar,
+                "sensitive cleanup detail",
+            ),
+            recovery: RecoveryDisposition::NewSession,
+        }])
+        .unwrap_err();
+
+        assert_eq!(failure.stage, "voice_sidecar");
+        assert_eq!(failure.message, "provider or sidecar operation failed");
+        assert!(!failure.message.contains("sensitive cleanup detail"));
+    }
+
+    #[test]
+    fn shutdown_terminal_preserves_a_queued_recoverable_failure_before_session_end() {
+        let failure = require_session_ended(vec![
+            VoiceSessionEvent::SessionFailed {
+                session_id: SessionId::new(1),
+                error: RuntimeError::new(
+                    RuntimeErrorKind::InvalidState,
+                    RuntimeStage::SpeechRecognizer,
+                    "recognition failed before shutdown",
+                ),
+                recovery: RecoveryDisposition::ContinueSession,
+            },
+            VoiceSessionEvent::SessionEnded {
+                session_id: SessionId::new(1),
+            },
+        ])
+        .unwrap_err();
+
+        assert_eq!(failure.stage, "speech_recognizer");
+        assert_eq!(failure.message, "recognition failed before shutdown");
+    }
 }

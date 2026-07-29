@@ -499,6 +499,8 @@ fn spawn_control_reader(sender: mpsc::Sender<FakeEvent>, stop_after_start: bool)
                         return;
                     }
                     if stop {
+                        let _ =
+                            write_marker_from_env(HELD_MARKER_ENV, "control-reader-held", false);
                         loop {
                             thread::sleep(Duration::from_secs(60));
                         }

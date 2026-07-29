@@ -217,6 +217,7 @@ impl SessionConfig {
         if self.schema_version != 2 {
             return Err("voice session configuration schema_version must be 2".to_owned());
         }
+        self.require_local_execution_adapters()?;
         if !SPEECH_START_MS.contains(&self.turn.speech_start_ms) {
             return Err("speech start threshold is outside the supported range".to_owned());
         }
@@ -273,6 +274,7 @@ impl SessionConfig {
     }
 
     pub fn adapters(&self) -> Result<VoiceSessionAdapters, String> {
+        self.require_local_execution_adapters()?;
         let language_model = Arc::new(IdentityTaggedLanguageModel::new(self.language_model()?));
         let speech_synthesizer: Arc<dyn SpeechSynthesizer> = Arc::new(self.speech_synthesizer()?);
         let speech_synthesizer =
@@ -283,6 +285,14 @@ impl SessionConfig {
             language_model,
             speech_synthesizer,
         ))
+    }
+
+    fn require_local_execution_adapters(&self) -> Result<(), String> {
+        if matches!(self.privacy.mode, PrivacyModeConfig::LocalOnly) {
+            Ok(())
+        } else {
+            Err("privacy mode requires unavailable execution-specific adapters".to_owned())
+        }
     }
 
     fn language_model(&self) -> Result<OllamaLanguageModel, String> {

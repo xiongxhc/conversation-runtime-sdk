@@ -1,0 +1,972 @@
+use std::collections::{BTreeMap, VecDeque};
+use std::fmt;
+use std::future::pending;
+use std::sync::Arc;
+use std::time::Duration;
+
+use conversation_model_adapters::{
+    AdapterError, ContinuousAudioOutput, GenerationLanguageModel, RecognitionEvent,
+    StreamingSpeechSynthesizer, VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
+};
+use conversation_protocol::{
+    GenerationId, RecoveryDisposition, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage,
+    RuntimeTimingMilestone, SessionId, TurnId, VoiceActivity, VoiceSessionEvent,
+    VoiceSessionPolicy, VoiceTimingMilestone,
+};
+use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::task::{JoinError, JoinHandle};
+use tokio_util::sync::CancellationToken;
+
+use crate::{
+    validate_voice_policy, SessionClock, StreamingTurnEventStream, StreamingTurnRuntime,
+    TurnFinalizationDeadline, TurnFinalizer,
+};
+
+const SESSION_EVENT_BUFFER_SIZE: usize = 32;
+const SESSION_COMMAND_BUFFER_SIZE: usize = 8;
+const RELIABLE_EVENT_RESERVE: usize = 4;
+
+#[derive(Clone)]
+pub struct VoiceSessionAdapters {
+    voice_io: Arc<dyn VoiceIoFactory>,
+    language_model: Arc<dyn GenerationLanguageModel>,
+    speech_synthesizer: Arc<dyn StreamingSpeechSynthesizer>,
+}
+
+impl VoiceSessionAdapters {
+    pub fn new(
+        voice_io: Arc<dyn VoiceIoFactory>,
+        language_model: Arc<dyn GenerationLanguageModel>,
+        speech_synthesizer: Arc<dyn StreamingSpeechSynthesizer>,
+    ) -> Self {
+        Self {
+            voice_io,
+            language_model,
+            speech_synthesizer,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct VoiceSessionRuntime {
+    adapters: VoiceSessionAdapters,
+    active: Arc<Mutex<Option<ActiveSession>>>,
+}
+
+#[derive(Clone)]
+struct ActiveSession {
+    session_id: SessionId,
+    commands: mpsc::Sender<SessionCommand>,
+}
+
+impl VoiceSessionRuntime {
+    pub fn new(adapters: VoiceSessionAdapters) -> Self {
+        Self {
+            adapters,
+            active: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub async fn start(
+        &self,
+        policy: VoiceSessionPolicy,
+    ) -> Result<VoiceSessionEventStream, RuntimeError> {
+        let privacy = validate_voice_policy(&policy)?;
+        let session_id = policy.session_id();
+        let mut active = self.active.lock().await;
+        if let Some(current) = active.as_ref() {
+            return Err(runtime_error(format!(
+                "voice session {} is still active",
+                current.session_id
+            )));
+        }
+
+        let (event_sender, event_receiver) = mpsc::channel(SESSION_EVENT_BUFFER_SIZE);
+        let (terminal_sender, terminal_receiver) = oneshot::channel();
+        let (command_sender, command_receiver) = mpsc::channel(SESSION_COMMAND_BUFFER_SIZE);
+        let cancellation = CancellationToken::new();
+        event_sender
+            .send(VoiceSessionEvent::SessionStarted {
+                session_id,
+                privacy,
+            })
+            .await
+            .map_err(|_| runtime_error("voice session event stream closed before start"))?;
+
+        *active = Some(ActiveSession {
+            session_id,
+            commands: command_sender,
+        });
+        drop(active);
+
+        let active_sessions = Arc::clone(&self.active);
+        let adapters = self.adapters.clone();
+        let task_cancellation = cancellation.clone();
+        tokio::spawn(async move {
+            let terminal = run_voice_session(
+                policy,
+                adapters,
+                command_receiver,
+                event_sender,
+                task_cancellation,
+            )
+            .await;
+
+            let mut active = active_sessions.lock().await;
+            if active
+                .as_ref()
+                .is_some_and(|current| current.session_id == session_id)
+            {
+                *active = None;
+            }
+            drop(active);
+            let _ = terminal_sender.send(terminal);
+        });
+
+        Ok(VoiceSessionEventStream {
+            events: event_receiver,
+            terminal: Some(terminal_receiver),
+            events_closed: false,
+            cancellation,
+        })
+    }
+
+    pub async fn barge_in(
+        &self,
+        turn_id: TurnId,
+        generation_id: GenerationId,
+    ) -> Result<(), RuntimeError> {
+        let commands = self.active_commands().await?;
+        let (completion, completed) = oneshot::channel();
+        commands
+            .send(SessionCommand::BargeIn {
+                turn_id,
+                generation_id,
+                completion,
+            })
+            .await
+            .map_err(|_| runtime_error("voice session command channel closed"))?;
+        completed
+            .await
+            .map_err(|_| runtime_error("voice session ended before barge-in completed"))
+    }
+
+    pub async fn shutdown(&self) -> Result<(), RuntimeError> {
+        let commands = self.active_commands().await?;
+        let (completion, completed) = oneshot::channel();
+        commands
+            .send(SessionCommand::Shutdown { completion })
+            .await
+            .map_err(|_| runtime_error("voice session command channel closed"))?;
+        completed
+            .await
+            .map_err(|_| runtime_error("voice session ended before shutdown completed"))
+    }
+
+    async fn active_commands(&self) -> Result<mpsc::Sender<SessionCommand>, RuntimeError> {
+        self.active
+            .lock()
+            .await
+            .as_ref()
+            .map(|active| active.commands.clone())
+            .ok_or_else(|| runtime_error("there is no active voice session"))
+    }
+}
+
+pub struct VoiceSessionEventStream {
+    events: mpsc::Receiver<VoiceSessionEvent>,
+    terminal: Option<oneshot::Receiver<VoiceSessionEvent>>,
+    events_closed: bool,
+    cancellation: CancellationToken,
+}
+
+impl VoiceSessionEventStream {
+    pub async fn recv(&mut self) -> Option<VoiceSessionEvent> {
+        if !self.events_closed {
+            if let Some(event) = self.events.recv().await {
+                return Some(event);
+            }
+            self.events_closed = true;
+        }
+
+        let terminal = self.terminal.as_mut()?.await.ok();
+        self.terminal = None;
+        terminal
+    }
+}
+
+impl fmt::Debug for VoiceSessionEventStream {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VoiceSessionEventStream")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for VoiceSessionEventStream {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+    }
+}
+
+enum SessionCommand {
+    BargeIn {
+        turn_id: TurnId,
+        generation_id: GenerationId,
+        completion: oneshot::Sender<()>,
+    },
+    Shutdown {
+        completion: oneshot::Sender<()>,
+    },
+}
+
+async fn run_voice_session(
+    policy: VoiceSessionPolicy,
+    adapters: VoiceSessionAdapters,
+    commands: mpsc::Receiver<SessionCommand>,
+    events: mpsc::Sender<VoiceSessionEvent>,
+    cancellation: CancellationToken,
+) -> VoiceSessionEvent {
+    let session_id = policy.session_id();
+    let VoiceIoSession {
+        input,
+        output,
+        mut completion,
+    } = match adapters
+        .voice_io
+        .start(session_id, cancellation.clone())
+        .await
+    {
+        Ok(session) => session,
+        Err(error) => {
+            return session_failure(
+                session_id,
+                adapter_runtime_error(RuntimeStage::VoiceSidecar, error),
+            );
+        }
+    };
+
+    let input_events = match input.start(session_id, cancellation.clone()).await {
+        Ok(input_events) => input_events,
+        Err(error) => {
+            cancellation.cancel();
+            let _ = (&mut completion).await;
+            return session_failure(
+                session_id,
+                adapter_runtime_error(RuntimeStage::AudioCapture, error),
+            );
+        }
+    };
+
+    let turn_runtime = StreamingTurnRuntime::new(
+        adapters.language_model,
+        adapters.speech_synthesizer,
+        output.clone(),
+    );
+    VoiceLoop::new(
+        policy,
+        input_events,
+        output,
+        completion,
+        turn_runtime,
+        commands,
+        events,
+        cancellation,
+    )
+    .run()
+    .await
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VoiceLoopState {
+    Listening,
+    Responding {
+        turn_id: TurnId,
+        generation_id: GenerationId,
+    },
+    Ending,
+}
+
+struct VoiceLoop {
+    session_id: SessionId,
+    final_silence_ms: u64,
+    final_silence: Duration,
+    input: mpsc::Receiver<Result<VoiceInputEvent, AdapterError>>,
+    output: Arc<dyn ContinuousAudioOutput>,
+    completion: Option<JoinHandle<Result<(), AdapterError>>>,
+    turn_runtime: StreamingTurnRuntime,
+    turn_events: Option<StreamingTurnEventStream>,
+    commands: mpsc::Receiver<SessionCommand>,
+    events: mpsc::Sender<VoiceSessionEvent>,
+    cancellation: CancellationToken,
+    clock: SessionClock,
+    deadline: TurnFinalizationDeadline,
+    finalizer: TurnFinalizer,
+    state: VoiceLoopState,
+    active_segment_id: Option<u64>,
+    finalization_due: bool,
+    next_turn_id: u64,
+    next_generation_id: u64,
+    reliable_events: VecDeque<VoiceSessionEvent>,
+    partials: BTreeMap<u64, String>,
+}
+
+impl VoiceLoop {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        policy: VoiceSessionPolicy,
+        input: mpsc::Receiver<Result<VoiceInputEvent, AdapterError>>,
+        output: Arc<dyn ContinuousAudioOutput>,
+        completion: JoinHandle<Result<(), AdapterError>>,
+        turn_runtime: StreamingTurnRuntime,
+        commands: mpsc::Receiver<SessionCommand>,
+        events: mpsc::Sender<VoiceSessionEvent>,
+        cancellation: CancellationToken,
+    ) -> Self {
+        let final_silence_ms = policy.final_silence_ms();
+        Self {
+            session_id: policy.session_id(),
+            final_silence_ms,
+            final_silence: Duration::from_millis(final_silence_ms),
+            input,
+            output,
+            completion: Some(completion),
+            turn_runtime,
+            turn_events: None,
+            commands,
+            events,
+            cancellation,
+            clock: SessionClock::new(),
+            deadline: TurnFinalizationDeadline::new(),
+            finalizer: TurnFinalizer::new(final_silence_ms)
+                .expect("validated policy has a non-zero final silence duration"),
+            state: VoiceLoopState::Listening,
+            active_segment_id: None,
+            finalization_due: false,
+            next_turn_id: 1,
+            next_generation_id: 1,
+            reliable_events: VecDeque::new(),
+            partials: BTreeMap::new(),
+        }
+    }
+
+    async fn run(mut self) -> VoiceSessionEvent {
+        let exit = self.run_until_exit().await;
+        self.cleanup_active_turn().await;
+        self.state = VoiceLoopState::Ending;
+        self.cancellation.cancel();
+        if let Some(completion) = self.completion.take() {
+            let _ = completion.await;
+        }
+
+        match exit {
+            LoopExit::Shutdown(completion) => {
+                let _ = completion.send(());
+                VoiceSessionEvent::SessionEnded {
+                    session_id: self.session_id,
+                }
+            }
+            LoopExit::ConsumerDropped => VoiceSessionEvent::SessionEnded {
+                session_id: self.session_id,
+            },
+            LoopExit::Fatal(error) => session_failure(self.session_id, error),
+        }
+    }
+
+    async fn run_until_exit(&mut self) -> LoopExit {
+        loop {
+            if !self.flush_pending_events() {
+                return LoopExit::ConsumerDropped;
+            }
+            let pending_delivery = self.has_pending_events();
+            let signal = tokio::select! {
+                biased;
+                _ = self.cancellation.cancelled() => LoopSignal::ConsumerDropped,
+                _ = self.events.closed() => LoopSignal::ConsumerDropped,
+                command = self.commands.recv() => LoopSignal::Command(command),
+                completion = wait_for_completion(&mut self.completion),
+                    if self.completion.is_some() => LoopSignal::Completion(completion),
+                input = self.input.recv() => LoopSignal::Input(input),
+                turn = recv_turn_event(&mut self.turn_events),
+                    if self.turn_events.is_some() => LoopSignal::Turn(turn),
+                _ = self.deadline.wait() => LoopSignal::Deadline,
+                permit = reserve_event(self.events.clone()),
+                    if pending_delivery => LoopSignal::Permit(permit),
+            };
+
+            let exit = match signal {
+                LoopSignal::ConsumerDropped => Some(LoopExit::ConsumerDropped),
+                LoopSignal::Command(command) => self.handle_command(command).await,
+                LoopSignal::Completion(completion) => {
+                    self.completion.take();
+                    Some(LoopExit::Fatal(completion_failure(completion)))
+                }
+                LoopSignal::Input(input) => self.handle_input(input).await,
+                LoopSignal::Turn(turn) => self.handle_turn_event(turn).await,
+                LoopSignal::Deadline => self.handle_deadline().await,
+                LoopSignal::Permit(permit) => {
+                    if let Some(permit) = permit {
+                        self.send_pending_event(permit);
+                        None
+                    } else {
+                        Some(LoopExit::ConsumerDropped)
+                    }
+                }
+            };
+            if let Some(exit) = exit {
+                return exit;
+            }
+        }
+    }
+
+    async fn handle_command(&mut self, command: Option<SessionCommand>) -> Option<LoopExit> {
+        match command {
+            Some(SessionCommand::BargeIn {
+                turn_id,
+                generation_id,
+                completion,
+            }) => {
+                let result = self.handle_barge_in(turn_id, generation_id).await;
+                let _ = completion.send(());
+                result.err().map(LoopExit::Fatal)
+            }
+            Some(SessionCommand::Shutdown { completion }) => Some(LoopExit::Shutdown(completion)),
+            None => Some(LoopExit::Shutdown(closed_completion())),
+        }
+    }
+
+    async fn handle_input(
+        &mut self,
+        input: Option<Result<VoiceInputEvent, AdapterError>>,
+    ) -> Option<LoopExit> {
+        match input {
+            Some(Ok(VoiceInputEvent::Activity(activity))) => self.handle_activity(activity).await,
+            Some(Ok(VoiceInputEvent::Recognition(RecognitionEvent::Hypothesis(hypothesis)))) => {
+                if !hypothesis.text().trim().is_empty() {
+                    if self.active_segment_id.is_some()
+                        && self.active_segment_id != Some(hypothesis.segment_id())
+                    {
+                        self.deadline.disarm();
+                        self.finalization_due = false;
+                    }
+                    self.active_segment_id = Some(hypothesis.segment_id());
+                    if !hypothesis.is_engine_final()
+                        && !self
+                            .publish_partial(hypothesis.segment_id(), hypothesis.text().to_owned())
+                    {
+                        return Some(LoopExit::ConsumerDropped);
+                    }
+                }
+                self.finalizer
+                    .observe_hypothesis(hypothesis, self.clock.now_ms());
+                None
+            }
+            Some(Ok(VoiceInputEvent::Playback(receipt))) => {
+                if !self.publish_best_effort(VoiceSessionEvent::Playback {
+                    session_id: self.session_id,
+                    generation_id: receipt.generation_id(),
+                    state: receipt.state(),
+                }) {
+                    return Some(LoopExit::ConsumerDropped);
+                }
+                None
+            }
+            Some(Ok(VoiceInputEvent::Capture(_))) => None,
+            Some(Ok(_)) => Some(LoopExit::Fatal(adapter_message(
+                RuntimeStage::VoiceSidecar,
+                "voice input event type is unsupported",
+            ))),
+            Some(Err(error)) if is_recognition_failure(&error) => {
+                if let Err(cleanup_error) = self.interrupt_current_turn().await {
+                    return Some(LoopExit::Fatal(cleanup_error));
+                }
+                self.deadline.disarm();
+                self.finalization_due = false;
+                self.finalizer = TurnFinalizer::new(self.final_silence_ms)
+                    .expect("session final silence remains valid");
+                self.active_segment_id = None;
+                if !self.publish_reliable(VoiceSessionEvent::SessionFailed {
+                    session_id: self.session_id,
+                    error: adapter_runtime_error(RuntimeStage::SpeechRecognizer, error),
+                    recovery: RecoveryDisposition::ContinueSession,
+                }) {
+                    return Some(LoopExit::ConsumerDropped);
+                }
+                None
+            }
+            Some(Err(error)) => Some(LoopExit::Fatal(voice_input_error(error))),
+            None => Some(LoopExit::Fatal(adapter_message(
+                RuntimeStage::VoiceSidecar,
+                "voice input event stream ended unexpectedly",
+            ))),
+        }
+    }
+
+    async fn handle_activity(&mut self, activity: VoiceActivity) -> Option<LoopExit> {
+        self.finalizer.observe_activity(activity);
+        if !self.publish_best_effort(VoiceSessionEvent::VoiceActivity {
+            session_id: self.session_id,
+            activity,
+        }) {
+            return Some(LoopExit::ConsumerDropped);
+        }
+
+        match activity {
+            VoiceActivity::SpeechStarted { .. } | VoiceActivity::SpeechContinued { .. } => {
+                self.deadline.disarm();
+                self.finalization_due = false;
+                if let VoiceLoopState::Responding {
+                    turn_id,
+                    generation_id,
+                } = self.state
+                {
+                    if let Err(error) = self.handle_barge_in(turn_id, generation_id).await {
+                        return Some(LoopExit::Fatal(error));
+                    }
+                }
+            }
+            VoiceActivity::SpeechEnded { .. } => {
+                self.deadline.arm_after(self.final_silence);
+                if !self.publish_best_effort(VoiceSessionEvent::Timing {
+                    session_id: self.session_id,
+                    turn_id: active_turn_id(self.state),
+                    milestone: VoiceTimingMilestone::SpeechEnd,
+                    elapsed_ms: self.clock.now_ms(),
+                }) {
+                    return Some(LoopExit::ConsumerDropped);
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
+    async fn handle_deadline(&mut self) -> Option<LoopExit> {
+        match self.state {
+            VoiceLoopState::Listening => self.start_ready_turn().await.err().map(LoopExit::Fatal),
+            VoiceLoopState::Responding { .. } => {
+                self.finalization_due = true;
+                None
+            }
+            VoiceLoopState::Ending => None,
+        }
+    }
+
+    async fn start_ready_turn(&mut self) -> Result<(), RuntimeError> {
+        self.finalization_due = false;
+        let Some(finalized) = self.finalizer.finalize_ready(self.clock.now_ms()) else {
+            return Ok(());
+        };
+        let turn_id = TurnId::new(self.next_turn_id);
+        let generation_id = GenerationId::new(self.next_generation_id);
+        let next_turn_id = self
+            .next_turn_id
+            .checked_add(1)
+            .ok_or_else(|| runtime_error("voice turn identifier overflowed"))?;
+        let next_generation_id = self
+            .next_generation_id
+            .checked_add(1)
+            .ok_or_else(|| runtime_error("voice generation identifier overflowed"))?;
+
+        if !self.publish_reliable(VoiceSessionEvent::TranscriptFinal {
+            session_id: self.session_id,
+            turn_id,
+            text: finalized.text.clone(),
+        }) {
+            return Err(runtime_error(
+                "voice session event stream closed during finalization",
+            ));
+        }
+        if !self.publish_best_effort(VoiceSessionEvent::Timing {
+            session_id: self.session_id,
+            turn_id: Some(turn_id),
+            milestone: VoiceTimingMilestone::TranscriptFinal,
+            elapsed_ms: self.clock.now_ms(),
+        }) {
+            return Err(runtime_error(
+                "voice session event stream closed during finalization",
+            ));
+        }
+
+        let turn_events = self
+            .turn_runtime
+            .start_turn(turn_id, generation_id, finalized.text)
+            .await?;
+        self.turn_events = Some(turn_events);
+        self.state = VoiceLoopState::Responding {
+            turn_id,
+            generation_id,
+        };
+        self.next_turn_id = next_turn_id;
+        self.next_generation_id = next_generation_id;
+        Ok(())
+    }
+
+    async fn handle_turn_event(&mut self, event: Option<RuntimeEvent>) -> Option<LoopExit> {
+        let Some(event) = event else {
+            self.turn_events.take();
+            return Some(LoopExit::Fatal(runtime_error(
+                "streaming turn ended without a terminal event",
+            )));
+        };
+        let terminal = event.is_terminal();
+        let failure = match &event {
+            RuntimeEvent::TurnFailed { error, .. } => Some(error.clone()),
+            _ => None,
+        };
+        self.publish_runtime_timing(&event);
+        if !self.publish_turn_event(event) {
+            return Some(LoopExit::ConsumerDropped);
+        }
+
+        if terminal {
+            self.turn_events.take();
+            self.state = VoiceLoopState::Listening;
+            if let Some(error) = failure {
+                if !self.publish_reliable(VoiceSessionEvent::SessionFailed {
+                    session_id: self.session_id,
+                    error,
+                    recovery: RecoveryDisposition::ContinueSession,
+                }) {
+                    return Some(LoopExit::ConsumerDropped);
+                }
+            }
+            if self.finalization_due {
+                if let Err(error) = self.start_ready_turn().await {
+                    return Some(LoopExit::Fatal(error));
+                }
+            }
+        }
+        None
+    }
+
+    async fn handle_barge_in(
+        &mut self,
+        turn_id: TurnId,
+        generation_id: GenerationId,
+    ) -> Result<(), RuntimeError> {
+        if self.state
+            != (VoiceLoopState::Responding {
+                turn_id,
+                generation_id,
+            })
+        {
+            return Ok(());
+        }
+        if !self.publish_reliable(VoiceSessionEvent::BargeIn {
+            session_id: self.session_id,
+            turn_id,
+            generation_id,
+        }) {
+            return Err(runtime_error(
+                "voice session event stream closed during barge-in",
+            ));
+        }
+
+        self.interrupt_current_turn().await
+    }
+
+    async fn interrupt_current_turn(&mut self) -> Result<(), RuntimeError> {
+        let VoiceLoopState::Responding {
+            turn_id,
+            generation_id,
+        } = self.state
+        else {
+            return Ok(());
+        };
+        let flush_result = self.output.flush(self.session_id, generation_id).await;
+        let interrupt_result = self.turn_runtime.interrupt(turn_id, generation_id).await;
+        let saw_terminal = self.drain_interrupted_turn().await;
+        self.state = VoiceLoopState::Listening;
+
+        if !saw_terminal {
+            return Err(interrupt_result.err().unwrap_or_else(|| {
+                runtime_error("interrupted turn ended without a terminal event")
+            }));
+        }
+        if let Err(error) = flush_result {
+            return Err(adapter_runtime_error(
+                RuntimeStage::ContinuousAudioOutput,
+                error,
+            ));
+        }
+        Ok(())
+    }
+
+    async fn drain_interrupted_turn(&mut self) -> bool {
+        let Some(mut turn_events) = self.turn_events.take() else {
+            return false;
+        };
+        while let Some(event) = turn_events.recv().await {
+            let terminal = event.is_terminal();
+            self.publish_runtime_timing(&event);
+            if !self.publish_turn_event(event) {
+                return terminal;
+            }
+            if terminal {
+                return true;
+            }
+        }
+        false
+    }
+
+    async fn cleanup_active_turn(&mut self) {
+        let VoiceLoopState::Responding {
+            turn_id,
+            generation_id,
+        } = self.state
+        else {
+            return;
+        };
+        let _ = self.turn_runtime.interrupt(turn_id, generation_id).await;
+        let _ = self.drain_interrupted_turn().await;
+    }
+
+    fn publish_runtime_timing(&mut self, event: &RuntimeEvent) {
+        let RuntimeEvent::Timing {
+            turn_id, milestone, ..
+        } = event
+        else {
+            return;
+        };
+        let milestone = match milestone {
+            RuntimeTimingMilestone::FirstTextDelta => VoiceTimingMilestone::FirstTextDelta,
+            RuntimeTimingMilestone::FirstSynthesisRequest => {
+                VoiceTimingMilestone::FirstSynthesisRequest
+            }
+            RuntimeTimingMilestone::FirstPlayableAudio => VoiceTimingMilestone::FirstPlayableAudio,
+            _ => return,
+        };
+        let _ = self.publish_best_effort(VoiceSessionEvent::Timing {
+            session_id: self.session_id,
+            turn_id: Some(*turn_id),
+            milestone,
+            elapsed_ms: self.clock.now_ms(),
+        });
+    }
+
+    fn publish_turn_event(&mut self, event: RuntimeEvent) -> bool {
+        let reliable = event.is_terminal();
+        let event = VoiceSessionEvent::Turn {
+            session_id: self.session_id,
+            event,
+        };
+        if reliable {
+            self.publish_reliable(event)
+        } else {
+            self.publish_best_effort(event)
+        }
+    }
+
+    fn publish_reliable(&mut self, event: VoiceSessionEvent) -> bool {
+        if !self.reliable_events.is_empty() {
+            self.reliable_events.push_back(event);
+            return !self.events.is_closed();
+        }
+        match self.events.try_send(event) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(event)) => {
+                self.reliable_events.push_back(event);
+                true
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+
+    fn publish_best_effort(&mut self, event: VoiceSessionEvent) -> bool {
+        if !self.reliable_events.is_empty() {
+            return !self.events.is_closed();
+        }
+        if self.events.capacity() <= RELIABLE_EVENT_RESERVE {
+            return !self.events.is_closed();
+        }
+        match self.events.try_send(event) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => true,
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+
+    fn publish_partial(&mut self, segment_id: u64, text: String) -> bool {
+        if !self.reliable_events.is_empty() {
+            self.partials.insert(segment_id, text);
+            return !self.events.is_closed();
+        }
+        if self.events.capacity() <= RELIABLE_EVENT_RESERVE {
+            self.partials.insert(segment_id, text);
+            return !self.events.is_closed();
+        }
+        let event = VoiceSessionEvent::TranscriptPartial {
+            session_id: self.session_id,
+            segment_id,
+            text,
+        };
+        match self.events.try_send(event) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(VoiceSessionEvent::TranscriptPartial {
+                segment_id,
+                text,
+                ..
+            })) => {
+                self.partials.insert(segment_id, text);
+                true
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                unreachable!("partial publication always contains a partial event")
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+
+    fn flush_pending_events(&mut self) -> bool {
+        while let Some(event) = self.reliable_events.front().cloned() {
+            match self.events.try_send(event) {
+                Ok(()) => {
+                    self.reliable_events.pop_front();
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => return true,
+                Err(mpsc::error::TrySendError::Closed(_)) => return false,
+            }
+        }
+        while self.events.capacity() > RELIABLE_EVENT_RESERVE {
+            let Some((&segment_id, text)) = self.partials.first_key_value() else {
+                break;
+            };
+            let event = VoiceSessionEvent::TranscriptPartial {
+                session_id: self.session_id,
+                segment_id,
+                text: text.clone(),
+            };
+            match self.events.try_send(event) {
+                Ok(()) => {
+                    self.partials.remove(&segment_id);
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => return true,
+                Err(mpsc::error::TrySendError::Closed(_)) => return false,
+            }
+        }
+        true
+    }
+
+    fn has_pending_events(&self) -> bool {
+        !self.reliable_events.is_empty()
+            || (!self.partials.is_empty() && self.events.capacity() > RELIABLE_EVENT_RESERVE)
+    }
+
+    fn send_pending_event(&mut self, permit: mpsc::OwnedPermit<VoiceSessionEvent>) {
+        if let Some(event) = self.reliable_events.pop_front() {
+            permit.send(event);
+            return;
+        }
+        if let Some((segment_id, text)) = self.partials.pop_first() {
+            permit.send(VoiceSessionEvent::TranscriptPartial {
+                session_id: self.session_id,
+                segment_id,
+                text,
+            });
+        }
+    }
+}
+
+enum LoopSignal {
+    ConsumerDropped,
+    Command(Option<SessionCommand>),
+    Completion(Result<Result<(), AdapterError>, JoinError>),
+    Input(Option<Result<VoiceInputEvent, AdapterError>>),
+    Turn(Option<RuntimeEvent>),
+    Deadline,
+    Permit(Option<mpsc::OwnedPermit<VoiceSessionEvent>>),
+}
+
+enum LoopExit {
+    Shutdown(oneshot::Sender<()>),
+    ConsumerDropped,
+    Fatal(RuntimeError),
+}
+
+async fn wait_for_completion(
+    completion: &mut Option<JoinHandle<Result<(), AdapterError>>>,
+) -> Result<Result<(), AdapterError>, JoinError> {
+    match completion.as_mut() {
+        Some(completion) => completion.await,
+        None => pending().await,
+    }
+}
+
+async fn recv_turn_event(events: &mut Option<StreamingTurnEventStream>) -> Option<RuntimeEvent> {
+    match events.as_mut() {
+        Some(events) => events.recv().await,
+        None => pending().await,
+    }
+}
+
+async fn reserve_event(
+    events: mpsc::Sender<VoiceSessionEvent>,
+) -> Option<mpsc::OwnedPermit<VoiceSessionEvent>> {
+    events.reserve_owned().await.ok()
+}
+
+fn active_turn_id(state: VoiceLoopState) -> Option<TurnId> {
+    match state {
+        VoiceLoopState::Responding { turn_id, .. } => Some(turn_id),
+        VoiceLoopState::Listening | VoiceLoopState::Ending => None,
+    }
+}
+
+fn completion_failure(completion: Result<Result<(), AdapterError>, JoinError>) -> RuntimeError {
+    match completion {
+        Ok(Ok(())) => adapter_message(
+            RuntimeStage::VoiceSidecar,
+            "voice I/O session ended unexpectedly",
+        ),
+        Ok(Err(error)) => adapter_runtime_error(RuntimeStage::VoiceSidecar, error),
+        Err(_) => adapter_message(
+            RuntimeStage::VoiceSidecar,
+            "voice I/O session completion task failed",
+        ),
+    }
+}
+
+fn voice_input_error(error: AdapterError) -> RuntimeError {
+    let stage = if error.message().contains("permission")
+        || error.message().contains("device unavailable")
+    {
+        RuntimeStage::AudioCapture
+    } else {
+        RuntimeStage::VoiceSidecar
+    };
+    adapter_runtime_error(stage, error)
+}
+
+fn is_recognition_failure(error: &AdapterError) -> bool {
+    error.message().contains("recognition failed")
+}
+
+fn session_failure(session_id: SessionId, error: RuntimeError) -> VoiceSessionEvent {
+    VoiceSessionEvent::SessionFailed {
+        session_id,
+        error,
+        recovery: RecoveryDisposition::NewSession,
+    }
+}
+
+fn adapter_runtime_error(stage: RuntimeStage, error: AdapterError) -> RuntimeError {
+    RuntimeError::new(RuntimeErrorKind::Adapter, stage, error.message())
+}
+
+fn adapter_message(stage: RuntimeStage, message: &'static str) -> RuntimeError {
+    RuntimeError::new(RuntimeErrorKind::Adapter, stage, message)
+}
+
+fn runtime_error(message: impl Into<String>) -> RuntimeError {
+    RuntimeError::new(
+        RuntimeErrorKind::InvalidState,
+        RuntimeStage::Runtime,
+        message,
+    )
+}
+
+fn closed_completion() -> oneshot::Sender<()> {
+    let (completion, completed) = oneshot::channel();
+    drop(completed);
+    completion
+}

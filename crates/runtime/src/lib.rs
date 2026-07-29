@@ -22,6 +22,7 @@ mod streaming_turn;
 mod turn_finalizer;
 mod utterance_assembler;
 mod voice_privacy;
+mod voice_session;
 
 pub use phrase_chunker::PhraseChunkingConfig;
 pub use session_clock::{SessionClock, TurnFinalizationDeadline};
@@ -29,6 +30,7 @@ pub use streaming_turn::{StreamingTurnEventStream, StreamingTurnRuntime};
 pub use turn_finalizer::{FinalizedTranscript, TurnFinalizer};
 pub use utterance_assembler::UtteranceAssembler;
 pub use voice_privacy::validate_voice_policy;
+pub use voice_session::{VoiceSessionAdapters, VoiceSessionEventStream, VoiceSessionRuntime};
 
 use phrase_chunker::PhraseChunker;
 use speech_text::normalize_speech_text;

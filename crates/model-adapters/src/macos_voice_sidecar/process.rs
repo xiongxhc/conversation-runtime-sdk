@@ -1374,6 +1374,8 @@ struct MediaOperation {
     identity: MediaIdentity,
     write_state: MediaWriteState,
     write_finished: Arc<Notify>,
+    acknowledgement_observed: bool,
+    flushed_after_observation: bool,
     accepted: bool,
     completion: Option<oneshot::Sender<Result<PlaybackReceipt, AdapterError>>>,
     reservation: Option<MediaReservation>,
@@ -1391,6 +1393,8 @@ struct CancelledMedia {
     identity: MediaIdentity,
     write_state: MediaWriteState,
     write_finished: Arc<Notify>,
+    acknowledgement_observed: bool,
+    flushed_after_observation: bool,
     accepted: bool,
     reservation: Option<MediaReservation>,
 }
@@ -1536,6 +1540,8 @@ impl SessionShared {
             identity,
             write_state: MediaWriteState::Queued,
             write_finished: Arc::new(Notify::new()),
+            acknowledgement_observed: false,
+            flushed_after_observation: false,
             accepted: false,
             completion: Some(completion),
             reservation: Some(reservation),
@@ -1564,6 +1570,8 @@ impl SessionShared {
                     identity: operation.identity,
                     write_state: operation.write_state,
                     write_finished: operation.write_finished,
+                    acknowledgement_observed: operation.acknowledgement_observed,
+                    flushed_after_observation: operation.flushed_after_observation,
                     accepted: operation.accepted,
                     reservation: operation.reservation,
                 });
@@ -1624,29 +1632,47 @@ impl SessionShared {
 
     fn resolve_media(&self, identity: MediaIdentity) -> Result<ResolveMedia, AdapterError> {
         let mut state = self.state.lock().expect("sidecar state lock poisoned");
-        if state
-            .flushed_through
-            .is_some_and(|flushed| identity.generation_id <= flushed)
-        {
-            return Err(AdapterError::new("voice sidecar generation is stale"));
+        if let Some(error) = &state.failure {
+            return Err(error.clone());
         }
-        validate_generation(&state, identity.generation_id, true)?;
-        if let Some(operation) = state
+        let media_index = state
             .media_operations
-            .iter_mut()
-            .find(|operation| operation.identity == identity)
-        {
-            return match operation.write_state {
+            .iter()
+            .position(|operation| operation.identity == identity);
+        let cancelled_index = state
+            .cancelled_media
+            .iter()
+            .position(|operation| operation.identity == identity);
+        let acknowledgement_was_observed = media_index
+            .is_some_and(|index| state.media_operations[index].acknowledgement_observed)
+            || cancelled_index
+                .is_some_and(|index| state.cancelled_media[index].acknowledgement_observed);
+        if !acknowledgement_was_observed {
+            if state
+                .flushed_through
+                .is_some_and(|flushed| identity.generation_id <= flushed)
+            {
+                return Err(AdapterError::new("voice sidecar generation is stale"));
+            }
+            validate_generation(&state, identity.generation_id, true)?;
+        }
+        if let Some(index) = media_index {
+            return match state.media_operations[index].write_state {
                 MediaWriteState::Queued => Err(AdapterError::new(
                     "voice sidecar media acknowledgement preceded its write",
                 )),
-                MediaWriteState::Writing => Ok(ResolveMedia::WaitForWrite(Arc::clone(
-                    &operation.write_finished,
-                ))),
-                MediaWriteState::Written if operation.accepted => Err(AdapterError::new(
-                    "voice sidecar media acknowledgement duplicated",
-                )),
+                MediaWriteState::Writing => {
+                    state.media_operations[index].acknowledgement_observed = true;
+                    Ok(ResolveMedia::WaitForWrite(Arc::clone(
+                        &state.media_operations[index].write_finished,
+                    )))
+                }
+                MediaWriteState::Written if state.media_operations[index].accepted => Err(
+                    AdapterError::new("voice sidecar media acknowledgement duplicated"),
+                ),
                 MediaWriteState::Written => {
+                    let operation = &mut state.media_operations[index];
+                    operation.acknowledgement_observed = false;
                     operation.accepted = true;
                     let generation_id = operation.identity.generation_id;
                     if let Some(completion) = operation.completion.take() {
@@ -1656,28 +1682,41 @@ impl SessionShared {
                         )));
                     }
                     operation.reservation.take();
+                    if operation.flushed_after_observation {
+                        state
+                            .media_operations
+                            .remove(index)
+                            .expect("media operation index");
+                    }
                     Ok(ResolveMedia::Complete)
                 }
             };
         }
-        if let Some(cancelled) = state
-            .cancelled_media
-            .iter_mut()
-            .find(|cancelled| cancelled.identity == identity)
-        {
-            return match cancelled.write_state {
+        if let Some(index) = cancelled_index {
+            return match state.cancelled_media[index].write_state {
                 MediaWriteState::Queued => Err(AdapterError::new(
                     "voice sidecar media acknowledgement preceded its write",
                 )),
-                MediaWriteState::Writing => Ok(ResolveMedia::WaitForWrite(Arc::clone(
-                    &cancelled.write_finished,
-                ))),
-                MediaWriteState::Written if cancelled.accepted => Err(AdapterError::new(
-                    "voice sidecar media acknowledgement duplicated",
-                )),
+                MediaWriteState::Writing => {
+                    state.cancelled_media[index].acknowledgement_observed = true;
+                    Ok(ResolveMedia::WaitForWrite(Arc::clone(
+                        &state.cancelled_media[index].write_finished,
+                    )))
+                }
+                MediaWriteState::Written if state.cancelled_media[index].accepted => Err(
+                    AdapterError::new("voice sidecar media acknowledgement duplicated"),
+                ),
                 MediaWriteState::Written => {
+                    let cancelled = &mut state.cancelled_media[index];
+                    cancelled.acknowledgement_observed = false;
                     cancelled.accepted = true;
                     cancelled.reservation.take();
+                    if cancelled.flushed_after_observation {
+                        state
+                            .cancelled_media
+                            .remove(index)
+                            .expect("cancelled media index");
+                    }
                     Ok(ResolveMedia::Complete)
                 }
             };
@@ -1764,12 +1803,18 @@ impl SessionShared {
             .checked_add(1)
             .ok_or_else(|| AdapterError::new("voice sidecar request identity overflowed"))?;
         let mut retained = VecDeque::new();
-        while let Some(operation) = state.media_operations.pop_front() {
+        while let Some(mut operation) = state.media_operations.pop_front() {
             if operation.identity.generation_id <= generation_id {
-                operation.write_finished.notify_one();
-                if let Some(completion) = operation.completion {
-                    let _ =
-                        completion.send(Err(AdapterError::new("voice sidecar generation flushed")));
+                if operation.acknowledgement_observed {
+                    operation.flushed_after_observation = true;
+                    operation.write_finished.notify_one();
+                    retained.push_back(operation);
+                } else {
+                    operation.write_finished.notify_one();
+                    if let Some(completion) = operation.completion {
+                        let _ = completion
+                            .send(Err(AdapterError::new("voice sidecar generation flushed")));
+                    }
                 }
             } else {
                 retained.push_back(operation);
@@ -1777,9 +1822,15 @@ impl SessionShared {
         }
         state.media_operations = retained;
         let mut retained_cancelled = VecDeque::new();
-        while let Some(cancelled) = state.cancelled_media.pop_front() {
+        while let Some(mut cancelled) = state.cancelled_media.pop_front() {
             if cancelled.identity.generation_id <= generation_id {
-                cancelled.write_finished.notify_one();
+                if cancelled.acknowledgement_observed {
+                    cancelled.flushed_after_observation = true;
+                    cancelled.write_finished.notify_one();
+                    retained_cancelled.push_back(cancelled);
+                } else {
+                    cancelled.write_finished.notify_one();
+                }
             } else {
                 retained_cancelled.push_back(cancelled);
             }
@@ -2102,7 +2153,13 @@ mod process_tests {
             .register_flush(flushed_identity.generation_id)
             .unwrap();
         notified(flushed_wait).await;
-        assert!(flushed.resolve_media(flushed_identity).is_err());
+        let resumed_flush_wait = wait_for_write(flushed.resolve_media(flushed_identity).unwrap());
+        flushed.finish_media_write(_flushed_operation).unwrap();
+        notified(resumed_flush_wait).await;
+        assert!(matches!(
+            flushed.resolve_media(flushed_identity).unwrap(),
+            ResolveMedia::Complete
+        ));
 
         let shutdown = Arc::new(SessionShared::new(SessionId::new(3)));
         let shutdown_identity = test_identity(3);
@@ -2113,9 +2170,65 @@ mod process_tests {
         assert!(shutdown.resolve_media(shutdown_identity).is_err());
     }
 
+    #[tokio::test]
+    async fn accepted_observed_while_writing_survives_covering_flush_and_resolver_continues() {
+        let shared = Arc::new(SessionShared::new(SessionId::new(4)));
+        let identity = test_identity(4);
+        let (operation_id, accepted) =
+            register_writing_media_with_completion(&shared, identity).await;
+        let resolver_shared = Arc::clone(&shared);
+        let resolver = tokio::spawn(async move {
+            resolve_media_ack(&resolver_shared, identity, &CancellationToken::new()).await
+        });
+        wait_for_acknowledgement_observation(&shared, identity).await;
+
+        let (flush_operation_id, flushed) = shared.register_flush(identity.generation_id).unwrap();
+        shared.finish_media_write(operation_id).unwrap();
+        resolver.await.unwrap().unwrap();
+        assert_eq!(
+            accepted.await.unwrap().unwrap().state(),
+            PlaybackState::Accepted
+        );
+
+        shared
+            .resolve_flush(identity.generation_id, flush_operation_id)
+            .unwrap();
+        assert_eq!(
+            flushed.await.unwrap().unwrap().state(),
+            PlaybackState::Flushed
+        );
+
+        let next_identity = test_identity(5);
+        let (next_operation_id, next_accepted) =
+            register_writing_media_with_completion(&shared, next_identity).await;
+        let next_resolver_shared = Arc::clone(&shared);
+        let next_resolver = tokio::spawn(async move {
+            resolve_media_ack(
+                &next_resolver_shared,
+                next_identity,
+                &CancellationToken::new(),
+            )
+            .await
+        });
+        wait_for_acknowledgement_observation(&shared, next_identity).await;
+        shared.finish_media_write(next_operation_id).unwrap();
+        next_resolver.await.unwrap().unwrap();
+        assert_eq!(
+            next_accepted.await.unwrap().unwrap().state(),
+            PlaybackState::Accepted
+        );
+        let state = shared.state.lock().expect("sidecar state lock poisoned");
+        let next_operation = state
+            .media_operations
+            .iter()
+            .find(|operation| operation.identity == next_identity)
+            .expect("accepted operation remains until rendered");
+        assert!(!next_operation.acknowledgement_observed);
+    }
+
     #[test]
     fn cancelled_flush_bookkeeping_never_exceeds_control_capacity() {
-        let shared = SessionShared::new(SessionId::new(4));
+        let shared = SessionShared::new(SessionId::new(6));
         for _ in 0..(CONTROL_QUEUE_CAPACITY * 4) {
             let (operation_id, _completion) = shared.register_flush(GenerationId::new(1)).unwrap();
             shared.cancel_flush(operation_id);
@@ -2125,6 +2238,18 @@ mod process_tests {
     }
 
     async fn register_writing_media(shared: &SessionShared, identity: MediaIdentity) -> u64 {
+        register_writing_media_with_completion(shared, identity)
+            .await
+            .0
+    }
+
+    async fn register_writing_media_with_completion(
+        shared: &SessionShared,
+        identity: MediaIdentity,
+    ) -> (
+        u64,
+        oneshot::Receiver<Result<PlaybackReceipt, AdapterError>>,
+    ) {
         let budget = Arc::new(MediaBudget::new());
         let capacity = Arc::new(Semaphore::new(1));
         let frame_permit = capacity.acquire_owned().await.unwrap();
@@ -2133,12 +2258,34 @@ mod process_tests {
             .reserve(1, frame_permit, &cancellation, &cancellation)
             .await
             .unwrap();
-        let (completion, _receiver) = oneshot::channel();
+        let (completion, receiver) = oneshot::channel();
         let operation_id = shared
             .register_media(identity, completion, reservation)
             .unwrap();
         assert!(shared.begin_media_write(operation_id));
-        operation_id
+        (operation_id, receiver)
+    }
+
+    async fn wait_for_acknowledgement_observation(shared: &SessionShared, identity: MediaIdentity) {
+        tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                let observed = shared
+                    .state
+                    .lock()
+                    .expect("sidecar state lock poisoned")
+                    .media_operations
+                    .iter()
+                    .any(|operation| {
+                        operation.identity == identity && operation.acknowledgement_observed
+                    });
+                if observed {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stdout resolver did not observe media acknowledgement");
     }
 
     fn test_identity(value: u64) -> MediaIdentity {

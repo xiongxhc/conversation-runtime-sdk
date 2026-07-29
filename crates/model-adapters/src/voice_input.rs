@@ -1,14 +1,16 @@
-use conversation_protocol::SessionId;
+use conversation_protocol::{SessionId, VoiceActivity};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::{AdapterError, AdapterFuture, CaptureEvent, RecognitionEvent};
+use crate::{AdapterError, AdapterFuture, CaptureEvent, PlaybackReceipt, RecognitionEvent};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum VoiceInputEvent {
+    Activity(VoiceActivity),
     Capture(CaptureEvent),
     Recognition(RecognitionEvent),
+    Playback(PlaybackReceipt),
 }
 
 /// Streams fused capture and recognition events for one voice session.

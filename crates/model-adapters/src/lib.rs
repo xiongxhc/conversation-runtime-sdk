@@ -7,7 +7,7 @@ mod generation_language;
 mod language_model;
 mod macos_afplay;
 mod macos_system_speech;
-pub(crate) mod macos_voice_sidecar;
+mod macos_voice_sidecar;
 mod mock;
 mod ollama;
 mod openai_compatible_speech;
@@ -35,6 +35,9 @@ pub use generation_language::{
 pub use language_model::{LanguageModel, LanguageModelRequest};
 pub use macos_afplay::{MacOsAfplayAudioOutput, MacOsAfplayConfig};
 pub use macos_system_speech::{MacOsSystemSpeechConfig, MacOsSystemSpeechSynthesizer};
+pub use macos_voice_sidecar::{
+    MacOsVoiceSidecar, MacOsVoiceSidecarConfig, MacOsVoiceSidecarSession, SystemDevice,
+};
 pub use mock::{MockAudioOutput, MockLanguageModel, MockSpeechSynthesizer};
 pub use ollama::{
     OllamaChatMetrics, OllamaChatStream, OllamaConfig, OllamaLanguageModel, OllamaThinkingLevel,

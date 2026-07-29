@@ -10,8 +10,10 @@ conversation-protocol.workspace = true
 conversation-runtime = { path = "../../crates/runtime" }
 reqwest.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 toml = "0.8"
 
 [lints]

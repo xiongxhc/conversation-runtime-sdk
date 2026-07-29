@@ -67,6 +67,7 @@ pub enum VoiceSessionEvent {
     },
     Turn {
         session_id: SessionId,
+        generation_id: GenerationId,
         event: RuntimeEvent,
     },
     Timing {

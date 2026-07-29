@@ -1,6 +1,6 @@
 use conversation_protocol::{
-    ComponentDescriptor, ComponentKind, ExecutionLocation, GenerationId, PrivacyMode, SessionId,
-    UtteranceId, VoiceSessionEvent, VoiceSessionPolicy,
+    ComponentDescriptor, ComponentKind, ExecutionLocation, GenerationId, PrivacyMode, RuntimeEvent,
+    SessionId, TurnId, UtteranceId, VoiceSessionEvent, VoiceSessionPolicy,
 };
 
 #[test]
@@ -54,6 +54,26 @@ fn partial_transcript_is_session_scoped_and_nonterminal() {
     };
 
     assert!(!event.is_session_terminal());
+}
+
+#[test]
+fn turn_events_preserve_generation_identity() {
+    let event = VoiceSessionEvent::Turn {
+        session_id: SessionId::new(1),
+        generation_id: GenerationId::new(2),
+        event: RuntimeEvent::TurnCompleted {
+            turn_id: TurnId::new(3),
+        },
+    };
+
+    assert!(!event.is_session_terminal());
+    assert!(matches!(
+        event,
+        VoiceSessionEvent::Turn {
+            generation_id,
+            ..
+        } if generation_id == GenerationId::new(2)
+    ));
 }
 
 #[test]

@@ -180,6 +180,69 @@ async fn stale_barge_in_does_not_cancel_replacement_generation() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn stale_rendered_is_discarded_while_replacement_generation_responds() {
+    let harness =
+        VoiceSessionHarness::speaking_generations([GenerationId::new(1), GenerationId::new(2)]);
+    let mut events = harness.start().await;
+    harness
+        .start_speaking_generation(&mut events, GenerationId::new(1))
+        .await;
+    harness
+        .runtime
+        .barge_in(TurnId::new(1), GenerationId::new(1))
+        .await
+        .unwrap();
+    drain_until_turn_terminal(&mut events).await;
+
+    harness
+        .start_speaking_generation(&mut events, GenerationId::new(2))
+        .await;
+    loop {
+        tokio::select! {
+            event = events.recv() => {
+                assert!(event.is_some(), "replacement generation event stream closed");
+            }
+            _ = tokio::time::sleep(Duration::from_millis(1)) => break,
+        }
+    }
+    harness
+        .emit_playback(PlaybackReceipt::new(
+            GenerationId::new(1),
+            PlaybackState::Rendered,
+        ))
+        .await;
+    tokio::select! {
+        event = events.recv() => {
+            assert!(!matches!(
+                event,
+                Some(VoiceSessionEvent::Playback {
+                    generation_id,
+                    state: PlaybackState::Rendered,
+                    ..
+                }) if generation_id == GenerationId::new(1)
+            ));
+        }
+        _ = tokio::time::sleep(Duration::from_millis(1)) => {}
+    }
+    harness
+        .runtime
+        .barge_in(TurnId::new(2), GenerationId::new(2))
+        .await
+        .unwrap();
+    let observed = drain_until_turn_terminal(&mut events).await;
+
+    assert!(!observed.iter().any(|event| matches!(
+        event,
+        VoiceSessionEvent::Playback {
+            generation_id,
+            state: PlaybackState::Rendered,
+            ..
+        } if *generation_id == GenerationId::new(1)
+    )));
+    harness.shutdown(&mut events).await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn barge_in_cleanup_is_not_blocked_by_full_lifecycle_output() {
     let harness = VoiceSessionHarness::speaking_generations([GenerationId::new(1)]);
     let mut events = harness.start().await;
@@ -654,6 +717,14 @@ impl VoiceSessionHarness {
                     at_ms: self.elapsed_ms.load(Ordering::Acquire) as u64,
                 },
             )))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+    }
+
+    async fn emit_playback(&self, receipt: PlaybackReceipt) {
+        self.input
+            .send(Ok(VoiceInputEvent::Playback(receipt)))
             .await
             .unwrap();
         tokio::task::yield_now().await;

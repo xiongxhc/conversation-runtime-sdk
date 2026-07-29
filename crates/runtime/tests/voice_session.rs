@@ -3,13 +3,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use conversation_model_adapters::{
-    AdapterError, AdapterFuture, MockContinuousAudioOutput, MockGenerationLanguageModel,
-    MockStreamingSpeechSynthesizer, VoiceInput, VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
+    AdapterError, AdapterFuture, AudioFrame, ContinuousAudioOutput, MockContinuousAudioOutput,
+    MockGenerationLanguageModel, MockStreamingSpeechSynthesizer, PcmFormat, PcmSampleFormat,
+    PlaybackReceipt, VoiceInput, VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
 };
 use conversation_protocol::{
-    ComponentDescriptor, ComponentKind, ExecutionLocation, GenerationId, PrivacyMode,
-    RecoveryDisposition, RuntimeEvent, SessionId, TurnId, VoiceActivity, VoiceSessionEvent,
-    VoiceSessionPolicy, VoiceTimingMilestone,
+    ComponentDescriptor, ComponentKind, ExecutionLocation, GenerationId, PlaybackState,
+    PrivacyMode, RecoveryDisposition, RuntimeEvent, RuntimeStage, SessionId, TurnId, UtteranceId,
+    VoiceActivity, VoiceSessionEvent, VoiceSessionPolicy, VoiceTimingMilestone,
 };
 use conversation_runtime::{VoiceSessionAdapters, VoiceSessionEventStream, VoiceSessionRuntime};
 use tokio::sync::{mpsc, Notify};
@@ -294,11 +295,129 @@ async fn stalled_consumer_backpressures_sustained_multi_turn_reliable_events() {
     .expect("saturated session did not clean up");
 }
 
+#[tokio::test]
+async fn input_side_acceptance_is_rejected_without_publication() {
+    let harness = VoiceSessionHarness::new();
+    let mut events = harness.start().await;
+    assert_session_started(events.recv().await);
+
+    harness
+        .send(VoiceInputEvent::Playback(PlaybackReceipt::new(
+            GenerationId::new(1),
+            PlaybackState::Accepted,
+        )))
+        .await;
+    let observed = drain_until_session_terminal(&mut events).await;
+
+    assert!(!observed.iter().any(|event| matches!(
+        event,
+        VoiceSessionEvent::Playback {
+            state: PlaybackState::Accepted,
+            ..
+        }
+    )));
+    assert!(observed.iter().any(|event| matches!(
+        event,
+        VoiceSessionEvent::SessionFailed {
+            error,
+            recovery: RecoveryDisposition::NewSession,
+            ..
+        } if error.stage() == RuntimeStage::VoiceSidecar
+    )));
+}
+
+#[tokio::test(start_paused = true)]
+async fn matching_playback_lifecycle_is_reliable_under_saturated_output() {
+    let harness = VoiceSessionHarness::with_playback();
+    let mut events = harness.start().await;
+    assert_session_started(events.recv().await);
+
+    for segment_id in 1..=96 {
+        harness
+            .partial(segment_id, &format!("saturated-{segment_id}"))
+            .await;
+    }
+    harness.engine_final(100, "final question").await;
+    harness.speech_ended(0).await;
+    tokio::time::advance(Duration::from_millis(600)).await;
+    harness.wait_for_request_count(1).await;
+    harness.wait_for_frame_count(1).await;
+    for _ in 0..96 {
+        harness
+            .send(VoiceInputEvent::Playback(PlaybackReceipt::new(
+                GenerationId::new(1),
+                PlaybackState::Rendered,
+            )))
+            .await;
+    }
+    harness.release_playback_acceptance();
+
+    let observed = drain_until_turn_terminal(&mut events).await;
+    let accepted = observed
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                VoiceSessionEvent::Playback {
+                    generation_id,
+                    state: PlaybackState::Accepted,
+                    ..
+                } if *generation_id == GenerationId::new(1)
+            )
+        })
+        .expect("matching runtime acceptance was not delivered");
+    let rendered = observed
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                VoiceSessionEvent::Playback {
+                    generation_id,
+                    state: PlaybackState::Rendered,
+                    ..
+                } if *generation_id == GenerationId::new(1)
+            )
+        })
+        .expect("matching rendered acknowledgement was not delivered");
+    let completed = observed
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                VoiceSessionEvent::Turn {
+                    generation_id,
+                    event: RuntimeEvent::TurnCompleted { .. },
+                    ..
+                } if *generation_id == GenerationId::new(1)
+            )
+        })
+        .expect("matching turn completion was not delivered");
+
+    assert!(accepted < rendered);
+    assert!(rendered < completed);
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|event| matches!(
+                event,
+                VoiceSessionEvent::Playback {
+                    generation_id,
+                    state: PlaybackState::Accepted | PlaybackState::Rendered,
+                    ..
+                } if *generation_id == GenerationId::new(1)
+            ))
+            .count(),
+        2
+    );
+    harness.shutdown(&mut events).await;
+}
+
 struct VoiceSessionHarness {
     runtime: VoiceSessionRuntime,
     factory: Arc<TestVoiceIoFactory>,
     input: mpsc::Sender<Result<VoiceInputEvent, AdapterError>>,
     language: Arc<MockGenerationLanguageModel>,
+    playback_gate: Option<Arc<GatedAcceptOutput>>,
 }
 
 impl VoiceSessionHarness {
@@ -318,6 +437,42 @@ impl VoiceSessionHarness {
             factory,
             input,
             language,
+            playback_gate: None,
+        }
+    }
+
+    fn with_playback() -> Self {
+        let turn_id = TurnId::new(1);
+        let generation_id = GenerationId::new(1);
+        let format = PcmFormat::new(24_000, 1, PcmSampleFormat::Signed16LittleEndian).unwrap();
+        let frame = AudioFrame::new(
+            turn_id,
+            generation_id,
+            UtteranceId::new(1),
+            0,
+            format,
+            vec![0; 960],
+        )
+        .unwrap();
+        let (input, input_receiver) = mpsc::channel(32);
+        let playback_gate = Arc::new(GatedAcceptOutput::new());
+        let factory = Arc::new(TestVoiceIoFactory::new(
+            input_receiver,
+            playback_gate.clone(),
+        ));
+        let language = Arc::new(MockGenerationLanguageModel::new(["Fixture response."]));
+        let speech = Arc::new(MockStreamingSpeechSynthesizer::new([frame]));
+        let runtime = VoiceSessionRuntime::new(VoiceSessionAdapters::new(
+            factory.clone(),
+            language.clone(),
+            speech,
+        ));
+        Self {
+            runtime,
+            factory,
+            input,
+            language,
+            playback_gate: Some(playback_gate),
         }
     }
 
@@ -376,6 +531,27 @@ impl VoiceSessionHarness {
         panic!("language request {expected} did not start");
     }
 
+    async fn wait_for_frame_count(&self, expected: usize) {
+        let playback_gate = self
+            .playback_gate
+            .as_ref()
+            .expect("playback harness has a gated output");
+        for _ in 0..128 {
+            if playback_gate.frames().len() >= expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("audio frame {expected} was not enqueued");
+    }
+
+    fn release_playback_acceptance(&self) {
+        self.playback_gate
+            .as_ref()
+            .expect("playback harness has a gated output")
+            .release();
+    }
+
     async fn shutdown(&self, events: &mut VoiceSessionEventStream) {
         self.runtime.shutdown().await.unwrap();
         let terminal = timeout(Duration::from_secs(1), async {
@@ -400,7 +576,7 @@ impl VoiceSessionHarness {
 
 struct TestVoiceIoFactory {
     input: Arc<TestVoiceInput>,
-    output: Arc<MockContinuousAudioOutput>,
+    output: Arc<dyn ContinuousAudioOutput>,
     start_count: AtomicUsize,
     input_started: Arc<AtomicBool>,
     completion_finished: Arc<AtomicBool>,
@@ -409,7 +585,7 @@ struct TestVoiceIoFactory {
 impl TestVoiceIoFactory {
     fn new(
         input: mpsc::Receiver<Result<VoiceInputEvent, AdapterError>>,
-        output: Arc<MockContinuousAudioOutput>,
+        output: Arc<dyn ContinuousAudioOutput>,
     ) -> Self {
         let input_started = Arc::new(AtomicBool::new(false));
         Self {
@@ -461,6 +637,58 @@ impl VoiceIoFactory for TestVoiceIoFactory {
                 }),
             })
         })
+    }
+}
+
+struct GatedAcceptOutput {
+    frames: Mutex<Vec<AudioFrame>>,
+    release: Notify,
+}
+
+impl GatedAcceptOutput {
+    fn new() -> Self {
+        Self {
+            frames: Mutex::new(Vec::new()),
+            release: Notify::new(),
+        }
+    }
+
+    fn frames(&self) -> Vec<AudioFrame> {
+        self.frames.lock().expect("frame lock poisoned").clone()
+    }
+
+    fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+impl ContinuousAudioOutput for GatedAcceptOutput {
+    fn enqueue<'a>(
+        &'a self,
+        frame: AudioFrame,
+        cancellation: CancellationToken,
+    ) -> AdapterFuture<'a, PlaybackReceipt> {
+        Box::pin(async move {
+            let generation_id = frame.generation_id();
+            self.frames.lock().expect("frame lock poisoned").push(frame);
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    Err(AdapterError::new("media enqueue cancelled"))
+                }
+                _ = self.release.notified() => {
+                    Ok(PlaybackReceipt::new(generation_id, PlaybackState::Accepted))
+                }
+            }
+        })
+    }
+
+    fn flush<'a>(
+        &'a self,
+        _session_id: SessionId,
+        generation_id: GenerationId,
+    ) -> AdapterFuture<'a, PlaybackReceipt> {
+        Box::pin(async move { Ok(PlaybackReceipt::new(generation_id, PlaybackState::Flushed)) })
     }
 }
 
@@ -565,6 +793,7 @@ fn assert_final_and_completed(observed: &[VoiceSessionEvent], turn_id: TurnId, t
     }));
     assert!(observed.contains(&VoiceSessionEvent::Turn {
         session_id: SESSION_ID,
+        generation_id: GenerationId::new(turn_id.get()),
         event: RuntimeEvent::TurnStarted { turn_id },
     }));
     assert_eq!(
@@ -613,4 +842,22 @@ async fn drain_until_turn_terminal(events: &mut VoiceSessionEventStream) -> Vec<
     })
     .await
     .expect("turn terminal timed out")
+}
+
+async fn drain_until_session_terminal(
+    events: &mut VoiceSessionEventStream,
+) -> Vec<VoiceSessionEvent> {
+    timeout(Duration::from_secs(1), async {
+        let mut observed = Vec::new();
+        while let Some(event) = events.recv().await {
+            let terminal = event.is_session_terminal();
+            observed.push(event);
+            if terminal {
+                return observed;
+            }
+        }
+        panic!("voice session ended before the session terminal");
+    })
+    .await
+    .expect("session terminal timed out")
 }

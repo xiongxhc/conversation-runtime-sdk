@@ -1,6 +1,5 @@
 #![cfg(unix)]
 
-use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -47,7 +46,7 @@ async fn run() -> Result<i32, CliFailure> {
     let mut events = runtime.start(policy).await.map_err(runtime_failure)?;
     let stdout = StdoutWriter::new();
     let mut playback = PlaybackRenderer::default();
-    let mut once_turn_completed = false;
+    let mut once_completion = OnceCompletion::default();
 
     loop {
         let event = tokio::select! {
@@ -116,16 +115,21 @@ async fn run() -> Result<i32, CliFailure> {
                 generation_id,
                 ..
             } => {
+                playback.interrupt(generation_id);
                 eprintln!(
                     "turn={} generation={} status=interrupted",
                     turn_id.get(),
                     generation_id.get()
                 );
             }
-            VoiceSessionEvent::Turn { event, .. } => {
+            VoiceSessionEvent::Turn {
+                generation_id,
+                event,
+                ..
+            } => {
                 if render_turn_event(&event) && arguments.once {
-                    once_turn_completed = true;
-                    if playback.has_rendered() {
+                    once_completion.complete(generation_id);
+                    if once_completion.is_ready(&playback) {
                         shutdown_and_drain(&runtime, &mut events, &mut playback).await?;
                         eprintln!("status=completed");
                         return Ok(0);
@@ -150,8 +154,7 @@ async fn run() -> Result<i32, CliFailure> {
                 ..
             } => {
                 playback.render(generation_id, state);
-                if arguments.once && once_turn_completed && matches!(state, PlaybackState::Rendered)
-                {
+                if arguments.once && once_completion.is_ready(&playback) {
                     shutdown_and_drain(&runtime, &mut events, &mut playback).await?;
                     eprintln!("status=completed");
                     return Ok(0);
@@ -328,10 +331,16 @@ fn session_already_ended(error: &RuntimeError) -> bool {
     error.stage() == RuntimeStage::Runtime && error.message() == "there is no active voice session"
 }
 
+#[derive(Clone, Copy)]
+struct PlaybackProgress {
+    generation_id: GenerationId,
+    accepted: bool,
+    rendered: bool,
+}
+
 #[derive(Default)]
 struct PlaybackRenderer {
-    accepted: BTreeSet<u64>,
-    rendered: BTreeSet<u64>,
+    active: Option<PlaybackProgress>,
 }
 
 impl PlaybackRenderer {
@@ -339,16 +348,36 @@ impl PlaybackRenderer {
         let generation = generation_id.get();
         match state {
             PlaybackState::Accepted => {
-                if self.accepted.insert(generation) {
-                    eprintln!("generation={generation} playback=accepted");
+                match &mut self.active {
+                    Some(active) if active.generation_id > generation_id => return,
+                    Some(active) if active.generation_id == generation_id => {
+                        if active.accepted {
+                            return;
+                        }
+                        active.accepted = true;
+                    }
+                    _ => {
+                        self.active = Some(PlaybackProgress {
+                            generation_id,
+                            accepted: true,
+                            rendered: false,
+                        });
+                    }
                 }
+                eprintln!("generation={generation} playback=accepted");
             }
             PlaybackState::Rendered => {
-                if self.rendered.insert(generation) {
-                    eprintln!("generation={generation} playback=rendered");
+                let Some(active) = &mut self.active else {
+                    return;
+                };
+                if active.generation_id != generation_id || !active.accepted || active.rendered {
+                    return;
                 }
+                active.rendered = true;
+                eprintln!("generation={generation} playback=rendered");
             }
             PlaybackState::Flushed => {
+                self.interrupt(generation_id);
                 eprintln!("generation={generation} playback=flushed");
             }
             _ => {
@@ -360,8 +389,35 @@ impl PlaybackRenderer {
         }
     }
 
-    fn has_rendered(&self) -> bool {
-        !self.rendered.is_empty()
+    fn interrupt(&mut self, generation_id: GenerationId) {
+        if self
+            .active
+            .is_some_and(|active| active.generation_id == generation_id)
+        {
+            self.active = None;
+        }
+    }
+
+    fn is_complete(&self, generation_id: GenerationId) -> bool {
+        self.active.is_some_and(|active| {
+            active.generation_id == generation_id && active.accepted && active.rendered
+        })
+    }
+}
+
+#[derive(Default)]
+struct OnceCompletion {
+    generation_id: Option<GenerationId>,
+}
+
+impl OnceCompletion {
+    fn complete(&mut self, generation_id: GenerationId) {
+        self.generation_id = Some(generation_id);
+    }
+
+    fn is_ready(&self, playback: &PlaybackRenderer) -> bool {
+        self.generation_id
+            .is_some_and(|generation_id| playback.is_complete(generation_id))
     }
 }
 
@@ -636,7 +692,26 @@ mod tests {
 
         renderer.render(GenerationId::new(7), PlaybackState::Rendered);
 
-        assert!(renderer.accepted.is_empty());
-        assert_eq!(renderer.rendered, BTreeSet::from([7]));
+        assert!(renderer.active.is_none());
+        assert!(!renderer.is_complete(GenerationId::new(7)));
+    }
+
+    #[test]
+    fn once_completion_requires_matching_replacement_generation_playback() {
+        let first = GenerationId::new(1);
+        let replacement = GenerationId::new(2);
+        let mut renderer = PlaybackRenderer::default();
+        let mut completion = OnceCompletion::default();
+
+        renderer.render(first, PlaybackState::Accepted);
+        renderer.render(first, PlaybackState::Rendered);
+        renderer.interrupt(first);
+        completion.complete(replacement);
+
+        assert!(!completion.is_ready(&renderer));
+        renderer.render(replacement, PlaybackState::Accepted);
+        assert!(!completion.is_ready(&renderer));
+        renderer.render(replacement, PlaybackState::Rendered);
+        assert!(completion.is_ready(&renderer));
     }
 }

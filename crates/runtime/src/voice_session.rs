@@ -724,9 +724,12 @@ impl VoiceLoop {
         match interrupt_result {
             Ok(Ok(())) => {}
             Ok(Err(error)) | Err(error) => {
-                self.turn_events.take();
+                let abort_error = self
+                    .abort_interrupted_turn(turn_id, generation_id)
+                    .await
+                    .err();
                 self.state = VoiceLoopState::Listening;
-                return Err(error);
+                return Err(abort_error.unwrap_or(error));
             }
         }
 
@@ -738,9 +741,17 @@ impl VoiceLoop {
         let drain_result =
             cleanup_with_timeout("streaming turn drain", self.drain_interrupted_turn(turn_id))
                 .await;
+        let drain_result = match drain_result {
+            Ok(result) => result,
+            Err(error) => {
+                let abort_result = self.abort_interrupted_turn(turn_id, generation_id).await;
+                self.state = VoiceLoopState::Listening;
+                abort_result?;
+                return Err(error);
+            }
+        };
         self.state = VoiceLoopState::Listening;
-
-        drain_result??;
+        drain_result?;
         if let Err(error) = flush_result? {
             return Err(adapter_runtime_error(
                 RuntimeStage::ContinuousAudioOutput,
@@ -754,13 +765,25 @@ impl VoiceLoop {
         &mut self,
         expected_turn_id: TurnId,
     ) -> Result<(), RuntimeError> {
-        let Some(mut turn_events) = self.turn_events.take() else {
+        if self.turn_events.is_none() {
             return Err(runtime_error(
                 "interrupted turn ended without an event stream",
             ));
-        };
+        }
         let mut delivery_open = true;
-        while let Some(event) = turn_events.recv().await {
+        loop {
+            let event = self
+                .turn_events
+                .as_mut()
+                .expect("interrupted turn event stream remains present")
+                .recv()
+                .await;
+            let Some(event) = event else {
+                self.turn_events.take();
+                return Err(runtime_error(
+                    "interrupted turn ended without a terminal event",
+                ));
+            };
             let terminal = event.is_terminal();
             let matching_cancellation = matches!(
                 event,
@@ -770,6 +793,7 @@ impl VoiceLoop {
             let published = self.publish_turn_event(event).await;
             delivery_open &= published;
             if terminal {
+                self.turn_events.take();
                 if !matching_cancellation {
                     return Err(runtime_error(format!(
                         "interrupted turn {expected_turn_id} ended without its matching cancellation"
@@ -784,9 +808,26 @@ impl VoiceLoop {
                 };
             }
         }
-        Err(runtime_error(
-            "interrupted turn ended without a terminal event",
-        ))
+    }
+
+    async fn abort_interrupted_turn(
+        &mut self,
+        turn_id: TurnId,
+        generation_id: GenerationId,
+    ) -> Result<(), RuntimeError> {
+        let Some(turn_events) = self.turn_events.as_mut() else {
+            return Err(runtime_error(
+                "interrupted turn ended without an abortable task",
+            ));
+        };
+        let abort_result = cleanup_with_timeout(
+            "streaming turn abort and reap",
+            self.turn_runtime
+                .abort_turn(turn_id, generation_id, turn_events),
+        )
+        .await;
+        self.turn_events.take();
+        abort_result?
     }
 
     async fn cleanup_active_turn(&mut self) -> Result<(), RuntimeError> {

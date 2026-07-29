@@ -268,6 +268,52 @@ async fn recognition_failure_keeps_real_factory_completion_alive() {
 }
 
 #[tokio::test]
+async fn recognition_failure_before_readiness_is_fatal() {
+    let harness = FakeSidecarHarness::new("recognition-failure-before-ready");
+    let error = match harness.start(CancellationToken::new()).await {
+        Ok(_) => panic!("pre-ready recognition failure started a session"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.message(), "voice sidecar recognition failed");
+    harness.assert_process_gone().await;
+}
+
+#[tokio::test]
+async fn recognition_failure_with_mismatched_stage_is_fatal() {
+    let harness = FakeSidecarHarness::new("recognition-failure-wrong-stage");
+    let session = harness.start(CancellationToken::new()).await.unwrap();
+    let _input = session
+        .input
+        .start(SESSION_ID, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let error = await_completion(session.completion)
+        .await
+        .expect_err("mismatched recognition stage kept completion alive");
+    assert_eq!(error.message(), "voice sidecar failure stage mismatch");
+    harness.assert_process_gone().await;
+}
+
+#[tokio::test]
+async fn recognition_failure_with_mismatched_session_is_fatal() {
+    let harness = FakeSidecarHarness::new("recognition-failure-wrong-session");
+    let session = harness.start(CancellationToken::new()).await.unwrap();
+    let _input = session
+        .input
+        .start(SESSION_ID, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let error = await_completion(session.completion)
+        .await
+        .expect_err("mismatched recognition session kept completion alive");
+    assert_eq!(error.message(), "voice sidecar session identity mismatch");
+    harness.assert_process_gone().await;
+}
+
+#[tokio::test]
 async fn startup_timeout_kills_and_reaps_child() {
     let fixture = TempDir::new().unwrap();
     let model = fixture.path().join("model");

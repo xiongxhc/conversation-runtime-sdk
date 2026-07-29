@@ -308,6 +308,10 @@ async fn stalled_turn_drain_times_out_to_one_new_session_terminal() {
     let observed = drain_until_session_terminal(&mut events).await;
 
     assert_new_session_cleanup_timeout(&observed);
+    assert!(
+        harness.output.stalled_work_stopped(),
+        "session terminal published before stalled turn work was aborted"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -479,7 +483,7 @@ impl VoiceSessionHarness {
     fn configured<I>(
         active_generations: I,
         flush_behavior: FlushBehavior,
-        stall_language_cleanup: bool,
+        stall_turn_cleanup: bool,
         stall_completion: bool,
     ) -> Self
     where
@@ -487,11 +491,8 @@ impl VoiceSessionHarness {
     {
         let active_generations: BTreeSet<_> = active_generations.into_iter().collect();
         let (input, input_receiver) = mpsc::channel(64);
-        let output = Arc::new(CancellableOutput::new(flush_behavior));
-        let language = Arc::new(CancellableLanguage::new(
-            active_generations.clone(),
-            stall_language_cleanup,
-        ));
+        let output = Arc::new(CancellableOutput::new(flush_behavior, stall_turn_cleanup));
+        let language = Arc::new(CancellableLanguage::new(active_generations.clone()));
         let speech = Arc::new(CancellableSpeech::new(active_generations));
         let factory = Arc::new(TestVoiceIoFactory::new(
             input_receiver,
@@ -665,15 +666,13 @@ impl VoiceSessionHarness {
 
 struct CancellableLanguage {
     active_generations: BTreeSet<GenerationId>,
-    stall_cleanup: bool,
     cleaned: Arc<Mutex<BTreeSet<GenerationId>>>,
 }
 
 impl CancellableLanguage {
-    fn new(active_generations: BTreeSet<GenerationId>, stall_cleanup: bool) -> Self {
+    fn new(active_generations: BTreeSet<GenerationId>) -> Self {
         Self {
             active_generations,
-            stall_cleanup,
             cleaned: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
@@ -698,7 +697,6 @@ impl GenerationLanguageModel for CancellableLanguage {
         }
 
         let cleaned = Arc::clone(&self.cleaned);
-        let stall_cleanup = self.stall_cleanup;
         tokio::spawn(async move {
             for _ in 0..128 {
                 if sender
@@ -714,9 +712,6 @@ impl GenerationLanguageModel for CancellableLanguage {
                 }
             }
             cancellation.cancelled().await;
-            if stall_cleanup {
-                pending::<()>().await;
-            }
             let _ = sender
                 .send(Ok(GenerationTextDelta::new(
                     request.turn_id(),
@@ -791,6 +786,8 @@ enum FlushBehavior {
 
 struct CancellableOutput {
     flush_behavior: FlushBehavior,
+    stall_turn_cleanup: bool,
+    stalled_work_stopped: Arc<AtomicBool>,
     frames: Mutex<Vec<AudioFrame>>,
     flushes: Mutex<Vec<GenerationId>>,
     enqueue_count: AtomicUsize,
@@ -799,9 +796,11 @@ struct CancellableOutput {
 }
 
 impl CancellableOutput {
-    fn new(flush_behavior: FlushBehavior) -> Self {
+    fn new(flush_behavior: FlushBehavior, stall_turn_cleanup: bool) -> Self {
         Self {
             flush_behavior,
+            stall_turn_cleanup,
+            stalled_work_stopped: Arc::new(AtomicBool::new(false)),
             frames: Mutex::new(Vec::new()),
             flushes: Mutex::new(Vec::new()),
             enqueue_count: AtomicUsize::new(0),
@@ -818,6 +817,10 @@ impl CancellableOutput {
         self.frames.lock().expect("frame lock poisoned").clone()
     }
 
+    fn stalled_work_stopped(&self) -> bool {
+        self.stalled_work_stopped.load(Ordering::Acquire)
+    }
+
     async fn wait_for_enqueue_count(&self, expected: usize) {
         while self.enqueue_count.load(Ordering::Acquire) < expected {
             self.enqueue_notify.notified().await;
@@ -832,6 +835,11 @@ impl ContinuousAudioOutput for CancellableOutput {
         cancellation: CancellationToken,
     ) -> AdapterFuture<'a, PlaybackReceipt> {
         Box::pin(async move {
+            let _stalled_work = StalledWorkGuard {
+                stopped: self
+                    .stall_turn_cleanup
+                    .then(|| Arc::clone(&self.stalled_work_stopped)),
+            };
             self.frames
                 .lock()
                 .expect("frame lock poisoned")
@@ -848,6 +856,9 @@ impl ContinuousAudioOutput for CancellableOutput {
                 }
             } else {
                 cancellation.cancelled().await;
+            }
+            if self.stall_turn_cleanup {
+                pending::<()>().await;
             }
             self.frames
                 .lock()
@@ -886,6 +897,18 @@ impl ContinuousAudioOutput for CancellableOutput {
                 FlushBehavior::Stall => pending().await,
             }
         })
+    }
+}
+
+struct StalledWorkGuard {
+    stopped: Option<Arc<AtomicBool>>,
+}
+
+impl Drop for StalledWorkGuard {
+    fn drop(&mut self) {
+        if let Some(stopped) = &self.stopped {
+            stopped.store(true, Ordering::Release);
+        }
     }
 }
 

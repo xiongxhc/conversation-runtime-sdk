@@ -99,6 +99,27 @@ fn run() -> Result<(), String> {
         match event {
             FakeEvent::Control(ControlFrame::StartSession { session }) => {
                 session_id = Some(session);
+                if scenario == "recognition-failure-before-ready" {
+                    write_json_frame(
+                        &mut stdout,
+                        FAILURE,
+                        json!({
+                            "session_id": session,
+                            "stage": "speech_recognizer",
+                            "code": "recognition_failed"
+                        }),
+                    )?;
+                    write_json_frame(
+                        &mut stdout,
+                        VOICE_ACTIVITY,
+                        json!({
+                            "session_id": session,
+                            "activity": "speech_started",
+                            "at_ms": 10
+                        }),
+                    )?;
+                    return Ok(());
+                }
                 if scenario == "permission-denied" {
                     write_json_frame(
                         &mut stdout,
@@ -157,6 +178,35 @@ fn run() -> Result<(), String> {
                             "session_id": session,
                             "activity": "speech_started",
                             "at_ms": 10
+                        }),
+                    )?;
+                } else if scenario == "recognition-failure-wrong-stage" {
+                    write_json_frame(
+                        &mut stdout,
+                        FAILURE,
+                        json!({
+                            "session_id": session,
+                            "stage": "voice_sidecar",
+                            "code": "recognition_failed"
+                        }),
+                    )?;
+                    write_json_frame(
+                        &mut stdout,
+                        VOICE_ACTIVITY,
+                        json!({
+                            "session_id": session + 1,
+                            "activity": "speech_started",
+                            "at_ms": 10
+                        }),
+                    )?;
+                } else if scenario == "recognition-failure-wrong-session" {
+                    write_json_frame(
+                        &mut stdout,
+                        FAILURE,
+                        json!({
+                            "session_id": session + 1,
+                            "stage": "speech_recognizer",
+                            "code": "recognition_failed"
                         }),
                     )?;
                 } else if scenario == "partial-final" {

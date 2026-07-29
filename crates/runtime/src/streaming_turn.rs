@@ -1,5 +1,7 @@
+use std::future::Future;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 
 use conversation_model_adapters::{
@@ -11,8 +13,8 @@ use conversation_protocol::{
     GenerationId, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage,
     RuntimeTimingMilestone, SessionId, TurnId, UtteranceId,
 };
-use tokio::sync::{mpsc, oneshot, Mutex};
-use tokio::task::{JoinError, JoinHandle};
+use tokio::sync::{mpsc, oneshot, Mutex, Notify};
+use tokio::task::{AbortHandle, JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use crate::generation::GenerationGuard;
@@ -27,6 +29,8 @@ pub struct StreamingTurnEventStream {
     events: mpsc::Receiver<RuntimeEvent>,
     terminal: Option<oneshot::Receiver<RuntimeEvent>>,
     events_closed: bool,
+    task: Option<JoinHandle<()>>,
+    tasks: TurnTaskGroup,
 }
 
 impl StreamingTurnEventStream {
@@ -38,9 +42,101 @@ impl StreamingTurnEventStream {
             self.events_closed = true;
         }
 
-        let terminal_event = self.terminal.as_mut()?.await.ok();
+        let terminal_event = self.terminal.as_mut()?.await;
         self.terminal = None;
-        terminal_event
+        self.join_task().await;
+        terminal_event.ok()
+    }
+
+    async fn join_task(&mut self) {
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+    }
+
+    async fn abort_and_reap(&mut self) -> Result<(), RuntimeError> {
+        self.tasks.abort_and_wait().await;
+        let Some(task) = self.task.take() else {
+            return Ok(());
+        };
+        match task.await {
+            Ok(()) => Ok(()),
+            Err(error) if error.is_cancelled() => Ok(()),
+            Err(_) => Err(runtime_error("streaming turn task failed during abort")),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct TurnTaskGroup {
+    inner: Arc<TurnTaskGroupInner>,
+}
+
+#[derive(Default)]
+struct TurnTaskGroupInner {
+    aborts: StdMutex<Vec<AbortHandle>>,
+    active: AtomicUsize,
+    finished: Notify,
+}
+
+impl TurnTaskGroup {
+    fn spawn<T>(&self, future: impl Future<Output = T> + Send + 'static) -> JoinHandle<T>
+    where
+        T: Send + 'static,
+    {
+        self.inner.active.fetch_add(1, Ordering::AcqRel);
+        let completion = TurnTaskCompletion {
+            group: self.clone(),
+        };
+        let task = tokio::spawn(async move {
+            let _completion = completion;
+            future.await
+        });
+        self.inner
+            .aborts
+            .lock()
+            .expect("turn task abort lock poisoned")
+            .push(task.abort_handle());
+        task
+    }
+
+    async fn abort_and_wait(&self) {
+        loop {
+            let finished = self.inner.finished.notified();
+            self.abort_all();
+            if self.inner.active.load(Ordering::Acquire) == 0 {
+                self.inner
+                    .aborts
+                    .lock()
+                    .expect("turn task abort lock poisoned")
+                    .clear();
+                return;
+            }
+            finished.await;
+        }
+    }
+
+    fn abort_all(&self) {
+        for task in self
+            .inner
+            .aborts
+            .lock()
+            .expect("turn task abort lock poisoned")
+            .iter()
+        {
+            task.abort();
+        }
+    }
+}
+
+struct TurnTaskCompletion {
+    group: TurnTaskGroup,
+}
+
+impl Drop for TurnTaskCompletion {
+    fn drop(&mut self) {
+        self.group.inner.active.fetch_sub(1, Ordering::AcqRel);
+        self.group.inner.finished.notify_one();
     }
 }
 
@@ -117,6 +213,7 @@ impl StreamingTurnRuntime {
             .send(RuntimeEvent::TurnStarted { turn_id })
             .await
             .map_err(|_| runtime_error("streaming turn event stream closed before start"))?;
+        let tasks = TurnTaskGroup::default();
         let task = StreamingTurnTask {
             turn_id,
             generation_id,
@@ -128,12 +225,13 @@ impl StreamingTurnRuntime {
             started_at: Instant::now(),
             external_interruption: external_interruption.clone(),
             work_cancellation,
+            tasks: tasks.clone(),
         };
         let active = Arc::clone(&self.active);
         let generation_guard = self.generation_guard.clone();
         let terminal_interruption = external_interruption;
 
-        tokio::spawn(async move {
+        let task = tasks.spawn(async move {
             let terminal_event = run_streaming_turn(task, &event_sender).await;
             drop(event_sender);
             generation_guard.deactivate(turn_id, generation_id).await;
@@ -158,6 +256,8 @@ impl StreamingTurnRuntime {
             events: event_receiver,
             terminal: Some(terminal_receiver),
             events_closed: false,
+            task: Some(task),
+            tasks,
         })
     }
 
@@ -196,6 +296,26 @@ impl StreamingTurnRuntime {
         }
         Ok(())
     }
+
+    pub(crate) async fn abort_turn(
+        &self,
+        turn_id: TurnId,
+        generation_id: GenerationId,
+        events: &mut StreamingTurnEventStream,
+    ) -> Result<(), RuntimeError> {
+        events.abort_and_reap().await?;
+        self.generation_guard
+            .deactivate(turn_id, generation_id)
+            .await;
+
+        let mut active = self.active.lock().await;
+        if active.as_ref().is_some_and(|current| {
+            current.turn_id == turn_id && current.generation_id == generation_id
+        }) {
+            *active = None;
+        }
+        Ok(())
+    }
 }
 
 struct StreamingTurnTask {
@@ -209,6 +329,7 @@ struct StreamingTurnTask {
     started_at: Instant,
     external_interruption: CancellationToken,
     work_cancellation: CancellationToken,
+    tasks: TurnTaskGroup,
 }
 
 #[derive(Debug)]
@@ -232,6 +353,7 @@ async fn run_streaming_turn(
         started_at,
         external_interruption,
         work_cancellation,
+        tasks,
     } = task;
 
     match send_event(
@@ -260,7 +382,7 @@ async fn run_streaming_turn(
 
     let (utterance_sender, utterance_receiver) = mpsc::channel(UTTERANCE_QUEUE_CAPACITY);
     let mut utterance_sender = Some(utterance_sender);
-    let mut speech_worker = tokio::spawn(run_streaming_speech(StreamingSpeechTask {
+    let mut speech_worker = tasks.spawn(run_streaming_speech(StreamingSpeechTask {
         turn_id,
         generation_id,
         speech_synthesizer,

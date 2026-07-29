@@ -186,6 +186,67 @@ func duplicateControlFieldsAreRejectedLikeSerde() {
 }
 
 @Test
+func everyUnsignedControlFieldRejectsNoncanonicalJSONNumbersLikeSerde() {
+    let cases: [
+        (kind: ChildFrameKind, payload: String, integerFields: [String])
+    ] = [
+        (
+            .startSession,
+            #"{"session_id":7,"speech_start_ms":7,"final_silence_ms":7}"#,
+            ["session_id", "speech_start_ms", "final_silence_ms"]
+        ),
+        (
+            .startCapture,
+            #"{"session_id":7}"#,
+            ["session_id"]
+        ),
+        (
+            .flushGeneration,
+            #"{"session_id":7,"generation_id":7,"operation_id":7}"#,
+            ["session_id", "generation_id", "operation_id"]
+        ),
+        (
+            .voiceActivity,
+            #"{"session_id":7,"activity":"speech_started","at_ms":7}"#,
+            ["session_id", "at_ms"]
+        ),
+        (
+            .transcriptHypothesis,
+            #"{"session_id":7,"segment_id":7,"text":"hello","engine_final":false}"#,
+            ["session_id", "segment_id"]
+        ),
+        (
+            .playbackAccepted,
+            #"{"session_id":7,"turn_id":7,"generation_id":7,"utterance_id":7,"sequence":7}"#,
+            ["session_id", "turn_id", "generation_id", "utterance_id", "sequence"]
+        ),
+        (
+            .failure,
+            #"{"session_id":7,"stage":"voice_sidecar","code":"invalid_state"}"#,
+            ["session_id"]
+        ),
+    ]
+
+    for item in cases {
+        for field in item.integerFields {
+            let canonical = #""\#(field)":7"#
+            for noncanonical in ["7.0", "7e0", "2e2"] {
+                let payload = item.payload.replacingOccurrences(
+                    of: canonical,
+                    with: #""\#(field)":\#(noncanonical)"#
+                )
+                #expect(payload != item.payload)
+                #expect(throws: ChildProtocolError.invalidControlJSON) {
+                    try ChildProtocol.decode(
+                        rawFrame(kind: item.kind, payload: Data(payload.utf8))
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Test
 func canonicalStringEscapingMatchesSerdeJSON() throws {
     let frame = ChildFrame(
         control: .transcriptHypothesis(
@@ -206,6 +267,43 @@ func canonicalStringEscapingMatchesSerdeJSON() throws {
             )
     )
     #expect(try ChildProtocol.decode(encoded) == frame)
+}
+
+@Test
+func transcriptEscapingIsPreflightedBeforeBoundedEncoding() throws {
+    let exact = ChildControl.transcriptHypothesis(
+        sessionID: 1,
+        hypothesis: RecognitionHypothesis(
+            segmentID: 1,
+            text: String(repeating: "\"", count: 32_737),
+            engineFinal: false
+        )
+    )
+    let exactFrame = ChildFrame(control: exact)
+
+    #expect(try ChildProtocol.preflightControlPayloadLength(exact) == 65_536)
+    #expect(try ChildProtocol.encode(exactFrame).count == 8 + 65_536)
+
+    let huge = ChildControl.transcriptHypothesis(
+        sessionID: 1,
+        hypothesis: RecognitionHypothesis(
+            segmentID: 1,
+            text: String(repeating: "\u{0001}", count: 1_000_000),
+            engineFinal: false
+        )
+    )
+    let expected = ChildProtocolError.payloadTooLarge(
+        kind: .transcriptHypothesis,
+        declared: 6_000_062,
+        maximum: 65_536
+    )
+
+    #expect(throws: expected) {
+        try ChildProtocol.preflightControlPayloadLength(huge)
+    }
+    #expect(throws: expected) {
+        try ChildProtocol.encode(ChildFrame(control: huge))
+    }
 }
 
 @Test

@@ -16,7 +16,7 @@ public struct PlaybackBuffer: Sendable {
     public static let maximumFrames = 100
     public static let maximumDurationNanoseconds: UInt64 = 2_000_000_000
 
-    private struct StreamIdentity: Equatable, Hashable, Sendable {
+    private struct StreamIdentity: Equatable, Sendable {
         let turnID: UInt64
         let generationID: UInt64
         let utteranceID: UInt64
@@ -38,7 +38,7 @@ public struct PlaybackBuffer: Sendable {
     private var latestGenerationID: UInt64?
     private var flushedThroughGenerationID: UInt64?
     private var currentStream: StreamIdentity?
-    private var closedStreams: Set<StreamIdentity> = []
+    private var closedThroughUtteranceID: UInt64?
     private var nextSequence: UInt64 = 0
 
     public init() {}
@@ -55,6 +55,14 @@ public struct PlaybackBuffer: Sendable {
 
     public var activeGenerationID: UInt64? {
         frames.first?.frame.generationID
+    }
+
+    var retainedStreamHistoryCount: Int {
+        closedThroughUtteranceID == nil ? 0 : 1
+    }
+
+    func contains(_ identity: PlaybackFrameIdentity) -> Bool {
+        frames.contains { $0.frame.identity == identity }
     }
 
     public mutating func enqueue(_ frame: PCMFrame) throws {
@@ -77,29 +85,36 @@ public struct PlaybackBuffer: Sendable {
             )
         }
 
-        var nextClosedStreams = closedStreams
+        let advancesGeneration = latestGenerationID.map {
+            frame.generationID > $0
+        } ?? false
         let stream = StreamIdentity(frame)
-        var nextCurrentStream = currentStream
-        var expectedSequence = nextSequence
-        if currentStream != stream {
-            if closedStreams.contains(stream) {
+        var nextCurrentStream = advancesGeneration ? nil : currentStream
+        var nextClosedThroughUtteranceID = advancesGeneration
+            ? nil
+            : closedThroughUtteranceID
+        var expectedSequence = advancesGeneration ? 0 : nextSequence
+        if nextCurrentStream != stream {
+            if let nextClosedThroughUtteranceID,
+               frame.utteranceID <= nextClosedThroughUtteranceID
+            {
                 throw PlaybackBufferError.staleUtterance
             }
-            if let currentStream,
-               currentStream.generationID == frame.generationID
+            if let nextCurrentStream,
+               nextCurrentStream.generationID == frame.generationID
             {
-                guard currentStream.turnID == frame.turnID else {
+                guard nextCurrentStream.turnID == frame.turnID else {
                     throw PlaybackBufferError.turnIdentityChanged
                 }
-                guard frame.utteranceID > currentStream.utteranceID else {
+                guard frame.utteranceID > nextCurrentStream.utteranceID else {
                     throw PlaybackBufferError.staleUtterance
                 }
             }
             guard frame.sequence == 0 else {
                 throw PlaybackBufferError.sequenceGap(expected: 0, received: frame.sequence)
             }
-            if let currentStream {
-                nextClosedStreams.insert(currentStream)
+            if let nextCurrentStream {
+                nextClosedThroughUtteranceID = nextCurrentStream.utteranceID
             }
             nextCurrentStream = stream
             expectedSequence = 0
@@ -118,7 +133,7 @@ public struct PlaybackBuffer: Sendable {
         if latestGenerationID == nil || frame.generationID > latestGenerationID! {
             latestGenerationID = frame.generationID
         }
-        closedStreams = nextClosedStreams
+        closedThroughUtteranceID = nextClosedThroughUtteranceID
         currentStream = nextCurrentStream
         nextSequence = frame.sequence + 1
         queuedDurationNanoseconds = nextDuration
@@ -157,7 +172,7 @@ public struct PlaybackBuffer: Sendable {
 
         if currentStream?.generationID ?? UInt64.max <= generationID {
             currentStream = nil
-            closedStreams.removeAll()
+            closedThroughUtteranceID = nil
             nextSequence = 0
         }
         return flushed

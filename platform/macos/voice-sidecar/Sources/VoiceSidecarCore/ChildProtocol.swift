@@ -169,7 +169,7 @@ public enum ChildProtocol {
     public static func encode(_ frame: ChildFrame) throws -> Data {
         let payload: Data
         if let control = frame.control {
-            payload = Data(encodeControl(control).utf8)
+            payload = try encodeControl(control)
         } else if let audio = frame.audio {
             payload = try encodeAudioPayload(audio)
         } else {
@@ -348,41 +348,67 @@ public enum ChildProtocol {
         return payload
     }
 
-    private static func encodeControl(_ control: ChildControl) -> String {
+    static func preflightControlPayloadLength(
+        _ control: ChildControl
+    ) throws -> Int {
+        guard case let .transcriptHypothesis(
+            sessionID,
+            hypothesis
+        ) = control else {
+            return try encodeControl(control).count
+        }
+        return try transcriptPayloadLength(
+            sessionID: sessionID,
+            hypothesis: hypothesis
+        )
+    }
+
+    private static func encodeControl(_ control: ChildControl) throws -> Data {
         switch control {
         case let .startSession(sessionID, speechStartMilliseconds, finalSilenceMilliseconds):
-            """
-            {"session_id":\(sessionID),"speech_start_ms":\(speechStartMilliseconds),"final_silence_ms":\(finalSilenceMilliseconds)}
-            """
+            return Data(
+                """
+                {"session_id":\(sessionID),"speech_start_ms":\(speechStartMilliseconds),"final_silence_ms":\(finalSilenceMilliseconds)}
+                """.utf8
+            )
         case let .startCapture(sessionID),
              let .shutdown(sessionID),
              let .ready(sessionID),
              let .shutdownComplete(sessionID):
-            #"{"session_id":\#(sessionID)}"#
+            return Data(#"{"session_id":\#(sessionID)}"#.utf8)
         case let .flushGeneration(sessionID, generationID, operationID),
              let .playbackFlushed(sessionID, generationID, operationID):
-            """
-            {"session_id":\(sessionID),"generation_id":\(generationID),"operation_id":\(operationID)}
-            """
+            return Data(
+                """
+                {"session_id":\(sessionID),"generation_id":\(generationID),"operation_id":\(operationID)}
+                """.utf8
+            )
         case let .voiceActivity(sessionID, activity):
             switch activity {
             case let .speechStarted(atMilliseconds):
-                """
-                {"session_id":\(sessionID),"activity":"speech_started","at_ms":\(atMilliseconds)}
-                """
+                return Data(
+                    """
+                    {"session_id":\(sessionID),"activity":"speech_started","at_ms":\(atMilliseconds)}
+                    """.utf8
+                )
             case let .speechContinued(atMilliseconds):
-                """
-                {"session_id":\(sessionID),"activity":"speech_continued","at_ms":\(atMilliseconds)}
-                """
+                return Data(
+                    """
+                    {"session_id":\(sessionID),"activity":"speech_continued","at_ms":\(atMilliseconds)}
+                    """.utf8
+                )
             case let .speechEnded(atMilliseconds):
-                """
-                {"session_id":\(sessionID),"activity":"speech_ended","at_ms":\(atMilliseconds)}
-                """
+                return Data(
+                    """
+                    {"session_id":\(sessionID),"activity":"speech_ended","at_ms":\(atMilliseconds)}
+                    """.utf8
+                )
             }
         case let .transcriptHypothesis(sessionID, hypothesis):
-            """
-            {"session_id":\(sessionID),"segment_id":\(hypothesis.segmentID),"text":\(encodeJSONString(hypothesis.text)),"engine_final":\(hypothesis.engineFinal)}
-            """
+            return try encodeTranscriptHypothesis(
+                sessionID: sessionID,
+                hypothesis: hypothesis
+            )
         case let .playbackAccepted(
             sessionID,
             turnID,
@@ -397,14 +423,134 @@ public enum ChildProtocol {
                  utteranceID,
                  sequence
              ):
-            """
-            {"session_id":\(sessionID),"turn_id":\(turnID),"generation_id":\(generationID),"utterance_id":\(utteranceID),"sequence":\(sequence)}
-            """
+            return Data(
+                """
+                {"session_id":\(sessionID),"turn_id":\(turnID),"generation_id":\(generationID),"utterance_id":\(utteranceID),"sequence":\(sequence)}
+                """.utf8
+            )
         case let .failure(sessionID, stage, code):
-            """
-            {"session_id":\(sessionID),"stage":"\(stage.rawValue)","code":"\(code.rawValue)"}
-            """
+            return Data(
+                """
+                {"session_id":\(sessionID),"stage":"\(stage.rawValue)","code":"\(code.rawValue)"}
+                """.utf8
+            )
         }
+    }
+
+    private static func transcriptPayloadLength(
+        sessionID: UInt64,
+        hypothesis: RecognitionHypothesis
+    ) throws -> Int {
+        var length = 0
+        try addByteCount(#"{"session_id":"#.utf8.count, to: &length)
+        try addByteCount(String(sessionID).utf8.count, to: &length)
+        try addByteCount(#","segment_id":"#.utf8.count, to: &length)
+        try addByteCount(String(hypothesis.segmentID).utf8.count, to: &length)
+        try addByteCount(#","text":"#.utf8.count, to: &length)
+        try addByteCount(
+            try escapedJSONStringByteCount(hypothesis.text),
+            to: &length
+        )
+        try addByteCount(#","engine_final":"#.utf8.count, to: &length)
+        try addByteCount(hypothesis.engineFinal ? 4 : 5, to: &length)
+        try addByteCount(1, to: &length)
+        guard length <= maximumControlPayloadBytes else {
+            throw ChildProtocolError.payloadTooLarge(
+                kind: .transcriptHypothesis,
+                declared: length,
+                maximum: maximumControlPayloadBytes
+            )
+        }
+        return length
+    }
+
+    private static func encodeTranscriptHypothesis(
+        sessionID: UInt64,
+        hypothesis: RecognitionHypothesis
+    ) throws -> Data {
+        let length = try transcriptPayloadLength(
+            sessionID: sessionID,
+            hypothesis: hypothesis
+        )
+        var payload = Data(capacity: length)
+        payload.append(contentsOf: #"{"session_id":"#.utf8)
+        payload.append(contentsOf: String(sessionID).utf8)
+        payload.append(contentsOf: #","segment_id":"#.utf8)
+        payload.append(contentsOf: String(hypothesis.segmentID).utf8)
+        payload.append(contentsOf: #","text":"#.utf8)
+        appendEscapedJSONString(hypothesis.text, to: &payload)
+        payload.append(contentsOf: #","engine_final":"#.utf8)
+        payload.append(
+            contentsOf: hypothesis.engineFinal ? "true".utf8 : "false".utf8
+        )
+        payload.append(0x7D)
+        return payload
+    }
+
+    private static func escapedJSONStringByteCount(
+        _ value: String
+    ) throws -> Int {
+        var length = 2
+        for byte in value.utf8 {
+            let increment: Int
+            switch byte {
+            case 0x08, 0x09, 0x0A, 0x0C, 0x0D, 0x22, 0x5C:
+                increment = 2
+            case 0x00...0x1F:
+                increment = 6
+            default:
+                increment = 1
+            }
+            try addByteCount(increment, to: &length)
+        }
+        return length
+    }
+
+    private static func addByteCount(
+        _ count: Int,
+        to total: inout Int
+    ) throws {
+        let (next, overflow) = total.addingReportingOverflow(count)
+        guard !overflow else {
+            throw ChildProtocolError.payloadLengthOverflow
+        }
+        total = next
+    }
+
+    private static func appendEscapedJSONString(
+        _ value: String,
+        to data: inout Data
+    ) {
+        data.append(0x22)
+        for byte in value.utf8 {
+            switch byte {
+            case 0x08:
+                data.append(contentsOf: [0x5C, 0x62])
+            case 0x09:
+                data.append(contentsOf: [0x5C, 0x74])
+            case 0x0A:
+                data.append(contentsOf: [0x5C, 0x6E])
+            case 0x0C:
+                data.append(contentsOf: [0x5C, 0x66])
+            case 0x0D:
+                data.append(contentsOf: [0x5C, 0x72])
+            case 0x22:
+                data.append(contentsOf: [0x5C, 0x22])
+            case 0x5C:
+                data.append(contentsOf: [0x5C, 0x5C])
+            case 0x00...0x1F:
+                data.append(contentsOf: [0x5C, 0x75, 0x30, 0x30])
+                data.append(hexDigit(byte >> 4))
+                data.append(hexDigit(byte & 0x0F))
+            default:
+                data.append(byte)
+            }
+        }
+        data.append(0x22)
+    }
+
+    private static func hexDigit(_ value: UInt8) -> UInt8 {
+        value < 10 ? 0x30 + value : 0x61 + value - 10
     }
 
     private static func decodeControl(
@@ -420,7 +566,8 @@ public enum ChildProtocol {
             case .startSession:
                 let value: StartSessionDTO = try decodeStrict(
                     payload,
-                    keys: ["session_id", "speech_start_ms", "final_silence_ms"]
+                    keys: ["session_id", "speech_start_ms", "final_silence_ms"],
+                    integerKeys: ["session_id", "speech_start_ms", "final_silence_ms"]
                 )
                 return .startSession(
                     sessionID: value.sessionID,
@@ -428,7 +575,11 @@ public enum ChildProtocol {
                     finalSilenceMilliseconds: value.finalSilenceMilliseconds
                 )
             case .startCapture, .shutdown, .ready, .shutdownComplete:
-                let value: SessionDTO = try decodeStrict(payload, keys: ["session_id"])
+                let value: SessionDTO = try decodeStrict(
+                    payload,
+                    keys: ["session_id"],
+                    integerKeys: ["session_id"]
+                )
                 switch kind {
                 case .startCapture:
                     return .startCapture(sessionID: value.sessionID)
@@ -444,7 +595,8 @@ public enum ChildProtocol {
             case .flushGeneration, .playbackFlushed:
                 let value: FlushIdentityDTO = try decodeStrict(
                     payload,
-                    keys: ["session_id", "generation_id", "operation_id"]
+                    keys: ["session_id", "generation_id", "operation_id"],
+                    integerKeys: ["session_id", "generation_id", "operation_id"]
                 )
                 if kind == .flushGeneration {
                     return .flushGeneration(
@@ -461,7 +613,8 @@ public enum ChildProtocol {
             case .voiceActivity:
                 let value: VoiceActivityDTO = try decodeStrict(
                     payload,
-                    keys: ["session_id", "activity", "at_ms"]
+                    keys: ["session_id", "activity", "at_ms"],
+                    integerKeys: ["session_id", "at_ms"]
                 )
                 let activity: VoiceActivity
                 switch value.activity {
@@ -476,7 +629,8 @@ public enum ChildProtocol {
             case .transcriptHypothesis:
                 let value: TranscriptHypothesisDTO = try decodeStrict(
                     payload,
-                    keys: ["session_id", "segment_id", "text", "engine_final"]
+                    keys: ["session_id", "segment_id", "text", "engine_final"],
+                    integerKeys: ["session_id", "segment_id"]
                 )
                 return .transcriptHypothesis(
                     sessionID: value.sessionID,
@@ -490,6 +644,13 @@ public enum ChildProtocol {
                 let value: MediaIdentityDTO = try decodeStrict(
                     payload,
                     keys: [
+                        "session_id",
+                        "turn_id",
+                        "generation_id",
+                        "utterance_id",
+                        "sequence",
+                    ],
+                    integerKeys: [
                         "session_id",
                         "turn_id",
                         "generation_id",
@@ -516,7 +677,8 @@ public enum ChildProtocol {
             case .failure:
                 let value: FailureDTO = try decodeStrict(
                     payload,
-                    keys: ["session_id", "stage", "code"]
+                    keys: ["session_id", "stage", "code"],
+                    integerKeys: ["session_id"]
                 )
                 return .failure(
                     sessionID: value.sessionID,
@@ -535,59 +697,41 @@ public enum ChildProtocol {
 
     private static func decodeStrict<Value: Decodable>(
         _ payload: Data,
-        keys expectedKeys: Set<String>
+        keys expectedKeys: Set<String>,
+        integerKeys: Set<String>
     ) throws -> Value {
-        let keys = try topLevelKeys(in: payload)
-        guard keys == expectedKeys else {
+        let bytes = [UInt8](payload)
+        let fields = try topLevelFields(in: bytes)
+        guard Set(fields.keys) == expectedKeys else {
             throw ChildProtocolError.invalidControlJSON
+        }
+        for key in integerKeys {
+            guard let range = fields[key],
+                  isCanonicalUnsignedInteger(bytes[range])
+            else {
+                throw ChildProtocolError.invalidControlJSON
+            }
         }
         return try JSONDecoder().decode(Value.self, from: payload)
     }
 
-    private static func encodeJSONString(_ value: String) -> String {
-        var encoded = "\""
-        for scalar in value.unicodeScalars {
-            switch scalar.value {
-            case 0x08:
-                encoded += "\\b"
-            case 0x09:
-                encoded += "\\t"
-            case 0x0A:
-                encoded += "\\n"
-            case 0x0C:
-                encoded += "\\f"
-            case 0x0D:
-                encoded += "\\r"
-            case 0x22:
-                encoded += "\\\""
-            case 0x5C:
-                encoded += "\\\\"
-            case 0x00...0x1F:
-                encoded += String(format: "\\u%04x", scalar.value)
-            default:
-                encoded.unicodeScalars.append(scalar)
-            }
-        }
-        encoded += "\""
-        return encoded
-    }
-
-    private static func topLevelKeys(in payload: Data) throws -> Set<String> {
-        let bytes = [UInt8](payload)
+    private static func topLevelFields(
+        in bytes: [UInt8]
+    ) throws -> [String: Range<Int>] {
         var index = 0
         skipWhitespace(bytes, index: &index)
         guard take(0x7B, from: bytes, index: &index) else {
             throw ChildProtocolError.invalidControlJSON
         }
 
-        var keys: Set<String> = []
+        var fields: [String: Range<Int>] = [:]
         skipWhitespace(bytes, index: &index)
         if take(0x7D, from: bytes, index: &index) {
             skipWhitespace(bytes, index: &index)
             guard index == bytes.count else {
                 throw ChildProtocolError.invalidControlJSON
             }
-            return keys
+            return fields
         }
 
         while index < bytes.count {
@@ -595,7 +739,7 @@ public enum ChildProtocol {
             try scanJSONString(bytes, index: &index)
             let keyData = Data(bytes[keyStart..<index])
             let key = try JSONDecoder().decode(String.self, from: keyData)
-            guard keys.insert(key).inserted else {
+            guard fields[key] == nil else {
                 throw ChildProtocolError.invalidControlJSON
             }
 
@@ -604,7 +748,9 @@ public enum ChildProtocol {
                 throw ChildProtocolError.invalidControlJSON
             }
             skipWhitespace(bytes, index: &index)
+            let valueStart = index
             try skipJSONValue(bytes, index: &index)
+            fields[key] = valueStart..<index
             skipWhitespace(bytes, index: &index)
 
             if take(0x2C, from: bytes, index: &index) {
@@ -618,10 +764,44 @@ public enum ChildProtocol {
             guard index == bytes.count else {
                 throw ChildProtocolError.invalidControlJSON
             }
-            return keys
+            return fields
         }
 
         throw ChildProtocolError.invalidControlJSON
+    }
+
+    private static func isCanonicalUnsignedInteger(
+        _ token: ArraySlice<UInt8>
+    ) -> Bool {
+        var start = token.startIndex
+        var end = token.endIndex
+        while start < end, isJSONWhitespace(token[start]) {
+            start += 1
+        }
+        while end > start, isJSONWhitespace(token[token.index(before: end)]) {
+            end = token.index(before: end)
+        }
+        guard start < end else {
+            return false
+        }
+        if token[start] == 0x30 {
+            return token.index(after: start) == end
+        }
+        guard (0x31...0x39).contains(token[start]) else {
+            return false
+        }
+        var index = token.index(after: start)
+        while index < end {
+            guard (0x30...0x39).contains(token[index]) else {
+                return false
+            }
+            index = token.index(after: index)
+        }
+        return true
+    }
+
+    private static func isJSONWhitespace(_ byte: UInt8) -> Bool {
+        byte == 0x20 || byte == 0x09 || byte == 0x0A || byte == 0x0D
     }
 
     private static func scanJSONString(
@@ -703,10 +883,7 @@ public enum ChildProtocol {
 
     private static func skipWhitespace(_ bytes: [UInt8], index: inout Int) {
         while index < bytes.count,
-              bytes[index] == 0x20
-                || bytes[index] == 0x09
-                || bytes[index] == 0x0A
-                || bytes[index] == 0x0D
+              isJSONWhitespace(bytes[index])
         {
             index += 1
         }

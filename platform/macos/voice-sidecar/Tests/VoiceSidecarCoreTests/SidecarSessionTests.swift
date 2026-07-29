@@ -132,6 +132,65 @@ func acceptedPCMUsesExactIdentityAndSession() async throws {
 }
 
 @Test
+func suspendedEnqueueCannotResurrectFlushedGenerationOrEmitLateAccepted() async throws {
+    let playback = ControllablePlaybackService()
+    await playback.setSuspendEnqueue(true)
+    let events = RecordingEventSink()
+    let session = SidecarSession(
+        audioService: RecordingAudioService(),
+        recognitionService: RecordingRecognitionService(),
+        playbackService: playback,
+        eventSink: events
+    )
+    try await startAndCapture(session)
+    let frame = try pcmFrame(generationID: 3)
+
+    let enqueue = Task {
+        try await session.handleMedia(
+            ChildFrame(audioSessionID: 7, frame: frame)
+        )
+    }
+    await playback.waitUntilEnqueueStarted()
+
+    try await session.handleControl(
+        ChildFrame(
+            control: .flushGeneration(
+                sessionID: 7,
+                generationID: 3,
+                operationID: 9
+            )
+        )
+    )
+    await playback.releaseEnqueues()
+    try await enqueue.value
+
+    #expect(
+        await events.frames
+            == [
+                ChildFrame(control: .ready(sessionID: 7)),
+                ChildFrame(
+                    control: .playbackFlushed(
+                        sessionID: 7,
+                        generationID: 3,
+                        operationID: 9
+                    )
+                ),
+            ]
+    )
+
+    do {
+        try await session.handleMedia(
+            ChildFrame(audioSessionID: 7, frame: frame)
+        )
+        Issue.record("expected flushed generation to remain stale")
+    } catch let error as PlaybackBufferError {
+        #expect(error == .staleGeneration)
+    } catch {
+        Issue.record("unexpected error \(error)")
+    }
+}
+
+@Test
 func mismatchedSessionFailsWithoutCallingPlayback() async throws {
     let playback = RecordingPlaybackService()
     let events = RecordingEventSink()
@@ -265,6 +324,188 @@ func parentFlushCompletesLocallyBeforeAcknowledgement() async throws {
 }
 
 @Test
+func suspendedFlushAndShutdownCannotInterleaveDuplicateLifecycle() async throws {
+    let playback = ControllablePlaybackService()
+    await playback.setSuspendFlush(true)
+    let events = RecordingEventSink()
+    let session = SidecarSession(
+        audioService: RecordingAudioService(),
+        recognitionService: RecordingRecognitionService(),
+        playbackService: playback,
+        eventSink: events
+    )
+    try await startAndCapture(session)
+
+    let firstFlush = Task {
+        try await session.handleControl(
+            ChildFrame(
+                control: .flushGeneration(
+                    sessionID: 7,
+                    generationID: 3,
+                    operationID: 1
+                )
+            )
+        )
+    }
+    await playback.waitUntilFlushStarted()
+
+    let secondDone = CompletionFlag()
+    let secondFlush = Task { () -> SidecarSessionError? in
+        do {
+            try await session.handleControl(
+                ChildFrame(
+                    control: .flushGeneration(
+                        sessionID: 7,
+                        generationID: 4,
+                        operationID: 2
+                    )
+                )
+            )
+            await secondDone.complete()
+            return nil
+        } catch let error as SidecarSessionError {
+            await secondDone.complete()
+            return error
+        } catch {
+            await secondDone.complete()
+            Issue.record("unexpected error \(error)")
+            return nil
+        }
+    }
+    let shutdownDone = CompletionFlag()
+    let concurrentShutdown = Task { () -> SidecarSessionError? in
+        do {
+            try await session.handleControl(
+                ChildFrame(control: .shutdown(sessionID: 7))
+            )
+            await shutdownDone.complete()
+            return nil
+        } catch let error as SidecarSessionError {
+            await shutdownDone.complete()
+            return error
+        } catch {
+            await shutdownDone.complete()
+            Issue.record("unexpected error \(error)")
+            return nil
+        }
+    }
+
+    #expect(
+        await waitUntil {
+            let shutdownComplete = await shutdownDone.isComplete
+            let flushCount = await playback.flushedGenerations.count
+            return shutdownComplete || flushCount == 2
+        }
+    )
+    await playback.releaseFlushes()
+    try await firstFlush.value
+
+    #expect(await secondFlush.value == .invalidState)
+    #expect(await concurrentShutdown.value == .invalidState)
+    #expect(await secondDone.isComplete)
+    #expect(await playback.flushedGenerations == [3])
+    #expect(
+        await events.frames
+            == [
+                ChildFrame(control: .ready(sessionID: 7)),
+                ChildFrame(
+                    control: .playbackFlushed(
+                        sessionID: 7,
+                        generationID: 3,
+                        operationID: 1
+                    )
+                ),
+            ]
+    )
+
+    try await session.handleControl(
+        ChildFrame(control: .shutdown(sessionID: 7))
+    )
+    #expect(await playback.stopCount == 1)
+    #expect(await events.frames.last == ChildFrame(control: .shutdownComplete(sessionID: 7)))
+}
+
+@Test
+func startAndShutdownCannotInterleaveDuplicateLifecycle() async throws {
+    let audio = SuspendingAudioService()
+    let recognition = RecordingRecognitionService()
+    let events = RecordingEventSink()
+    let session = SidecarSession(
+        audioService: audio,
+        recognitionService: recognition,
+        playbackService: RecordingPlaybackService(),
+        eventSink: events
+    )
+    try await startSession(session)
+
+    let firstStart = Task {
+        try await session.handleControl(
+            ChildFrame(control: .startCapture(sessionID: 7))
+        )
+    }
+    await audio.waitUntilStarted()
+
+    let duplicateDone = CompletionFlag()
+    let duplicateStart = Task { () -> SidecarSessionError? in
+        do {
+            try await session.handleControl(
+                ChildFrame(control: .startCapture(sessionID: 7))
+            )
+            await duplicateDone.complete()
+            return nil
+        } catch let error as SidecarSessionError {
+            await duplicateDone.complete()
+            return error
+        } catch {
+            await duplicateDone.complete()
+            Issue.record("unexpected error \(error)")
+            return nil
+        }
+    }
+    let shutdownDone = CompletionFlag()
+    let concurrentShutdown = Task { () -> SidecarSessionError? in
+        do {
+            try await session.handleControl(
+                ChildFrame(control: .shutdown(sessionID: 7))
+            )
+            await shutdownDone.complete()
+            return nil
+        } catch let error as SidecarSessionError {
+            await shutdownDone.complete()
+            return error
+        } catch {
+            await shutdownDone.complete()
+            Issue.record("unexpected error \(error)")
+            return nil
+        }
+    }
+
+    #expect(
+        await waitUntil {
+            let shutdownComplete = await shutdownDone.isComplete
+            let startCount = await audio.startCount
+            return shutdownComplete || startCount == 2
+        }
+    )
+    await audio.releaseStarts()
+    try await firstStart.value
+
+    #expect(await duplicateStart.value == .invalidState)
+    #expect(await concurrentShutdown.value == .invalidState)
+    #expect(await duplicateDone.isComplete)
+    #expect(await audio.startCount == 1)
+    #expect(await recognition.configurations.count == 1)
+    #expect(await events.frames == [ChildFrame(control: .ready(sessionID: 7))])
+
+    try await session.handleControl(
+        ChildFrame(control: .shutdown(sessionID: 7))
+    )
+    #expect(await audio.stopCount == 1)
+    #expect(await recognition.stopCount == 1)
+    #expect(await session.isTerminated)
+}
+
+@Test
 func hypothesesAreForwardedWithoutConversationalFinalization() async throws {
     let events = RecordingEventSink()
     let session = SidecarSession(
@@ -324,6 +565,100 @@ func playbackFailureEmitsClosedTypedFailure() async throws {
                     code: .playbackFailed
                 )
             )
+    )
+    #expect(await audio.stopCount == 1)
+    #expect(await recognition.stopCount == 1)
+    #expect(await playback.stopCount == 1)
+}
+
+@Test
+func partialAudioStartFailureStopsAttemptedServiceOnceBeforeFailure() async throws {
+    let callLog = CallLog()
+    let audio = RecordingAudioService(callLog: callLog)
+    let failure = SidecarServiceFailure(
+        stage: .audioCapture,
+        code: .audioDeviceUnavailable
+    )
+    await audio.setStartFailure(failure)
+    let recognition = RecordingRecognitionService(callLog: callLog)
+    let playback = RecordingPlaybackService(callLog: callLog)
+    let events = RecordingEventSink(callLog: callLog)
+    let session = SidecarSession(
+        audioService: audio,
+        recognitionService: recognition,
+        playbackService: playback,
+        eventSink: events
+    )
+    try await startSession(session)
+    await callLog.clear()
+
+    do {
+        try await session.handleControl(
+            ChildFrame(control: .startCapture(sessionID: 7))
+        )
+        Issue.record("expected partial audio startup failure")
+    } catch let error as SidecarServiceFailure {
+        #expect(error == failure)
+    } catch {
+        Issue.record("unexpected error \(error)")
+    }
+
+    #expect(
+        await callLog.entries
+            == [
+                "audio.start",
+                "audio.stop",
+                "playback.stop",
+                "event.failure",
+            ]
+    )
+    #expect(await audio.stopCount == 1)
+    #expect(await recognition.stopCount == 0)
+    #expect(await playback.stopCount == 1)
+}
+
+@Test
+func partialRecognitionStartFailureCleansUpInReverseOrderOnce() async throws {
+    let callLog = CallLog()
+    let audio = RecordingAudioService(callLog: callLog)
+    let recognition = RecordingRecognitionService(callLog: callLog)
+    let failure = SidecarServiceFailure(
+        stage: .speechRecognizer,
+        code: .recognitionFailed
+    )
+    await recognition.setStartFailure(failure)
+    let playback = RecordingPlaybackService(callLog: callLog)
+    let events = RecordingEventSink(callLog: callLog)
+    let session = SidecarSession(
+        audioService: audio,
+        recognitionService: recognition,
+        playbackService: playback,
+        eventSink: events
+    )
+    try await startSession(session)
+    await callLog.clear()
+
+    do {
+        try await session.handleControl(
+            ChildFrame(control: .startCapture(sessionID: 7))
+        )
+        Issue.record("expected partial recognition startup failure")
+    } catch let error as SidecarServiceFailure {
+        #expect(error == failure)
+    } catch {
+        Issue.record("unexpected error \(error)")
+    }
+
+    #expect(
+        await callLog.entries
+            == [
+                "audio.start",
+                "recognition.start",
+                "recognition.stop",
+                "audio.stop",
+                "playback.stop",
+                "event.failure",
+            ]
     )
     #expect(await audio.stopCount == 1)
     #expect(await recognition.stopCount == 1)

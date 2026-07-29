@@ -204,6 +204,14 @@ actor CallLog {
     }
 }
 
+actor CompletionFlag {
+    private(set) var isComplete = false
+
+    func complete() {
+        isComplete = true
+    }
+}
+
 actor RecordingEventSink: SidecarEventSink {
     private let callLog: CallLog?
     private(set) var frames: [ChildFrame] = []
@@ -221,36 +229,66 @@ actor RecordingEventSink: SidecarEventSink {
 }
 
 actor RecordingAudioService: SidecarAudioService {
+    private let callLog: CallLog?
     private(set) var configurations: [SidecarConfiguration] = []
     private(set) var stopCount = 0
-    var startFailure: SidecarServiceFailure?
+    private var startFailure: SidecarServiceFailure?
+
+    init(callLog: CallLog? = nil) {
+        self.callLog = callLog
+    }
+
+    func setStartFailure(_ failure: SidecarServiceFailure) {
+        startFailure = failure
+    }
 
     func start(configuration: SidecarConfiguration) async throws {
+        configurations.append(configuration)
+        if let callLog {
+            await callLog.append("audio.start")
+        }
         if let startFailure {
             throw startFailure
         }
-        configurations.append(configuration)
     }
 
     func stop() async {
         stopCount += 1
+        if let callLog {
+            await callLog.append("audio.stop")
+        }
     }
 }
 
 actor RecordingRecognitionService: SidecarRecognitionService {
+    private let callLog: CallLog?
     private(set) var configurations: [SidecarConfiguration] = []
     private(set) var stopCount = 0
-    var startFailure: SidecarServiceFailure?
+    private var startFailure: SidecarServiceFailure?
+
+    init(callLog: CallLog? = nil) {
+        self.callLog = callLog
+    }
+
+    func setStartFailure(_ failure: SidecarServiceFailure) {
+        startFailure = failure
+    }
 
     func start(configuration: SidecarConfiguration) async throws {
+        configurations.append(configuration)
+        if let callLog {
+            await callLog.append("recognition.start")
+        }
         if let startFailure {
             throw startFailure
         }
-        configurations.append(configuration)
     }
 
     func stop() async {
         stopCount += 1
+        if let callLog {
+            await callLog.append("recognition.stop")
+        }
     }
 }
 
@@ -292,7 +330,159 @@ actor RecordingPlaybackService: SidecarPlaybackService {
 
     func stop() async {
         stopCount += 1
+        if let callLog {
+            await callLog.append("playback.stop")
+        }
     }
+}
+
+actor SuspendingAudioService: SidecarAudioService {
+    private(set) var startCount = 0
+    private(set) var stopCount = 0
+    private var startContinuations: [CheckedContinuation<Void, Never>] = []
+    private var startCountWaiters: [
+        (count: Int, continuation: CheckedContinuation<Void, Never>)
+    ] = []
+
+    func waitUntilStarted(_ count: Int = 1) async {
+        if startCount >= count {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            startCountWaiters.append((count, continuation))
+        }
+    }
+
+    func releaseStarts() {
+        let continuations = startContinuations
+        startContinuations.removeAll()
+        for continuation in continuations {
+            continuation.resume()
+        }
+    }
+
+    func start(configuration _: SidecarConfiguration) async throws {
+        startCount += 1
+        let ready = startCountWaiters.filter { startCount >= $0.count }
+        startCountWaiters.removeAll { startCount >= $0.count }
+        for item in ready {
+            item.continuation.resume()
+        }
+        await withCheckedContinuation { continuation in
+            startContinuations.append(continuation)
+        }
+    }
+
+    func stop() async {
+        stopCount += 1
+    }
+}
+
+actor ControllablePlaybackService: SidecarPlaybackService {
+    private(set) var frames: [PCMFrame] = []
+    private(set) var flushedGenerations: [UInt64] = []
+    private(set) var stopCount = 0
+    private var suspendEnqueue = false
+    private var suspendFlush = false
+    private var enqueueStarted = false
+    private var flushStarted = false
+    private var enqueueStartWaiters: [CheckedContinuation<Void, Never>] = []
+    private var flushStartWaiters: [CheckedContinuation<Void, Never>] = []
+    private var enqueueContinuations: [CheckedContinuation<Void, Never>] = []
+    private var flushContinuations: [CheckedContinuation<Void, Never>] = []
+
+    func setSuspendEnqueue(_ value: Bool) {
+        suspendEnqueue = value
+    }
+
+    func setSuspendFlush(_ value: Bool) {
+        suspendFlush = value
+    }
+
+    func waitUntilEnqueueStarted() async {
+        if enqueueStarted {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            enqueueStartWaiters.append(continuation)
+        }
+    }
+
+    func waitUntilFlushStarted() async {
+        if flushStarted {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            flushStartWaiters.append(continuation)
+        }
+    }
+
+    func releaseEnqueues() {
+        suspendEnqueue = false
+        let continuations = enqueueContinuations
+        enqueueContinuations.removeAll()
+        for continuation in continuations {
+            continuation.resume()
+        }
+    }
+
+    func releaseFlushes() {
+        suspendFlush = false
+        let continuations = flushContinuations
+        flushContinuations.removeAll()
+        for continuation in continuations {
+            continuation.resume()
+        }
+    }
+
+    func enqueue(_ frame: PCMFrame) async throws {
+        frames.append(frame)
+        enqueueStarted = true
+        let waiters = enqueueStartWaiters
+        enqueueStartWaiters.removeAll()
+        for continuation in waiters {
+            continuation.resume()
+        }
+        if suspendEnqueue {
+            await withCheckedContinuation { continuation in
+                enqueueContinuations.append(continuation)
+            }
+        }
+    }
+
+    func flush(throughGenerationID generationID: UInt64) async throws {
+        flushedGenerations.append(generationID)
+        flushStarted = true
+        let waiters = flushStartWaiters
+        flushStartWaiters.removeAll()
+        for continuation in waiters {
+            continuation.resume()
+        }
+        if suspendFlush {
+            await withCheckedContinuation { continuation in
+                flushContinuations.append(continuation)
+            }
+        }
+    }
+
+    func stop() async {
+        stopCount += 1
+    }
+}
+
+func waitUntil(
+    timeout: Duration = .seconds(1),
+    condition: @escaping @Sendable () async -> Bool
+) async -> Bool {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: timeout)
+    while clock.now < deadline {
+        if await condition() {
+            return true
+        }
+        try? await Task.sleep(for: .milliseconds(1))
+    }
+    return await condition()
 }
 
 func pcmFrame(

@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import Testing
 @testable import VoiceSidecarCore
@@ -129,6 +130,121 @@ func mediaEOFDoesNotCancelTheIndependentControlReader() async throws {
     )
 
     #expect(await recorder.controlFrames == [flush])
+}
+
+@Test
+func shutdownCancelsIdleDescriptorReadWithoutClosingItsOpenPeer() async throws {
+    var controlDescriptors = [Int32](repeating: -1, count: 2)
+    var mediaDescriptors = [Int32](repeating: -1, count: 2)
+    #expect(socketpair(AF_UNIX, SOCK_STREAM, 0, &controlDescriptors) == 0)
+    #expect(socketpair(AF_UNIX, SOCK_STREAM, 0, &mediaDescriptors) == 0)
+
+    let controlInput = FileHandle(
+        fileDescriptor: controlDescriptors[0],
+        closeOnDealloc: true
+    )
+    let controlPeer = FileHandle(
+        fileDescriptor: controlDescriptors[1],
+        closeOnDealloc: true
+    )
+    let mediaInput = FileHandle(
+        fileDescriptor: mediaDescriptors[0],
+        closeOnDealloc: true
+    )
+    let mediaPeer = FileHandle(
+        fileDescriptor: mediaDescriptors[1],
+        closeOnDealloc: true
+    )
+    defer {
+        try? controlInput.close()
+        try? controlPeer.close()
+        try? mediaInput.close()
+        try? mediaPeer.close()
+    }
+
+    let events = RecordingEventSink()
+    let session = SidecarSession(
+        audioService: RecordingAudioService(),
+        recognitionService: RecordingRecognitionService(),
+        playbackService: RecordingPlaybackService(),
+        eventSink: events
+    )
+    let stdio = FramedStdio(
+        controlReader: FileHandleFrameReader(fileHandle: controlInput),
+        mediaReader: FileHandleFrameReader(fileHandle: mediaInput)
+    )
+    let completion = CompletionFlag()
+    let task = Task {
+        do {
+            try await stdio.run(
+                onControl: { frame in
+                    try await session.handleControl(frame)
+                    return await session.isTerminated ? .stop : .continue
+                },
+                onMedia: { frame in
+                    try await session.handleMedia(frame)
+                    return .continue
+                }
+            )
+            await completion.complete()
+        } catch {
+            await completion.complete()
+            throw error
+        }
+    }
+
+    var control = try ChildProtocol.encode(
+        ChildFrame(
+            control: .startSession(
+                sessionID: 7,
+                speechStartMilliseconds: 200,
+                finalSilenceMilliseconds: 600
+            )
+        )
+    )
+    control.append(
+        try ChildProtocol.encode(
+            ChildFrame(control: .shutdown(sessionID: 7))
+        )
+    )
+    try controlPeer.write(contentsOf: control)
+
+    let completedBeforeForcedClose = await waitUntil {
+        await completion.isComplete
+    }
+    if !completedBeforeForcedClose {
+        _ = shutdown(mediaInput.fileDescriptor, SHUT_RDWR)
+        try? mediaInput.close()
+    }
+    try await task.value
+
+    #expect(completedBeforeForcedClose)
+    #expect(
+        await events.frames
+            == [
+                ChildFrame(control: .ready(sessionID: 7)),
+                ChildFrame(control: .shutdownComplete(sessionID: 7)),
+            ]
+    )
+    #expect(fcntl(controlInput.fileDescriptor, F_GETFD) != -1)
+    #expect(fcntl(mediaPeer.fileDescriptor, F_GETFD) != -1)
+
+    if completedBeforeForcedClose {
+        var noSignal = Int32(1)
+        #expect(
+            setsockopt(
+                mediaPeer.fileDescriptor,
+                SOL_SOCKET,
+                SO_NOSIGPIPE,
+                &noSignal,
+                socklen_t(MemoryLayout.size(ofValue: noSignal))
+            ) == 0
+        )
+        let sent = Data([0]).withUnsafeBytes {
+            send(mediaPeer.fileDescriptor, $0.baseAddress, $0.count, 0)
+        }
+        #expect(sent == 1)
+    }
 }
 
 @Test

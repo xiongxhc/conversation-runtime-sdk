@@ -54,17 +54,47 @@ public actor SidecarSession {
     private static let speechStartRange: ClosedRange<UInt64> = 100...1_000
     private static let finalSilenceRange: ClosedRange<UInt64> = 200...3_000
 
+    private enum StablePhase: Equatable, Sendable {
+        case ready
+        case capturing
+    }
+
+    private enum Phase: Equatable, Sendable {
+        case awaitingSession
+        case configuring
+        case ready
+        case starting
+        case capturing
+        case flushing(StablePhase)
+        case terminating
+        case failing
+        case terminated
+    }
+
+    private enum ServiceState: Sendable {
+        case notAttempted
+        case attempted
+        case started
+        case stopped
+    }
+
     private let audioService: any SidecarAudioService
     private let recognitionService: any SidecarRecognitionService
     private let playbackService: any SidecarPlaybackService
     private let eventSink: any SidecarEventSink
 
     private var configuration: SidecarConfiguration?
-    private var captureStarted = false
-    private var failed = false
-    public private(set) var isTerminated = false
+    private var phase = Phase.awaitingSession
+    private var audioState = ServiceState.notAttempted
+    private var recognitionState = ServiceState.notAttempted
+    private var playbackStopped = false
+    private var cleanupStarted = false
     private var playbackBuffer = PlaybackBuffer()
     private var bargeInGate: BargeInGate?
+
+    public var isTerminated: Bool {
+        phase == .terminated
+    }
 
     public init(
         audioService: any SidecarAudioService,
@@ -79,6 +109,7 @@ public actor SidecarSession {
     }
 
     public func handleControl(_ frame: ChildFrame) async throws {
+        try requireAvailableOperation()
         guard let control = frame.control else {
             try await fail(
                 SidecarSessionError.expectedControlFrame,
@@ -94,6 +125,7 @@ public actor SidecarSession {
     }
 
     public func handleMedia(_ frame: ChildFrame) async throws {
+        try requireAvailableOperation()
         guard let audio = frame.audio else {
             try await fail(
                 SidecarSessionError.expectedAudioFrame,
@@ -109,8 +141,13 @@ public actor SidecarSession {
 
             var nextBuffer = playbackBuffer
             try nextBuffer.enqueue(audio.frame)
-            try await playbackService.enqueue(audio.frame)
             playbackBuffer = nextBuffer
+            try await playbackService.enqueue(audio.frame)
+            guard phase == .capturing,
+                  playbackBuffer.contains(audio.frame.identity)
+            else {
+                return
+            }
             try await eventSink.send(
                 ChildFrame(
                     control: .playbackAccepted(
@@ -128,6 +165,7 @@ public actor SidecarSession {
     }
 
     public func playbackRendered(_ identity: PlaybackFrameIdentity) async throws {
+        try requireAvailableOperation()
         do {
             let configuration = try requireCapturing()
             try playbackBuffer.markRendered(identity)
@@ -148,6 +186,7 @@ public actor SidecarSession {
     }
 
     public func publishVoiceActivity(_ activity: VoiceActivity) async throws {
+        try requireAvailableOperation()
         do {
             let configuration = try requireCapturing()
             try await eventSink.send(
@@ -166,6 +205,7 @@ public actor SidecarSession {
     public func publishRecognitionHypothesis(
         _ hypothesis: RecognitionHypothesis
     ) async throws {
+        try requireAvailableOperation()
         do {
             let configuration = try requireCapturing()
             try await eventSink.send(
@@ -187,6 +227,7 @@ public actor SidecarSession {
         frameMilliseconds: UInt64,
         atMilliseconds: UInt64
     ) async throws -> Bool {
+        try requireAvailableOperation()
         do {
             let configuration = try requireCapturing()
             guard playbackBuffer.isPlaybackActive,
@@ -202,7 +243,13 @@ public actor SidecarSession {
                 return false
             }
 
-            try await flushLocally(throughGenerationID: generationID)
+            let resumePhase = try reserveFlush(
+                throughGenerationID: generationID
+            )
+            try await playbackService.flush(
+                throughGenerationID: generationID
+            )
+            bargeInGate?.reset()
             try await eventSink.send(
                 ChildFrame(
                     control: .voiceActivity(
@@ -211,6 +258,7 @@ public actor SidecarSession {
                     )
                 )
             )
+            restoreAfterFlush(resumePhase)
             return true
         } catch {
             try await fail(error, fallbackSessionID: configuration?.sessionID ?? 0)
@@ -218,17 +266,13 @@ public actor SidecarSession {
     }
 
     private func process(_ control: ChildControl) async throws {
-        guard !failed, !isTerminated else {
-            throw SidecarSessionError.invalidState
-        }
-
         switch control {
         case let .startSession(
             sessionID,
             speechStartMilliseconds,
             finalSilenceMilliseconds
         ):
-            guard configuration == nil else {
+            guard phase == .awaitingSession, configuration == nil else {
                 throw SidecarSessionError.invalidState
             }
             guard Self.speechStartRange.contains(speechStartMilliseconds) else {
@@ -244,22 +288,30 @@ public actor SidecarSession {
             )
             self.configuration = configuration
             bargeInGate = BargeInGate(thresholdMilliseconds: speechStartMilliseconds)
+            phase = .configuring
             try await eventSink.send(ChildFrame(control: .ready(sessionID: sessionID)))
+            phase = .ready
 
         case let .startCapture(sessionID):
             let configuration = try requireReady(sessionID: sessionID)
+            phase = .starting
+            audioState = .attempted
             try await audioService.start(configuration: configuration)
-            do {
-                try await recognitionService.start(configuration: configuration)
-            } catch {
-                await audioService.stop()
-                throw error
-            }
-            captureStarted = true
+            audioState = .started
+            recognitionState = .attempted
+            try await recognitionService.start(configuration: configuration)
+            recognitionState = .started
+            phase = .capturing
 
         case let .flushGeneration(sessionID, generationID, operationID):
             let configuration = try requireConfigured(sessionID: sessionID)
-            try await flushLocally(throughGenerationID: generationID)
+            let resumePhase = try reserveFlush(
+                throughGenerationID: generationID
+            )
+            try await playbackService.flush(
+                throughGenerationID: generationID
+            )
+            bargeInGate?.reset()
             try await eventSink.send(
                 ChildFrame(
                     control: .playbackFlushed(
@@ -269,17 +321,19 @@ public actor SidecarSession {
                     )
                 )
             )
+            restoreAfterFlush(resumePhase)
 
         case let .shutdown(sessionID):
             let configuration = try requireConfigured(sessionID: sessionID)
-            await recognitionService.stop()
-            await audioService.stop()
-            await playbackService.stop()
-            captureStarted = false
-            isTerminated = true
+            guard phase == .ready || phase == .capturing else {
+                throw SidecarSessionError.invalidState
+            }
+            phase = .terminating
+            await cleanupServices()
             try await eventSink.send(
                 ChildFrame(control: .shutdownComplete(sessionID: configuration.sessionID))
             )
+            phase = .terminated
 
         case .ready,
              .voiceActivity,
@@ -293,12 +347,35 @@ public actor SidecarSession {
         }
     }
 
-    private func flushLocally(throughGenerationID generationID: UInt64) async throws {
+    private func reserveFlush(
+        throughGenerationID generationID: UInt64
+    ) throws -> StablePhase {
+        let resumePhase: StablePhase
+        switch phase {
+        case .ready:
+            resumePhase = .ready
+        case .capturing:
+            resumePhase = .capturing
+        default:
+            throw SidecarSessionError.invalidState
+        }
         var nextBuffer = playbackBuffer
         _ = try nextBuffer.flush(throughGenerationID: generationID)
-        try await playbackService.flush(throughGenerationID: generationID)
         playbackBuffer = nextBuffer
-        bargeInGate?.reset()
+        phase = .flushing(resumePhase)
+        return resumePhase
+    }
+
+    private func restoreAfterFlush(_ resumePhase: StablePhase) {
+        guard phase == .flushing(resumePhase) else {
+            return
+        }
+        switch resumePhase {
+        case .ready:
+            phase = .ready
+        case .capturing:
+            phase = .capturing
+        }
     }
 
     private func requireConfigured(
@@ -317,23 +394,43 @@ public actor SidecarSession {
         sessionID: UInt64
     ) throws -> SidecarConfiguration {
         let configuration = try requireConfigured(sessionID: sessionID)
-        guard !captureStarted else {
+        guard phase == .ready else {
             throw SidecarSessionError.invalidState
         }
         return configuration
     }
 
     private func requireCapturing() throws -> SidecarConfiguration {
-        guard captureStarted, let configuration, !failed, !isTerminated else {
+        guard phase == .capturing, let configuration else {
             throw SidecarSessionError.invalidState
         }
         return configuration
+    }
+
+    private func requireAvailableOperation() throws {
+        switch phase {
+        case .awaitingSession, .ready, .capturing:
+            return
+        case .configuring,
+             .starting,
+             .flushing,
+             .terminating,
+             .failing,
+             .terminated:
+            throw SidecarSessionError.invalidState
+        }
     }
 
     private func fail(
         _ error: any Error,
         fallbackSessionID: UInt64
     ) async throws -> Never {
+        guard phase != .failing,
+              phase != .terminating,
+              phase != .terminated
+        else {
+            throw error
+        }
         let sessionID = configuration?.sessionID ?? fallbackSessionID
         let failure: SidecarServiceFailure
         if let serviceFailure = error as? SidecarServiceFailure {
@@ -349,13 +446,8 @@ public actor SidecarSession {
             failure = SidecarServiceFailure(stage: .voiceSidecar, code: .internal)
         }
 
-        failed = true
-        if captureStarted {
-            await recognitionService.stop()
-            await audioService.stop()
-            captureStarted = false
-        }
-        await playbackService.stop()
+        phase = .failing
+        await cleanupServices()
         try await eventSink.send(
             ChildFrame(
                 control: .failure(
@@ -366,5 +458,25 @@ public actor SidecarSession {
             )
         )
         throw error
+    }
+
+    private func cleanupServices() async {
+        guard !cleanupStarted else {
+            return
+        }
+        cleanupStarted = true
+
+        if recognitionState == .attempted || recognitionState == .started {
+            recognitionState = .stopped
+            await recognitionService.stop()
+        }
+        if audioState == .attempted || audioState == .started {
+            audioState = .stopped
+            await audioService.stop()
+        }
+        if !playbackStopped {
+            playbackStopped = true
+            await playbackService.stop()
+        }
     }
 }

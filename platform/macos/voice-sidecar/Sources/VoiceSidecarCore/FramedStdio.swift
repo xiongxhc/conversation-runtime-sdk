@@ -1,3 +1,5 @@
+import Darwin
+import Dispatch
 import Foundation
 
 public protocol FrameByteReader: Sendable {
@@ -21,6 +23,9 @@ public enum FramedStdioError: Error, Equatable, Sendable {
     case controlChannelReceivedAudio
     case mediaChannelReceivedControl
     case unexpectedControlEOF
+    case descriptorDuplicateFailed(Int32)
+    case descriptorConfigurationFailed(Int32)
+    case descriptorReadFailed(Int32)
 }
 
 public actor SerializedFrameWriter: SidecarEventSink {
@@ -190,14 +195,49 @@ private enum ChannelCompletion: Equatable, Sendable {
 }
 
 public final class FileHandleFrameReader: FrameByteReader, @unchecked Sendable {
-    private let fileHandle: FileHandle
+    private let descriptor: Int32
+    private let setupError: FramedStdioError?
 
     public init(fileHandle: FileHandle) {
-        self.fileHandle = fileHandle
+        let duplicated = dup(fileHandle.fileDescriptor)
+        guard duplicated >= 0 else {
+            descriptor = -1
+            setupError = .descriptorDuplicateFailed(errno)
+            return
+        }
+        let flags = fcntl(duplicated, F_GETFL)
+        guard flags >= 0 else {
+            let code = errno
+            close(duplicated)
+            descriptor = -1
+            setupError = .descriptorConfigurationFailed(code)
+            return
+        }
+        guard fcntl(duplicated, F_SETFL, flags | O_NONBLOCK) >= 0 else {
+            let code = errno
+            close(duplicated)
+            descriptor = -1
+            setupError = .descriptorConfigurationFailed(code)
+            return
+        }
+        descriptor = duplicated
+        setupError = nil
+    }
+
+    deinit {
+        if descriptor >= 0 {
+            close(descriptor)
+        }
     }
 
     public func read(upToCount count: Int) async throws -> Data {
-        try fileHandle.read(upToCount: count) ?? Data()
+        if let setupError {
+            throw setupError
+        }
+        return try await DescriptorReadOperation(
+            descriptor: descriptor,
+            count: count
+        ).run()
     }
 }
 
@@ -210,5 +250,95 @@ public final class FileHandleFrameWriter: FrameByteWriter, @unchecked Sendable {
 
     public func write(_ data: Data) async throws {
         try fileHandle.write(contentsOf: data)
+    }
+}
+
+private final class DescriptorReadOperation: @unchecked Sendable {
+    private let descriptor: Int32
+    private let count: Int
+    private let lock = NSLock()
+    private var source: DispatchSourceRead?
+    private var continuation: CheckedContinuation<Data, Error>?
+    private var isCancelled = false
+    private var isFinished = false
+
+    init(descriptor: Int32, count: Int) {
+        self.descriptor = descriptor
+        self.count = count
+    }
+
+    func run() async throws -> Data {
+        try Task.checkCancellation()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                start(continuation)
+            }
+        } onCancel: {
+            cancel()
+        }
+    }
+
+    private func start(
+        _ continuation: CheckedContinuation<Data, Error>
+    ) {
+        lock.lock()
+        guard !isCancelled else {
+            lock.unlock()
+            continuation.resume(throwing: CancellationError())
+            return
+        }
+
+        self.continuation = continuation
+        let source = DispatchSource.makeReadSource(
+            fileDescriptor: descriptor,
+            queue: .global(qos: .userInitiated)
+        )
+        self.source = source
+        source.setEventHandler { [weak self] in
+            self?.readAvailableBytes()
+        }
+        source.resume()
+        lock.unlock()
+    }
+
+    private func cancel() {
+        lock.lock()
+        isCancelled = true
+        lock.unlock()
+        finish(.failure(CancellationError()))
+    }
+
+    private func readAvailableBytes() {
+        var bytes = [UInt8](repeating: 0, count: count)
+        let readCount = Darwin.read(descriptor, &bytes, count)
+        if readCount > 0 {
+            finish(.success(Data(bytes.prefix(Int(readCount)))))
+            return
+        }
+        if readCount == 0 {
+            finish(.success(Data()))
+            return
+        }
+        if errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR {
+            return
+        }
+        finish(.failure(FramedStdioError.descriptorReadFailed(errno)))
+    }
+
+    private func finish(_ result: Result<Data, Error>) {
+        lock.lock()
+        guard !isFinished else {
+            lock.unlock()
+            return
+        }
+        isFinished = true
+        let continuation = continuation
+        self.continuation = nil
+        let source = source
+        self.source = nil
+        lock.unlock()
+
+        source?.cancel()
+        continuation?.resume(with: result)
     }
 }

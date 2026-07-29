@@ -149,3 +149,21 @@ func flushMayAdvanceBeforeTheFirstMediaFrame() throws {
     try buffer.enqueue(pcmFrame(generationID: 2))
     #expect(buffer.activeGenerationID == 2)
 }
+
+@Test
+func longSessionsRetainOnlyBoundedClosedStreamState() throws {
+    var buffer = PlaybackBuffer()
+
+    for generationID in 1...10_000 {
+        let generation = UInt64(generationID)
+        let frame = try pcmFrame(
+            generationID: generation,
+            utteranceID: generation
+        )
+        try buffer.enqueue(frame)
+        try buffer.markRendered(frame.identity)
+    }
+
+    #expect(buffer.frameCount == 0)
+    #expect(buffer.retainedStreamHistoryCount <= 1)
+}

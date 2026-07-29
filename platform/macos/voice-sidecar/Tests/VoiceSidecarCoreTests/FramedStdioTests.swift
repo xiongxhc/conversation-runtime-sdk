@@ -155,6 +155,12 @@ func shutdownCancelsIdleDescriptorReadWithoutClosingItsOpenPeer() async throws {
         fileDescriptor: mediaDescriptors[1],
         closeOnDealloc: true
     )
+    let originalControlStatusFlags = fcntl(controlInput.fileDescriptor, F_GETFL)
+    let originalMediaStatusFlags = fcntl(mediaInput.fileDescriptor, F_GETFL)
+    #expect(originalControlStatusFlags >= 0)
+    #expect(originalMediaStatusFlags >= 0)
+    #expect(originalControlStatusFlags & O_NONBLOCK == 0)
+    #expect(originalMediaStatusFlags & O_NONBLOCK == 0)
     defer {
         try? controlInput.close()
         try? controlPeer.close()
@@ -226,6 +232,10 @@ func shutdownCancelsIdleDescriptorReadWithoutClosingItsOpenPeer() async throws {
                 ChildFrame(control: .shutdownComplete(sessionID: 7)),
             ]
     )
+    #expect(fcntl(controlInput.fileDescriptor, F_GETFL) == originalControlStatusFlags)
+    #expect(fcntl(mediaInput.fileDescriptor, F_GETFL) == originalMediaStatusFlags)
+    #expect(fcntl(controlInput.fileDescriptor, F_GETFL) & O_NONBLOCK == 0)
+    #expect(fcntl(mediaInput.fileDescriptor, F_GETFL) & O_NONBLOCK == 0)
     #expect(fcntl(controlInput.fileDescriptor, F_GETFD) != -1)
     #expect(fcntl(mediaPeer.fileDescriptor, F_GETFD) != -1)
 

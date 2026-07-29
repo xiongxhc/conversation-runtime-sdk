@@ -24,7 +24,6 @@ public enum FramedStdioError: Error, Equatable, Sendable {
     case mediaChannelReceivedControl
     case unexpectedControlEOF
     case descriptorDuplicateFailed(Int32)
-    case descriptorConfigurationFailed(Int32)
     case descriptorReadFailed(Int32)
 }
 
@@ -203,21 +202,6 @@ public final class FileHandleFrameReader: FrameByteReader, @unchecked Sendable {
         guard duplicated >= 0 else {
             descriptor = -1
             setupError = .descriptorDuplicateFailed(errno)
-            return
-        }
-        let flags = fcntl(duplicated, F_GETFL)
-        guard flags >= 0 else {
-            let code = errno
-            close(duplicated)
-            descriptor = -1
-            setupError = .descriptorConfigurationFailed(code)
-            return
-        }
-        guard fcntl(duplicated, F_SETFL, flags | O_NONBLOCK) >= 0 else {
-            let code = errno
-            close(duplicated)
-            descriptor = -1
-            setupError = .descriptorConfigurationFailed(code)
             return
         }
         descriptor = duplicated

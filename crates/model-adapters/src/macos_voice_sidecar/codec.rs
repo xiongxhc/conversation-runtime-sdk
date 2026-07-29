@@ -9,14 +9,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::{AudioFrame, PcmFormat, PcmSampleFormat, RecognitionHypothesis, MAX_PCM_FRAME_BYTES};
 
-pub const PROTOCOL_VERSION: u16 = 1;
-pub const HEADER_BYTES: usize = 8;
-pub const AUDIO_METADATA_BYTES: usize = 48;
-pub const MAX_CONTROL_PAYLOAD_BYTES: usize = 65_536;
-pub const MAX_AUDIO_PAYLOAD_BYTES: usize = AUDIO_METADATA_BYTES + MAX_PCM_FRAME_BYTES;
+pub(crate) const PROTOCOL_VERSION: u16 = 1;
+pub(crate) const HEADER_BYTES: usize = 8;
+pub(crate) const AUDIO_METADATA_BYTES: usize = 48;
+pub(crate) const MAX_CONTROL_PAYLOAD_BYTES: usize = 65_536;
+pub(crate) const MAX_AUDIO_PAYLOAD_BYTES: usize = AUDIO_METADATA_BYTES + MAX_PCM_FRAME_BYTES;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SidecarFrameKind {
+pub(crate) enum SidecarFrameKind {
     StartSession,
     StartCapture,
     FlushGeneration,
@@ -33,7 +33,7 @@ pub enum SidecarFrameKind {
 }
 
 impl SidecarFrameKind {
-    pub const fn code(self) -> u16 {
+    pub(crate) const fn code(self) -> u16 {
         match self {
             Self::StartSession => 0x0001,
             Self::StartCapture => 0x0002,
@@ -82,8 +82,20 @@ impl TryFrom<u16> for SidecarFrameKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SidecarFailureCode {
+    PermissionDenied,
+    InvalidState,
+    MalformedFrame,
+    AudioDeviceUnavailable,
+    RecognitionFailed,
+    PlaybackFailed,
+    Internal,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SidecarControl {
+pub(crate) enum SidecarControl {
     StartSession {
         session_id: SessionId,
         speech_start_ms: u64,
@@ -125,7 +137,7 @@ pub enum SidecarControl {
     Failure {
         session_id: SessionId,
         stage: RuntimeStage,
-        message: String,
+        code: SidecarFailureCode,
     },
     ShutdownComplete {
         session_id: SessionId,
@@ -133,7 +145,7 @@ pub enum SidecarControl {
 }
 
 impl SidecarControl {
-    pub const fn kind(&self) -> SidecarFrameKind {
+    pub(crate) const fn kind(&self) -> SidecarFrameKind {
         match self {
             Self::StartSession { .. } => SidecarFrameKind::StartSession,
             Self::StartCapture { .. } => SidecarFrameKind::StartCapture,
@@ -161,45 +173,45 @@ enum SidecarFramePayload {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SidecarFrame {
+pub(crate) struct SidecarFrame {
     version: u16,
     payload: SidecarFramePayload,
 }
 
 impl SidecarFrame {
-    pub const fn control(control: SidecarControl) -> Self {
+    pub(crate) const fn control(control: SidecarControl) -> Self {
         Self {
             version: PROTOCOL_VERSION,
             payload: SidecarFramePayload::Control(control),
         }
     }
 
-    pub const fn audio(session_id: SessionId, frame: AudioFrame) -> Self {
+    pub(crate) const fn audio(session_id: SessionId, frame: AudioFrame) -> Self {
         Self {
             version: PROTOCOL_VERSION,
             payload: SidecarFramePayload::Audio { session_id, frame },
         }
     }
 
-    pub const fn version(&self) -> u16 {
+    pub(crate) const fn version(&self) -> u16 {
         self.version
     }
 
-    pub const fn kind(&self) -> SidecarFrameKind {
+    pub(crate) const fn kind(&self) -> SidecarFrameKind {
         match &self.payload {
             SidecarFramePayload::Control(control) => control.kind(),
             SidecarFramePayload::Audio { .. } => SidecarFrameKind::AudioFrame,
         }
     }
 
-    pub const fn as_control(&self) -> Option<&SidecarControl> {
+    pub(crate) const fn as_control(&self) -> Option<&SidecarControl> {
         match &self.payload {
             SidecarFramePayload::Control(control) => Some(control),
             SidecarFramePayload::Audio { .. } => None,
         }
     }
 
-    pub const fn as_audio(&self) -> Option<(SessionId, &AudioFrame)> {
+    pub(crate) const fn as_audio(&self) -> Option<(SessionId, &AudioFrame)> {
         match &self.payload {
             SidecarFramePayload::Control(_) => None,
             SidecarFramePayload::Audio { session_id, frame } => Some((*session_id, frame)),
@@ -208,7 +220,7 @@ impl SidecarFrame {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SidecarCodecError {
+pub(crate) enum SidecarCodecError {
     NeedMoreData {
         required: usize,
         available: usize,
@@ -294,7 +306,7 @@ impl fmt::Display for SidecarCodecError {
 
 impl Error for SidecarCodecError {}
 
-pub fn encode_frame(frame: &SidecarFrame) -> Result<Vec<u8>, SidecarCodecError> {
+pub(crate) fn encode_frame(frame: &SidecarFrame) -> Result<Vec<u8>, SidecarCodecError> {
     let kind = frame.kind();
     let payload = match &frame.payload {
         SidecarFramePayload::Control(control) => encode_control(control)?,
@@ -316,7 +328,7 @@ pub fn encode_frame(frame: &SidecarFrame) -> Result<Vec<u8>, SidecarCodecError> 
     Ok(encoded)
 }
 
-pub fn decode_frame(bytes: &[u8]) -> Result<SidecarFrame, SidecarCodecError> {
+pub(crate) fn decode_frame(bytes: &[u8]) -> Result<SidecarFrame, SidecarCodecError> {
     if bytes.len() < HEADER_BYTES {
         return Err(SidecarCodecError::NeedMoreData {
             required: HEADER_BYTES,
@@ -362,7 +374,7 @@ pub fn decode_frame(bytes: &[u8]) -> Result<SidecarFrame, SidecarCodecError> {
     })
 }
 
-pub fn decode_frame_at_eof(bytes: &[u8]) -> Result<SidecarFrame, SidecarCodecError> {
+pub(crate) fn decode_frame_at_eof(bytes: &[u8]) -> Result<SidecarFrame, SidecarCodecError> {
     match decode_frame(bytes) {
         Err(SidecarCodecError::NeedMoreData {
             required,
@@ -375,7 +387,9 @@ pub fn decode_frame_at_eof(bytes: &[u8]) -> Result<SidecarFrame, SidecarCodecErr
     }
 }
 
-pub fn decode_audio_payload(payload: &[u8]) -> Result<(SessionId, AudioFrame), SidecarCodecError> {
+pub(crate) fn decode_audio_payload(
+    payload: &[u8],
+) -> Result<(SessionId, AudioFrame), SidecarCodecError> {
     let pcm_length = payload.len().saturating_sub(AUDIO_METADATA_BYTES);
     if pcm_length > MAX_PCM_FRAME_BYTES {
         return Err(SidecarCodecError::PcmPayloadTooLarge {
@@ -557,11 +571,11 @@ fn encode_control(control: &SidecarControl) -> Result<Vec<u8>, SidecarCodecError
         SidecarControl::Failure {
             session_id,
             stage,
-            message,
+            code,
         } => serialize(&FailureDto {
             session_id: session_id.get(),
             stage: FailureStageDto::try_from(*stage)?,
-            message,
+            code: *code,
         }),
     }
 }
@@ -652,11 +666,11 @@ fn decode_control(
             })
         }
         SidecarFrameKind::Failure => {
-            let value: FailureDto<'_> = deserialize(json)?;
+            let value: FailureDto = deserialize(json)?;
             Ok(SidecarControl::Failure {
                 session_id: SessionId::new(value.session_id),
                 stage: value.stage.into(),
-                message: value.message.to_owned(),
+                code: value.code,
             })
         }
         SidecarFrameKind::AudioFrame => Err(SidecarCodecError::InvalidControlJson),
@@ -789,9 +803,8 @@ impl From<FailureStageDto> for RuntimeStage {
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct FailureDto<'a> {
+struct FailureDto {
     session_id: u64,
     stage: FailureStageDto,
-    #[serde(borrow)]
-    message: &'a str,
+    code: SidecarFailureCode,
 }

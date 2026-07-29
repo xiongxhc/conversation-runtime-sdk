@@ -7,8 +7,7 @@ mod generation_language;
 mod language_model;
 mod macos_afplay;
 mod macos_system_speech;
-#[doc(hidden)]
-pub mod macos_voice_sidecar;
+pub(crate) mod macos_voice_sidecar;
 mod mock;
 mod ollama;
 mod openai_compatible_speech;

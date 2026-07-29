@@ -1,12 +1,12 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use conversation_model_adapters::macos_voice_sidecar::codec::{
+use super::codec::{
     decode_audio_payload, decode_frame, decode_frame_at_eof, encode_frame, SidecarCodecError,
-    SidecarControl, SidecarFrame, SidecarFrameKind, AUDIO_METADATA_BYTES, HEADER_BYTES,
-    MAX_AUDIO_PAYLOAD_BYTES, MAX_CONTROL_PAYLOAD_BYTES, PROTOCOL_VERSION,
+    SidecarControl, SidecarFailureCode, SidecarFrame, SidecarFrameKind, AUDIO_METADATA_BYTES,
+    HEADER_BYTES, MAX_AUDIO_PAYLOAD_BYTES, MAX_CONTROL_PAYLOAD_BYTES, PROTOCOL_VERSION,
 };
-use conversation_model_adapters::{AudioFrame, PcmFormat, PcmSampleFormat, RecognitionHypothesis};
+use crate::{AudioFrame, PcmFormat, PcmSampleFormat, RecognitionHypothesis};
 use conversation_protocol::{
     GenerationId, RuntimeStage, SessionId, TurnId, UtteranceId, VoiceActivity,
 };
@@ -39,7 +39,7 @@ fn version_one_kind_codes_are_pinned() {
 #[test]
 fn start_session_fixture_round_trips_exactly() {
     let bytes =
-        include_bytes!("../../../tests/fixtures/voice-sidecar-v1/control/start-session.bin");
+        include_bytes!("../../../../tests/fixtures/voice-sidecar-v1/control/start-session.bin");
     let frame = decode_frame(bytes).unwrap();
 
     assert_eq!(frame.version(), 1);
@@ -53,8 +53,9 @@ fn start_session_fixture_round_trips_exactly() {
 
 #[test]
 fn transcript_partial_fixture_round_trips_exactly() {
-    let bytes =
-        include_bytes!("../../../tests/fixtures/voice-sidecar-v1/control/transcript-partial.bin");
+    let bytes = include_bytes!(
+        "../../../../tests/fixtures/voice-sidecar-v1/control/transcript-partial.bin"
+    );
     let frame = decode_frame(bytes).unwrap();
 
     assert_eq!(frame.kind(), SidecarFrameKind::TranscriptHypothesis);
@@ -74,7 +75,7 @@ fn transcript_partial_fixture_round_trips_exactly() {
 
 #[test]
 fn signed_sixteen_audio_fixture_pins_metadata_and_pcm_bytes() {
-    let bytes = include_bytes!("../../../tests/fixtures/voice-sidecar-v1/audio/pcm-s16le.bin");
+    let bytes = include_bytes!("../../../../tests/fixtures/voice-sidecar-v1/audio/pcm-s16le.bin");
     let frame = decode_frame(bytes).unwrap();
     let (session_id, audio) = frame.as_audio().unwrap();
 
@@ -159,7 +160,7 @@ fn partial_payload_returns_need_more_data_until_exact_length() {
 #[test]
 fn eof_converts_partial_data_to_typed_truncation() {
     let bytes =
-        include_bytes!("../../../tests/fixtures/voice-sidecar-v1/invalid/truncated-control.bin");
+        include_bytes!("../../../../tests/fixtures/voice-sidecar-v1/invalid/truncated-control.bin");
     let error = decode_frame_at_eof(bytes).unwrap_err();
 
     assert!(matches!(
@@ -236,7 +237,7 @@ fn control_json_denies_unknown_fields() {
 #[test]
 fn declared_control_length_is_rejected_before_payload_read() {
     let bytes =
-        include_bytes!("../../../tests/fixtures/voice-sidecar-v1/invalid/oversized-header.bin");
+        include_bytes!("../../../../tests/fixtures/voice-sidecar-v1/invalid/oversized-header.bin");
 
     assert_eq!(
         decode_frame(bytes),
@@ -250,25 +251,23 @@ fn declared_control_length_is_rejected_before_payload_read() {
 
 #[test]
 fn maximum_control_payload_round_trips_and_one_more_byte_fails() {
-    let exact = SidecarFrame::control(SidecarControl::Failure {
+    let exact = SidecarFrame::control(SidecarControl::TranscriptHypothesis {
         session_id: SessionId::new(1),
-        stage: RuntimeStage::VoiceSidecar,
-        message: "x".repeat(MAX_CONTROL_PAYLOAD_BYTES - 53),
+        hypothesis: RecognitionHypothesis::partial(1, "x".repeat(MAX_CONTROL_PAYLOAD_BYTES - 62)),
     });
     let encoded = encode_frame(&exact).unwrap();
 
     assert_eq!(encoded.len(), HEADER_BYTES + MAX_CONTROL_PAYLOAD_BYTES);
     assert_eq!(decode_frame(&encoded).unwrap(), exact);
 
-    let oversized = SidecarFrame::control(SidecarControl::Failure {
+    let oversized = SidecarFrame::control(SidecarControl::TranscriptHypothesis {
         session_id: SessionId::new(1),
-        stage: RuntimeStage::VoiceSidecar,
-        message: "x".repeat(MAX_CONTROL_PAYLOAD_BYTES - 52),
+        hypothesis: RecognitionHypothesis::partial(1, "x".repeat(MAX_CONTROL_PAYLOAD_BYTES - 61)),
     });
     assert_eq!(
         encode_frame(&oversized),
         Err(SidecarCodecError::PayloadTooLarge {
-            kind: SidecarFrameKind::Failure,
+            kind: SidecarFrameKind::TranscriptHypothesis,
             declared: MAX_CONTROL_PAYLOAD_BYTES + 1,
             maximum: MAX_CONTROL_PAYLOAD_BYTES,
         })
@@ -393,21 +392,51 @@ fn audio_metadata_rejects_unaligned_pcm() {
 }
 
 #[test]
-fn failure_payload_has_no_transcript_or_content_field() {
+fn failure_payload_is_exactly_typed_and_content_free() {
     let frame = SidecarFrame::control(SidecarControl::Failure {
         session_id: SessionId::new(9),
         stage: RuntimeStage::SpeechRecognizer,
-        message: "recognizer unavailable".to_owned(),
+        code: SidecarFailureCode::PermissionDenied,
     });
     let encoded = encode_frame(&frame).unwrap();
-    let payload: serde_json::Value = serde_json::from_slice(&encoded[HEADER_BYTES..]).unwrap();
-    let object = payload.as_object().unwrap();
 
-    assert_eq!(object.len(), 3);
-    assert!(!object.contains_key("transcript"));
-    assert!(!object.contains_key("content"));
-    assert!(!object.contains_key("text"));
+    assert_eq!(
+        &encoded[HEADER_BYTES..],
+        br#"{"session_id":9,"stage":"speech_recognizer","code":"permission_denied"}"#
+    );
     assert_eq!(decode_frame(&encoded).unwrap(), frame);
+}
+
+#[test]
+fn failure_json_rejects_every_arbitrary_content_field() {
+    let payloads = [
+        br#"{"session_id":9,"stage":"speech_recognizer","code":"permission_denied","message":"private transcript"}"#.as_slice(),
+        br#"{"session_id":9,"stage":"speech_recognizer","code":"permission_denied","text":"private transcript"}"#.as_slice(),
+        br#"{"session_id":9,"stage":"speech_recognizer","code":"permission_denied","transcript":"private transcript"}"#.as_slice(),
+        br#"{"session_id":9,"stage":"speech_recognizer","code":"permission_denied","content":"private transcript"}"#.as_slice(),
+    ];
+
+    for payload in payloads {
+        let bytes = raw_frame(PROTOCOL_VERSION, SidecarFrameKind::Failure.code(), payload);
+        assert_eq!(
+            decode_frame(&bytes),
+            Err(SidecarCodecError::InvalidControlJson)
+        );
+    }
+}
+
+#[test]
+fn failure_json_rejects_unknown_string_code() {
+    let bytes = raw_frame(
+        PROTOCOL_VERSION,
+        SidecarFrameKind::Failure.code(),
+        br#"{"session_id":9,"stage":"speech_recognizer","code":"private transcript"}"#,
+    );
+
+    assert_eq!(
+        decode_frame(&bytes),
+        Err(SidecarCodecError::InvalidControlJson)
+    );
 }
 
 #[test]
@@ -473,7 +502,7 @@ fn every_control_kind_round_trips_with_exact_identity_fields() {
         SidecarControl::Failure {
             session_id: SessionId::new(1),
             stage: RuntimeStage::AudioOutput,
-            message: "render failed".to_owned(),
+            code: SidecarFailureCode::PlaybackFailed,
         },
         SidecarControl::ShutdownComplete {
             session_id: SessionId::new(1),

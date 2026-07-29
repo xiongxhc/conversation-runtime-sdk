@@ -1,32 +1,132 @@
 import Darwin
 import Foundation
 import VoiceSidecarCore
+import VoiceSidecarMacOS
 
-private actor ProtocolOnlyAudioService: SidecarAudioService {
-    func start(configuration _: SidecarConfiguration) async throws {}
-    func stop() async {}
+private struct LaunchConfiguration {
+    let modelPath: String
+
+    init(arguments: [String]) throws {
+        var modelPath: String?
+        var device: String?
+        var download: String?
+        var index = 0
+        while index < arguments.count {
+            guard index + 1 < arguments.count else {
+                throw LaunchConfigurationError.invalidArguments
+            }
+            switch arguments[index] {
+            case "--model-path":
+                modelPath = arguments[index + 1]
+            case "--device":
+                device = arguments[index + 1]
+            case "--download":
+                download = arguments[index + 1]
+            default:
+                throw LaunchConfigurationError.invalidArguments
+            }
+            index += 2
+        }
+        var modelIsDirectory = ObjCBool(false)
+        guard let modelPath,
+            (modelPath as NSString).isAbsolutePath,
+            FileManager.default.fileExists(
+                atPath: modelPath,
+                isDirectory: &modelIsDirectory
+            ),
+            modelIsDirectory.boolValue,
+            device == "system-default",
+            download == "false"
+        else {
+            throw LaunchConfigurationError.invalidArguments
+        }
+        self.modelPath = modelPath
+    }
 }
 
-private actor ProtocolOnlyRecognitionService: SidecarRecognitionService {
-    func start(configuration _: SidecarConfiguration) async throws {}
-    func stop() async {}
+private enum LaunchConfigurationError: Error {
+    case invalidArguments
 }
 
-private actor ProtocolOnlyPlaybackService: SidecarPlaybackService {
-    func enqueue(_: PCMFrame) async throws {}
-    func flush(throughGenerationID _: UInt64) async throws {}
-    func stop() async {}
+private let launchConfiguration: LaunchConfiguration
+do {
+    launchConfiguration = try LaunchConfiguration(
+        arguments: Array(CommandLine.arguments.dropFirst())
+    )
+} catch {
+    try? FileHandle.standardError.write(
+        contentsOf: Data("voice sidecar configuration failed\n".utf8)
+    )
+    exit(EXIT_FAILURE)
 }
 
 let eventWriter = SerializedFrameWriter(
     writer: FileHandleFrameWriter(fileHandle: .standardOutput)
 )
+let engine = VoiceProcessingEngine()
+let audioProcessor = VoiceProcessingAudioProcessor(engine: engine)
+let recognition = WhisperKitRecognition(
+    modelPath: launchConfiguration.modelPath,
+    audioProcessor: audioProcessor
+)
+let playback = ContinuousPCMPlayback(scheduler: engine)
 let session = SidecarSession(
-    audioService: ProtocolOnlyAudioService(),
-    recognitionService: ProtocolOnlyRecognitionService(),
-    playbackService: ProtocolOnlyPlaybackService(),
+    audioService: engine,
+    recognitionService: recognition,
+    playbackService: playback,
     eventSink: eventWriter
 )
+await playback.setRenderedHandler { identity in
+    try? await session.playbackRendered(identity)
+}
+await recognition.setEventHandler { event in
+    switch event {
+    case .hypothesis(let hypothesis):
+        try await session.publishRecognitionHypothesis(hypothesis)
+        return false
+    case .voiceWindow(
+        let
+            isSpeech,
+        let
+            frameMilliseconds,
+        let
+            atMilliseconds
+    ):
+        return try await session.observeBargeIn(
+            isSpeech: isSpeech,
+            frameMilliseconds: frameMilliseconds,
+            atMilliseconds: atMilliseconds
+        )
+    case .activity(let activity):
+        try await session.publishVoiceActivity(activity)
+        return false
+    case .failure(let sessionID, let failure):
+        try? await eventWriter.send(
+            ChildFrame(
+                control: .failure(
+                    sessionID: sessionID,
+                    stage: failure.stage,
+                    code: failure.code
+                )
+            )
+        )
+        exit(EXIT_FAILURE)
+    }
+}
+engine.setFailureHandler { sessionID, failure in
+    await recognition.stop()
+    await playback.stop()
+    try? await eventWriter.send(
+        ChildFrame(
+            control: .failure(
+                sessionID: sessionID,
+                stage: failure.stage,
+                code: failure.code
+            )
+        )
+    )
+    exit(EXIT_FAILURE)
+}
 let stdio = FramedStdio(
     controlReader: FileHandleFrameReader(fileHandle: .standardInput),
     mediaReader: FileHandleFrameReader(

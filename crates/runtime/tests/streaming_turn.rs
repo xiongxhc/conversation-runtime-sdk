@@ -1,15 +1,19 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use conversation_model_adapters::{
-    AudioFrame, MockContinuousAudioOutput, MockGenerationLanguageModel,
-    MockStreamingSpeechSynthesizer, PcmFormat, PcmSampleFormat,
+    AdapterError, AdapterFuture, AudioFrame, ContinuousAudioOutput, MockContinuousAudioOutput,
+    MockGenerationLanguageModel, MockStreamingSpeechSynthesizer, PcmFormat, PcmSampleFormat,
+    PlaybackReceipt, StreamingSpeechRequest, StreamingSpeechSynthesizer,
 };
 use conversation_protocol::{
-    GenerationId, RuntimeEvent, RuntimeTimingMilestone, TurnId, UtteranceId,
+    GenerationId, PlaybackState, RuntimeEvent, RuntimeTimingMilestone, SessionId, TurnId,
+    UtteranceId,
 };
 use conversation_runtime::{StreamingTurnEventStream, StreamingTurnRuntime, UtteranceAssembler};
+use tokio::sync::{mpsc, watch, Notify};
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 
 #[test]
 fn short_answer_is_one_utterance() {
@@ -151,46 +155,89 @@ async fn speech_normalization_runs_after_utterance_boundary_selection() {
     assert_eq!(speech.requests()[0].text(), "Heading. This is important.");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn first_playable_publication_precedes_frame_enqueue_under_backpressure() {
     let turn_id = TurnId::new(9);
     let generation_id = GenerationId::new(10);
-    let expected_frame = frame(
-        turn_id,
-        generation_id,
-        UtteranceId::new(1),
-        0,
-        PcmFormat::new(24_000, 1, PcmSampleFormat::Signed16LittleEndian).unwrap(),
-    );
+    let format = PcmFormat::new(24_000, 1, PcmSampleFormat::Signed16LittleEndian).unwrap();
+    let expected_frames = vec![
+        frame(turn_id, generation_id, UtteranceId::new(1), 0, format),
+        frame(turn_id, generation_id, UtteranceId::new(1), 1, format),
+    ];
     let language = Arc::new(MockGenerationLanguageModel::new(std::iter::repeat_n(
         "x", 27,
     )));
-    let speech = Arc::new(MockStreamingSpeechSynthesizer::new(
-        [expected_frame.clone()],
-    ));
-    let output = Arc::new(MockContinuousAudioOutput::new());
-    let runtime = StreamingTurnRuntime::new(language, speech.clone(), output.clone());
+    let first_frame_validated = Arc::new(Notify::new());
+    let speech = Arc::new(FirstPlayableProbeSpeech {
+        frames: expected_frames.clone(),
+        first_frame_validated: Arc::clone(&first_frame_validated),
+    });
+    let (enqueue_started_sender, mut enqueue_started_receiver) = mpsc::unbounded_channel();
+    let (release_sender, release_receiver) = watch::channel(false);
+    let output = Arc::new(GatedOrderingOutput {
+        enqueue_started: enqueue_started_sender,
+        first_enqueue_release: release_receiver,
+        accepted_sequences: Mutex::new(Vec::new()),
+    });
+    let runtime = StreamingTurnRuntime::new(language, speech, output.clone());
     let mut stream = runtime
         .start_turn(turn_id, generation_id, "question")
         .await
         .unwrap();
 
-    timeout(Duration::from_secs(1), async {
-        while speech.requests().is_empty() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("speech request never started");
-    tokio::task::yield_now().await;
+    timeout(Duration::from_secs(1), first_frame_validated.notified())
+        .await
+        .expect("worker never validated the first frame");
     assert!(
-        output.frames().is_empty(),
+        enqueue_started_receiver.try_recv().is_err(),
         "frame enqueue ran while FirstPlayableAudio publication was blocked"
     );
 
-    let observed = drain(&mut stream).await;
+    let mut observed = vec![stream.recv().await.expect("lifecycle stream closed early")];
+    let first_enqueued_sequence = timeout(Duration::from_secs(1), enqueue_started_receiver.recv())
+        .await
+        .expect("enqueue did not start after lifecycle capacity was released")
+        .expect("enqueue probe closed");
+    assert_eq!(first_enqueued_sequence, 0);
 
-    assert_eq!(output.frames(), vec![expected_frame]);
+    while !observed.iter().any(|event| {
+        matches!(
+            event,
+            RuntimeEvent::Timing {
+                milestone: RuntimeTimingMilestone::FirstPlayableAudio,
+                ..
+            }
+        )
+    }) {
+        observed.push(
+            stream
+                .recv()
+                .await
+                .expect("stream closed before FirstPlayableAudio was observed"),
+        );
+    }
+    assert!(
+        output
+            .accepted_sequences
+            .lock()
+            .expect("accepted sequence lock poisoned")
+            .is_empty(),
+        "first enqueue completed before the retained release"
+    );
+
+    release_sender
+        .send(true)
+        .expect("first enqueue release receiver dropped");
+    observed.extend(drain(&mut stream).await);
+
+    assert_eq!(
+        output
+            .accepted_sequences
+            .lock()
+            .expect("accepted sequence lock poisoned")
+            .as_slice(),
+        &[0, 1]
+    );
     assert_eq!(
         observed
             .iter()
@@ -206,6 +253,77 @@ async fn first_playable_publication_precedes_frame_enqueue_under_backpressure() 
             .count(),
         1
     );
+}
+
+struct FirstPlayableProbeSpeech {
+    frames: Vec<AudioFrame>,
+    first_frame_validated: Arc<Notify>,
+}
+
+impl StreamingSpeechSynthesizer for FirstPlayableProbeSpeech {
+    fn stream(
+        &self,
+        _request: StreamingSpeechRequest,
+        _cancellation: CancellationToken,
+    ) -> mpsc::Receiver<Result<AudioFrame, AdapterError>> {
+        let (sender, receiver) = mpsc::channel(1);
+        sender
+            .try_send(Ok(self.frames[0].clone()))
+            .expect("first frame fits the empty probe channel");
+        let second_frame = self.frames[1].clone();
+        let first_frame_validated = Arc::clone(&self.first_frame_validated);
+        tokio::spawn(async move {
+            if sender.send(Ok(second_frame)).await.is_ok() {
+                first_frame_validated.notify_one();
+            }
+        });
+        receiver
+    }
+}
+
+struct GatedOrderingOutput {
+    enqueue_started: mpsc::UnboundedSender<u64>,
+    first_enqueue_release: watch::Receiver<bool>,
+    accepted_sequences: Mutex<Vec<u64>>,
+}
+
+impl ContinuousAudioOutput for GatedOrderingOutput {
+    fn enqueue<'a>(
+        &'a self,
+        frame: AudioFrame,
+        _cancellation: CancellationToken,
+    ) -> AdapterFuture<'a, PlaybackReceipt> {
+        Box::pin(async move {
+            self.enqueue_started
+                .send(frame.sequence())
+                .map_err(|_| AdapterError::new("enqueue probe closed"))?;
+            if frame.sequence() == 0 {
+                let mut release = self.first_enqueue_release.clone();
+                while !*release.borrow() {
+                    release
+                        .changed()
+                        .await
+                        .map_err(|_| AdapterError::new("enqueue release dropped"))?;
+                }
+            }
+            self.accepted_sequences
+                .lock()
+                .expect("accepted sequence lock poisoned")
+                .push(frame.sequence());
+            Ok(PlaybackReceipt::new(
+                frame.generation_id(),
+                PlaybackState::Accepted,
+            ))
+        })
+    }
+
+    fn flush<'a>(
+        &'a self,
+        _session_id: SessionId,
+        generation_id: GenerationId,
+    ) -> AdapterFuture<'a, PlaybackReceipt> {
+        Box::pin(async move { Ok(PlaybackReceipt::new(generation_id, PlaybackState::Flushed)) })
+    }
 }
 
 fn frame(

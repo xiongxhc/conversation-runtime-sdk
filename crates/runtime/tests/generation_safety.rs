@@ -12,7 +12,7 @@ use conversation_protocol::{
     GenerationId, PlaybackState, RuntimeEvent, RuntimeStage, SessionId, TurnId, UtteranceId,
 };
 use conversation_runtime::{StreamingTurnEventStream, StreamingTurnRuntime};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, watch, Notify};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
@@ -217,6 +217,96 @@ async fn interruption_unblocks_full_media_enqueue_and_waits_for_cleanup() {
     );
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn queue_interruption_awaits_speech_cleanup_before_terminal_and_reuse() {
+    let first_turn = TurnId::new(20);
+    let first_generation = GenerationId::new(30);
+    let speech_started = Arc::new(Notify::new());
+    let cleanup_started = Arc::new(Notify::new());
+    let cleanup_finished = Arc::new(AtomicBool::new(false));
+    let (cleanup_release_sender, cleanup_release_receiver) = watch::channel(false);
+    let runtime = StreamingTurnRuntime::new(
+        Arc::new(QueuePressureLanguage),
+        Arc::new(LatchedCleanupSpeech {
+            speech_started: Arc::clone(&speech_started),
+            cleanup_started: Arc::clone(&cleanup_started),
+            cleanup_finished: Arc::clone(&cleanup_finished),
+            cleanup_release: cleanup_release_receiver,
+        }),
+        Arc::new(MockContinuousAudioOutput::new()),
+    );
+    let mut first = runtime
+        .start_turn(first_turn, first_generation, "first")
+        .await
+        .unwrap();
+
+    timeout(Duration::from_secs(1), speech_started.notified())
+        .await
+        .expect("speech worker never occupied the utterance queue");
+    runtime
+        .interrupt(first_turn, first_generation)
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(1), cleanup_started.notified())
+        .await
+        .expect("speech cleanup never started");
+
+    let second_turn = TurnId::new(21);
+    let second_generation = GenerationId::new(31);
+    let premature_reuse = timeout(Duration::from_millis(50), async {
+        loop {
+            if let Ok(stream) = runtime
+                .start_turn(second_turn, second_generation, "second")
+                .await
+            {
+                break stream;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(
+        premature_reuse.is_err(),
+        "runtime became reusable before speech cleanup completed"
+    );
+    assert!(
+        timeout(Duration::from_millis(50), drain(&mut first))
+            .await
+            .is_err(),
+        "terminal published before speech cleanup completed"
+    );
+    assert!(!cleanup_finished.load(Ordering::Acquire));
+
+    cleanup_release_sender
+        .send(true)
+        .expect("speech cleanup release receiver dropped");
+    let observed = timeout(Duration::from_secs(1), drain(&mut first))
+        .await
+        .expect("terminal did not publish after speech cleanup");
+    assert!(cleanup_finished.load(Ordering::Acquire));
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|event| event.is_terminal())
+            .collect::<Vec<_>>(),
+        vec![&RuntimeEvent::TurnCancelled {
+            turn_id: first_turn
+        }]
+    );
+
+    let mut second = runtime
+        .start_turn(second_turn, second_generation, "second")
+        .await
+        .expect("terminal observation must imply runtime reuse");
+    runtime
+        .interrupt(second_turn, second_generation)
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(1), drain(&mut second))
+        .await
+        .expect("second turn did not clean up");
+}
+
 #[tokio::test]
 async fn dropped_consumer_cancels_owned_work_and_runtime_reuses() {
     let first_turn = TurnId::new(1);
@@ -367,6 +457,61 @@ async fn cancelled_generation_cannot_publish_late_text_or_audio() {
 
 struct TaggedLanguage {
     deltas: Vec<GenerationTextDelta>,
+}
+
+struct QueuePressureLanguage;
+
+impl GenerationLanguageModel for QueuePressureLanguage {
+    fn stream(
+        &self,
+        request: GenerationLanguageRequest,
+        _cancellation: CancellationToken,
+    ) -> mpsc::Receiver<Result<GenerationTextDelta, AdapterError>> {
+        let (sender, receiver) = mpsc::channel(1);
+        tokio::spawn(async move {
+            let _ = sender
+                .send(Ok(GenerationTextDelta::new(
+                    request.turn_id(),
+                    request.generation_id(),
+                    "a".repeat(4_096),
+                )))
+                .await;
+        });
+        receiver
+    }
+}
+
+struct LatchedCleanupSpeech {
+    speech_started: Arc<Notify>,
+    cleanup_started: Arc<Notify>,
+    cleanup_finished: Arc<AtomicBool>,
+    cleanup_release: watch::Receiver<bool>,
+}
+
+impl StreamingSpeechSynthesizer for LatchedCleanupSpeech {
+    fn stream(
+        &self,
+        _request: StreamingSpeechRequest,
+        cancellation: CancellationToken,
+    ) -> mpsc::Receiver<Result<AudioFrame, AdapterError>> {
+        let (sender, receiver) = mpsc::channel(1);
+        self.speech_started.notify_one();
+        let cleanup_started = Arc::clone(&self.cleanup_started);
+        let cleanup_finished = Arc::clone(&self.cleanup_finished);
+        let mut cleanup_release = self.cleanup_release.clone();
+        tokio::spawn(async move {
+            cancellation.cancelled().await;
+            cleanup_started.notify_one();
+            while !*cleanup_release.borrow() {
+                if cleanup_release.changed().await.is_err() {
+                    return;
+                }
+            }
+            cleanup_finished.store(true, Ordering::Release);
+            drop(sender);
+        });
+        receiver
+    }
 }
 
 impl TaggedLanguage {

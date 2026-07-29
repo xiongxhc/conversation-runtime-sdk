@@ -138,19 +138,20 @@ impl StreamingTurnRuntime {
             drop(event_sender);
             generation_guard.deactivate(turn_id, generation_id).await;
 
-            let terminal_event = if terminal_interruption.is_cancelled() {
-                RuntimeEvent::TurnCancelled { turn_id }
-            } else {
-                terminal_event
-            };
-            let _ = terminal_sender.send(terminal_event);
-
             let mut active = active.lock().await;
             if active.as_ref().is_some_and(|current| {
                 current.turn_id == turn_id && current.generation_id == generation_id
             }) {
                 *active = None;
             }
+            drop(active);
+
+            let terminal_event = if terminal_interruption.is_cancelled() {
+                RuntimeEvent::TurnCancelled { turn_id }
+            } else {
+                terminal_event
+            };
+            let _ = terminal_sender.send(terminal_event);
         });
 
         Ok(StreamingTurnEventStream {
@@ -433,9 +434,16 @@ async fn run_streaming_turn(
                     )
                     .await
                     {
-                        cleanup_language_stream(&language_cancellation, &mut deltas).await;
-                        utterance_sender.take();
-                        return terminal_for_queue_outcome(turn_id, terminal);
+                        return finish_queue_outcome(
+                            turn_id,
+                            terminal,
+                            &mut utterance_sender,
+                            &language_cancellation,
+                            &work_cancellation,
+                            &mut deltas,
+                            &mut speech_worker,
+                        )
+                        .await;
                     }
                 }
             }
@@ -469,9 +477,16 @@ async fn run_streaming_turn(
         )
         .await
         {
-            cleanup_language_stream(&language_cancellation, &mut deltas).await;
-            utterance_sender.take();
-            return terminal_for_queue_outcome(turn_id, outcome);
+            return finish_queue_outcome(
+                turn_id,
+                outcome,
+                &mut utterance_sender,
+                &language_cancellation,
+                &work_cancellation,
+                &mut deltas,
+                &mut speech_worker,
+            )
+            .await;
         }
     }
 
@@ -943,6 +958,58 @@ async fn stop_streaming_pipeline(
     let (_, _) = tokio::join!(drain_language_stream(deltas), &mut *speech_worker);
 }
 
+async fn finish_queue_outcome(
+    turn_id: TurnId,
+    outcome: QueueOutcome,
+    utterance_sender: &mut Option<mpsc::Sender<QueuedUtterance>>,
+    language_cancellation: &CancellationToken,
+    work_cancellation: &CancellationToken,
+    deltas: &mut mpsc::Receiver<Result<GenerationTextDelta, AdapterError>>,
+    speech_worker: &mut JoinHandle<SpeechOutcome>,
+) -> RuntimeEvent {
+    match outcome {
+        QueueOutcome::WorkerFinished(outcome) => {
+            work_cancellation.cancel();
+            utterance_sender.take();
+            cleanup_language_stream(language_cancellation, deltas).await;
+            terminal_from_speech(turn_id, outcome)
+        }
+        QueueOutcome::Interrupted => {
+            stop_streaming_pipeline(
+                utterance_sender,
+                language_cancellation,
+                work_cancellation,
+                deltas,
+                speech_worker,
+            )
+            .await;
+            RuntimeEvent::TurnCancelled { turn_id }
+        }
+        QueueOutcome::Closed => {
+            stop_streaming_pipeline(
+                utterance_sender,
+                language_cancellation,
+                work_cancellation,
+                deltas,
+                speech_worker,
+            )
+            .await;
+            runtime_failure(turn_id, "streaming speech utterance queue closed early")
+        }
+        QueueOutcome::Failed(error) => {
+            stop_streaming_pipeline(
+                utterance_sender,
+                language_cancellation,
+                work_cancellation,
+                deltas,
+                speech_worker,
+            )
+            .await;
+            adapter_failure(turn_id, RuntimeStage::Runtime, error)
+        }
+    }
+}
+
 async fn cleanup_language_stream(
     cancellation: &CancellationToken,
     deltas: &mut mpsc::Receiver<Result<GenerationTextDelta, AdapterError>>,
@@ -963,17 +1030,6 @@ async fn cleanup_frame_stream(
 ) {
     cancellation.cancel();
     while frames.recv().await.is_some() {}
-}
-
-fn terminal_for_queue_outcome(turn_id: TurnId, outcome: QueueOutcome) -> RuntimeEvent {
-    match outcome {
-        QueueOutcome::Interrupted => RuntimeEvent::TurnCancelled { turn_id },
-        QueueOutcome::Closed => {
-            runtime_failure(turn_id, "streaming speech utterance queue closed early")
-        }
-        QueueOutcome::Failed(error) => adapter_failure(turn_id, RuntimeStage::Runtime, error),
-        QueueOutcome::WorkerFinished(outcome) => terminal_from_speech(turn_id, outcome),
-    }
 }
 
 fn terminal_from_speech(
@@ -1054,4 +1110,102 @@ enum SpeechOutcome {
         error: AdapterError,
     },
     EventStreamClosed,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use conversation_model_adapters::{
+        MockContinuousAudioOutput, MockGenerationLanguageModel, MockStreamingSpeechSynthesizer,
+        PcmSampleFormat,
+    };
+    use tokio::time::timeout;
+
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_waits_for_active_clear_and_immediately_allows_reuse() {
+        let first_turn = TurnId::new(1);
+        let first_generation = GenerationId::new(1);
+        let format = PcmFormat::new(24_000, 1, PcmSampleFormat::Signed16LittleEndian).unwrap();
+        let runtime = StreamingTurnRuntime::new(
+            Arc::new(MockGenerationLanguageModel::new(["answer"])),
+            Arc::new(MockStreamingSpeechSynthesizer::new([AudioFrame::new(
+                first_turn,
+                first_generation,
+                UtteranceId::new(1),
+                0,
+                format,
+                vec![0; 960],
+            )
+            .unwrap()])),
+            Arc::new(MockContinuousAudioOutput::new()),
+        );
+        let mut first = runtime
+            .start_turn(first_turn, first_generation, "first")
+            .await
+            .unwrap();
+        let active = runtime.active.lock().await;
+
+        let terminal_while_active_is_locked = timeout(Duration::from_millis(50), async {
+            while let Some(event) = first.recv().await {
+                if event.is_terminal() {
+                    return event;
+                }
+            }
+            panic!("stream ended without a terminal event");
+        })
+        .await;
+        assert!(
+            terminal_while_active_is_locked.is_err(),
+            "terminal published before the active generation was cleared"
+        );
+
+        drop(active);
+        let terminal = timeout(Duration::from_secs(1), async {
+            loop {
+                let event = first
+                    .recv()
+                    .await
+                    .expect("stream ended without a terminal event");
+                if event.is_terminal() {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("terminal did not publish after active generation clear");
+        assert_eq!(
+            terminal,
+            RuntimeEvent::TurnCompleted {
+                turn_id: first_turn
+            }
+        );
+
+        let interrupt_error = runtime
+            .interrupt(first_turn, first_generation)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            interrupt_error.message(),
+            "there is no active streaming generation"
+        );
+
+        let second_turn = TurnId::new(2);
+        let second_generation = GenerationId::new(2);
+        let mut second = runtime
+            .start_turn(second_turn, second_generation, "second")
+            .await
+            .expect("terminal observation must imply immediate runtime reuse");
+        runtime
+            .interrupt(second_turn, second_generation)
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), async {
+            while second.recv().await.is_some() {}
+        })
+        .await
+        .expect("second turn did not clean up");
+    }
 }

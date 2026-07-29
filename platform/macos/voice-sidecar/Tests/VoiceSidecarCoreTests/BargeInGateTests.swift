@@ -3,7 +3,7 @@ import Testing
 
 @Test
 func twoHundredMillisecondsOfSpeechFlushesCurrentGeneration() {
-    var gate = BargeInGate(thresholdMilliseconds: 200)
+    var gate = BargeInGate()
 
     #expect(gate.observe(isSpeech: true, frameMilliseconds: 100) == false)
     #expect(gate.observe(isSpeech: true, frameMilliseconds: 100) == true)
@@ -12,12 +12,14 @@ func twoHundredMillisecondsOfSpeechFlushesCurrentGeneration() {
 
 @Test
 func speechGapResetsAccumulationAndTriggerLatch() {
-    var gate = BargeInGate(thresholdMilliseconds: 200)
+    var gate = BargeInGate()
 
     #expect(gate.observe(isSpeech: true, frameMilliseconds: 100) == false)
     #expect(gate.observe(isSpeech: false, frameMilliseconds: 100) == false)
     #expect(gate.observe(isSpeech: true, frameMilliseconds: 100) == false)
     #expect(gate.observe(isSpeech: true, frameMilliseconds: 100) == true)
     #expect(gate.observe(isSpeech: false, frameMilliseconds: 100) == false)
-    #expect(gate.observe(isSpeech: true, frameMilliseconds: 200) == true)
+    #expect(gate.observe(isSpeech: true, frameMilliseconds: 200) == false)
+    #expect(gate.observe(isSpeech: true, frameMilliseconds: 100) == false)
+    #expect(gate.observe(isSpeech: true, frameMilliseconds: 100) == true)
 }

@@ -96,7 +96,7 @@ func invalidThresholdsEmitTypedContentFreeFailure() async {
                         stage: .voiceSidecar,
                         code: .invalidState
                     )
-                ),
+                )
             ]
     )
 }
@@ -126,6 +126,77 @@ func acceptedPCMUsesExactIdentityAndSession() async throws {
                     generationID: 3,
                     utteranceID: 4,
                     sequence: 0
+                )
+            )
+    )
+}
+
+@Test
+func flushedRenderedCallbackIsTheOnlyIgnoredOutputCallback() async throws {
+    let events = RecordingEventSink()
+    let session = SidecarSession(
+        audioService: RecordingAudioService(),
+        recognitionService: RecordingRecognitionService(),
+        playbackService: RecordingPlaybackService(),
+        eventSink: events
+    )
+    try await startAndCapture(session)
+    let frame = try pcmFrame(generationID: 5)
+    try await session.handleMedia(
+        ChildFrame(audioSessionID: 7, frame: frame)
+    )
+    try await session.handleControl(
+        ChildFrame(
+            control: .flushGeneration(
+                sessionID: 7,
+                generationID: 5,
+                operationID: 9
+            )
+        )
+    )
+    let framesBeforeLateCallback = await events.frames
+
+    try await session.playbackRendered(frame.identity)
+
+    #expect(await events.frames == framesBeforeLateCallback)
+}
+
+@Test
+func nonStaleRenderedOrderFailureIsFatal() async throws {
+    let audio = RecordingAudioService()
+    let recognition = RecordingRecognitionService()
+    let playback = RecordingPlaybackService()
+    let events = RecordingEventSink()
+    let session = SidecarSession(
+        audioService: audio,
+        recognitionService: recognition,
+        playbackService: playback,
+        eventSink: events
+    )
+    try await startAndCapture(session)
+    let first = try pcmFrame(generationID: 5, sequence: 0)
+    let second = try pcmFrame(generationID: 5, sequence: 1)
+    try await session.handleMedia(
+        ChildFrame(audioSessionID: 7, frame: first)
+    )
+    try await session.handleMedia(
+        ChildFrame(audioSessionID: 7, frame: second)
+    )
+
+    await #expect(throws: PlaybackBufferError.renderOrderMismatch) {
+        try await session.playbackRendered(second.identity)
+    }
+
+    #expect(await audio.stopCount == 1)
+    #expect(await recognition.stopCount == 1)
+    #expect(await playback.stopCount == 1)
+    #expect(
+        await events.frames.last
+            == ChildFrame(
+                control: .failure(
+                    sessionID: 7,
+                    stage: .voiceSidecar,
+                    code: .malformedFrame
                 )
             )
     )
@@ -260,6 +331,43 @@ func localFlushPrecedesBargeInActivity() async throws {
         await callLog.entries
             == ["playback.flush.5", "event.voiceActivity"]
     )
+}
+
+@Test(arguments: [UInt64(100), UInt64(300)])
+func bargeInAlwaysRequiresTwoConsecutiveWindows(
+    speechStartMilliseconds: UInt64
+) async throws {
+    let playback = RecordingPlaybackService()
+    let session = SidecarSession(
+        audioService: RecordingAudioService(),
+        recognitionService: RecordingRecognitionService(),
+        playbackService: playback,
+        eventSink: RecordingEventSink()
+    )
+    try await startAndCapture(
+        session,
+        speechStartMilliseconds: speechStartMilliseconds
+    )
+    try await session.handleMedia(
+        ChildFrame(audioSessionID: 7, frame: pcmFrame(generationID: 5))
+    )
+
+    #expect(
+        try await session.observeBargeIn(
+            isSpeech: true,
+            frameMilliseconds: 100,
+            atMilliseconds: 10
+        ) == false
+    )
+    #expect(await playback.flushedGenerations.isEmpty)
+    #expect(
+        try await session.observeBargeIn(
+            isSpeech: true,
+            frameMilliseconds: 100,
+            atMilliseconds: 110
+        ) == true
+    )
+    #expect(await playback.flushedGenerations == [5])
 }
 
 @Test
@@ -693,20 +801,29 @@ func shutdownStopsInjectedServicesAndEmitsCompletion() async throws {
     )
 }
 
-private func startSession(_ session: SidecarSession) async throws {
+private func startSession(
+    _ session: SidecarSession,
+    speechStartMilliseconds: UInt64 = 200
+) async throws {
     try await session.handleControl(
         ChildFrame(
             control: .startSession(
                 sessionID: 7,
-                speechStartMilliseconds: 200,
+                speechStartMilliseconds: speechStartMilliseconds,
                 finalSilenceMilliseconds: 600
             )
         )
     )
 }
 
-private func startAndCapture(_ session: SidecarSession) async throws {
-    try await startSession(session)
+private func startAndCapture(
+    _ session: SidecarSession,
+    speechStartMilliseconds: UInt64 = 200
+) async throws {
+    try await startSession(
+        session,
+        speechStartMilliseconds: speechStartMilliseconds
+    )
     try await session.handleControl(
         ChildFrame(control: .startCapture(sessionID: 7))
     )

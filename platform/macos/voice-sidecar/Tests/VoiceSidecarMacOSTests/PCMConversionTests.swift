@@ -131,6 +131,180 @@ func recognizerConversionRejectsUnsupportedSampleFormat() throws {
     }
 }
 
+@Test
+func captureRingDropsOverflowAndPreservesOrder() throws {
+    let format = try #require(
+        AVAudioFormat(
+            commonFormat: .pcmFormatInt16,
+            sampleRate: 48_000,
+            channels: 1,
+            interleaved: true
+        )
+    )
+    let ring = try CapturePCMBufferRing(
+        format: format,
+        frameCapacity: 1,
+        capacity: 2
+    )
+
+    #expect(ring.copyFromTap(try int16Buffer(format: format, samples: [1])))
+    #expect(ring.copyFromTap(try int16Buffer(format: format, samples: [2])))
+    #expect(!ring.copyFromTap(try int16Buffer(format: format, samples: [3])))
+
+    var received: [Int16] = []
+    ring.drain { buffer in
+        received.append(interleavedSamples(from: buffer, as: Int16.self)[0])
+    }
+
+    #expect(received == [1, 2])
+    #expect(ring.droppedBufferCount == 1)
+    #expect(ring.copyFromTap(try int16Buffer(format: format, samples: [4])))
+}
+
+@Test(
+    arguments: [
+        StreamingRecognizerCase(sampleFormat: .signed16LittleEndian, channels: 1),
+        StreamingRecognizerCase(sampleFormat: .signed16LittleEndian, channels: 2),
+        StreamingRecognizerCase(sampleFormat: .float32LittleEndian, channels: 1),
+        StreamingRecognizerCase(sampleFormat: .float32LittleEndian, channels: 2),
+    ]
+)
+func streamingRecognizerResamplingPreservesPhase(
+    input: StreamingRecognizerCase
+) throws {
+    let converter = StreamingPCMRecognizerConverter()
+    var output: [Float] = []
+    for chunk in 0..<3 {
+        output.append(
+            contentsOf: try converter.convert(
+                streamingBuffer(
+                    sampleFormat: input.sampleFormat,
+                    channels: input.channels,
+                    startFrame: chunk * 4_096,
+                    frameCount: 4_096
+                )
+            )
+        )
+    }
+
+    #expect(output.count == 4_096)
+    for index in output.indices {
+        let expected = streamingExpectedSample(
+            sampleFormat: input.sampleFormat,
+            sourceFrame: index * 3
+        )
+        #expect(abs(output[index] - expected) < 0.000_01)
+    }
+}
+
+@Test
+func streamingRecognizerFormatChangesRequireExplicitReset() throws {
+    let converter = StreamingPCMRecognizerConverter()
+    _ = try converter.convert(
+        streamingBuffer(
+            sampleFormat: .float32LittleEndian,
+            channels: 1,
+            startFrame: 0,
+            frameCount: 32,
+            sampleRate: 48_000
+        )
+    )
+    let changed = streamingBuffer(
+        sampleFormat: .float32LittleEndian,
+        channels: 1,
+        startFrame: 0,
+        frameCount: 32,
+        sampleRate: 44_100
+    )
+
+    #expect(throws: PCMConversionError.formatChanged) {
+        _ = try converter.convert(changed)
+    }
+
+    converter.reset()
+    #expect(try !converter.convert(changed).isEmpty)
+}
+
+struct StreamingRecognizerCase: Sendable {
+    let sampleFormat: PCMSampleFormat
+    let channels: AVAudioChannelCount
+}
+
+private func int16Buffer(
+    format: AVAudioFormat,
+    samples: [Int16]
+) throws -> AVAudioPCMBuffer {
+    let buffer = try #require(
+        AVAudioPCMBuffer(
+            pcmFormat: format,
+            frameCapacity: AVAudioFrameCount(samples.count)
+        )
+    )
+    buffer.frameLength = AVAudioFrameCount(samples.count)
+    let destination = try #require(
+        buffer.mutableAudioBufferList.pointee.mBuffers.mData?
+            .assumingMemoryBound(to: Int16.self)
+    )
+    for index in samples.indices {
+        destination[index] = samples[index]
+    }
+    buffer.mutableAudioBufferList.pointee.mBuffers.mDataByteSize =
+        UInt32(samples.count * MemoryLayout<Int16>.stride)
+    return buffer
+}
+
+private func streamingBuffer(
+    sampleFormat: PCMSampleFormat,
+    channels: AVAudioChannelCount,
+    startFrame: Int,
+    frameCount: Int,
+    sampleRate: Double = 48_000
+) -> AVAudioPCMBuffer {
+    let commonFormat: AVAudioCommonFormat =
+        sampleFormat == .signed16LittleEndian
+        ? .pcmFormatInt16
+        : .pcmFormatFloat32
+    let format = AVAudioFormat(
+        commonFormat: commonFormat,
+        sampleRate: sampleRate,
+        channels: channels,
+        interleaved: false
+    )!
+    let buffer = AVAudioPCMBuffer(
+        pcmFormat: format,
+        frameCapacity: AVAudioFrameCount(frameCount)
+    )!
+    buffer.frameLength = AVAudioFrameCount(frameCount)
+    for channel in 0..<Int(channels) {
+        for frame in 0..<frameCount {
+            let sourceFrame = startFrame + frame
+            switch sampleFormat {
+            case .signed16LittleEndian:
+                let base = Int16(sourceFrame % 8_192 - 4_096)
+                let offset: Int16 = channels == 1 ? 0 : (channel == 0 ? -64 : 64)
+                buffer.int16ChannelData![channel][frame] = base + offset
+            case .float32LittleEndian:
+                let base = Float(sourceFrame) / 20_000 - 0.5
+                let offset: Float = channels == 1 ? 0 : (channel == 0 ? -0.1 : 0.1)
+                buffer.floatChannelData![channel][frame] = base + offset
+            }
+        }
+    }
+    return buffer
+}
+
+private func streamingExpectedSample(
+    sampleFormat: PCMSampleFormat,
+    sourceFrame: Int
+) -> Float {
+    switch sampleFormat {
+    case .signed16LittleEndian:
+        Float(Int16(sourceFrame % 8_192 - 4_096)) / 32_768
+    case .float32LittleEndian:
+        Float(sourceFrame) / 20_000 - 0.5
+    }
+}
+
 private func data<Element>(of values: [Element]) -> Data {
     values.withUnsafeBytes { Data($0) }
 }

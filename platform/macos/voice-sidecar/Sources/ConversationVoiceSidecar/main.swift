@@ -76,13 +76,23 @@ let session = SidecarSession(
     playbackService: playback,
     eventSink: eventWriter
 )
+let failureController = SidecarFailureController(
+    session: session,
+    exitHandler: {
+        exit(EXIT_FAILURE)
+    }
+)
 await playback.setRenderedHandler { identity in
-    try? await session.playbackRendered(identity)
+    await failureController.perform {
+        try await session.playbackRendered(identity)
+    }
 }
 await recognition.setEventHandler { event in
     switch event {
     case .hypothesis(let hypothesis):
-        try await session.publishRecognitionHypothesis(hypothesis)
+        await failureController.perform {
+            try await session.publishRecognitionHypothesis(hypothesis)
+        }
         return false
     case .voiceWindow(
         let
@@ -92,40 +102,31 @@ await recognition.setEventHandler { event in
         let
             atMilliseconds
     ):
-        return try await session.observeBargeIn(
-            isSpeech: isSpeech,
-            frameMilliseconds: frameMilliseconds,
-            atMilliseconds: atMilliseconds
-        )
+        return await failureController.performBool {
+            try await session.observeBargeIn(
+                isSpeech: isSpeech,
+                frameMilliseconds: frameMilliseconds,
+                atMilliseconds: atMilliseconds
+            )
+        }
     case .activity(let activity):
-        try await session.publishVoiceActivity(activity)
+        await failureController.perform {
+            try await session.publishVoiceActivity(activity)
+        }
         return false
     case .failure(let sessionID, let failure):
-        try? await eventWriter.send(
-            ChildFrame(
-                control: .failure(
-                    sessionID: sessionID,
-                    stage: failure.stage,
-                    code: failure.code
-                )
-            )
+        await failureController.terminate(
+            with: failure,
+            fallbackSessionID: sessionID
         )
-        exit(EXIT_FAILURE)
+        return false
     }
 }
 engine.setFailureHandler { sessionID, failure in
-    await recognition.stop()
-    await playback.stop()
-    try? await eventWriter.send(
-        ChildFrame(
-            control: .failure(
-                sessionID: sessionID,
-                stage: failure.stage,
-                code: failure.code
-            )
-        )
+    await failureController.terminate(
+        with: failure,
+        fallbackSessionID: sessionID
     )
-    exit(EXIT_FAILURE)
 }
 let stdio = FramedStdio(
     controlReader: FileHandleFrameReader(fileHandle: .standardInput),
@@ -146,6 +147,8 @@ do {
         }
     )
 } catch {
-    try? FileHandle.standardError.write(contentsOf: Data("voice sidecar failed\n".utf8))
-    exit(EXIT_FAILURE)
+    await failureController.terminate(
+        with: error,
+        fallbackSessionID: 0
+    )
 }

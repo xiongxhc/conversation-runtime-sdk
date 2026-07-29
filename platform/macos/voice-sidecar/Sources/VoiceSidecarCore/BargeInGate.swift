@@ -1,18 +1,19 @@
 public struct BargeInGate: Equatable, Sendable {
-    public let thresholdMilliseconds: UInt64
+    public static let windowMilliseconds: UInt64 = 100
+    public static let requiredConsecutiveWindows = 2
 
-    private var accumulatedMilliseconds: UInt64 = 0
+    private var consecutiveWindows = 0
     private var triggered = false
 
-    public init(thresholdMilliseconds: UInt64) {
-        self.thresholdMilliseconds = thresholdMilliseconds
-    }
+    public init() {}
 
     public mutating func observe(
         isSpeech: Bool,
         frameMilliseconds: UInt64
     ) -> Bool {
-        guard isSpeech else {
+        guard isSpeech,
+            frameMilliseconds == Self.windowMilliseconds
+        else {
             reset()
             return false
         }
@@ -20,12 +21,8 @@ public struct BargeInGate: Equatable, Sendable {
             return false
         }
 
-        accumulatedMilliseconds = accumulatedMilliseconds.addingReportingOverflow(
-            frameMilliseconds
-        ).overflow
-            ? UInt64.max
-            : accumulatedMilliseconds + frameMilliseconds
-        guard accumulatedMilliseconds >= thresholdMilliseconds else {
+        consecutiveWindows += 1
+        guard consecutiveWindows == Self.requiredConsecutiveWindows else {
             return false
         }
 
@@ -34,7 +31,7 @@ public struct BargeInGate: Equatable, Sendable {
     }
 
     public mutating func reset() {
-        accumulatedMilliseconds = 0
+        consecutiveWindows = 0
         triggered = false
     }
 }

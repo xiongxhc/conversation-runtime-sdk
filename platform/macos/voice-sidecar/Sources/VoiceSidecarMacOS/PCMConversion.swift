@@ -5,6 +5,109 @@ import VoiceSidecarCore
 public enum PCMConversionError: Error, Equatable, Sendable {
     case unsupportedFormat
     case invalidBuffer
+    case formatChanged
+}
+
+public final class StreamingPCMRecognizerConverter: @unchecked Sendable {
+    private struct FormatSignature: Equatable {
+        let commonFormat: AVAudioCommonFormat
+        let sampleRate: Double
+        let channelCount: AVAudioChannelCount
+        let isInterleaved: Bool
+
+        init(_ format: AVAudioFormat) {
+            commonFormat = format.commonFormat
+            sampleRate = format.sampleRate
+            channelCount = format.channelCount
+            isInterleaved = format.isInterleaved
+        }
+    }
+
+    private struct State {
+        let signature: FormatSignature
+        let sourceFramesPerOutputFrame: Double
+        var processedSourceFrames: Int64 = 0
+        var nextSourcePosition: Double = 0
+        var previousSample: Float?
+    }
+
+    private let lock = NSLock()
+    private var state: State?
+
+    public init() {}
+
+    public func convert(_ buffer: AVAudioPCMBuffer) throws -> [Float] {
+        let samples = try PCMConversion.monoSamples(from: buffer)
+        let signature = FormatSignature(buffer.format)
+        return try lock.withLock {
+            if state == nil {
+                state = State(
+                    signature: signature,
+                    sourceFramesPerOutputFrame:
+                        buffer.format.sampleRate / 16_000
+                )
+            }
+            guard var current = state,
+                current.signature == signature
+            else {
+                throw PCMConversionError.formatChanged
+            }
+
+            let start = current.processedSourceFrames
+            let end = start + Int64(samples.count)
+            var output: [Float] = []
+            output.reserveCapacity(
+                Int(
+                    ceil(
+                        Double(samples.count)
+                            / current.sourceFramesPerOutputFrame
+                    )
+                ) + 1
+            )
+
+            while current.nextSourcePosition < Double(end) {
+                let lower = Int64(floor(current.nextSourcePosition))
+                let fraction = Float(
+                    current.nextSourcePosition - Double(lower)
+                )
+                let lowerSample: Float
+                if lower == start - 1, let previous = current.previousSample {
+                    lowerSample = previous
+                } else if lower >= start, lower < end {
+                    lowerSample = samples[Int(lower - start)]
+                } else {
+                    break
+                }
+
+                if fraction < 0.000_000_1 {
+                    output.append(lowerSample)
+                } else {
+                    let upper = lower + 1
+                    guard upper >= start, upper < end else {
+                        break
+                    }
+                    let upperSample = samples[Int(upper - start)]
+                    output.append(
+                        lowerSample
+                            + (upperSample - lowerSample) * fraction
+                    )
+                }
+                current.nextSourcePosition +=
+                    current.sourceFramesPerOutputFrame
+            }
+
+            current.processedSourceFrames = end
+            current.previousSample = samples.last
+            state = current
+            return output
+        }
+    }
+
+    public func reset() {
+        lock.withLock {
+            state = nil
+        }
+    }
 }
 
 public enum PCMConversion {
@@ -103,6 +206,12 @@ public enum PCMConversion {
     public static func recognizerSamples(
         from buffer: AVAudioPCMBuffer
     ) throws -> [Float] {
+        try StreamingPCMRecognizerConverter().convert(buffer)
+    }
+
+    static func monoSamples(
+        from buffer: AVAudioPCMBuffer
+    ) throws -> [Float] {
         guard buffer.frameLength > 0,
             buffer.format.sampleRate > 0,
             buffer.format.channelCount > 0
@@ -110,29 +219,7 @@ public enum PCMConversion {
             throw PCMConversionError.invalidBuffer
         }
         let channels = try decodedChannels(from: buffer)
-        let mono = mixToMono(channels)
-        guard buffer.format.sampleRate != 16_000 else {
-            return mono
-        }
-        let outputCount = max(
-            1,
-            Int(
-                (Double(mono.count)
-                    * 16_000
-                    / buffer.format.sampleRate).rounded(.down)
-            )
-        )
-        var output = [Float](repeating: 0, count: outputCount)
-        output.withUnsafeMutableBufferPointer { destination in
-            resample(
-                mono,
-                from: buffer.format.sampleRate,
-                to: 16_000,
-                into: destination.baseAddress!,
-                count: outputCount
-            )
-        }
-        return output
+        return mixToMono(channels)
     }
 
     private static func decodedChannels(

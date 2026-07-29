@@ -1,6 +1,318 @@
 import Foundation
+import NaturalLanguage
 import VoiceSidecarCore
 @preconcurrency import WhisperKit
+
+public final class OfflineWhisperTokenizer:
+    WhisperTokenizer,
+    @unchecked Sendable
+{
+    private let tokenizer: TokenizerWrapper
+    public let specialTokens: SpecialTokens
+    public let allLanguageTokens: Set<Int>
+
+    private init(tokenizer: TokenizerWrapper) {
+        self.tokenizer = tokenizer
+        let specialTokens = SpecialTokens(
+            endToken: tokenizer.convertTokenToId("<|endoftext|>") ?? 50_257,
+            englishToken: tokenizer.convertTokenToId("<|en|>") ?? 50_259,
+            noSpeechToken: tokenizer.convertTokenToId("<|nospeech|>") ?? 50_362,
+            noTimestampsToken:
+                tokenizer.convertTokenToId("<|notimestamps|>") ?? 50_363,
+            specialTokenBegin:
+                tokenizer.convertTokenToId("<|endoftext|>") ?? 50_257,
+            startOfPreviousToken:
+                tokenizer.convertTokenToId("<|startofprev|>") ?? 50_361,
+            startOfTranscriptToken:
+                tokenizer.convertTokenToId("<|startoftranscript|>") ?? 50_258,
+            timeTokenBegin:
+                tokenizer.convertTokenToId("<|0.00|>") ?? 50_364,
+            transcribeToken:
+                tokenizer.convertTokenToId("<|transcribe|>") ?? 50_359,
+            translateToken:
+                tokenizer.convertTokenToId("<|translate|>") ?? 50_358,
+            whitespaceToken: tokenizer.convertTokenToId(" ") ?? 220
+        )
+        self.specialTokens = specialTokens
+        allLanguageTokens = Set(
+            Constants.languages.values
+                .compactMap {
+                    tokenizer.convertTokenToId("<|\($0)|>")
+                }
+                .filter { $0 > specialTokens.specialTokenBegin }
+        )
+    }
+
+    public static func load(
+        from modelFolder: URL
+    ) async throws -> OfflineWhisperTokenizer {
+        let tokenizer = try await AutoTokenizerWrapper.from(
+            modelFolder: modelFolder,
+            strict: true
+        )
+        return OfflineWhisperTokenizer(tokenizer: tokenizer)
+    }
+
+    public func encode(text: String) -> [Int] {
+        tokenizer.encode(text: text)
+    }
+
+    public func decode(tokens: [Int]) -> String {
+        tokenizer.decode(tokens: tokens)
+    }
+
+    public func convertTokenToId(_ token: String) -> Int? {
+        tokenizer.convertTokenToId(token)
+    }
+
+    public func convertIdToToken(_ id: Int) -> String? {
+        tokenizer.convertIdToToken(id)
+    }
+
+    public func splitToWordTokens(
+        tokenIds: [Int]
+    ) -> (words: [String], wordTokens: [[Int]]) {
+        let decodedWords = tokenizer.decode(
+            tokens: tokenIds.filter {
+                $0 < specialTokens.specialTokenBegin
+            }
+        )
+        let recognizer = NLLanguageRecognizer()
+        recognizer.processString(decodedWords)
+        if ["zh", "ja", "th", "lo", "my", "yue"].contains(
+            recognizer.dominantLanguage?.rawValue
+        ) {
+            return splitTokensOnUnicode(tokens: tokenIds)
+        }
+        return splitTokensOnSpaces(tokens: tokenIds)
+    }
+
+    private func splitTokensOnUnicode(
+        tokens: [Int]
+    ) -> (words: [String], wordTokens: [[Int]]) {
+        let decodedFull = tokenizer.decode(tokens: tokens)
+        let replacementString = "\u{fffd}"
+        var words: [String] = []
+        var wordTokens: [[Int]] = []
+        var currentTokens: [Int] = []
+
+        for token in tokens {
+            currentTokens.append(token)
+            let decoded = tokenizer.decode(tokens: currentTokens)
+            var replacementExistsInFullText = false
+            if let range = decoded.range(of: replacementString) {
+                replacementExistsInFullText =
+                    decodedFull[range] == replacementString
+            }
+            if !decoded.contains(replacementString)
+                || replacementExistsInFullText
+            {
+                words.append(decoded)
+                wordTokens.append(currentTokens)
+                currentTokens = []
+            }
+        }
+        return (words, wordTokens)
+    }
+
+    private func splitTokensOnSpaces(
+        tokens: [Int]
+    ) -> (words: [String], wordTokens: [[Int]]) {
+        let (subwords, subwordTokensList) =
+            splitTokensOnUnicode(tokens: tokens)
+        var words: [String] = []
+        var wordTokens: [[Int]] = []
+
+        for (subword, subwordTokens) in zip(
+            subwords,
+            subwordTokensList
+        ) {
+            let special =
+                subwordTokens.first! >= specialTokens.specialTokenBegin
+            let withSpace = subword.hasPrefix(" ")
+            let stripped = subword.trimmingCharacters(in: .whitespaces)
+            let punctuation =
+                UnicodeScalar(stripped).map {
+                    CharacterSet.punctuationCharacters.contains($0)
+                } ?? false
+            if special || withSpace || punctuation || words.isEmpty {
+                words.append(subword)
+                wordTokens.append(subwordTokens)
+            } else {
+                words[words.count - 1] += subword
+                wordTokens[words.count - 1].append(
+                    contentsOf: subwordTokens
+                )
+            }
+        }
+        return (words, wordTokens)
+    }
+}
+
+public final class OrderedRecognitionBatchPipeline: @unchecked Sendable {
+    public typealias Handler =
+        @Sendable ([RecognitionHypothesis]) async -> Void
+    public typealias FailureHandler = @Sendable () async -> Void
+
+    private let stream: AsyncStream<[RecognitionHypothesis]>
+    private let continuation:
+        AsyncStream<
+            [RecognitionHypothesis]
+        >.Continuation
+    private let stateLock = NSLock()
+    private var consumer: Task<Void, Never>?
+    private var failureHandler: FailureHandler?
+    private var failed = false
+
+    public init(capacity: Int) {
+        (stream, continuation) = AsyncStream.makeStream(
+            bufferingPolicy: .bufferingOldest(max(1, capacity))
+        )
+    }
+
+    public func start(
+        _ handler: @escaping Handler,
+        failureHandler: FailureHandler? = nil
+    ) {
+        stateLock.withLock {
+            guard consumer == nil else {
+                return
+            }
+            self.failureHandler = failureHandler
+            let stream = stream
+            consumer = Task { [weak self] in
+                for await batch in stream {
+                    await handler(batch)
+                }
+                await self?.reportOverflowIfNeeded()
+            }
+        }
+    }
+
+    @discardableResult
+    public func enqueue(
+        _ batch: [RecognitionHypothesis]
+    ) -> Bool {
+        guard !batch.isEmpty else {
+            return true
+        }
+        switch continuation.yield(batch) {
+        case .enqueued:
+            return true
+        case .dropped:
+            fail()
+            return false
+        case .terminated:
+            return false
+        @unknown default:
+            fail()
+            return false
+        }
+    }
+
+    public func fail() {
+        stateLock.withLock {
+            failed = true
+        }
+        continuation.finish()
+    }
+
+    public func finish() async {
+        continuation.finish()
+        let task = stateLock.withLock {
+            consumer
+        }
+        await task?.value
+        stateLock.withLock {
+            consumer = nil
+            failureHandler = nil
+        }
+    }
+
+    public func cancel() {
+        continuation.finish()
+        let task = stateLock.withLock {
+            let task = consumer
+            consumer = nil
+            failureHandler = nil
+            return task
+        }
+        task?.cancel()
+    }
+
+    private func reportOverflowIfNeeded() async {
+        let handler = stateLock.withLock {
+            failed ? failureHandler : nil
+        }
+        await handler?()
+    }
+}
+
+public actor SidecarFailureController {
+    private let session: SidecarSession
+    private let exitHandler: @Sendable () -> Void
+    private var terminating = false
+
+    public init(
+        session: SidecarSession,
+        exitHandler: @escaping @Sendable () -> Void
+    ) {
+        self.session = session
+        self.exitHandler = exitHandler
+    }
+
+    public func perform(
+        fallbackSessionID: UInt64 = 0,
+        _ operation: @Sendable () async throws -> Void
+    ) async {
+        guard !terminating else {
+            return
+        }
+        do {
+            try await operation()
+        } catch {
+            await terminate(
+                with: error,
+                fallbackSessionID: fallbackSessionID
+            )
+        }
+    }
+
+    public func performBool(
+        fallbackSessionID: UInt64 = 0,
+        _ operation: @Sendable () async throws -> Bool
+    ) async -> Bool {
+        guard !terminating else {
+            return false
+        }
+        do {
+            return try await operation()
+        } catch {
+            await terminate(
+                with: error,
+                fallbackSessionID: fallbackSessionID
+            )
+            return false
+        }
+    }
+
+    public func terminate(
+        with error: any Error,
+        fallbackSessionID: UInt64
+    ) async {
+        guard !terminating else {
+            return
+        }
+        terminating = true
+        do {
+            try await session.terminateFromServiceFailure(
+                error,
+                fallbackSessionID: fallbackSessionID
+            )
+        } catch {}
+        exitHandler()
+    }
+}
 
 public struct RecognitionSegmentSnapshot: Equatable, Sendable {
     public let id: Int
@@ -126,7 +438,7 @@ private actor RecognitionEventRelay {
     typealias Handler =
         @Sendable (
             WhisperKitRecognitionEvent
-        ) async throws -> Bool
+        ) async -> Bool
 
     private var handler: Handler?
 
@@ -135,11 +447,7 @@ private actor RecognitionEventRelay {
     }
 
     func emit(_ event: WhisperKitRecognitionEvent) async -> Bool {
-        do {
-            return try await handler?(event) ?? false
-        } catch {
-            return false
-        }
+        await handler?(event) ?? false
     }
 }
 
@@ -147,7 +455,7 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
     public typealias EventHandler =
         @Sendable (
             WhisperKitRecognitionEvent
-        ) async throws -> Bool
+        ) async -> Bool
 
     private let modelPath: String
     private let audioProcessor: VoiceProcessingAudioProcessor
@@ -159,6 +467,7 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
     private let eventRelay = RecognitionEventRelay()
 
     private var transcriber: AudioStreamTranscriber?
+    private var hypothesisPipeline: OrderedRecognitionBatchPipeline?
     private var transcriptionTask: Task<Void, Never>?
     private var voiceWindowTask: Task<Void, Never>?
     private var voiceWindowContinuation:
@@ -218,23 +527,22 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
         speaking = false
         startTimeNanoseconds = DispatchTime.now().uptimeNanoseconds
 
+        let tokenizer: OfflineWhisperTokenizer
         let whisperKit: WhisperKit
         do {
+            tokenizer = try await OfflineWhisperTokenizer.load(
+                from: modelURL
+            )
             whisperKit = try await WhisperKit(
                 modelFolder: modelURL.path,
-                tokenizerFolder: modelURL,
                 audioProcessor: audioProcessor,
                 verbose: false,
-                load: true,
+                load: false,
                 download: false
             )
+            whisperKit.tokenizer = tokenizer
+            try await whisperKit.loadModels()
         } catch {
-            throw SidecarServiceFailure(
-                stage: .speechRecognizer,
-                code: .recognitionFailed
-            )
-        }
-        guard let tokenizer = whisperKit.tokenizer else {
             throw SidecarServiceFailure(
                 stage: .speechRecognizer,
                 code: .recognitionFailed
@@ -243,6 +551,23 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
 
         let mapper = mapper
         let eventRelay = eventRelay
+        let pipeline = OrderedRecognitionBatchPipeline(capacity: 8)
+        pipeline.start(
+            { hypotheses in
+                for hypothesis in hypotheses {
+                    _ = await eventRelay.emit(
+                        .hypothesis(hypothesis)
+                    )
+                }
+            },
+            failureHandler: { [weak self] in
+                await self?.recognitionStoppedUnexpectedly()
+            }
+        )
+        hypothesisPipeline = pipeline
+        audioProcessor.setConversionFailureHandler { _ in
+            pipeline.fail()
+        }
         let transcriber = AudioStreamTranscriber(
             audioEncoder: whisperKit.audioEncoder,
             featureExtractor: whisperKit.featureExtractor,
@@ -260,13 +585,7 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
                 guard !hypotheses.isEmpty else {
                     return
                 }
-                Task {
-                    for hypothesis in hypotheses {
-                        _ = await eventRelay.emit(
-                            .hypothesis(hypothesis)
-                        )
-                    }
-                }
+                pipeline.enqueue(hypotheses)
             }
         )
         self.transcriber = transcriber
@@ -309,6 +628,8 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
         }
         self.voiceWindowTask = nil
 
+        hypothesisPipeline?.cancel()
+        hypothesisPipeline = nil
         if let transcriber {
             await transcriber.stopStreamTranscription()
         }

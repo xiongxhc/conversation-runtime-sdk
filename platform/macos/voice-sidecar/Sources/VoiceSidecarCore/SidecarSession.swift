@@ -165,8 +165,11 @@ public actor SidecarSession {
     }
 
     public func playbackRendered(_ identity: PlaybackFrameIdentity) async throws {
-        try requireAvailableOperation()
+        if playbackBuffer.isExplicitlyStale(identity) {
+            return
+        }
         do {
+            try requireAvailableOperation()
             let configuration = try requireCapturing()
             try playbackBuffer.markRendered(identity)
             try await eventSink.send(
@@ -183,6 +186,16 @@ public actor SidecarSession {
         } catch {
             try await fail(error, fallbackSessionID: configuration?.sessionID ?? 0)
         }
+    }
+
+    public func terminateFromServiceFailure(
+        _ error: any Error,
+        fallbackSessionID: UInt64
+    ) async throws -> Never {
+        try await fail(
+            error,
+            fallbackSessionID: fallbackSessionID
+        )
     }
 
     public func publishVoiceActivity(_ activity: VoiceActivity) async throws {
@@ -287,7 +300,7 @@ public actor SidecarSession {
                 finalSilenceMilliseconds: finalSilenceMilliseconds
             )
             self.configuration = configuration
-            bargeInGate = BargeInGate(thresholdMilliseconds: speechStartMilliseconds)
+            bargeInGate = BargeInGate()
             phase = .configuring
             try await eventSink.send(ChildFrame(control: .ready(sessionID: sessionID)))
             phase = .ready

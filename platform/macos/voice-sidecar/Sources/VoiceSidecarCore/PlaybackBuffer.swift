@@ -65,6 +65,13 @@ public struct PlaybackBuffer: Sendable {
         frames.contains { $0.frame.identity == identity }
     }
 
+    func isExplicitlyStale(_ identity: PlaybackFrameIdentity) -> Bool {
+        guard let flushedThroughGenerationID else {
+            return false
+        }
+        return identity.generationID <= flushedThroughGenerationID
+    }
+
     public mutating func enqueue(_ frame: PCMFrame) throws {
         try validateGeneration(frame.generationID)
         if let negotiatedFormat, frame.format != negotiatedFormat {

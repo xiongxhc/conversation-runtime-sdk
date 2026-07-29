@@ -9,6 +9,8 @@ public final class VoiceProcessingAudioProcessor:
     @unchecked Sendable
 {
     public typealias VoiceWindowHandler = @Sendable ([Float]) -> Void
+    public typealias ConversionFailureHandler =
+        @Sendable (SidecarServiceFailure) -> Void
 
     private struct State {
         var audioSamples: ContiguousArray<Float> = []
@@ -16,6 +18,7 @@ public final class VoiceProcessingAudioProcessor:
         var relativeEnergyWindow = 20
         var callback: (([Float]) -> Void)?
         var voiceWindowHandler: VoiceWindowHandler?
+        var conversionFailureHandler: ConversionFailureHandler?
         var windowSamples: [Float] = []
         var paused = true
         var recordingStartWaiters: [CheckedContinuation<Void, Never>] = []
@@ -24,6 +27,7 @@ public final class VoiceProcessingAudioProcessor:
     private static let voiceWindowSamples = 1_600
 
     private let engine: VoiceProcessingEngine
+    private let recognizerConverter = StreamingPCMRecognizerConverter()
     private let stateLock = NSLock()
     private var state = State()
 
@@ -115,6 +119,14 @@ public final class VoiceProcessingAudioProcessor:
         }
     }
 
+    public func setConversionFailureHandler(
+        _ handler: ConversionFailureHandler?
+    ) {
+        stateLock.withLock {
+            state.conversionFailureHandler = handler
+        }
+    }
+
     public func waitUntilRecordingStarted() async {
         let shouldWait = stateLock.withLock {
             state.paused
@@ -151,6 +163,7 @@ public final class VoiceProcessingAudioProcessor:
         inputDeviceID _: DeviceID?,
         callback: (([Float]) -> Void)?
     ) throws {
+        recognizerConverter.reset()
         let waiters = stateLock.withLock {
             state.audioSamples = []
             state.energy = []
@@ -215,17 +228,30 @@ public final class VoiceProcessingAudioProcessor:
             state.paused = true
             state.callback = nil
             state.voiceWindowHandler = nil
+            state.conversionFailureHandler = nil
             state.windowSamples = []
         }
         engine.setCaptureHandler(nil)
+        recognizerConverter.reset()
     }
 
     private func process(_ buffer: AVAudioPCMBuffer) {
-        guard
-            let samples = try? PCMConversion.recognizerSamples(
-                from: buffer
-            ), !samples.isEmpty
-        else {
+        let samples: [Float]
+        do {
+            samples = try recognizerConverter.convert(buffer)
+        } catch {
+            let handler = stateLock.withLock {
+                state.conversionFailureHandler
+            }
+            handler?(
+                SidecarServiceFailure(
+                    stage: .speechRecognizer,
+                    code: .recognitionFailed
+                )
+            )
+            return
+        }
+        guard !samples.isEmpty else {
             return
         }
 

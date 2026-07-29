@@ -1,0 +1,54 @@
+schema_version = 2
+
+[privacy]
+mode = "local-only"
+
+[capture]
+device = "system-default"
+
+[turn]
+speech_start_ms = 200
+final_silence_ms = 600
+
+[asr]
+backend = "whisperkit"
+execution = "local"
+provider = "local-asr"
+model_path = "/opt/conversation-runtime/models/local-asr"
+download = false
+
+[language]
+backend = "ollama"
+execution = "local"
+provider = "local-language"
+endpoint = "http://127.0.0.1:11434"
+model = "local-language-model"
+thinking = false
+temperature = 0.0
+seed = 42
+num_predict = 128
+num_ctx = 8192
+max_assistant_content_bytes = 65536
+
+[speech]
+backend = "openai-compatible"
+execution = "local"
+provider = "local-speech"
+mode = "buffered"
+endpoint = "http://127.0.0.1:8000/v1"
+model = "local-speech-model"
+voice = "local-voice"
+speed = 1.0
+language = "auto"
+instructions = "Speak naturally and clearly."
+max_tokens = 128
+repetition_penalty = 1.05
+max_text_bytes = 4096
+max_audio_bytes = 8388608
+
+[audio]
+backend = "managed-sidecar"
+execution = "local"
+provider = "macos-system-audio"
+sidecar_executable = "/opt/conversation-runtime/bin/conversation-voice-sidecar"
+max_error_bytes = 65536

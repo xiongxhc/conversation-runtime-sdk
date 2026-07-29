@@ -3,6 +3,19 @@ name = "conversation-voice-probe"
 version.workspace = true
 edition.workspace = true
 publish = false
+autobins = false
+
+[[bin]]
+name = "conversation-voice-probe"
+path = "src/main.rs"
+
+[[bin]]
+name = "conversation-fake-voice-sidecar"
+path = "src/bin/conversation-fake-voice-sidecar.rs"
+
+[[bin]]
+name = "conversation-voice-loop"
+path = "src/bin/conversation-voice-loop.rs"
 
 [dependencies]
 conversation-model-adapters.workspace = true

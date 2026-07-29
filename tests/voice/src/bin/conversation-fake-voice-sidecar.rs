@@ -37,6 +37,7 @@ const DESCENDANT_PID_MARKER_ENV: &str = "CONVERSATION_FAKE_VOICE_SIDECAR_DESCEND
 const HELD_MARKER_ENV: &str = "CONVERSATION_FAKE_VOICE_SIDECAR_HELD_MARKER";
 const INPUT_FLOOD_MARKER_ENV: &str = "CONVERSATION_FAKE_VOICE_SIDECAR_INPUT_FLOOD_MARKER";
 const ORDER_MARKER_ENV: &str = "CONVERSATION_FAKE_VOICE_SIDECAR_ORDER_MARKER";
+const PLAYBACK_MARKER_ENV: &str = "CONVERSATION_FAKE_VOICE_SIDECAR_PLAYBACK_MARKER";
 
 fn main() {
     let result = run();
@@ -94,6 +95,7 @@ fn run() -> Result<(), String> {
     let mut reversed_media = Vec::new();
     let mut last_media = None;
     let mut held_flush = false;
+    let mut media_count = 0_u64;
 
     while let Ok(event) = event_receiver.recv() {
         match event {
@@ -209,7 +211,8 @@ fn run() -> Result<(), String> {
                             "code": "recognition_failed"
                         }),
                     )?;
-                } else if scenario == "partial-final" {
+                } else if scenario == "partial-final" || scenario.starts_with("partial-final-hold-")
+                {
                     write_json_frame(
                         &mut stdout,
                         VOICE_ACTIVITY,
@@ -371,6 +374,7 @@ fn run() -> Result<(), String> {
             }
             FakeEvent::Audio(identity) if ready => {
                 last_media = Some(identity);
+                media_count = media_count.saturating_add(1);
                 match scenario.as_str() {
                     "reverse-acknowledgements" => {
                         reversed_media.push(identity);
@@ -380,7 +384,17 @@ fn run() -> Result<(), String> {
                             acknowledge_media(&mut stdout, reversed_media[0])?;
                         }
                     }
-                    "hold-first-media-ack" if held_media.is_none() => {
+                    "hold-first-media-ack" | "partial-final-hold-first-media-ack"
+                        if held_media.is_none() =>
+                    {
+                        held_media = Some(identity);
+                        write_marker_from_env(HELD_MARKER_ENV, "media-held", false)?;
+                    }
+                    "partial-final-hold-second-media-ack" if media_count == 1 => {
+                        acknowledge_media(&mut stdout, identity)?;
+                        write_marker_from_env(PLAYBACK_MARKER_ENV, "rendered", false)?;
+                    }
+                    "partial-final-hold-second-media-ack" if media_count == 2 => {
                         held_media = Some(identity);
                         write_marker_from_env(HELD_MARKER_ENV, "media-held", false)?;
                     }

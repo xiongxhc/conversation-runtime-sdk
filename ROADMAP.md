@@ -22,9 +22,11 @@ The first release is not a directory-complete platform. It is one local voice lo
   managed macOS voice-processing sidecar, local recognition integration,
   generation-safe continuous playback, explicit streaming local speech, and a
   bounded ten-minute acceptance harness.
-- The private device configuration and local ASR model were unavailable for the
-  recorded Task 12 milestone. No ten-minute device run or 30-sample acoustic
-  recording has been performed, so R3 remains incomplete.
+- A private local-only configuration and local ASR model now pass preflight,
+  the current macOS source passes an opt-in full-duplex capture/playback smoke,
+  and the release CLI starts under `LocalOnly`. A complete post-fix
+  human-spoken turn, ten-minute device run, and 30-sample acoustic recording
+  remain unperformed, so R3 remains incomplete.
 - First-audible timing, audible-stop p95, representative warm measurements,
   subjective English and Chinese quality, and the 1.2-second
   time-to-useful-audio goal remain unvalidated.
@@ -138,12 +140,16 @@ identity through cancellation and backpressure; and the managed macOS sidecar
 owns capture and playback in one Apple voice-processing engine.
 
 The public acceptance harness and acoustic procedure are present. Process/device
-evidence is `NOT VALIDATED` because the required private configuration and local
-ASR model were absent. Acoustic evidence is `NOT VALIDATED` because no external
-recording set exists. The deterministic Task 12 gate recorded `433` passing Rust
-tests plus one intentionally ignored fixture writer and `102` passing Swift
-tests. No ten-minute continuity, first-audible, audible-stop p95, or R3
-completion claim is made. See
+evidence is `PARTIALLY VALIDATED`: a private local-only configuration and local
+ASR model pass preflight, the current macOS source passes an opt-in full-duplex
+capture/playback smoke, and the release CLI starts under `LocalOnly`. Local
+multilingual fixtures transcribe without control tokens. A complete spoken
+microphone-to-audible-response turn is not yet observed after the latest
+finalization fix, so process/device acceptance remains incomplete. Acoustic
+evidence is `NOT VALIDATED` because no external recording set exists. The latest
+deterministic gate recorded `446` passing Rust tests plus one intentionally
+ignored fixture writer and `109` passing Swift tests. No ten-minute continuity,
+first-audible, audible-stop p95, or R3 completion claim is made. See
 [the R3 evaluation](docs/r3-real-time-voice-evaluation.md).
 
 ### Deliverables

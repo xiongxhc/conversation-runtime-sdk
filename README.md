@@ -32,7 +32,7 @@ The repository now contains the deterministic runtime foundation, reviewed local
 - explicit buffered and streaming OpenAI-compatible speech modes, with checked concatenated-RIFF parsing and no streaming-to-buffered fallback; and
 - a bounded ten-minute acceptance harness plus an external acoustic measurement procedure.
 
-The integrated typed-text-to-audio path and deterministic R3 contracts are implemented and test-covered. The Task 12 gate recorded `437` passing Rust tests plus one intentionally ignored fixture writer and `102` passing Swift tests. The real schema-v2 microphone, local ASR, streaming speech, shared audio-engine, and barge-in path exists in source, but the required private configuration and local ASR model are absent from the recorded Task 12 environment. A ten-minute device run and the 30-sample acoustic procedure have therefore not been performed. R3 is not complete, and no first-audible or audible-stop latency is claimed. See [the R3 evaluation](docs/r3-real-time-voice-evaluation.md) and [ROADMAP.md](ROADMAP.md).
+The integrated typed-text-to-audio path and deterministic R3 contracts are implemented and test-covered. The latest gate recorded `446` passing Rust tests plus one intentionally ignored fixture writer and `109` passing Swift tests. A private local-only configuration and local ASR model now pass preflight, the current macOS source passes an opt-in full-duplex capture/playback smoke, and the release CLI starts under `LocalOnly`. A complete post-fix human-spoken turn, a ten-minute device run, and the 30-sample acoustic procedure have not been performed. R3 is not complete, and no first-audible or audible-stop latency is claimed. See [the R3 evaluation](docs/r3-real-time-voice-evaluation.md) and [ROADMAP.md](ROADMAP.md).
 
 ## R3 Target Architecture
 
@@ -195,6 +195,16 @@ After privately configuring installed local services, run:
 ```bash
 target/release/conversation-voice-loop \
   --config "$PRIVATE_SESSION_CONFIG"
+```
+
+Add `--once` for a one-turn smoke run. The CLI keeps listening until it
+receives a finalized spoken transcript, then exits only after that generation
+finishes and its playback lifecycle completes:
+
+```bash
+target/release/conversation-voice-loop \
+  --config "$PRIVATE_SESSION_CONFIG" \
+  --once
 ```
 
 The ten-minute harness discards transcript output, records only bounded

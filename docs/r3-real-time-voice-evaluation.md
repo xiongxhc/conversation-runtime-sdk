@@ -3,12 +3,12 @@
 ## Scope and Status
 
 This record evaluates the R3 milestone based on implementation
-commit `ee6e4b47cf30b341320941948e6f5fab1e9850b8` on
+commit `fd6e2f12d9a4bd3d1e0869e3006d1b90ad495ff8` on
 `feature/r3-real-time-voice-loop`. It separates repository contract evidence
 from process/device and acoustic evidence.
 
 **R3 status: INCOMPLETE.** Repository code and documentation gates pass.
-Process/device evidence is `NOT VALIDATED`. Acoustic evidence is
+Process/device evidence is `PARTIALLY VALIDATED`. Acoustic evidence is
 `NOT VALIDATED`.
 
 ## Repository Contract Evidence
@@ -22,14 +22,18 @@ Process/device evidence is `NOT VALIDATED`. Acoustic evidence is
 - Cargo: `cargo 1.97.1 (c980f4866 2026-06-30)`.
 - Swift: Apple Swift `6.3.3`; target `arm64-apple-macosx26.0`.
 - Release sidecar: `conversation-voice-sidecar`, built from
-  `ee6e4b47cf30b341320941948e6f5fab1e9850b8`.
+  source corresponding to
+  `fd6e2f12d9a4bd3d1e0869e3006d1b90ad495ff8`.
 - Observed release-sidecar SHA-256 from one build:
-  `b17e157db7388da1e7ea10283f7c34ecb70459deb8a6a0af20b9e611ab2b1e83`.
-- Private schema-v2 config digest: `NOT AVAILABLE`; the private file was
-  absent and no private config was created.
+  `25f3db9bcb90be584f0a9a32f633712b15c7e3f3678aab09cf0f0b3b4215ad62`.
+- Private schema-v2 config digest:
+  `7baa3de85e9c03f363b4f2f0a0d7e1f4d69a3a22989d41686f0d3882e08d3615`.
+- Measured ASR model: local
+  `openai_whisper-large-v3-v20240930_turbo_632MB`, approximately `626 MB`;
+  this records one private test composition and is not a public default.
 
 The durable source identity is implementation commit
-`ee6e4b47cf30b341320941948e6f5fab1e9850b8`. This evaluation records the
+`fd6e2f12d9a4bd3d1e0869e3006d1b90ad495ff8`. This evaluation records the
 observed Swift/Xcode toolchain version in the environment above but does not
 pin that toolchain. Repeated clean Swift release builds are not byte-identical
 because Mach-O UUIDs vary. The recorded SHA-256 is an observed digest from one
@@ -37,8 +41,8 @@ build, not a stable binary identity.
 
 ### Commands and Results
 
-The following repository gates passed from a clean checkout of
-`ee6e4b47cf30b341320941948e6f5fab1e9850b8`:
+The following repository gates passed for the implementation through
+`fd6e2f12d9a4bd3d1e0869e3006d1b90ad495ff8`:
 
 ```text
 PATH="/opt/homebrew/opt/rustup/bin:$PATH" \
@@ -83,7 +87,7 @@ xcrun swift build \
   -Xswiftc -warnings-as-errors
 
 test "$(git rev-parse HEAD)" = \
-  "ee6e4b47cf30b341320941948e6f5fab1e9850b8"
+  "fd6e2f12d9a4bd3d1e0869e3006d1b90ad495ff8"
 tests/voice/build-macos-sidecar.sh
 SIDECAR_BIN="$(
   xcrun swift build -c release \
@@ -120,9 +124,9 @@ Results:
 - cancellation-aware WAV decode boundary: `1` focused unit test passed;
 - schema-v2 voice CLI: `20` tests passed, including buffered compatibility,
   explicit streaming mode, and adjacent bundled-sidecar resolution;
-- complete Rust workspace: passed with `1` intentionally ignored
+- complete Rust workspace: `446` tests passed with `1` intentionally ignored
   immutable-fixture writer;
-- complete Swift sidecar package: `104` tests passed;
+- complete Swift sidecar package: `109` tests passed;
 - acceptance-harness script: passed success, failure,
   content-filtering, repository/resolved-alias rejection, existing-file,
   concurrent-parent swap, repository redirection, concurrent no-overwrite,
@@ -135,8 +139,9 @@ Results:
 - strict Swift 6 release build: passed with complete concurrency checking and
   warnings denied;
 - release sidecar build script: passed; one executable built from
-  `ee6e4b47cf30b341320941948e6f5fab1e9850b8` had observed SHA-256
-  `b17e157db7388da1e7ea10283f7c34ecb70459deb8a6a0af20b9e611ab2b1e83`,
+  source corresponding to
+  `fd6e2f12d9a4bd3d1e0869e3006d1b90ad495ff8` had observed SHA-256
+  `25f3db9bcb90be584f0a9a32f633712b15c7e3f3678aab09cf0f0b3b4215ad62`,
   which is not a stable binary identity because Mach-O UUIDs vary;
 - formatting, shell syntax, and whitespace checks: passed.
 
@@ -210,33 +215,50 @@ malicious-process containment claim.
 
 ## Process/Device Evidence
 
-**Status: NOT VALIDATED**
+**Status: PARTIALLY VALIDATED**
 
-- Private schema-v2 configuration: absent.
-- Private configuration digest: not available.
-- `CONVERSATION_RUN_HARDWARE_ACCEPTANCE`: unset.
-- `CONVERSATION_WHISPERKIT_MODEL_PATH`: unset.
-- Local WhisperKit model: absent for this run.
-- Ten-minute device session: `NOT RUN`; the harness was not run against a real
-  microphone, model, TTS service, or speaker.
+- Private schema-v2 configuration: present outside the repository, mode `0600`.
+- Private configuration digest:
+  `7baa3de85e9c03f363b4f2f0a0d7e1f4d69a3a22989d41686f0d3882e08d3615`.
+- Active policy at release-CLI startup: `privacy=local-only`.
+- Local language endpoint preflight: passed on loopback.
+- Local streaming speech endpoint preflight: passed on loopback with a valid
+  mono `24 kHz`, signed-16 WAV response.
+- Local ASR fixture validation: Japanese and Spanish were transcribed in their
+  source languages with no Whisper control tokens.
+- Opt-in full-duplex hardware smoke: passed after `1.991 s`; it started the
+  Apple voice-processing engine, observed a real captured buffer, converted
+  audio, scheduled and flushed one PCM frame, and completed cleanup.
+- Ten-minute device session: `NOT RUN`.
 
-The Swift hardware smoke returned before constructing hardware because its
-explicit opt-in was unset. The release sidecar build proves compilation only.
-No microphone permission was requested, no local ASR model was loaded, and no
-real `conversation-voice-loop` session was started.
+Several release-CLI diagnostic sessions started the real sidecar under
+`LocalOnly` and were cancelled cleanly. An initial tiny-model run exposed two
+separate issues: VPIO format/ring assumptions and a runtime ordering gap when
+the `600 ms` silence deadline elapsed before WhisperKit emitted its
+recognizer-final hypothesis. Both now have deterministic regressions and
+independent review. The larger measured ASR model remained quiet during
+approximately `40 s` of room silence, unlike the tiny-model diagnostic that
+produced false display partials.
 
-Therefore this record contains no observed:
+A synthetic phrase played through the Mac speaker was rejected by the active
+voice-processing path and did not produce a microphone turn. This is useful
+echo-cancellation behavior, not spoken-turn acceptance evidence. No detectable
+human speech was supplied during the post-fix run, so this record does not
+claim a complete microphone-to-transcript-to-LLM-to-TTS-to-speaker turn.
 
-- ten-minute continuity result;
-- pipeline reset count from a real session;
-- stale-generation rejection count from a real session;
-- queue underrun count from a real session;
-- real interruption count;
-- speech-end, first-playable, sidecar-accept, or render-acknowledgement latency;
-- packet-capture result or device-level `LocalOnly` traffic observation.
+The following remain unvalidated:
 
-Contract policy tests prove pre-capture rejection behavior. They do not
-substitute for a device run or network observation.
+- ten-minute continuity and pipeline-reset count;
+- one post-fix human-spoken complete turn;
+- stale-generation and queue-underrun counts from a real multi-turn session;
+- user-speech barge-in and interruption count;
+- speech-end, first-playable, sidecar-accept, render-acknowledgement, and first
+  audible latency over a representative set;
+- packet-capture or equivalent device-level `LocalOnly` traffic observation.
+
+Contract policy tests prove pre-capture rejection behavior. The opt-in hardware
+smoke proves current device I/O and cleanup. Neither substitutes for the
+remaining complete-turn, continuity, network-observation, or acoustic gates.
 
 ## Acoustic Evidence
 

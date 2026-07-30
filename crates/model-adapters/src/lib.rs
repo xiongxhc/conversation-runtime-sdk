@@ -11,6 +11,7 @@ mod macos_voice_sidecar;
 mod mock;
 mod ollama;
 mod openai_compatible_speech;
+mod openai_compatible_streaming_speech;
 mod recognition;
 mod speech;
 mod streaming_speech;
@@ -45,6 +46,9 @@ pub use ollama::{
 };
 pub use openai_compatible_speech::{
     OpenAiCompatibleSpeechConfig, OpenAiCompatibleSpeechSynthesizer,
+};
+pub use openai_compatible_streaming_speech::{
+    OpenAiCompatibleStreamingSpeechConfig, OpenAiCompatibleStreamingSpeechSynthesizer,
 };
 pub use recognition::{RecognitionEvent, RecognitionHypothesis, SpeechRecognizer};
 pub use speech::{AudioFormat, SpeechRequest, SpeechSynthesizer, SynthesizedAudio};

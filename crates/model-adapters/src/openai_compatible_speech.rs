@@ -127,6 +127,18 @@ impl OpenAiCompatibleSpeechConfig {
         self.max_audio_bytes = require_non_zero(max_audio_bytes, "audio byte limit")?;
         Ok(self)
     }
+
+    pub(crate) const fn endpoint(&self) -> &reqwest::Url {
+        &self.endpoint
+    }
+
+    pub(crate) const fn max_text_bytes(&self) -> usize {
+        self.max_text_bytes
+    }
+
+    pub(crate) const fn max_audio_bytes(&self) -> usize {
+        self.max_audio_bytes
+    }
 }
 
 impl OpenAiCompatibleSpeechSynthesizer {
@@ -150,9 +162,9 @@ impl SpeechSynthesizer for OpenAiCompatibleSpeechSynthesizer {
         Box::pin(async move {
             ensure_not_cancelled(&cancellation)?;
             let result = async {
-                validate_request(&request, self.config.max_text_bytes)?;
+                validate_speech_text(request.text(), self.config.max_text_bytes)?;
 
-                let payload = OpenAiCompatibleSpeechRequest::from_config(&self.config, &request);
+                let payload = OpenAiCompatibleSpeechRequest::buffered(&self.config, request.text());
                 let request_future = self
                     .client
                     .post(speech_endpoint(&self.config.endpoint))
@@ -183,7 +195,7 @@ impl SpeechSynthesizer for OpenAiCompatibleSpeechSynthesizer {
 }
 
 #[derive(Serialize)]
-struct OpenAiCompatibleSpeechRequest<'a> {
+pub(crate) struct OpenAiCompatibleSpeechRequest<'a> {
     model: &'a str,
     input: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -199,13 +211,22 @@ struct OpenAiCompatibleSpeechRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     repetition_penalty: Option<f32>,
     response_format: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    streaming_interval: Option<f32>,
 }
 
 impl<'a> OpenAiCompatibleSpeechRequest<'a> {
-    fn from_config(config: &'a OpenAiCompatibleSpeechConfig, request: &'a SpeechRequest) -> Self {
+    fn new(
+        config: &'a OpenAiCompatibleSpeechConfig,
+        input: &'a str,
+        stream: Option<bool>,
+        streaming_interval: Option<f32>,
+    ) -> Self {
         Self {
             model: &config.model,
-            input: request.text(),
+            input,
             voice: config.voice.as_deref(),
             speed: config.speed,
             language: config.language.as_deref(),
@@ -213,11 +234,25 @@ impl<'a> OpenAiCompatibleSpeechRequest<'a> {
             max_tokens: config.max_tokens,
             repetition_penalty: config.repetition_penalty,
             response_format: "wav",
+            stream,
+            streaming_interval,
         }
+    }
+
+    fn buffered(config: &'a OpenAiCompatibleSpeechConfig, input: &'a str) -> Self {
+        Self::new(config, input, None, None)
+    }
+
+    pub(crate) fn streaming(
+        config: &'a OpenAiCompatibleSpeechConfig,
+        input: &'a str,
+        streaming_interval: f32,
+    ) -> Self {
+        Self::new(config, input, Some(true), Some(streaming_interval))
     }
 }
 
-fn speech_endpoint(endpoint: &reqwest::Url) -> reqwest::Url {
+pub(crate) fn speech_endpoint(endpoint: &reqwest::Url) -> reqwest::Url {
     let mut endpoint = endpoint.clone();
     endpoint.set_query(None);
     endpoint.set_fragment(None);
@@ -226,11 +261,11 @@ fn speech_endpoint(endpoint: &reqwest::Url) -> reqwest::Url {
     endpoint
 }
 
-fn validate_request(request: &SpeechRequest, max_text_bytes: usize) -> Result<(), AdapterError> {
-    if request.text().is_empty() {
+pub(crate) fn validate_speech_text(text: &str, max_text_bytes: usize) -> Result<(), AdapterError> {
+    if text.is_empty() {
         return Err(AdapterError::new("speech synthesis text must not be empty"));
     }
-    if request.text().len() > max_text_bytes {
+    if text.len() > max_text_bytes {
         return Err(AdapterError::new(
             "speech synthesis text exceeded the configured limit",
         ));
@@ -276,7 +311,7 @@ fn invalid_wav_error() -> AdapterError {
     AdapterError::new("speech synthesis output was not a valid WAV file")
 }
 
-fn http_error(status: u16) -> AdapterError {
+pub(crate) fn http_error(status: u16) -> AdapterError {
     AdapterError::new(format!(
         "speech synthesis request failed with HTTP status {status}"
     ))
@@ -297,7 +332,7 @@ fn prioritize_terminal_result<T>(
     result
 }
 
-fn cancelled_error() -> AdapterError {
+pub(crate) fn cancelled_error() -> AdapterError {
     AdapterError::new("speech synthesis cancelled")
 }
 

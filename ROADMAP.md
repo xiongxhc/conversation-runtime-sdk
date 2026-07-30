@@ -18,8 +18,16 @@ The first release is not a directory-complete platform. It is one local voice lo
 - Phrase-level language-to-speech integration, first-playable-audio timing, integrated runtime speech, and cancellation through active playback are implemented and deterministic-test covered.
 - One cold cached Apple Silicon run records first text, first synthesis, first playable audio, playback-process launch, total completion, and cleanup. It is machine-specific evidence, not a model or backend selection.
 - A later isolated Apple Silicon continuity check records one speech request, one playback launch, process-level timings, and cleanup for the corrected punctuation/formatting path. It adds no first-audible or subjective-quality claim.
-- Microphone capture, ASR, barge-in, persona, SQLite memory, the macOS app, and client SDKs have not started.
-- First-audible timing, representative warm measurements, subjective English and Chinese quality, and the 1.2-second time-to-useful-audio goal remain unvalidated.
+- The deterministic R3 implementation now includes schema-v2 privacy policy, a
+  managed macOS voice-processing sidecar, local recognition integration,
+  generation-safe continuous playback, explicit streaming local speech, and a
+  bounded ten-minute acceptance harness.
+- The private device configuration and local ASR model were unavailable for the
+  recorded Task 12 milestone. No ten-minute device run or 30-sample acoustic
+  recording has been performed, so R3 remains incomplete.
+- First-audible timing, audible-stop p95, representative warm measurements,
+  subjective English and Chinese quality, and the 1.2-second
+  time-to-useful-audio goal remain unvalidated.
 
 ## R0 — Toolchain and Feasibility
 
@@ -119,6 +127,24 @@ turn finalization, provider coordination, generation safety, and cancellation.
 See
 [the R3 design](docs/superpowers/specs/2026-07-28-r3-real-time-voice-loop-design.md)
 and [the canonical architecture](docs/architecture.md).
+
+### Source Status
+
+The deterministic code path is implemented: strict schema-v2 configuration
+selects buffered compatibility or explicit streaming speech; the streaming
+adapter parses arbitrarily chunked concatenated WAV containers with checked
+bounds; the Rust runtime preserves turn, generation, utterance, and sequence
+identity through cancellation and backpressure; and the managed macOS sidecar
+owns capture and playback in one Apple voice-processing engine.
+
+The public acceptance harness and acoustic procedure are present. Process/device
+evidence is `NOT VALIDATED` because the required private configuration and local
+ASR model were absent. Acoustic evidence is `NOT VALIDATED` because no external
+recording set exists. The deterministic Task 12 gate recorded `433` passing Rust
+tests plus one intentionally ignored fixture writer and `102` passing Swift
+tests. No ten-minute continuity, first-audible, audible-stop p95, or R3
+completion claim is made. See
+[the R3 evaluation](docs/r3-real-time-voice-evaluation.md).
 
 ### Deliverables
 
@@ -266,6 +292,7 @@ Each platform receives its own measured hardware profile and end-to-end exit cri
 - Cloud synchronization
 - Model marketplaces
 - Hosted inference
+- Additional cloud/provider adapters and failover policy
 - Multi-agent orchestration
 - Organization or team memory
 - Android and remote-internet mobile clients

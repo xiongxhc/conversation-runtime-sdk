@@ -244,6 +244,81 @@ fn once_mode_runs_one_private_voice_turn_and_cleans_every_process() {
 }
 
 #[test]
+fn streaming_mode_runs_concatenated_wav_without_buffered_fallback() {
+    let harness = CliHarness::new("partial-final");
+    let language = FixtureServer::immediate(
+        harness.fixture_path("language-request"),
+        "application/x-ndjson",
+        LANGUAGE_RESPONSE,
+    );
+    let mut speech_body = pcm_wav(1);
+    speech_body.extend_from_slice(&pcm_wav(1));
+    let speech = FixtureServer::immediate(
+        harness.fixture_path("speech-request"),
+        "audio/wav",
+        &speech_body,
+    );
+    let config =
+        harness.streaming_config(language.endpoint(), &speech.endpoint_with_path("/v1"), 0.32);
+
+    let output = harness.run_once(&config);
+    let speech_request = speech.finish_with_request();
+    let speech_payload = request_json(&speech_request);
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(speech_payload["stream"], true);
+    assert_eq!(speech_payload["streaming_interval"], 0.32);
+    assert_eq!(speech_payload["response_format"], "wav");
+    assert!(output.stderr_text().contains("status=completed"));
+    assert!(!output.stderr_text().contains("Fixture response."));
+    assert!(harness.shutdown_marker().exists());
+    harness.assert_sidecar_reaped();
+    language.finish();
+}
+
+#[test]
+fn streaming_interval_is_required_only_for_streaming_and_is_bounded() {
+    let cases = [
+        (
+            "streaming-missing",
+            "mode = \"streaming\"".to_owned(),
+            "streaming speech mode requires streaming_interval",
+        ),
+        (
+            "streaming-low",
+            "mode = \"streaming\"\nstreaming_interval = 0.09".to_owned(),
+            "streaming_interval must be within 0.10..=2.00",
+        ),
+        (
+            "streaming-high",
+            "mode = \"streaming\"\nstreaming_interval = 2.01".to_owned(),
+            "streaming_interval must be within 0.10..=2.00",
+        ),
+        (
+            "buffered-present",
+            "mode = \"buffered\"\nstreaming_interval = 0.32".to_owned(),
+            "streaming_interval is only valid for streaming speech mode",
+        ),
+    ];
+
+    for (name, speech_mode, expected) in cases {
+        let harness = CliHarness::new("ready");
+        let config = harness
+            .valid_config("http://127.0.0.1:9", "http://127.0.0.1:9/v1")
+            .replacen("mode = \"buffered\"", &speech_mode, 1);
+        let output = harness.run_once(&config);
+
+        assert!(!output.status.success(), "{name}: {output:?}");
+        assert!(
+            output.stderr_text().contains(expected),
+            "{name}: {}",
+            output.stderr_text()
+        );
+        assert!(!harness.spawn_marker().exists(), "{name} spawned sidecar");
+    }
+}
+
+#[test]
 fn sigint_during_listening_cleans_the_sidecar() {
     let harness = CliHarness::new("ready");
     let config = harness.valid_config("http://127.0.0.1:9", "http://127.0.0.1:9/v1");
@@ -517,6 +592,20 @@ max_error_bytes = 65536
             toml_path(&self.model_path),
             toml_path(&fake_sidecar_binary()),
         )
+    }
+
+    fn streaming_config(
+        &self,
+        language_endpoint: &str,
+        speech_endpoint: &str,
+        streaming_interval: f32,
+    ) -> String {
+        self.valid_config(language_endpoint, speech_endpoint)
+            .replacen(
+                "mode = \"buffered\"",
+                &format!("mode = \"streaming\"\nstreaming_interval = {streaming_interval}"),
+                1,
+            )
     }
 
     fn run_once(&self, config: &str) -> CliOutput {

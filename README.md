@@ -8,7 +8,7 @@ The SDK is cross-platform by design. The first validated product target is macOS
 
 ## Current Status
 
-The repository now contains the deterministic runtime foundation plus reviewed local text-to-audio reference paths:
+The repository now contains the deterministic runtime foundation, reviewed local text-to-audio reference paths, and the deterministic R3 real-time voice implementation:
 
 - typed commands, events, turn identifiers, and errors;
 - cancellation-aware language-model and speech-synthesis adapter contracts;
@@ -26,9 +26,13 @@ The repository now contains the deterministic runtime foundation plus reviewed l
 - speech-only Markdown and story-heading normalization that preserves the original text stream, including literal content such as `C#` and `2*3`;
 - a bounded two-stage speech pipeline that may prefetch exactly one synthesized segment while the current segment plays;
 - runtime timing events for first text delta, first synthesis request, and first playable audio;
-- an integrated voice probe that composes replaceable language, speech, and audio-output adapters behind `ConversationRuntime`.
+- an integrated voice probe that composes replaceable language, speech, and audio-output adapters behind `ConversationRuntime`;
+- schema-v2 local voice-session policy, generation-safe streaming contracts, and a managed macOS sidecar protocol;
+- a Swift macOS voice-processing sidecar with local recognition and continuous generation-tagged PCM playback;
+- explicit buffered and streaming OpenAI-compatible speech modes, with checked concatenated-RIFF parsing and no streaming-to-buffered fallback; and
+- a bounded ten-minute acceptance harness plus an external acoustic measurement procedure.
 
-The integrated typed-text-to-audio path is implemented and deterministic-test covered. Apple Silicon evidence includes a historical full-path benchmark and a later isolated continuity check; both record process-level milestones rather than first audible sound. Microphone capture, ASR, first-audible measurement, barge-in, persona, SQLite memory, the desktop app, and iPhone LAN access remain staged in [ROADMAP.md](ROADMAP.md).
+The integrated typed-text-to-audio path and deterministic R3 contracts are implemented and test-covered. The Task 12 gate recorded `433` passing Rust tests plus one intentionally ignored fixture writer and `102` passing Swift tests. The real schema-v2 microphone, local ASR, streaming speech, shared audio-engine, and barge-in path exists in source, but the required private configuration and local ASR model are absent from the recorded Task 12 environment. A ten-minute device run and the 30-sample acoustic procedure have therefore not been performed. R3 is not complete, and no first-audible or audible-stop latency is claimed. See [the R3 evaluation](docs/r3-real-time-voice-evaluation.md) and [ROADMAP.md](ROADMAP.md).
 
 ## R3 Target Architecture
 
@@ -52,7 +56,8 @@ queued audio, and playback after approximately `200 ms` of sustained user speech
 Partial transcripts remain display-only. `LocalOnly` rejects remote or
 undeclared adapters before microphone access and never falls back silently.
 
-This is the approved R3 target, not current implementation status. See
+The deterministic implementation now follows this architecture. Process/device
+continuity and acoustic output remain separate unvalidated evidence classes. See
 [docs/architecture.md](docs/architecture.md) for the canonical diagram and
 [the R3 design](docs/superpowers/specs/2026-07-28-r3-real-time-voice-loop-design.md)
 for the complete privacy, protocol, lifecycle, and acceptance rules.
@@ -145,6 +150,62 @@ Text deltas go to standard output unchanged. For speech only, short punctuation-
 
 The public template demonstrates one reference composition; it does not select a deployment model, voice, or backend policy. See [docs/runtime-text-to-audio-evaluation.md](docs/runtime-text-to-audio-evaluation.md) for deterministic evidence, the historical integration benchmark, the later process-level continuity check, timing definitions, and evidence limits.
 
+## Run the Real-Time Voice CLI
+
+Build the Rust CLI and macOS sidecar without starting capture:
+
+```bash
+cargo build --locked --release -p conversation-voice-probe \
+  --bin conversation-voice-loop
+tests/voice/build-macos-sidecar.sh
+```
+
+Copy the public schema-v2 template to a private absolute path outside the
+repository. Replace every placeholder with installed local components,
+including the absolute ASR model directory and sidecar executable. Do not
+commit the private file.
+
+```bash
+PRIVATE_SESSION_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/conversation-runtime/voice-session.toml"
+mkdir -p "$(dirname "$PRIVATE_SESSION_CONFIG")"
+cp configs/voice-session.example.toml "$PRIVATE_SESSION_CONFIG"
+```
+
+Streaming is explicit. The private file must contain these exact public
+reference settings to select streaming:
+
+```toml
+[speech]
+mode = "streaming"
+streaming_interval = 0.32
+```
+
+Use `mode = "buffered"` only as an explicit compatibility choice and omit
+`streaming_interval` in that mode. An unsupported streaming backend fails at
+the speech adapter; the runtime never falls back to buffered synthesis.
+
+After privately configuring installed local services, run:
+
+```bash
+target/release/conversation-voice-loop \
+  --config "$PRIVATE_SESSION_CONFIG"
+```
+
+The ten-minute harness discards transcript output, records only bounded
+content-free JSONL metrics, and refuses repository output:
+
+```bash
+tests/voice/acceptance-macos.sh \
+  --config "$PRIVATE_SESSION_CONFIG" \
+  --duration-seconds 600 \
+  --metrics /private/tmp/conversation-runtime-r3-metrics.jsonl
+```
+
+`first_playable_audio_ms`, sidecar acceptance, and render acknowledgement are
+process milestones. First audible sound and audible interruption stop require
+the external procedure in
+[tests/voice/acoustic/README.md](tests/voice/acoustic/README.md).
+
 ## Project Layout
 
 ```text
@@ -158,7 +219,7 @@ models/                Registry schema and local model instructions
 tests/latency/         Runnable mock latency probe and metric definitions
 tests/ollama/          Runnable local Ollama text probe
 tests/tts/             Runnable macOS system-speech and playback probe
-tests/voice/           Integrated typed-turn text-to-audio probe
+tests/voice/           Typed and real-time voice CLIs, sidecar fixtures, and acceptance harnesses
 ```
 
 ## Development

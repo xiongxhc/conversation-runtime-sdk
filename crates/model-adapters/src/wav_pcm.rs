@@ -32,6 +32,17 @@ impl WavPcmDecoder {
         utterance_id: UtteranceId,
         audio: &SynthesizedAudio,
     ) -> Result<Vec<AudioFrame>, AdapterError> {
+        self.decode_from_sequence(turn_id, generation_id, utterance_id, 0, audio)
+    }
+
+    pub(crate) fn decode_from_sequence(
+        &self,
+        turn_id: TurnId,
+        generation_id: GenerationId,
+        utterance_id: UtteranceId,
+        initial_sequence: u64,
+        audio: &SynthesizedAudio,
+    ) -> Result<Vec<AudioFrame>, AdapterError> {
         if audio.format() == AudioFormat::Aiff {
             return Err(AdapterError::new(
                 "R3 PCM streaming does not support AIFF audio",
@@ -72,7 +83,7 @@ impl WavPcmDecoder {
         let mut frames = Vec::with_capacity(frame_count_upper_bound);
         let mut previous_sample_boundary = 0_usize;
         let mut frame_slot = 1_u64;
-        let mut sequence = 0_u64;
+        let mut sequence = initial_sequence;
         while previous_sample_boundary < sample_count {
             let mut sample_boundary = sample_boundary(frame_slot, frame_sample_numerator)?;
             if sample_boundary <= previous_sample_boundary {

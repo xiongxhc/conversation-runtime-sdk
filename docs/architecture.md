@@ -63,8 +63,36 @@ There is no silent remote fallback.
 See
 [the approved R3 design](superpowers/specs/2026-07-28-r3-real-time-voice-loop-design.md)
 for the protocol, configuration, failure, testing, and acoustic-measurement
-requirements. This section describes the target architecture and is not a claim
-that the R3 loop is already implemented.
+requirements. The deterministic Rust and Swift implementation now follows this
+shape. The private local-model/device run and external acoustic recording remain
+unperformed, so implementation status does not promote R3 to complete.
+
+## Streaming Speech Boundary
+
+Schema-v2 voice configuration selects speech mode explicitly:
+
+```toml
+[speech]
+mode = "streaming"
+streaming_interval = 0.32
+```
+
+`streaming_interval` is required only for streaming and must be within
+`0.10..=2.00`. `0.32` is the public reference interval, not a backend or model
+selection. Buffered compatibility remains available only through
+`mode = "buffered"` with no interval. An unsupported streaming endpoint fails
+at `SpeechSynthesizer`; the runtime does not retry in buffered mode.
+
+The streaming OpenAI-compatible adapter sends `response_format = "wav"`,
+`stream = true`, and the configured interval. HTTP transport chunks are not
+media boundaries. The adapter buffers only within the aggregate response limit,
+waits for at least 12 RIFF bytes, reads checked `riff_size + 8`, and passes each
+complete WAV container to the existing PCM decoder. It rejects redirects, HTTP
+failures, stalls, incomplete EOF, oversized declarations, malformed WAV,
+aggregate overflow, and format changes. Capacity-one delivery preserves
+backpressure, while cancellation can stop request reads and blocked frame sends.
+Turn, generation, utterance, and continuous sequence identities remain
+unchanged across concatenated containers.
 
 ## Runtime Text-to-Audio Flow
 
@@ -102,6 +130,19 @@ Runtime timing events share one monotonic origin captured at `TurnStarted`:
 
 First playable audio means validated encoded bytes are ready for output. It is not a claim that an output process has launched or that a physical speaker has become audible.
 
+The real-time loop adds sidecar acceptance, render acknowledgement, barge-in
+onset/threshold, flush acknowledgement, queue depth, underrun count, and cleanup
+metrics on the same content-free evidence boundary. These meanings stay
+separate:
+
+- first playable: Rust has a validated PCM frame;
+- first sidecar accept: the sidecar accepted generation-tagged PCM;
+- render acknowledgement: the audio engine reported rendering progress;
+- first audible: an external recording observes speaker output;
+- audible stop: an external recording observes the interrupted response end.
+
+Neither sidecar acceptance nor render acknowledgement is acoustic evidence.
+
 ## Runtime Invariants
 
 - A runtime instance owns at most one active turn.
@@ -119,7 +160,11 @@ The runtime uses a cancellation token for the active turn and child tokens for a
 
 Terminal selection, publication, and removal of the active turn are serialized by the active-turn lock: if interruption returns accepted, that turn cannot later complete successfully. Real high-rate partial transcripts or audio require explicit aggregation or a separate media transport; lifecycle finalization remains independent of consumer backpressure.
 
-The macOS reference playback path adopts the same token and has deterministic cleanup and cancellation coverage. The barge-in milestone still requires microphone capture, ASR/VAD turn detection, a measured user-speech trigger, and first-audible/stop-audible evidence.
+The macOS real-time path adopts the same generation token and has deterministic
+capture, recognition, queue, playback flush, cleanup, and stale-generation
+coverage. Physical microphone behavior, echo rejection, first audible output,
+and audible stop still require the separate process/device and acoustic
+procedures.
 
 ## macOS System-Speech Reference
 
@@ -140,6 +185,11 @@ Affectionate expressions, special moments, and relationship signals must emerge 
 The public SDK defines portable contracts, reference adapters, reproducible evaluation methods, and clearly labeled historical measurements. It does not encode an application's models, voices, routing thresholds, personas, or deployment policy.
 
 Exact checkpoint identifiers may appear only when required to reproduce benchmark evidence. They are measurements, not endorsements. Public examples use generic identifiers, while application configuration and deployment decisions remain outside this repository.
+
+Desktop controls, SQLite conversation memory, authenticated iPhone/LAN access,
+Linux and Windows media implementations, and cloud/provider adapters remain
+deferred boundaries. The deterministic macOS source does not imply those
+platform or deployment capabilities.
 
 ## Why the Desktop Shell Is Deferred
 

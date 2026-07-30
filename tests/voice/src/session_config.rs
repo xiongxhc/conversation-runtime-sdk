@@ -6,8 +6,9 @@ use conversation_model_adapters::{
     AdapterError, BufferedStreamingSpeechSynthesizer, GenerationLanguageModel,
     GenerationLanguageRequest, GenerationTextDelta, LanguageModel, LanguageModelRequest,
     MacOsVoiceSidecar, MacOsVoiceSidecarConfig, OllamaConfig, OllamaLanguageModel,
-    OpenAiCompatibleSpeechConfig, OpenAiCompatibleSpeechSynthesizer, SpeechSynthesizer,
-    SystemDevice,
+    OpenAiCompatibleSpeechConfig, OpenAiCompatibleSpeechSynthesizer,
+    OpenAiCompatibleStreamingSpeechConfig, OpenAiCompatibleStreamingSpeechSynthesizer,
+    SpeechSynthesizer, StreamingSpeechSynthesizer, SystemDevice,
 };
 use conversation_protocol::{
     ComponentDescriptor, ComponentKind, ExecutionLocation, PrivacyMode, RuntimeError, SessionId,
@@ -121,6 +122,7 @@ struct SpeechConfig {
     execution: ExecutionConfig,
     provider: String,
     mode: SpeechMode,
+    streaming_interval: Option<f32>,
     endpoint: String,
     model: String,
     voice: String,
@@ -143,6 +145,7 @@ enum SpeechBackend {
 #[serde(rename_all = "kebab-case")]
 enum SpeechMode {
     Buffered,
+    Streaming,
 }
 
 #[derive(Debug, Deserialize)]
@@ -238,6 +241,7 @@ impl SessionConfig {
         }
         validate_http_endpoint(&self.language.endpoint, "language", self.language.execution)?;
         validate_http_endpoint(&self.speech.endpoint, "speech", self.speech.execution)?;
+        self.validate_speech_mode()?;
 
         match (
             self.capture.device,
@@ -252,7 +256,7 @@ impl SessionConfig {
                 AsrBackend::Whisperkit,
                 LanguageBackend::Ollama,
                 SpeechBackend::OpenaiCompatible,
-                SpeechMode::Buffered,
+                SpeechMode::Buffered | SpeechMode::Streaming,
                 AudioBackend::ManagedSidecar,
             ) => {}
         }
@@ -276,9 +280,24 @@ impl SessionConfig {
     pub fn adapters(&self) -> Result<VoiceSessionAdapters, String> {
         self.require_local_execution_adapters()?;
         let language_model = Arc::new(IdentityTaggedLanguageModel::new(self.language_model()?));
-        let speech_synthesizer: Arc<dyn SpeechSynthesizer> = Arc::new(self.speech_synthesizer()?);
-        let speech_synthesizer =
-            Arc::new(BufferedStreamingSpeechSynthesizer::new(speech_synthesizer));
+        self.validate_speech_mode()?;
+        let speech_synthesizer: Arc<dyn StreamingSpeechSynthesizer> = match self.speech.mode {
+            SpeechMode::Buffered => {
+                let synthesizer: Arc<dyn SpeechSynthesizer> = Arc::new(
+                    OpenAiCompatibleSpeechSynthesizer::new(self.speech_config()?),
+                );
+                Arc::new(BufferedStreamingSpeechSynthesizer::new(synthesizer))
+            }
+            SpeechMode::Streaming => {
+                let interval = self.speech.streaming_interval.ok_or_else(|| {
+                    "streaming speech mode requires streaming_interval".to_owned()
+                })?;
+                let config =
+                    OpenAiCompatibleStreamingSpeechConfig::new(self.speech_config()?, interval)
+                        .map_err(adapter_message)?;
+                Arc::new(OpenAiCompatibleStreamingSpeechSynthesizer::new(config))
+            }
+        };
         let voice_io = Arc::new(self.voice_io()?);
         Ok(VoiceSessionAdapters::new(
             voice_io,
@@ -312,7 +331,27 @@ impl SessionConfig {
         Ok(OllamaLanguageModel::new(config))
     }
 
-    fn speech_synthesizer(&self) -> Result<OpenAiCompatibleSpeechSynthesizer, String> {
+    fn validate_speech_mode(&self) -> Result<(), String> {
+        match (self.speech.mode, self.speech.streaming_interval) {
+            (SpeechMode::Buffered, None) => Ok(()),
+            (SpeechMode::Buffered, Some(_)) => {
+                Err("streaming_interval is only valid for streaming speech mode".to_owned())
+            }
+            (SpeechMode::Streaming, None) => {
+                Err("streaming speech mode requires streaming_interval".to_owned())
+            }
+            (SpeechMode::Streaming, Some(interval))
+                if interval.is_finite() && (0.10..=2.00).contains(&interval) =>
+            {
+                Ok(())
+            }
+            (SpeechMode::Streaming, Some(_)) => {
+                Err("streaming_interval must be within 0.10..=2.00".to_owned())
+            }
+        }
+    }
+
+    fn speech_config(&self) -> Result<OpenAiCompatibleSpeechConfig, String> {
         let config = OpenAiCompatibleSpeechConfig::new(&self.speech.model)
             .map_err(adapter_message)?
             .with_endpoint(&self.speech.endpoint)
@@ -333,7 +372,7 @@ impl SessionConfig {
             .map_err(adapter_message)?
             .with_max_audio_bytes(self.speech.max_audio_bytes)
             .map_err(adapter_message)?;
-        Ok(OpenAiCompatibleSpeechSynthesizer::new(config))
+        Ok(config)
     }
 
     fn voice_io(&self) -> Result<MacOsVoiceSidecar, String> {

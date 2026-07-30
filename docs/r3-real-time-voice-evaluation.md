@@ -2,16 +2,16 @@
 
 ## Scope and Status
 
-This record evaluates the deterministic R3 milestone based on implementation
+This record evaluates the R3 milestone based on implementation
 commit `ee6e4b47cf30b341320941948e6f5fab1e9850b8` on
 `feature/r3-real-time-voice-loop`. It separates repository contract evidence
 from process/device and acoustic evidence.
 
-**R3 status: INCOMPLETE.** Deterministic code and documentation gates pass.
+**R3 status: INCOMPLETE.** Repository code and documentation gates pass.
 Process/device evidence is `NOT VALIDATED`. Acoustic evidence is
 `NOT VALIDATED`.
 
-## Deterministic Contract Evidence
+## Repository Contract Evidence
 
 ### Environment
 
@@ -23,14 +23,21 @@ Process/device evidence is `NOT VALIDATED`. Acoustic evidence is
 - Swift: Apple Swift `6.3.3`; target `arm64-apple-macosx26.0`.
 - Release sidecar: `conversation-voice-sidecar`, built from
   `ee6e4b47cf30b341320941948e6f5fab1e9850b8`.
-- Release sidecar SHA-256:
+- Observed release-sidecar SHA-256 from one build:
   `b17e157db7388da1e7ea10283f7c34ecb70459deb8a6a0af20b9e611ab2b1e83`.
 - Private schema-v2 config digest: `NOT AVAILABLE`; the private file was
   absent and no private config was created.
 
+The durable source identity is implementation commit
+`ee6e4b47cf30b341320941948e6f5fab1e9850b8`. This evaluation records the
+observed Swift/Xcode toolchain version in the environment above but does not
+pin that toolchain. Repeated clean Swift release builds are not byte-identical
+because Mach-O UUIDs vary. The recorded SHA-256 is an observed digest from one
+build, not a stable binary identity.
+
 ### Commands and Results
 
-The following deterministic gates passed from a clean checkout of
+The following repository gates passed from a clean checkout of
 `ee6e4b47cf30b341320941948e6f5fab1e9850b8`:
 
 ```text
@@ -90,8 +97,8 @@ sh -n tests/voice/acceptance-macos.test.sh
 git diff --check
 ```
 
-To reproduce the schema-v2 bundled layout without starting capture, build the
-Rust CLI and place the verified sidecar beside it. Leave
+To rebuild the schema-v2 bundled layout without starting capture, build the
+Rust CLI and place the sidecar beside it. Leave
 `sidecar_executable` absent from the private config; an absolute override is
 only for development or alternate packaging:
 
@@ -104,6 +111,9 @@ test -x target/release/conversation-voice-sidecar
 shasum -a 256 target/release/conversation-voice-sidecar
 ```
 
+These commands rebuild the functionality and may produce a new observed
+digest; they are not expected to reproduce the recorded SHA-256 byte-for-byte.
+
 Results:
 
 - streaming OpenAI-compatible speech: `16` focused tests passed;
@@ -113,7 +123,7 @@ Results:
 - complete Rust workspace: passed with `1` intentionally ignored
   immutable-fixture writer;
 - complete Swift sidecar package: `104` tests passed;
-- deterministic acceptance-harness script: passed success, failure,
+- acceptance-harness script: passed success, failure,
   content-filtering, repository/resolved-alias rejection, existing-file,
   concurrent-parent swap, repository redirection, concurrent no-overwrite,
   symlink, persistent/transient hard-link, FIFO, safe-parent mode, injected
@@ -124,16 +134,17 @@ Results:
 - strict workspace Clippy: passed with warnings denied;
 - strict Swift 6 release build: passed with complete concurrency checking and
   warnings denied;
-- release sidecar build script: passed; the executable built from
-  `ee6e4b47cf30b341320941948e6f5fab1e9850b8` has SHA-256
-  `b17e157db7388da1e7ea10283f7c34ecb70459deb8a6a0af20b9e611ab2b1e83`;
+- release sidecar build script: passed; one executable built from
+  `ee6e4b47cf30b341320941948e6f5fab1e9850b8` had observed SHA-256
+  `b17e157db7388da1e7ea10283f7c34ecb70459deb8a6a0af20b9e611ab2b1e83`,
+  which is not a stable binary identity because Mach-O UUIDs vary;
 - formatting, shell syntax, and whitespace checks: passed.
 
 No dependency was added, so `Cargo.lock` is unchanged.
 
 ### Covered Contracts
 
-The deterministic evidence covers:
+The repository contract evidence covers:
 
 - `stream = true`, `response_format = "wav"`, and the required bounded
   `streaming_interval`;
@@ -176,7 +187,7 @@ When a real source line is absent, the harness records stale-generation and
 queue-underrun counts as JSON `null` with the corresponding observation flag
 set to `false`; it never invents zero observations.
 
-This evidence uses loopback fixtures, fake sidecars, deterministic Swift
+This evidence uses loopback fixtures, fake sidecars, controlled Swift
 services, and synthetic WAV data. It is not hardware, local-model, audible, or
 latency evidence.
 
@@ -191,10 +202,10 @@ It is not a security boundary against a malicious same-EUID process racing
 namespaces, hard links, or mounts. Monitoring cannot cover activity before the
 relevant descriptor is opened and registered, and retained descriptors cannot
 close mount-namespace gaps. Its process authority is the verified numeric PID,
-PGID, and SID while the guardian remains alive; deterministic fixtures verify
+PGID, and SID while the guardian remains alive; controlled fixtures verify
 that controlled descendants do not change group or session. A measured
 descendant that intentionally calls `setpgid` or `setsid` can escape
-supervision. The deterministic results above make no race-proof or
+supervision. The contract-test results above make no race-proof or
 malicious-process containment claim.
 
 ## Process/Device Evidence
@@ -224,7 +235,7 @@ Therefore this record contains no observed:
 - speech-end, first-playable, sidecar-accept, or render-acknowledgement latency;
 - packet-capture result or device-level `LocalOnly` traffic observation.
 
-Deterministic policy tests prove pre-capture rejection behavior. They do not
+Contract policy tests prove pre-capture rejection behavior. They do not
 substitute for a device run or network observation.
 
 ## Acoustic Evidence

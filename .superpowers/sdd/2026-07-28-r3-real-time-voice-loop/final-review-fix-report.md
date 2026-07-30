@@ -13,8 +13,14 @@ single R3 final-review fix wave are addressed.
 - Evidence commit: `docs: pin R3 deterministic evidence` (the commit containing
   this report; its SHA is reported in the completion handoff because a commit
   cannot embed its own stable SHA).
-- Release sidecar SHA-256:
+- Observed release-sidecar SHA-256 from one build:
   `b17e157db7388da1e7ea10283f7c34ecb70459deb8a6a0af20b9e611ab2b1e83`.
+- Durable source identity: implementation commit
+  `ee6e4b47cf30b341320941948e6f5fab1e9850b8`.
+- Toolchain evidence: the evaluation records the observed Swift/Xcode
+  toolchain version but does not pin it. Repeated clean Swift release builds
+  are not byte-identical because Mach-O UUIDs vary; the recorded SHA-256 is an
+  observed digest, not a stable binary identity.
 - R3 remains **INCOMPLETE**.
 - Process/device evidence remains **NOT VALIDATED**.
 - Acoustic evidence remains **NOT VALIDATED**.
@@ -62,12 +68,14 @@ single R3 final-review fix wave are addressed.
    - Relative overrides and missing or non-executable resolved files fail
      before capture.
 
-6. Deterministic evaluation identity
-   - `docs/r3-real-time-voice-evaluation.md` now pins implementation commit
-     `ee6e4b47cf30b341320941948e6f5fab1e9850b8`.
-   - It records the release sidecar SHA-256
+6. Source and observed artifact evidence
+   - `docs/r3-real-time-voice-evaluation.md` records implementation commit
+     `ee6e4b47cf30b341320941948e6f5fab1e9850b8` as the durable source
+     identity.
+   - It records the observed release-sidecar SHA-256
      `b17e157db7388da1e7ea10283f7c34ecb70459deb8a6a0af20b9e611ab2b1e83`
-     and the reproduction commands.
+     and the commands that rebuild functionality without promising a
+     byte-identical binary.
    - Device and acoustic status remain unchanged.
 
 7. Multi-utterance reconstruction
@@ -264,6 +272,11 @@ git rev-parse HEAD
 ee6e4b47cf30b341320941948e6f5fab1e9850b8
 ```
 
+This implementation commit is the durable source identity. The evaluation
+records the observed Swift/Xcode toolchain version but does not pin it. The
+source identity does not include a binary SHA-256: repeated clean Swift release
+builds differ because Mach-O UUIDs vary.
+
 The release artifact was then built from that clean source revision:
 
 ```text
@@ -286,9 +299,11 @@ shasum -a 256 \
 b17e157db7388da1e7ea10283f7c34ecb70459deb8a6a0af20b9e611ab2b1e83
 ```
 
-This is deterministic build identity only. It is not evidence that the binary
-loaded a real model, requested microphone permission, rendered audible audio,
-or met process/device or acoustic thresholds.
+This is the observed digest from one build, not a stable binary identity. The
+commands rebuild functionality but are not expected to reproduce this SHA-256
+byte-for-byte. It is not evidence that the binary loaded a real model,
+requested microphone permission, rendered audible audio, or met process/device
+or acoustic thresholds.
 
 ## Remaining Concerns
 

@@ -144,7 +144,6 @@ fn decoder_rejects_malformed_or_unsupported_wav_containers() {
             (*b"data", vec![0, 0]),
         ]),
         SynthesizedAudio::new(trailing_chunk, AudioFormat::Wav),
-        SynthesizedAudio::new(minimal_aiff(), AudioFormat::Aiff),
     ];
 
     for audio in cases {
@@ -157,6 +156,18 @@ fn decoder_rejects_malformed_or_unsupported_wav_containers() {
             )
             .is_err());
     }
+}
+
+#[test]
+fn decoder_rejects_aiff_with_explicit_unsupported_container_error() {
+    let audio = SynthesizedAudio::new(minimal_aiff(), AudioFormat::Aiff);
+
+    let error = decode(&audio).unwrap_err();
+
+    assert_eq!(
+        error.message(),
+        "R3 PCM streaming does not support AIFF audio"
+    );
 }
 
 #[test]

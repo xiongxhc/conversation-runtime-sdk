@@ -51,5 +51,6 @@ max_audio_bytes = 8388608
 backend = "managed-sidecar"
 execution = "local"
 provider = "macos-system-audio"
-sidecar_executable = "/opt/conversation-runtime/bin/conversation-voice-sidecar"
+# Optional development override. It must be absolute when present.
+# sidecar_executable = "/opt/conversation-runtime/bin/conversation-voice-sidecar"
 max_error_bytes = 65536

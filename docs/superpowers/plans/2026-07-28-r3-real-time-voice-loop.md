@@ -1001,7 +1001,7 @@ git commit -m "feat: add generation-safe streaming turns"
 **Files:**
 - Create: `crates/model-adapters/src/macos_voice_sidecar/codec.rs`
 - Create: `crates/model-adapters/src/macos_voice_sidecar/mod.rs`
-- Create: `crates/model-adapters/tests/macos_voice_sidecar_codec.rs`
+- Create: `crates/model-adapters/src/macos_voice_sidecar/codec_tests.rs`
 - Create: `tests/fixtures/voice-sidecar-v1/control/start-session.bin`
 - Create: `tests/fixtures/voice-sidecar-v1/control/transcript-partial.bin`
 - Create: `tests/fixtures/voice-sidecar-v1/audio/pcm-s16le.bin`
@@ -1081,7 +1081,8 @@ Run:
 
 ```bash
 PATH="/opt/homebrew/opt/rustup/bin:$PATH" \
-  cargo test --locked -p conversation-model-adapters --test macos_voice_sidecar_codec
+  cargo test --locked -p conversation-model-adapters \
+  --lib macos_voice_sidecar::codec_tests
 ```
 
 Expected: compilation fails because the codec is absent.
@@ -1099,7 +1100,8 @@ Add a test-only fixture writer invoked once through:
 ```bash
 PATH="/opt/homebrew/opt/rustup/bin:$PATH" \
   cargo test --locked -p conversation-model-adapters \
-  --test macos_voice_sidecar_codec write_version_one_fixtures -- --ignored
+  --lib macos_voice_sidecar::codec_tests::write_version_one_fixtures \
+  -- --exact --ignored
 ```
 
 Read each fixture back in the normal tests. Remove any environment-specific
@@ -1111,7 +1113,8 @@ Run:
 
 ```bash
 PATH="/opt/homebrew/opt/rustup/bin:$PATH" \
-  cargo test --locked -p conversation-model-adapters --test macos_voice_sidecar_codec
+  cargo test --locked -p conversation-model-adapters \
+  --lib macos_voice_sidecar::codec_tests
 git diff --check
 ```
 
@@ -1527,13 +1530,16 @@ max_audio_bytes = 8388608
 backend = "managed-sidecar"
 execution = "local"
 provider = "macos-system-audio"
-sidecar_executable = "/opt/conversation-runtime/bin/conversation-voice-sidecar"
+# Optional absolute override; otherwise resolve beside conversation-voice-loop.
+# sidecar_executable = "/opt/conversation-runtime/bin/conversation-voice-sidecar"
 max_error_bytes = 65536
 ```
 
 `[[tools]]`, `[[memory]]`, and `[[telemetry]]` each accept `provider`,
 `execution`, and `enabled`; omitted arrays mean no configured component.
 Missing `execution` is a configuration error, not inferred locality.
+An omitted `sidecar_executable` resolves `conversation-voice-sidecar` adjacent
+to the running CLI without consulting `PATH`.
 
 - [ ] **Step 3: Write the policy-before-spawn regression**
 
@@ -1770,7 +1776,8 @@ ordered, format changes fail, and the `100`-frame/two-second limits apply.
 
 1. validates `StartSession`;
 2. snapshots identifiers and configured thresholds;
-3. starts injected audio/recognition services only after `StartCapture`;
+3. validates and loads recognition before starting injected audio capture, then
+   activates recognition only after audio startup;
 4. validates every PCM frame;
 5. flushes locally before `BargeIn`;
 6. emits typed failure and shutdown frames;
@@ -1784,7 +1791,8 @@ Run:
 VOICE_SIDECAR_FIXTURES_DIR="$PWD/tests/fixtures/voice-sidecar-v1" \
   swift test --package-path platform/macos/voice-sidecar
 PATH="/opt/homebrew/opt/rustup/bin:$PATH" \
-  cargo test --locked -p conversation-model-adapters --test macos_voice_sidecar_codec
+  cargo test --locked -p conversation-model-adapters \
+  --lib macos_voice_sidecar::codec_tests
 ```
 
 Expected: Swift core and Rust fixture tests pass.
@@ -1950,8 +1958,9 @@ test -x "$SIDE_CAR_BIN"
 printf '%s\n' "$SIDE_CAR_BIN"
 ```
 
-The private schema-v2 config may use that absolute path. Packaged applications
-later place it adjacent to the Rust executable.
+Install that executable beside `conversation-voice-loop`; this is the schema-v2
+default and does not consult `PATH`. A private config may use the printed
+absolute path only as an explicit override.
 
 - [ ] **Step 9: Run Swift, Rust process, and one real local `--once` check**
 

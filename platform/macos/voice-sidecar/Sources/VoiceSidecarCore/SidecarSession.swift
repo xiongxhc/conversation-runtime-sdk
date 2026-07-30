@@ -40,6 +40,7 @@ public protocol SidecarAudioService: Sendable {
 }
 
 public protocol SidecarRecognitionService: Sendable {
+    func prepare(configuration: SidecarConfiguration) async throws
     func start(configuration: SidecarConfiguration) async throws
     func stop() async
 }
@@ -78,6 +79,15 @@ public actor SidecarSession {
         case stopped
     }
 
+    private enum RecognitionServiceState: Sendable {
+        case notAttempted
+        case prepareAttempted
+        case prepared
+        case startAttempted
+        case started
+        case stopped
+    }
+
     private let audioService: any SidecarAudioService
     private let recognitionService: any SidecarRecognitionService
     private let playbackService: any SidecarPlaybackService
@@ -86,7 +96,7 @@ public actor SidecarSession {
     private var configuration: SidecarConfiguration?
     private var phase = Phase.awaitingSession
     private var audioState = ServiceState.notAttempted
-    private var recognitionState = ServiceState.notAttempted
+    private var recognitionState = RecognitionServiceState.notAttempted
     private var playbackStopped = false
     private var cleanupStarted = false
     private var playbackBuffer = PlaybackBuffer()
@@ -381,7 +391,9 @@ public actor SidecarSession {
                 finalSilenceMilliseconds: finalSilenceMilliseconds
             )
             self.configuration = configuration
-            bargeInGate = BargeInGate()
+            bargeInGate = BargeInGate(
+                speechStartMilliseconds: speechStartMilliseconds
+            )
             phase = .configuring
             try await eventSink.send(ChildFrame(control: .ready(sessionID: sessionID)))
             phase = .ready
@@ -389,10 +401,13 @@ public actor SidecarSession {
         case let .startCapture(sessionID):
             let configuration = try requireReady(sessionID: sessionID)
             phase = .starting
+            recognitionState = .prepareAttempted
+            try await recognitionService.prepare(configuration: configuration)
+            recognitionState = .prepared
             audioState = .attempted
             try await audioService.start(configuration: configuration)
             audioState = .started
-            recognitionState = .attempted
+            recognitionState = .startAttempted
             try await recognitionService.start(configuration: configuration)
             recognitionState = .started
             phase = .capturing
@@ -560,13 +575,17 @@ public actor SidecarSession {
         }
         cleanupStarted = true
 
-        if recognitionState == .attempted || recognitionState == .started {
+        if recognitionState == .startAttempted || recognitionState == .started {
             recognitionState = .stopped
             await recognitionService.stop()
         }
         if audioState == .attempted || audioState == .started {
             audioState = .stopped
             await audioService.stop()
+        }
+        if recognitionState == .prepareAttempted || recognitionState == .prepared {
+            recognitionState = .stopped
+            await recognitionService.stop()
         }
         if !playbackStopped {
             playbackStopped = true

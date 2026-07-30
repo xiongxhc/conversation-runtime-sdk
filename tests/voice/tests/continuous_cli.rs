@@ -3,6 +3,7 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::OwnedFd;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -19,6 +20,7 @@ const PLAYBACK_MARKER_ENV: &str = "CONVERSATION_FAKE_VOICE_SIDECAR_PLAYBACK_MARK
 
 const LANGUAGE_RESPONSE: &[u8] =
     b"{\"message\":{\"content\":\"Fixture response.\"},\"done\":true}\n";
+const LANGUAGE_RESPONSE_END: &[u8] = b"{\"message\":{\"content\":\"\"},\"done\":true}\n";
 
 #[test]
 fn strict_schema_v2_rejects_wrong_version_unknown_fields_and_missing_execution() {
@@ -142,6 +144,124 @@ fn missing_local_asr_model_directory_is_rejected_before_sidecar_spawn() {
 }
 
 #[test]
+fn relative_sidecar_override_is_rejected_before_capture() {
+    let harness = CliHarness::new("ready");
+    let config = harness
+        .valid_config("http://127.0.0.1:9", "http://127.0.0.1:9/v1")
+        .replacen(
+            &format!(
+                "sidecar_executable = \"{}\"",
+                toml_path(&fake_sidecar_binary())
+            ),
+            "sidecar_executable = \"relative-sidecar\"",
+            1,
+        );
+
+    let output = harness.run_once(&config);
+
+    assert!(!output.status.success(), "{output:?}");
+    assert!(output.stderr_text().contains("stage=configuration"));
+    assert!(output
+        .stderr_text()
+        .contains("sidecar executable override must be absolute"));
+    assert!(!harness.spawn_marker().exists());
+}
+
+#[test]
+fn omitted_sidecar_override_uses_adjacent_binary_and_never_path() {
+    let harness = CliHarness::new("partial-final");
+    let bundle = harness.fixture_path("bundle");
+    std::fs::create_dir(&bundle).unwrap();
+    let bundled_loop = bundle.join("conversation-voice-loop");
+    let bundled_sidecar = bundle.join("conversation-voice-sidecar");
+    copy_executable(&voice_loop_binary(), &bundled_loop);
+    copy_executable(&fake_sidecar_binary(), &bundled_sidecar);
+
+    let path_trap = harness.fixture_path("path-trap");
+    std::fs::create_dir(&path_trap).unwrap();
+    let path_marker = harness.fixture_path("path-sidecar-used");
+    let path_sidecar = path_trap.join("conversation-voice-sidecar");
+    std::fs::write(
+        &path_sidecar,
+        format!(
+            "#!/bin/sh\n: > \"{}\"\nexec \"{}\" \"$@\"\n",
+            path_marker.display(),
+            fake_sidecar_binary().display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path_sidecar, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let language = FixtureServer::immediate(
+        harness.fixture_path("language-request"),
+        "application/x-ndjson",
+        LANGUAGE_RESPONSE,
+    );
+    let speech = FixtureServer::immediate(
+        harness.fixture_path("speech-request"),
+        "audio/wav",
+        &pcm_wav(1),
+    );
+    let config = without_sidecar_override(
+        &harness.valid_config(language.endpoint(), &speech.endpoint_with_path("/v1")),
+    );
+
+    let child = harness.spawn_with_binary(
+        &bundled_loop,
+        &config,
+        true,
+        Stdio::piped(),
+        Some(&path_trap),
+    );
+    let output = CliOutput(wait_for_output(child));
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(harness.spawn_marker().exists());
+    assert!(!path_marker.exists());
+    harness.assert_sidecar_reaped();
+    language.finish();
+    speech.finish();
+}
+
+#[test]
+fn omitted_sidecar_override_rejects_missing_and_non_executable_adjacent_binary() {
+    for (name, create_sidecar, expected) in [
+        ("missing", false, "sidecar executable does not exist"),
+        (
+            "non-executable",
+            true,
+            "sidecar executable is not executable",
+        ),
+    ] {
+        let harness = CliHarness::new("ready");
+        let bundle = harness.fixture_path(name);
+        std::fs::create_dir(&bundle).unwrap();
+        let bundled_loop = bundle.join("conversation-voice-loop");
+        copy_executable(&voice_loop_binary(), &bundled_loop);
+        if create_sidecar {
+            let bundled_sidecar = bundle.join("conversation-voice-sidecar");
+            std::fs::write(&bundled_sidecar, []).unwrap();
+            std::fs::set_permissions(&bundled_sidecar, std::fs::Permissions::from_mode(0o644))
+                .unwrap();
+        }
+        let config = without_sidecar_override(
+            &harness.valid_config("http://127.0.0.1:9", "http://127.0.0.1:9/v1"),
+        );
+
+        let child = harness.spawn_with_binary(&bundled_loop, &config, true, Stdio::piped(), None);
+        let output = CliOutput(wait_for_output(child));
+
+        assert!(!output.status.success(), "{name}: {output:?}");
+        assert!(
+            output.stderr_text().contains(expected),
+            "{name}: {}",
+            output.stderr_text()
+        );
+        assert!(!harness.spawn_marker().exists());
+    }
+}
+
+#[test]
 fn declared_local_http_providers_reject_remote_endpoints_before_sidecar_spawn() {
     for provider in ["language", "speech"] {
         let harness = CliHarness::new("crash");
@@ -241,6 +361,40 @@ fn once_mode_runs_one_private_voice_turn_and_cleans_every_process() {
     assert!(!stderr.contains("Fixture response."));
     assert!(harness.shutdown_marker().exists());
     harness.assert_sidecar_reaped();
+}
+
+#[test]
+fn once_mode_receives_rendered_receipt_under_partial_pressure() {
+    let harness = CliHarness::new("partial-final-render-under-partial-pressure");
+    let language_start = format!(
+        "{{\"message\":{{\"content\":\"{}\\n\\n\"}},\"done\":false}}\n",
+        "a".repeat(400)
+    );
+    let language = FixtureServer::split(
+        harness.fixture_path("language-request"),
+        "application/x-ndjson",
+        language_start.as_bytes(),
+        LANGUAGE_RESPONSE_END,
+        Duration::from_millis(250),
+    );
+    let speech = FixtureServer::immediate(
+        harness.fixture_path("speech-request"),
+        "audio/wav",
+        &pcm_wav(1),
+    );
+    let config = harness.valid_config(language.endpoint(), &speech.endpoint_with_path("/v1"));
+
+    let child = harness.spawn(&config, true, Stdio::piped());
+    let output = CliOutput(wait_for_output_with_deadline(child, Duration::from_secs(4)));
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(output
+        .stderr_text()
+        .contains("generation=1 playback=rendered"));
+    assert!(output.stderr_text().contains("status=completed"));
+    harness.assert_sidecar_reaped();
+    language.finish();
+    speech.finish();
 }
 
 #[test]
@@ -614,12 +768,26 @@ max_error_bytes = 65536
     }
 
     fn spawn(&self, config: &str, once: bool, stdout: Stdio) -> Child {
+        self.spawn_with_binary(&voice_loop_binary(), config, once, stdout, None)
+    }
+
+    fn spawn_with_binary(
+        &self,
+        binary: &Path,
+        config: &str,
+        once: bool,
+        stdout: Stdio,
+        path: Option<&Path>,
+    ) -> Child {
         let config_path = self.fixture.path().join("voice-session.toml");
         std::fs::write(&config_path, config).unwrap();
-        let mut command = Command::new(voice_loop_binary());
+        let mut command = Command::new(binary);
         command.args(["--config", config_path.to_str().unwrap()]);
         if once {
             command.arg("--once");
+        }
+        if let Some(path) = path {
+            command.env("PATH", path);
         }
         command
             .env(SCENARIO_ENV, self.scenario)
@@ -733,6 +901,24 @@ impl FixtureServer {
         Self::start(request_marker, FixtureResponse::Stalled)
     }
 
+    fn split(
+        request_marker: PathBuf,
+        content_type: &'static str,
+        first: &[u8],
+        second: &[u8],
+        delay: Duration,
+    ) -> Self {
+        Self::start(
+            request_marker,
+            FixtureResponse::Split {
+                content_type,
+                first: first.to_vec(),
+                second: second.to_vec(),
+                delay,
+            },
+        )
+    }
+
     fn start(request_marker: PathBuf, response: FixtureResponse) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -751,6 +937,23 @@ impl FixtureServer {
                     )
                     .unwrap();
                     stream.write_all(&body).unwrap();
+                }
+                FixtureResponse::Split {
+                    content_type,
+                    first,
+                    second,
+                    delay,
+                } => {
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        first.len() + second.len()
+                    )
+                    .unwrap();
+                    stream.write_all(&first).unwrap();
+                    stream.flush().unwrap();
+                    thread::sleep(delay);
+                    stream.write_all(&second).unwrap();
                 }
                 FixtureResponse::Stalled => wait_for_disconnect(&mut stream),
             }
@@ -797,6 +1000,12 @@ enum FixtureResponse {
         content_type: &'static str,
         body: Vec<u8>,
     },
+    Split {
+        content_type: &'static str,
+        first: Vec<u8>,
+        second: Vec<u8>,
+        delay: Duration,
+    },
     Stalled,
 }
 
@@ -806,6 +1015,20 @@ fn voice_loop_binary() -> PathBuf {
 
 fn fake_sidecar_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_conversation-fake-voice-sidecar"))
+}
+
+fn copy_executable(source: &Path, destination: &Path) {
+    std::fs::copy(source, destination).unwrap();
+    std::fs::set_permissions(destination, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn without_sidecar_override(config: &str) -> String {
+    config
+        .lines()
+        .filter(|line| !line.starts_with("sidecar_executable = "))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
 }
 
 fn remote_component(config: &str, component: &str) -> String {
@@ -1006,8 +1229,12 @@ fn wait_for_output_with_deadline(mut child: Child, timeout: Duration) -> Output 
         }
         if Instant::now() >= deadline {
             child.kill().unwrap();
-            let _ = child.wait();
-            panic!("voice-loop subprocess exceeded its test deadline");
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "voice-loop subprocess exceeded its test deadline: stdout={:?} stderr={:?}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
         thread::sleep(Duration::from_millis(5));
     }

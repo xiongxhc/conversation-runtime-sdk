@@ -211,7 +211,9 @@ fn run() -> Result<(), String> {
                             "code": "recognition_failed"
                         }),
                     )?;
-                } else if scenario == "partial-final" || scenario.starts_with("partial-final-hold-")
+                } else if scenario == "partial-final"
+                    || scenario.starts_with("partial-final-hold-")
+                    || scenario == "partial-final-render-under-partial-pressure"
                 {
                     write_json_frame(
                         &mut stdout,
@@ -438,6 +440,39 @@ fn run() -> Result<(), String> {
                             ..identity
                         };
                         write_media_event(&mut stdout, PLAYBACK_ACCEPTED, stale)?;
+                    }
+                    "partial-final-render-under-partial-pressure" => {
+                        write_media_event(&mut stdout, PLAYBACK_ACCEPTED, identity)?;
+                        let mut burst = Vec::new();
+                        write_json_frame(
+                            &mut burst,
+                            TRANSCRIPT_HYPOTHESIS,
+                            json!({
+                                "session_id": identity.session,
+                                "segment_id": 9,
+                                "text": "pressure-0",
+                                "engine_final": false
+                            }),
+                        )?;
+                        write_media_event(&mut burst, PLAYBACK_RENDERED, identity)?;
+                        for index in 1..32 {
+                            write_json_frame(
+                                &mut burst,
+                                TRANSCRIPT_HYPOTHESIS,
+                                json!({
+                                    "session_id": identity.session,
+                                    "segment_id": 9,
+                                    "text": format!("pressure-{index}"),
+                                    "engine_final": false
+                                }),
+                            )?;
+                        }
+                        stdout
+                            .write_all(&burst)
+                            .map_err(|_| "failed to write partial pressure burst".to_owned())?;
+                        stdout
+                            .flush()
+                            .map_err(|_| "failed to flush partial pressure burst".to_owned())?;
                     }
                     _ => acknowledge_media(&mut stdout, identity)?,
                 }

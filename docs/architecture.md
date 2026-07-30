@@ -47,13 +47,24 @@ echo cancellation can distinguish user speech from speaker output. It also owns
 the first local WhisperKit adapter and the continuous PCM buffer. It binds no
 network port.
 
+Before microphone permission or audio-engine startup, the sidecar validates the
+absolute local model directory and tokenizer and loads WhisperKit with downloads
+disabled. Capture activation follows that recognition preflight; shutdown and
+partial-start failures clean up in reverse activation order.
+
 Rust remains authoritative for privacy and adapter validation, session and turn
 state, the `600 ms` final-silence rule, generation identifiers, provider
 coordination, cancellation, and lifecycle events. Partial transcripts are
 observable but never reach the language model. During playback, approximately
-`200 ms` of sustained local speech flushes the active sidecar generation and
-cancels language generation, TTS, queued frames, and playback without waiting
-for a transcript.
+the configured `speech_start_ms` of sustained local speech, measured in `100 ms`
+VAD windows, flushes the active sidecar generation and cancels language
+generation, TTS, queued frames, and playback without waiting for a transcript.
+The default remains `200 ms`.
+
+Schema v2 resolves `conversation-voice-sidecar` adjacent to the running
+`conversation-voice-loop` binary. `sidecar_executable` is only an optional
+absolute override; relative overrides, missing files, and files without an
+executable bit fail before capture. Resolution never searches ambient `PATH`.
 
 The session privacy mode and every component's declared local or remote execution
 status are immutable after capture begins. `LocalOnly` rejects remote or

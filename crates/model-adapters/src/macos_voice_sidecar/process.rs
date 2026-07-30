@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -1103,7 +1104,7 @@ async fn run_stdout_reader(
                             generation_id,
                             PlaybackState::Rendered,
                         )),
-                        false,
+                        true,
                     )),
                     Ok(false) => None,
                     Err(error) => {
@@ -2115,13 +2116,15 @@ fn require_absolute_path(path: &Path, field: &str) -> Result<(), AdapterError> {
 fn require_executable_file(path: &Path) -> Result<(), AdapterError> {
     let metadata = std::fs::metadata(path)
         .map_err(|_| configuration_error("sidecar executable does not exist"))?;
-    if metadata.is_file() {
-        Ok(())
-    } else {
-        Err(configuration_error(
+    if !metadata.is_file() {
+        return Err(configuration_error(
             "sidecar executable must be a regular file",
-        ))
+        ));
     }
+    if metadata.permissions().mode() & 0o111 == 0 {
+        return Err(configuration_error("sidecar executable is not executable"));
+    }
+    Ok(())
 }
 
 fn configuration_error(message: impl AsRef<str>) -> AdapterError {

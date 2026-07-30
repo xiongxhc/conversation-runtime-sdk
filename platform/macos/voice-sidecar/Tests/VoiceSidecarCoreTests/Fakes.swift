@@ -262,8 +262,10 @@ actor RecordingAudioService: SidecarAudioService {
 
 actor RecordingRecognitionService: SidecarRecognitionService {
     private let callLog: CallLog?
+    private(set) var preparedConfigurations: [SidecarConfiguration] = []
     private(set) var configurations: [SidecarConfiguration] = []
     private(set) var stopCount = 0
+    private var prepareFailure: SidecarServiceFailure?
     private var startFailure: SidecarServiceFailure?
 
     init(callLog: CallLog? = nil) {
@@ -272,6 +274,20 @@ actor RecordingRecognitionService: SidecarRecognitionService {
 
     func setStartFailure(_ failure: SidecarServiceFailure) {
         startFailure = failure
+    }
+
+    func setPrepareFailure(_ failure: SidecarServiceFailure) {
+        prepareFailure = failure
+    }
+
+    func prepare(configuration: SidecarConfiguration) async throws {
+        preparedConfigurations.append(configuration)
+        if let callLog {
+            await callLog.append("recognition.prepare")
+        }
+        if let prepareFailure {
+            throw prepareFailure
+        }
     }
 
     func start(configuration: SidecarConfiguration) async throws {

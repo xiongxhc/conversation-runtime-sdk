@@ -114,6 +114,23 @@ func unchangedAndWhitespaceRecognitionStateEmitsNothing() {
 }
 
 @Test
+func incompleteMultibyteTokenPrefixUsesOnlyCompletedDecodeIndices() {
+    let result = UnicodeTokenSplitter.split(tokens: [1, 2]) { tokens in
+        switch tokens {
+        case [1]:
+            "\u{fffd}"
+        case [1, 2]:
+            "é"
+        default:
+            ""
+        }
+    }
+
+    #expect(result.words == ["é"])
+    #expect(result.wordTokens == [[1, 2]])
+}
+
+@Test
 func captureDiscontinuityResetsRecognitionSpeechAccumulation() {
     var gate = RecognitionSpeechGate(thresholdMilliseconds: 300)
 
@@ -634,27 +651,18 @@ func sustainedSpeechPublishesOneLifecycleAcrossGateWindows(
         thresholdMilliseconds: speechStartMilliseconds
     )
 
-    gate = try await publishRecognitionWindow(
-        isSpeech: true,
-        atMilliseconds: 100,
-        gate: gate,
-        publisher: publisher
-    )
-    #expect(await playback.flushedGenerationIDs.isEmpty)
-    gate = try await publishRecognitionWindow(
-        isSpeech: true,
-        atMilliseconds: 200,
-        gate: gate,
-        publisher: publisher
-    )
+    let requiredWindows = Int(speechStartMilliseconds / 100)
     let firstFlushes: [UInt64] = playbackActive ? [5] : []
-    #expect(await playback.flushedGenerationIDs == firstFlushes)
-    for atMilliseconds in [UInt64(300), 400] {
+    for window in 1...4 {
         gate = try await publishRecognitionWindow(
             isSpeech: true,
-            atMilliseconds: atMilliseconds,
+            atMilliseconds: UInt64(window * 100),
             gate: gate,
             publisher: publisher
+        )
+        #expect(
+            await playback.flushedGenerationIDs
+                == (window >= requiredWindows ? firstFlushes : [])
         )
     }
     _ = try await publisher.publish(
@@ -676,27 +684,17 @@ func sustainedSpeechPublishesOneLifecycleAcrossGateWindows(
             )
         )
     }
-    gate = try await publishRecognitionWindow(
-        isSpeech: true,
-        atMilliseconds: 700,
-        gate: gate,
-        publisher: publisher
-    )
-    #expect(await playback.flushedGenerationIDs == firstFlushes)
-    gate = try await publishRecognitionWindow(
-        isSpeech: true,
-        atMilliseconds: 800,
-        gate: gate,
-        publisher: publisher
-    )
     let secondFlushes: [UInt64] = playbackActive ? [5, 6] : []
-    #expect(await playback.flushedGenerationIDs == secondFlushes)
-    for atMilliseconds in [UInt64(900), 1_000] {
+    for window in 1...4 {
         gate = try await publishRecognitionWindow(
             isSpeech: true,
-            atMilliseconds: atMilliseconds,
+            atMilliseconds: UInt64(600 + window * 100),
             gate: gate,
             publisher: publisher
+        )
+        #expect(
+            await playback.flushedGenerationIDs
+                == (window >= requiredWindows ? secondFlushes : firstFlushes)
         )
     }
     _ = try await publishRecognitionWindow(
@@ -706,9 +704,7 @@ func sustainedSpeechPublishesOneLifecycleAcrossGateWindows(
         publisher: publisher
     )
 
-    let firstStart =
-        playbackActive && speechStartMilliseconds == 300
-        ? UInt64(200) : speechStartMilliseconds
+    let firstStart = speechStartMilliseconds
     let secondStart = firstStart + 600
     let lifecycle = speechLifecycle(in: await events.frames)
     #expect(
@@ -1186,6 +1182,8 @@ private actor FatalRecordingAudioService: SidecarAudioService {
 private actor FatalRecordingRecognitionService: SidecarRecognitionService {
     private(set) var stopCount = 0
 
+    func prepare(configuration _: SidecarConfiguration) {}
+
     func start(configuration _: SidecarConfiguration) {}
 
     func stop() {
@@ -1236,6 +1234,8 @@ private actor SessionOwnedRecognitionWorker: SidecarRecognitionService {
         self.publisher = publisher
         self.failureController = failureController
     }
+
+    func prepare(configuration _: SidecarConfiguration) {}
 
     func start(configuration: SidecarConfiguration) throws {
         guard let publisher, let failureController else {

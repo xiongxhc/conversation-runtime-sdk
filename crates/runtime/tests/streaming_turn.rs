@@ -155,6 +155,65 @@ async fn speech_normalization_runs_after_utterance_boundary_selection() {
     assert_eq!(speech.requests()[0].text(), "Heading. This is important.");
 }
 
+#[tokio::test]
+async fn long_response_reconstructs_ordered_multi_utterance_playback() {
+    let turn_id = TurnId::new(12);
+    let generation_id = GenerationId::new(13);
+    let format = PcmFormat::new(24_000, 2, PcmSampleFormat::Float32LittleEndian).unwrap();
+    let response = format!(
+        "{}\n\n{}\n\n{}",
+        "a".repeat(400),
+        "b".repeat(400),
+        "c".repeat(50)
+    );
+    let language = Arc::new(MockGenerationLanguageModel::new([response]));
+    let speech = Arc::new(ReconstructingSpeech::new(format));
+    let output = Arc::new(MockContinuousAudioOutput::new());
+    let runtime = StreamingTurnRuntime::new(language, speech.clone(), output.clone());
+
+    let mut stream = runtime
+        .start_turn(turn_id, generation_id, "question")
+        .await
+        .unwrap();
+    let observed = drain(&mut stream).await;
+
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|event| event.is_terminal())
+            .collect::<Vec<_>>(),
+        vec![&RuntimeEvent::TurnCompleted { turn_id }]
+    );
+    let requests = speech.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests
+            .iter()
+            .map(StreamingSpeechRequest::utterance_id)
+            .collect::<Vec<_>>(),
+        [UtteranceId::new(1), UtteranceId::new(2)]
+    );
+    assert_eq!(requests[0].text(), "a".repeat(400));
+    assert_eq!(
+        requests[1].text(),
+        format!("{} {}", "b".repeat(400), "c".repeat(50))
+    );
+    let frames = output.frames();
+    assert_eq!(
+        frames
+            .iter()
+            .map(|frame| (frame.utterance_id(), frame.sequence()))
+            .collect::<Vec<_>>(),
+        [
+            (UtteranceId::new(1), 0),
+            (UtteranceId::new(1), 1),
+            (UtteranceId::new(2), 0),
+            (UtteranceId::new(2), 1),
+        ]
+    );
+    assert!(frames.iter().all(|frame| frame.format() == format));
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn first_playable_publication_precedes_frame_enqueue_under_backpressure() {
     let turn_id = TurnId::new(9);
@@ -296,6 +355,55 @@ async fn first_playable_publication_precedes_frame_enqueue_under_backpressure() 
             .count(),
         1
     );
+}
+
+struct ReconstructingSpeech {
+    format: PcmFormat,
+    requests: Mutex<Vec<StreamingSpeechRequest>>,
+}
+
+impl ReconstructingSpeech {
+    fn new(format: PcmFormat) -> Self {
+        Self {
+            format,
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn requests(&self) -> Vec<StreamingSpeechRequest> {
+        self.requests
+            .lock()
+            .expect("reconstructing speech request lock poisoned")
+            .clone()
+    }
+}
+
+impl StreamingSpeechSynthesizer for ReconstructingSpeech {
+    fn stream(
+        &self,
+        request: StreamingSpeechRequest,
+        cancellation: CancellationToken,
+    ) -> mpsc::Receiver<Result<AudioFrame, AdapterError>> {
+        self.requests
+            .lock()
+            .expect("reconstructing speech request lock poisoned")
+            .push(request.clone());
+        let (sender, receiver) = mpsc::channel(2);
+        if !cancellation.is_cancelled() {
+            for sequence in 0..=1 {
+                sender
+                    .try_send(Ok(frame(
+                        request.turn_id(),
+                        request.generation_id(),
+                        request.utterance_id(),
+                        sequence,
+                        self.format,
+                    )))
+                    .expect("reconstructed frame fits bounded stream");
+            }
+        }
+        receiver
+    }
 }
 
 struct FirstPlayableProbeSpeech {

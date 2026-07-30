@@ -85,6 +85,9 @@ fn configuration_rejects_missing_executable_thresholds_and_zero_limits() {
     let model = fixture.path().join("model");
     std::fs::create_dir(&model).unwrap();
     let missing = fixture.path().join("missing-sidecar");
+    let non_executable = fixture.path().join("non-executable-sidecar");
+    std::fs::write(&non_executable, []).unwrap();
+    std::fs::set_permissions(&non_executable, std::fs::Permissions::from_mode(0o644)).unwrap();
     let executable = fake_sidecar_executable();
 
     assert!(MacOsVoiceSidecarConfig::new(
@@ -96,6 +99,19 @@ fn configuration_rejects_missing_executable_thresholds_and_zero_limits() {
         600,
     )
     .is_err());
+    let error = MacOsVoiceSidecarConfig::new(
+        non_executable,
+        &model,
+        SystemDevice::SystemDefault,
+        false,
+        200,
+        600,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.message(),
+        "invalid macOS voice sidecar configuration: sidecar executable is not executable"
+    );
     for (speech_start_ms, final_silence_ms) in [(99, 600), (1_001, 600), (200, 199), (200, 3_001)] {
         assert!(MacOsVoiceSidecarConfig::new(
             &executable,

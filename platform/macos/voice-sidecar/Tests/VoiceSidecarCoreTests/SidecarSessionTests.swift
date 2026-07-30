@@ -34,8 +34,9 @@ func startSessionSnapshotsThresholdsAndEmitsReady() async throws {
 
 @Test
 func injectedServicesStartOnlyAfterStartCapture() async throws {
-    let audio = RecordingAudioService()
-    let recognition = RecordingRecognitionService()
+    let callLog = CallLog()
+    let audio = RecordingAudioService(callLog: callLog)
+    let recognition = RecordingRecognitionService(callLog: callLog)
     let session = SidecarSession(
         audioService: audio,
         recognitionService: recognition,
@@ -45,7 +46,9 @@ func injectedServicesStartOnlyAfterStartCapture() async throws {
 
     try await startSession(session)
     #expect(await audio.configurations.isEmpty)
+    #expect(await recognition.preparedConfigurations.isEmpty)
     #expect(await recognition.configurations.isEmpty)
+    await callLog.clear()
 
     try await session.handleControl(
         ChildFrame(control: .startCapture(sessionID: 7))
@@ -57,7 +60,16 @@ func injectedServicesStartOnlyAfterStartCapture() async throws {
         finalSilenceMilliseconds: 600
     )
     #expect(await audio.configurations == [expected])
+    #expect(await recognition.preparedConfigurations == [expected])
     #expect(await recognition.configurations == [expected])
+    #expect(
+        await callLog.entries
+            == [
+                "recognition.prepare",
+                "audio.start",
+                "recognition.start",
+            ]
+    )
 }
 
 @Test
@@ -333,9 +345,14 @@ func localFlushPrecedesBargeInActivity() async throws {
     )
 }
 
-@Test(arguments: [UInt64(100), UInt64(300)])
-func bargeInAlwaysRequiresTwoConsecutiveWindows(
-    speechStartMilliseconds: UInt64
+@Test(arguments: [
+    (UInt64(100), 1),
+    (UInt64(200), 2),
+    (UInt64(1_000), 10),
+])
+func bargeInHonorsConfiguredSpeechStartThreshold(
+    speechStartMilliseconds: UInt64,
+    requiredWindows: Int
 ) async throws {
     let playback = RecordingPlaybackService()
     let session = SidecarSession(
@@ -352,19 +369,21 @@ func bargeInAlwaysRequiresTwoConsecutiveWindows(
         ChildFrame(audioSessionID: 7, frame: pcmFrame(generationID: 5))
     )
 
+    for index in 1..<requiredWindows {
+        #expect(
+            try await session.observeBargeIn(
+                isSpeech: true,
+                frameMilliseconds: 100,
+                atMilliseconds: UInt64(index * 100)
+            ) == false
+        )
+        #expect(await playback.flushedGenerations.isEmpty)
+    }
     #expect(
         try await session.observeBargeIn(
             isSpeech: true,
             frameMilliseconds: 100,
-            atMilliseconds: 10
-        ) == false
-    )
-    #expect(await playback.flushedGenerations.isEmpty)
-    #expect(
-        try await session.observeBargeIn(
-            isSpeech: true,
-            frameMilliseconds: 100,
-            atMilliseconds: 110
+            atMilliseconds: UInt64(requiredWindows * 100)
         ) == true
     )
     #expect(await playback.flushedGenerations == [5])
@@ -714,14 +733,63 @@ func partialAudioStartFailureStopsAttemptedServiceOnceBeforeFailure() async thro
     #expect(
         await callLog.entries
             == [
+                "recognition.prepare",
                 "audio.start",
                 "audio.stop",
+                "recognition.stop",
                 "playback.stop",
                 "event.failure",
             ]
     )
     #expect(await audio.stopCount == 1)
-    #expect(await recognition.stopCount == 0)
+    #expect(await recognition.stopCount == 1)
+    #expect(await playback.stopCount == 1)
+}
+
+@Test
+func recognitionPreflightFailureDoesNotActivateCapture() async throws {
+    let callLog = CallLog()
+    let audio = RecordingAudioService(callLog: callLog)
+    let recognition = RecordingRecognitionService(callLog: callLog)
+    let failure = SidecarServiceFailure(
+        stage: .speechRecognizer,
+        code: .recognitionFailed
+    )
+    await recognition.setPrepareFailure(failure)
+    let playback = RecordingPlaybackService(callLog: callLog)
+    let events = RecordingEventSink(callLog: callLog)
+    let session = SidecarSession(
+        audioService: audio,
+        recognitionService: recognition,
+        playbackService: playback,
+        eventSink: events
+    )
+    try await startSession(session)
+    await callLog.clear()
+
+    do {
+        try await session.handleControl(
+            ChildFrame(control: .startCapture(sessionID: 7))
+        )
+        Issue.record("expected recognition preflight failure")
+    } catch let error as SidecarServiceFailure {
+        #expect(error == failure)
+    } catch {
+        Issue.record("unexpected error \(error)")
+    }
+
+    #expect(
+        await callLog.entries
+            == [
+                "recognition.prepare",
+                "recognition.stop",
+                "playback.stop",
+                "event.failure",
+            ]
+    )
+    #expect(await audio.configurations.isEmpty)
+    #expect(await audio.stopCount == 0)
+    #expect(await recognition.stopCount == 1)
     #expect(await playback.stopCount == 1)
 }
 
@@ -760,6 +828,7 @@ func partialRecognitionStartFailureCleansUpInReverseOrderOnce() async throws {
     #expect(
         await callLog.entries
             == [
+                "recognition.prepare",
                 "audio.start",
                 "recognition.start",
                 "recognition.stop",

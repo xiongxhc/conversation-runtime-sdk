@@ -24,6 +24,7 @@ use crate::config_file::load_toml;
 const SPEECH_START_MS: std::ops::RangeInclusive<u64> = 100..=1_000;
 const FINAL_SILENCE_MS: std::ops::RangeInclusive<u64> = 200..=3_000;
 const GENERATION_BUFFER_SIZE: usize = 16;
+const BUNDLED_SIDECAR_NAME: &str = "conversation-voice-sidecar";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -154,7 +155,7 @@ struct AudioConfig {
     backend: AudioBackend,
     execution: ExecutionConfig,
     provider: String,
-    sidecar_executable: PathBuf,
+    sidecar_executable: Option<PathBuf>,
     max_error_bytes: usize,
 }
 
@@ -233,8 +234,13 @@ impl SessionConfig {
         if !self.asr.model_path.is_dir() {
             return Err("ASR model path must be an existing directory".to_owned());
         }
-        if !self.audio.sidecar_executable.is_absolute() {
-            return Err("sidecar executable must be absolute".to_owned());
+        if self
+            .audio
+            .sidecar_executable
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
+        {
+            return Err("sidecar executable override must be absolute".to_owned());
         }
         if !self.language.temperature.is_finite() || self.language.temperature < 0.0 {
             return Err("language temperature must be finite and non-negative".to_owned());
@@ -376,8 +382,9 @@ impl SessionConfig {
     }
 
     fn voice_io(&self) -> Result<MacOsVoiceSidecar, String> {
+        let sidecar_executable = self.sidecar_executable()?;
         let config = MacOsVoiceSidecarConfig::new(
-            &self.audio.sidecar_executable,
+            sidecar_executable,
             &self.asr.model_path,
             match self.capture.device {
                 CaptureDevice::SystemDefault => SystemDevice::SystemDefault,
@@ -390,6 +397,18 @@ impl SessionConfig {
         .with_max_stderr_bytes(self.audio.max_error_bytes)
         .map_err(adapter_message)?;
         Ok(MacOsVoiceSidecar::new(config))
+    }
+
+    fn sidecar_executable(&self) -> Result<PathBuf, String> {
+        if let Some(executable) = &self.audio.sidecar_executable {
+            return Ok(executable.clone());
+        }
+        let executable = std::env::current_exe()
+            .map_err(|_| "failed to resolve the running voice-loop executable".to_owned())?;
+        let directory = executable.parent().ok_or_else(|| {
+            "failed to resolve the running voice-loop executable directory".to_owned()
+        })?;
+        Ok(directory.join(BUNDLED_SIDECAR_NAME))
     }
 }
 

@@ -166,7 +166,7 @@ fn eof_converts_partial_data_to_typed_truncation() {
     assert!(matches!(
         error,
         SidecarCodecError::TruncatedFrame {
-            required: _,
+            required: 69,
             available
         } if available == bytes.len()
     ));

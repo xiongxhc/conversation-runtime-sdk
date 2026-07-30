@@ -1,11 +1,18 @@
 public struct BargeInGate: Equatable, Sendable {
     public static let windowMilliseconds: UInt64 = 100
-    public static let requiredConsecutiveWindows = 2
 
+    private let requiredConsecutiveWindows: Int
     private var consecutiveWindows = 0
     private var triggered = false
 
-    public init() {}
+    public init(speechStartMilliseconds: UInt64 = 200) {
+        let fullWindows =
+            speechStartMilliseconds / Self.windowMilliseconds
+        let roundedWindows =
+            fullWindows
+            + (speechStartMilliseconds % Self.windowMilliseconds == 0 ? 0 : 1)
+        requiredConsecutiveWindows = max(1, Int(clamping: roundedWindows))
+    }
 
     public mutating func observe(
         isSpeech: Bool,
@@ -22,7 +29,7 @@ public struct BargeInGate: Equatable, Sendable {
         }
 
         consecutiveWindows += 1
-        guard consecutiveWindows == Self.requiredConsecutiveWindows else {
+        guard consecutiveWindows == requiredConsecutiveWindows else {
             return false
         }
 

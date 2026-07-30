@@ -157,13 +157,19 @@ Build the Rust CLI and macOS sidecar without starting capture:
 ```bash
 cargo build --locked --release -p conversation-voice-probe \
   --bin conversation-voice-loop
-tests/voice/build-macos-sidecar.sh
+SIDECAR="$(tests/voice/build-macos-sidecar.sh)"
+install -m 755 "$SIDECAR" \
+  target/release/conversation-voice-sidecar
 ```
 
 Copy the public schema-v2 template to a private absolute path outside the
 repository. Replace every placeholder with installed local components,
-including the absolute ASR model directory and sidecar executable. Do not
-commit the private file.
+including the absolute ASR model directory. By default the CLI resolves
+`conversation-voice-sidecar` beside its own executable and never through
+ambient `PATH`; the commands above create that layout. The optional
+`sidecar_executable` setting is an absolute development/packaging override.
+Missing, relative, and non-executable paths fail before capture. Do not commit
+the private file.
 
 ```bash
 PRIVATE_SESSION_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/conversation-runtime/voice-session.toml"

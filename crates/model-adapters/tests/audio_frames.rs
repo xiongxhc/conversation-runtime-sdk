@@ -35,6 +35,20 @@ fn pcm_frame_requires_aligned_bounded_payload() {
 }
 
 #[test]
+fn pcm_frame_alignment_covers_float_and_stereo_formats() {
+    for (sample_format, channels, aligned, misaligned) in [
+        (PcmSampleFormat::Signed16LittleEndian, 2, 4, 2),
+        (PcmSampleFormat::Float32LittleEndian, 1, 4, 2),
+        (PcmSampleFormat::Float32LittleEndian, 2, 8, 4),
+    ] {
+        let format = PcmFormat::new(24_000, channels, sample_format).unwrap();
+
+        assert!(frame(0, format, vec![0; aligned]).is_ok());
+        assert!(frame(0, format, vec![0; misaligned]).is_err());
+    }
+}
+
+#[test]
 fn pcm_format_requires_non_zero_sample_rate_and_channels() {
     assert!(PcmFormat::new(0, 1, PcmSampleFormat::Signed16LittleEndian).is_err());
     assert!(PcmFormat::new(24_000, 0, PcmSampleFormat::Signed16LittleEndian).is_err());

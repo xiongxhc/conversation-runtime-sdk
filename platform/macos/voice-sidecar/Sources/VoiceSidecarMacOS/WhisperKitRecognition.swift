@@ -3,6 +3,84 @@ import NaturalLanguage
 import VoiceSidecarCore
 @preconcurrency import WhisperKit
 
+struct UnicodeTokenSplitter {
+    static func split(
+        tokens: [Int],
+        decode: ([Int]) -> String
+    ) -> (words: [String], wordTokens: [[Int]]) {
+        let decodedFull = decode(tokens)
+        let replacementString = "\u{fffd}"
+        var words: [String] = []
+        var wordTokens: [[Int]] = []
+        var currentTokens: [Int] = []
+
+        for token in tokens {
+            currentTokens.append(token)
+            let decoded = decode(currentTokens)
+            let replacementExistsInFullText =
+                decoded.range(of: replacementString).map {
+                    replacementExists(
+                        decodedRange: $0,
+                        decoded: decoded,
+                        decodedFull: decodedFull,
+                        replacementString: replacementString
+                    )
+                } ?? false
+            if !decoded.contains(replacementString)
+                || replacementExistsInFullText
+            {
+                words.append(decoded)
+                wordTokens.append(currentTokens)
+                currentTokens = []
+            }
+        }
+        return (words, wordTokens)
+    }
+
+    private static func replacementExists(
+        decodedRange: Range<String.Index>,
+        decoded: String,
+        decodedFull: String,
+        replacementString: String
+    ) -> Bool {
+        guard
+            let decodedLower = decodedRange.lowerBound.samePosition(
+                in: decoded.utf8
+            ),
+            let decodedUpper = decodedRange.upperBound.samePosition(
+                in: decoded.utf8
+            )
+        else {
+            return false
+        }
+        let lowerOffset = decoded.utf8.distance(
+            from: decoded.utf8.startIndex,
+            to: decodedLower
+        )
+        let upperOffset = decoded.utf8.distance(
+            from: decoded.utf8.startIndex,
+            to: decodedUpper
+        )
+        guard
+            let fullLower = decodedFull.utf8.index(
+                decodedFull.utf8.startIndex,
+                offsetBy: lowerOffset,
+                limitedBy: decodedFull.utf8.endIndex
+            ),
+            let fullUpper = decodedFull.utf8.index(
+                decodedFull.utf8.startIndex,
+                offsetBy: upperOffset,
+                limitedBy: decodedFull.utf8.endIndex
+            )
+        else {
+            return false
+        }
+        return decodedFull.utf8[fullLower..<fullUpper].elementsEqual(
+            replacementString.utf8
+        )
+    }
+}
+
 public final class OfflineWhisperTokenizer:
     WhisperTokenizer,
     @unchecked Sendable
@@ -90,29 +168,9 @@ public final class OfflineWhisperTokenizer:
     private func splitTokensOnUnicode(
         tokens: [Int]
     ) -> (words: [String], wordTokens: [[Int]]) {
-        let decodedFull = tokenizer.decode(tokens: tokens)
-        let replacementString = "\u{fffd}"
-        var words: [String] = []
-        var wordTokens: [[Int]] = []
-        var currentTokens: [Int] = []
-
-        for token in tokens {
-            currentTokens.append(token)
-            let decoded = tokenizer.decode(tokens: currentTokens)
-            var replacementExistsInFullText = false
-            if let range = decoded.range(of: replacementString) {
-                replacementExistsInFullText =
-                    decodedFull[range] == replacementString
-            }
-            if !decoded.contains(replacementString)
-                || replacementExistsInFullText
-            {
-                words.append(decoded)
-                wordTokens.append(currentTokens)
-                currentTokens = []
-            }
+        UnicodeTokenSplitter.split(tokens: tokens) {
+            tokenizer.decode(tokens: $0)
         }
-        return (words, wordTokens)
     }
 
     private func splitTokensOnSpaces(
@@ -837,6 +895,7 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
     )
     private let eventRelay = RecognitionEventRelay()
 
+    private var preparedConfiguration: SidecarConfiguration?
     private var transcriber: AudioStreamTranscriber?
     private var hypothesisPipeline: OrderedRecognitionBatchPipeline?
     private var transcriptionTask: Task<RecognitionWorkerCompletion, Never>?
@@ -865,8 +924,10 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
         await eventRelay.setFailureHandler(handler)
     }
 
-    public func start(configuration: SidecarConfiguration) async throws {
-        guard transcriptionTask == nil else {
+    public func prepare(configuration: SidecarConfiguration) async throws {
+        guard transcriptionTask == nil,
+            preparedConfiguration == nil
+        else {
             throw SidecarServiceFailure(
                 stage: .speechRecognizer,
                 code: .invalidState
@@ -892,12 +953,6 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
             )
         }
 
-        workerStopState = RecognitionWorkerStopState()
-        speechGate = RecognitionSpeechGate(
-            thresholdMilliseconds: configuration.speechStartMilliseconds
-        )
-        startTimeNanoseconds = DispatchTime.now().uptimeNanoseconds
-
         let tokenizer: OfflineWhisperTokenizer
         let whisperKit: WhisperKit
         do {
@@ -919,30 +974,8 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
                 code: .recognitionFailed
             )
         }
-
         let mapper = mapper
-        let eventRelay = eventRelay
-        let sessionID = configuration.sessionID
         let pipeline = OrderedRecognitionBatchPipeline(capacity: 8)
-        let hypothesisWorker = pipeline.start { hypotheses in
-            for hypothesis in hypotheses {
-                _ = try await eventRelay.emit(
-                    .hypothesis(hypothesis)
-                )
-            }
-        }
-        hypothesisPipeline = pipeline
-        monitorTasks.append(
-            monitorRecognitionWorker(hypothesisWorker) { failure in
-                await eventRelay.reportFailure(
-                    sessionID: sessionID,
-                    failure: failure
-                )
-            }
-        )
-        audioProcessor.setConversionFailureHandler { failure in
-            pipeline.fail(failure)
-        }
         let transcriber = AudioStreamTranscriber(
             audioEncoder: whisperKit.audioEncoder,
             featureExtractor: whisperKit.featureExtractor,
@@ -963,7 +996,49 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
                 pipeline.enqueue(hypotheses)
             }
         )
+        preparedConfiguration = configuration
+        hypothesisPipeline = pipeline
         self.transcriber = transcriber
+    }
+
+    public func start(configuration: SidecarConfiguration) async throws {
+        guard transcriptionTask == nil,
+            preparedConfiguration == configuration,
+            let pipeline = hypothesisPipeline,
+            let transcriber
+        else {
+            throw SidecarServiceFailure(
+                stage: .speechRecognizer,
+                code: .invalidState
+            )
+        }
+
+        workerStopState = RecognitionWorkerStopState()
+        speechGate = RecognitionSpeechGate(
+            thresholdMilliseconds: configuration.speechStartMilliseconds
+        )
+        startTimeNanoseconds = DispatchTime.now().uptimeNanoseconds
+
+        let eventRelay = eventRelay
+        let sessionID = configuration.sessionID
+        let hypothesisWorker = pipeline.start { hypotheses in
+            for hypothesis in hypotheses {
+                _ = try await eventRelay.emit(
+                    .hypothesis(hypothesis)
+                )
+            }
+        }
+        monitorTasks.append(
+            monitorRecognitionWorker(hypothesisWorker) { failure in
+                await eventRelay.reportFailure(
+                    sessionID: sessionID,
+                    failure: failure
+                )
+            }
+        )
+        audioProcessor.setConversionFailureHandler { failure in
+            pipeline.fail(failure)
+        }
 
         let voiceMailbox = RecognitionVoiceMailbox(capacity: 8)
         self.voiceMailbox = voiceMailbox
@@ -1035,6 +1110,7 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
         self.transcriptionTask = nil
         self.transcriber = nil
         audioProcessor.stopRecording()
+        preparedConfiguration = nil
 
         for task in monitorTasks {
             task.cancel()

@@ -475,6 +475,189 @@ func unexpectedRecognitionWorkerCompletionCannotSelfAwait() async {
 }
 
 @Test
+func realSessionPublicationFailureCleansUpAfterRecognitionWorkerExit() async throws {
+    let audio = FatalRecordingAudioService()
+    let recognition = SessionOwnedRecognitionWorker()
+    let playback = IntegrationPlaybackService()
+    let events = FailOnceEventSink()
+    let session = SidecarSession(
+        audioService: audio,
+        recognitionService: recognition,
+        playbackService: playback,
+        eventSink: events
+    )
+    let exitSignal = LockedSignal()
+    let controller = SidecarFailureController(
+        session: session,
+        exitHandler: {
+            exitSignal.signal()
+        }
+    )
+    await recognition.attach(
+        publisher: SidecarRecognitionEventPublisher(session: session),
+        failureController: controller
+    )
+    try await startFatalSession(session)
+    await events.failNext()
+
+    #expect(
+        await recognition.publish(
+            RecognitionHypothesis(
+                segmentID: 1,
+                text: "rejected",
+                engineFinal: true
+            )
+        ) == .queued
+    )
+    #expect(exitSignal.wait() == .success)
+
+    #expect(await recognition.stopCount == 1)
+    #expect(await recognition.stopObservedExitedWorker)
+    #expect(await audio.stopCount == 1)
+    #expect(await playback.stopCount == 1)
+    #expect(
+        await events.frames.filter {
+            if case .failure = $0.control {
+                return true
+            }
+            return false
+        }
+            == [
+                ChildFrame(
+                    control: .failure(
+                        sessionID: 7,
+                        stage: .speechRecognizer,
+                        code: .recognitionFailed
+                    )
+                )
+            ]
+    )
+}
+
+@Test
+func speakingGapPublishesEndedBeforeResetAndLaterSilenceDoesNotDuplicate() async throws {
+    let playback = IntegrationPlaybackService()
+    let events = FailOnceEventSink()
+    let session = SidecarSession(
+        audioService: FatalRecordingAudioService(),
+        recognitionService: FatalRecordingRecognitionService(),
+        playbackService: playback,
+        eventSink: events
+    )
+    try await startFatalSession(session)
+    try await session.handleMedia(
+        ChildFrame(
+            audioSessionID: 7,
+            frame: pcmFrame(generationID: 5)
+        )
+    )
+    let publisher = SidecarRecognitionEventPublisher(session: session)
+    var gate = RecognitionSpeechGate(thresholdMilliseconds: 300)
+    #expect(gate.observe(isSpeech: true) == .none)
+    #expect(
+        try await !publisher.publish(
+            .voiceWindow(
+                isSpeech: true,
+                frameMilliseconds: 100,
+                atMilliseconds: 100
+            )
+        )
+    )
+    #expect(gate.observe(isSpeech: true) == .none)
+    #expect(
+        try await publisher.publish(
+            .voiceWindow(
+                isSpeech: true,
+                frameMilliseconds: 100,
+                atMilliseconds: 200
+            )
+        )
+    )
+
+    #expect(!gate.isSpeaking)
+    _ = try await publisher.publish(
+        .captureDiscontinuity(atMilliseconds: 300)
+    )
+    gate.resetForDiscontinuity()
+    #expect(gate.observe(isSpeech: false) == .none)
+
+    let activities: [VoiceActivity] = await events.frames.compactMap { frame in
+        guard
+            case .voiceActivity(
+                sessionID: _,
+                activity: let activity
+            ) = frame.control
+        else {
+            return nil
+        }
+        return activity
+    }
+    #expect(
+        activities
+            == [
+                .speechStarted(atMilliseconds: 200),
+                .speechEnded(atMilliseconds: 300),
+            ]
+    )
+}
+
+@Test
+func sessionBargeInRequiresTwoPostGapPlaybackActiveWindows() async throws {
+    let playback = IntegrationPlaybackService()
+    let events = FailOnceEventSink()
+    let session = SidecarSession(
+        audioService: FatalRecordingAudioService(),
+        recognitionService: FatalRecordingRecognitionService(),
+        playbackService: playback,
+        eventSink: events
+    )
+    try await startFatalSession(session)
+    try await session.handleMedia(
+        ChildFrame(
+            audioSessionID: 7,
+            frame: pcmFrame(generationID: 5)
+        )
+    )
+    let publisher = SidecarRecognitionEventPublisher(session: session)
+
+    #expect(
+        try await !publisher.publish(
+            .voiceWindow(
+                isSpeech: true,
+                frameMilliseconds: 100,
+                atMilliseconds: 100
+            )
+        )
+    )
+    #expect(
+        try await !publisher.publish(
+            .captureDiscontinuity(atMilliseconds: 200)
+        )
+    )
+    #expect(
+        try await !publisher.publish(
+            .voiceWindow(
+                isSpeech: true,
+                frameMilliseconds: 100,
+                atMilliseconds: 300
+            )
+        )
+    )
+    #expect(await playback.flushedGenerationIDs.isEmpty)
+
+    #expect(
+        try await publisher.publish(
+            .voiceWindow(
+                isSpeech: true,
+                frameMilliseconds: 100,
+                atMilliseconds: 400
+            )
+        )
+    )
+    #expect(await playback.flushedGenerationIDs == [5])
+}
+
+@Test
 func publicationRejectionTriggersOneFatalCleanupAndExit() async throws {
     let audio = FatalRecordingAudioService()
     let recognition = FatalRecordingRecognitionService()
@@ -850,6 +1033,107 @@ private actor FatalRecordingPlaybackService: SidecarPlaybackService {
 
     func stop() {
         stopCount += 1
+    }
+}
+
+private actor IntegrationPlaybackService: SidecarPlaybackService {
+    private(set) var flushedGenerationIDs: [UInt64] = []
+    private(set) var stopCount = 0
+
+    func enqueue(_: PCMFrame) {}
+
+    func flush(throughGenerationID generationID: UInt64) {
+        flushedGenerationIDs.append(generationID)
+    }
+
+    func stop() {
+        stopCount += 1
+    }
+}
+
+private actor SessionOwnedRecognitionWorker: SidecarRecognitionService {
+    private var publisher: SidecarRecognitionEventPublisher?
+    private var failureController: SidecarFailureController?
+    private var pipeline: OrderedRecognitionBatchPipeline?
+    private var monitor: Task<Void, Never>?
+    private let monitorObservedExit = LockedFlag()
+    private(set) var stopCount = 0
+    private(set) var stopObservedExitedWorker = false
+
+    func attach(
+        publisher: SidecarRecognitionEventPublisher,
+        failureController: SidecarFailureController
+    ) {
+        self.publisher = publisher
+        self.failureController = failureController
+    }
+
+    func start(configuration: SidecarConfiguration) throws {
+        guard let publisher, let failureController else {
+            throw SidecarServiceFailure(
+                stage: .speechRecognizer,
+                code: .invalidState
+            )
+        }
+        let pipeline = OrderedRecognitionBatchPipeline(capacity: 2)
+        let worker = pipeline.start { hypotheses in
+            for hypothesis in hypotheses {
+                _ = try await publisher.publish(
+                    .hypothesis(hypothesis)
+                )
+            }
+        }
+        self.pipeline = pipeline
+        let monitorObservedExit = monitorObservedExit
+        monitor = monitorRecognitionWorker(worker) { failure in
+            monitorObservedExit.set()
+            await failureController.terminate(
+                with: failure,
+                fallbackSessionID: configuration.sessionID
+            )
+        }
+    }
+
+    func stop() async {
+        stopCount += 1
+        stopObservedExitedWorker = monitorObservedExit.value
+        await pipeline?.cancel()
+        pipeline = nil
+        monitor?.cancel()
+        monitor = nil
+    }
+
+    func publish(
+        _ hypothesis: RecognitionHypothesis
+    ) -> RecognitionBatchEnqueueResult {
+        pipeline?.enqueue([hypothesis]) ?? .terminated
+    }
+}
+
+private final class LockedFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isSet = false
+
+    var value: Bool {
+        lock.withLock { isSet }
+    }
+
+    func set() {
+        lock.withLock {
+            isSet = true
+        }
+    }
+}
+
+private final class LockedSignal: @unchecked Sendable {
+    private let semaphore = DispatchSemaphore(value: 0)
+
+    func signal() {
+        semaphore.signal()
+    }
+
+    func wait() -> DispatchTimeoutResult {
+        semaphore.wait(timeout: .now() + 2)
     }
 }
 

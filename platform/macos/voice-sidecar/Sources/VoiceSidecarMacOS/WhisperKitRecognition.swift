@@ -614,6 +614,7 @@ public enum WhisperKitRecognitionEvent: Sendable {
         atMilliseconds: UInt64
     )
     case activity(VoiceActivity)
+    case captureDiscontinuity(atMilliseconds: UInt64)
     case failure(
         sessionID: UInt64,
         failure: SidecarServiceFailure
@@ -631,6 +632,10 @@ struct RecognitionSpeechGate: Sendable {
     private let thresholdMilliseconds: UInt64
     private var positiveMilliseconds: UInt64 = 0
     private var speaking = false
+
+    var isSpeaking: Bool {
+        speaking
+    }
 
     init(thresholdMilliseconds: UInt64) {
         self.thresholdMilliseconds = thresholdMilliseconds
@@ -663,6 +668,50 @@ struct RecognitionSpeechGate: Sendable {
     mutating func resetForDiscontinuity() {
         positiveMilliseconds = 0
         speaking = false
+    }
+}
+
+public struct SidecarRecognitionEventPublisher: Sendable {
+    private let session: SidecarSession
+
+    public init(session: SidecarSession) {
+        self.session = session
+    }
+
+    @discardableResult
+    public func publish(
+        _ event: WhisperKitRecognitionEvent
+    ) async throws -> Bool {
+        switch event {
+        case .hypothesis(let hypothesis):
+            try await session.publishRecognitionHypothesisFromWorker(
+                hypothesis
+            )
+            return false
+        case .voiceWindow(
+            let isSpeech,
+            let frameMilliseconds,
+            let atMilliseconds
+        ):
+            return try await session.observeBargeInFromRecognitionWorker(
+                isSpeech: isSpeech,
+                frameMilliseconds: frameMilliseconds,
+                atMilliseconds: atMilliseconds
+            )
+        case .activity(let activity):
+            try await session.publishVoiceActivityFromRecognitionWorker(
+                activity
+            )
+            return false
+        case .captureDiscontinuity(let atMilliseconds):
+            try await session
+                .observeCaptureDiscontinuityFromRecognitionWorker(
+                    atMilliseconds: atMilliseconds
+                )
+            return false
+        case .failure(_, let failure):
+            throw failure
+        }
     }
 }
 
@@ -1014,6 +1063,11 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
     ) async throws {
         switch input {
         case .discontinuity:
+            _ = try await eventRelay.emit(
+                .captureDiscontinuity(
+                    atMilliseconds: elapsedMilliseconds()
+                )
+            )
             speechGate.resetForDiscontinuity()
         case .window(let window):
             try await processVoiceWindow(window)
@@ -1022,9 +1076,7 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
 
     private func processVoiceWindow(_ window: [Float]) async throws {
         let isSpeech = vad.voiceActivity(in: window).last == true
-        let atMilliseconds =
-            (DispatchTime.now().uptimeNanoseconds
-                &- startTimeNanoseconds) / 1_000_000
+        let atMilliseconds = elapsedMilliseconds()
         let didBargeIn = try await eventRelay.emit(
             .voiceWindow(
                 isSpeech: isSpeech,
@@ -1063,5 +1115,10 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
                 )
             )
         }
+    }
+
+    private func elapsedMilliseconds() -> UInt64 {
+        (DispatchTime.now().uptimeNanoseconds
+            &- startTimeNanoseconds) / 1_000_000
     }
 }

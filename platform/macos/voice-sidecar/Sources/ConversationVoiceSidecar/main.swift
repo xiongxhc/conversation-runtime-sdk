@@ -93,34 +93,11 @@ await playback.setFailureHandler { failure in
         fallbackSessionID: 0
     )
 }
+let recognitionPublisher = SidecarRecognitionEventPublisher(
+    session: session
+)
 await recognition.setEventHandler { event in
-    switch event {
-    case .hypothesis(let hypothesis):
-        try await session.publishRecognitionHypothesis(hypothesis)
-        return false
-    case .voiceWindow(
-        let
-            isSpeech,
-        let
-            frameMilliseconds,
-        let
-            atMilliseconds
-    ):
-        return try await session.observeBargeIn(
-            isSpeech: isSpeech,
-            frameMilliseconds: frameMilliseconds,
-            atMilliseconds: atMilliseconds
-        )
-    case .activity(let activity):
-        try await session.publishVoiceActivity(activity)
-        return false
-    case .failure(let sessionID, let failure):
-        await failureController.terminate(
-            with: failure,
-            fallbackSessionID: sessionID
-        )
-        return false
-    }
+    try await recognitionPublisher.publish(event)
 }
 await recognition.setFailureHandler { sessionID, failure in
     await failureController.terminate(

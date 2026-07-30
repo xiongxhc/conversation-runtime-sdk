@@ -91,6 +91,7 @@ public actor SidecarSession {
     private var cleanupStarted = false
     private var playbackBuffer = PlaybackBuffer()
     private var bargeInGate: BargeInGate?
+    private var voiceActivityActive = false
 
     public var isTerminated: Bool {
         phase == .terminated
@@ -201,18 +202,17 @@ public actor SidecarSession {
     public func publishVoiceActivity(_ activity: VoiceActivity) async throws {
         try requireAvailableOperation()
         do {
-            let configuration = try requireCapturing()
-            try await eventSink.send(
-                ChildFrame(
-                    control: .voiceActivity(
-                        sessionID: configuration.sessionID,
-                        activity: activity
-                    )
-                )
-            )
+            try await sendVoiceActivity(activity)
         } catch {
             try await fail(error, fallbackSessionID: configuration?.sessionID ?? 0)
         }
+    }
+
+    public func publishVoiceActivityFromRecognitionWorker(
+        _ activity: VoiceActivity
+    ) async throws {
+        try requireAvailableOperation()
+        try await sendVoiceActivity(activity)
     }
 
     public func publishRecognitionHypothesis(
@@ -220,18 +220,17 @@ public actor SidecarSession {
     ) async throws {
         try requireAvailableOperation()
         do {
-            let configuration = try requireCapturing()
-            try await eventSink.send(
-                ChildFrame(
-                    control: .transcriptHypothesis(
-                        sessionID: configuration.sessionID,
-                        hypothesis: hypothesis
-                    )
-                )
-            )
+            try await sendRecognitionHypothesis(hypothesis)
         } catch {
             try await fail(error, fallbackSessionID: configuration?.sessionID ?? 0)
         }
+    }
+
+    public func publishRecognitionHypothesisFromWorker(
+        _ hypothesis: RecognitionHypothesis
+    ) async throws {
+        try requireAvailableOperation()
+        try await sendRecognitionHypothesis(hypothesis)
     }
 
     @discardableResult
@@ -242,40 +241,119 @@ public actor SidecarSession {
     ) async throws -> Bool {
         try requireAvailableOperation()
         do {
-            let configuration = try requireCapturing()
-            guard playbackBuffer.isPlaybackActive,
-                  let generationID = playbackBuffer.activeGenerationID
-            else {
-                bargeInGate?.reset()
-                return false
-            }
-            guard bargeInGate?.observe(
+            return try await processBargeIn(
                 isSpeech: isSpeech,
-                frameMilliseconds: frameMilliseconds
-            ) == true else {
-                return false
-            }
-
-            let resumePhase = try reserveFlush(
-                throughGenerationID: generationID
+                frameMilliseconds: frameMilliseconds,
+                atMilliseconds: atMilliseconds
             )
-            try await playbackService.flush(
-                throughGenerationID: generationID
-            )
-            bargeInGate?.reset()
-            try await eventSink.send(
-                ChildFrame(
-                    control: .voiceActivity(
-                        sessionID: configuration.sessionID,
-                        activity: .speechStarted(atMilliseconds: atMilliseconds)
-                    )
-                )
-            )
-            restoreAfterFlush(resumePhase)
-            return true
         } catch {
             try await fail(error, fallbackSessionID: configuration?.sessionID ?? 0)
         }
+    }
+
+    @discardableResult
+    public func observeBargeInFromRecognitionWorker(
+        isSpeech: Bool,
+        frameMilliseconds: UInt64,
+        atMilliseconds: UInt64
+    ) async throws -> Bool {
+        try requireAvailableOperation()
+        return try await processBargeIn(
+            isSpeech: isSpeech,
+            frameMilliseconds: frameMilliseconds,
+            atMilliseconds: atMilliseconds
+        )
+    }
+
+    public func observeCaptureDiscontinuityFromRecognitionWorker(
+        atMilliseconds: UInt64
+    ) async throws {
+        try requireAvailableOperation()
+        _ = try requireCapturing()
+        if voiceActivityActive {
+            try await sendVoiceActivity(
+                .speechEnded(atMilliseconds: atMilliseconds)
+            )
+        }
+        bargeInGate?.reset()
+    }
+
+    private func sendVoiceActivity(_ activity: VoiceActivity) async throws {
+        let configuration = try requireCapturing()
+        try await sendVoiceActivity(
+            activity,
+            sessionID: configuration.sessionID
+        )
+    }
+
+    private func sendVoiceActivity(
+        _ activity: VoiceActivity,
+        sessionID: UInt64
+    ) async throws {
+        try await eventSink.send(
+            ChildFrame(
+                control: .voiceActivity(
+                    sessionID: sessionID,
+                    activity: activity
+                )
+            )
+        )
+        switch activity {
+        case .speechStarted, .speechContinued:
+            voiceActivityActive = true
+        case .speechEnded:
+            voiceActivityActive = false
+        }
+    }
+
+    private func sendRecognitionHypothesis(
+        _ hypothesis: RecognitionHypothesis
+    ) async throws {
+        let configuration = try requireCapturing()
+        try await eventSink.send(
+            ChildFrame(
+                control: .transcriptHypothesis(
+                    sessionID: configuration.sessionID,
+                    hypothesis: hypothesis
+                )
+            )
+        )
+    }
+
+    private func processBargeIn(
+        isSpeech: Bool,
+        frameMilliseconds: UInt64,
+        atMilliseconds: UInt64
+    ) async throws -> Bool {
+        let configuration = try requireCapturing()
+        guard playbackBuffer.isPlaybackActive,
+            let generationID = playbackBuffer.activeGenerationID
+        else {
+            bargeInGate?.reset()
+            return false
+        }
+        guard
+            bargeInGate?.observe(
+                isSpeech: isSpeech,
+                frameMilliseconds: frameMilliseconds
+            ) == true
+        else {
+            return false
+        }
+
+        let resumePhase = try reserveFlush(
+            throughGenerationID: generationID
+        )
+        try await playbackService.flush(
+            throughGenerationID: generationID
+        )
+        bargeInGate?.reset()
+        try await sendVoiceActivity(
+            .speechStarted(atMilliseconds: atMilliseconds),
+            sessionID: configuration.sessionID
+        )
+        restoreAfterFlush(resumePhase)
+        return true
     }
 
     private func process(_ control: ChildControl) async throws {

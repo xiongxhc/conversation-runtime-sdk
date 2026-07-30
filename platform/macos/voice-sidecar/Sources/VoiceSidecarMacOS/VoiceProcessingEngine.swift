@@ -27,6 +27,25 @@ public protocol PCMPlaybackScheduling: Sendable {
     func resetPlayback()
 }
 
+public enum CaptureRingPushResult: Equatable, Sendable {
+    case enqueued
+    case capacityOverflow
+    case formatMismatch
+    case oversizedInput
+    case invalidBuffer
+}
+
+public enum CapturePCMEvent: @unchecked Sendable {
+    case buffer(AVAudioPCMBuffer)
+    case discontinuity
+}
+
+enum CaptureStructuralFault: Int32, Equatable, Sendable {
+    case formatMismatch = 1
+    case oversizedInput = 2
+    case invalidBuffer = 3
+}
+
 private struct SystemMicrophonePermissionProvider: MicrophonePermissionProviding {
     func authorizationStatus() -> MicrophoneAuthorization {
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
@@ -49,6 +68,15 @@ private struct SystemMicrophonePermissionProvider: MicrophonePermissionProviding
 }
 
 public final class CapturePCMBufferRing: @unchecked Sendable {
+    private final class Slot {
+        let buffer: AVAudioPCMBuffer
+        var discontinuityBefore = false
+
+        init(buffer: AVAudioPCMBuffer) {
+            self.buffer = buffer
+        }
+    }
+
     private struct FormatSignature: Equatable {
         let commonFormat: AVAudioCommonFormat
         let sampleRate: Double
@@ -66,13 +94,25 @@ public final class CapturePCMBufferRing: @unchecked Sendable {
     private let formatSignature: FormatSignature
     private let frameCapacity: AVAudioFrameCount
     private let capacity: Int
-    private let buffers: [AVAudioPCMBuffer]
+    private let slots: [Slot]
     private var writeSequence: Int64 = 0
     private var readSequence: Int64 = 0
     private var droppedBuffers: Int64 = 0
+    private var pendingDiscontinuity: Int32 = 0
+    private var maximumQueuedBuffers: Int64 = 0
 
     public var droppedBufferCount: Int {
         Int(OSAtomicAdd64Barrier(0, &droppedBuffers))
+    }
+
+    public var queuedBufferCount: Int {
+        let write = OSAtomicAdd64Barrier(0, &writeSequence)
+        let read = OSAtomicAdd64Barrier(0, &readSequence)
+        return Int(write - read)
+    }
+
+    public var maximumQueuedBufferCount: Int {
+        Int(OSAtomicAdd64Barrier(0, &maximumQueuedBuffers))
     }
 
     public init(
@@ -83,8 +123,8 @@ public final class CapturePCMBufferRing: @unchecked Sendable {
         guard frameCapacity > 0, capacity > 0 else {
             throw PCMConversionError.invalidBuffer
         }
-        var buffers: [AVAudioPCMBuffer] = []
-        buffers.reserveCapacity(capacity)
+        var slots: [Slot] = []
+        slots.reserveCapacity(capacity)
         for _ in 0..<capacity {
             guard
                 let buffer = AVAudioPCMBuffer(
@@ -94,31 +134,41 @@ public final class CapturePCMBufferRing: @unchecked Sendable {
             else {
                 throw PCMConversionError.invalidBuffer
             }
-            buffers.append(buffer)
+            slots.append(Slot(buffer: buffer))
         }
         formatSignature = FormatSignature(format)
         self.frameCapacity = frameCapacity
         self.capacity = capacity
-        self.buffers = buffers
+        self.slots = slots
     }
 
     @discardableResult
-    public func copyFromTap(_ source: AVAudioPCMBuffer) -> Bool {
-        guard FormatSignature(source.format) == formatSignature,
-            source.frameLength <= frameCapacity
-        else {
+    public func copyFromTap(
+        _ source: AVAudioPCMBuffer
+    ) -> CaptureRingPushResult {
+        guard FormatSignature(source.format) == formatSignature else {
             OSAtomicIncrement64Barrier(&droppedBuffers)
-            return false
+            return .formatMismatch
+        }
+        guard source.frameLength <= frameCapacity else {
+            OSAtomicIncrement64Barrier(&droppedBuffers)
+            return .oversizedInput
         }
 
         let write = OSAtomicAdd64Barrier(0, &writeSequence)
         let read = OSAtomicAdd64Barrier(0, &readSequence)
         guard write - read < Int64(capacity) else {
             OSAtomicIncrement64Barrier(&droppedBuffers)
-            return false
+            _ = OSAtomicCompareAndSwap32Barrier(
+                0,
+                1,
+                &pendingDiscontinuity
+            )
+            return .capacityOverflow
         }
 
-        let destination = buffers[Int(write % Int64(capacity))]
+        let slot = slots[Int(write % Int64(capacity))]
+        let destination = slot.buffer
         destination.frameLength = source.frameLength
         let sourceList = UnsafeMutableAudioBufferListPointer(
             source.mutableAudioBufferList
@@ -128,7 +178,7 @@ public final class CapturePCMBufferRing: @unchecked Sendable {
         )
         guard sourceList.count == destinationList.count else {
             OSAtomicIncrement64Barrier(&droppedBuffers)
-            return false
+            return .invalidBuffer
         }
         for index in sourceList.indices {
             guard let sourceData = sourceList[index].mData,
@@ -137,7 +187,7 @@ public final class CapturePCMBufferRing: @unchecked Sendable {
                     <= destinationList[index].mDataByteSize
             else {
                 OSAtomicIncrement64Barrier(&droppedBuffers)
-                return false
+                return .invalidBuffer
             }
             memcpy(
                 destinationData,
@@ -147,47 +197,89 @@ public final class CapturePCMBufferRing: @unchecked Sendable {
             destinationList[index].mDataByteSize =
                 sourceList[index].mDataByteSize
         }
+        slot.discontinuityBefore = OSAtomicCompareAndSwap32Barrier(
+            1,
+            0,
+            &pendingDiscontinuity
+        )
         OSAtomicIncrement64Barrier(&writeSequence)
-        return true
+        recordMaximumQueued(write - read + 1)
+        return .enqueued
     }
 
     public func drain(
-        _ handler: (AVAudioPCMBuffer) -> Void
+        _ handler: (CapturePCMEvent) -> Void
     ) {
         var read = OSAtomicAdd64Barrier(0, &readSequence)
         let write = OSAtomicAdd64Barrier(0, &writeSequence)
         while read < write {
-            handler(buffers[Int(read % Int64(capacity))])
+            let slot = slots[Int(read % Int64(capacity))]
+            if slot.discontinuityBefore {
+                slot.discontinuityBefore = false
+                handler(.discontinuity)
+            }
+            handler(.buffer(slot.buffer))
             read += 1
             OSAtomicIncrement64Barrier(&readSequence)
         }
     }
+
+    private func recordMaximumQueued(_ value: Int64) {
+        var current = OSAtomicAdd64Barrier(0, &maximumQueuedBuffers)
+        while value > current {
+            if OSAtomicCompareAndSwap64Barrier(
+                current,
+                value,
+                &maximumQueuedBuffers
+            ) {
+                return
+            }
+            current = OSAtomicAdd64Barrier(0, &maximumQueuedBuffers)
+        }
+    }
 }
 
-private final class CaptureBufferPump: @unchecked Sendable {
+final class CaptureBufferPump: @unchecked Sendable {
+    typealias EventHandler = @Sendable (CapturePCMEvent) -> Void
+    typealias FaultHandler = @Sendable (CaptureStructuralFault) -> Void
+
     private let ring: CapturePCMBufferRing
-    private let handler: @Sendable (AVAudioPCMBuffer) -> Void
+    private let eventHandler: EventHandler
+    private let faultHandler: FaultHandler
     private let semaphore = DispatchSemaphore(value: 0)
     private let queue = DispatchQueue(
         label: "conversation-runtime.voice-capture"
     )
     private var active: Int64 = 1
+    private var pendingFault: Int32 = 0
 
     init(
         ring: CapturePCMBufferRing,
-        handler: @escaping @Sendable (AVAudioPCMBuffer) -> Void
+        eventHandler: @escaping EventHandler,
+        faultHandler: @escaping FaultHandler
     ) {
         self.ring = ring
-        self.handler = handler
+        self.eventHandler = eventHandler
+        self.faultHandler = faultHandler
         queue.async { [self] in
             run()
         }
     }
 
-    func enqueue(_ buffer: AVAudioPCMBuffer) {
-        if ring.copyFromTap(buffer) {
+    @discardableResult
+    func enqueue(_ buffer: AVAudioPCMBuffer) -> CaptureRingPushResult {
+        let result = ring.copyFromTap(buffer)
+        switch result {
+        case .enqueued, .capacityOverflow:
             semaphore.signal()
+        case .formatMismatch:
+            recordFault(.formatMismatch)
+        case .oversizedInput:
+            recordFault(.oversizedInput)
+        case .invalidBuffer:
+            recordFault(.invalidBuffer)
         }
+        return result
     }
 
     func stop() {
@@ -201,8 +293,32 @@ private final class CaptureBufferPump: @unchecked Sendable {
             guard OSAtomicAdd64Barrier(0, &active) == 1 else {
                 return
             }
-            ring.drain(handler)
+            if let fault = takeFault() {
+                faultHandler(fault)
+                _ = OSAtomicCompareAndSwap64Barrier(1, 0, &active)
+                return
+            }
+            ring.drain(eventHandler)
         }
+    }
+
+    private func recordFault(_ fault: CaptureStructuralFault) {
+        _ = OSAtomicCompareAndSwap32Barrier(
+            0,
+            fault.rawValue,
+            &pendingFault
+        )
+        semaphore.signal()
+    }
+
+    private func takeFault() -> CaptureStructuralFault? {
+        let value = OSAtomicAdd32Barrier(0, &pendingFault)
+        guard value != 0,
+            OSAtomicCompareAndSwap32Barrier(value, 0, &pendingFault)
+        else {
+            return nil
+        }
+        return CaptureStructuralFault(rawValue: value)
     }
 }
 
@@ -232,7 +348,7 @@ public final class VoiceProcessingEngine:
     private let permissionProvider: any MicrophonePermissionProviding
     private let stateLock = NSLock()
 
-    private var captureHandler: (@Sendable (AVAudioPCMBuffer) -> Void)?
+    private var captureHandler: (@Sendable (CapturePCMEvent) -> Void)?
     private var capturePump: CaptureBufferPump?
     private var failureHandler: FailureHandler?
     private var configurationObserver: NSObjectProtocol?
@@ -291,7 +407,7 @@ public final class VoiceProcessingEngine:
     }
 
     public func setCaptureHandler(
-        _ handler: (@Sendable (AVAudioPCMBuffer) -> Void)?
+        _ handler: (@Sendable (CapturePCMEvent) -> Void)?
     ) {
         stateLock.withLock {
             captureHandler = handler
@@ -343,10 +459,14 @@ public final class VoiceProcessingEngine:
                 capacity: 8
             )
             let pump = CaptureBufferPump(
-                ring: ring
-            ) { [weak self] buffer in
-                self?.deliverCapture(buffer)
-            }
+                ring: ring,
+                eventHandler: { [weak self] event in
+                    self?.deliverCapture(event)
+                },
+                faultHandler: { [weak self] _ in
+                    self?.captureFault()
+                }
+            )
             capturePump = pump
             inputNode.installTap(
                 onBus: 0,
@@ -448,11 +568,11 @@ public final class VoiceProcessingEngine:
         }
     }
 
-    private func deliverCapture(_ buffer: AVAudioPCMBuffer) {
+    private func deliverCapture(_ event: CapturePCMEvent) {
         let handler = stateLock.withLock {
             captureHandler
         }
-        handler?(buffer)
+        handler?(event)
     }
 
     private func installConfigurationObserver() {
@@ -469,6 +589,10 @@ public final class VoiceProcessingEngine:
     }
 
     private func configurationChanged() {
+        captureFault()
+    }
+
+    private func captureFault() {
         let fatal: (UInt64, FailureHandler?, CaptureBufferPump?)? =
             stateLock.withLock {
                 guard running, let sessionID else {

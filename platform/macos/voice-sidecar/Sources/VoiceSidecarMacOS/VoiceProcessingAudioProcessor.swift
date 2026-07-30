@@ -9,6 +9,7 @@ public final class VoiceProcessingAudioProcessor:
     @unchecked Sendable
 {
     public typealias VoiceWindowHandler = @Sendable ([Float]) -> Void
+    public typealias DiscontinuityHandler = @Sendable () -> Void
     public typealias ConversionFailureHandler =
         @Sendable (SidecarServiceFailure) -> Void
 
@@ -18,6 +19,7 @@ public final class VoiceProcessingAudioProcessor:
         var relativeEnergyWindow = 20
         var callback: (([Float]) -> Void)?
         var voiceWindowHandler: VoiceWindowHandler?
+        var discontinuityHandler: DiscontinuityHandler?
         var conversionFailureHandler: ConversionFailureHandler?
         var windowSamples: [Float] = []
         var paused = true
@@ -119,6 +121,14 @@ public final class VoiceProcessingAudioProcessor:
         }
     }
 
+    public func setDiscontinuityHandler(
+        _ handler: DiscontinuityHandler?
+    ) {
+        stateLock.withLock {
+            state.discontinuityHandler = handler
+        }
+    }
+
     public func setConversionFailureHandler(
         _ handler: ConversionFailureHandler?
     ) {
@@ -174,8 +184,8 @@ public final class VoiceProcessingAudioProcessor:
             state.recordingStartWaiters.removeAll()
             return values
         }
-        engine.setCaptureHandler { [weak self] buffer in
-            self?.process(buffer)
+        engine.setCaptureHandler { [weak self] event in
+            self?.consumeCaptureEvent(event)
         }
         for waiter in waiters {
             waiter.resume()
@@ -228,11 +238,26 @@ public final class VoiceProcessingAudioProcessor:
             state.paused = true
             state.callback = nil
             state.voiceWindowHandler = nil
+            state.discontinuityHandler = nil
             state.conversionFailureHandler = nil
             state.windowSamples = []
         }
         engine.setCaptureHandler(nil)
         recognizerConverter.reset()
+    }
+
+    func consumeCaptureEvent(_ event: CapturePCMEvent) {
+        switch event {
+        case .buffer(let buffer):
+            process(buffer)
+        case .discontinuity:
+            recognizerConverter.reset()
+            let handler = stateLock.withLock {
+                state.windowSamples = []
+                return state.discontinuityHandler
+            }
+            handler?()
+        }
     }
 
     private func process(_ buffer: AVAudioPCMBuffer) {

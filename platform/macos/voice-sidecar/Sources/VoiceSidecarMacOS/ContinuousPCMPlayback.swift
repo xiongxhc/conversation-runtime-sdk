@@ -6,11 +6,16 @@ public actor ContinuousPCMPlayback: SidecarPlaybackService {
         @Sendable (
             PlaybackFrameIdentity
         ) async -> Void
+    public typealias FailureHandler =
+        @Sendable (
+            SidecarServiceFailure
+        ) async -> Void
 
     private let scheduler: any PCMPlaybackScheduling
     private var playbackBuffer = PlaybackBuffer()
     private var epoch: UInt64 = 0
     private var renderedHandler: RenderedHandler?
+    private var failureHandler: FailureHandler?
 
     public init(scheduler: any PCMPlaybackScheduling) {
         self.scheduler = scheduler
@@ -18,6 +23,10 @@ public actor ContinuousPCMPlayback: SidecarPlaybackService {
 
     public func setRenderedHandler(_ handler: RenderedHandler?) {
         renderedHandler = handler
+    }
+
+    public func setFailureHandler(_ handler: FailureHandler?) {
+        failureHandler = handler
     }
 
     public func enqueue(_ frame: PCMFrame) async throws {
@@ -53,6 +62,7 @@ public actor ContinuousPCMPlayback: SidecarPlaybackService {
         epoch &+= 1
         playbackBuffer = PlaybackBuffer()
         renderedHandler = nil
+        failureHandler = nil
         scheduler.resetPlayback()
     }
 
@@ -66,6 +76,13 @@ public actor ContinuousPCMPlayback: SidecarPlaybackService {
         do {
             try playbackBuffer.markRendered(identity)
         } catch {
+            epoch &+= 1
+            await failureHandler?(
+                SidecarServiceFailure(
+                    stage: .audioOutput,
+                    code: .playbackFailed
+                )
+            )
             return
         }
         await renderedHandler?(identity)

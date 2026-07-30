@@ -114,6 +114,18 @@ func unchangedAndWhitespaceRecognitionStateEmitsNothing() {
 }
 
 @Test
+func captureDiscontinuityResetsRecognitionSpeechAccumulation() {
+    var gate = RecognitionSpeechGate(thresholdMilliseconds: 300)
+
+    #expect(gate.observe(isSpeech: true) == .none)
+    #expect(gate.observe(isSpeech: true) == .none)
+    gate.resetForDiscontinuity()
+    #expect(gate.observe(isSpeech: true) == .none)
+    #expect(gate.observe(isSpeech: true) == .none)
+    #expect(gate.observe(isSpeech: true) == .started)
+}
+
+@Test
 func authorizedMicrophoneDoesNotRequestPermission() async throws {
     let requests = PermissionRequestCounter()
     let provider = StubMicrophonePermissionProvider(
@@ -235,6 +247,22 @@ func malformedLocalTokenizerIsRejectedWithoutNetworkRequests() async throws {
 }
 
 @Test
+func networkTrapPositiveControlInterceptsURLSessionWithoutNetwork() async throws {
+    NetworkTrapURLProtocol.reset()
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [NetworkTrapURLProtocol.self]
+    let session = URLSession(configuration: configuration)
+
+    await #expect(throws: (any Error).self) {
+        _ = try await session.data(
+            from: URL(string: "https://network-trap.invalid/tokenizer.json")!
+        )
+    }
+
+    #expect(NetworkTrapURLProtocol.requestCount > 0)
+}
+
+@Test
 func orderedRecognitionBatchesCannotOvertakeDelayedHandlers() async {
     let gate = AsyncGate()
     let recorder = HypothesisRecorder()
@@ -250,21 +278,200 @@ func orderedRecognitionBatchesCannotOvertakeDelayedHandlers() async {
         pipeline.enqueue([
             RecognitionHypothesis(segmentID: 0, text: "zero", engineFinal: false)
         ])
+            == .queued
     )
+    await gate.waitUntilWaiting()
     #expect(
         pipeline.enqueue([
             RecognitionHypothesis(segmentID: 1, text: "one", engineFinal: false)
         ])
+            == .queued
     )
     #expect(
         pipeline.enqueue([
             RecognitionHypothesis(segmentID: 2, text: "two", engineFinal: true)
         ])
+            == .queued
     )
     await gate.open()
-    await pipeline.finish()
+    _ = await pipeline.finish()
 
     #expect(await recorder.segmentIDs == [0, 1, 2])
+}
+
+@Test
+func saturatedRecognitionMailboxEvictsPartialsButPreservesFinalOrder() async {
+    let gate = AsyncGate()
+    let recorder = HypothesisRecorder()
+    let pipeline = OrderedRecognitionBatchPipeline(capacity: 3)
+    pipeline.start { batch in
+        if batch.first?.segmentID == 0 {
+            await gate.wait()
+        }
+        await recorder.append(batch)
+    }
+    #expect(
+        pipeline.enqueue([
+            RecognitionHypothesis(segmentID: 0, text: "zero", engineFinal: true)
+        ]) == .queued
+    )
+    await gate.waitUntilWaiting()
+
+    #expect(
+        pipeline.enqueue([
+            RecognitionHypothesis(segmentID: 10, text: "old", engineFinal: false)
+        ]) == .queued
+    )
+    #expect(
+        pipeline.enqueue([
+            RecognitionHypothesis(segmentID: 11, text: "new", engineFinal: false)
+        ]) == .coalescedPartial
+    )
+    #expect(
+        pipeline.enqueue([
+            RecognitionHypothesis(segmentID: 1, text: "one", engineFinal: true)
+        ]) == .queued
+    )
+    #expect(
+        pipeline.enqueue([
+            RecognitionHypothesis(segmentID: 2, text: "two", engineFinal: true)
+        ]) == .queued
+    )
+    #expect(
+        pipeline.enqueue([
+            RecognitionHypothesis(segmentID: 3, text: "three", engineFinal: true)
+        ]) == .evictedPartial
+    )
+    #expect(pipeline.pendingCount == 3)
+    #expect(pipeline.maximumPendingCount == 3)
+
+    await gate.open()
+    #expect(await pipeline.finish() == .stopped)
+    #expect(await recorder.segmentIDs == [0, 1, 2, 3])
+}
+
+@Test
+func allFinalMailboxSaturationFailsTypedWithoutSilentLoss() async {
+    let gate = AsyncGate()
+    let recorder = HypothesisRecorder()
+    let pipeline = OrderedRecognitionBatchPipeline(capacity: 2)
+    let worker = pipeline.start { batch in
+        if batch.first?.segmentID == 0 {
+            await gate.wait()
+        }
+        await recorder.append(batch)
+    }
+    #expect(
+        pipeline.enqueue([
+            RecognitionHypothesis(segmentID: 0, text: "zero", engineFinal: true)
+        ]) == .queued
+    )
+    await gate.waitUntilWaiting()
+    for segmentID in 1...2 {
+        #expect(
+            pipeline.enqueue([
+                RecognitionHypothesis(
+                    segmentID: UInt64(segmentID),
+                    text: "\(segmentID)",
+                    engineFinal: true
+                )
+            ]) == .queued
+        )
+    }
+    #expect(
+        pipeline.enqueue([
+            RecognitionHypothesis(segmentID: 3, text: "three", engineFinal: true)
+        ]) == .finalOverflow
+    )
+
+    await gate.open()
+    #expect(
+        await worker.value
+            == .failed(
+                SidecarServiceFailure(
+                    stage: .speechRecognizer,
+                    code: .recognitionFailed
+                )
+            )
+    )
+    #expect(await recorder.segmentIDs == [0, 1, 2])
+    #expect(pipeline.maximumPendingCount == 2)
+}
+
+@Test
+func voiceWindowPublicationFailureIsReportedAfterWorkerExit() async {
+    let relay = RecognitionEventRelay()
+    await relay.setHandler { event in
+        guard case .voiceWindow = event else {
+            return false
+        }
+        throw FatalTestError.rejectedPublication
+    }
+    let stopState = RecognitionWorkerStopState()
+    let worker = Task {
+        await runRecognitionWorker(stopState: stopState) {
+            _ = try await relay.emit(
+                .voiceWindow(
+                    isSpeech: true,
+                    frameMilliseconds: 100,
+                    atMilliseconds: 100
+                )
+            )
+        }
+    }
+    let recorder = WorkerFailureRecorder()
+    let monitor = monitorRecognitionWorker(worker) { failure in
+        let completion = await worker.value
+        await recorder.record(
+            failure: failure,
+            observedCompletion: completion
+        )
+    }
+
+    await monitor.value
+    #expect(
+        await recorder.failure
+            == SidecarServiceFailure(
+                stage: .speechRecognizer,
+                code: .recognitionFailed
+            )
+    )
+    #expect(
+        await recorder.observedCompletion
+            == .failed(
+                SidecarServiceFailure(
+                    stage: .speechRecognizer,
+                    code: .recognitionFailed
+                )
+            )
+    )
+}
+
+@Test
+func unexpectedRecognitionWorkerCompletionCannotSelfAwait() async {
+    let stopState = RecognitionWorkerStopState()
+    let worker = Task {
+        await runRecognitionWorker(stopState: stopState) {}
+    }
+    let recorder = WorkerFailureRecorder()
+    let monitor = monitorRecognitionWorker(worker) { failure in
+        let completion = await worker.value
+        await recorder.record(
+            failure: failure,
+            observedCompletion: completion
+        )
+    }
+
+    await monitor.value
+    #expect(
+        await recorder.observedCompletion
+            == .failed(
+                SidecarServiceFailure(
+                    stage: .speechRecognizer,
+                    code: .recognitionFailed
+                )
+            )
+    )
 }
 
 @Test
@@ -358,6 +565,38 @@ func asynchronousOutputFailureUsesTheSameFatalPath() async throws {
     )
 }
 
+@Test
+func outOfOrderRenderedCallbackUsesTypedFatalPath() async throws {
+    let scheduler = RecordingPlaybackScheduler()
+    let rendered = RenderedRecorder()
+    let failures = PlaybackFailureRecorder()
+    let playback = ContinuousPCMPlayback(scheduler: scheduler)
+    await playback.setRenderedHandler { identity in
+        await rendered.append(identity)
+    }
+    await playback.setFailureHandler { failure in
+        await failures.record(failure)
+    }
+    try await playback.enqueue(
+        pcmFrame(generationID: 9, sequence: 0)
+    )
+    try await playback.enqueue(
+        pcmFrame(generationID: 9, sequence: 1)
+    )
+
+    scheduler.completeScheduledBuffer(at: 1)
+    await failures.waitForFailure()
+
+    #expect(await rendered.identities.isEmpty)
+    #expect(
+        await failures.failure
+            == SidecarServiceFailure(
+                stage: .audioOutput,
+                code: .playbackFailed
+            )
+    )
+}
+
 private actor PermissionRequestCounter {
     private(set) var count = 0
 
@@ -442,6 +681,29 @@ private actor RenderedRecorder {
     }
 }
 
+private actor PlaybackFailureRecorder {
+    private(set) var failure: SidecarServiceFailure?
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func record(_ failure: SidecarServiceFailure) {
+        self.failure = failure
+        let values = waiters
+        waiters.removeAll()
+        for waiter in values {
+            waiter.resume()
+        }
+    }
+
+    func waitForFailure() async {
+        guard failure == nil else {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+}
+
 private final class NetworkTrapURLProtocol: URLProtocol, @unchecked Sendable {
     private static let lock = NSLock()
     private static var requests = 0
@@ -479,14 +741,31 @@ private final class NetworkTrapURLProtocol: URLProtocol, @unchecked Sendable {
 
 private actor AsyncGate {
     private var isOpen = false
+    private var isWaiting = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var waitingObservers: [CheckedContinuation<Void, Never>] = []
 
     func wait() async {
         if isOpen {
             return
         }
+        isWaiting = true
+        let observers = waitingObservers
+        waitingObservers.removeAll()
+        for observer in observers {
+            observer.resume()
+        }
         await withCheckedContinuation { continuation in
             waiters.append(continuation)
+        }
+    }
+
+    func waitUntilWaiting() async {
+        guard !isWaiting else {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            waitingObservers.append(continuation)
         }
     }
 
@@ -505,6 +784,19 @@ private actor HypothesisRecorder {
 
     func append(_ batch: [RecognitionHypothesis]) {
         segmentIDs.append(contentsOf: batch.map(\.segmentID))
+    }
+}
+
+private actor WorkerFailureRecorder {
+    private(set) var failure: SidecarServiceFailure?
+    private(set) var observedCompletion: RecognitionWorkerCompletion?
+
+    func record(
+        failure: SidecarServiceFailure,
+        observedCompletion: RecognitionWorkerCompletion
+    ) {
+        self.failure = failure
+        self.observedCompletion = observedCompletion
     }
 }
 
@@ -591,13 +883,16 @@ private func startFatalSession(_ session: SidecarSession) async throws {
     )
 }
 
-private func pcmFrame(generationID: UInt64) throws -> PCMFrame {
+private func pcmFrame(
+    generationID: UInt64,
+    sequence: UInt64 = 0
+) throws -> PCMFrame {
     let sample: Float = 0
     return try PCMFrame(
         turnID: generationID,
         generationID: generationID,
         utteranceID: 1,
-        sequence: 0,
+        sequence: sequence,
         format: PCMFormat(
             sampleRateHz: 16_000,
             channels: 1,

@@ -149,102 +149,288 @@ public final class OfflineWhisperTokenizer:
     }
 }
 
-public final class OrderedRecognitionBatchPipeline: @unchecked Sendable {
-    public typealias Handler =
-        @Sendable ([RecognitionHypothesis]) async -> Void
-    public typealias FailureHandler = @Sendable () async -> Void
+public enum RecognitionWorkerCompletion: Equatable, Sendable {
+    case stopped
+    case failed(SidecarServiceFailure)
+}
 
-    private let stream: AsyncStream<[RecognitionHypothesis]>
-    private let continuation:
-        AsyncStream<
-            [RecognitionHypothesis]
-        >.Continuation
-    private let stateLock = NSLock()
-    private var consumer: Task<Void, Never>?
-    private var failureHandler: FailureHandler?
-    private var failed = false
+public enum RecognitionBatchEnqueueResult: Equatable, Sendable {
+    case queued
+    case coalescedPartial
+    case evictedPartial
+    case droppedPartial
+    case finalOverflow
+    case terminated
+}
 
-    public init(capacity: Int) {
-        (stream, continuation) = AsyncStream.makeStream(
-            bufferingPolicy: .bufferingOldest(max(1, capacity))
+private final class RecognitionBatchMailbox: @unchecked Sendable {
+    private let capacity: Int
+    private let lock = NSLock()
+    private let notifications: AsyncStream<Void>
+    private let continuation: AsyncStream<Void>.Continuation
+    private var batches: [[RecognitionHypothesis]] = []
+    private var terminal: RecognitionWorkerCompletion?
+    private var maximumCount = 0
+
+    var stream: AsyncStream<Void> {
+        notifications
+    }
+
+    var pendingCount: Int {
+        lock.withLock { batches.count }
+    }
+
+    var maximumPendingCount: Int {
+        lock.withLock { maximumCount }
+    }
+
+    init(capacity: Int) {
+        self.capacity = max(1, capacity)
+        (notifications, continuation) = AsyncStream.makeStream(
+            bufferingPolicy: .bufferingNewest(1)
         )
     }
 
-    public func start(
-        _ handler: @escaping Handler,
-        failureHandler: FailureHandler? = nil
+    func enqueue(
+        _ batch: [RecognitionHypothesis]
+    ) -> RecognitionBatchEnqueueResult {
+        guard !batch.isEmpty else {
+            return .queued
+        }
+        let result = lock.withLock {
+            guard terminal == nil else {
+                return RecognitionBatchEnqueueResult.terminated
+            }
+            let containsFinal = batch.contains(where: \.engineFinal)
+            if !containsFinal,
+                batches.last?.allSatisfy({
+                    !$0.engineFinal
+                }) == true
+            {
+                batches[batches.count - 1] = batch
+                return .coalescedPartial
+            }
+            if batches.count < capacity {
+                batches.append(batch)
+                maximumCount = max(maximumCount, batches.count)
+                return .queued
+            }
+            if !containsFinal {
+                return .droppedPartial
+            }
+            if let partialIndex = batches.firstIndex(where: {
+                $0.allSatisfy { !$0.engineFinal }
+            }) {
+                batches.remove(at: partialIndex)
+                batches.append(batch)
+                return .evictedPartial
+            }
+            terminal = .failed(
+                SidecarServiceFailure(
+                    stage: .speechRecognizer,
+                    code: .recognitionFailed
+                )
+            )
+            return .finalOverflow
+        }
+        continuation.yield()
+        if result == .finalOverflow {
+            continuation.finish()
+        }
+        return result
+    }
+
+    func dequeue() -> [RecognitionHypothesis]? {
+        lock.withLock {
+            guard !batches.isEmpty else {
+                return nil
+            }
+            return batches.removeFirst()
+        }
+    }
+
+    func completionIfDrained() -> RecognitionWorkerCompletion? {
+        lock.withLock {
+            batches.isEmpty ? terminal : nil
+        }
+    }
+
+    func finish(
+        with completion: RecognitionWorkerCompletion = .stopped
     ) {
+        lock.withLock {
+            if terminal == nil {
+                terminal = completion
+            }
+        }
+        continuation.finish()
+    }
+
+    func cancel() {
+        lock.withLock {
+            batches.removeAll(keepingCapacity: true)
+            terminal = .stopped
+        }
+        continuation.finish()
+    }
+}
+
+public final class OrderedRecognitionBatchPipeline: @unchecked Sendable {
+    public typealias Handler =
+        @Sendable ([RecognitionHypothesis]) async throws -> Void
+
+    private let mailbox: RecognitionBatchMailbox
+    private let stateLock = NSLock()
+    private var consumer: Task<RecognitionWorkerCompletion, Never>?
+
+    public var pendingCount: Int {
+        mailbox.pendingCount
+    }
+
+    public var maximumPendingCount: Int {
+        mailbox.maximumPendingCount
+    }
+
+    public init(capacity: Int) {
+        mailbox = RecognitionBatchMailbox(capacity: capacity)
+    }
+
+    @discardableResult
+    public func start(
+        _ handler: @escaping Handler
+    ) -> Task<RecognitionWorkerCompletion, Never> {
         stateLock.withLock {
-            guard consumer == nil else {
-                return
+            if let consumer {
+                return consumer
             }
-            self.failureHandler = failureHandler
-            let stream = stream
-            consumer = Task { [weak self] in
-                for await batch in stream {
-                    await handler(batch)
+            let mailbox = mailbox
+            let task = Task<RecognitionWorkerCompletion, Never> {
+                for await _ in mailbox.stream {
+                    while let batch = mailbox.dequeue() {
+                        guard !Task.isCancelled else {
+                            return .stopped
+                        }
+                        do {
+                            try await handler(batch)
+                        } catch {
+                            let failure = SidecarServiceFailure(
+                                stage: .speechRecognizer,
+                                code: .recognitionFailed
+                            )
+                            mailbox.finish(with: .failed(failure))
+                            return .failed(failure)
+                        }
+                    }
+                    if let completion = mailbox.completionIfDrained() {
+                        return completion
+                    }
                 }
-                await self?.reportOverflowIfNeeded()
+                while let batch = mailbox.dequeue() {
+                    do {
+                        try await handler(batch)
+                    } catch {
+                        let failure = SidecarServiceFailure(
+                            stage: .speechRecognizer,
+                            code: .recognitionFailed
+                        )
+                        mailbox.finish(with: .failed(failure))
+                        return .failed(failure)
+                    }
+                }
+                return mailbox.completionIfDrained() ?? .stopped
             }
+            consumer = task
+            return task
         }
     }
 
     @discardableResult
     public func enqueue(
         _ batch: [RecognitionHypothesis]
-    ) -> Bool {
-        guard !batch.isEmpty else {
-            return true
-        }
-        switch continuation.yield(batch) {
-        case .enqueued:
-            return true
-        case .dropped:
-            fail()
-            return false
-        case .terminated:
-            return false
-        @unknown default:
-            fail()
-            return false
-        }
+    ) -> RecognitionBatchEnqueueResult {
+        mailbox.enqueue(batch)
     }
 
-    public func fail() {
-        stateLock.withLock {
-            failed = true
-        }
-        continuation.finish()
+    public func fail(_ failure: SidecarServiceFailure) {
+        mailbox.finish(with: .failed(failure))
     }
 
-    public func finish() async {
-        continuation.finish()
-        let task = stateLock.withLock {
-            consumer
-        }
-        await task?.value
+    public func finish() async -> RecognitionWorkerCompletion {
+        mailbox.finish()
+        let task = stateLock.withLock { consumer }
+        let completion = await task?.value ?? .stopped
         stateLock.withLock {
             consumer = nil
-            failureHandler = nil
         }
+        return completion
     }
 
-    public func cancel() {
-        continuation.finish()
+    public func cancel() async {
+        mailbox.cancel()
         let task = stateLock.withLock {
             let task = consumer
             consumer = nil
-            failureHandler = nil
             return task
         }
         task?.cancel()
+        _ = await task?.value
+    }
+}
+
+final class RecognitionWorkerStopState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stopping = false
+
+    var isStopping: Bool {
+        lock.withLock { stopping }
     }
 
-    private func reportOverflowIfNeeded() async {
-        let handler = stateLock.withLock {
-            failed ? failureHandler : nil
+    func beginStopping() {
+        lock.withLock {
+            stopping = true
         }
-        await handler?()
+    }
+}
+
+func runRecognitionWorker(
+    stopState: RecognitionWorkerStopState,
+    operation: @escaping @Sendable () async throws -> Void
+) async -> RecognitionWorkerCompletion {
+    do {
+        try await operation()
+    } catch {
+        if stopState.isStopping || Task.isCancelled {
+            return .stopped
+        }
+        return .failed(
+            SidecarServiceFailure(
+                stage: .speechRecognizer,
+                code: .recognitionFailed
+            )
+        )
+    }
+    if stopState.isStopping || Task.isCancelled {
+        return .stopped
+    }
+    return .failed(
+        SidecarServiceFailure(
+            stage: .speechRecognizer,
+            code: .recognitionFailed
+        )
+    )
+}
+
+@discardableResult
+func monitorRecognitionWorker(
+    _ worker: Task<RecognitionWorkerCompletion, Never>,
+    failureHandler: @escaping @Sendable (SidecarServiceFailure) async -> Void
+) -> Task<Void, Never> {
+    Task {
+        let completion = await worker.value
+        guard case .failed(let failure) = completion else {
+            return
+        }
+        await failureHandler(failure)
     }
 }
 
@@ -434,20 +620,151 @@ public enum WhisperKitRecognitionEvent: Sendable {
     )
 }
 
-private actor RecognitionEventRelay {
+enum RecognitionSpeechTransition: Equatable, Sendable {
+    case none
+    case started
+    case continued
+    case ended
+}
+
+struct RecognitionSpeechGate: Sendable {
+    private let thresholdMilliseconds: UInt64
+    private var positiveMilliseconds: UInt64 = 0
+    private var speaking = false
+
+    init(thresholdMilliseconds: UInt64) {
+        self.thresholdMilliseconds = thresholdMilliseconds
+    }
+
+    mutating func observe(
+        isSpeech: Bool
+    ) -> RecognitionSpeechTransition {
+        if isSpeech {
+            positiveMilliseconds = min(
+                thresholdMilliseconds,
+                positiveMilliseconds + 100
+            )
+            if !speaking,
+                positiveMilliseconds >= thresholdMilliseconds
+            {
+                speaking = true
+                return .started
+            }
+            return speaking ? .continued : .none
+        }
+        positiveMilliseconds = 0
+        if speaking {
+            speaking = false
+            return .ended
+        }
+        return .none
+    }
+
+    mutating func resetForDiscontinuity() {
+        positiveMilliseconds = 0
+        speaking = false
+    }
+}
+
+actor RecognitionEventRelay {
     typealias Handler =
         @Sendable (
             WhisperKitRecognitionEvent
-        ) async -> Bool
+        ) async throws -> Bool
+    typealias FailureHandler =
+        @Sendable (
+            UInt64,
+            SidecarServiceFailure
+        ) async -> Void
 
     private var handler: Handler?
+    private var failureHandler: FailureHandler?
 
     func setHandler(_ handler: Handler?) {
         self.handler = handler
     }
 
-    func emit(_ event: WhisperKitRecognitionEvent) async -> Bool {
-        await handler?(event) ?? false
+    func setFailureHandler(_ handler: FailureHandler?) {
+        failureHandler = handler
+    }
+
+    func emit(_ event: WhisperKitRecognitionEvent) async throws -> Bool {
+        guard let handler else {
+            return false
+        }
+        return try await handler(event)
+    }
+
+    func reportFailure(
+        sessionID: UInt64,
+        failure: SidecarServiceFailure
+    ) async {
+        await failureHandler?(sessionID, failure)
+    }
+}
+
+private enum RecognitionVoiceInput: Sendable {
+    case window([Float])
+    case discontinuity
+}
+
+private final class RecognitionVoiceMailbox: @unchecked Sendable {
+    private let capacity: Int
+    private let lock = NSLock()
+    private let notifications: AsyncStream<Void>
+    private let continuation: AsyncStream<Void>.Continuation
+    private var inputs: [RecognitionVoiceInput] = []
+    private var finished = false
+
+    var stream: AsyncStream<Void> {
+        notifications
+    }
+
+    init(capacity: Int) {
+        self.capacity = max(2, capacity)
+        (notifications, continuation) = AsyncStream.makeStream(
+            bufferingPolicy: .bufferingNewest(1)
+        )
+    }
+
+    func enqueue(_ input: RecognitionVoiceInput) {
+        let shouldNotify = lock.withLock {
+            guard !finished else {
+                return false
+            }
+            switch input {
+            case .discontinuity:
+                inputs.removeAll(keepingCapacity: true)
+                inputs.append(.discontinuity)
+            case .window:
+                if inputs.count >= capacity {
+                    inputs.removeAll(keepingCapacity: true)
+                    inputs.append(.discontinuity)
+                }
+                inputs.append(input)
+            }
+            return true
+        }
+        if shouldNotify {
+            continuation.yield()
+        }
+    }
+
+    func dequeue() -> RecognitionVoiceInput? {
+        lock.withLock {
+            guard !inputs.isEmpty else {
+                return nil
+            }
+            return inputs.removeFirst()
+        }
+    }
+
+    func finish() {
+        lock.withLock {
+            finished = true
+            inputs.removeAll(keepingCapacity: true)
+        }
+        continuation.finish()
     }
 }
 
@@ -455,7 +772,12 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
     public typealias EventHandler =
         @Sendable (
             WhisperKitRecognitionEvent
-        ) async -> Bool
+        ) async throws -> Bool
+    public typealias FailureHandler =
+        @Sendable (
+            UInt64,
+            SidecarServiceFailure
+        ) async -> Void
 
     private let modelPath: String
     private let audioProcessor: VoiceProcessingAudioProcessor
@@ -468,18 +790,15 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
 
     private var transcriber: AudioStreamTranscriber?
     private var hypothesisPipeline: OrderedRecognitionBatchPipeline?
-    private var transcriptionTask: Task<Void, Never>?
-    private var voiceWindowTask: Task<Void, Never>?
-    private var voiceWindowContinuation:
-        AsyncStream<
-            [Float]
-        >.Continuation?
+    private var transcriptionTask: Task<RecognitionWorkerCompletion, Never>?
+    private var voiceWindowTask: Task<RecognitionWorkerCompletion, Never>?
+    private var voiceMailbox: RecognitionVoiceMailbox?
+    private var monitorTasks: [Task<Void, Never>] = []
+    private var workerStopState = RecognitionWorkerStopState()
     private var startTimeNanoseconds: UInt64 = 0
-    private var activeSessionID: UInt64?
-    private var speechStartMilliseconds: UInt64 = 200
-    private var positiveSpeechMilliseconds: UInt64 = 0
-    private var speaking = false
-    private var stopping = false
+    private var speechGate = RecognitionSpeechGate(
+        thresholdMilliseconds: 200
+    )
 
     public init(
         modelPath: String,
@@ -491,6 +810,10 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
 
     public func setEventHandler(_ handler: EventHandler?) async {
         await eventRelay.setHandler(handler)
+    }
+
+    public func setFailureHandler(_ handler: FailureHandler?) async {
+        await eventRelay.setFailureHandler(handler)
     }
 
     public func start(configuration: SidecarConfiguration) async throws {
@@ -520,11 +843,10 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
             )
         }
 
-        stopping = false
-        activeSessionID = configuration.sessionID
-        speechStartMilliseconds = configuration.speechStartMilliseconds
-        positiveSpeechMilliseconds = 0
-        speaking = false
+        workerStopState = RecognitionWorkerStopState()
+        speechGate = RecognitionSpeechGate(
+            thresholdMilliseconds: configuration.speechStartMilliseconds
+        )
         startTimeNanoseconds = DispatchTime.now().uptimeNanoseconds
 
         let tokenizer: OfflineWhisperTokenizer
@@ -551,22 +873,26 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
 
         let mapper = mapper
         let eventRelay = eventRelay
+        let sessionID = configuration.sessionID
         let pipeline = OrderedRecognitionBatchPipeline(capacity: 8)
-        pipeline.start(
-            { hypotheses in
-                for hypothesis in hypotheses {
-                    _ = await eventRelay.emit(
-                        .hypothesis(hypothesis)
-                    )
-                }
-            },
-            failureHandler: { [weak self] in
-                await self?.recognitionStoppedUnexpectedly()
+        let hypothesisWorker = pipeline.start { hypotheses in
+            for hypothesis in hypotheses {
+                _ = try await eventRelay.emit(
+                    .hypothesis(hypothesis)
+                )
+            }
+        }
+        hypothesisPipeline = pipeline
+        monitorTasks.append(
+            monitorRecognitionWorker(hypothesisWorker) { failure in
+                await eventRelay.reportFailure(
+                    sessionID: sessionID,
+                    failure: failure
+                )
             }
         )
-        hypothesisPipeline = pipeline
-        audioProcessor.setConversionFailureHandler { _ in
-            pipeline.fail()
+        audioProcessor.setConversionFailureHandler { failure in
+            pipeline.fail(failure)
         }
         let transcriber = AudioStreamTranscriber(
             audioEncoder: whisperKit.audioEncoder,
@@ -590,59 +916,83 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
         )
         self.transcriber = transcriber
 
-        let (voiceWindows, continuation) = AsyncStream<
-            [Float]
-        >.makeStream(bufferingPolicy: .bufferingNewest(8))
-        voiceWindowContinuation = continuation
+        let voiceMailbox = RecognitionVoiceMailbox(capacity: 8)
+        self.voiceMailbox = voiceMailbox
         audioProcessor.setVoiceWindowHandler { window in
-            continuation.yield(window)
+            voiceMailbox.enqueue(.window(window))
         }
-        voiceWindowTask = Task { [weak self] in
-            for await window in voiceWindows {
-                guard !Task.isCancelled else {
-                    return
+        audioProcessor.setDiscontinuityHandler {
+            voiceMailbox.enqueue(.discontinuity)
+        }
+        let stopState = workerStopState
+        let recognition = self
+        let voiceWorker = Task {
+            await runRecognitionWorker(stopState: stopState) {
+                for await _ in voiceMailbox.stream {
+                    while let input = voiceMailbox.dequeue() {
+                        try await recognition.processVoiceInput(input)
+                    }
                 }
-                await self?.processVoiceWindow(window)
             }
         }
+        voiceWindowTask = voiceWorker
+        monitorTasks.append(
+            monitorRecognitionWorker(voiceWorker) { failure in
+                await eventRelay.reportFailure(
+                    sessionID: sessionID,
+                    failure: failure
+                )
+            }
+        )
 
-        transcriptionTask = Task { [weak self] in
-            do {
+        let transcriptionWorker = Task {
+            await runRecognitionWorker(stopState: stopState) {
                 try await transcriber.startStreamTranscription()
-                await self?.recognitionStoppedUnexpectedly()
-            } catch {
-                await self?.recognitionStoppedUnexpectedly()
             }
         }
+        transcriptionTask = transcriptionWorker
+        monitorTasks.append(
+            monitorRecognitionWorker(transcriptionWorker) { failure in
+                await eventRelay.reportFailure(
+                    sessionID: sessionID,
+                    failure: failure
+                )
+            }
+        )
         await audioProcessor.waitUntilRecordingStarted()
     }
 
     public func stop() async {
-        stopping = true
+        workerStopState.beginStopping()
         audioProcessor.setVoiceWindowHandler(nil)
-        voiceWindowContinuation?.finish()
-        voiceWindowContinuation = nil
+        audioProcessor.setDiscontinuityHandler(nil)
+        voiceMailbox?.finish()
+        voiceMailbox = nil
         voiceWindowTask?.cancel()
         if let voiceWindowTask {
-            await voiceWindowTask.value
+            _ = await voiceWindowTask.value
         }
         self.voiceWindowTask = nil
 
-        hypothesisPipeline?.cancel()
+        await hypothesisPipeline?.cancel()
         hypothesisPipeline = nil
         if let transcriber {
             await transcriber.stopStreamTranscription()
         }
         transcriptionTask?.cancel()
         if let transcriptionTask {
-            await transcriptionTask.value
+            _ = await transcriptionTask.value
         }
         self.transcriptionTask = nil
         self.transcriber = nil
-        activeSessionID = nil
         audioProcessor.stopRecording()
 
+        for task in monitorTasks {
+            task.cancel()
+        }
+        monitorTasks = []
         await eventRelay.setHandler(nil)
+        await eventRelay.setFailureHandler(nil)
     }
 
     private static func snapshot(
@@ -659,12 +1009,23 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
         )
     }
 
-    private func processVoiceWindow(_ window: [Float]) async {
+    private func processVoiceInput(
+        _ input: RecognitionVoiceInput
+    ) async throws {
+        switch input {
+        case .discontinuity:
+            speechGate.resetForDiscontinuity()
+        case .window(let window):
+            try await processVoiceWindow(window)
+        }
+    }
+
+    private func processVoiceWindow(_ window: [Float]) async throws {
         let isSpeech = vad.voiceActivity(in: window).last == true
         let atMilliseconds =
             (DispatchTime.now().uptimeNanoseconds
                 &- startTimeNanoseconds) / 1_000_000
-        let didBargeIn = await eventRelay.emit(
+        let didBargeIn = try await eventRelay.emit(
             .voiceWindow(
                 isSpeech: isSpeech,
                 frameMilliseconds: 100,
@@ -672,63 +1033,35 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
             )
         )
 
-        if isSpeech {
-            positiveSpeechMilliseconds = min(
-                speechStartMilliseconds,
-                positiveSpeechMilliseconds + 100
-            )
-            if !speaking,
-                positiveSpeechMilliseconds >= speechStartMilliseconds
-            {
-                speaking = true
-                if !didBargeIn {
-                    _ = await eventRelay.emit(
-                        .activity(
-                            .speechStarted(
-                                atMilliseconds: atMilliseconds
-                            )
-                        )
-                    )
-                }
-            } else if speaking {
-                _ = await eventRelay.emit(
+        switch speechGate.observe(isSpeech: isSpeech) {
+        case .none:
+            break
+        case .started:
+            if !didBargeIn {
+                _ = try await eventRelay.emit(
                     .activity(
-                        .speechContinued(
+                        .speechStarted(
                             atMilliseconds: atMilliseconds
                         )
                     )
                 )
             }
-        } else {
-            positiveSpeechMilliseconds = 0
-            if speaking {
-                speaking = false
-                _ = await eventRelay.emit(
-                    .activity(
-                        .speechEnded(
-                            atMilliseconds: atMilliseconds
-                        )
+        case .continued:
+            _ = try await eventRelay.emit(
+                .activity(
+                    .speechContinued(
+                        atMilliseconds: atMilliseconds
                     )
                 )
-            }
-        }
-    }
-
-    private func recognitionStoppedUnexpectedly() async {
-        guard !stopping else {
-            return
-        }
-        guard let activeSessionID else {
-            return
-        }
-        _ = await eventRelay.emit(
-            .failure(
-                sessionID: activeSessionID,
-                failure: SidecarServiceFailure(
-                    stage: .speechRecognizer,
-                    code: .recognitionFailed
+            )
+        case .ended:
+            _ = try await eventRelay.emit(
+                .activity(
+                    .speechEnded(
+                        atMilliseconds: atMilliseconds
+                    )
                 )
             )
-        )
+        }
     }
 }

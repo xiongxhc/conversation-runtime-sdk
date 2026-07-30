@@ -87,12 +87,16 @@ await playback.setRenderedHandler { identity in
         try await session.playbackRendered(identity)
     }
 }
+await playback.setFailureHandler { failure in
+    await failureController.terminate(
+        with: failure,
+        fallbackSessionID: 0
+    )
+}
 await recognition.setEventHandler { event in
     switch event {
     case .hypothesis(let hypothesis):
-        await failureController.perform {
-            try await session.publishRecognitionHypothesis(hypothesis)
-        }
+        try await session.publishRecognitionHypothesis(hypothesis)
         return false
     case .voiceWindow(
         let
@@ -102,17 +106,13 @@ await recognition.setEventHandler { event in
         let
             atMilliseconds
     ):
-        return await failureController.performBool {
-            try await session.observeBargeIn(
-                isSpeech: isSpeech,
-                frameMilliseconds: frameMilliseconds,
-                atMilliseconds: atMilliseconds
-            )
-        }
+        return try await session.observeBargeIn(
+            isSpeech: isSpeech,
+            frameMilliseconds: frameMilliseconds,
+            atMilliseconds: atMilliseconds
+        )
     case .activity(let activity):
-        await failureController.perform {
-            try await session.publishVoiceActivity(activity)
-        }
+        try await session.publishVoiceActivity(activity)
         return false
     case .failure(let sessionID, let failure):
         await failureController.terminate(
@@ -121,6 +121,12 @@ await recognition.setEventHandler { event in
         )
         return false
     }
+}
+await recognition.setFailureHandler { sessionID, failure in
+    await failureController.terminate(
+        with: failure,
+        fallbackSessionID: sessionID
+    )
 }
 engine.setFailureHandler { sessionID, failure in
     await failureController.terminate(

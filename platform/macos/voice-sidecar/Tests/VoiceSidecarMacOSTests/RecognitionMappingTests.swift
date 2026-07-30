@@ -6,6 +6,18 @@ import Testing
 @testable import VoiceSidecarMacOS
 
 @Test
+func streamingRecognitionTranscribesDetectedLanguageWithoutControlTokens() {
+    let options = WhisperKitRecognition.transcriptionDecodingOptions()
+
+    #expect(options.task == .transcribe)
+    #expect(options.language == nil)
+    #expect(options.usePrefillPrompt)
+    #expect(options.detectLanguage)
+    #expect(options.skipSpecialTokens)
+    #expect(options.withoutTimestamps)
+}
+
+@Test
 func changedCurrentTextReplacesThePartialForTheSameSegment() {
     let mapper = RecognitionMapper()
     let oldState = RecognitionStateSnapshot(currentText: "hel")

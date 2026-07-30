@@ -924,6 +924,17 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
         await eventRelay.setFailureHandler(handler)
     }
 
+    static func transcriptionDecodingOptions() -> DecodingOptions {
+        DecodingOptions(
+            task: .transcribe,
+            language: nil,
+            usePrefillPrompt: true,
+            detectLanguage: true,
+            skipSpecialTokens: true,
+            withoutTimestamps: true
+        )
+    }
+
     public func prepare(configuration: SidecarConfiguration) async throws {
         guard transcriptionTask == nil,
             preparedConfiguration == nil
@@ -983,7 +994,7 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
             textDecoder: whisperKit.textDecoder,
             tokenizer: tokenizer,
             audioProcessor: audioProcessor,
-            decodingOptions: DecodingOptions(),
+            decodingOptions: Self.transcriptionDecodingOptions(),
             requiredSegmentsForConfirmation: 0,
             stateChangeCallback: { oldState, newState in
                 let hypotheses = mapper.changes(

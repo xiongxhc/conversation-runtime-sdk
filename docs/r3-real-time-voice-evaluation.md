@@ -2,8 +2,8 @@
 
 ## Scope and Status
 
-This record evaluates the deterministic Task 12 milestone based on
-`939f84c783dfcbf365610a37f56845bc72676259` on
+This record evaluates the deterministic R3 milestone based on implementation
+commit `ee6e4b47cf30b341320941948e6f5fab1e9850b8` on
 `feature/r3-real-time-voice-loop`. It separates repository contract evidence
 from process/device and acoustic evidence.
 
@@ -21,12 +21,17 @@ Process/device evidence is `NOT VALIDATED`. Acoustic evidence is
 - Rust: `rustc 1.97.1 (8bab26f4f 2026-07-14)`.
 - Cargo: `cargo 1.97.1 (c980f4866 2026-06-30)`.
 - Swift: Apple Swift `6.3.3`; target `arm64-apple-macosx26.0`.
+- Release sidecar: `conversation-voice-sidecar`, built from
+  `ee6e4b47cf30b341320941948e6f5fab1e9850b8`.
+- Release sidecar SHA-256:
+  `b17e157db7388da1e7ea10283f7c34ecb70459deb8a6a0af20b9e611ab2b1e83`.
 - Private schema-v2 config digest: `NOT AVAILABLE`; the private file was
   absent and no private config was created.
 
 ### Commands and Results
 
-The following deterministic gates passed:
+The following deterministic gates passed from a clean checkout of
+`ee6e4b47cf30b341320941948e6f5fab1e9850b8`:
 
 ```text
 PATH="/opt/homebrew/opt/rustup/bin:$PATH" \
@@ -70,21 +75,44 @@ xcrun swift build \
   -Xswiftc -strict-concurrency=complete \
   -Xswiftc -warnings-as-errors
 
+test "$(git rev-parse HEAD)" = \
+  "ee6e4b47cf30b341320941948e6f5fab1e9850b8"
 tests/voice/build-macos-sidecar.sh
+SIDECAR_BIN="$(
+  xcrun swift build -c release \
+    --package-path platform/macos/voice-sidecar \
+    --show-bin-path
+)/conversation-voice-sidecar"
+test -x "$SIDECAR_BIN"
+shasum -a 256 "$SIDECAR_BIN"
 sh -n tests/voice/acceptance-macos.sh
 sh -n tests/voice/acceptance-macos.test.sh
 git diff --check
+```
+
+To reproduce the schema-v2 bundled layout without starting capture, build the
+Rust CLI and place the verified sidecar beside it. Leave
+`sidecar_executable` absent from the private config; an absolute override is
+only for development or alternate packaging:
+
+```text
+cargo build --locked --release -p conversation-voice-probe \
+  --bin conversation-voice-loop
+install -m 755 "$SIDECAR_BIN" \
+  target/release/conversation-voice-sidecar
+test -x target/release/conversation-voice-sidecar
+shasum -a 256 target/release/conversation-voice-sidecar
 ```
 
 Results:
 
 - streaming OpenAI-compatible speech: `16` focused tests passed;
 - cancellation-aware WAV decode boundary: `1` focused unit test passed;
-- schema-v2 voice CLI: `16` tests passed, including buffered compatibility and
-  explicit streaming mode;
-- complete Rust workspace: `438` tests listed, `437` passed, and `1`
-  intentionally ignored immutable-fixture writer;
-- complete Swift sidecar package: `102` tests passed;
+- schema-v2 voice CLI: `20` tests passed, including buffered compatibility,
+  explicit streaming mode, and adjacent bundled-sidecar resolution;
+- complete Rust workspace: passed with `1` intentionally ignored
+  immutable-fixture writer;
+- complete Swift sidecar package: `104` tests passed;
 - deterministic acceptance-harness script: passed success, failure,
   content-filtering, repository/resolved-alias rejection, existing-file,
   concurrent-parent swap, repository redirection, concurrent no-overwrite,
@@ -96,7 +124,9 @@ Results:
 - strict workspace Clippy: passed with warnings denied;
 - strict Swift 6 release build: passed with complete concurrency checking and
   warnings denied;
-- release sidecar build script: passed;
+- release sidecar build script: passed; the executable built from
+  `ee6e4b47cf30b341320941948e6f5fab1e9850b8` has SHA-256
+  `b17e157db7388da1e7ea10283f7c34ecb70459deb8a6a0af20b9e611ab2b1e83`;
 - formatting, shell syntax, and whitespace checks: passed.
 
 No dependency was added, so `Cargo.lock` is unchanged.
@@ -121,6 +151,14 @@ The deterministic evidence covers:
 - cancellation checks before PCM/frame allocation and throughout WAV chunk and
   frame processing after a complete container is selected;
 - stable turn, generation, utterance, format, and continuous sequence identity;
+- ordered multi-utterance reconstruction with per-utterance sequence reset and
+  stable float32 stereo format;
+- reliable rendered-receipt delivery under saturated/coalesced partial traffic;
+- local tokenizer/model validation and loading before capture activation, with
+  downloads disabled and reverse-order cleanup;
+- configured `speech_start_ms` barge-in thresholds using `100 ms` VAD windows;
+- optional absolute sidecar override or bundled resolution beside the running
+  voice-loop executable without ambient `PATH`;
 - explicit buffered compatibility with no streaming-to-buffered fallback;
 - bounded content-free JSONL metrics on success, interruption, failure, and
   detected orphan cleanup;

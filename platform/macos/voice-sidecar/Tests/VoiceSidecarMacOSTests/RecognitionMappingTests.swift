@@ -601,6 +601,127 @@ func speakingGapPublishesEndedBeforeResetAndLaterSilenceDoesNotDuplicate() async
     )
 }
 
+@Test(
+    arguments: [UInt64(100), UInt64(300)],
+    [false, true]
+)
+func sustainedSpeechPublishesOneLifecycleAcrossGateWindows(
+    speechStartMilliseconds: UInt64,
+    playbackActive: Bool
+) async throws {
+    let playback = IntegrationPlaybackService()
+    let events = FailOnceEventSink()
+    let session = SidecarSession(
+        audioService: FatalRecordingAudioService(),
+        recognitionService: FatalRecordingRecognitionService(),
+        playbackService: playback,
+        eventSink: events
+    )
+    try await startFatalSession(
+        session,
+        speechStartMilliseconds: speechStartMilliseconds
+    )
+    if playbackActive {
+        try await session.handleMedia(
+            ChildFrame(
+                audioSessionID: 7,
+                frame: pcmFrame(generationID: 5)
+            )
+        )
+    }
+    let publisher = SidecarRecognitionEventPublisher(session: session)
+    var gate = RecognitionSpeechGate(
+        thresholdMilliseconds: speechStartMilliseconds
+    )
+
+    gate = try await publishRecognitionWindow(
+        isSpeech: true,
+        atMilliseconds: 100,
+        gate: gate,
+        publisher: publisher
+    )
+    #expect(await playback.flushedGenerationIDs.isEmpty)
+    gate = try await publishRecognitionWindow(
+        isSpeech: true,
+        atMilliseconds: 200,
+        gate: gate,
+        publisher: publisher
+    )
+    let firstFlushes: [UInt64] = playbackActive ? [5] : []
+    #expect(await playback.flushedGenerationIDs == firstFlushes)
+    for atMilliseconds in [UInt64(300), 400] {
+        gate = try await publishRecognitionWindow(
+            isSpeech: true,
+            atMilliseconds: atMilliseconds,
+            gate: gate,
+            publisher: publisher
+        )
+    }
+    _ = try await publisher.publish(
+        .captureDiscontinuity(atMilliseconds: 500)
+    )
+    gate.resetForDiscontinuity()
+    gate = try await publishRecognitionWindow(
+        isSpeech: false,
+        atMilliseconds: 600,
+        gate: gate,
+        publisher: publisher
+    )
+
+    if playbackActive {
+        try await session.handleMedia(
+            ChildFrame(
+                audioSessionID: 7,
+                frame: pcmFrame(generationID: 6)
+            )
+        )
+    }
+    gate = try await publishRecognitionWindow(
+        isSpeech: true,
+        atMilliseconds: 700,
+        gate: gate,
+        publisher: publisher
+    )
+    #expect(await playback.flushedGenerationIDs == firstFlushes)
+    gate = try await publishRecognitionWindow(
+        isSpeech: true,
+        atMilliseconds: 800,
+        gate: gate,
+        publisher: publisher
+    )
+    let secondFlushes: [UInt64] = playbackActive ? [5, 6] : []
+    #expect(await playback.flushedGenerationIDs == secondFlushes)
+    for atMilliseconds in [UInt64(900), 1_000] {
+        gate = try await publishRecognitionWindow(
+            isSpeech: true,
+            atMilliseconds: atMilliseconds,
+            gate: gate,
+            publisher: publisher
+        )
+    }
+    _ = try await publishRecognitionWindow(
+        isSpeech: false,
+        atMilliseconds: 1_100,
+        gate: gate,
+        publisher: publisher
+    )
+
+    let firstStart =
+        playbackActive && speechStartMilliseconds == 300
+        ? UInt64(200) : speechStartMilliseconds
+    let secondStart = firstStart + 600
+    let lifecycle = speechLifecycle(in: await events.frames)
+    #expect(
+        lifecycle
+            == [
+                .speechStarted(atMilliseconds: firstStart),
+                .speechEnded(atMilliseconds: 500),
+                .speechStarted(atMilliseconds: secondStart),
+                .speechEnded(atMilliseconds: 1_100),
+            ]
+    )
+}
+
 @Test
 func sessionBargeInRequiresTwoPostGapPlaybackActiveWindows() async throws {
     let playback = IntegrationPlaybackService()
@@ -819,6 +940,54 @@ private func expectPermissionDenied(
         )
     } catch {
         Issue.record("unexpected error \(error)")
+    }
+}
+
+private func publishRecognitionWindow(
+    isSpeech: Bool,
+    atMilliseconds: UInt64,
+    gate: RecognitionSpeechGate,
+    publisher: SidecarRecognitionEventPublisher
+) async throws -> RecognitionSpeechGate {
+    var gate = gate
+    _ = try await publisher.publish(
+        .voiceWindow(
+            isSpeech: isSpeech,
+            frameMilliseconds: 100,
+            atMilliseconds: atMilliseconds
+        )
+    )
+    let activity: VoiceActivity
+    switch gate.observe(isSpeech: isSpeech) {
+    case .none:
+        return gate
+    case .started:
+        activity = .speechStarted(atMilliseconds: atMilliseconds)
+    case .continued:
+        activity = .speechContinued(atMilliseconds: atMilliseconds)
+    case .ended:
+        activity = .speechEnded(atMilliseconds: atMilliseconds)
+    }
+    _ = try await publisher.publish(.activity(activity))
+    return gate
+}
+
+private func speechLifecycle(in frames: [ChildFrame]) -> [VoiceActivity] {
+    frames.compactMap { frame in
+        guard
+            case .voiceActivity(
+                sessionID: _,
+                activity: let activity
+            ) = frame.control
+        else {
+            return nil
+        }
+        switch activity {
+        case .speechStarted, .speechEnded:
+            return activity
+        case .speechContinued:
+            return nil
+        }
     }
 }
 
@@ -1152,12 +1321,15 @@ private final class LockedCounter: @unchecked Sendable {
     }
 }
 
-private func startFatalSession(_ session: SidecarSession) async throws {
+private func startFatalSession(
+    _ session: SidecarSession,
+    speechStartMilliseconds: UInt64 = 200
+) async throws {
     try await session.handleControl(
         ChildFrame(
             control: .startSession(
                 sessionID: 7,
-                speechStartMilliseconds: 200,
+                speechStartMilliseconds: speechStartMilliseconds,
                 finalSilenceMilliseconds: 600
             )
         )

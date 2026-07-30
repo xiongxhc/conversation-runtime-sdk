@@ -290,6 +290,9 @@ public actor SidecarSession {
         _ activity: VoiceActivity,
         sessionID: UInt64
     ) async throws {
+        if case .speechStarted = activity, voiceActivityActive {
+            return
+        }
         try await eventSink.send(
             ChildFrame(
                 control: .voiceActivity(

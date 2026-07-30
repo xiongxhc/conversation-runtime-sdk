@@ -1077,7 +1077,7 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
     private func processVoiceWindow(_ window: [Float]) async throws {
         let isSpeech = vad.voiceActivity(in: window).last == true
         let atMilliseconds = elapsedMilliseconds()
-        let didBargeIn = try await eventRelay.emit(
+        _ = try await eventRelay.emit(
             .voiceWindow(
                 isSpeech: isSpeech,
                 frameMilliseconds: 100,
@@ -1089,15 +1089,13 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
         case .none:
             break
         case .started:
-            if !didBargeIn {
-                _ = try await eventRelay.emit(
-                    .activity(
-                        .speechStarted(
-                            atMilliseconds: atMilliseconds
-                        )
+            _ = try await eventRelay.emit(
+                .activity(
+                    .speechStarted(
+                        atMilliseconds: atMilliseconds
                     )
                 )
-            }
+            )
         case .continued:
             _ = try await eventRelay.emit(
                 .activity(

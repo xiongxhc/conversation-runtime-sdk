@@ -192,7 +192,9 @@ target/release/conversation-voice-loop \
 ```
 
 The ten-minute harness discards transcript output, records only bounded
-content-free JSONL metrics, and refuses repository output:
+content-free JSONL metrics, and refuses repository output. The metrics path
+must not already exist; the harness atomically creates a regular `0600` file
+without following links while leaving the containing directory unchanged:
 
 ```bash
 tests/voice/acceptance-macos.sh \

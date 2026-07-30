@@ -53,7 +53,7 @@ VOICE_SIDECAR_FIXTURES_DIR="$PWD/tests/fixtures/voice-sidecar-v1" \
 
 xcrun swift build \
   --package-path platform/macos/voice-sidecar \
-  --scratch-path /tmp/conversation-runtime-task12-strict \
+  --scratch-path /tmp/conversation-runtime-task12-round1-strict \
   -c release \
   -Xswiftc -swift-version -Xswiftc 6 \
   -Xswiftc -strict-concurrency=complete \
@@ -67,14 +67,17 @@ git diff --check
 
 Results:
 
-- streaming OpenAI-compatible speech: `13` focused tests passed;
+- streaming OpenAI-compatible speech: `16` focused tests passed;
+- cancellation-aware WAV decode boundary: `1` focused unit test passed;
 - schema-v2 voice CLI: `16` tests passed, including buffered compatibility and
   explicit streaming mode;
-- complete Rust workspace: `434` tests listed, `433` passed, and `1`
+- complete Rust workspace: `438` tests listed, `437` passed, and `1`
   intentionally ignored immutable-fixture writer;
 - complete Swift sidecar package: `102` tests passed;
 - deterministic acceptance-harness script: passed success, failure,
-  content-filtering, repository-output rejection, and orphan-cleanup scenarios;
+  content-filtering, repository/resolved-alias rejection, existing-file,
+  symlink, hard-link, FIFO, mode, immediate-orphan, late-child,
+  no-collateral-kill, and orphan-cleanup scenarios;
 - strict workspace Clippy: passed with warnings denied;
 - strict Swift 6 release build: passed with complete concurrency checking and
   warnings denied;
@@ -97,12 +100,19 @@ The deterministic evidence covers:
   failure, response stall, malformed WAV, and cross-container format change;
 - content-free request failures that do not echo synthesized text or response
   bodies;
-- capacity-one backpressure and cancellation of request reads and blocked frame
-  sends;
+- capacity-one backpressure, cancellation of request reads and blocked frame
+  sends, and prompt producer disconnect when the receiver closes during
+  pre-header, incomplete-body, or slow-trickle waits;
+- cancellation checks before PCM/frame allocation and throughout WAV chunk and
+  frame processing after a complete container is selected;
 - stable turn, generation, utterance, format, and continuous sequence identity;
 - explicit buffered compatibility with no streaming-to-buffered fallback;
 - bounded content-free JSONL metrics on success, interruption, failure, and
-  detected orphan cleanup.
+  detected orphan cleanup;
+- exclusive no-follow creation of a previously absent `0600` regular metrics
+  file without modifying the containing directory;
+- dedicated measured process groups with TERM/KILL cleanup, root reaping, and
+  bounded empty-group verification independent of PID ancestry snapshots.
 
 When a real source line is absent, the harness records stale-generation and
 queue-underrun counts as JSON `null` with the corresponding observation flag

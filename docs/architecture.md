@@ -166,6 +166,19 @@ coverage. Physical microphone behavior, echo rejection, first audible output,
 and audible stop still require the separate process/device and acoustic
 procedures.
 
+The streaming speech adapter treats receiver closure like explicit
+cancellation while awaiting request headers or body chunks and while decoding
+selected WAV containers. Cancellation checks precede PCM/frame allocations and
+run during chunk and frame processing, so a dropped consumer does not leave an
+HTTP producer or full-container decode running without an owner.
+
+The process/device harness requires a previously absent metrics target and
+keeps the exclusively created no-follow `0600` regular file open through one
+writer descriptor. The measured command runs in a dedicated session/process
+group; timeout, interruption, failure, and exit cleanup signal that group,
+reap the root, and verify boundedly that the group is empty. Process snapshots
+are evidence only and are never the cleanup authority.
+
 ## macOS System-Speech Reference
 
 `MacOsSystemSpeechSynthesizer` implements `SpeechSynthesizer` without changing protocol types. Its public configuration types compile across supported development platforms, while `/usr/bin/say` and `/usr/bin/afplay` defaults are macOS-gated.

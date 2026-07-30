@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use conversation_model_adapters::{
     AdapterError, AudioFrame, OpenAiCompatibleSpeechConfig, OpenAiCompatibleStreamingSpeechConfig,
@@ -8,7 +11,7 @@ use conversation_protocol::{GenerationId, TurnId, UtteranceId};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 use tokio_util::sync::CancellationToken;
@@ -277,6 +280,57 @@ async fn cancellation_resolves_a_stalled_request_and_closes_the_stream() {
     assert!(result.is_none());
 }
 
+#[tokio::test]
+async fn dropping_receiver_closes_a_pre_header_request() {
+    let server = StreamingSpeechServer::stall_before_headers().await;
+    let frames = configured_streaming_adapter_with_stall(
+        server.endpoint(),
+        0.32,
+        1024 * 1024,
+        Duration::from_secs(60),
+    )
+    .stream(request(), CancellationToken::new());
+
+    server.wait_for_request().await;
+    drop(frames);
+
+    server.wait_for_disconnect().await;
+}
+
+#[tokio::test]
+async fn dropping_receiver_closes_an_incomplete_container_body() {
+    let server = StreamingSpeechServer::incomplete_and_wait().await;
+    let frames = configured_streaming_adapter_with_stall(
+        server.endpoint(),
+        0.32,
+        1024 * 1024,
+        Duration::from_secs(60),
+    )
+    .stream(request(), CancellationToken::new());
+
+    server.wait_for_response_started().await;
+    drop(frames);
+
+    server.wait_for_disconnect().await;
+}
+
+#[tokio::test]
+async fn dropping_receiver_stops_a_slow_trickle_body() {
+    let server = StreamingSpeechServer::slow_trickle().await;
+    let frames = configured_streaming_adapter_with_stall(
+        server.endpoint(),
+        0.32,
+        1024 * 1024,
+        Duration::from_secs(60),
+    )
+    .stream(request(), CancellationToken::new());
+
+    server.wait_for_response_started().await;
+    drop(frames);
+
+    server.wait_for_disconnect().await;
+}
+
 #[test]
 fn streaming_interval_requires_finite_inclusive_reference_bounds() {
     let base = || OpenAiCompatibleSpeechConfig::new("local-speech-model").unwrap();
@@ -406,6 +460,10 @@ fn split_at(bytes: Vec<u8>, offsets: &[usize]) -> Vec<Vec<u8>> {
 struct StreamingSpeechServer {
     endpoint: String,
     request: Arc<Mutex<Option<(Value, String)>>>,
+    response_started: Arc<AtomicBool>,
+    response_started_notify: Arc<Notify>,
+    disconnected: Arc<AtomicBool>,
+    disconnected_notify: Arc<Notify>,
     worker: JoinHandle<()>,
 }
 
@@ -438,19 +496,53 @@ impl StreamingSpeechServer {
         Self::start(Response::Redirect(location.into())).await
     }
 
+    async fn stall_before_headers() -> Self {
+        Self::start(Response::ObserveDisconnectBeforeHeaders).await
+    }
+
+    async fn incomplete_and_wait() -> Self {
+        Self::start(Response::ObserveDisconnectAfterIncompleteBody).await
+    }
+
+    async fn slow_trickle() -> Self {
+        Self::start(Response::ObserveDisconnectDuringSlowTrickle).await
+    }
+
     async fn start(response: Response) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let request = Arc::new(Mutex::new(None));
         let stored_request = request.clone();
+        let response_started = Arc::new(AtomicBool::new(false));
+        let response_started_notify = Arc::new(Notify::new());
+        let worker_response_started = response_started.clone();
+        let worker_response_started_notify = response_started_notify.clone();
+        let disconnected = Arc::new(AtomicBool::new(false));
+        let disconnected_notify = Arc::new(Notify::new());
+        let worker_disconnected = disconnected.clone();
+        let worker_disconnected_notify = disconnected_notify.clone();
         let worker = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             *stored_request.lock().await = Some(read_request_json(&mut stream).await);
-            write_response(&mut stream, response).await;
+            let observed_disconnect = write_response(
+                &mut stream,
+                response,
+                &worker_response_started,
+                &worker_response_started_notify,
+            )
+            .await;
+            if observed_disconnect {
+                worker_disconnected.store(true, Ordering::SeqCst);
+                worker_disconnected_notify.notify_waiters();
+            }
         });
         Self {
             endpoint,
             request,
+            response_started,
+            response_started_notify,
+            disconnected,
+            disconnected_notify,
             worker,
         }
     }
@@ -463,6 +555,34 @@ impl StreamingSpeechServer {
         while !self.request_received().await {
             tokio::task::yield_now().await;
         }
+    }
+
+    async fn wait_for_response_started(&self) {
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let notified = self.response_started_notify.notified();
+                if self.response_started.load(Ordering::SeqCst) {
+                    break;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .expect("test server did not start the response");
+    }
+
+    async fn wait_for_disconnect(&self) {
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let notified = self.disconnected_notify.notified();
+                if self.disconnected.load(Ordering::SeqCst) {
+                    break;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .expect("streaming request task did not disconnect after receiver drop");
     }
 
     async fn request_received(&self) -> bool {
@@ -491,9 +611,17 @@ enum Response {
     DeclaredLength(usize),
     Failure { status: u16, body: Vec<u8> },
     Redirect(String),
+    ObserveDisconnectBeforeHeaders,
+    ObserveDisconnectAfterIncompleteBody,
+    ObserveDisconnectDuringSlowTrickle,
 }
 
-async fn write_response(stream: &mut TcpStream, response: Response) {
+async fn write_response(
+    stream: &mut TcpStream,
+    response: Response,
+    response_started: &AtomicBool,
+    response_started_notify: &Notify,
+) -> bool {
     match response {
         Response::Chunked(chunks) => {
             stream
@@ -510,6 +638,7 @@ async fn write_response(stream: &mut TcpStream, response: Response) {
                 tokio::task::yield_now().await;
             }
             stream.write_all(b"0\r\n\r\n").await.unwrap();
+            false
         }
         Response::Fixed(body) => {
             stream
@@ -519,6 +648,7 @@ async fn write_response(stream: &mut TcpStream, response: Response) {
                 .await
                 .unwrap();
             stream.write_all(&body).await.unwrap();
+            false
         }
         Response::StallAfter(body_prefix) => {
             stream
@@ -533,7 +663,7 @@ async fn write_response(stream: &mut TcpStream, response: Response) {
                 stream.write_all(&body_prefix).await.unwrap();
                 stream.write_all(b"\r\n").await.unwrap();
             }
-            std::future::pending::<()>().await;
+            std::future::pending::<bool>().await
         }
         Response::DeclaredLength(content_length) => {
             stream
@@ -543,7 +673,7 @@ async fn write_response(stream: &mut TcpStream, response: Response) {
                 )
                 .await
                 .unwrap();
-            std::future::pending::<()>().await;
+            std::future::pending::<bool>().await
         }
         Response::Failure { status, body } => {
             stream
@@ -557,6 +687,7 @@ async fn write_response(stream: &mut TcpStream, response: Response) {
                 .await
                 .unwrap();
             stream.write_all(&body).await.unwrap();
+            false
         }
         Response::Redirect(location) => {
             stream
@@ -568,6 +699,51 @@ async fn write_response(stream: &mut TcpStream, response: Response) {
                 )
                 .await
                 .unwrap();
+            false
+        }
+        Response::ObserveDisconnectBeforeHeaders => wait_for_peer_disconnect(stream).await,
+        Response::ObserveDisconnectAfterIncompleteBody => {
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nb\r\nRIFF\0\0\0\0WAV\r\n")
+                .await
+                .unwrap();
+            mark_response_started(response_started, response_started_notify);
+            wait_for_peer_disconnect(stream).await
+        }
+        Response::ObserveDisconnectDuringSlowTrickle => {
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nR\r\n")
+                .await
+                .unwrap();
+            mark_response_started(response_started, response_started_notify);
+            let mut probe = [0_u8; 1];
+            loop {
+                tokio::select! {
+                    read = stream.read(&mut probe) => {
+                        break matches!(read, Ok(0) | Err(_));
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(250)) => {
+                        if stream.write_all(b"1\r\nI\r\n").await.is_err() {
+                            break true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn mark_response_started(response_started: &AtomicBool, response_started_notify: &Notify) {
+    response_started.store(true, Ordering::SeqCst);
+    response_started_notify.notify_waiters();
+}
+
+async fn wait_for_peer_disconnect(stream: &mut TcpStream) -> bool {
+    let mut probe = [0_u8; 1];
+    loop {
+        match stream.read(&mut probe).await {
+            Ok(0) | Err(_) => return true,
+            Ok(_) => {}
         }
     }
 }

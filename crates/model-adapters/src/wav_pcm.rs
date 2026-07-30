@@ -32,17 +32,21 @@ impl WavPcmDecoder {
         utterance_id: UtteranceId,
         audio: &SynthesizedAudio,
     ) -> Result<Vec<AudioFrame>, AdapterError> {
-        self.decode_from_sequence(turn_id, generation_id, utterance_id, 0, audio)
+        self.decode_from_sequence_with_check(turn_id, generation_id, utterance_id, 0, audio, || {
+            Ok(())
+        })
     }
 
-    pub(crate) fn decode_from_sequence(
+    pub(crate) fn decode_from_sequence_with_check(
         &self,
         turn_id: TurnId,
         generation_id: GenerationId,
         utterance_id: UtteranceId,
         initial_sequence: u64,
         audio: &SynthesizedAudio,
+        mut check: impl FnMut() -> Result<(), AdapterError>,
     ) -> Result<Vec<AudioFrame>, AdapterError> {
+        check()?;
         if audio.format() == AudioFormat::Aiff {
             return Err(AdapterError::new(
                 "R3 PCM streaming does not support AIFF audio",
@@ -54,7 +58,7 @@ impl WavPcmDecoder {
             return Err(AdapterError::new("WAV audio exceeded the configured limit"));
         }
 
-        let (format, data_bytes) = parse_wav(bytes, self.max_audio_bytes)?;
+        let (format, data_bytes) = parse_wav(bytes, self.max_audio_bytes, &mut check)?;
         let alignment = format.frame_alignment_bytes()?;
         if !data_bytes.is_multiple_of(alignment) {
             return Err(invalid_wav_error());
@@ -72,19 +76,23 @@ impl WavPcmDecoder {
             return Err(AdapterError::new("WAV audio produced too many PCM frames"));
         }
 
+        check()?;
         let mut pcm_bytes = Vec::with_capacity(data_bytes);
         walk_chunks(bytes, |chunk_id, chunk_body| {
+            check()?;
             if chunk_id == b"data" {
                 pcm_bytes.extend_from_slice(chunk_body);
             }
             Ok(())
         })?;
 
+        check()?;
         let mut frames = Vec::with_capacity(frame_count_upper_bound);
         let mut previous_sample_boundary = 0_usize;
         let mut frame_slot = 1_u64;
         let mut sequence = initial_sequence;
         while previous_sample_boundary < sample_count {
+            check()?;
             let mut sample_boundary = sample_boundary(frame_slot, frame_sample_numerator)?;
             if sample_boundary <= previous_sample_boundary {
                 frame_slot = next_frame_slot(previous_sample_boundary, frame_sample_numerator)?;
@@ -113,7 +121,11 @@ impl WavPcmDecoder {
     }
 }
 
-fn parse_wav(bytes: &[u8], max_audio_bytes: usize) -> Result<(PcmFormat, usize), AdapterError> {
+fn parse_wav(
+    bytes: &[u8],
+    max_audio_bytes: usize,
+    check: &mut impl FnMut() -> Result<(), AdapterError>,
+) -> Result<(PcmFormat, usize), AdapterError> {
     if bytes.len() < 12 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
         return Err(invalid_wav_error());
     }
@@ -130,24 +142,27 @@ fn parse_wav(bytes: &[u8], max_audio_bytes: usize) -> Result<(PcmFormat, usize),
 
     let mut format = None;
     let mut data_bytes = 0_usize;
-    walk_chunks(bytes, |chunk_id, chunk_body| match chunk_id {
-        b"fmt " => {
-            let next_format = parse_format(chunk_body)?;
-            if let Some(previous_format) = format.replace(next_format) {
-                if previous_format != next_format {
-                    return Err(AdapterError::new("WAV PCM format changed between chunks"));
+    walk_chunks(bytes, |chunk_id, chunk_body| {
+        check()?;
+        match chunk_id {
+            b"fmt " => {
+                let next_format = parse_format(chunk_body)?;
+                if let Some(previous_format) = format.replace(next_format) {
+                    if previous_format != next_format {
+                        return Err(AdapterError::new("WAV PCM format changed between chunks"));
+                    }
                 }
+                Ok(())
             }
-            Ok(())
+            b"data" => {
+                data_bytes = data_bytes
+                    .checked_add(chunk_body.len())
+                    .filter(|size| *size <= max_audio_bytes)
+                    .ok_or_else(|| AdapterError::new("WAV audio exceeded the configured limit"))?;
+                Ok(())
+            }
+            _ => Ok(()),
         }
-        b"data" => {
-            data_bytes = data_bytes
-                .checked_add(chunk_body.len())
-                .filter(|size| *size <= max_audio_bytes)
-                .ok_or_else(|| AdapterError::new("WAV audio exceeded the configured limit"))?;
-            Ok(())
-        }
-        _ => Ok(()),
     })?;
 
     let format = format.ok_or_else(invalid_wav_error)?;
@@ -298,4 +313,55 @@ fn read_u32_le(bytes: &[u8]) -> Result<u32, AdapterError> {
 
 fn invalid_wav_error() -> AdapterError {
     AdapterError::new("WAV audio was malformed for R3 PCM streaming")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancellation_after_container_selection_precedes_pcm_and_frame_allocation() {
+        let audio = pcm16_wav(24_000, 24_000);
+        let mut checks = 0;
+
+        let error = WavPcmDecoder::default()
+            .decode_from_sequence_with_check(
+                TurnId::new(2),
+                GenerationId::new(3),
+                UtteranceId::new(4),
+                0,
+                &audio,
+                || {
+                    checks += 1;
+                    if checks == 1 {
+                        Err(AdapterError::new("cancelled at decode boundary"))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .unwrap_err();
+
+        assert_eq!(error.message(), "cancelled at decode boundary");
+        assert_eq!(checks, 1);
+    }
+
+    fn pcm16_wav(sample_rate_hz: u32, sample_count: usize) -> SynthesizedAudio {
+        let data_bytes = u32::try_from(sample_count * 2).unwrap();
+        let mut bytes = Vec::with_capacity(44 + usize::try_from(data_bytes).unwrap());
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&sample_rate_hz.to_le_bytes());
+        bytes.extend_from_slice(&(sample_rate_hz * 2).to_le_bytes());
+        bytes.extend_from_slice(&2_u16.to_le_bytes());
+        bytes.extend_from_slice(&16_u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_bytes.to_le_bytes());
+        bytes.resize(44 + usize::try_from(data_bytes).unwrap(), 0);
+        SynthesizedAudio::new(bytes, AudioFormat::Wav)
+    }
 }

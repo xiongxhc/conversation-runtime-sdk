@@ -81,7 +81,6 @@ case "$metrics_path" in
         fail "metrics output must be outside the repository"
         ;;
 esac
-[ ! -L "$metrics_path" ] || fail "metrics output must not be a symbolic link"
 
 voice_loop_bin=${CONVERSATION_VOICE_LOOP_BIN:-$DEFAULT_VOICE_LOOP_BIN}
 case "$voice_loop_bin" in
@@ -95,30 +94,79 @@ umask 077
 temporary_root=$(mktemp -d "${TMPDIR:-/tmp}/conversation-runtime-acceptance.XXXXXX") ||
     fail "could not create private temporary directory"
 fifo_path="$temporary_root/stderr.fifo"
+metrics_fifo="$temporary_root/metrics.fifo"
+metrics_ready="$temporary_root/metrics-ready"
+metrics_failed="$temporary_root/metrics-failed"
 parser_state="$temporary_root/parser.state"
-descendant_history="$temporary_root/descendants.tsv"
-unique_descendants="$temporary_root/unique-descendants.tsv"
-process_snapshot="$temporary_root/process-snapshot.txt"
+process_group_snapshot="$temporary_root/process-groups.txt"
 process_inspection_failed="$temporary_root/process-inspection-failed"
+process_cleanup_failed="$temporary_root/process-cleanup-failed"
 duration_marker="$temporary_root/duration-reached"
 interrupt_marker="$temporary_root/user-interrupted"
 
 voice_pid=
+voice_pgid=
 timer_pid=
 parser_pid=
-monitor_pid=
 force_shutdown_pid=
+metrics_writer_pid=
+metrics_fd_open=0
+
+group_exists() {
+    [ -n "$voice_pgid" ] || return 1
+    /usr/bin/perl -e 'exit(kill(0, -$ARGV[0]) ? 0 : 1)' "$voice_pgid"
+}
+
+signal_voice_group() {
+    signal_name=$1
+    [ -n "$voice_pgid" ] || return 0
+    /usr/bin/perl -e '
+        my ($signal_name, $process_group) = @ARGV;
+        kill $signal_name, -$process_group;
+        exit 0;
+    ' "$signal_name" "$voice_pgid"
+}
+
+stop_voice_group() {
+    [ -n "$voice_pgid" ] || return 0
+    if group_exists; then
+        signal_voice_group TERM
+        sleep 0.5
+    fi
+    if group_exists; then
+        signal_voice_group KILL
+    fi
+
+    attempts=0
+    while group_exists; do
+        attempts=$((attempts + 1))
+        if [ "$attempts" -ge 40 ]; then
+            : >"$process_cleanup_failed"
+            return 1
+        fi
+        sleep 0.05
+    done
+    return 0
+}
 
 cleanup() {
-    for pid in "$timer_pid" "$force_shutdown_pid" "$monitor_pid" "$parser_pid"; do
+    for pid in "$timer_pid" "$force_shutdown_pid" "$parser_pid"; do
         if [ -n "$pid" ]; then
             kill "$pid" 2>/dev/null || true
             wait "$pid" 2>/dev/null || true
         fi
     done
-    if [ -n "$voice_pid" ] && kill -0 "$voice_pid" 2>/dev/null; then
-        kill -INT "$voice_pid" 2>/dev/null || true
+    stop_voice_group || true
+    if [ -n "$voice_pid" ]; then
         wait "$voice_pid" 2>/dev/null || true
+    fi
+    if [ "$metrics_fd_open" -eq 1 ]; then
+        exec 3>&-
+        metrics_fd_open=0
+    fi
+    if [ -n "$metrics_writer_pid" ]; then
+        kill "$metrics_writer_pid" 2>/dev/null || true
+        wait "$metrics_writer_pid" 2>/dev/null || true
     fi
     rm -rf "$temporary_root"
 }
@@ -126,12 +174,76 @@ trap cleanup EXIT
 
 config_sha256=$(/usr/bin/shasum -a 256 "$config_path" | awk '{print $1}') ||
     fail "could not digest configuration"
-: >"$metrics_path" || fail "could not create metrics output"
+mkfifo "$metrics_fifo" || fail "could not create private metrics pipe"
+/usr/bin/perl -e '
+    use Fcntl qw(:DEFAULT :mode O_NOFOLLOW);
+    my ($path, $fifo, $ready, $failed) = @ARGV;
+
+    sub mark_failed {
+        my ($marker) = @_;
+        sysopen(my $failure_handle, $marker, O_WRONLY | O_CREAT | O_EXCL, 0600);
+        close $failure_handle if $failure_handle;
+        exit 1;
+    }
+
+    sysopen(my $output, $path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600)
+        or mark_failed($failed);
+    my @opened = stat($output);
+    mark_failed($failed)
+        unless @opened &&
+            S_ISREG($opened[2]) &&
+            $opened[3] == 1 &&
+            ($opened[2] & 0777) == 0600;
+
+    sysopen(my $ready_handle, $ready, O_WRONLY | O_CREAT | O_EXCL, 0600)
+        or mark_failed($failed);
+    close $ready_handle or mark_failed($failed);
+    open my $input, "<", $fifo or mark_failed($failed);
+
+    my $buffer;
+    while (1) {
+        my $read = sysread($input, $buffer, 8192);
+        mark_failed($failed) unless defined $read;
+        last if $read == 0;
+        my $offset = 0;
+        while ($offset < $read) {
+            my $written = syswrite($output, $buffer, $read - $offset, $offset);
+            mark_failed($failed) unless defined $written && $written > 0;
+            $offset += $written;
+        }
+    }
+
+    my @path_state = lstat($path);
+    mark_failed($failed)
+        unless @path_state &&
+            $path_state[0] == $opened[0] &&
+            $path_state[1] == $opened[1] &&
+            S_ISREG($path_state[2]) &&
+            $path_state[3] == 1 &&
+            ($path_state[2] & 0777) == 0600;
+    close $input or mark_failed($failed);
+    close $output or mark_failed($failed);
+' "$metrics_path" "$metrics_fifo" "$metrics_ready" "$metrics_failed" &
+metrics_writer_pid=$!
+
+attempts=0
+while [ ! -f "$metrics_ready" ]; do
+    if [ -f "$metrics_failed" ] || ! kill -0 "$metrics_writer_pid" 2>/dev/null; then
+        wait "$metrics_writer_pid" 2>/dev/null || true
+        metrics_writer_pid=
+        fail "metrics output must be a previously absent regular file"
+    fi
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 200 ] || fail "timed out creating metrics output"
+    sleep 0.01
+done
+exec 3>"$metrics_fifo" || fail "could not open private metrics pipe"
+metrics_fd_open=1
 printf '{"schema_version":1,"record_type":"session_start","config_sha256":"%s","duration_seconds":%s}\n' \
-    "$config_sha256" "$duration_seconds" >>"$metrics_path"
+    "$config_sha256" "$duration_seconds" >&3 ||
+    fail "could not write metrics output"
 
 mkfifo "$fifo_path" || fail "could not create private metrics pipe"
-: >"$descendant_history"
 
 awk -v state_file="$parser_state" -v max_records="$MAX_METRIC_RECORDS" '
 function metric_name(milestone) {
@@ -212,71 +324,44 @@ END {
     printf "queue_underrun_observed=%d\n", underrun_observed >> state_file
     printf "dropped_metric_record_count=%d\n", dropped >> state_file
 }
-' <"$fifo_path" >>"$metrics_path" &
+' <"$fifo_path" >&3 &
 parser_pid=$!
 
-"$voice_loop_bin" --config "$config_path" >/dev/null 2>"$fifo_path" &
+/usr/bin/perl -MPOSIX=setsid -e '
+    setsid() >= 0 or die "could not create measured process session\n";
+    exec @ARGV or die "could not execute measured command\n";
+' "$voice_loop_bin" --config "$config_path" >/dev/null 2>"$fifo_path" 3>&- &
 voice_pid=$!
-
-(
-    while kill -0 "$voice_pid" 2>/dev/null; do
-        if ! /bin/ps -axo pid=,ppid=,lstart= >"$process_snapshot"; then
-            : >"$process_inspection_failed"
-            break
-        fi
-        awk -v root="$voice_pid" '
-        {
-            pid[NR] = $1
-            parent[$1] = $2
-            started[$1] = $3 " " $4 " " $5 " " $6 " " $7
-        }
-        END {
-            for (row = 1; row <= NR; row++) {
-                candidate = pid[row]
-                ancestor = candidate
-                while (ancestor in parent && parent[ancestor] != 0) {
-                    if (parent[ancestor] == root) {
-                        printf "%s\t%s\n", candidate, started[candidate]
-                        break
-                    }
-                    ancestor = parent[ancestor]
-                }
-            }
-        }
-        ' "$process_snapshot" >>"$descendant_history"
-        sleep 0.1
-    done
-) &
-monitor_pid=$!
+voice_pgid=$voice_pid
 
 /usr/bin/perl -e '
     $SIG{HUP} = $SIG{INT} = $SIG{TERM} = sub { exit 0 };
-    my ($duration, $pid, $marker) = @ARGV;
+    my ($duration, $process_group, $marker) = @ARGV;
     sleep $duration;
-    exit 0 unless kill 0, $pid;
+    exit 0 unless kill 0, -$process_group;
     open my $handle, ">", $marker or exit 2;
     close $handle;
-    kill "INT", $pid;
+    kill "INT", -$process_group;
     sleep 10;
-    kill "TERM", $pid if kill 0, $pid;
+    kill "TERM", -$process_group if kill 0, -$process_group;
     sleep 2;
-    kill "KILL", $pid if kill 0, $pid;
-' "$duration_seconds" "$voice_pid" "$duration_marker" &
+    kill "KILL", -$process_group if kill 0, -$process_group;
+' "$duration_seconds" "$voice_pgid" "$duration_marker" 3>&- &
 timer_pid=$!
 
 handle_interrupt() {
     : >"$interrupt_marker"
-    if [ -n "$voice_pid" ]; then
-        kill -INT "$voice_pid" 2>/dev/null || true
+    if [ -n "$voice_pgid" ]; then
+        signal_voice_group INT
         if [ -z "$force_shutdown_pid" ]; then
             /usr/bin/perl -e '
                 $SIG{HUP} = $SIG{INT} = $SIG{TERM} = sub { exit 0 };
-                my ($pid) = @ARGV;
+                my ($process_group) = @ARGV;
                 sleep 10;
-                kill "TERM", $pid if kill 0, $pid;
+                kill "TERM", -$process_group if kill 0, -$process_group;
                 sleep 2;
-                kill "KILL", $pid if kill 0, $pid;
-            ' "$voice_pid" &
+                kill "KILL", -$process_group if kill 0, -$process_group;
+            ' "$voice_pgid" 3>&- &
             force_shutdown_pid=$!
         fi
     fi
@@ -284,14 +369,16 @@ handle_interrupt() {
 trap handle_interrupt HUP INT TERM
 
 while :; do
-    wait "$voice_pid"
-    voice_status=$?
+    if wait "$voice_pid"; then
+        voice_status=0
+    else
+        voice_status=$?
+    fi
     if [ -f "$interrupt_marker" ] && kill -0 "$voice_pid" 2>/dev/null; then
         continue
     fi
     break
 done
-voice_pid=
 
 kill "$timer_pid" 2>/dev/null || true
 wait "$timer_pid" 2>/dev/null || true
@@ -301,34 +388,28 @@ if [ -n "$force_shutdown_pid" ]; then
     wait "$force_shutdown_pid" 2>/dev/null || true
     force_shutdown_pid=
 fi
-wait "$monitor_pid" 2>/dev/null || true
-monitor_pid=
 
-awk -F '	' '!seen[$1]++' "$descendant_history" >"$unique_descendants"
 orphaned_child_count=0
-tab=$(printf '\t')
-while IFS="$tab" read -r descendant_pid recorded_start; do
-    case "$descendant_pid" in
-        ''|*[!0-9]*) continue ;;
-    esac
-    current_start=$(
-        /bin/ps -p "$descendant_pid" -o lstart= 2>/dev/null |
-            awk '{$1=$1; print}'
-    )
-    if [ -n "$current_start" ] && [ "$current_start" = "$recorded_start" ]; then
-        orphaned_child_count=$((orphaned_child_count + 1))
-        kill -TERM "$descendant_pid" 2>/dev/null || true
-        sleep 0.1
-        kill -KILL "$descendant_pid" 2>/dev/null || true
+if group_exists; then
+    if /bin/ps -axo pgid= >"$process_group_snapshot"; then
+        orphaned_child_count=$(
+            awk -v process_group="$voice_pgid" \
+                '$1 == process_group { count++ } END { print count + 0 }' \
+                "$process_group_snapshot"
+        )
+    else
+        : >"$process_inspection_failed"
     fi
-done <"$unique_descendants"
+fi
+stop_voice_group || true
+voice_pid=
 
 /usr/bin/perl -e '
     $SIG{HUP} = $SIG{INT} = $SIG{TERM} = sub { exit 0 };
     my ($pid) = @ARGV;
     sleep 2;
     kill "TERM", $pid if kill 0, $pid;
-' "$parser_pid" &
+' "$parser_pid" 3>&- &
 parser_guard_pid=$!
 wait "$parser_pid"
 parser_status=$?
@@ -364,6 +445,11 @@ if [ -f "$process_inspection_failed" ]; then
     process_inspection_failure_count=1
     session_result=failed
 fi
+process_cleanup_failure_count=0
+if [ -f "$process_cleanup_failed" ]; then
+    process_cleanup_failure_count=1
+    session_result=failed
+fi
 
 stale_generation_reject_json=null
 stale_generation_observed_json=false
@@ -378,7 +464,7 @@ if [ "$queue_underrun_observed" -eq 1 ]; then
     queue_underrun_observed_json=true
 fi
 
-printf '{"schema_version":1,"record_type":"session_summary","session_result":"%s","exit_code":%s,"session_reset_count":%s,"stale_generation_reject_count":%s,"stale_generation_observed":%s,"queue_underrun_count":%s,"queue_underrun_observed":%s,"interruption_count":%s,"orphaned_child_count":%s,"process_inspection_failure_count":%s,"dropped_metric_record_count":%s}\n' \
+printf '{"schema_version":1,"record_type":"session_summary","session_result":"%s","exit_code":%s,"session_reset_count":%s,"stale_generation_reject_count":%s,"stale_generation_observed":%s,"queue_underrun_count":%s,"queue_underrun_observed":%s,"interruption_count":%s,"orphaned_child_count":%s,"process_inspection_failure_count":%s,"process_cleanup_failure_count":%s,"dropped_metric_record_count":%s}\n' \
     "$session_result" \
     "$voice_status" \
     "$session_reset_count" \
@@ -389,7 +475,19 @@ printf '{"schema_version":1,"record_type":"session_summary","session_result":"%s
     "$interruption_count" \
     "$orphaned_child_count" \
     "$process_inspection_failure_count" \
-    "$dropped_metric_record_count" >>"$metrics_path"
+    "$process_cleanup_failure_count" \
+    "$dropped_metric_record_count" >&3 ||
+    fail "could not write metrics summary"
+
+exec 3>&-
+metrics_fd_open=0
+if wait "$metrics_writer_pid"; then
+    metrics_writer_status=0
+else
+    metrics_writer_status=$?
+fi
+metrics_writer_pid=
+[ "$metrics_writer_status" -eq 0 ] || exit 1
 
 case "$session_result" in
     duration-complete) exit 0 ;;

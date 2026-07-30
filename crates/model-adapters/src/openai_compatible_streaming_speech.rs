@@ -81,12 +81,12 @@ impl StreamingSpeechSynthesizer for OpenAiCompatibleStreamingSpeechSynthesizer {
         let config = self.config.clone();
 
         tokio::spawn(async move {
-            if cancellation.is_cancelled() {
+            if cancellation.is_cancelled() || sender.is_closed() {
                 return;
             }
             let result = stream_response(client, config, request, &sender, &cancellation).await;
             if let Err(error) = result {
-                if cancellation.is_cancelled() {
+                if cancellation.is_cancelled() || sender.is_closed() {
                     return;
                 }
                 tokio::select! {
@@ -121,6 +121,7 @@ async fn stream_response(
             .send(),
         config.stall_timeout,
         cancellation,
+        sender,
     )
     .await?
     .map_err(|_| AdapterError::new("speech synthesis request failed"))?;
@@ -153,29 +154,37 @@ async fn decode_response(
     let mut emitted_frame = false;
 
     loop {
-        let chunk = await_transport(response.chunk(), config.stall_timeout, cancellation)
+        let chunk = await_transport(response.chunk(), config.stall_timeout, cancellation, sender)
             .await?
             .map_err(|_| AdapterError::new("failed to read speech synthesis output"))?;
         let Some(chunk) = chunk else {
             break;
         };
 
+        ensure_stream_open(cancellation, sender)?;
         received_bytes = received_bytes
             .checked_add(chunk.len())
             .filter(|total| *total <= config.speech.max_audio_bytes())
             .ok_or_else(output_limit_error)?;
         buffer.extend_from_slice(&chunk);
 
-        while let Some(container_bytes) =
-            take_complete_container(&mut buffer, config.speech.max_audio_bytes())?
-        {
-            let frames = decoder.decode_from_sequence(
+        loop {
+            ensure_stream_open(cancellation, sender)?;
+            let Some(container_bytes) =
+                take_complete_container(&mut buffer, config.speech.max_audio_bytes())?
+            else {
+                break;
+            };
+            ensure_stream_open(cancellation, sender)?;
+            let frames = decoder.decode_from_sequence_with_check(
                 request.turn_id(),
                 request.generation_id(),
                 request.utterance_id(),
                 next_sequence,
                 &SynthesizedAudio::new(container_bytes, AudioFormat::Wav),
+                || ensure_stream_open(cancellation, sender),
             )?;
+            ensure_stream_open(cancellation, sender)?;
             let format = frames
                 .first()
                 .map(crate::AudioFrame::format)
@@ -258,14 +267,33 @@ async fn await_transport<T>(
     future: impl std::future::Future<Output = T>,
     stall_timeout: Duration,
     cancellation: &CancellationToken,
+    sender: &mpsc::Sender<Result<crate::AudioFrame, AdapterError>>,
 ) -> Result<T, AdapterError> {
     tokio::select! {
         biased;
         _ = cancellation.cancelled() => Err(cancelled_error()),
+        _ = sender.closed() => Err(receiver_closed_error()),
         result = tokio::time::timeout(stall_timeout, future) => {
             result.map_err(|_| AdapterError::new("speech synthesis response stalled"))
         }
     }
+}
+
+fn ensure_stream_open(
+    cancellation: &CancellationToken,
+    sender: &mpsc::Sender<Result<crate::AudioFrame, AdapterError>>,
+) -> Result<(), AdapterError> {
+    if cancellation.is_cancelled() {
+        Err(cancelled_error())
+    } else if sender.is_closed() {
+        Err(receiver_closed_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn receiver_closed_error() -> AdapterError {
+    AdapterError::new("speech synthesis receiver closed")
 }
 
 fn output_limit_error() -> AdapterError {

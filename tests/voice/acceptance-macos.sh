@@ -13,6 +13,13 @@ Runs the real voice loop for 600 seconds by default. The JSONL output contains
 only content-free timing metrics, identifiers, stages, counts, and a session
 result. Set CONVERSATION_VOICE_LOOP_BIN to an absolute executable for a
 separately built binary.
+
+This harness assumes a trusted local operator account. It protects against
+accidental overwrite, symlinks and special files, unsafe output permissions,
+repository output, ordinary child leaks, timeout or SIGINT, and descendants
+created by the controlled CLI and sidecar. It is not a security boundary
+against a malicious same-EUID process racing namespaces, hard links, or mounts,
+or against a measured descendant intentionally escaping with setpgid/setsid.
 EOF
 }
 
@@ -107,6 +114,7 @@ fifo_path="$temporary_root/stderr.fifo"
 metrics_fifo="$temporary_root/metrics.fifo"
 metrics_ready="$temporary_root/metrics-ready"
 metrics_failed="$temporary_root/metrics-failed"
+metrics_cleanup_failed="$temporary_root/metrics-cleanup-failed"
 parser_state="$temporary_root/parser.state"
 process_inspection_failed="$temporary_root/process-inspection-failed"
 process_cleanup_failed="$temporary_root/process-cleanup-failed"
@@ -115,7 +123,8 @@ interrupt_marker="$temporary_root/user-interrupted"
 launch_handshake="$temporary_root/launch-handshake"
 launch_release="$temporary_root/launch-release"
 launch_status="$temporary_root/launch-status"
-launch_finish="$temporary_root/launch-finish"
+launch_report_failed="$temporary_root/launch-report-failed"
+launch_cleanup_ack="$temporary_root/launch-cleanup-ack"
 
 voice_pid=
 voice_pgid=
@@ -198,7 +207,7 @@ stop_voice_group() {
         if [ "$member_count" -gt 1 ]; then
             signal_voice_group KILL || : >"$process_cleanup_failed"
         else
-            : >"$launch_finish"
+            : >"$launch_cleanup_ack"
         fi
     fi
 
@@ -242,7 +251,8 @@ mkfifo "$metrics_fifo" || fail "could not create private metrics pipe"
     "$metrics_fifo" \
     "$metrics_ready" \
     "$metrics_failed" \
-    "$REPOSITORY_ROOT" &
+    "$REPOSITORY_ROOT" \
+    "$metrics_cleanup_failed" &
 metrics_writer_pid=$!
 
 attempts=0
@@ -350,7 +360,8 @@ parser_pid=$!
     "$launch_handshake" \
     "$launch_release" \
     "$launch_status" \
-    "$launch_finish" \
+    "$launch_report_failed" \
+    "$launch_cleanup_ack" \
     "$voice_loop_bin" \
     --config \
     "$config_path" \
@@ -417,7 +428,7 @@ handle_interrupt() {
 trap handle_interrupt HUP INT TERM
 
 voice_status=
-while [ ! -f "$launch_status" ]; do
+while [ ! -f "$launch_status" ] && [ ! -f "$launch_report_failed" ]; do
     if ! kill -0 "$voice_pid" 2>/dev/null; then
         if wait "$voice_pid"; then
             launcher_status=0
@@ -425,6 +436,7 @@ while [ ! -f "$launch_status" ]; do
             launcher_status=$?
         fi
         voice_pid=
+        voice_identity_verified=0
         voice_status=$launcher_status
         verify_group_empty || true
         break
@@ -440,6 +452,9 @@ if [ -f "$launch_status" ]; then
             : >"$process_cleanup_failed"
             ;;
     esac
+elif [ -f "$launch_report_failed" ]; then
+    voice_status=125
+    : >"$process_cleanup_failed"
 fi
 
 kill "$timer_pid" 2>/dev/null || true
@@ -546,7 +561,14 @@ else
     metrics_writer_status=$?
 fi
 metrics_writer_pid=
-[ "$metrics_writer_status" -eq 0 ] || exit 1
+if [ "$metrics_writer_status" -ne 0 ]; then
+    if [ -f "$metrics_cleanup_failed" ]; then
+        printf '%s\n' \
+            "acceptance harness: metrics cleanup could not safely remove an expected artifact" \
+            >&2
+    fi
+    exit 1
+fi
 
 case "$session_result" in
     duration-complete) exit 0 ;;

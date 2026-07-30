@@ -39,6 +39,17 @@ PATH="/opt/homebrew/opt/rustup/bin:$PATH" \
 
 sh tests/voice/acceptance-macos.test.sh
 
+xcrun clang -std=c11 -Wall -Wextra -Werror \
+  -DACCEPTANCE_HELPER_TESTING tests/voice/acceptance-helper.c \
+  -o /tmp/conversation-runtime-task12-round3-helper-test
+
+xcrun clang -std=c11 -O2 -Wall -Wextra -Werror \
+  tests/voice/acceptance-helper.c \
+  -o /tmp/conversation-runtime-task12-round3-helper-release
+
+xcrun clang --analyze -Xanalyzer -analyzer-output=text \
+  -std=c11 -Wall -Wextra -Werror tests/voice/acceptance-helper.c
+
 PATH="/opt/homebrew/opt/rustup/bin:$PATH" \
   cargo fmt --all -- --check
 
@@ -53,7 +64,7 @@ VOICE_SIDECAR_FIXTURES_DIR="$PWD/tests/fixtures/voice-sidecar-v1" \
 
 xcrun swift build \
   --package-path platform/macos/voice-sidecar \
-  --scratch-path /tmp/conversation-runtime-task12-round2-strict \
+  --scratch-path /tmp/conversation-runtime-task12-round3-strict \
   -c release \
   -Xswiftc -swift-version -Xswiftc 6 \
   -Xswiftc -strict-concurrency=complete \
@@ -77,10 +88,11 @@ Results:
 - deterministic acceptance-harness script: passed success, failure,
   content-filtering, repository/resolved-alias rejection, existing-file,
   concurrent-parent swap, repository redirection, concurrent no-overwrite,
-  symlink, persistent/transient hard-link, FIFO, safe-parent mode,
-  session-creation failure, delayed/mismatched identity handshake, unrelated
-  group collision, immediate-orphan, late-child, no-collateral-kill, and
-  orphan-cleanup scenarios;
+  symlink, persistent/transient hard-link, FIFO, safe-parent mode, injected
+  parent/stage/output change, replacement-file preservation, session-creation
+  failure, delayed/mismatched identity handshake, status-report failure,
+  unrelated group collision, controlled descendant identity, immediate-orphan,
+  late-child, no-collateral-kill, and orphan-cleanup scenarios;
 - strict workspace Clippy: passed with warnings denied;
 - strict Swift 6 release build: passed with complete concurrency checking and
   warnings denied;
@@ -113,13 +125,14 @@ The deterministic evidence covers:
 - bounded content-free JSONL metrics on success, interruption, failure, and
   detected orphan cleanup;
 - descriptor-relative no-follow creation of a previously absent `0600` regular
-  metrics file in a private staging directory, parent identity monitoring,
-  exclusive atomic publication, and persistent/transient link rejection
-  without changing containing-directory permissions;
+  metrics file in a private staging directory, parent/stage/output monitoring,
+  exclusive atomic publication, and identity-bound cleanup that never removes
+  a replacement file;
 - verified `PID == PGID == SID` launch handshakes before measured exec,
   identity revalidation before every group TERM/KILL, PID-only cleanup before
-  trust, root reaping, no-collateral-kill behavior, and bounded empty-group
-  verification independent of PID ancestry snapshots.
+  trust, a guardian retained through status-report failure, root reaping,
+  no-collateral-kill behavior, and bounded empty-group verification independent
+  of PID ancestry snapshots.
 
 When a real source line is absent, the harness records stale-generation and
 queue-underrun counts as JSON `null` with the corresponding observation flag
@@ -128,6 +141,23 @@ set to `false`; it never invents zero observations.
 This evidence uses loopback fixtures, fake sidecars, deterministic Swift
 services, and synthetic WAV data. It is not hardware, local-model, audible, or
 latency evidence.
+
+### Acceptance Harness Threat Boundary
+
+The harness assumes a trusted local operator account. It protects against
+accidental overwrite, symbolic links and special files, unsafe output
+permissions, repository output, ordinary child leaks, timeout/SIGINT, and
+descendants created by the controlled CLI and sidecar.
+
+It is not a security boundary against a malicious same-EUID process racing
+namespaces, hard links, or mounts. Monitoring cannot cover activity before the
+relevant descriptor is opened and registered, and retained descriptors cannot
+close mount-namespace gaps. Its process authority is the verified numeric PID,
+PGID, and SID while the guardian remains alive; deterministic fixtures verify
+that controlled descendants do not change group or session. A measured
+descendant that intentionally calls `setpgid` or `setsid` can escape
+supervision. The deterministic results above make no race-proof or
+malicious-process containment claim.
 
 ## Process/Device Evidence
 

@@ -174,12 +174,16 @@ HTTP producer or full-container decode running without an owner.
 
 The process/device harness securely opens each metrics-parent path component
 with no-follow directory descriptors, checks ownership and permissions, rejects
-repository ancestry, and watches the parent identity. Metrics are written
-through one exclusively created `0600` descriptor inside a private `0700`
-staging directory. Link-count transitions invalidate the run; after EOF, the
-helper revalidates the parent and publishes the complete file with an exclusive
-descriptor-relative rename. No sensitive writes occur through the public
-target pathname.
+repository ancestry, and retains the parent ancestry needed to revalidate the
+path. Metrics are written through one exclusively created `0600` descriptor
+inside a private `0700` staging directory. Before readiness, the helper
+registers vnode monitoring on the output parent, staging directory, and output
+file; watched link, rename, delete, or revoke events fail the run. After EOF,
+the helper revalidates the parent and publishes the complete file with an
+exclusive descriptor-relative rename. Failed cleanup removes a public leaf
+only when its reopened type, device, inode, and link count match the expected
+file, so an unrelated replacement is left untouched and reported. No sensitive
+writes occur through the public target pathname.
 
 The measured-command launcher creates a new session and reports its PID, PGID,
 and SID from inside that session before it can exec the command. The parent
@@ -189,6 +193,29 @@ keeps the verified session leader alive until cleanup. Every group TERM/KILL is
 preceded by another kernel identity check; failed or timed-out handshakes clean
 only the known child PID. The parent reaps the launcher and boundedly verifies
 that the group is empty without using PID ancestry as cleanup authority.
+Status-report failures retain the guardian and verified identity until the
+parent explicitly acknowledges cleanup or signals the verified group.
+
+### Acceptance Harness Threat Boundary
+
+The harness assumes a trusted local operator account. It protects against
+accidental overwrite, symbolic links and special files, unsafe output
+permissions, repository output, ordinary child leaks, timeout/SIGINT, and
+descendants created by the controlled CLI and sidecar.
+
+It is not a security boundary against a malicious same-EUID process racing
+namespaces, hard links, or mounts. Descriptor monitoring begins only after each
+relevant object can be opened and registered, so pre-registration races and
+mount-namespace substitution remain outside its guarantee. Retaining
+descriptors detects controlled path identity changes but does not make the
+filesystem namespace race-proof.
+
+Process cleanup similarly relies on verified numeric PID, PGID, and SID
+identity while the guardian remains alive. Deterministic fixtures verify that
+controlled conversation-runtime descendants retain that group and session,
+and identity is revalidated before every signal. A measured descendant that
+intentionally calls `setpgid` or `setsid` can escape supervision. The harness
+does not claim containment of a malicious measured command.
 
 ## macOS System-Speech Reference
 

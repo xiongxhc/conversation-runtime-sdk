@@ -118,6 +118,27 @@ assert_process_gone() {
     done
 }
 
+atomic_swap_paths() {
+    /usr/bin/perl -e '
+        use constant AT_FDCWD => -2;
+        use constant RENAME_SWAP => 2;
+        use constant SYS_RENAMEATX_NP => 488;
+        syscall(
+            SYS_RENAMEATX_NP,
+            AT_FDCWD,
+            $ARGV[0],
+            AT_FDCWD,
+            $ARGV[1],
+            RENAME_SWAP
+        ) == 0 or die "renameatx_np RENAME_SWAP failed\n";
+    ' "$1" "$2"
+}
+
+HELP_OUTPUT=$("$HARNESS" --help)
+printf '%s\n' "$HELP_OUTPUT" | grep -q 'trusted local operator account'
+printf '%s\n' "$HELP_OUTPUT" | grep -q 'malicious same-EUID process'
+printf '%s\n' "$HELP_OUTPUT" | grep -q 'setpgid/setsid'
+
 assert_fails "$HARNESS" \
     --config voice-session.toml \
     --duration-seconds 1 \
@@ -234,6 +255,51 @@ assert_background_fails "$repository_redirect_pid"
 test ! -e "$REPOSITORY_REDIRECT_METRICS"
 test ! -e "$REPOSITORY_REDIRECT_ORIGINAL/forbidden-race-metrics.jsonl"
 
+PARENT_LINK_ROOT="$FIXTURE_ROOT/parent-link"
+PARENT_LINK_OUTPUT="$PARENT_LINK_ROOT/output"
+PARENT_LINK_MARKER="$FIXTURE_ROOT/parent-link-ready"
+mkdir -p "$PARENT_LINK_OUTPUT"
+chmod 700 "$PARENT_LINK_ROOT" "$PARENT_LINK_OUTPUT"
+env \
+    CONVERSATION_ACCEPTANCE_TEST_METRICS_READY_MARKER="$PARENT_LINK_MARKER" \
+    CONVERSATION_ACCEPTANCE_TEST_METRICS_READY_DELAY_MS=500 \
+    CONVERSATION_VOICE_LOOP_BIN=/usr/bin/true \
+    "$HARNESS" \
+    --config "$CONFIG" \
+    --duration-seconds 1 \
+    --metrics "$PARENT_LINK_OUTPUT/metrics.jsonl" \
+    >"$FIXTURE_ROOT/parent-link.stdout" \
+    2>"$FIXTURE_ROOT/parent-link.stderr" &
+parent_link_pid=$!
+wait_for_path "$PARENT_LINK_MARKER" "$parent_link_pid"
+mkdir "$PARENT_LINK_OUTPUT/injected-directory"
+rmdir "$PARENT_LINK_OUTPUT/injected-directory"
+assert_background_fails "$parent_link_pid"
+test ! -e "$PARENT_LINK_OUTPUT/metrics.jsonl"
+
+STAGE_EVENT_ROOT="$FIXTURE_ROOT/stage-event"
+STAGE_EVENT_OUTPUT="$STAGE_EVENT_ROOT/output"
+STAGE_EVENT_MARKER="$FIXTURE_ROOT/stage-event-ready"
+mkdir -p "$STAGE_EVENT_OUTPUT"
+chmod 700 "$STAGE_EVENT_ROOT" "$STAGE_EVENT_OUTPUT"
+env \
+    CONVERSATION_ACCEPTANCE_TEST_METRICS_READY_MARKER="$STAGE_EVENT_MARKER" \
+    CONVERSATION_ACCEPTANCE_TEST_METRICS_READY_DELAY_MS=500 \
+    CONVERSATION_VOICE_LOOP_BIN=/usr/bin/true \
+    "$HARNESS" \
+    --config "$CONFIG" \
+    --duration-seconds 1 \
+    --metrics "$STAGE_EVENT_OUTPUT/metrics.jsonl" \
+    >"$FIXTURE_ROOT/stage-event.stdout" \
+    2>"$FIXTURE_ROOT/stage-event.stderr" &
+stage_event_pid=$!
+wait_for_path "$STAGE_EVENT_MARKER" "$stage_event_pid"
+set -- "$STAGE_EVENT_OUTPUT"/.conversation-runtime-metrics-*
+[ "$#" -eq 1 ] && [ -d "$1" ]
+mv "$1" "$STAGE_EVENT_OUTPUT/injected-stage-name"
+assert_background_fails "$stage_event_pid"
+test ! -e "$STAGE_EVENT_OUTPUT/metrics.jsonl"
+
 CONCURRENT_TARGET_METRICS="$FIXTURE_ROOT/concurrent-target.jsonl"
 CONCURRENT_TARGET_MARKER="$FIXTURE_ROOT/concurrent-target-ready"
 env \
@@ -261,7 +327,7 @@ TRANSIENT_LINK_ALIAS="$FIXTURE_ROOT/transient-link-alias.jsonl"
 TRANSIENT_LINK_MARKER="$FIXTURE_ROOT/transient-link-published"
 env \
     CONVERSATION_ACCEPTANCE_TEST_METRICS_PUBLISHED_MARKER="$TRANSIENT_LINK_MARKER" \
-    CONVERSATION_ACCEPTANCE_TEST_METRICS_MONITOR_MS=1000 \
+    CONVERSATION_ACCEPTANCE_TEST_METRICS_MONITOR_MS=5000 \
     CONVERSATION_VOICE_LOOP_BIN=/usr/bin/true \
     "$HARNESS" \
     --config "$CONFIG" \
@@ -275,6 +341,31 @@ ln "$TRANSIENT_LINK_METRICS" "$TRANSIENT_LINK_ALIAS"
 rm "$TRANSIENT_LINK_ALIAS"
 assert_background_fails "$transient_link_pid"
 test ! -e "$TRANSIENT_LINK_METRICS"
+
+REPLACEMENT_METRICS="$FIXTURE_ROOT/replacement.jsonl"
+REPLACEMENT_OTHER="$FIXTURE_ROOT/replacement-other.jsonl"
+REPLACEMENT_MARKER="$FIXTURE_ROOT/replacement-published"
+printf '%s\n' 'unrelated replacement must survive cleanup' >"$REPLACEMENT_OTHER"
+chmod 644 "$REPLACEMENT_OTHER"
+env \
+    CONVERSATION_ACCEPTANCE_TEST_METRICS_PUBLISHED_MARKER="$REPLACEMENT_MARKER" \
+    CONVERSATION_ACCEPTANCE_TEST_METRICS_MONITOR_MS=5000 \
+    CONVERSATION_VOICE_LOOP_BIN=/usr/bin/true \
+    "$HARNESS" \
+    --config "$CONFIG" \
+    --duration-seconds 1 \
+    --metrics "$REPLACEMENT_METRICS" \
+    >"$FIXTURE_ROOT/replacement.stdout" \
+    2>"$FIXTURE_ROOT/replacement.stderr" &
+replacement_pid=$!
+wait_for_path "$REPLACEMENT_MARKER" "$replacement_pid"
+atomic_swap_paths "$REPLACEMENT_METRICS" "$REPLACEMENT_OTHER"
+assert_background_fails "$replacement_pid"
+test "$(cat "$REPLACEMENT_METRICS")" = \
+    'unrelated replacement must survive cleanup'
+test "$(stat -f '%Lp' "$REPLACEMENT_METRICS")" = 644
+grep -q 'metrics cleanup could not safely remove' \
+    "$FIXTURE_ROOT/replacement.stderr"
 
 NEVER_RUN_MARKER="$FIXTURE_ROOT/measured-command-ran"
 NEVER_RUN_LOOP="$FIXTURE_ROOT/never-run-voice-loop.sh"
@@ -317,6 +408,68 @@ kill -0 "$outside_pid"
 kill -TERM "$outside_pid"
 wait "$outside_pid" 2>/dev/null || true
 outside_pid=
+
+STATUS_CHILD_PID="$FIXTURE_ROOT/status-child.pid"
+STATUS_FAILURE_LOOP="$FIXTURE_ROOT/status-failure-voice-loop.sh"
+cat >"$STATUS_FAILURE_LOOP" <<EOF
+#!/usr/bin/ruby
+child = Process.spawn("/bin/sleep", "30")
+File.write("$STATUS_CHILD_PID", child.to_s)
+exit 1
+EOF
+chmod 700 "$STATUS_FAILURE_LOOP"
+
+STATUS_FAILURE_METRICS="$FIXTURE_ROOT/status-failure.jsonl"
+assert_fails_bounded env \
+    CONVERSATION_ACCEPTANCE_TEST_LAUNCH_MODE=status_write_failure \
+    CONVERSATION_VOICE_LOOP_BIN="$STATUS_FAILURE_LOOP" \
+    "$HARNESS" \
+    --config "$CONFIG" \
+    --duration-seconds 5 \
+    --metrics "$STATUS_FAILURE_METRICS"
+jq -e . "$STATUS_FAILURE_METRICS" >/dev/null
+grep -q '"exit_code":125' "$STATUS_FAILURE_METRICS"
+grep -q '"process_cleanup_failure_count":1' "$STATUS_FAILURE_METRICS"
+test -f "$STATUS_CHILD_PID"
+assert_process_gone "$(cat "$STATUS_CHILD_PID")"
+
+CONTROLLED_PARENT_IDENTITY="$FIXTURE_ROOT/controlled-parent.identity"
+CONTROLLED_CHILD_IDENTITY="$FIXTURE_ROOT/controlled-child.identity"
+CONTROLLED_CHILD_PID="$FIXTURE_ROOT/controlled-child.pid"
+CONTROLLED_LOOP="$FIXTURE_ROOT/controlled-group-voice-loop.sh"
+cat >"$CONTROLLED_LOOP" <<EOF
+#!/usr/bin/ruby
+child = fork do
+  File.write(
+    "$CONTROLLED_CHILD_IDENTITY",
+    [Process.pid, Process.getpgrp, Process.getsid].join(" ")
+  )
+  sleep 30
+end
+File.write("$CONTROLLED_CHILD_PID", child.to_s)
+File.write(
+  "$CONTROLLED_PARENT_IDENTITY",
+  [Process.pid, Process.getpgrp, Process.getsid].join(" ")
+)
+sleep 0.2
+exit 1
+EOF
+chmod 700 "$CONTROLLED_LOOP"
+
+assert_fails env CONVERSATION_VOICE_LOOP_BIN="$CONTROLLED_LOOP" "$HARNESS" \
+    --config "$CONFIG" \
+    --duration-seconds 5 \
+    --metrics "$FIXTURE_ROOT/controlled-group.jsonl"
+set -- $(cat "$CONTROLLED_PARENT_IDENTITY")
+controlled_parent_pgid=$2
+controlled_parent_sid=$3
+set -- $(cat "$CONTROLLED_CHILD_IDENTITY")
+controlled_child_pgid=$2
+controlled_child_sid=$3
+test "$controlled_parent_pgid" = "$controlled_parent_sid"
+test "$controlled_child_pgid" = "$controlled_parent_pgid"
+test "$controlled_child_sid" = "$controlled_parent_sid"
+assert_process_gone "$(cat "$CONTROLLED_CHILD_PID")"
 
 FAKE_LOOP="$FIXTURE_ROOT/fake-voice-loop.sh"
 cat >"$FAKE_LOOP" <<'EOF'

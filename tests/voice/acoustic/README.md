@@ -107,3 +107,19 @@ repository until reviewed. Add only the following to
 
 If the procedure is not performed, mark acoustic evidence `NOT VALIDATED` and
 do not publish counts or latency values.
+
+## Acceptance Harness Threat Boundary
+
+The ten-minute acceptance harness assumes a trusted local operator account. It
+protects against accidental overwrite, symbolic links and special files,
+unsafe output permissions, repository output, ordinary child leaks,
+timeout/SIGINT, and descendants created by the controlled CLI and sidecar.
+
+It is not a security boundary against a malicious same-EUID process racing
+namespaces, hard links, or mounts. Descriptor monitoring starts only after the
+relevant path components can be opened, so it cannot eliminate pre-registration
+or mount-namespace gaps. Process supervision uses verified numeric PID, PGID,
+and SID identity and covers controlled descendants that remain in that
+session/group; a measured descendant that intentionally calls `setpgid` or
+`setsid` can escape it. The acoustic procedure does not test or strengthen
+these security limits.

@@ -53,7 +53,7 @@ VOICE_SIDECAR_FIXTURES_DIR="$PWD/tests/fixtures/voice-sidecar-v1" \
 
 xcrun swift build \
   --package-path platform/macos/voice-sidecar \
-  --scratch-path /tmp/conversation-runtime-task12-round1-strict \
+  --scratch-path /tmp/conversation-runtime-task12-round2-strict \
   -c release \
   -Xswiftc -swift-version -Xswiftc 6 \
   -Xswiftc -strict-concurrency=complete \
@@ -76,8 +76,11 @@ Results:
 - complete Swift sidecar package: `102` tests passed;
 - deterministic acceptance-harness script: passed success, failure,
   content-filtering, repository/resolved-alias rejection, existing-file,
-  symlink, hard-link, FIFO, mode, immediate-orphan, late-child,
-  no-collateral-kill, and orphan-cleanup scenarios;
+  concurrent-parent swap, repository redirection, concurrent no-overwrite,
+  symlink, persistent/transient hard-link, FIFO, safe-parent mode,
+  session-creation failure, delayed/mismatched identity handshake, unrelated
+  group collision, immediate-orphan, late-child, no-collateral-kill, and
+  orphan-cleanup scenarios;
 - strict workspace Clippy: passed with warnings denied;
 - strict Swift 6 release build: passed with complete concurrency checking and
   warnings denied;
@@ -109,10 +112,14 @@ The deterministic evidence covers:
 - explicit buffered compatibility with no streaming-to-buffered fallback;
 - bounded content-free JSONL metrics on success, interruption, failure, and
   detected orphan cleanup;
-- exclusive no-follow creation of a previously absent `0600` regular metrics
-  file without modifying the containing directory;
-- dedicated measured process groups with TERM/KILL cleanup, root reaping, and
-  bounded empty-group verification independent of PID ancestry snapshots.
+- descriptor-relative no-follow creation of a previously absent `0600` regular
+  metrics file in a private staging directory, parent identity monitoring,
+  exclusive atomic publication, and persistent/transient link rejection
+  without changing containing-directory permissions;
+- verified `PID == PGID == SID` launch handshakes before measured exec,
+  identity revalidation before every group TERM/KILL, PID-only cleanup before
+  trust, root reaping, no-collateral-kill behavior, and bounded empty-group
+  verification independent of PID ancestry snapshots.
 
 When a real source line is absent, the harness records stale-generation and
 queue-underrun counts as JSON `null` with the corresponding observation flag

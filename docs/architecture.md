@@ -172,12 +172,23 @@ selected WAV containers. Cancellation checks precede PCM/frame allocations and
 run during chunk and frame processing, so a dropped consumer does not leave an
 HTTP producer or full-container decode running without an owner.
 
-The process/device harness requires a previously absent metrics target and
-keeps the exclusively created no-follow `0600` regular file open through one
-writer descriptor. The measured command runs in a dedicated session/process
-group; timeout, interruption, failure, and exit cleanup signal that group,
-reap the root, and verify boundedly that the group is empty. Process snapshots
-are evidence only and are never the cleanup authority.
+The process/device harness securely opens each metrics-parent path component
+with no-follow directory descriptors, checks ownership and permissions, rejects
+repository ancestry, and watches the parent identity. Metrics are written
+through one exclusively created `0600` descriptor inside a private `0700`
+staging directory. Link-count transitions invalidate the run; after EOF, the
+helper revalidates the parent and publishes the complete file with an exclusive
+descriptor-relative rename. No sensitive writes occur through the public
+target pathname.
+
+The measured-command launcher creates a new session and reports its PID, PGID,
+and SID from inside that session before it can exec the command. The parent
+requires `PID == PGID == SID`, requires that identity to equal the launcher
+child, and verifies it with the kernel before releasing execution. A guardian
+keeps the verified session leader alive until cleanup. Every group TERM/KILL is
+preceded by another kernel identity check; failed or timed-out handshakes clean
+only the known child PID. The parent reaps the launcher and boundedly verifies
+that the group is empty without using PID ancestry as cleanup authority.
 
 ## macOS System-Speech Reference
 

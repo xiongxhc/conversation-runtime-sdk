@@ -72,15 +72,6 @@ esac
 metrics_parent=$(dirname -- "$metrics_path")
 metrics_name=$(basename -- "$metrics_path")
 [ "$metrics_name" != "." ] && [ "$metrics_name" != ".." ] || fail "invalid metrics path"
-metrics_parent=$(
-    CDPATH= cd -- "$metrics_parent" 2>/dev/null && pwd -P
-) || fail "metrics parent directory does not exist"
-metrics_path="$metrics_parent/$metrics_name"
-case "$metrics_path" in
-    "$REPOSITORY_ROOT"|"$REPOSITORY_ROOT"/*)
-        fail "metrics output must be outside the repository"
-        ;;
-esac
 
 voice_loop_bin=${CONVERSATION_VOICE_LOOP_BIN:-$DEFAULT_VOICE_LOOP_BIN}
 case "$voice_loop_bin" in
@@ -93,52 +84,80 @@ esac
 umask 077
 temporary_root=$(mktemp -d "${TMPDIR:-/tmp}/conversation-runtime-acceptance.XXXXXX") ||
     fail "could not create private temporary directory"
+helper_bin=${CONVERSATION_ACCEPTANCE_HELPER_BIN:-}
+if [ -z "$helper_bin" ]; then
+    helper_bin="$temporary_root/acceptance-helper"
+    /usr/bin/xcrun clang \
+        -std=c11 \
+        -O2 \
+        -Wall \
+        -Wextra \
+        -Werror \
+        "$REPOSITORY_ROOT/tests/voice/acceptance-helper.c" \
+        -o "$helper_bin" ||
+        fail "could not build acceptance safety helper"
+fi
+case "$helper_bin" in
+    /*) ;;
+    *) fail "acceptance safety helper must use an absolute path" ;;
+esac
+[ -x "$helper_bin" ] || fail "acceptance safety helper is not available"
+
 fifo_path="$temporary_root/stderr.fifo"
 metrics_fifo="$temporary_root/metrics.fifo"
 metrics_ready="$temporary_root/metrics-ready"
 metrics_failed="$temporary_root/metrics-failed"
 parser_state="$temporary_root/parser.state"
-process_group_snapshot="$temporary_root/process-groups.txt"
 process_inspection_failed="$temporary_root/process-inspection-failed"
 process_cleanup_failed="$temporary_root/process-cleanup-failed"
 duration_marker="$temporary_root/duration-reached"
 interrupt_marker="$temporary_root/user-interrupted"
+launch_handshake="$temporary_root/launch-handshake"
+launch_release="$temporary_root/launch-release"
+launch_status="$temporary_root/launch-status"
+launch_finish="$temporary_root/launch-finish"
 
 voice_pid=
 voice_pgid=
+voice_sid=
+voice_identity_verified=0
 timer_pid=
 parser_pid=
 force_shutdown_pid=
 metrics_writer_pid=
 metrics_fd_open=0
 
-group_exists() {
+session_identity_valid() {
+    [ "$voice_identity_verified" -eq 1 ] || return 1
+    [ -n "$voice_pid" ] && [ -n "$voice_pgid" ] && [ -n "$voice_sid" ] ||
+        return 1
+    "$helper_bin" verify-session "$voice_pid" "$voice_pgid" "$voice_sid"
+}
+
+group_member_count() {
     [ -n "$voice_pgid" ] || return 1
-    /usr/bin/perl -e 'exit(kill(0, -$ARGV[0]) ? 0 : 1)' "$voice_pgid"
+    "$helper_bin" group-count "$voice_pgid"
 }
 
 signal_voice_group() {
     signal_name=$1
-    [ -n "$voice_pgid" ] || return 0
-    /usr/bin/perl -e '
-        my ($signal_name, $process_group) = @ARGV;
-        kill $signal_name, -$process_group;
-        exit 0;
-    ' "$signal_name" "$voice_pgid"
+    session_identity_valid || return 1
+    "$helper_bin" signal-group \
+        "$voice_pid" \
+        "$voice_pgid" \
+        "$voice_sid" \
+        "$signal_name"
 }
 
-stop_voice_group() {
+verify_group_empty() {
     [ -n "$voice_pgid" ] || return 0
-    if group_exists; then
-        signal_voice_group TERM
-        sleep 0.5
-    fi
-    if group_exists; then
-        signal_voice_group KILL
-    fi
-
     attempts=0
-    while group_exists; do
+    while :; do
+        member_count=$(group_member_count) || {
+            : >"$process_inspection_failed"
+            return 1
+        }
+        [ "$member_count" -eq 0 ] && return 0
         attempts=$((attempts + 1))
         if [ "$attempts" -ge 40 ]; then
             : >"$process_cleanup_failed"
@@ -146,7 +165,48 @@ stop_voice_group() {
         fi
         sleep 0.05
     done
-    return 0
+}
+
+stop_unverified_voice() {
+    [ -n "$voice_pid" ] || return 0
+    kill -TERM "$voice_pid" 2>/dev/null || true
+    attempts=0
+    while kill -0 "$voice_pid" 2>/dev/null; do
+        attempts=$((attempts + 1))
+        if [ "$attempts" -ge 20 ]; then
+            kill -KILL "$voice_pid" 2>/dev/null || true
+            break
+        fi
+        sleep 0.01
+    done
+    wait "$voice_pid" 2>/dev/null || true
+    voice_pid=
+}
+
+stop_voice_group() {
+    [ "$voice_identity_verified" -eq 1 ] || return 0
+    if session_identity_valid; then
+        signal_voice_group TERM || : >"$process_cleanup_failed"
+        sleep 0.5
+    fi
+
+    if session_identity_valid; then
+        member_count=$(group_member_count) || {
+            : >"$process_inspection_failed"
+            member_count=2
+        }
+        if [ "$member_count" -gt 1 ]; then
+            signal_voice_group KILL || : >"$process_cleanup_failed"
+        else
+            : >"$launch_finish"
+        fi
+    fi
+
+    if [ -n "$voice_pid" ]; then
+        wait "$voice_pid" 2>/dev/null || true
+        voice_pid=
+    fi
+    verify_group_empty
 }
 
 cleanup() {
@@ -156,9 +216,10 @@ cleanup() {
             wait "$pid" 2>/dev/null || true
         fi
     done
-    stop_voice_group || true
-    if [ -n "$voice_pid" ]; then
-        wait "$voice_pid" 2>/dev/null || true
+    if [ "$voice_identity_verified" -eq 1 ]; then
+        stop_voice_group || true
+    else
+        stop_unverified_voice
     fi
     if [ "$metrics_fd_open" -eq 1 ]; then
         exec 3>&-
@@ -175,55 +236,13 @@ trap cleanup EXIT
 config_sha256=$(/usr/bin/shasum -a 256 "$config_path" | awk '{print $1}') ||
     fail "could not digest configuration"
 mkfifo "$metrics_fifo" || fail "could not create private metrics pipe"
-/usr/bin/perl -e '
-    use Fcntl qw(:DEFAULT :mode O_NOFOLLOW);
-    my ($path, $fifo, $ready, $failed) = @ARGV;
-
-    sub mark_failed {
-        my ($marker) = @_;
-        sysopen(my $failure_handle, $marker, O_WRONLY | O_CREAT | O_EXCL, 0600);
-        close $failure_handle if $failure_handle;
-        exit 1;
-    }
-
-    sysopen(my $output, $path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600)
-        or mark_failed($failed);
-    my @opened = stat($output);
-    mark_failed($failed)
-        unless @opened &&
-            S_ISREG($opened[2]) &&
-            $opened[3] == 1 &&
-            ($opened[2] & 0777) == 0600;
-
-    sysopen(my $ready_handle, $ready, O_WRONLY | O_CREAT | O_EXCL, 0600)
-        or mark_failed($failed);
-    close $ready_handle or mark_failed($failed);
-    open my $input, "<", $fifo or mark_failed($failed);
-
-    my $buffer;
-    while (1) {
-        my $read = sysread($input, $buffer, 8192);
-        mark_failed($failed) unless defined $read;
-        last if $read == 0;
-        my $offset = 0;
-        while ($offset < $read) {
-            my $written = syswrite($output, $buffer, $read - $offset, $offset);
-            mark_failed($failed) unless defined $written && $written > 0;
-            $offset += $written;
-        }
-    }
-
-    my @path_state = lstat($path);
-    mark_failed($failed)
-        unless @path_state &&
-            $path_state[0] == $opened[0] &&
-            $path_state[1] == $opened[1] &&
-            S_ISREG($path_state[2]) &&
-            $path_state[3] == 1 &&
-            ($path_state[2] & 0777) == 0600;
-    close $input or mark_failed($failed);
-    close $output or mark_failed($failed);
-' "$metrics_path" "$metrics_fifo" "$metrics_ready" "$metrics_failed" &
+"$helper_bin" metrics \
+    "$metrics_parent" \
+    "$metrics_name" \
+    "$metrics_fifo" \
+    "$metrics_ready" \
+    "$metrics_failed" \
+    "$REPOSITORY_ROOT" &
 metrics_writer_pid=$!
 
 attempts=0
@@ -231,7 +250,7 @@ while [ ! -f "$metrics_ready" ]; do
     if [ -f "$metrics_failed" ] || ! kill -0 "$metrics_writer_pid" 2>/dev/null; then
         wait "$metrics_writer_pid" 2>/dev/null || true
         metrics_writer_pid=
-        fail "metrics output must be a previously absent regular file"
+        fail "metrics output requires a safe, unchanged directory and absent target"
     fi
     attempts=$((attempts + 1))
     [ "$attempts" -lt 200 ] || fail "timed out creating metrics output"
@@ -327,58 +346,101 @@ END {
 ' <"$fifo_path" >&3 &
 parser_pid=$!
 
-/usr/bin/perl -MPOSIX=setsid -e '
-    setsid() >= 0 or die "could not create measured process session\n";
-    exec @ARGV or die "could not execute measured command\n";
-' "$voice_loop_bin" --config "$config_path" >/dev/null 2>"$fifo_path" 3>&- &
+"$helper_bin" launch \
+    "$launch_handshake" \
+    "$launch_release" \
+    "$launch_status" \
+    "$launch_finish" \
+    "$voice_loop_bin" \
+    --config \
+    "$config_path" \
+    >/dev/null 2>"$fifo_path" 3>&- &
 voice_pid=$!
-voice_pgid=$voice_pid
 
-/usr/bin/perl -e '
-    $SIG{HUP} = $SIG{INT} = $SIG{TERM} = sub { exit 0 };
-    my ($duration, $process_group, $marker) = @ARGV;
-    sleep $duration;
-    exit 0 unless kill 0, -$process_group;
-    open my $handle, ">", $marker or exit 2;
-    close $handle;
-    kill "INT", -$process_group;
-    sleep 10;
-    kill "TERM", -$process_group if kill 0, -$process_group;
-    sleep 2;
-    kill "KILL", -$process_group if kill 0, -$process_group;
-' "$duration_seconds" "$voice_pgid" "$duration_marker" 3>&- &
+"$helper_bin" wait-handshake "$voice_pid" "$launch_handshake" 1000 ||
+    fail "timed out verifying measured process identity"
+
+handshake_pid=
+handshake_pgid=
+handshake_sid=
+handshake_extra=
+IFS=' ' read -r handshake_pid handshake_pgid handshake_sid handshake_extra \
+    <"$launch_handshake" ||
+    fail "invalid measured process identity handshake"
+for identity in "$handshake_pid" "$handshake_pgid" "$handshake_sid"; do
+    case "$identity" in
+        ''|*[!0-9]*) fail "invalid measured process identity handshake" ;;
+    esac
+done
+[ -z "$handshake_extra" ] ||
+    fail "invalid measured process identity handshake"
+[ "$handshake_pid" = "$voice_pid" ] &&
+    [ "$handshake_pid" = "$handshake_pgid" ] &&
+    [ "$handshake_pid" = "$handshake_sid" ] ||
+    fail "measured process identity handshake did not match launcher"
+"$helper_bin" verify-session \
+    "$handshake_pid" \
+    "$handshake_pgid" \
+    "$handshake_sid" ||
+    fail "measured process identity could not be verified"
+voice_pgid=$handshake_pgid
+voice_sid=$handshake_sid
+voice_identity_verified=1
+: >"$launch_release" ||
+    fail "could not release verified measured process"
+
+"$helper_bin" timeout-watchdog \
+    "$voice_pid" \
+    "$voice_pgid" \
+    "$voice_sid" \
+    "$duration_seconds" \
+    "$duration_marker" \
+    "$process_cleanup_failed" \
+    3>&- &
 timer_pid=$!
 
 handle_interrupt() {
     : >"$interrupt_marker"
-    if [ -n "$voice_pgid" ]; then
-        signal_voice_group INT
+    if [ "$voice_identity_verified" -eq 1 ]; then
+        signal_voice_group INT || : >"$process_cleanup_failed"
         if [ -z "$force_shutdown_pid" ]; then
-            /usr/bin/perl -e '
-                $SIG{HUP} = $SIG{INT} = $SIG{TERM} = sub { exit 0 };
-                my ($process_group) = @ARGV;
-                sleep 10;
-                kill "TERM", -$process_group if kill 0, -$process_group;
-                sleep 2;
-                kill "KILL", -$process_group if kill 0, -$process_group;
-            ' "$voice_pgid" 3>&- &
+            "$helper_bin" shutdown-watchdog \
+                "$voice_pid" \
+                "$voice_pgid" \
+                "$voice_sid" \
+                "$process_cleanup_failed" \
+                3>&- &
             force_shutdown_pid=$!
         fi
     fi
 }
 trap handle_interrupt HUP INT TERM
 
-while :; do
-    if wait "$voice_pid"; then
-        voice_status=0
-    else
-        voice_status=$?
+voice_status=
+while [ ! -f "$launch_status" ]; do
+    if ! kill -0 "$voice_pid" 2>/dev/null; then
+        if wait "$voice_pid"; then
+            launcher_status=0
+        else
+            launcher_status=$?
+        fi
+        voice_pid=
+        voice_status=$launcher_status
+        verify_group_empty || true
+        break
     fi
-    if [ -f "$interrupt_marker" ] && kill -0 "$voice_pid" 2>/dev/null; then
-        continue
-    fi
-    break
+    sleep 0.01
 done
+if [ -f "$launch_status" ]; then
+    IFS= read -r voice_status <"$launch_status" ||
+        voice_status=
+    case "$voice_status" in
+        ''|*[!0-9]*)
+            voice_status=125
+            : >"$process_cleanup_failed"
+            ;;
+    esac
+fi
 
 kill "$timer_pid" 2>/dev/null || true
 wait "$timer_pid" 2>/dev/null || true
@@ -390,19 +452,16 @@ if [ -n "$force_shutdown_pid" ]; then
 fi
 
 orphaned_child_count=0
-if group_exists; then
-    if /bin/ps -axo pgid= >"$process_group_snapshot"; then
-        orphaned_child_count=$(
-            awk -v process_group="$voice_pgid" \
-                '$1 == process_group { count++ } END { print count + 0 }' \
-                "$process_group_snapshot"
-        )
+if [ -n "$voice_pid" ]; then
+    if member_count=$(group_member_count); then
+        if [ "$member_count" -gt 0 ]; then
+            orphaned_child_count=$((member_count - 1))
+        fi
     else
         : >"$process_inspection_failed"
     fi
 fi
 stop_voice_group || true
-voice_pid=
 
 /usr/bin/perl -e '
     $SIG{HUP} = $SIG{INT} = $SIG{TERM} = sub { exit 0 };

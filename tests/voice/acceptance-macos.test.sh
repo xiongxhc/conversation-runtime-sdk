@@ -4,6 +4,8 @@ set -eu
 REPOSITORY_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd -P)
 HARNESS="$REPOSITORY_ROOT/tests/voice/acceptance-macos.sh"
 FIXTURE_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/conversation-runtime-acceptance-test.XXXXXX")
+FIXTURE_ROOT=$(CDPATH= cd -- "$FIXTURE_ROOT" && pwd -P)
+HELPER="$FIXTURE_ROOT/acceptance-helper"
 outside_pid=
 
 cleanup() {
@@ -26,6 +28,16 @@ trap cleanup EXIT HUP INT TERM
 CONFIG="$FIXTURE_ROOT/voice-session.toml"
 printf '%s\n' 'schema_version = 2' >"$CONFIG"
 
+/usr/bin/xcrun clang \
+    -std=c11 \
+    -Wall \
+    -Wextra \
+    -Werror \
+    -DACCEPTANCE_HELPER_TESTING \
+    "$REPOSITORY_ROOT/tests/voice/acceptance-helper.c" \
+    -o "$HELPER"
+export CONVERSATION_ACCEPTANCE_HELPER_BIN="$HELPER"
+
 assert_fails() {
     if "$@" >"$FIXTURE_ROOT/assert.stdout" 2>"$FIXTURE_ROOT/assert.stderr"; then
         printf '%s\n' "expected command to fail: $*" >&2
@@ -40,7 +52,7 @@ assert_fails_bounded() {
     command_pid=$!
     /usr/bin/perl -e '
         my ($pid, $marker) = @ARGV;
-        sleep 2;
+        sleep 8;
         exit 0 unless kill 0, $pid;
         open my $handle, ">", $marker or exit 2;
         close $handle;
@@ -63,6 +75,33 @@ assert_fails_bounded() {
     if [ "$command_status" -eq 0 ]; then
         printf '%s\n' "expected command to fail: $*" >&2
         exit 1
+    fi
+}
+
+wait_for_path() {
+    awaited_path=$1
+    awaited_pid=$2
+    attempts=0
+    while [ ! -e "$awaited_path" ]; do
+        if ! kill -0 "$awaited_pid" 2>/dev/null; then
+            wait "$awaited_pid" 2>/dev/null || true
+            printf '%s\n' "fixture command exited before creating: $awaited_path" >&2
+            return 1
+        fi
+        attempts=$((attempts + 1))
+        if [ "$attempts" -ge 400 ]; then
+            printf '%s\n' "timed out waiting for fixture path: $awaited_path" >&2
+            return 1
+        fi
+        sleep 0.01
+    done
+}
+
+assert_background_fails() {
+    background_pid=$1
+    if wait "$background_pid"; then
+        printf '%s\n' "expected background command to fail: $background_pid" >&2
+        return 1
     fi
 }
 
@@ -135,6 +174,149 @@ assert_fails_bounded env CONVERSATION_VOICE_LOOP_BIN=/usr/bin/true "$HARNESS" \
     --duration-seconds 1 \
     --metrics "$FIFO_METRICS"
 test -p "$FIFO_METRICS"
+
+UNSAFE_OUTPUT="$FIXTURE_ROOT/unsafe-output"
+mkdir "$UNSAFE_OUTPUT"
+chmod 777 "$UNSAFE_OUTPUT"
+assert_fails env CONVERSATION_VOICE_LOOP_BIN=/usr/bin/true "$HARNESS" \
+    --config "$CONFIG" \
+    --duration-seconds 1 \
+    --metrics "$UNSAFE_OUTPUT/metrics.jsonl"
+test ! -e "$UNSAFE_OUTPUT/metrics.jsonl"
+
+PARENT_SWAP_ROOT="$FIXTURE_ROOT/parent-swap"
+PARENT_SWAP_OUTPUT="$PARENT_SWAP_ROOT/output"
+PARENT_SWAP_ORIGINAL="$PARENT_SWAP_ROOT/output-original"
+PARENT_SWAP_MARKER="$FIXTURE_ROOT/parent-swap-ready"
+mkdir -p "$PARENT_SWAP_OUTPUT"
+chmod 700 "$PARENT_SWAP_ROOT" "$PARENT_SWAP_OUTPUT"
+env \
+    CONVERSATION_ACCEPTANCE_TEST_METRICS_READY_MARKER="$PARENT_SWAP_MARKER" \
+    CONVERSATION_ACCEPTANCE_TEST_METRICS_READY_DELAY_MS=500 \
+    CONVERSATION_VOICE_LOOP_BIN=/usr/bin/true \
+    "$HARNESS" \
+    --config "$CONFIG" \
+    --duration-seconds 1 \
+    --metrics "$PARENT_SWAP_OUTPUT/metrics.jsonl" \
+    >"$FIXTURE_ROOT/parent-swap.stdout" \
+    2>"$FIXTURE_ROOT/parent-swap.stderr" &
+parent_swap_pid=$!
+wait_for_path "$PARENT_SWAP_MARKER" "$parent_swap_pid"
+mv "$PARENT_SWAP_OUTPUT" "$PARENT_SWAP_ORIGINAL"
+mkdir "$PARENT_SWAP_OUTPUT"
+chmod 700 "$PARENT_SWAP_OUTPUT"
+assert_background_fails "$parent_swap_pid"
+test ! -e "$PARENT_SWAP_OUTPUT/metrics.jsonl"
+test ! -e "$PARENT_SWAP_ORIGINAL/metrics.jsonl"
+
+REPOSITORY_REDIRECT_ROOT="$FIXTURE_ROOT/repository-redirect"
+REPOSITORY_REDIRECT_OUTPUT="$REPOSITORY_REDIRECT_ROOT/output"
+REPOSITORY_REDIRECT_ORIGINAL="$REPOSITORY_REDIRECT_ROOT/output-original"
+REPOSITORY_REDIRECT_MARKER="$FIXTURE_ROOT/repository-redirect-ready"
+REPOSITORY_REDIRECT_METRICS="$REPOSITORY_ROOT/tests/voice/forbidden-race-metrics.jsonl"
+mkdir -p "$REPOSITORY_REDIRECT_OUTPUT"
+chmod 700 "$REPOSITORY_REDIRECT_ROOT" "$REPOSITORY_REDIRECT_OUTPUT"
+env \
+    CONVERSATION_ACCEPTANCE_TEST_METRICS_READY_MARKER="$REPOSITORY_REDIRECT_MARKER" \
+    CONVERSATION_ACCEPTANCE_TEST_METRICS_READY_DELAY_MS=500 \
+    CONVERSATION_VOICE_LOOP_BIN=/usr/bin/true \
+    "$HARNESS" \
+    --config "$CONFIG" \
+    --duration-seconds 1 \
+    --metrics "$REPOSITORY_REDIRECT_OUTPUT/forbidden-race-metrics.jsonl" \
+    >"$FIXTURE_ROOT/repository-redirect.stdout" \
+    2>"$FIXTURE_ROOT/repository-redirect.stderr" &
+repository_redirect_pid=$!
+wait_for_path "$REPOSITORY_REDIRECT_MARKER" "$repository_redirect_pid"
+mv "$REPOSITORY_REDIRECT_OUTPUT" "$REPOSITORY_REDIRECT_ORIGINAL"
+ln -s "$REPOSITORY_ROOT/tests/voice" "$REPOSITORY_REDIRECT_OUTPUT"
+assert_background_fails "$repository_redirect_pid"
+test ! -e "$REPOSITORY_REDIRECT_METRICS"
+test ! -e "$REPOSITORY_REDIRECT_ORIGINAL/forbidden-race-metrics.jsonl"
+
+CONCURRENT_TARGET_METRICS="$FIXTURE_ROOT/concurrent-target.jsonl"
+CONCURRENT_TARGET_MARKER="$FIXTURE_ROOT/concurrent-target-ready"
+env \
+    CONVERSATION_ACCEPTANCE_TEST_METRICS_READY_MARKER="$CONCURRENT_TARGET_MARKER" \
+    CONVERSATION_ACCEPTANCE_TEST_METRICS_READY_DELAY_MS=500 \
+    CONVERSATION_VOICE_LOOP_BIN=/usr/bin/true \
+    "$HARNESS" \
+    --config "$CONFIG" \
+    --duration-seconds 1 \
+    --metrics "$CONCURRENT_TARGET_METRICS" \
+    >"$FIXTURE_ROOT/concurrent-target.stdout" \
+    2>"$FIXTURE_ROOT/concurrent-target.stderr" &
+concurrent_target_pid=$!
+wait_for_path "$CONCURRENT_TARGET_MARKER" "$concurrent_target_pid"
+printf '%s\n' 'concurrent target must remain unchanged' \
+    >"$CONCURRENT_TARGET_METRICS"
+chmod 644 "$CONCURRENT_TARGET_METRICS"
+assert_background_fails "$concurrent_target_pid"
+test "$(cat "$CONCURRENT_TARGET_METRICS")" = \
+    'concurrent target must remain unchanged'
+test "$(stat -f '%Lp' "$CONCURRENT_TARGET_METRICS")" = 644
+
+TRANSIENT_LINK_METRICS="$FIXTURE_ROOT/transient-link.jsonl"
+TRANSIENT_LINK_ALIAS="$FIXTURE_ROOT/transient-link-alias.jsonl"
+TRANSIENT_LINK_MARKER="$FIXTURE_ROOT/transient-link-published"
+env \
+    CONVERSATION_ACCEPTANCE_TEST_METRICS_PUBLISHED_MARKER="$TRANSIENT_LINK_MARKER" \
+    CONVERSATION_ACCEPTANCE_TEST_METRICS_MONITOR_MS=1000 \
+    CONVERSATION_VOICE_LOOP_BIN=/usr/bin/true \
+    "$HARNESS" \
+    --config "$CONFIG" \
+    --duration-seconds 1 \
+    --metrics "$TRANSIENT_LINK_METRICS" \
+    >"$FIXTURE_ROOT/transient-link.stdout" \
+    2>"$FIXTURE_ROOT/transient-link.stderr" &
+transient_link_pid=$!
+wait_for_path "$TRANSIENT_LINK_MARKER" "$transient_link_pid"
+ln "$TRANSIENT_LINK_METRICS" "$TRANSIENT_LINK_ALIAS"
+rm "$TRANSIENT_LINK_ALIAS"
+assert_background_fails "$transient_link_pid"
+test ! -e "$TRANSIENT_LINK_METRICS"
+
+NEVER_RUN_MARKER="$FIXTURE_ROOT/measured-command-ran"
+NEVER_RUN_LOOP="$FIXTURE_ROOT/never-run-voice-loop.sh"
+cat >"$NEVER_RUN_LOOP" <<EOF
+#!/bin/sh
+: >"$NEVER_RUN_MARKER"
+exit 0
+EOF
+chmod 700 "$NEVER_RUN_LOOP"
+
+for launch_mode in setsid_failure delay mismatch; do
+    rm -f "$NEVER_RUN_MARKER"
+    assert_fails_bounded env \
+        CONVERSATION_ACCEPTANCE_TEST_LAUNCH_MODE="$launch_mode" \
+        CONVERSATION_VOICE_LOOP_BIN="$NEVER_RUN_LOOP" \
+        "$HARNESS" \
+        --config "$CONFIG" \
+        --duration-seconds 1 \
+        --metrics "$FIXTURE_ROOT/launch-$launch_mode.jsonl"
+    test ! -e "$NEVER_RUN_MARKER"
+done
+
+COLLISION_READY="$FIXTURE_ROOT/collision-ready"
+"$HELPER" test-session "$COLLISION_READY" &
+outside_pid=$!
+wait_for_path "$COLLISION_READY" "$outside_pid"
+collision_identity=$(cat "$COLLISION_READY")
+test "$collision_identity" = "$outside_pid"
+rm -f "$NEVER_RUN_MARKER"
+assert_fails_bounded env \
+    CONVERSATION_ACCEPTANCE_TEST_LAUNCH_MODE=collision \
+    CONVERSATION_ACCEPTANCE_TEST_COLLISION_ID="$collision_identity" \
+    CONVERSATION_VOICE_LOOP_BIN="$NEVER_RUN_LOOP" \
+    "$HARNESS" \
+    --config "$CONFIG" \
+    --duration-seconds 1 \
+    --metrics "$FIXTURE_ROOT/launch-collision.jsonl"
+test ! -e "$NEVER_RUN_MARKER"
+kill -0 "$outside_pid"
+kill -TERM "$outside_pid"
+wait "$outside_pid" 2>/dev/null || true
+outside_pid=
 
 FAKE_LOOP="$FIXTURE_ROOT/fake-voice-loop.sh"
 cat >"$FAKE_LOOP" <<'EOF'

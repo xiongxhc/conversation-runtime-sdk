@@ -32,7 +32,7 @@ The repository now contains the deterministic runtime foundation, reviewed local
 - explicit buffered and streaming OpenAI-compatible speech modes, with checked concatenated-RIFF parsing and no streaming-to-buffered fallback; and
 - a bounded ten-minute acceptance harness plus an external acoustic measurement procedure.
 
-The integrated typed-text-to-audio path and deterministic R3 contracts are implemented and test-covered. The Task 12 gate recorded `433` passing Rust tests plus one intentionally ignored fixture writer and `102` passing Swift tests. The real schema-v2 microphone, local ASR, streaming speech, shared audio-engine, and barge-in path exists in source, but the required private configuration and local ASR model are absent from the recorded Task 12 environment. A ten-minute device run and the 30-sample acoustic procedure have therefore not been performed. R3 is not complete, and no first-audible or audible-stop latency is claimed. See [the R3 evaluation](docs/r3-real-time-voice-evaluation.md) and [ROADMAP.md](ROADMAP.md).
+The integrated typed-text-to-audio path and deterministic R3 contracts are implemented and test-covered. The Task 12 gate recorded `437` passing Rust tests plus one intentionally ignored fixture writer and `102` passing Swift tests. The real schema-v2 microphone, local ASR, streaming speech, shared audio-engine, and barge-in path exists in source, but the required private configuration and local ASR model are absent from the recorded Task 12 environment. A ten-minute device run and the 30-sample acoustic procedure have therefore not been performed. R3 is not complete, and no first-audible or audible-stop latency is claimed. See [the R3 evaluation](docs/r3-real-time-voice-evaluation.md) and [ROADMAP.md](ROADMAP.md).
 
 ## R3 Target Architecture
 
@@ -193,14 +193,20 @@ target/release/conversation-voice-loop \
 
 The ten-minute harness discards transcript output, records only bounded
 content-free JSONL metrics, and refuses repository output. The metrics path
-must not already exist; the harness atomically creates a regular `0600` file
-without following links while leaving the containing directory unchanged:
+must not already exist. Its containing directory must already exist, be owned
+by the current user, have no group/other write permission, and use an absolute
+path with no symbolic-link components. The harness writes through a
+descriptor-relative private `0600` staging file, rejects directory identity or
+link-count changes, then publishes with an exclusive atomic rename without
+changing the directory's mode or ownership:
 
 ```bash
+mkdir -m 700 "$HOME/conversation-runtime-r3-evidence"
+
 tests/voice/acceptance-macos.sh \
   --config "$PRIVATE_SESSION_CONFIG" \
   --duration-seconds 600 \
-  --metrics /private/tmp/conversation-runtime-r3-metrics.jsonl
+  --metrics "$HOME/conversation-runtime-r3-evidence/session.jsonl"
 ```
 
 `first_playable_audio_ms`, sidecar acceptance, and render acknowledgement are

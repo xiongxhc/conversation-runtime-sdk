@@ -82,6 +82,27 @@ async fn deadline_fires_without_any_subsequent_input_event() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn recognizer_final_arriving_after_elapsed_silence_starts_the_turn() {
+    let harness = VoiceSessionHarness::new();
+    let mut events = harness.start().await;
+    assert_session_started(events.recv().await);
+
+    harness.partial(4, "late final").await;
+    assert_partial(events.recv().await, 4, "late final");
+    harness.speech_ended(0).await;
+    tokio::time::advance(Duration::from_millis(600)).await;
+    tokio::task::yield_now().await;
+    assert!(harness.language.requests().is_empty());
+
+    harness.engine_final(4, "late final").await;
+    harness.wait_for_request_count(1).await;
+
+    let observed = drain_until_turn_terminal(&mut events).await;
+    assert_final_and_completed(&observed, TurnId::new(1), "late final");
+    harness.shutdown(&mut events).await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn sidecar_timestamp_skew_does_not_move_the_session_deadline() {
     let harness = VoiceSessionHarness::new();
     let mut events = harness.start().await;

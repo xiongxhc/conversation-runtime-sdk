@@ -481,6 +481,7 @@ impl VoiceLoop {
         match input {
             Some(Ok(VoiceInputEvent::Activity(activity))) => self.handle_activity(activity).await,
             Some(Ok(VoiceInputEvent::Recognition(RecognitionEvent::Hypothesis(hypothesis)))) => {
+                let is_engine_final = hypothesis.is_engine_final();
                 if !hypothesis.text().trim().is_empty() {
                     if self.active_segment_id.is_some()
                         && self.active_segment_id != Some(hypothesis.segment_id())
@@ -498,6 +499,11 @@ impl VoiceLoop {
                 }
                 self.finalizer
                     .observe_hypothesis(hypothesis, self.clock.now_ms());
+                if is_engine_final && self.state == VoiceLoopState::Listening {
+                    if let Err(error) = self.start_ready_turn().await {
+                        return Some(LoopExit::Fatal(error));
+                    }
+                }
                 None
             }
             Some(Ok(VoiceInputEvent::Playback(receipt)))

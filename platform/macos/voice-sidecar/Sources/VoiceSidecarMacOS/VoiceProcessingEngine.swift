@@ -327,6 +327,8 @@ public final class VoiceProcessingEngine:
     PCMPlaybackScheduling,
     @unchecked Sendable
 {
+    private static let captureFrameCapacity: AVAudioFrameCount = 8_192
+
     public typealias FailureHandler =
         @Sendable (
             UInt64,
@@ -406,6 +408,60 @@ public final class VoiceProcessingEngine:
         }
     }
 
+    static func configurePlaybackGraph(
+        engine: AVAudioEngine,
+        player: AVAudioPlayerNode,
+        sampleRate: Double
+    ) throws -> AVAudioFormat {
+        guard sampleRate.isFinite, sampleRate > 0,
+            let playbackFormat = AVAudioFormat(
+                standardFormatWithSampleRate: sampleRate,
+                channels: 1
+            )
+        else {
+            throw SidecarServiceFailure(
+                stage: .audioOutput,
+                code: .playbackFailed
+            )
+        }
+        if !engine.attachedNodes.contains(player) {
+            engine.attach(player)
+        }
+        engine.connect(
+            player,
+            to: engine.mainMixerNode,
+            format: playbackFormat
+        )
+        engine.connect(
+            engine.mainMixerNode,
+            to: engine.outputNode,
+            format: playbackFormat
+        )
+        return playbackFormat
+    }
+
+    static func makeCaptureRing(
+        format: AVAudioFormat
+    ) throws -> CapturePCMBufferRing {
+        try CapturePCMBufferRing(
+            format: format,
+            frameCapacity: captureFrameCapacity,
+            capacity: 8
+        )
+    }
+
+    static func startupFailure(
+        from error: any Error
+    ) -> SidecarServiceFailure {
+        if let failure = error as? SidecarServiceFailure {
+            return failure
+        }
+        return SidecarServiceFailure(
+            stage: .audioCapture,
+            code: .audioDeviceUnavailable
+        )
+    }
+
     public func setCaptureHandler(
         _ handler: (@Sendable (CapturePCMEvent) -> Void)?
     ) {
@@ -441,23 +497,12 @@ public final class VoiceProcessingEngine:
 
         do {
             try inputNode.setVoiceProcessingEnabled(true)
-            if !engine.attachedNodes.contains(player) {
-                engine.attach(player)
-            }
-            let playbackFormat = AVAudioFormat(
-                standardFormatWithSampleRate: outputFormat.sampleRate,
-                channels: outputFormat.channelCount
-            )!
-            engine.connect(
-                player,
-                to: engine.mainMixerNode,
-                format: playbackFormat
+            let playbackFormat = try Self.configurePlaybackGraph(
+                engine: engine,
+                player: player,
+                sampleRate: outputFormat.sampleRate
             )
-            let ring = try CapturePCMBufferRing(
-                format: inputFormat,
-                frameCapacity: 4_096,
-                capacity: 8
-            )
+            let ring = try Self.makeCaptureRing(format: inputFormat)
             let pump = CaptureBufferPump(
                 ring: ring,
                 eventHandler: { [weak self] event in
@@ -470,7 +515,7 @@ public final class VoiceProcessingEngine:
             capturePump = pump
             inputNode.installTap(
                 onBus: 0,
-                bufferSize: 4_096,
+                bufferSize: Self.captureFrameCapacity,
                 format: inputFormat
             ) { buffer, _ in
                 pump.enqueue(buffer)
@@ -493,10 +538,7 @@ public final class VoiceProcessingEngine:
             capturePump = nil
             player.stop()
             engine.stop()
-            throw SidecarServiceFailure(
-                stage: .audioCapture,
-                code: .audioDeviceUnavailable
-            )
+            throw Self.startupFailure(from: error)
         }
     }
 

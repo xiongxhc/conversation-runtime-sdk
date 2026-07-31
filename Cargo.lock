@@ -110,6 +110,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "command-fds"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b60b5124979fccd9addd89d8b97a1d6eebb4950694520c75ddd722535ea443f"
+dependencies = [
+ "nix",
+ "thiserror",
+]
+
+[[package]]
 name = "conversation-latency-harness"
 version = "0.1.0"
 dependencies = [
@@ -123,6 +133,7 @@ dependencies = [
 name = "conversation-model-adapters"
 version = "0.1.0"
 dependencies = [
+ "command-fds",
  "conversation-protocol",
  "reqwest",
  "serde",
@@ -178,8 +189,10 @@ dependencies = [
  "conversation-runtime",
  "reqwest",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
+ "tokio-util",
  "toml",
 ]
 
@@ -689,6 +702,18 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "nix"
+version = "0.31.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
 ]
 
 [[package]]

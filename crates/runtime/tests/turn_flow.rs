@@ -1,5 +1,5 @@
 use std::future::ready;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -48,6 +48,26 @@ struct RecordingSpeechSynthesizer {
     calls: mpsc::UnboundedSender<String>,
 }
 
+struct PrefetchRecordingSpeech {
+    started: mpsc::UnboundedSender<String>,
+    completed: mpsc::UnboundedSender<()>,
+}
+
+struct SecondSynthesisFails {
+    started: mpsc::UnboundedSender<String>,
+    attempts: AtomicUsize,
+}
+
+struct GatedRecordingOutput {
+    started: mpsc::UnboundedSender<u64>,
+    first_release: Mutex<Option<oneshot::Receiver<()>>>,
+    played: Arc<Mutex<Vec<u64>>>,
+}
+
+struct CancellationBlockingOutput {
+    started: mpsc::UnboundedSender<u64>,
+}
+
 struct BlockingSpeechSynthesizer {
     started: mpsc::UnboundedSender<String>,
     release: Mutex<Option<oneshot::Receiver<()>>>,
@@ -88,6 +108,93 @@ impl SpeechSynthesizer for RecordingSpeechSynthesizer {
         let _ = self.calls.send(request.text().to_owned());
         let audio = self.audio.clone();
         Box::pin(async move { Ok(audio) })
+    }
+}
+
+impl SpeechSynthesizer for PrefetchRecordingSpeech {
+    fn synthesize<'a>(
+        &'a self,
+        request: SpeechRequest,
+        _cancellation: CancellationToken,
+    ) -> AdapterFuture<'a, SynthesizedAudio> {
+        let _ = self.started.send(request.text().to_owned());
+        let completed = self.completed.clone();
+        Box::pin(async move {
+            let _ = completed.send(());
+            Ok(SynthesizedAudio::new(minimal_aiff(), AudioFormat::Aiff))
+        })
+    }
+}
+
+impl SpeechSynthesizer for SecondSynthesisFails {
+    fn synthesize<'a>(
+        &'a self,
+        request: SpeechRequest,
+        _cancellation: CancellationToken,
+    ) -> AdapterFuture<'a, SynthesizedAudio> {
+        let _ = self.started.send(request.text().to_owned());
+        let attempt = self.attempts.fetch_add(1, Ordering::AcqRel);
+        Box::pin(async move {
+            if attempt == 0 {
+                Ok(SynthesizedAudio::new(minimal_aiff(), AudioFormat::Aiff))
+            } else {
+                Err(AdapterError::new("second synthesis failed"))
+            }
+        })
+    }
+}
+
+impl AudioOutput for GatedRecordingOutput {
+    fn play<'a>(
+        &'a self,
+        request: AudioOutputRequest,
+        cancellation: CancellationToken,
+    ) -> AdapterFuture<'a, ()> {
+        let segment_index = request.segment_index();
+        let _ = self.started.send(segment_index);
+        let first_release = if segment_index == 0 {
+            self.first_release
+                .lock()
+                .expect("first output release lock poisoned")
+                .take()
+        } else {
+            None
+        };
+        let played = Arc::clone(&self.played);
+
+        Box::pin(async move {
+            if let Some(first_release) = first_release {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => {
+                        return Err(AdapterError::new("audio output cancelled"));
+                    }
+                    _ = first_release => {}
+                }
+            } else if cancellation.is_cancelled() {
+                return Err(AdapterError::new("audio output cancelled"));
+            }
+
+            played
+                .lock()
+                .expect("played output lock poisoned")
+                .push(segment_index);
+            Ok(())
+        })
+    }
+}
+
+impl AudioOutput for CancellationBlockingOutput {
+    fn play<'a>(
+        &'a self,
+        request: AudioOutputRequest,
+        cancellation: CancellationToken,
+    ) -> AdapterFuture<'a, ()> {
+        let _ = self.started.send(request.segment_index());
+        Box::pin(async move {
+            cancellation.cancelled().await;
+            Err(AdapterError::new("audio output cancelled"))
+        })
     }
 }
 
@@ -290,7 +397,8 @@ async fn streams_ordered_phrases_to_audio_before_generation_completes() {
         Arc::new(ControlledLanguageModel::new(delta_receiver)),
         speech,
         output.clone(),
-    );
+    )
+    .with_phrase_chunking(PhraseChunkingConfig::new(15, 24).unwrap());
     let turn_id = TurnId::new(20);
     let mut events = start_turn(&runtime, turn_id, "overlap").await;
 
@@ -302,7 +410,7 @@ async fn streams_ordered_phrases_to_audio_before_generation_completes() {
     assert_eq!(first_synthesis, "First sentence.");
 
     delta_sender
-        .send(Ok("Second sentence.".into()))
+        .send(Ok("Third sentence.".into()))
         .await
         .unwrap();
     drop(delta_sender);
@@ -315,7 +423,7 @@ async fn streams_ordered_phrases_to_audio_before_generation_completes() {
     let synthesized_text = vec![first_synthesis, second_synthesis];
     assert_eq!(
         synthesized_text,
-        vec!["First sentence.".to_owned(), "Second sentence.".to_owned()]
+        vec!["First sentence.".to_owned(), "Third sentence.".to_owned()]
     );
     assert!(first_synthesis_started_before_model_release);
 
@@ -403,6 +511,278 @@ async fn streams_ordered_phrases_to_audio_before_generation_completes() {
 }
 
 #[tokio::test]
+async fn prepares_one_segment_ahead_before_current_audio_finishes() {
+    const EVENT_BUFFER_FILLER_DELTAS: usize = 26;
+
+    let (delta_sender, delta_receiver) = mpsc::channel(EVENT_BUFFER_FILLER_DELTAS + 1);
+    for _ in 0..EVENT_BUFFER_FILLER_DELTAS {
+        delta_sender.send(Ok(String::new())).await.unwrap();
+    }
+    delta_sender
+        .send(Ok("First segment. Second segment. Third segment.".into()))
+        .await
+        .unwrap();
+    drop(delta_sender);
+    let (synthesis_started, mut synthesis_started_receiver) = mpsc::unbounded_channel();
+    let (synthesis_completed, mut synthesis_completed_receiver) = mpsc::unbounded_channel();
+    let (output_started, mut output_started_receiver) = mpsc::unbounded_channel();
+    let (release_first_output, first_output_release) = oneshot::channel();
+    let played = Arc::new(Mutex::new(Vec::new()));
+    let runtime = ConversationRuntime::new(
+        Arc::new(ControlledLanguageModel::new(delta_receiver)),
+        Arc::new(PrefetchRecordingSpeech {
+            started: synthesis_started,
+            completed: synthesis_completed,
+        }),
+        Arc::new(GatedRecordingOutput {
+            started: output_started,
+            first_release: Mutex::new(Some(first_output_release)),
+            played: Arc::clone(&played),
+        }),
+    )
+    .with_phrase_chunking(PhraseChunkingConfig::new(14, 20).unwrap());
+    let turn_id = TurnId::new(62);
+    let mut events = start_turn(&runtime, turn_id, "prefetch").await;
+    let mut observed = Vec::new();
+
+    assert_eq!(
+        timeout(Duration::from_secs(1), synthesis_started_receiver.recv())
+            .await
+            .expect("first synthesis did not start")
+            .expect("synthesis start channel closed"),
+        "First segment."
+    );
+    timeout(Duration::from_secs(1), synthesis_completed_receiver.recv())
+        .await
+        .expect("first synthesis did not complete")
+        .expect("synthesis completion channel closed");
+    tokio::task::yield_now().await;
+    assert!(
+        output_started_receiver.try_recv().is_err(),
+        "output was invoked while FirstPlayableAudio publication was blocked"
+    );
+
+    loop {
+        let event = timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("first playable event was not emitted")
+            .expect("event stream closed before first playable audio");
+        let first_playable = matches!(
+            event,
+            RuntimeEvent::Timing {
+                milestone: RuntimeTimingMilestone::FirstPlayableAudio,
+                ..
+            }
+        );
+        observed.push(event);
+        if first_playable {
+            break;
+        }
+    }
+
+    assert_eq!(
+        timeout(Duration::from_secs(1), output_started_receiver.recv())
+            .await
+            .expect("first output did not start")
+            .expect("output start channel closed"),
+        0
+    );
+    assert_eq!(
+        timeout(Duration::from_secs(1), synthesis_started_receiver.recv())
+            .await
+            .expect("second synthesis did not start while first output was active")
+            .expect("synthesis start channel closed"),
+        "Second segment."
+    );
+    tokio::task::yield_now().await;
+    assert!(
+        synthesis_started_receiver.try_recv().is_err(),
+        "third synthesis started while the prepared-audio slot was occupied"
+    );
+
+    release_first_output
+        .send(())
+        .expect("first output release receiver dropped");
+    assert_eq!(
+        timeout(Duration::from_secs(1), synthesis_started_receiver.recv())
+            .await
+            .expect("third synthesis did not start after first output released capacity")
+            .expect("synthesis start channel closed"),
+        "Third segment."
+    );
+
+    observed.extend(drain_events(&mut events).await);
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|event| matches!(
+                event,
+                RuntimeEvent::Timing {
+                    milestone: RuntimeTimingMilestone::FirstSynthesisRequest,
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|event| matches!(
+                event,
+                RuntimeEvent::Timing {
+                    milestone: RuntimeTimingMilestone::FirstPlayableAudio,
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(output_started_receiver.try_recv(), Ok(1));
+    assert_eq!(output_started_receiver.try_recv(), Ok(2));
+    assert!(output_started_receiver.try_recv().is_err());
+    assert_eq!(
+        *played.lock().expect("played output lock poisoned"),
+        [0, 1, 2]
+    );
+}
+
+#[tokio::test]
+async fn synthesis_failure_during_active_output_keeps_the_synthesis_stage() {
+    let (synthesis_started, mut synthesis_started_receiver) = mpsc::unbounded_channel();
+    let (output_started, mut output_started_receiver) = mpsc::unbounded_channel();
+    let runtime = ConversationRuntime::new(
+        Arc::new(MockLanguageModel::new(["First segment. Second segment."])),
+        Arc::new(SecondSynthesisFails {
+            started: synthesis_started,
+            attempts: AtomicUsize::new(0),
+        }),
+        Arc::new(CancellationBlockingOutput {
+            started: output_started,
+        }),
+    )
+    .with_phrase_chunking(PhraseChunkingConfig::new(14, 20).unwrap());
+    let turn_id = TurnId::new(63);
+    let mut events = start_turn(&runtime, turn_id, "synthesis priority").await;
+
+    assert_eq!(
+        timeout(Duration::from_secs(1), output_started_receiver.recv())
+            .await
+            .expect("first output did not start")
+            .expect("output start channel closed"),
+        0
+    );
+    assert_eq!(
+        timeout(Duration::from_secs(1), synthesis_started_receiver.recv())
+            .await
+            .expect("first synthesis did not start")
+            .expect("synthesis start channel closed"),
+        "First segment."
+    );
+    assert_eq!(
+        timeout(Duration::from_secs(1), synthesis_started_receiver.recv())
+            .await
+            .expect("second synthesis did not start during active output")
+            .expect("synthesis start channel closed"),
+        "Second segment."
+    );
+
+    assert_eq!(
+        drain_events(&mut events)
+            .await
+            .into_iter()
+            .filter(RuntimeEvent::is_terminal)
+            .collect::<Vec<_>>(),
+        [RuntimeEvent::TurnFailed {
+            turn_id,
+            error: RuntimeError::new(
+                RuntimeErrorKind::Adapter,
+                RuntimeStage::SpeechSynthesizer,
+                "second synthesis failed",
+            ),
+        }]
+    );
+    assert!(output_started_receiver.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn short_sentences_are_one_speech_request_without_changing_text_deltas() {
+    let original = "# 问候\n你好。今天很好！*保持自然*";
+    let (speech_calls, mut synthesized_text) = mpsc::unbounded_channel();
+    let runtime = ConversationRuntime::new(
+        Arc::new(MockLanguageModel::new([original])),
+        Arc::new(RecordingSpeechSynthesizer {
+            audio: SynthesizedAudio::new(minimal_aiff(), AudioFormat::Aiff),
+            calls: speech_calls,
+        }),
+        Arc::new(DiscardAudioOutput),
+    );
+    let turn_id = TurnId::new(60);
+    let mut events = start_turn(&runtime, turn_id, "coalesce").await;
+
+    let observed = drain_events(&mut events).await;
+    let deltas = observed
+        .iter()
+        .filter_map(|event| match event {
+            RuntimeEvent::TextDelta { delta, .. } => Some(delta.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+
+    assert_eq!(deltas, original);
+    assert_eq!(
+        synthesized_text.recv().await.as_deref(),
+        Some("问候. 你好。今天很好！保持自然")
+    );
+    assert!(synthesized_text.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn formatting_only_output_preserves_text_deltas_and_skips_speech_lifecycle() {
+    let original = "#\n***\n```";
+    let (speech_calls, mut synthesized_text) = mpsc::unbounded_channel();
+    let runtime = ConversationRuntime::new(
+        Arc::new(MockLanguageModel::new([original])),
+        Arc::new(RecordingSpeechSynthesizer {
+            audio: SynthesizedAudio::new(minimal_aiff(), AudioFormat::Aiff),
+            calls: speech_calls,
+        }),
+        Arc::new(DiscardAudioOutput),
+    );
+    let turn_id = TurnId::new(61);
+    let mut events = start_turn(&runtime, turn_id, "formatting only").await;
+
+    let observed = drain_events(&mut events).await;
+    let deltas = observed
+        .iter()
+        .filter_map(|event| match event {
+            RuntimeEvent::TextDelta { delta, .. } => Some(delta.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+
+    assert_eq!(deltas, original);
+    assert!(synthesized_text.try_recv().is_err());
+    assert!(!observed.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::SpeechStarted { .. }
+            | RuntimeEvent::SpeechCompleted { .. }
+            | RuntimeEvent::Timing {
+                milestone: RuntimeTimingMilestone::FirstSynthesisRequest
+                    | RuntimeTimingMilestone::FirstPlayableAudio,
+                ..
+            }
+    )));
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|event| event.is_terminal())
+            .collect::<Vec<_>>(),
+        [&RuntimeEvent::TurnCompleted { turn_id }]
+    );
+}
+
+#[tokio::test]
 async fn configured_phrase_limits_control_runtime_synthesis_segments() {
     let (speech_calls, mut synthesized_text) = mpsc::unbounded_channel();
     let runtime = ConversationRuntime::new(
@@ -484,7 +864,8 @@ async fn two_item_phrase_queue_backpressures_language_consumption() {
             release: Mutex::new(Some(speech_release)),
         }),
         Arc::new(DiscardAudioOutput),
-    );
+    )
+    .with_phrase_chunking(PhraseChunkingConfig::new(6, 12).unwrap());
     let turn_id = TurnId::new(22);
     let mut events = start_turn(&runtime, turn_id, "queue").await;
 

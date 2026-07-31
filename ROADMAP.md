@@ -17,8 +17,19 @@ The first release is not a directory-complete platform. It is one local voice lo
 - The TTS probe supports installed-voice discovery, direct voice and rate controls, and bounded named profiles. Profile precedence is `CLI > environment > selected profile > macOS system defaults`; supported backends are `macos-system` and `openai-compatible`.
 - Phrase-level language-to-speech integration, first-playable-audio timing, integrated runtime speech, and cancellation through active playback are implemented and deterministic-test covered.
 - One cold cached Apple Silicon run records first text, first synthesis, first playable audio, playback-process launch, total completion, and cleanup. It is machine-specific evidence, not a model or backend selection.
-- Microphone capture, ASR, barge-in, persona, SQLite memory, the macOS app, and client SDKs have not started.
-- First-audible timing, representative warm measurements, subjective English and Chinese quality, and the 1.2-second time-to-useful-audio goal remain unvalidated.
+- A later isolated Apple Silicon continuity check records one speech request, one playback launch, process-level timings, and cleanup for the corrected punctuation/formatting path. It adds no first-audible or subjective-quality claim.
+- The deterministic R3 implementation now includes schema-v2 privacy policy, a
+  managed macOS voice-processing sidecar, local recognition integration,
+  generation-safe continuous playback, explicit streaming local speech, and a
+  bounded ten-minute acceptance harness.
+- A private local-only configuration and local ASR model now pass preflight,
+  the current macOS source passes an opt-in full-duplex capture/playback smoke,
+  and the release CLI starts under `LocalOnly`. A complete post-fix
+  human-spoken turn, ten-minute device run, and 30-sample acoustic recording
+  remain unperformed, so R3 remains incomplete.
+- First-audible timing, audible-stop p95, representative warm measurements,
+  subjective English and Chinese quality, and the 1.2-second
+  time-to-useful-audio goal remain unvalidated.
 
 ## R0 — Toolchain and Feasibility
 
@@ -26,7 +37,7 @@ The first release is not a directory-complete platform. It is one local voice lo
 
 ### Source Status
 
-The toolchain, safe machine profile, bounded language adapter, reproducible local text probe, model digests, loaded-state snapshots, and first language-model measurements are complete. The macOS system-speech reference adapter and deterministic local HTTP speech adapter have typed-text probe coverage. One integrated run now records first-playable-audio timing and playback-process launch for exact benchmark inputs. First-audible timing, representative sampling, subjective model-quality selection, and ASR benchmarking remain pending. Backend selection belongs to the consuming deployment and remains outside the public SDK roadmap.
+The toolchain, safe machine profile, bounded language adapter, reproducible local text probe, model digests, loaded-state snapshots, and first language-model measurements are complete. The macOS system-speech reference adapter and deterministic local HTTP speech adapter have typed-text probe coverage. A historical integrated benchmark and later isolated continuity check record first-playable-audio timing and playback-process launch for exact benchmark inputs. First-audible timing, representative sampling, subjective model-quality selection, and ASR benchmarking remain pending. Backend selection belongs to the consuming deployment and remains outside the public SDK roadmap.
 
 ### TTS Adapter Boundary
 
@@ -82,18 +93,20 @@ Complete. The initial source and deterministic runtime validation for this miles
 
 ### Source Status
 
-Complete for the implemented typed-input slice. The configurable language adapter, streamed text probe, bounded timeout/output behavior, typed audio and output contracts, deterministic local speech adapter, UTF-8-safe phrase segmentation, bounded concurrent speech pipeline, runtime timing events, active-playback cancellation, and integrated voice probe are present. One Apple Silicon run exercised local generation, synthesis, validated audio, playback-process launch, terminal completion, and cleanup. The run does not measure first audible sound or select a deployment stack. Each consuming deployment must preserve its measured inference policy explicitly rather than inheriting model defaults silently.
+Complete for the implemented typed-input slice. The configurable language adapter, streamed text probe, bounded timeout/output behavior, typed audio and output contracts, deterministic local speech adapter, UTF-8-safe phrase segmentation, short-clause coalescing, speech-only Markdown normalization with unchanged text events, capacity-one synthesized-audio prefetch, runtime timing events, active-playback cancellation, and integrated voice probe are present. The historical Apple Silicon benchmark exercised local generation, synthesis, validated audio, playback-process launch, terminal completion, and cleanup; a later isolated check exercised the corrected one-request continuity path. Neither check measures first audible sound or selects a deployment stack. Each consuming deployment must preserve its measured inference policy explicitly rather than inheriting model defaults silently.
 
 ### Deliverables
 
 - One measured Apple Silicon language-model adapter configured by the reference application.
 - Incremental text streaming into the runtime.
 - One measured Apple Silicon TTS reference adapter.
-- Sentence or phrase chunking that starts synthesis before the full response completes.
+- Sentence or phrase chunking that coalesces short clauses while starting synthesis before the full response completes.
+- Speech-only formatting normalization that preserves the original emitted text.
+- Ordered playback with capacity for exactly one prefetched synthesized segment.
 - Runtime timing events for first text delta, first synthesis request, and first playable audio.
 - A command-line example that turns typed input into local spoken output.
 
-All listed R2 deliverables are implemented and deterministic-test covered. The reference command has one machine-specific Apple Silicon evidence run; exact benchmark inputs are measurements rather than SDK recommendations.
+All listed R2 deliverables are implemented and deterministic-test covered. The reference command has a historical machine-specific benchmark plus a later isolated process-level continuity check; exact benchmark inputs are measurements rather than SDK recommendations.
 
 ### Exit Criteria
 
@@ -109,23 +122,64 @@ The first-audible timestamp is intentionally not inferred from playback-process 
 
 **Outcome:** Support a continuous microphone-to-speaker conversation with interruption as a first-class event.
 
+The approved first slice is a macOS Apple Silicon CLI session with a managed
+Swift sidecar. The sidecar owns the full-duplex Apple voice-processing engine,
+local WhisperKit recognition, and continuous playback; Rust owns privacy policy,
+turn finalization, provider coordination, generation safety, and cancellation.
+See
+[the R3 design](docs/superpowers/specs/2026-07-28-r3-real-time-voice-loop-design.md)
+and [the canonical architecture](docs/architecture.md).
+
+### Source Status
+
+The deterministic code path is implemented: strict schema-v2 configuration
+selects buffered compatibility or explicit streaming speech; the streaming
+adapter parses arbitrarily chunked concatenated WAV containers with checked
+bounds; the Rust runtime preserves turn, generation, utterance, and sequence
+identity through cancellation and backpressure; and the managed macOS sidecar
+owns capture and playback in one Apple voice-processing engine.
+
+The public acceptance harness and acoustic procedure are present. Process/device
+evidence is `PARTIALLY VALIDATED`: a private local-only configuration and local
+ASR model pass preflight, the current macOS source passes an opt-in full-duplex
+capture/playback smoke, and the release CLI starts under `LocalOnly`. Local
+multilingual fixtures transcribe without control tokens. A complete spoken
+microphone-to-audible-response turn is not yet observed after the latest
+finalization fix, so process/device acceptance remains incomplete. Acoustic
+evidence is `NOT VALIDATED` because no external recording set exists. The latest
+deterministic gate recorded `446` passing Rust tests plus one intentionally
+ignored fixture writer and `109` passing Swift tests. No ten-minute continuity,
+first-audible, audible-stop p95, or R3 completion claim is made. See
+[the R3 evaluation](docs/r3-real-time-voice-evaluation.md).
+
 ### Deliverables
 
-- Audio capture and playback abstractions.
-- Local VAD and turn segmentation.
-- Streaming or low-latency local ASR adapter.
-- Partial transcript handling with clear finalization rules.
-- Playback cancellation connected to the active turn token.
+- Local-first, backend-neutral session policy with explicit per-component
+  execution location and no silent remote fallback.
+- System-default audio capture and continuous playback abstractions.
+- Managed macOS sidecar with Apple echo cancellation and bounded framed child
+  protocol.
+- Local VAD and WhisperKit ASR adapter.
+- Display-only partial transcripts and finalization after approximately `600 ms`
+  of silence.
+- Generation-tagged playback cancellation after approximately `200 ms` of
+  sustained user speech.
 - Barge-in that stops generation, synthesis, queued audio, and active playback.
 - End-to-end latency and cancellation measurements.
 
 ### Exit Criteria
 
 - A user sustains a ten-minute local voice conversation without manually resetting the pipeline.
-- Speaking during playback stops audible output and downstream work within a measured bound.
+- Speaking during playback stops audible output within `500 ms` p95 over the
+  scripted acoustic set and cancels downstream work.
 - Stale text or audio from a cancelled turn never appears in the next turn.
-- Time from speech end to useful audio is measured over a representative scripted set.
-- Failures identify their stage and leave the runtime ready for a new turn.
+- Time from speech end to first playable and first audible audio is measured
+  separately over a representative scripted set.
+- Failures identify their stage; turn-scoped failures leave the session ready
+  for a new turn, while device, permission, sidecar, framing, and policy failures
+  require a new session.
+- `LocalOnly` rejects remote STT, LLM, TTS, tools, memory, and telemetry before
+  microphone access.
 
 ## R4 — Conversation Quality Controls
 
@@ -244,6 +298,7 @@ Each platform receives its own measured hardware profile and end-to-end exit cri
 - Cloud synchronization
 - Model marketplaces
 - Hosted inference
+- Additional cloud/provider adapters and failover policy
 - Multi-agent orchestration
 - Organization or team memory
 - Android and remote-internet mobile clients

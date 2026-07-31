@@ -6,14 +6,24 @@ use std::time::Instant;
 
 use conversation_model_adapters::{
     AdapterError, AdapterFuture, AudioOutput, AudioOutputRequest, SpeechRequest, SpeechSynthesizer,
+    SynthesizedAudio,
 };
 use conversation_protocol::{RuntimeEvent, RuntimeStage, RuntimeTimingMilestone, TurnId};
 use tokio::sync::{mpsc, Mutex};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+
+const PREPARED_AUDIO_CAPACITY: usize = 1;
+const SYNTHESIS_TASK_FAILED: &str = "speech synthesis task failed";
 
 pub(crate) struct SpeechSegment {
     pub(crate) index: u64,
     pub(crate) text: String,
+}
+
+struct PreparedAudio {
+    index: u64,
+    audio: SynthesizedAudio,
 }
 
 pub(crate) enum SpeechWorkerOutcome {
@@ -25,6 +35,15 @@ pub(crate) enum SpeechWorkerOutcome {
         error: AdapterError,
     },
     EventStreamClosed,
+}
+
+enum SynthesisStageOutcome {
+    Completed { synthesized_any: bool },
+    Interrupted,
+    Stopped,
+    EventStreamClosed,
+    TaskFailed,
+    Failed(AdapterError),
 }
 
 pub(crate) struct SpeechWorkerContext {
@@ -49,6 +68,28 @@ pub(crate) struct SpeechWorker {
     started_at: Instant,
     external_interruption: CancellationToken,
     work_cancellation: CancellationToken,
+}
+
+#[derive(Clone)]
+struct SpeechEventPublisher {
+    turn_id: TurnId,
+    events: mpsc::Sender<RuntimeEvent>,
+    event_gate: Arc<Mutex<()>>,
+    started_at: Instant,
+    external_interruption: CancellationToken,
+    work_cancellation: CancellationToken,
+}
+
+struct SynthesisStage {
+    speech_synthesizer: Arc<dyn SpeechSynthesizer>,
+    segments: mpsc::Receiver<SpeechSegment>,
+    prepared_audio: mpsc::Sender<PreparedAudio>,
+    publisher: SpeechEventPublisher,
+}
+
+struct OutputStage {
+    audio_output: Arc<dyn AudioOutput>,
+    publisher: SpeechEventPublisher,
 }
 
 impl SpeechWorker {
@@ -77,142 +118,371 @@ impl SpeechWorker {
         }
     }
 
-    pub(crate) async fn run(mut self) -> SpeechWorkerOutcome {
+    pub(crate) async fn run(self) -> SpeechWorkerOutcome {
+        let Self {
+            turn_id,
+            speech_synthesizer,
+            audio_output,
+            segments,
+            events,
+            event_gate,
+            started_at,
+            external_interruption,
+            work_cancellation,
+        } = self;
+        let publisher = SpeechEventPublisher {
+            turn_id,
+            events,
+            event_gate,
+            started_at,
+            external_interruption,
+            work_cancellation,
+        };
+        let (prepared_sender, prepared_receiver) = mpsc::channel(PREPARED_AUDIO_CAPACITY);
+        let synthesis_stage = tokio::spawn(
+            SynthesisStage {
+                speech_synthesizer,
+                segments,
+                prepared_audio: prepared_sender,
+                publisher: publisher.clone(),
+            }
+            .run(),
+        );
+
+        OutputStage {
+            audio_output,
+            publisher,
+        }
+        .run(prepared_receiver, synthesis_stage)
+        .await
+    }
+}
+
+impl SynthesisStage {
+    async fn run(mut self) -> SynthesisStageOutcome {
         let mut speech_started = false;
         let mut first_playable_audio = false;
+        let mut synthesized_any = false;
 
         loop {
             let segment = tokio::select! {
                 biased;
-                _ = self.external_interruption.cancelled() => {
-                    return SpeechWorkerOutcome::Interrupted;
+                _ = self.publisher.external_interruption.cancelled() => {
+                    self.publisher.work_cancellation.cancel();
+                    return SynthesisStageOutcome::Interrupted;
                 }
-                _ = self.work_cancellation.cancelled() => {
-                    return SpeechWorkerOutcome::Stopped;
+                _ = self.publisher.events.closed() => {
+                    self.publisher.work_cancellation.cancel();
+                    return SynthesisStageOutcome::EventStreamClosed;
                 }
-                _ = self.events.closed() => {
-                    return self.event_stream_closed();
+                _ = self.publisher.work_cancellation.cancelled() => {
+                    return SynthesisStageOutcome::Stopped;
                 }
                 segment = self.segments.recv() => segment,
             };
             let Some(segment) = segment else {
-                break;
+                return SynthesisStageOutcome::Completed { synthesized_any };
+            };
+
+            let permit = tokio::select! {
+                biased;
+                _ = self.publisher.external_interruption.cancelled() => {
+                    self.publisher.work_cancellation.cancel();
+                    return SynthesisStageOutcome::Interrupted;
+                }
+                _ = self.publisher.events.closed() => {
+                    self.publisher.work_cancellation.cancel();
+                    return SynthesisStageOutcome::EventStreamClosed;
+                }
+                _ = self.publisher.work_cancellation.cancelled() => {
+                    return SynthesisStageOutcome::Stopped;
+                }
+                permit = self.prepared_audio.reserve() => {
+                    match permit {
+                        Ok(permit) => permit,
+                        Err(_) => return SynthesisStageOutcome::Stopped,
+                    }
+                }
             };
 
             if !speech_started {
                 match self
+                    .publisher
                     .send_required_pair(|| {
                         [
                             RuntimeEvent::SpeechStarted {
-                                turn_id: self.turn_id,
+                                turn_id: self.publisher.turn_id,
                             },
-                            self.timing_event(RuntimeTimingMilestone::FirstSynthesisRequest),
+                            self.publisher
+                                .timing_event(RuntimeTimingMilestone::FirstSynthesisRequest),
                         ]
                     })
                     .await
                 {
                     WorkerSend::Sent => speech_started = true,
-                    WorkerSend::Interrupted => return SpeechWorkerOutcome::Interrupted,
-                    WorkerSend::Stopped => return SpeechWorkerOutcome::Stopped,
-                    WorkerSend::Closed => return self.event_stream_closed(),
+                    WorkerSend::Interrupted => return SynthesisStageOutcome::Interrupted,
+                    WorkerSend::Stopped => return SynthesisStageOutcome::Stopped,
+                    WorkerSend::Closed => return SynthesisStageOutcome::EventStreamClosed,
                 }
             }
 
             let synthesis = catch_unwind(AssertUnwindSafe(|| {
                 self.speech_synthesizer.synthesize(
-                    SpeechRequest::new(self.turn_id, segment.text),
-                    self.work_cancellation.child_token(),
+                    SpeechRequest::new(self.publisher.turn_id, segment.text),
+                    self.publisher.work_cancellation.child_token(),
                 )
             }));
             let synthesis = match synthesis {
                 Ok(synthesis) => synthesis,
                 Err(_) => {
-                    return self.failure(
-                        RuntimeStage::SpeechSynthesizer,
-                        AdapterError::new("speech synthesizer adapter panicked"),
-                    );
+                    return SynthesisStageOutcome::Failed(AdapterError::new(
+                        "speech synthesizer adapter panicked",
+                    ));
                 }
             };
-            let audio = match self.wait_for_adapter(synthesis).await {
+            let audio = match self.publisher.wait_for_adapter(synthesis).await {
                 AdapterWait::Completed(Ok(audio)) => audio,
                 AdapterWait::Completed(Err(error)) => {
-                    return self.failure(RuntimeStage::SpeechSynthesizer, error);
+                    return SynthesisStageOutcome::Failed(error);
                 }
                 AdapterWait::Panicked => {
-                    return self.failure(
-                        RuntimeStage::SpeechSynthesizer,
-                        AdapterError::new("speech synthesizer adapter panicked"),
-                    );
+                    return SynthesisStageOutcome::Failed(AdapterError::new(
+                        "speech synthesizer adapter panicked",
+                    ));
                 }
-                AdapterWait::Interrupted => return SpeechWorkerOutcome::Interrupted,
-                AdapterWait::Stopped => return SpeechWorkerOutcome::Stopped,
-                AdapterWait::Closed => return self.event_stream_closed(),
+                AdapterWait::Interrupted => return SynthesisStageOutcome::Interrupted,
+                AdapterWait::Stopped => return SynthesisStageOutcome::Stopped,
+                AdapterWait::Closed => return SynthesisStageOutcome::EventStreamClosed,
             };
             if let Err(error) = audio.validate() {
-                return self.failure(RuntimeStage::SpeechSynthesizer, error);
+                return SynthesisStageOutcome::Failed(error);
             }
 
             if !first_playable_audio {
                 match self
-                    .send_event(self.timing_event(RuntimeTimingMilestone::FirstPlayableAudio))
+                    .publisher
+                    .send_event(
+                        self.publisher
+                            .timing_event(RuntimeTimingMilestone::FirstPlayableAudio),
+                    )
                     .await
                 {
                     WorkerSend::Sent => first_playable_audio = true,
-                    WorkerSend::Interrupted => return SpeechWorkerOutcome::Interrupted,
-                    WorkerSend::Stopped => return SpeechWorkerOutcome::Stopped,
-                    WorkerSend::Closed => return self.event_stream_closed(),
+                    WorkerSend::Interrupted => return SynthesisStageOutcome::Interrupted,
+                    WorkerSend::Stopped => return SynthesisStageOutcome::Stopped,
+                    WorkerSend::Closed => return SynthesisStageOutcome::EventStreamClosed,
                 }
             }
 
-            let output = catch_unwind(AssertUnwindSafe(|| {
-                self.audio_output.play(
-                    AudioOutputRequest::new(self.turn_id, segment.index, audio),
-                    self.work_cancellation.child_token(),
-                )
-            }));
-            let output = match output {
-                Ok(output) => output,
-                Err(_) => {
-                    return self.failure(
-                        RuntimeStage::AudioOutput,
-                        AdapterError::new("audio output adapter panicked"),
-                    );
-                }
-            };
-            match self.wait_for_adapter(output).await {
-                AdapterWait::Completed(Ok(())) => {}
-                AdapterWait::Completed(Err(error)) => {
-                    return self.failure(RuntimeStage::AudioOutput, error);
-                }
-                AdapterWait::Panicked => {
-                    return self.failure(
-                        RuntimeStage::AudioOutput,
-                        AdapterError::new("audio output adapter panicked"),
-                    );
-                }
-                AdapterWait::Interrupted => return SpeechWorkerOutcome::Interrupted,
-                AdapterWait::Stopped => return SpeechWorkerOutcome::Stopped,
-                AdapterWait::Closed => return self.event_stream_closed(),
-            }
+            permit.send(PreparedAudio {
+                index: segment.index,
+                audio,
+            });
+            synthesized_any = true;
         }
+    }
+}
 
-        if speech_started {
-            match self
-                .send_event(RuntimeEvent::SpeechCompleted {
-                    turn_id: self.turn_id,
-                })
+impl OutputStage {
+    async fn run(
+        self,
+        mut prepared_audio: mpsc::Receiver<PreparedAudio>,
+        mut synthesis_stage: JoinHandle<SynthesisStageOutcome>,
+    ) -> SpeechWorkerOutcome {
+        let mut synthesis_outcome = None;
+
+        loop {
+            let prepared = tokio::select! {
+                biased;
+                _ = self.publisher.external_interruption.cancelled() => {
+                    self.publisher.work_cancellation.cancel();
+                    prepared_audio.close();
+                    let _ = resolve_synthesis_stage(
+                        &mut synthesis_stage,
+                        &mut synthesis_outcome,
+                    ).await;
+                    return SpeechWorkerOutcome::Interrupted;
+                }
+                _ = self.publisher.events.closed() => {
+                    self.publisher.work_cancellation.cancel();
+                    prepared_audio.close();
+                    let _ = resolve_synthesis_stage(
+                        &mut synthesis_stage,
+                        &mut synthesis_outcome,
+                    ).await;
+                    return SpeechWorkerOutcome::EventStreamClosed;
+                }
+                outcome = &mut synthesis_stage, if synthesis_outcome.is_none() => {
+                    let outcome = synthesis_join_outcome(outcome);
+                    if matches!(outcome, SynthesisStageOutcome::Completed { .. }) {
+                        synthesis_outcome = Some(outcome);
+                        continue;
+                    }
+                    self.publisher.work_cancellation.cancel();
+                    prepared_audio.close();
+                    return synthesis_worker_outcome(outcome);
+                }
+                _ = self.publisher.work_cancellation.cancelled() => {
+                    prepared_audio.close();
+                    let outcome = resolve_synthesis_stage(
+                        &mut synthesis_stage,
+                        &mut synthesis_outcome,
+                    ).await;
+                    return stopped_worker_outcome(outcome);
+                }
+                prepared = prepared_audio.recv() => prepared,
+            };
+            let Some(prepared) = prepared else {
+                break;
+            };
+
+            if let Err(outcome) = self
+                .play(
+                    prepared,
+                    &mut prepared_audio,
+                    &mut synthesis_stage,
+                    &mut synthesis_outcome,
+                )
                 .await
             {
-                WorkerSend::Sent => {}
-                WorkerSend::Interrupted => return SpeechWorkerOutcome::Interrupted,
-                WorkerSend::Stopped => return SpeechWorkerOutcome::Stopped,
-                WorkerSend::Closed => return self.event_stream_closed(),
+                return outcome;
             }
         }
 
-        SpeechWorkerOutcome::Completed
+        match resolve_synthesis_stage(&mut synthesis_stage, &mut synthesis_outcome).await {
+            SynthesisStageOutcome::Completed { synthesized_any } => {
+                if synthesized_any {
+                    match self
+                        .publisher
+                        .send_event(RuntimeEvent::SpeechCompleted {
+                            turn_id: self.publisher.turn_id,
+                        })
+                        .await
+                    {
+                        WorkerSend::Sent => {}
+                        WorkerSend::Interrupted => return SpeechWorkerOutcome::Interrupted,
+                        WorkerSend::Stopped => return SpeechWorkerOutcome::Stopped,
+                        WorkerSend::Closed => return SpeechWorkerOutcome::EventStreamClosed,
+                    }
+                }
+                SpeechWorkerOutcome::Completed
+            }
+            outcome => synthesis_worker_outcome(outcome),
+        }
     }
 
+    async fn play(
+        &self,
+        prepared: PreparedAudio,
+        prepared_audio: &mut mpsc::Receiver<PreparedAudio>,
+        synthesis_stage: &mut JoinHandle<SynthesisStageOutcome>,
+        synthesis_outcome: &mut Option<SynthesisStageOutcome>,
+    ) -> Result<(), SpeechWorkerOutcome> {
+        let output = catch_unwind(AssertUnwindSafe(|| {
+            self.audio_output.play(
+                AudioOutputRequest::new(self.publisher.turn_id, prepared.index, prepared.audio),
+                self.publisher.work_cancellation.child_token(),
+            )
+        }));
+        let output = match output {
+            Ok(output) => output,
+            Err(_) => {
+                return Err(self
+                    .finish_output_failure(
+                        prepared_audio,
+                        synthesis_stage,
+                        synthesis_outcome,
+                        AdapterError::new("audio output adapter panicked"),
+                    )
+                    .await);
+            }
+        };
+        let output = catch_adapter_panic(output);
+        tokio::pin!(output);
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = self.publisher.external_interruption.cancelled() => {
+                    self.publisher.work_cancellation.cancel();
+                    prepared_audio.close();
+                    let (_, _) = tokio::join!(
+                        &mut output,
+                        resolve_synthesis_stage(synthesis_stage, synthesis_outcome),
+                    );
+                    return Err(SpeechWorkerOutcome::Interrupted);
+                }
+                _ = self.publisher.events.closed() => {
+                    self.publisher.work_cancellation.cancel();
+                    prepared_audio.close();
+                    let (_, _) = tokio::join!(
+                        &mut output,
+                        resolve_synthesis_stage(synthesis_stage, synthesis_outcome),
+                    );
+                    return Err(SpeechWorkerOutcome::EventStreamClosed);
+                }
+                result = &mut output => {
+                    return match result {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(error)) => Err(
+                            self.finish_output_failure(
+                                prepared_audio,
+                                synthesis_stage,
+                                synthesis_outcome,
+                                error,
+                            ).await
+                        ),
+                        Err(()) => Err(
+                            self.finish_output_failure(
+                                prepared_audio,
+                                synthesis_stage,
+                                synthesis_outcome,
+                                AdapterError::new("audio output adapter panicked"),
+                            ).await
+                        ),
+                    };
+                }
+                outcome = &mut *synthesis_stage, if synthesis_outcome.is_none() => {
+                    let outcome = synthesis_join_outcome(outcome);
+                    if matches!(outcome, SynthesisStageOutcome::Completed { .. }) {
+                        *synthesis_outcome = Some(outcome);
+                        continue;
+                    }
+                    self.publisher.work_cancellation.cancel();
+                    prepared_audio.close();
+                    let _ = output.await;
+                    return Err(synthesis_worker_outcome(outcome));
+                }
+                _ = self.publisher.work_cancellation.cancelled() => {
+                    prepared_audio.close();
+                    let (_, outcome) = tokio::join!(
+                        &mut output,
+                        resolve_synthesis_stage(synthesis_stage, synthesis_outcome),
+                    );
+                    return Err(stopped_worker_outcome(outcome));
+                }
+            }
+        }
+    }
+
+    async fn finish_output_failure(
+        &self,
+        prepared_audio: &mut mpsc::Receiver<PreparedAudio>,
+        synthesis_stage: &mut JoinHandle<SynthesisStageOutcome>,
+        synthesis_outcome: &mut Option<SynthesisStageOutcome>,
+        error: AdapterError,
+    ) -> SpeechWorkerOutcome {
+        self.publisher.work_cancellation.cancel();
+        prepared_audio.close();
+        let _ = resolve_synthesis_stage(synthesis_stage, synthesis_outcome).await;
+        SpeechWorkerOutcome::Failed {
+            stage: RuntimeStage::AudioOutput,
+            error,
+        }
+    }
+}
+
+impl SpeechEventPublisher {
     async fn wait_for_adapter<T>(&self, adapter: AdapterFuture<'_, T>) -> AdapterWait<T> {
         let adapter = catch_adapter_panic(adapter);
         tokio::pin!(adapter);
@@ -229,15 +499,16 @@ impl SpeechWorker {
                 let _ = adapter.await;
                 AdapterWait::Closed
             }
-            _ = self.work_cancellation.cancelled() => {
-                let _ = adapter.await;
-                AdapterWait::Stopped
-            }
             result = &mut adapter => {
                 match result {
+                    Ok(Ok(_)) if self.work_cancellation.is_cancelled() => AdapterWait::Stopped,
                     Ok(result) => AdapterWait::Completed(result),
                     Err(()) => AdapterWait::Panicked,
                 }
+            }
+            _ = self.work_cancellation.cancelled() => {
+                let _ = adapter.await;
+                AdapterWait::Stopped
             }
         }
     }
@@ -248,11 +519,11 @@ impl SpeechWorker {
             _ = self.external_interruption.cancelled() => {
                 return WorkerSend::Interrupted;
             }
-            _ = self.work_cancellation.cancelled() => {
-                return WorkerSend::Stopped;
-            }
             _ = self.events.closed() => {
                 return WorkerSend::Closed;
+            }
+            _ = self.work_cancellation.cancelled() => {
+                return WorkerSend::Stopped;
             }
             event_guard = self.event_gate.lock() => event_guard,
         };
@@ -262,11 +533,11 @@ impl SpeechWorker {
             _ = self.external_interruption.cancelled() => {
                 return WorkerSend::Interrupted;
             }
-            _ = self.work_cancellation.cancelled() => {
-                return WorkerSend::Stopped;
-            }
             _ = self.events.closed() => {
                 return WorkerSend::Closed;
+            }
+            _ = self.work_cancellation.cancelled() => {
+                return WorkerSend::Stopped;
             }
             result = self.events.send(event) => result,
         };
@@ -286,11 +557,11 @@ impl SpeechWorker {
             _ = self.external_interruption.cancelled() => {
                 return WorkerSend::Interrupted;
             }
-            _ = self.work_cancellation.cancelled() => {
-                return WorkerSend::Stopped;
-            }
             _ = self.events.closed() => {
                 return WorkerSend::Closed;
+            }
+            _ = self.work_cancellation.cancelled() => {
+                return WorkerSend::Stopped;
             }
             event_guard = self.event_gate.lock() => event_guard,
         };
@@ -300,11 +571,11 @@ impl SpeechWorker {
             _ = self.external_interruption.cancelled() => {
                 return WorkerSend::Interrupted;
             }
-            _ = self.work_cancellation.cancelled() => {
-                return WorkerSend::Stopped;
-            }
             _ = self.events.closed() => {
                 return WorkerSend::Closed;
+            }
+            _ = self.work_cancellation.cancelled() => {
+                return WorkerSend::Stopped;
             }
             permits = self.events.reserve_many(2) => {
                 match permits {
@@ -333,15 +604,51 @@ impl SpeechWorker {
             elapsed_ms: elapsed_milliseconds(self.started_at),
         }
     }
+}
 
-    fn failure(&self, stage: RuntimeStage, error: AdapterError) -> SpeechWorkerOutcome {
-        self.work_cancellation.cancel();
-        SpeechWorkerOutcome::Failed { stage, error }
+async fn resolve_synthesis_stage(
+    synthesis_stage: &mut JoinHandle<SynthesisStageOutcome>,
+    synthesis_outcome: &mut Option<SynthesisStageOutcome>,
+) -> SynthesisStageOutcome {
+    match synthesis_outcome.take() {
+        Some(outcome) => outcome,
+        None => synthesis_join_outcome(synthesis_stage.await),
     }
+}
 
-    fn event_stream_closed(&self) -> SpeechWorkerOutcome {
-        self.work_cancellation.cancel();
-        SpeechWorkerOutcome::EventStreamClosed
+fn synthesis_join_outcome(
+    outcome: Result<SynthesisStageOutcome, tokio::task::JoinError>,
+) -> SynthesisStageOutcome {
+    outcome.unwrap_or(SynthesisStageOutcome::TaskFailed)
+}
+
+fn synthesis_worker_outcome(outcome: SynthesisStageOutcome) -> SpeechWorkerOutcome {
+    match outcome {
+        SynthesisStageOutcome::Completed { .. } => SpeechWorkerOutcome::Completed,
+        SynthesisStageOutcome::Interrupted => SpeechWorkerOutcome::Interrupted,
+        SynthesisStageOutcome::Stopped => SpeechWorkerOutcome::Stopped,
+        SynthesisStageOutcome::EventStreamClosed => SpeechWorkerOutcome::EventStreamClosed,
+        SynthesisStageOutcome::TaskFailed => SpeechWorkerOutcome::Failed {
+            stage: RuntimeStage::SpeechSynthesizer,
+            error: AdapterError::new(SYNTHESIS_TASK_FAILED),
+        },
+        SynthesisStageOutcome::Failed(error) => SpeechWorkerOutcome::Failed {
+            stage: RuntimeStage::SpeechSynthesizer,
+            error,
+        },
+    }
+}
+
+fn stopped_worker_outcome(outcome: SynthesisStageOutcome) -> SpeechWorkerOutcome {
+    match outcome {
+        SynthesisStageOutcome::Failed(_) | SynthesisStageOutcome::TaskFailed => {
+            synthesis_worker_outcome(outcome)
+        }
+        SynthesisStageOutcome::Interrupted => SpeechWorkerOutcome::Interrupted,
+        SynthesisStageOutcome::EventStreamClosed => SpeechWorkerOutcome::EventStreamClosed,
+        SynthesisStageOutcome::Completed { .. } | SynthesisStageOutcome::Stopped => {
+            SpeechWorkerOutcome::Stopped
+        }
     }
 }
 
@@ -384,12 +691,15 @@ mod tests {
     use std::sync::Arc;
     use std::time::Instant;
 
-    use conversation_model_adapters::{DiscardAudioOutput, MockSpeechSynthesizer};
-    use conversation_protocol::{RuntimeEvent, RuntimeTimingMilestone, TurnId};
+    use conversation_model_adapters::{AdapterError, AdapterFuture};
+    use conversation_protocol::{RuntimeEvent, RuntimeStage, RuntimeTimingMilestone, TurnId};
     use tokio::sync::{mpsc, Mutex};
     use tokio_util::sync::CancellationToken;
 
-    use super::{SpeechWorker, SpeechWorkerContext, WorkerSend};
+    use super::{
+        synthesis_join_outcome, synthesis_worker_outcome, SpeechEventPublisher,
+        SpeechWorkerOutcome, WorkerSend,
+    };
 
     #[tokio::test(flavor = "current_thread")]
     async fn speech_start_pair_is_not_partially_published_with_one_slot_free() {
@@ -401,8 +711,102 @@ mod tests {
         assert_interrupted_pair_is_absent(2).await;
     }
 
+    #[tokio::test]
+    async fn synthesis_join_error_maps_to_static_synthesis_failure() {
+        let join_error = tokio::spawn(async { panic!("private synthesis panic payload") })
+            .await
+            .expect_err("synthesis task unexpectedly completed");
+        let outcome = synthesis_worker_outcome(synthesis_join_outcome(Err(join_error)));
+
+        match outcome {
+            SpeechWorkerOutcome::Failed { stage, error } => {
+                assert_eq!(stage, RuntimeStage::SpeechSynthesizer);
+                assert_eq!(error.message(), "speech synthesis task failed");
+            }
+            _ => panic!("synthesis join error did not produce a synthesis failure"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ready_synthesis_failure_and_panic_win_over_internal_stop() {
+        let (event_sender, _event_receiver) = mpsc::channel(1);
+        let work_cancellation = CancellationToken::new();
+        work_cancellation.cancel();
+        let publisher = SpeechEventPublisher {
+            turn_id: TurnId::new(41),
+            events: event_sender,
+            event_gate: Arc::new(Mutex::new(())),
+            started_at: Instant::now(),
+            external_interruption: CancellationToken::new(),
+            work_cancellation,
+        };
+        let failure: AdapterFuture<'_, ()> =
+            Box::pin(async { Err(AdapterError::new("ready synthesis failure")) });
+
+        match publisher.wait_for_adapter(failure).await {
+            super::AdapterWait::Completed(Err(error)) => {
+                assert_eq!(error.message(), "ready synthesis failure");
+            }
+            _ => panic!("internal stop masked a ready synthesis failure"),
+        }
+
+        let panic: AdapterFuture<'_, ()> =
+            Box::pin(async { panic!("ready synthesis panic payload") });
+        assert!(matches!(
+            publisher.wait_for_adapter(panic).await,
+            super::AdapterWait::Panicked
+        ));
+
+        let success: AdapterFuture<'_, ()> = Box::pin(async { Ok(()) });
+        assert!(matches!(
+            publisher.wait_for_adapter(success).await,
+            super::AdapterWait::Stopped
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_interruption_and_lifecycle_closure_keep_priority_over_ready_failure() {
+        let (interrupted_sender, _interrupted_receiver) = mpsc::channel(1);
+        let external_interruption = CancellationToken::new();
+        external_interruption.cancel();
+        let interrupted_work = CancellationToken::new();
+        interrupted_work.cancel();
+        let interrupted = SpeechEventPublisher {
+            turn_id: TurnId::new(42),
+            events: interrupted_sender,
+            event_gate: Arc::new(Mutex::new(())),
+            started_at: Instant::now(),
+            external_interruption,
+            work_cancellation: interrupted_work,
+        };
+        let failure: AdapterFuture<'_, ()> =
+            Box::pin(async { Err(AdapterError::new("ready synthesis failure")) });
+        assert!(matches!(
+            interrupted.wait_for_adapter(failure).await,
+            super::AdapterWait::Interrupted
+        ));
+
+        let (closed_sender, closed_receiver) = mpsc::channel(1);
+        drop(closed_receiver);
+        let closed_work = CancellationToken::new();
+        closed_work.cancel();
+        let closed = SpeechEventPublisher {
+            turn_id: TurnId::new(43),
+            events: closed_sender,
+            event_gate: Arc::new(Mutex::new(())),
+            started_at: Instant::now(),
+            external_interruption: CancellationToken::new(),
+            work_cancellation: closed_work,
+        };
+        let failure: AdapterFuture<'_, ()> =
+            Box::pin(async { Err(AdapterError::new("ready synthesis failure")) });
+        assert!(matches!(
+            closed.wait_for_adapter(failure).await,
+            super::AdapterWait::Closed
+        ));
+    }
+
     async fn assert_interrupted_pair_is_absent(prefilled_slots: usize) {
-        let (segment_sender, segment_receiver) = mpsc::channel(1);
         let (event_sender, mut event_receiver) = mpsc::channel(2);
         let turn_id = TurnId::new(40);
         event_sender
@@ -421,18 +825,15 @@ mod tests {
         let external_interruption = CancellationToken::new();
         let timing_sampled = Arc::new(AtomicBool::new(false));
         let timing_sampled_for_pair = Arc::clone(&timing_sampled);
-        let worker = SpeechWorker::new(SpeechWorkerContext {
+        let publisher = SpeechEventPublisher {
             turn_id,
-            speech_synthesizer: Arc::new(MockSpeechSynthesizer::new([])),
-            audio_output: Arc::new(DiscardAudioOutput),
-            segments: segment_receiver,
             events: event_sender,
             event_gate: Arc::new(Mutex::new(())),
             started_at: Instant::now(),
             external_interruption: external_interruption.clone(),
             work_cancellation: CancellationToken::new(),
-        });
-        let send_pair = worker.send_required_pair(move || {
+        };
+        let send_pair = publisher.send_required_pair(move || {
             timing_sampled_for_pair.store(true, Ordering::Release);
             [
                 RuntimeEvent::SpeechStarted { turn_id },
@@ -475,6 +876,5 @@ mod tests {
             event_receiver.try_recv().is_err(),
             "interruption exposed half of the speech start pair"
         );
-        drop(segment_sender);
     }
 }

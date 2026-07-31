@@ -16,11 +16,13 @@ const MINIMAL_PCM_WAV: &[u8] = &[
     0, 0x80, 0,
 ];
 
-const TWO_SENTENCES_NDJSON: &[u8] = concat!(
-    "{\"message\":{\"content\":\"First sentence. \"},\"done\":false}\n",
-    "{\"message\":{\"content\":\"Second sentence.\"},\"done\":true}\n",
-)
-.as_bytes();
+const FORMATTED_SPEECH_NDJSON: &[u8] =
+    "{\"message\":{\"content\":\"# 问候\\n你好。今天很好！*保持自然*，C# 和 2*3 不变。\"},\"done\":true}\n"
+        .as_bytes();
+
+const STORY_HEADING_NDJSON: &[u8] =
+    "{\"message\":{\"content\":\"### 故事名：《第25小时的雨》\\n\\n#### 1. 初遇：咖啡馆的旧雨伞\\n\\n林默是一家专门\"},\"done\":true}\n"
+        .as_bytes();
 
 const ONE_SENTENCE_NDJSON: &[u8] =
     b"{\"message\":{\"content\":\"Input response.\"},\"done\":true}\n";
@@ -33,11 +35,8 @@ fn composes_runtime_with_generic_identifiers_and_reports_observable_milestones()
     std::fs::create_dir(&capture_directory).unwrap();
     std::fs::create_dir(&playback_temp_directory).unwrap();
     let player = write_capture_player(fixture.path(), &capture_directory);
-    let language = FixtureServer::start(vec![HttpResponse::ndjson(TWO_SENTENCES_NDJSON)]);
-    let speech = FixtureServer::start(vec![
-        HttpResponse::wav(MINIMAL_PCM_WAV),
-        HttpResponse::wav(MINIMAL_PCM_WAV),
-    ]);
+    let language = FixtureServer::start(vec![HttpResponse::ndjson(FORMATTED_SPEECH_NDJSON)]);
+    let speech = FixtureServer::start(vec![HttpResponse::wav(MINIMAL_PCM_WAV)]);
     let config = write_config(
         fixture.path(),
         &valid_config(
@@ -58,7 +57,7 @@ fn composes_runtime_with_generic_identifiers_and_reports_observable_milestones()
     assert!(output.status.success(), "{output:?}");
     assert_eq!(
         String::from_utf8(output.stdout.clone()).unwrap(),
-        "First sentence. Second sentence."
+        "# 问候\n你好。今天很好！*保持自然*，C# 和 2*3 不变。"
     );
     assert_stderr(
         &output,
@@ -70,7 +69,7 @@ fn composes_runtime_with_generic_identifiers_and_reports_observable_milestones()
         ],
     );
     let captures = read_directory_files(&capture_directory);
-    assert_eq!(captures.len(), 2);
+    assert_eq!(captures.len(), 1);
     for capture in captures {
         assert_eq!(capture, MINIMAL_PCM_WAV);
     }
@@ -99,9 +98,9 @@ fn composes_runtime_with_generic_identifiers_and_reports_observable_milestones()
     }
 
     let speech_requests = speech.finish();
-    assert_eq!(speech_requests.len(), 2);
-    assert!(speech_requests[0].contains("\"input\":\"First sentence.\""));
-    assert!(speech_requests[1].contains("\"input\":\"Second sentence.\""));
+    assert_eq!(speech_requests.len(), 1);
+    assert!(speech_requests[0]
+        .contains("\"input\":\"问候. 你好。今天很好！保持自然，C# 和 2*3 不变。\""));
     for request in &speech_requests {
         for field in [
             "\"model\":\"speech-model-id\"",
@@ -116,6 +115,47 @@ fn composes_runtime_with_generic_identifiers_and_reports_observable_milestones()
             assert!(request.contains(field), "missing {field} in {request}");
         }
     }
+}
+
+#[test]
+fn keeps_story_markdown_visible_but_sends_spoken_prose_to_tts() {
+    let fixture = tempfile::tempdir().unwrap();
+    let player = write_exit_player(fixture.path(), 0);
+    let language = FixtureServer::start(vec![HttpResponse::ndjson(STORY_HEADING_NDJSON)]);
+    let speech = FixtureServer::start(vec![
+        HttpResponse::wav(MINIMAL_PCM_WAV),
+        HttpResponse::wav(MINIMAL_PCM_WAV),
+    ]);
+    let config = write_config(
+        fixture.path(),
+        &valid_config(
+            language.endpoint(),
+            speech.endpoint_with_path("/v1"),
+            &player,
+            fixture.path(),
+        ),
+    );
+
+    let output = run_probe(Command::new(probe_binary()).args([
+        "--config",
+        config.to_str().unwrap(),
+        "--no-play",
+        "Tell",
+        "a story",
+    ]));
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "### 故事名：《第25小时的雨》\n\n#### 1. 初遇：咖啡馆的旧雨伞\n\n林默是一家专门"
+    );
+    language.finish();
+    let speech_requests = speech.finish();
+    assert_eq!(speech_requests.len(), 2);
+    assert!(
+        speech_requests[0].contains("\"input\":\"故事名，第25小时的雨。 初遇，咖啡馆的旧雨伞。\"")
+    );
+    assert!(speech_requests[1].contains("\"input\":\"林默是一家专门\""));
 }
 
 #[test]
@@ -654,9 +694,14 @@ fn broken_stdout_write_drains_active_playback_before_reporting_output_failure() 
     std::fs::create_dir(&playback_temp_directory).unwrap();
     let player_started = fixture.path().join("player-started");
     let player_pid = fixture.path().join("player.pid");
+    let second_delta_release = fixture.path().join("second-delta-release");
     let player = write_blocking_player(fixture.path(), &player_started, &player_pid);
-    let response = large_sentence_ndjson();
-    let language = FixtureServer::start(vec![HttpResponse::ndjson(&response)]);
+    let (first_delta, second_delta) = gated_large_sentence_ndjson();
+    let language = FixtureServer::start(vec![HttpResponse::gated_ndjson(
+        &first_delta,
+        &second_delta,
+        &second_delta_release,
+    )]);
     let speech = FixtureServer::start(vec![HttpResponse::wav(MINIMAL_PCM_WAV)]);
     let config = write_config(
         fixture.path(),
@@ -667,7 +712,7 @@ fn broken_stdout_write_drains_active_playback_before_reporting_output_failure() 
             &playback_temp_directory,
         ),
     );
-    let (stdout, blocked_reader) = blocked_stdout();
+    let (stdout, stdout_reader) = connected_stdout();
     let child = Command::new(probe_binary())
         .args([
             "--config",
@@ -683,7 +728,8 @@ fn broken_stdout_write_drains_active_playback_before_reporting_output_failure() 
 
     wait_for_path(&player_started);
     let player_guard = PlayerGuard::new(&player_pid);
-    drop(blocked_reader);
+    drop(stdout_reader);
+    std::fs::write(&second_delta_release, []).unwrap();
     let output = wait_for_output_with_deadline(child, Duration::from_secs(3));
 
     assert!(!output.status.success());
@@ -769,12 +815,18 @@ fn probe_binary() -> &'static str {
     env!("CARGO_BIN_EXE_conversation-voice-probe")
 }
 
-fn large_sentence_ndjson() -> Vec<u8> {
-    format!(
+fn gated_large_sentence_ndjson() -> (Vec<u8>, Vec<u8>) {
+    let first = format!(
+        "{{\"message\":{{\"content\":\"{}.\"}},\"done\":false}}\n",
+        "x".repeat(95)
+    )
+    .into_bytes();
+    let second = format!(
         "{{\"message\":{{\"content\":\"{}.\"}},\"done\":true}}\n",
         "x".repeat(16 * 1024)
     )
-    .into_bytes()
+    .into_bytes();
+    (first, second)
 }
 
 fn valid_config(
@@ -917,6 +969,12 @@ fn blocked_stdout() -> (Stdio, UnixStream) {
     child_stdout.set_nonblocking(false).unwrap();
     let child_stdout: OwnedFd = child_stdout.into();
     (Stdio::from(child_stdout), blocked_reader)
+}
+
+fn connected_stdout() -> (Stdio, UnixStream) {
+    let (child_stdout, stdout_reader) = UnixStream::pair().unwrap();
+    let child_stdout: OwnedFd = child_stdout.into();
+    (Stdio::from(child_stdout), stdout_reader)
 }
 
 fn wait_for_output(child: Child) -> Output {
@@ -1154,6 +1212,12 @@ impl FixtureServer {
             let deadline = Instant::now() + Duration::from_secs(8);
             let mut requests = Vec::with_capacity(responses.len());
             for response in responses {
+                let HttpResponse {
+                    status,
+                    content_type,
+                    body,
+                    body_gate,
+                } = response;
                 let mut stream = loop {
                     match listener.accept() {
                         Ok((stream, _)) => break stream,
@@ -1178,12 +1242,19 @@ impl FixtureServer {
                 write!(
                     stream,
                     "HTTP/1.1 {} Fixture\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    response.status,
-                    response.content_type,
-                    response.body.len(),
+                    status,
+                    content_type,
+                    body.len(),
                 )
                 .unwrap();
-                stream.write_all(&response.body).unwrap();
+                if let Some(body_gate) = body_gate {
+                    stream.write_all(&body[..body_gate.split_at]).unwrap();
+                    stream.flush().unwrap();
+                    wait_for_path(&body_gate.release);
+                    stream.write_all(&body[body_gate.split_at..]).unwrap();
+                } else {
+                    stream.write_all(&body).unwrap();
+                }
             }
             requests
         });
@@ -1207,6 +1278,12 @@ struct HttpResponse {
     status: u16,
     content_type: &'static str,
     body: Vec<u8>,
+    body_gate: Option<BodyGate>,
+}
+
+struct BodyGate {
+    split_at: usize,
+    release: PathBuf,
 }
 
 impl HttpResponse {
@@ -1215,6 +1292,22 @@ impl HttpResponse {
             status: 200,
             content_type: "application/x-ndjson",
             body: body.to_vec(),
+            body_gate: None,
+        }
+    }
+
+    fn gated_ndjson(first: &[u8], second: &[u8], release: &Path) -> Self {
+        let mut body = first.to_vec();
+        let split_at = body.len();
+        body.extend_from_slice(second);
+        Self {
+            status: 200,
+            content_type: "application/x-ndjson",
+            body,
+            body_gate: Some(BodyGate {
+                split_at,
+                release: release.to_path_buf(),
+            }),
         }
     }
 
@@ -1223,6 +1316,7 @@ impl HttpResponse {
             status: 200,
             content_type: "audio/wav",
             body: body.to_vec(),
+            body_gate: None,
         }
     }
 
@@ -1231,6 +1325,7 @@ impl HttpResponse {
             status,
             content_type: "text/plain",
             body: b"fixture failure".to_vec(),
+            body_gate: None,
         }
     }
 }

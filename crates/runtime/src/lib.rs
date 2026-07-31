@@ -13,12 +13,27 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::{JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
 
+mod generation;
 mod phrase_chunker;
+mod session_clock;
+mod speech_text;
 mod speech_worker;
+mod streaming_turn;
+mod turn_finalizer;
+mod utterance_assembler;
+mod voice_privacy;
+mod voice_session;
 
 pub use phrase_chunker::PhraseChunkingConfig;
+pub use session_clock::{SessionClock, TurnFinalizationDeadline};
+pub use streaming_turn::{StreamingTurnEventStream, StreamingTurnRuntime};
+pub use turn_finalizer::{FinalizedTranscript, TurnFinalizer};
+pub use utterance_assembler::UtteranceAssembler;
+pub use voice_privacy::validate_voice_policy;
+pub use voice_session::{VoiceSessionAdapters, VoiceSessionEventStream, VoiceSessionRuntime};
 
 use phrase_chunker::PhraseChunker;
+use speech_text::normalize_speech_text;
 use speech_worker::{SpeechSegment, SpeechWorker, SpeechWorkerContext, SpeechWorkerOutcome};
 
 const EVENT_BUFFER_SIZE: usize = 32;
@@ -455,7 +470,10 @@ async fn run_turn(task: TurnTask, events: &mpsc::Sender<RuntimeEvent>) -> Runtim
                 }
                 emitted_first_text_timing = true;
 
-                for text in chunker.push_delta(&delta) {
+                for phrase in chunker.push_delta(&delta) {
+                    let Some(text) = normalize_speech_text(&phrase) else {
+                        continue;
+                    };
                     let segment = SpeechSegment {
                         index: segment_index,
                         text,
@@ -521,7 +539,10 @@ async fn run_turn(task: TurnTask, events: &mpsc::Sender<RuntimeEvent>) -> Runtim
         }
     }
 
-    if let Some(text) = chunker.finish() {
+    if let Some(text) = chunker
+        .finish()
+        .and_then(|phrase| normalize_speech_text(&phrase))
+    {
         let segment = SpeechSegment {
             index: segment_index,
             text,

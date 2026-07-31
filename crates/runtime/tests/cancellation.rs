@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -10,7 +10,9 @@ use conversation_model_adapters::{
 use conversation_protocol::{
     RuntimeCommand, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage, TurnId,
 };
-use conversation_runtime::{ConversationRuntime, RuntimeCommandResult, TurnEventStream};
+use conversation_runtime::{
+    ConversationRuntime, PhraseChunkingConfig, RuntimeCommandResult, TurnEventStream,
+};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -26,6 +28,10 @@ fn minimal_aiff() -> Vec<u8> {
     bytes.extend_from_slice(&[0; 8]);
     bytes.extend_from_slice(&[0x80, 0]);
     bytes
+}
+
+fn small_phrase_chunking_config() -> PhraseChunkingConfig {
+    PhraseChunkingConfig::new(4, 192).unwrap()
 }
 
 struct CompletionSignallingSpeech {
@@ -89,6 +95,43 @@ struct DropAwareSpeech {
 struct DropAwareOutput {
     started: mpsc::UnboundedSender<()>,
     cleanup_completed: mpsc::UnboundedSender<()>,
+}
+
+enum SecondSynthesisBehavior {
+    Cleanup(Arc<AtomicBool>),
+    Fail(Mutex<Option<oneshot::Receiver<()>>>),
+}
+
+struct TwoStageSpeech {
+    controlled_turn: TurnId,
+    started: mpsc::UnboundedSender<String>,
+    attempts: AtomicUsize,
+    second: SecondSynthesisBehavior,
+}
+
+enum FirstOutputBehavior {
+    Cleanup(Arc<AtomicBool>),
+    Fail(Mutex<Option<oneshot::Receiver<()>>>),
+}
+
+struct ControlledOutput {
+    controlled_turn: TurnId,
+    started: mpsc::UnboundedSender<u64>,
+    first: FirstOutputBehavior,
+}
+
+struct QueueCompletingSpeech {
+    controlled_turn: TurnId,
+    started: mpsc::UnboundedSender<usize>,
+    completed: mpsc::UnboundedSender<usize>,
+    attempts: AtomicUsize,
+}
+
+struct GatedFirstFailureOutput {
+    controlled_turn: TurnId,
+    started: mpsc::UnboundedSender<u64>,
+    fail_first: Mutex<Option<oneshot::Receiver<()>>>,
+    cleanup: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -306,6 +349,155 @@ impl SpeechSynthesizer for DropAwareSpeech {
             cancellation.cancelled().await;
             let _ = self.cleanup_completed.send(());
             Err(AdapterError::new("speech synthesis cancelled"))
+        })
+    }
+}
+
+impl SpeechSynthesizer for TwoStageSpeech {
+    fn synthesize<'a>(
+        &'a self,
+        request: SpeechRequest,
+        cancellation: CancellationToken,
+    ) -> AdapterFuture<'a, SynthesizedAudio> {
+        let turn_id = request.turn_id();
+        let _ = self.started.send(request.text().to_owned());
+        let attempt = self.attempts.fetch_add(1, Ordering::AcqRel);
+
+        if turn_id != self.controlled_turn || attempt == 0 {
+            return Box::pin(async {
+                Ok(SynthesizedAudio::new(minimal_aiff(), AudioFormat::Aiff))
+            });
+        }
+
+        match &self.second {
+            SecondSynthesisBehavior::Cleanup(cleanup) => {
+                let cleanup = Arc::clone(cleanup);
+                Box::pin(async move {
+                    cancellation.cancelled().await;
+                    cleanup.store(true, Ordering::Release);
+                    Err(AdapterError::new("speech synthesis cancelled"))
+                })
+            }
+            SecondSynthesisBehavior::Fail(fail_second) => {
+                let fail_second = fail_second
+                    .lock()
+                    .expect("second synthesis failure gate lock poisoned")
+                    .take()
+                    .expect("second synthesis failure gate used more than once");
+                Box::pin(async move {
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => {
+                            Err(AdapterError::new("speech synthesis cancelled"))
+                        }
+                        _ = fail_second => {
+                            Err(AdapterError::new("second synthesis failed"))
+                        }
+                    }
+                })
+            }
+        }
+    }
+}
+
+impl SpeechSynthesizer for QueueCompletingSpeech {
+    fn synthesize<'a>(
+        &'a self,
+        request: SpeechRequest,
+        _cancellation: CancellationToken,
+    ) -> AdapterFuture<'a, SynthesizedAudio> {
+        let attempt = self.attempts.fetch_add(1, Ordering::AcqRel);
+        let controlled = request.turn_id() == self.controlled_turn;
+        if controlled {
+            let _ = self.started.send(attempt);
+        }
+        let completed = self.completed.clone();
+
+        Box::pin(async move {
+            if controlled {
+                let _ = completed.send(attempt);
+            }
+            Ok(SynthesizedAudio::new(minimal_aiff(), AudioFormat::Aiff))
+        })
+    }
+}
+
+impl AudioOutput for ControlledOutput {
+    fn play<'a>(
+        &'a self,
+        request: AudioOutputRequest,
+        cancellation: CancellationToken,
+    ) -> AdapterFuture<'a, ()> {
+        let turn_id = request.turn_id();
+        let segment_index = request.segment_index();
+        let _ = self.started.send(segment_index);
+
+        if turn_id != self.controlled_turn || segment_index != 0 {
+            return Box::pin(async { Ok(()) });
+        }
+
+        match &self.first {
+            FirstOutputBehavior::Cleanup(cleanup) => {
+                let cleanup = Arc::clone(cleanup);
+                Box::pin(async move {
+                    cancellation.cancelled().await;
+                    cleanup.store(true, Ordering::Release);
+                    Err(AdapterError::new("audio output cancelled"))
+                })
+            }
+            FirstOutputBehavior::Fail(fail_first) => {
+                let fail_first = fail_first
+                    .lock()
+                    .expect("first output failure gate lock poisoned")
+                    .take()
+                    .expect("first output failure gate used more than once");
+                Box::pin(async move {
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => {
+                            Err(AdapterError::new("audio output cancelled"))
+                        }
+                        _ = fail_first => {
+                            Err(AdapterError::new("audio output unavailable"))
+                        }
+                    }
+                })
+            }
+        }
+    }
+}
+
+impl AudioOutput for GatedFirstFailureOutput {
+    fn play<'a>(
+        &'a self,
+        request: AudioOutputRequest,
+        cancellation: CancellationToken,
+    ) -> AdapterFuture<'a, ()> {
+        let turn_id = request.turn_id();
+        let segment_index = request.segment_index();
+        if turn_id == self.controlled_turn {
+            let _ = self.started.send(segment_index);
+        }
+        let fail_first = (turn_id == self.controlled_turn && segment_index == 0).then(|| {
+            self.fail_first
+                .lock()
+                .expect("queued output failure gate lock poisoned")
+                .take()
+                .expect("queued output failure gate used more than once")
+        });
+
+        Box::pin(async move {
+            let Some(fail_first) = fail_first else {
+                return Ok(());
+            };
+
+            let message = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => "audio output cancelled",
+                _ = fail_first => "audio output unavailable",
+            };
+            self.cleanup.store(true, Ordering::Release);
+            Err(AdapterError::new(message))
         })
     }
 }
@@ -679,7 +871,8 @@ async fn interruption_discards_queued_synthesis_after_active_cleanup() {
             cleanup_completed: Arc::clone(&cleanup_completed),
         }),
         Arc::new(DiscardAudioOutput),
-    );
+    )
+    .with_phrase_chunking(small_phrase_chunking_config());
     let turn_id = TurnId::new(15);
     let mut events = start_turn(&runtime, turn_id, "cancel queue").await;
 
@@ -742,6 +935,312 @@ async fn interruption_waits_for_active_output_cleanup() {
 }
 
 #[tokio::test]
+async fn interruption_cleans_active_output_and_prefetched_synthesis_before_terminal() {
+    let controlled_turn = TurnId::new(32);
+    let reuse_turn = TurnId::new(33);
+    let (synthesis_started, mut synthesis_started_receiver) = mpsc::unbounded_channel();
+    let (output_started, mut output_started_receiver) = mpsc::unbounded_channel();
+    let synthesis_cleanup = Arc::new(AtomicBool::new(false));
+    let output_cleanup = Arc::new(AtomicBool::new(false));
+    let runtime = ConversationRuntime::new(
+        Arc::new(MockLanguageModel::new(["First segment. Second segment."])),
+        Arc::new(TwoStageSpeech {
+            controlled_turn,
+            started: synthesis_started,
+            attempts: AtomicUsize::new(0),
+            second: SecondSynthesisBehavior::Cleanup(Arc::clone(&synthesis_cleanup)),
+        }),
+        Arc::new(ControlledOutput {
+            controlled_turn,
+            started: output_started,
+            first: FirstOutputBehavior::Cleanup(Arc::clone(&output_cleanup)),
+        }),
+    )
+    .with_phrase_chunking(PhraseChunkingConfig::new(14, 20).unwrap());
+    let mut events = start_turn(&runtime, controlled_turn, "interrupt both stages").await;
+
+    assert_two_speech_stages_active(
+        &mut synthesis_started_receiver,
+        &mut output_started_receiver,
+    )
+    .await;
+
+    interrupt(&runtime, controlled_turn).await.unwrap();
+
+    let terminal_events = drain_with_cleanup_before_terminal(
+        &mut events,
+        &[
+            (
+                output_cleanup.as_ref(),
+                "turn terminal arrived before active output cleanup",
+            ),
+            (
+                synthesis_cleanup.as_ref(),
+                "turn terminal arrived before active synthesis cleanup",
+            ),
+        ],
+    )
+    .await;
+
+    assert_eq!(
+        terminal_events,
+        [RuntimeEvent::TurnCancelled {
+            turn_id: controlled_turn
+        }]
+    );
+    assert!(
+        output_started_receiver.try_recv().is_err(),
+        "queued playback started after interruption"
+    );
+
+    let mut reuse_events = start_turn(&runtime, reuse_turn, "reuse after interruption").await;
+    assert_eq!(
+        drain_events(&mut reuse_events)
+            .await
+            .into_iter()
+            .filter(RuntimeEvent::is_terminal)
+            .collect::<Vec<_>>(),
+        [RuntimeEvent::TurnCompleted {
+            turn_id: reuse_turn
+        }]
+    );
+}
+
+#[tokio::test]
+async fn second_synthesis_failure_cancels_active_output_before_turn_failed() {
+    let controlled_turn = TurnId::new(34);
+    let (synthesis_started, mut synthesis_started_receiver) = mpsc::unbounded_channel();
+    let (output_started, mut output_started_receiver) = mpsc::unbounded_channel();
+    let (fail_second, second_failure) = oneshot::channel();
+    let output_cleanup = Arc::new(AtomicBool::new(false));
+    let runtime = ConversationRuntime::new(
+        Arc::new(MockLanguageModel::new(["First segment. Second segment."])),
+        Arc::new(TwoStageSpeech {
+            controlled_turn,
+            started: synthesis_started,
+            attempts: AtomicUsize::new(0),
+            second: SecondSynthesisBehavior::Fail(Mutex::new(Some(second_failure))),
+        }),
+        Arc::new(ControlledOutput {
+            controlled_turn,
+            started: output_started,
+            first: FirstOutputBehavior::Cleanup(Arc::clone(&output_cleanup)),
+        }),
+    )
+    .with_phrase_chunking(PhraseChunkingConfig::new(14, 20).unwrap());
+    let mut events = start_turn(&runtime, controlled_turn, "fail synthesis").await;
+
+    assert_two_speech_stages_active(
+        &mut synthesis_started_receiver,
+        &mut output_started_receiver,
+    )
+    .await;
+    fail_second
+        .send(())
+        .expect("second synthesis failure receiver dropped");
+
+    let terminal_events = drain_with_cleanup_before_terminal(
+        &mut events,
+        &[(
+            output_cleanup.as_ref(),
+            "turn failure arrived before active output cleanup",
+        )],
+    )
+    .await;
+
+    assert_eq!(
+        terminal_events,
+        [RuntimeEvent::TurnFailed {
+            turn_id: controlled_turn,
+            error: RuntimeError::new(
+                RuntimeErrorKind::Adapter,
+                RuntimeStage::SpeechSynthesizer,
+                "second synthesis failed",
+            ),
+        }]
+    );
+    assert!(
+        output_started_receiver.try_recv().is_err(),
+        "queued playback started after synthesis failure"
+    );
+}
+
+#[tokio::test]
+async fn first_output_failure_cancels_active_next_synthesis_before_turn_failed() {
+    let controlled_turn = TurnId::new(35);
+    let (synthesis_started, mut synthesis_started_receiver) = mpsc::unbounded_channel();
+    let (output_started, mut output_started_receiver) = mpsc::unbounded_channel();
+    let (fail_first, first_failure) = oneshot::channel();
+    let synthesis_cleanup = Arc::new(AtomicBool::new(false));
+    let runtime = ConversationRuntime::new(
+        Arc::new(MockLanguageModel::new(["First segment. Second segment."])),
+        Arc::new(TwoStageSpeech {
+            controlled_turn,
+            started: synthesis_started,
+            attempts: AtomicUsize::new(0),
+            second: SecondSynthesisBehavior::Cleanup(Arc::clone(&synthesis_cleanup)),
+        }),
+        Arc::new(ControlledOutput {
+            controlled_turn,
+            started: output_started,
+            first: FirstOutputBehavior::Fail(Mutex::new(Some(first_failure))),
+        }),
+    )
+    .with_phrase_chunking(PhraseChunkingConfig::new(14, 20).unwrap());
+    let mut events = start_turn(&runtime, controlled_turn, "fail output").await;
+
+    assert_two_speech_stages_active(
+        &mut synthesis_started_receiver,
+        &mut output_started_receiver,
+    )
+    .await;
+    fail_first
+        .send(())
+        .expect("first output failure receiver dropped");
+
+    let terminal_events = drain_with_cleanup_before_terminal(
+        &mut events,
+        &[(
+            synthesis_cleanup.as_ref(),
+            "turn failure arrived before active synthesis cleanup",
+        )],
+    )
+    .await;
+
+    assert_eq!(
+        terminal_events,
+        [RuntimeEvent::TurnFailed {
+            turn_id: controlled_turn,
+            error: RuntimeError::new(
+                RuntimeErrorKind::Adapter,
+                RuntimeStage::AudioOutput,
+                "audio output unavailable",
+            ),
+        }]
+    );
+    assert!(
+        output_started_receiver.try_recv().is_err(),
+        "queued playback started after output failure"
+    );
+}
+
+#[tokio::test]
+async fn output_failure_discards_validated_audio_queued_behind_active_output() {
+    let controlled_turn = TurnId::new(36);
+    let reuse_turn = TurnId::new(37);
+    let (synthesis_started, mut synthesis_started_receiver) = mpsc::unbounded_channel();
+    let (synthesis_completed, mut synthesis_completed_receiver) = mpsc::unbounded_channel();
+    let (output_started, mut output_started_receiver) = mpsc::unbounded_channel();
+    let (fail_first, first_failure) = oneshot::channel();
+    let output_cleanup = Arc::new(AtomicBool::new(false));
+    let runtime = ConversationRuntime::new(
+        Arc::new(MockLanguageModel::new([
+            "First segment. Second segment. Third segment.",
+        ])),
+        Arc::new(QueueCompletingSpeech {
+            controlled_turn,
+            started: synthesis_started,
+            completed: synthesis_completed,
+            attempts: AtomicUsize::new(0),
+        }),
+        Arc::new(GatedFirstFailureOutput {
+            controlled_turn,
+            started: output_started,
+            fail_first: Mutex::new(Some(first_failure)),
+            cleanup: Arc::clone(&output_cleanup),
+        }),
+    )
+    .with_phrase_chunking(PhraseChunkingConfig::new(14, 20).unwrap());
+    let mut events = start_turn(&runtime, controlled_turn, "discard queued audio").await;
+
+    assert_eq!(
+        timeout(Duration::from_secs(1), synthesis_started_receiver.recv())
+            .await
+            .expect("first synthesis did not start")
+            .expect("synthesis start channel closed"),
+        0
+    );
+    assert_eq!(
+        timeout(Duration::from_secs(1), synthesis_completed_receiver.recv())
+            .await
+            .expect("first synthesis did not complete")
+            .expect("synthesis completion channel closed"),
+        0
+    );
+    assert_eq!(
+        timeout(Duration::from_secs(1), output_started_receiver.recv())
+            .await
+            .expect("first output did not start")
+            .expect("output start channel closed"),
+        0
+    );
+    assert_eq!(
+        timeout(Duration::from_secs(1), synthesis_started_receiver.recv())
+            .await
+            .expect("second synthesis did not start during active output")
+            .expect("synthesis start channel closed"),
+        1
+    );
+    assert_eq!(
+        timeout(Duration::from_secs(1), synthesis_completed_receiver.recv())
+            .await
+            .expect("second synthesis did not complete during active output")
+            .expect("synthesis completion channel closed"),
+        1
+    );
+    tokio::task::yield_now().await;
+    assert!(
+        synthesis_started_receiver.try_recv().is_err(),
+        "third synthesis started instead of blocking behind queued segment 1"
+    );
+
+    fail_first
+        .send(())
+        .expect("first output failure receiver dropped");
+
+    let terminal_events = drain_with_cleanup_before_terminal(
+        &mut events,
+        &[(
+            output_cleanup.as_ref(),
+            "turn failure arrived before active output cleanup",
+        )],
+    )
+    .await;
+
+    assert!(
+        output_started_receiver.try_recv().is_err(),
+        "queued segment 1 played after output failure"
+    );
+    assert!(
+        synthesis_started_receiver.try_recv().is_err(),
+        "segment 2 synthesis started after output failure"
+    );
+    assert_eq!(
+        terminal_events,
+        [RuntimeEvent::TurnFailed {
+            turn_id: controlled_turn,
+            error: RuntimeError::new(
+                RuntimeErrorKind::Adapter,
+                RuntimeStage::AudioOutput,
+                "audio output unavailable",
+            ),
+        }]
+    );
+
+    let mut reuse_events = start_turn(&runtime, reuse_turn, "reuse after queued failure").await;
+    assert_eq!(
+        drain_events(&mut reuse_events)
+            .await
+            .into_iter()
+            .filter(RuntimeEvent::is_terminal)
+            .collect::<Vec<_>>(),
+        [RuntimeEvent::TurnCompleted {
+            turn_id: reuse_turn
+        }]
+    );
+}
+
+#[tokio::test]
 async fn language_failure_retains_its_stage_after_active_speech_cleanup() {
     let (delta_sender, delta_receiver) = mpsc::channel(2);
     delta_sender
@@ -757,7 +1256,8 @@ async fn language_failure_retains_its_stage_after_active_speech_cleanup() {
             cleanup_completed: Arc::clone(&cleanup_completed),
         }),
         Arc::new(DiscardAudioOutput),
-    );
+    )
+    .with_phrase_chunking(small_phrase_chunking_config());
     let turn_id = TurnId::new(17);
     let mut events = start_turn(&runtime, turn_id, "language failure").await;
 
@@ -766,7 +1266,7 @@ async fn language_failure_retains_its_stage_after_active_speech_cleanup() {
             .await
             .expect("speech synthesis did not start")
             .expect("speech start channel closed"),
-        "First."
+        "First. Second. Third."
     );
     delta_sender
         .send(Err(AdapterError::new("language model unavailable")))
@@ -811,7 +1311,8 @@ async fn synthesis_failure_cancels_and_cleans_active_generation() {
             started: speech_started,
         }),
         Arc::new(DiscardAudioOutput),
-    );
+    )
+    .with_phrase_chunking(small_phrase_chunking_config());
     let turn_id = TurnId::new(18);
     let mut events = start_turn(&runtime, turn_id, "synthesis failure").await;
 
@@ -855,7 +1356,8 @@ async fn output_failure_cancels_generation_discards_queue_and_waits_for_cleanup(
             fail: Mutex::new(Some(output_failure)),
             cleanup_completed: Arc::clone(&output_cleanup),
         }),
-    );
+    )
+    .with_phrase_chunking(small_phrase_chunking_config());
     let turn_id = TurnId::new(19);
     let mut events = start_turn(&runtime, turn_id, "output failure").await;
 
@@ -904,7 +1406,8 @@ async fn output_failure_resolves_when_lifecycle_events_are_saturated() {
             fail: Mutex::new(Some(output_failure)),
             cleanup_completed: Arc::clone(&output_cleanup),
         }),
-    );
+    )
+    .with_phrase_chunking(small_phrase_chunking_config());
     let turn_id = TurnId::new(20);
     let mut events = start_turn(&runtime, turn_id, "saturate events").await;
 
@@ -1226,6 +1729,49 @@ async fn interruption_finalizes_when_the_event_consumer_is_backpressured() {
         terminal_events,
         vec![RuntimeEvent::TurnCancelled { turn_id }]
     );
+}
+
+async fn assert_two_speech_stages_active(
+    synthesis_started: &mut mpsc::UnboundedReceiver<String>,
+    output_started: &mut mpsc::UnboundedReceiver<u64>,
+) {
+    assert_eq!(
+        timeout(Duration::from_secs(1), synthesis_started.recv())
+            .await
+            .expect("first synthesis did not start")
+            .expect("synthesis start channel closed"),
+        "First segment."
+    );
+    assert_eq!(
+        timeout(Duration::from_secs(1), output_started.recv())
+            .await
+            .expect("first output did not start")
+            .expect("output start channel closed"),
+        0
+    );
+    assert_eq!(
+        timeout(Duration::from_secs(1), synthesis_started.recv())
+            .await
+            .expect("second synthesis did not start during active output")
+            .expect("synthesis start channel closed"),
+        "Second segment."
+    );
+}
+
+async fn drain_with_cleanup_before_terminal(
+    events: &mut TurnEventStream,
+    cleanup_requirements: &[(&AtomicBool, &str)],
+) -> Vec<RuntimeEvent> {
+    let mut terminal_events = Vec::new();
+    while let Some(event) = events.recv().await {
+        if event.is_terminal() {
+            for (cleanup, message) in cleanup_requirements {
+                assert!(cleanup.load(Ordering::Acquire), "{message}");
+            }
+            terminal_events.push(event);
+        }
+    }
+    terminal_events
 }
 
 async fn start_turn(

@@ -1,4 +1,3 @@
-use std::io::Read;
 use std::net::IpAddr;
 use std::path::Path;
 
@@ -8,7 +7,7 @@ use conversation_model_adapters::{
 };
 use serde::Deserialize;
 
-const MAX_CONFIG_BYTES: u64 = 64 * 1024;
+use crate::config_file::load_toml;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -65,23 +64,7 @@ enum AudioBackend {
 
 impl VoiceConfig {
     pub(crate) fn load(path: &Path) -> Result<Self, String> {
-        if !path.is_absolute() {
-            return Err("voice configuration path must be absolute".to_owned());
-        }
-
-        let file = std::fs::File::open(path)
-            .map_err(|_| "voice configuration file could not be opened".to_owned())?;
-        let mut contents = Vec::new();
-        file.take(MAX_CONFIG_BYTES + 1)
-            .read_to_end(&mut contents)
-            .map_err(|_| "voice configuration file could not be read".to_owned())?;
-        if contents.len() as u64 > MAX_CONFIG_BYTES {
-            return Err("voice configuration file exceeded 64 KiB".to_owned());
-        }
-        let contents = std::str::from_utf8(&contents)
-            .map_err(|_| "voice configuration file was not valid UTF-8".to_owned())?;
-        let config: Self = toml::from_str(contents)
-            .map_err(|_| "voice configuration file was not valid TOML".to_owned())?;
+        let config: Self = load_toml(path)?;
         config.validate()?;
         Ok(config)
     }

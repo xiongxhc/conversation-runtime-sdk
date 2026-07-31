@@ -1404,7 +1404,7 @@ struct CancelledMedia {
     acknowledgement_observed: bool,
     flushed_after_observation: bool,
     accepted: bool,
-    reservation: Option<MediaReservation>,
+    _reservation: Option<MediaReservation>,
 }
 
 struct FlushOperation {
@@ -1581,7 +1581,7 @@ impl SessionShared {
                     acknowledgement_observed: operation.acknowledgement_observed,
                     flushed_after_observation: operation.flushed_after_observation,
                     accepted: operation.accepted,
-                    reservation: operation.reservation,
+                    _reservation: operation.reservation,
                 });
             }
         }
@@ -1689,7 +1689,6 @@ impl SessionShared {
                             PlaybackState::Accepted,
                         )));
                     }
-                    operation.reservation.take();
                     if operation.flushed_after_observation {
                         state
                             .media_operations
@@ -1718,7 +1717,6 @@ impl SessionShared {
                     let cancelled = &mut state.cancelled_media[index];
                     cancelled.acknowledgement_observed = false;
                     cancelled.accepted = true;
-                    cancelled.reservation.take();
                     if cancelled.flushed_after_observation {
                         state
                             .cancelled_media
@@ -2236,9 +2234,53 @@ mod process_tests {
         assert!(!next_operation.acknowledgement_observed);
     }
 
+    #[tokio::test]
+    async fn accepted_media_retains_budget_until_rendered() {
+        let shared = Arc::new(SessionShared::new(SessionId::new(6)));
+        let identity = test_identity(6);
+        let budget = Arc::new(MediaBudget::new());
+        let capacity = Arc::new(Semaphore::new(1));
+        let frame_permit = capacity.acquire_owned().await.unwrap();
+        let cancellation = CancellationToken::new();
+        let reservation = budget
+            .reserve(1, frame_permit, &cancellation, &cancellation)
+            .await
+            .unwrap();
+        let (completion, accepted) = oneshot::channel();
+        let operation_id = shared
+            .register_media(identity, completion, reservation)
+            .unwrap();
+        assert!(shared.begin_media_write(operation_id));
+        shared.finish_media_write(operation_id).unwrap();
+        assert!(matches!(
+            shared.resolve_media(identity).unwrap(),
+            ResolveMedia::Complete
+        ));
+        assert_eq!(
+            accepted.await.unwrap().unwrap().state(),
+            PlaybackState::Accepted
+        );
+        assert_eq!(
+            *budget
+                .used_nanos
+                .lock()
+                .expect("media budget lock poisoned"),
+            1
+        );
+
+        assert!(shared.resolve_render(identity).unwrap());
+        assert_eq!(
+            *budget
+                .used_nanos
+                .lock()
+                .expect("media budget lock poisoned"),
+            0
+        );
+    }
+
     #[test]
     fn cancelled_flush_bookkeeping_never_exceeds_control_capacity() {
-        let shared = SessionShared::new(SessionId::new(6));
+        let shared = SessionShared::new(SessionId::new(7));
         for _ in 0..(CONTROL_QUEUE_CAPACITY * 4) {
             let (operation_id, _completion) = shared.register_flush(GenerationId::new(1)).unwrap();
             shared.cancel_flush(operation_id);

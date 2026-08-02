@@ -1,4 +1,4 @@
-# R3 Real-Time Voice Evaluation — 2026-07-30
+# R3 Real-Time Voice Evaluation — Through 2026-08-02
 
 ## Scope and Status
 
@@ -10,6 +10,39 @@ from process/device and acoustic evidence.
 **R3 status: INCOMPLETE.** Repository code and documentation gates pass.
 Process/device evidence is `PARTIALLY VALIDATED`. Acoustic evidence is
 `NOT VALIDATED`.
+
+## Acceptance Closure Update — 2026-08-02
+
+Source commit `55d29b4` closes the remaining deterministic acceptance-tooling
+gaps without changing the evidence status above:
+
+- the ten-minute harness now requires explicit completed-turn and interruption
+  minima and counts unique turn or turn/generation identities rather than log
+  lines;
+- silent process duration, unmet thresholds, any session reset, duplicate
+  lifecycle output, and noncanonical numeric options cannot produce a passing
+  result;
+- the new `conversation-acoustic-report` command accepts only a bounded absolute
+  CSV with canonical numeric sample sequence and enumerated exclusion reasons;
+- the analyzer requires at least `30` valid samples, rejects negative or
+  overflowing latency and malformed ordering, calculates nearest-rank p50, p95,
+  and maximum, and passes only when audible-stop p95 is at most `500 ms`;
+- report output omits sample identifiers, paths, annotations, transcripts, and
+  free-form exclusion text; and
+- the two Swift tests sharing the global network trap now run in one serialized
+  suite, removing their prior parallel-state race.
+
+Current verification passed the acceptance-harness adversarial suite, all `10`
+acoustic-report CLI scenarios, the complete Rust workspace with one intentionally
+ignored immutable-fixture writer, strict Rust formatting and Clippy with warnings
+denied, whitespace checks, and all `109` Swift sidecar tests. Independent review
+reproduced four evidence-integrity failures in the first draft—duplicate activity
+inflation, noncanonical JSON numbers, negative-latency false pass, and free-form
+report content—and confirmed each corrected regression.
+
+No human-spoken ten-minute session or calibrated 30-sample recording was run in
+this update. R3 therefore remains `ACCEPTANCE BLOCKED`; this section adds no
+first-audible or audible-stop measurement.
 
 ## Repository Contract Evidence
 

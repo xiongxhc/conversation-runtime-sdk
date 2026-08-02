@@ -6,6 +6,31 @@ This document defines the external measurement procedure. It is not acoustic
 evidence. No repository test, playback acknowledgement, or process timestamp
 can validate physical speaker output.
 
+R3 remains `ACCEPTANCE BLOCKED` until both the canonical ten-minute device run
+and the calibrated acoustic set pass with current-run evidence. Passing the
+repository tests or the analyzer alone does not change that status.
+
+## Canonical Ten-Minute Device Run
+
+Build the release voice loop and sidecar, start the configured local services,
+and run:
+
+```sh
+sh tests/voice/acceptance-macos.sh \
+  --config /absolute/path/to/private-voice-session.toml \
+  --metrics /absolute/path/to/new-device-metrics.jsonl \
+  --duration-seconds 600 \
+  --minimum-completed-turns 10 \
+  --minimum-interruptions 5
+```
+
+During the same uninterrupted session, complete at least ten turns and perform
+at least five user interruptions while response audio is audible. Include
+English and Chinese turns, one explicit shorter-response correction, one
+rejected follow-up question, and one deliberate pause that must not create a
+turn. The harness fails when either declared interaction threshold is unmet;
+process uptime or room silence alone cannot pass.
+
 ## Required Equipment
 
 Use one of:
@@ -92,14 +117,65 @@ Keep these milestones distinct:
 A render acknowledgement, player callback, or process launch cannot substitute
 for first-audible or audible-stop waveform evidence.
 
+## Annotation CSV
+
+Create one content-free CSV outside the repository with this exact header:
+
+```text
+sample_id,user_speech_onset_ms,last_response_waveform_ms,user_speech_end_ms,first_response_waveform_ms,valid,exclusion_reason
+```
+
+The file uses unquoted comma-separated fields and is limited to `1 MiB` and
+`10,000` sample rows. `sample_id` is the canonical decimal sequence number
+`1..=10000`, with no leading zero. `exclusion_reason` must be one of
+`annotation-error`, `calibration-error`, `environment-noise`,
+`overlapping-speaker`, `protocol-deviation`, or `recorder-failure`. Do not place
+prompts, transcripts, recording paths, participant names, free-form reasons, or
+audio content in the CSV.
+
+For a valid row:
+
+- all four timestamps are unsigned absolute milliseconds on the calibrated
+  recorder clock;
+- `user_speech_onset_ms <= user_speech_end_ms`;
+- `valid` is `true`;
+- `exclusion_reason` is empty.
+
+For an excluded row, set `valid` to `false`, provide a non-empty content-free
+reason, and leave unavailable timestamps empty. Any supplied timestamp must
+still be an unsigned integer. Every sample identifier must be unique.
+
+The analyzer uses checked subtraction. Negative latency indicates invalid
+annotation or calibration and rejects the complete input rather than passing or
+clamping it. Malformed rows, duplicate identifiers, timestamp overflow, or
+non-monotonic user-speech timestamps also reject the complete input without a
+partial report.
+
+## Analyzer
+
+Run the analyzer with an absolute CSV path:
+
+```sh
+cargo run --locked -p conversation-voice-probe \
+  --bin conversation-acoustic-report -- \
+  --input /absolute/path/to/acoustic-samples.csv
+```
+
+The command requires at least `30` valid samples and calculates nearest-rank
+p50, p95, and maximum values for audible-stop and
+speech-end-to-first-audible latency. It emits one deterministic, content-free
+JSON report. Exit status is zero only when the input is valid and audible-stop
+p95 is at most `500 ms`; a threshold failure emits a report with `"pass":false`
+and exits nonzero. Invalid or under-sampled input emits no partial JSON report.
+
 ## Reporting
 
-Store the content-free sample table and aggregate calculations outside the
+Store the content-free sample table and generated JSON report outside the
 repository until reviewed. Add only the following to
 `docs/r3-real-time-voice-evaluation.md`:
 
 - run identity and configuration digest;
-- valid and excluded sample counts;
+- valid and excluded sample counts, with enumerated exclusion-reason counts;
 - percentile method;
 - p50, p95, and maximum for audible stop;
 - separately measured speech-end-to-first-audible results;

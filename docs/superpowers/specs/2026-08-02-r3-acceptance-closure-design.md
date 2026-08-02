@@ -73,10 +73,11 @@ The canonical scripted profile is:
 
 - Capture user onset and physical response output on one recorder clock.
 - Keep recordings, prompts, transcripts, and raw annotations outside Git.
-- Import only a content-free CSV containing sample identifiers, event times,
-  validity, and exclusion reason.
+- Import only a content-free CSV containing canonical numeric sample sequence,
+  event times, validity, and an enumerated exclusion reason.
 - Require at least `30` valid interruption samples.
-- Calculate nearest-rank p50, p95, and maximum without clamping values.
+- Calculate nearest-rank p50, p95, and maximum without clamping valid
+  non-negative values.
 - Require `p95 audible_stop_latency_ms <= 500`.
 - Calculate speech-end-to-first-audible separately.
 - Reject malformed, duplicate, non-monotonic, or under-sampled tables.
@@ -108,14 +109,16 @@ CSV columns:
 sample_id,user_speech_onset_ms,last_response_waveform_ms,user_speech_end_ms,first_response_waveform_ms,valid,exclusion_reason
 ```
 
-The report contains valid/excluded counts, nearest-rank p50/p95/max audible-stop
-latency, nearest-rank p50/p95/max first-audible latency, and pass/fail status.
+The report contains valid/excluded counts, enumerated exclusion-reason counts,
+nearest-rank p50/p95/max audible-stop latency, nearest-rank p50/p95/max
+first-audible latency, and pass/fail status. It never republishes sample
+identifiers or free-form annotation fields.
 
 ### Evidence Documents
 
 `docs/r3-real-time-voice-evaluation.md` and `ROADMAP.md` will record:
 
-- the confirmed post-fix AirPods turn;
+- an actual post-fix device turn only after it is run;
 - the deterministic test-isolation fix;
 - the strict harness behavior;
 - actual ten-minute and acoustic results only after they are run;
@@ -127,8 +130,8 @@ latency, nearest-rank p50/p95/max first-audible latency, and pass/fail status.
 - Invalid acoustic rows fail without partial aggregate output.
 - Excluded samples require a non-empty reason and do not count toward 30 valid
   samples.
-- Negative latency values remain valid input for investigation and are not
-  clamped.
+- Negative latency values indicate invalid annotation or calibration and fail
+  without being clamped into a passing distribution.
 - No command silently falls back to synthetic or process-only evidence.
 
 ## Verification

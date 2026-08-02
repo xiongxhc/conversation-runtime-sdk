@@ -239,56 +239,59 @@ func flushSuppressesLateRenderedCallbacksFromTheOldEpoch() async throws {
     #expect(scheduler.resetCount == 1)
 }
 
-@Test
-func malformedLocalTokenizerIsRejectedWithoutNetworkRequests() async throws {
-    let folder = FileManager.default.temporaryDirectory.appendingPathComponent(
-        UUID().uuidString,
-        isDirectory: true
-    )
-    try FileManager.default.createDirectory(
-        at: folder,
-        withIntermediateDirectories: true
-    )
-    defer {
-        try? FileManager.default.removeItem(at: folder)
-    }
-    try Data("{not valid json".utf8).write(
-        to: folder.appendingPathComponent("tokenizer.json")
-    )
-    try Data(
-        #"{"tokenizer_class":"PreTrainedTokenizerFast"}"#.utf8
-    ).write(
-        to: folder.appendingPathComponent("tokenizer_config.json")
-    )
-    NetworkTrapURLProtocol.reset()
-    try #require(
-        URLProtocol.registerClass(NetworkTrapURLProtocol.self)
-    )
-    defer {
-        URLProtocol.unregisterClass(NetworkTrapURLProtocol.self)
-    }
-
-    await #expect(throws: (any Error).self) {
-        _ = try await OfflineWhisperTokenizer.load(from: folder)
-    }
-
-    #expect(NetworkTrapURLProtocol.requestCount == 0)
-}
-
-@Test
-func networkTrapPositiveControlInterceptsURLSessionWithoutNetwork() async throws {
-    NetworkTrapURLProtocol.reset()
-    let configuration = URLSessionConfiguration.ephemeral
-    configuration.protocolClasses = [NetworkTrapURLProtocol.self]
-    let session = URLSession(configuration: configuration)
-
-    await #expect(throws: (any Error).self) {
-        _ = try await session.data(
-            from: URL(string: "https://network-trap.invalid/tokenizer.json")!
+@Suite(.serialized)
+struct NetworkTrapTests {
+    @Test
+    func malformedLocalTokenizerIsRejectedWithoutNetworkRequests() async throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(
+            UUID().uuidString,
+            isDirectory: true
         )
+        try FileManager.default.createDirectory(
+            at: folder,
+            withIntermediateDirectories: true
+        )
+        defer {
+            try? FileManager.default.removeItem(at: folder)
+        }
+        try Data("{not valid json".utf8).write(
+            to: folder.appendingPathComponent("tokenizer.json")
+        )
+        try Data(
+            #"{"tokenizer_class":"PreTrainedTokenizerFast"}"#.utf8
+        ).write(
+            to: folder.appendingPathComponent("tokenizer_config.json")
+        )
+        NetworkTrapURLProtocol.reset()
+        try #require(
+            URLProtocol.registerClass(NetworkTrapURLProtocol.self)
+        )
+        defer {
+            URLProtocol.unregisterClass(NetworkTrapURLProtocol.self)
+        }
+
+        await #expect(throws: (any Error).self) {
+            _ = try await OfflineWhisperTokenizer.load(from: folder)
+        }
+
+        #expect(NetworkTrapURLProtocol.requestCount == 0)
     }
 
-    #expect(NetworkTrapURLProtocol.requestCount > 0)
+    @Test
+    func networkTrapPositiveControlInterceptsURLSessionWithoutNetwork() async throws {
+        NetworkTrapURLProtocol.reset()
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [NetworkTrapURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+
+        await #expect(throws: (any Error).self) {
+            _ = try await session.data(
+                from: URL(string: "https://network-trap.invalid/tokenizer.json")!
+            )
+        }
+
+        #expect(NetworkTrapURLProtocol.requestCount > 0)
+    }
 }
 
 @Test

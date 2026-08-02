@@ -4,10 +4,11 @@ set -u
 REPOSITORY_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd -P) || exit 1
 DEFAULT_VOICE_LOOP_BIN="$REPOSITORY_ROOT/target/release/conversation-voice-loop"
 MAX_METRIC_RECORDS=10000
+MAX_INTERACTION_THRESHOLD=10000
 
 usage() {
     cat <<'EOF'
-Usage: acceptance-macos.sh --config ABSOLUTE_PATH --metrics ABSOLUTE_PATH [--duration-seconds SECONDS]
+Usage: acceptance-macos.sh --config ABSOLUTE_PATH --metrics ABSOLUTE_PATH --minimum-completed-turns COUNT --minimum-interruptions COUNT [--duration-seconds SECONDS]
 
 Runs the real voice loop for 600 seconds by default. The JSONL output contains
 only content-free timing metrics, identifiers, stages, counts, and a session
@@ -31,6 +32,8 @@ fail() {
 config_path=
 metrics_path=
 duration_seconds=600
+minimum_completed_turns=
+minimum_interruptions=
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -49,6 +52,18 @@ while [ "$#" -gt 0 ]; do
         --duration-seconds)
             [ "$#" -ge 2 ] || fail "--duration-seconds requires a positive integer"
             duration_seconds=$2
+            shift 2
+            ;;
+        --minimum-completed-turns)
+            [ "$#" -ge 2 ] || fail "--minimum-completed-turns requires a bounded non-negative integer"
+            [ -z "$minimum_completed_turns" ] || fail "--minimum-completed-turns may be specified only once"
+            minimum_completed_turns=$2
+            shift 2
+            ;;
+        --minimum-interruptions)
+            [ "$#" -ge 2 ] || fail "--minimum-interruptions requires a bounded non-negative integer"
+            [ -z "$minimum_interruptions" ] || fail "--minimum-interruptions may be specified only once"
+            minimum_interruptions=$2
             shift 2
             ;;
         --help|-h)
@@ -72,8 +87,32 @@ esac
 case "$duration_seconds" in
     ''|*[!0-9]*) fail "--duration-seconds requires a positive integer" ;;
 esac
+case "$duration_seconds" in
+    [1-9]*) ;;
+    *) fail "--duration-seconds requires a canonical positive integer" ;;
+esac
 [ "$duration_seconds" -gt 0 ] || fail "--duration-seconds requires a positive integer"
 [ "$duration_seconds" -le 86400 ] || fail "--duration-seconds exceeds the 86400-second safety limit"
+case "$minimum_completed_turns" in
+    ''|*[!0-9]*) fail "--minimum-completed-turns requires a bounded non-negative integer" ;;
+esac
+case "$minimum_completed_turns" in
+    0|[1-9]*) ;;
+    *) fail "--minimum-completed-turns requires a canonical non-negative integer" ;;
+esac
+[ "$minimum_completed_turns" -le "$MAX_INTERACTION_THRESHOLD" ] ||
+    fail "--minimum-completed-turns exceeds the 10000-count safety limit"
+case "$minimum_interruptions" in
+    ''|*[!0-9]*) fail "--minimum-interruptions requires a bounded non-negative integer" ;;
+esac
+case "$minimum_interruptions" in
+    0|[1-9]*) ;;
+    *) fail "--minimum-interruptions requires a canonical non-negative integer" ;;
+esac
+[ "$minimum_interruptions" -le "$MAX_INTERACTION_THRESHOLD" ] ||
+    fail "--minimum-interruptions exceeds the 10000-count safety limit"
+[ "$minimum_completed_turns" -gt 0 ] || [ "$minimum_interruptions" -gt 0 ] ||
+    fail "at least one interaction threshold must be positive"
 [ -f "$config_path" ] && [ -r "$config_path" ] || fail "configuration file is not readable"
 
 metrics_parent=$(dirname -- "$metrics_path")
@@ -268,8 +307,11 @@ while [ ! -f "$metrics_ready" ]; do
 done
 exec 3>"$metrics_fifo" || fail "could not open private metrics pipe"
 metrics_fd_open=1
-printf '{"schema_version":1,"record_type":"session_start","config_sha256":"%s","duration_seconds":%s}\n' \
-    "$config_sha256" "$duration_seconds" >&3 ||
+printf '{"schema_version":1,"record_type":"session_start","config_sha256":"%s","duration_seconds":%s,"minimum_completed_turns":%s,"minimum_interruptions":%s}\n' \
+    "$config_sha256" \
+    "$duration_seconds" \
+    "$minimum_completed_turns" \
+    "$minimum_interruptions" >&3 ||
     fail "could not write metrics output"
 
 mkfifo "$fifo_path" || fail "could not create private metrics pipe"
@@ -326,7 +368,28 @@ function emit(line) {
         }
     }
 
-    if (field["status"] == "interrupted") interruptions++
+    if (field["turn"] ~ /^[0-9]+$/) {
+        turn_key = field["turn"]
+        if (field["status"] == "completed" && !(turn_key in completed_seen)) {
+            completed_seen[turn_key] = 1
+            completed_turns++
+        }
+        if (field["status"] == "cancelled" && !(turn_key in cancelled_seen)) {
+            cancelled_seen[turn_key] = 1
+            cancelled_turns++
+        }
+        if (field["status"] == "failed" && !(turn_key in failed_seen)) {
+            failed_seen[turn_key] = 1
+            failed_turns++
+        }
+        if (field["status"] == "interrupted" && field["generation"] ~ /^[0-9]+$/) {
+            interruption_key = turn_key ":" field["generation"]
+            if (!(interruption_key in interruption_seen)) {
+                interruption_seen[interruption_key] = 1
+                interruptions++
+            }
+        }
+    }
     if (field["status"] == "session-reset") resets++
     if (field["stale_generation"] == "rejected") {
         stale_rejects++
@@ -345,7 +408,10 @@ function emit(line) {
     }
 }
 END {
-    printf "interruption_count=%d\n", interruptions > state_file
+    printf "completed_turn_count=%d\n", completed_turns > state_file
+    printf "cancelled_turn_count=%d\n", cancelled_turns >> state_file
+    printf "failed_turn_count=%d\n", failed_turns >> state_file
+    printf "interruption_count=%d\n", interruptions >> state_file
     printf "session_reset_count=%d\n", resets >> state_file
     printf "stale_generation_reject_count=%d\n", stale_rejects >> state_file
     printf "stale_generation_observed=%d\n", stale_observed >> state_file
@@ -491,6 +557,9 @@ parser_pid=
 kill "$parser_guard_pid" 2>/dev/null || true
 wait "$parser_guard_pid" 2>/dev/null || true
 
+completed_turn_count=0
+cancelled_turn_count=0
+failed_turn_count=0
 interruption_count=0
 session_reset_count=0
 stale_generation_reject_count=0
@@ -512,6 +581,13 @@ else
     session_result=failed
 fi
 if [ "$parser_status" -ne 0 ] || [ "$orphaned_child_count" -ne 0 ]; then
+    session_result=failed
+fi
+if [ "$completed_turn_count" -lt "$minimum_completed_turns" ] ||
+    [ "$interruption_count" -lt "$minimum_interruptions" ]; then
+    session_result=failed
+fi
+if [ "$session_reset_count" -ne 0 ]; then
     session_result=failed
 fi
 process_inspection_failure_count=0
@@ -538,9 +614,12 @@ if [ "$queue_underrun_observed" -eq 1 ]; then
     queue_underrun_observed_json=true
 fi
 
-printf '{"schema_version":1,"record_type":"session_summary","session_result":"%s","exit_code":%s,"session_reset_count":%s,"stale_generation_reject_count":%s,"stale_generation_observed":%s,"queue_underrun_count":%s,"queue_underrun_observed":%s,"interruption_count":%s,"orphaned_child_count":%s,"process_inspection_failure_count":%s,"process_cleanup_failure_count":%s,"dropped_metric_record_count":%s}\n' \
+printf '{"schema_version":1,"record_type":"session_summary","session_result":"%s","exit_code":%s,"completed_turn_count":%s,"cancelled_turn_count":%s,"failed_turn_count":%s,"session_reset_count":%s,"stale_generation_reject_count":%s,"stale_generation_observed":%s,"queue_underrun_count":%s,"queue_underrun_observed":%s,"interruption_count":%s,"orphaned_child_count":%s,"process_inspection_failure_count":%s,"process_cleanup_failure_count":%s,"dropped_metric_record_count":%s}\n' \
     "$session_result" \
     "$voice_status" \
+    "$completed_turn_count" \
+    "$cancelled_turn_count" \
+    "$failed_turn_count" \
     "$session_reset_count" \
     "$stale_generation_reject_json" \
     "$stale_generation_observed_json" \

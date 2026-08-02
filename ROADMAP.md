@@ -21,12 +21,19 @@ The first release is not a directory-complete platform. It is one local voice lo
 - The deterministic R3 implementation now includes schema-v2 privacy policy, a
   managed macOS voice-processing sidecar, local recognition integration,
   generation-safe continuous playback, explicit streaming local speech, and a
-  bounded ten-minute acceptance harness.
+  bounded ten-minute acceptance harness that requires observed completed turns
+  and interruptions rather than process duration alone, plus a bounded
+  30-sample acoustic report analyzer.
 - A private local-only configuration and local ASR model now pass preflight,
   the current macOS source passes an opt-in full-duplex capture/playback smoke,
   and the release CLI starts under `LocalOnly`. A complete post-fix
   human-spoken turn, ten-minute device run, and 30-sample acoustic recording
-  remain unperformed, so R3 remains incomplete.
+  remain unperformed, so R3 remains `ACCEPTANCE BLOCKED` despite complete
+  deterministic acceptance tooling.
+- R4 bounded in-session conversation quality controls are implemented and
+  regression-tested: visible persona dimensions, four modes, response limits,
+  temporary corrections, completed-only history, typed provider envelopes,
+  content-free decisions, and context-derived relationship guidance.
 - First-audible timing, audible-stop p95, representative warm measurements,
   subjective English and Chinese quality, and the 1.2-second
   time-to-useful-audio goal remain unvalidated.
@@ -184,6 +191,26 @@ first-audible, audible-stop p95, or R3 completion claim is made. See
 ## R4 — Conversation Quality Controls
 
 **Outcome:** Make pacing and style responsive to user state rather than leaving behavior inside one opaque prompt.
+
+### Source Status
+
+Complete for bounded in-session controls. The protocol exposes validated
+persona, mode, response, signal, message, context-source, and content-free
+decision types. The runtime resolves short answers and explicit corrections,
+retains at most eight completed exchanges within `16 KiB`, excludes cancelled
+or failed partial output, and carries one typed generation envelope into the
+selected language adapter. The Ollama-compatible reference translation
+preserves deployment guidance, runtime guidance, ordered history, and current
+input while lowering its output-token cap to the resolved spoken-duration
+budget.
+
+Schema-v2 configuration exposes persona, response, and content-free metric
+controls with explicit defaults and pre-capture validation. Relationship
+guidance is derived from visible persona, supplied context, reciprocity, pacing,
+and rapport; no scripted expression, hidden unlock, or frequency quota exists.
+The deterministic R4 gate passes the complete Rust workspace and `109` Swift
+tests. Subjective model quality remains deployment-specific; SQLite persistence
+remains R5 and application controls remain R6.
 
 ### Deliverables
 

@@ -1,3 +1,5 @@
+# Visible application-owned persona dimensions. Values map from 0.0 to 1.0
+# into the SDK's validated 0-to-100 levels.
 warmth = 0.8
 humor = 0.6
 teasing = 0.4

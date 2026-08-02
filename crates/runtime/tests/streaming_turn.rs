@@ -114,9 +114,100 @@ async fn streaming_turn_publishes_original_text_and_enqueues_ordered_frames() {
     );
     assert_eq!(output.frames(), expected_frames);
     assert_eq!(language.requests().len(), 1);
+    let quality_index = observed
+        .iter()
+        .position(|event| matches!(event, RuntimeEvent::QualityResolved { .. }))
+        .expect("quality decision was not published");
+    let transcript_index = observed
+        .iter()
+        .position(|event| matches!(event, RuntimeEvent::TranscriptFinal { .. }))
+        .unwrap();
+    let first_text_index = observed
+        .iter()
+        .position(|event| matches!(event, RuntimeEvent::TextDelta { .. }))
+        .unwrap();
+    assert!(transcript_index < quality_index);
+    assert!(quality_index < first_text_index);
+    let first_request = &language.requests()[0];
+    assert!(first_request.input().quality_decision().is_some());
+    assert!(first_request.input().runtime_guidance().is_some());
+    assert!(first_request.input().recent_messages().is_empty());
     assert_eq!(speech.requests().len(), 1);
     assert_eq!(speech.requests()[0].utterance_id(), utterance_id);
     assert_eq!(speech.requests()[0].text(), "hello world");
+
+    let mut second = runtime
+        .start_turn(TurnId::new(9), GenerationId::new(10), "next question")
+        .await
+        .unwrap();
+    let _ = drain(&mut second).await;
+    let requests = language.requests();
+    assert_eq!(requests[1].input().recent_messages().len(), 2);
+    assert_eq!(requests[1].input().recent_messages()[0].text(), "question");
+    assert_eq!(
+        requests[1].input().recent_messages()[1].text(),
+        "hello world"
+    );
+}
+
+#[tokio::test]
+async fn interrupted_turn_constrains_the_next_generation_envelope_once() {
+    let language = Arc::new(MockGenerationLanguageModel::new(["#"]));
+    let speech = Arc::new(MockStreamingSpeechSynthesizer::new([]));
+    let output = Arc::new(MockContinuousAudioOutput::new());
+    let runtime = StreamingTurnRuntime::new(language.clone(), speech, output);
+
+    let mut interrupted = runtime
+        .start_turn(
+            TurnId::new(1),
+            GenerationId::new(1),
+            "explain this in detail",
+        )
+        .await
+        .unwrap();
+    runtime
+        .interrupt(TurnId::new(1), GenerationId::new(1))
+        .await
+        .unwrap();
+    let interrupted_events = drain(&mut interrupted).await;
+    assert!(interrupted_events
+        .iter()
+        .any(|event| matches!(event, RuntimeEvent::TurnCancelled { .. })));
+
+    let mut constrained = runtime
+        .start_turn(
+            TurnId::new(2),
+            GenerationId::new(2),
+            "continue with enough detail",
+        )
+        .await
+        .unwrap();
+    let _ = drain(&mut constrained).await;
+    let requests = language.requests();
+    let decision = requests.last().unwrap().input().quality_decision().unwrap();
+    assert!(decision
+        .signals()
+        .contains(&conversation_protocol::ConversationSignal::Interrupted));
+    assert_eq!(decision.controls().maximum_spoken_seconds(), 8);
+
+    let mut following = runtime
+        .start_turn(
+            TurnId::new(3),
+            GenerationId::new(3),
+            "continue normally with enough detail",
+        )
+        .await
+        .unwrap();
+    let _ = drain(&mut following).await;
+    let requests = language.requests();
+    assert!(!requests
+        .last()
+        .unwrap()
+        .input()
+        .quality_decision()
+        .unwrap()
+        .signals()
+        .contains(&conversation_protocol::ConversationSignal::Interrupted));
 }
 
 #[tokio::test]
@@ -224,7 +315,7 @@ async fn first_playable_publication_precedes_frame_enqueue_under_backpressure() 
         frame(turn_id, generation_id, UtteranceId::new(1), 1, format),
     ];
     let language = Arc::new(MockGenerationLanguageModel::new(std::iter::repeat_n(
-        "x", 27,
+        "x", 26,
     )));
     let first_frame_validated = Arc::new(Notify::new());
     let speech = Arc::new(FirstPlayableProbeSpeech {

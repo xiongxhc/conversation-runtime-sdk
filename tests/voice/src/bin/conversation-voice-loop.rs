@@ -36,6 +36,7 @@ async fn run() -> Result<i32, CliFailure> {
     config
         .validate()
         .map_err(|message| CliFailure::new("configuration", message))?;
+    let quality_metrics_enabled = config.quality_metrics_enabled();
     let policy = config.policy(descriptors).map_err(runtime_failure)?;
     let adapters = config
         .adapters()
@@ -127,7 +128,7 @@ async fn run() -> Result<i32, CliFailure> {
                 event,
                 ..
             } => {
-                if render_turn_event(&event) && arguments.once {
+                if render_turn_event(&event, quality_metrics_enabled) && arguments.once {
                     once_completion.complete(generation_id);
                     if once_completion.is_ready(&playback) {
                         shutdown_and_drain(&runtime, &mut events, &mut playback).await?;
@@ -187,7 +188,7 @@ async fn run() -> Result<i32, CliFailure> {
     }
 }
 
-fn render_turn_event(event: &RuntimeEvent) -> bool {
+fn render_turn_event(event: &RuntimeEvent, quality_metrics_enabled: bool) -> bool {
     match event {
         RuntimeEvent::TurnStarted { turn_id } => {
             eprintln!("turn={} status=started", turn_id.get());
@@ -209,6 +210,11 @@ fn render_turn_event(event: &RuntimeEvent) -> bool {
         RuntimeEvent::SpeechCompleted { turn_id } => {
             eprintln!("turn={} speech=completed", turn_id.get());
         }
+        RuntimeEvent::QualityResolved { .. } if quality_metrics_enabled => {
+            if let Some(metric) = event.quality_metric_json() {
+                eprintln!("quality={metric}");
+            }
+        }
         RuntimeEvent::TurnCompleted { turn_id } => {
             eprintln!("turn={} status=completed", turn_id.get());
             return true;
@@ -224,7 +230,9 @@ fn render_turn_event(event: &RuntimeEvent) -> bool {
                 public_runtime_message(error)
             );
         }
-        RuntimeEvent::TranscriptFinal { .. } | RuntimeEvent::TextDelta { .. } => {}
+        RuntimeEvent::TranscriptFinal { .. }
+        | RuntimeEvent::TextDelta { .. }
+        | RuntimeEvent::QualityResolved { .. } => {}
         _ => {}
     }
     false

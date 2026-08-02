@@ -63,6 +63,56 @@ fn strict_schema_v2_rejects_wrong_version_unknown_fields_and_missing_execution()
 }
 
 #[test]
+fn quality_configuration_rejects_invalid_or_content_recording_values_before_capture() {
+    let cases = [
+        (
+            "persona-high",
+            "warmth = 0.8",
+            "warmth = 1.1",
+            "persona warmth",
+        ),
+        (
+            "persona-nan",
+            "warmth = 0.8",
+            "warmth = nan",
+            "persona warmth",
+        ),
+        (
+            "zero-duration",
+            "maximum_spoken_seconds = 20",
+            "maximum_spoken_seconds = 0",
+            "maximum spoken seconds",
+        ),
+        (
+            "forced-filler",
+            "allow_silence = true",
+            "allow_silence = false",
+            "allow_silence must remain true",
+        ),
+        (
+            "content-metrics",
+            "record_content = false",
+            "record_content = true",
+            "quality metrics cannot record transcript content",
+        ),
+    ];
+
+    for (name, from, to, expected) in cases {
+        let harness = CliHarness::new("ready");
+        let config = with_quality_sections(
+            harness.valid_config("http://127.0.0.1:9", "http://127.0.0.1:9/v1"),
+        )
+        .replacen(from, to, 1);
+        let output = harness.run_once(&config);
+
+        assert!(!output.status.success(), "{name}: {output:?}");
+        assert!(output.stderr_text().contains("stage=configuration"));
+        assert!(output.stderr_text().contains(expected));
+        assert!(!harness.spawn_marker().exists(), "{name} spawned sidecar");
+    }
+}
+
+#[test]
 fn local_only_rejects_every_remote_component_before_sidecar_spawn() {
     for component in [
         "asr",
@@ -308,7 +358,9 @@ fn once_mode_runs_one_private_voice_turn_and_cleans_every_process() {
         "audio/wav",
         &pcm_wav(1),
     );
-    let config = harness.valid_config(language.endpoint(), &speech.endpoint_with_path("/v1"));
+    let config = with_quality_sections(
+        harness.valid_config(language.endpoint(), &speech.endpoint_with_path("/v1")),
+    );
 
     let output = harness.run_once(&config);
     let language_request = language.finish_with_request();
@@ -321,13 +373,22 @@ fn once_mode_runs_one_private_voice_turn_and_cleans_every_process() {
     assert_eq!(output.stdout_text(), "partial=hel\nfinal=hello\n");
     assert_eq!(request_target(&language_request), "/api/chat");
     assert_eq!(language_payload["model"], "local-language-model");
-    assert_eq!(language_payload["messages"][0]["role"], "user");
-    assert_eq!(language_payload["messages"][0]["content"], "hello");
+    assert_eq!(language_payload["messages"][0]["role"], "system");
+    assert!(language_payload["messages"][0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("direct_answer mode"));
+    assert!(language_payload["messages"][0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("within 8 seconds"));
+    assert_eq!(language_payload["messages"][1]["role"], "user");
+    assert_eq!(language_payload["messages"][1]["content"], "hello");
     assert_eq!(language_payload["stream"], true);
     assert_eq!(language_payload["think"], false);
     assert_eq!(language_payload["options"]["temperature"], 0.0);
     assert_eq!(language_payload["options"]["seed"], 42);
-    assert_eq!(language_payload["options"]["num_predict"], 128);
+    assert_eq!(language_payload["options"]["num_predict"], 32);
     assert_eq!(language_payload["options"]["num_ctx"], 8192);
     assert_eq!(request_target(&speech_request), "/v1/audio/speech");
     assert_eq!(speech_payload["model"], "local-speech-model");
@@ -359,6 +420,14 @@ fn once_mode_runs_one_private_voice_turn_and_cleans_every_process() {
     assert!(turn_completed < terminal_status);
     assert!(!stderr.contains("hello"));
     assert!(!stderr.contains("Fixture response."));
+    let quality = stderr
+        .lines()
+        .find(|line| line.starts_with("quality="))
+        .expect("quality metric was not emitted");
+    assert!(quality.contains("quality_resolved"));
+    assert!(quality.contains("direct_answer"));
+    assert!(!quality.contains("transcript"));
+    assert!(!quality.contains("prompt"));
     assert!(harness.shutdown_marker().exists());
     harness.assert_sidecar_reaped();
 }
@@ -1029,6 +1098,37 @@ fn without_sidecar_override(config: &str) -> String {
         .collect::<Vec<_>>()
         .join("\n")
         + "\n"
+}
+
+fn with_quality_sections(config: String) -> String {
+    config.replacen(
+        "\n[asr]\n",
+        r#"
+[persona]
+warmth = 0.8
+humor = 0.6
+teasing = 0.4
+initiative = 0.35
+directness = 0.8
+intimacy = 0.3
+verbosity = 0.2
+follow_up_frequency = 0.25
+
+[response]
+mode = "direct-answer"
+maximum_spoken_seconds = 20
+pace = "natural"
+allow_silence = true
+ask_follow_up_by_default = false
+
+[quality_metrics]
+enabled = true
+record_content = false
+
+[asr]
+"#,
+        1,
+    )
 }
 
 fn remote_component(config: &str, component: &str) -> String {

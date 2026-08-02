@@ -78,6 +78,44 @@ requirements. The deterministic Rust and Swift implementation now follows this
 shape. The private local-model/device run and external acoustic recording remain
 unperformed, so implementation status does not promote R3 to complete.
 
+## R4 Conversation Quality Layer
+
+R4 inserts one backend-neutral decision layer between finalized input and model
+generation:
+
+```mermaid
+flowchart LR
+    Transcript["Final transcript"] --> Controller["Conversation quality controller"]
+    Persona["Saved persona"] --> Controller
+    History["Bounded completed history"] --> Controller
+    Signals["Temporary conversation signals"] --> Controller
+    Controller --> Decision["Content-free quality decision"]
+    Controller --> Envelope["Typed generation envelope"]
+    Decision --> Events["Runtime events and local metrics"]
+    Envelope --> Adapter["Selected language adapter"]
+    Adapter --> Provider["Local or explicitly selected provider"]
+```
+
+The saved persona contains visible warmth, humor, teasing, initiative,
+directness, intimacy, verbosity, and follow-up-frequency dimensions. The
+controller combines that immutable session configuration with explicit mode,
+response defaults, at most eight completed exchanges, and current signals. It
+resolves spoken-duration, pace, follow-up, and silence behavior before provider
+translation.
+
+Corrections are transient. A shorter request, stop-explaining request, rejected
+question, hesitation, rapid topic change, or interruption can constrain one
+applicable response without changing the saved persona. Cancelled and failed
+partial assistant output never enters recent history. Silence creates neither a
+turn nor a filler response.
+
+Language adapters receive the same typed envelope: deterministic runtime
+guidance, ordered bounded history, current input, resolved controls, and
+content-free context sources. An adapter translates those values into its
+native message format; it does not own conversation policy. Quality events
+expose the decision but never the transcript, prompt, response, provider
+payload, or model identifier.
+
 ## Streaming Speech Boundary
 
 Schema-v2 voice configuration selects speech mode explicitly:

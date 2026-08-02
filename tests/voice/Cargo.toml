@@ -17,6 +17,10 @@ path = "src/bin/conversation-fake-voice-sidecar.rs"
 name = "conversation-voice-loop"
 path = "src/bin/conversation-voice-loop.rs"
 
+[[bin]]
+name = "conversation-acoustic-report"
+path = "src/bin/conversation-acoustic-report.rs"
+
 [dependencies]
 conversation-model-adapters.workspace = true
 conversation-protocol.workspace = true

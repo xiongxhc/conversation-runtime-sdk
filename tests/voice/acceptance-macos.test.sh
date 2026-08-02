@@ -2,9 +2,10 @@
 set -eu
 
 REPOSITORY_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd -P)
-HARNESS="$REPOSITORY_ROOT/tests/voice/acceptance-macos.sh"
+REAL_HARNESS="$REPOSITORY_ROOT/tests/voice/acceptance-macos.sh"
 FIXTURE_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/conversation-runtime-acceptance-test.XXXXXX")
 FIXTURE_ROOT=$(CDPATH= cd -- "$FIXTURE_ROOT" && pwd -P)
+HARNESS="$FIXTURE_ROOT/acceptance-macos-zero-thresholds.sh"
 HELPER="$FIXTURE_ROOT/acceptance-helper"
 outside_pid=
 
@@ -37,6 +38,15 @@ printf '%s\n' 'schema_version = 2' >"$CONFIG"
     "$REPOSITORY_ROOT/tests/voice/acceptance-helper.c" \
     -o "$HELPER"
 export CONVERSATION_ACCEPTANCE_HELPER_BIN="$HELPER"
+
+cat >"$HARNESS" <<EOF
+#!/bin/sh
+exec "$REAL_HARNESS" \
+    --minimum-completed-turns 1 \
+    --minimum-interruptions 0 \
+    "\$@"
+EOF
+chmod 700 "$HARNESS"
 
 assert_fails() {
     if "$@" >"$FIXTURE_ROOT/assert.stdout" 2>"$FIXTURE_ROOT/assert.stderr"; then
@@ -138,6 +148,35 @@ HELP_OUTPUT=$("$HARNESS" --help)
 printf '%s\n' "$HELP_OUTPUT" | grep -q 'trusted local operator account'
 printf '%s\n' "$HELP_OUTPUT" | grep -q 'malicious same-EUID process'
 printf '%s\n' "$HELP_OUTPUT" | grep -q 'setpgid/setsid'
+
+assert_fails env CONVERSATION_VOICE_LOOP_BIN=/usr/bin/true "$REAL_HARNESS" \
+    --config "$CONFIG" \
+    --duration-seconds 1 \
+    --metrics "$FIXTURE_ROOT/missing-thresholds.jsonl"
+assert_fails env CONVERSATION_VOICE_LOOP_BIN=/usr/bin/true "$REAL_HARNESS" \
+    --config "$CONFIG" \
+    --minimum-completed-turns -1 \
+    --minimum-interruptions 0 \
+    --duration-seconds 1 \
+    --metrics "$FIXTURE_ROOT/negative-threshold.jsonl"
+assert_fails env CONVERSATION_VOICE_LOOP_BIN=/usr/bin/true "$REAL_HARNESS" \
+    --config "$CONFIG" \
+    --minimum-completed-turns 10001 \
+    --minimum-interruptions 0 \
+    --duration-seconds 1 \
+    --metrics "$FIXTURE_ROOT/excessive-threshold.jsonl"
+assert_fails env CONVERSATION_VOICE_LOOP_BIN=/usr/bin/true "$REAL_HARNESS" \
+    --config "$CONFIG" \
+    --minimum-completed-turns 01 \
+    --minimum-interruptions 0 \
+    --duration-seconds 1 \
+    --metrics "$FIXTURE_ROOT/noncanonical-threshold.jsonl"
+assert_fails env CONVERSATION_VOICE_LOOP_BIN=/usr/bin/true "$REAL_HARNESS" \
+    --config "$CONFIG" \
+    --minimum-completed-turns 1 \
+    --minimum-interruptions 0 \
+    --duration-seconds 01 \
+    --metrics "$FIXTURE_ROOT/noncanonical-duration.jsonl"
 
 assert_fails "$HARNESS" \
     --config voice-session.toml \
@@ -484,7 +523,14 @@ end
 Signal.trap("INT", &shutdown)
 Signal.trap("TERM", &shutdown)
 warn "privacy=local-only"
+warn "turn=3 status=completed"
+warn "turn=3 status=completed"
+warn "turn=4 status=cancelled"
+warn "turn=4 status=cancelled"
+warn "turn=5 status=failed stage=speech_recognizer error=content-free-fixture"
+warn "turn=5 status=failed stage=speech_recognizer error=content-free-fixture"
 warn "turn=4 milestone=speech_end elapsed_ms=12"
+warn "turn=4 generation=7 status=interrupted"
 warn "turn=4 generation=7 status=interrupted"
 warn "stale_generation=rejected"
 warn "metric=underrun_count count=2"
@@ -494,9 +540,86 @@ Process.wait(owned_child)
 EOF
 chmod 700 "$FAKE_LOOP"
 
-METRICS="$FIXTURE_ROOT/metrics.jsonl"
-if ! CONVERSATION_VOICE_LOOP_BIN="$FAKE_LOOP" "$HARNESS" \
+SILENT_LOOP="$FIXTURE_ROOT/silent-voice-loop.sh"
+cat >"$SILENT_LOOP" <<'EOF'
+#!/bin/sh
+trap 'exit 130' INT TERM
+while :; do
+    sleep 1
+done
+EOF
+chmod 700 "$SILENT_LOOP"
+
+ZERO_ACTIVITY_METRICS="$FIXTURE_ROOT/zero-activity.jsonl"
+assert_fails env CONVERSATION_VOICE_LOOP_BIN="$SILENT_LOOP" "$REAL_HARNESS" \
     --config "$CONFIG" \
+    --minimum-completed-turns 0 \
+    --minimum-interruptions 0 \
+    --duration-seconds 1 \
+    --metrics "$ZERO_ACTIVITY_METRICS"
+
+SILENT_METRICS="$FIXTURE_ROOT/silent.jsonl"
+assert_fails env CONVERSATION_VOICE_LOOP_BIN="$SILENT_LOOP" "$REAL_HARNESS" \
+    --config "$CONFIG" \
+    --minimum-completed-turns 1 \
+    --minimum-interruptions 1 \
+    --duration-seconds 1 \
+    --metrics "$SILENT_METRICS"
+jq -e . "$SILENT_METRICS" >/dev/null
+grep -q '"session_result":"failed"' "$SILENT_METRICS"
+grep -q '"minimum_completed_turns":1' "$SILENT_METRICS"
+grep -q '"minimum_interruptions":1' "$SILENT_METRICS"
+grep -q '"completed_turn_count":0' "$SILENT_METRICS"
+grep -q '"interruption_count":0' "$SILENT_METRICS"
+
+RESET_LOOP="$FIXTURE_ROOT/reset-voice-loop.sh"
+cat >"$RESET_LOOP" <<'EOF'
+#!/usr/bin/ruby
+Signal.trap("INT") { exit 130 }
+Signal.trap("TERM") { exit 130 }
+warn "turn=1 status=completed"
+warn "status=session-reset"
+sleep 30
+EOF
+chmod 700 "$RESET_LOOP"
+
+RESET_METRICS="$FIXTURE_ROOT/reset.jsonl"
+assert_fails env CONVERSATION_VOICE_LOOP_BIN="$RESET_LOOP" "$REAL_HARNESS" \
+    --config "$CONFIG" \
+    --minimum-completed-turns 1 \
+    --minimum-interruptions 0 \
+    --duration-seconds 1 \
+    --metrics "$RESET_METRICS"
+grep -q '"session_reset_count":1' "$RESET_METRICS"
+grep -q '"session_result":"failed"' "$RESET_METRICS"
+
+UNMET_COMPLETED_METRICS="$FIXTURE_ROOT/unmet-completed.jsonl"
+assert_fails env CONVERSATION_VOICE_LOOP_BIN="$FAKE_LOOP" "$REAL_HARNESS" \
+    --config "$CONFIG" \
+    --minimum-completed-turns 2 \
+    --minimum-interruptions 1 \
+    --duration-seconds 1 \
+    --metrics "$UNMET_COMPLETED_METRICS"
+grep -q '"completed_turn_count":1' "$UNMET_COMPLETED_METRICS"
+grep -q '"interruption_count":1' "$UNMET_COMPLETED_METRICS"
+grep -q '"session_result":"failed"' "$UNMET_COMPLETED_METRICS"
+
+UNMET_INTERRUPTION_METRICS="$FIXTURE_ROOT/unmet-interruption.jsonl"
+assert_fails env CONVERSATION_VOICE_LOOP_BIN="$FAKE_LOOP" "$REAL_HARNESS" \
+    --config "$CONFIG" \
+    --minimum-completed-turns 1 \
+    --minimum-interruptions 2 \
+    --duration-seconds 1 \
+    --metrics "$UNMET_INTERRUPTION_METRICS"
+grep -q '"completed_turn_count":1' "$UNMET_INTERRUPTION_METRICS"
+grep -q '"interruption_count":1' "$UNMET_INTERRUPTION_METRICS"
+grep -q '"session_result":"failed"' "$UNMET_INTERRUPTION_METRICS"
+
+METRICS="$FIXTURE_ROOT/metrics.jsonl"
+if ! CONVERSATION_VOICE_LOOP_BIN="$FAKE_LOOP" "$REAL_HARNESS" \
+    --config "$CONFIG" \
+    --minimum-completed-turns 1 \
+    --minimum-interruptions 1 \
     --duration-seconds 1 \
     --metrics "$METRICS"; then
     cat "$METRICS" >&2
@@ -507,7 +630,12 @@ test "$(stat -f '%Lp' "$METRICS")" = 600
 jq -e . "$METRICS" >/dev/null
 grep -q '"metric":"speech_end_ms"' "$METRICS"
 grep -q '"turn_id":4' "$METRICS"
+grep -q '"minimum_completed_turns":1' "$METRICS"
+grep -q '"minimum_interruptions":1' "$METRICS"
 grep -q '"session_result":"duration-complete"' "$METRICS"
+grep -q '"completed_turn_count":1' "$METRICS"
+grep -q '"cancelled_turn_count":1' "$METRICS"
+grep -q '"failed_turn_count":1' "$METRICS"
 grep -q '"interruption_count":1' "$METRICS"
 grep -q '"session_reset_count":0' "$METRICS"
 grep -q '"stale_generation_reject_count":1' "$METRICS"

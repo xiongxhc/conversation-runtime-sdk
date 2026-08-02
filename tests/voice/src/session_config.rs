@@ -11,10 +11,11 @@ use conversation_model_adapters::{
     SpeechSynthesizer, StreamingSpeechSynthesizer, SystemDevice,
 };
 use conversation_protocol::{
-    ComponentDescriptor, ComponentKind, ExecutionLocation, PrivacyMode, RuntimeError, SessionId,
-    VoiceSessionPolicy,
+    ComponentDescriptor, ComponentKind, ConversationMode, ExecutionLocation, FollowUpPolicy,
+    PersonaLevel, PersonaProfile, PrivacyMode, ResponseControls, RuntimeError, SessionId,
+    SilencePolicy, SpeechPace, VoiceSessionPolicy,
 };
-use conversation_runtime::VoiceSessionAdapters;
+use conversation_runtime::{ConversationQualityController, VoiceSessionAdapters};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -33,6 +34,12 @@ pub struct SessionConfig {
     privacy: PrivacyConfig,
     capture: CaptureConfig,
     turn: TurnConfig,
+    #[serde(default)]
+    persona: PersonaConfig,
+    #[serde(default)]
+    response: ResponseConfig,
+    #[serde(default)]
+    quality_metrics: QualityMetricsConfig,
     asr: AsrConfig,
     language: LanguageConfig,
     speech: SpeechConfig,
@@ -76,6 +83,89 @@ enum CaptureDevice {
 struct TurnConfig {
     speech_start_ms: u64,
     final_silence_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct PersonaConfig {
+    warmth: f32,
+    humor: f32,
+    teasing: f32,
+    initiative: f32,
+    directness: f32,
+    intimacy: f32,
+    verbosity: f32,
+    follow_up_frequency: f32,
+}
+
+impl Default for PersonaConfig {
+    fn default() -> Self {
+        Self {
+            warmth: 0.8,
+            humor: 0.6,
+            teasing: 0.4,
+            initiative: 0.35,
+            directness: 0.8,
+            intimacy: 0.3,
+            verbosity: 0.2,
+            follow_up_frequency: 0.25,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ResponseConfig {
+    mode: ConversationModeConfig,
+    maximum_spoken_seconds: u16,
+    pace: SpeechPaceConfig,
+    allow_silence: bool,
+    ask_follow_up_by_default: bool,
+}
+
+impl Default for ResponseConfig {
+    fn default() -> Self {
+        Self {
+            mode: ConversationModeConfig::DirectAnswer,
+            maximum_spoken_seconds: 20,
+            pace: SpeechPaceConfig::Natural,
+            allow_silence: true,
+            ask_follow_up_by_default: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ConversationModeConfig {
+    DirectAnswer,
+    Companionship,
+    Brainstorming,
+    Reflective,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum SpeechPaceConfig {
+    Measured,
+    Natural,
+    Brisk,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct QualityMetricsConfig {
+    enabled: bool,
+    record_content: bool,
+}
+
+impl Default for QualityMetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            record_content: false,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -245,6 +335,11 @@ impl SessionConfig {
         if !self.language.temperature.is_finite() || self.language.temperature < 0.0 {
             return Err("language temperature must be finite and non-negative".to_owned());
         }
+        self.persona_profile()?;
+        self.response_controls()?;
+        if self.quality_metrics.record_content {
+            return Err("quality metrics cannot record transcript content".to_owned());
+        }
         validate_http_endpoint(&self.language.endpoint, "language", self.language.execution)?;
         validate_http_endpoint(&self.speech.endpoint, "speech", self.speech.execution)?;
         self.validate_speech_mode()?;
@@ -305,11 +400,14 @@ impl SessionConfig {
             }
         };
         let voice_io = Arc::new(self.voice_io()?);
-        Ok(VoiceSessionAdapters::new(
-            voice_io,
-            language_model,
-            speech_synthesizer,
-        ))
+        Ok(
+            VoiceSessionAdapters::new(voice_io, language_model, speech_synthesizer)
+                .with_quality_controller(self.quality_controller()?),
+        )
+    }
+
+    pub const fn quality_metrics_enabled(&self) -> bool {
+        self.quality_metrics.enabled
     }
 
     fn require_local_execution_adapters(&self) -> Result<(), String> {
@@ -335,6 +433,45 @@ impl SessionConfig {
             .with_max_assistant_content_bytes(self.language.max_assistant_content_bytes)
             .map_err(adapter_message)?;
         Ok(OllamaLanguageModel::new(config))
+    }
+
+    fn quality_controller(&self) -> Result<ConversationQualityController, String> {
+        Ok(ConversationQualityController::new(
+            self.persona_profile()?,
+            self.response_controls()?,
+            self.response.mode.into(),
+        ))
+    }
+
+    fn persona_profile(&self) -> Result<PersonaProfile, String> {
+        Ok(PersonaProfile::new(
+            persona_level(self.persona.warmth, "warmth")?,
+            persona_level(self.persona.humor, "humor")?,
+            persona_level(self.persona.teasing, "teasing")?,
+            persona_level(self.persona.initiative, "initiative")?,
+            persona_level(self.persona.directness, "directness")?,
+            persona_level(self.persona.intimacy, "intimacy")?,
+            persona_level(self.persona.verbosity, "verbosity")?,
+            persona_level(self.persona.follow_up_frequency, "follow_up_frequency")?,
+        ))
+    }
+
+    fn response_controls(&self) -> Result<ResponseControls, String> {
+        if !self.response.allow_silence {
+            return Err("response allow_silence must remain true".to_owned());
+        }
+        ResponseControls::new(
+            self.response.maximum_spoken_seconds,
+            persona_level(self.persona.directness, "directness")?,
+            self.response.pace.into(),
+            if self.response.ask_follow_up_by_default {
+                FollowUpPolicy::Allowed
+            } else {
+                FollowUpPolicy::Contextual
+            },
+            SilencePolicy::AllowWithoutFiller,
+        )
+        .map_err(|error| error.message().to_owned())
     }
 
     fn validate_speech_mode(&self) -> Result<(), String> {
@@ -431,6 +568,27 @@ impl From<ExecutionConfig> for ExecutionLocation {
     }
 }
 
+impl From<ConversationModeConfig> for ConversationMode {
+    fn from(value: ConversationModeConfig) -> Self {
+        match value {
+            ConversationModeConfig::DirectAnswer => Self::DirectAnswer,
+            ConversationModeConfig::Companionship => Self::Companionship,
+            ConversationModeConfig::Brainstorming => Self::Brainstorming,
+            ConversationModeConfig::Reflective => Self::Reflective,
+        }
+    }
+}
+
+impl From<SpeechPaceConfig> for SpeechPace {
+    fn from(value: SpeechPaceConfig) -> Self {
+        match value {
+            SpeechPaceConfig::Measured => Self::Measured,
+            SpeechPaceConfig::Natural => Self::Natural,
+            SpeechPaceConfig::Brisk => Self::Brisk,
+        }
+    }
+}
+
 fn descriptor(
     kind: ComponentKind,
     provider: &str,
@@ -451,6 +609,15 @@ fn optional_descriptors(
 
 fn adapter_message(error: AdapterError) -> String {
     error.message().to_owned()
+}
+
+fn persona_level(value: f32, name: &str) -> Result<PersonaLevel, String> {
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        return Err(format!(
+            "persona {name} must be finite and within 0.0..=1.0"
+        ));
+    }
+    PersonaLevel::new((value * 100.0).round() as u8).map_err(|error| error.message().to_owned())
 }
 
 fn validate_http_endpoint(
@@ -509,10 +676,15 @@ impl GenerationLanguageModel for IdentityTaggedLanguageModel {
         let (sender, receiver) = mpsc::channel(GENERATION_BUFFER_SIZE);
         let turn_id = request.turn_id();
         let generation_id = request.generation_id();
-        let mut deltas = self.inner.stream(
-            LanguageModelRequest::new(turn_id, request.transcript()),
-            cancellation.clone(),
-        );
+        let language_request =
+            match LanguageModelRequest::from_input(turn_id, request.input().clone()) {
+                Ok(request) => request,
+                Err(error) => {
+                    let _ = sender.try_send(Err(error));
+                    return receiver;
+                }
+            };
+        let mut deltas = self.inner.stream(language_request, cancellation.clone());
 
         tokio::spawn(async move {
             loop {

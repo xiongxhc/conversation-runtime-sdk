@@ -1,4 +1,4 @@
-use crate::{GenerationId, PlaybackState, RuntimeError, TurnId};
+use crate::{GenerationId, PlaybackState, QualityDecision, RuntimeError, TurnId};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -38,6 +38,9 @@ pub enum RuntimeEvent {
         generation_id: GenerationId,
         state: PlaybackState,
     },
+    QualityResolved {
+        decision: QualityDecision,
+    },
     TurnCompleted {
         turn_id: TurnId,
     },
@@ -63,6 +66,7 @@ impl RuntimeEvent {
             | Self::TurnCompleted { turn_id }
             | Self::TurnCancelled { turn_id }
             | Self::TurnFailed { turn_id, .. } => *turn_id,
+            Self::QualityResolved { decision } => decision.turn_id(),
         }
     }
 
@@ -71,6 +75,16 @@ impl RuntimeEvent {
             self,
             Self::TurnCompleted { .. } | Self::TurnCancelled { .. } | Self::TurnFailed { .. }
         )
+    }
+
+    pub fn quality_metric_json(&self) -> Option<String> {
+        match self {
+            Self::QualityResolved { decision } => Some(format!(
+                "{{\"event\":\"quality_resolved\",\"decision\":{}}}",
+                decision.metric_json()
+            )),
+            _ => None,
+        }
     }
 }
 

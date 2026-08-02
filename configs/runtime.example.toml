@@ -1,5 +1,7 @@
 [turn]
+mode = "direct-answer"
 maximum_spoken_seconds = 20
+pace = "natural"
 allow_silence = true
 ask_follow_up_by_default = false
 

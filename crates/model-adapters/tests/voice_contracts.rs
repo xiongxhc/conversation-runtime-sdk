@@ -1,12 +1,15 @@
 use conversation_model_adapters::{
     AudioCapture, AudioFrame, CaptureEvent, ContinuousAudioOutput, GenerationLanguageModel,
-    GenerationLanguageRequest, MockAudioCapture, MockContinuousAudioOutput,
+    GenerationLanguageRequest, LanguageModelInput, MockAudioCapture, MockContinuousAudioOutput,
     MockGenerationLanguageModel, MockSpeechRecognizer, MockStreamingSpeechSynthesizer,
     MockVoiceInput, MockVoiceIoFactory, PcmFormat, PcmSampleFormat, RecognitionEvent,
     RecognitionHypothesis, SpeechRecognizer, StreamingSpeechRequest, StreamingSpeechSynthesizer,
     VoiceInput, VoiceInputEvent, VoiceIoFactory,
 };
-use conversation_protocol::{GenerationId, PlaybackState, SessionId, TurnId, UtteranceId};
+use conversation_protocol::{
+    ContextSource, ConversationMessage, ConversationMode, ConversationRole, GenerationId,
+    PlaybackState, QualityDecision, ResponseControls, SessionId, TurnId, UtteranceId,
+};
 use tokio::time::{timeout, Duration};
 use tokio_util::sync::CancellationToken;
 
@@ -130,6 +133,41 @@ async fn generation_language_preserves_request_and_delta_identities() {
     assert_eq!(delta.generation_id(), request.generation_id());
     assert_eq!(delta.delta(), "hello");
     assert_eq!(language.requests(), vec![request]);
+}
+
+#[test]
+fn generation_language_carries_bounded_typed_quality_input() {
+    let turn_id = TurnId::new(5);
+    let decision = QualityDecision::new(
+        turn_id,
+        ConversationMode::DirectAnswer,
+        ResponseControls::default(),
+        [],
+        2,
+        [ContextSource::SavedPersona, ContextSource::RecentHistory],
+    )
+    .unwrap();
+    let history = [
+        ConversationMessage::new(ConversationRole::User, "earlier question").unwrap(),
+        ConversationMessage::new(ConversationRole::Assistant, "earlier answer").unwrap(),
+    ];
+    let input = LanguageModelInput::with_quality(
+        "current question",
+        history.clone(),
+        decision.clone(),
+        "Answer directly within the resolved spoken-duration limit.",
+    )
+    .unwrap();
+    let request =
+        GenerationLanguageRequest::from_input(turn_id, GenerationId::new(6), input).unwrap();
+
+    assert_eq!(request.transcript(), "current question");
+    assert_eq!(request.input().recent_messages(), &history);
+    assert_eq!(request.input().quality_decision(), Some(&decision));
+    assert_eq!(
+        request.input().runtime_guidance(),
+        Some("Answer directly within the resolved spoken-duration limit.")
+    );
 }
 
 #[tokio::test]

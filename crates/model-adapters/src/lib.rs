@@ -33,7 +33,9 @@ pub use continuous_audio_output::{ContinuousAudioOutput, PlaybackReceipt};
 pub use generation_language::{
     GenerationLanguageModel, GenerationLanguageRequest, GenerationTextDelta,
 };
-pub use language_model::{LanguageModel, LanguageModelRequest};
+pub use language_model::{
+    LanguageModel, LanguageModelInput, LanguageModelRequest, MAX_RUNTIME_GUIDANCE_BYTES,
+};
 pub use macos_afplay::{MacOsAfplayAudioOutput, MacOsAfplayConfig};
 pub use macos_system_speech::{MacOsSystemSpeechConfig, MacOsSystemSpeechSynthesizer};
 #[cfg(unix)]

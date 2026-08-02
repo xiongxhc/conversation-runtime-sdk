@@ -10,6 +10,27 @@ device = "system-default"
 speech_start_ms = 200
 final_silence_ms = 600
 
+[persona]
+warmth = 0.8
+humor = 0.6
+teasing = 0.4
+initiative = 0.35
+directness = 0.8
+intimacy = 0.3
+verbosity = 0.2
+follow_up_frequency = 0.25
+
+[response]
+mode = "direct-answer"
+maximum_spoken_seconds = 20
+pace = "natural"
+allow_silence = true
+ask_follow_up_by_default = false
+
+[quality_metrics]
+enabled = true
+record_content = false
+
 [asr]
 backend = "whisperkit"
 execution = "local"

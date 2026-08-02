@@ -6,12 +6,13 @@ use std::time::Instant;
 
 use conversation_model_adapters::{
     AdapterError, AudioFrame, ContinuousAudioOutput, GenerationLanguageModel,
-    GenerationLanguageRequest, GenerationTextDelta, PcmFormat, StreamingSpeechRequest,
-    StreamingSpeechSynthesizer,
+    GenerationLanguageRequest, GenerationTextDelta, LanguageModelInput, PcmFormat,
+    StreamingSpeechRequest, StreamingSpeechSynthesizer,
 };
 use conversation_protocol::{
-    GenerationId, PlaybackState, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage,
-    RuntimeTimingMilestone, SessionId, TurnId, UtteranceId,
+    ConversationMode, GenerationId, PersonaProfile, PlaybackState, ResponseControls, RuntimeError,
+    RuntimeErrorKind, RuntimeEvent, RuntimeStage, RuntimeTimingMilestone, SessionId, TurnId,
+    UtteranceId,
 };
 use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 use tokio::task::{AbortHandle, JoinError, JoinHandle};
@@ -19,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::generation::GenerationGuard;
 use crate::speech_text::normalize_speech_text;
-use crate::UtteranceAssembler;
+use crate::{ConversationQualityController, UtteranceAssembler};
 
 const EVENT_BUFFER_SIZE: usize = 32;
 const UTTERANCE_QUEUE_CAPACITY: usize = 2;
@@ -147,6 +148,7 @@ pub struct StreamingTurnRuntime {
     audio_output: Arc<dyn ContinuousAudioOutput>,
     active: Arc<Mutex<Option<ActiveGeneration>>>,
     generation_guard: GenerationGuard,
+    quality: Arc<Mutex<ConversationQualityController>>,
     session_id: Option<SessionId>,
 }
 
@@ -170,8 +172,18 @@ impl StreamingTurnRuntime {
             audio_output,
             active: Arc::new(Mutex::new(None)),
             generation_guard: GenerationGuard::default(),
+            quality: Arc::new(Mutex::new(ConversationQualityController::new(
+                PersonaProfile::default(),
+                ResponseControls::default(),
+                ConversationMode::DirectAnswer,
+            ))),
             session_id: None,
         }
+    }
+
+    pub fn with_quality_controller(mut self, controller: ConversationQualityController) -> Self {
+        self.quality = Arc::new(Mutex::new(controller));
+        self
     }
 
     pub fn with_session_id(mut self, session_id: SessionId) -> Self {
@@ -185,15 +197,57 @@ impl StreamingTurnRuntime {
         generation_id: GenerationId,
         transcript: impl Into<String>,
     ) -> Result<StreamingTurnEventStream, RuntimeError> {
+        let transcript = transcript.into();
         if !self.generation_guard.activate(turn_id, generation_id).await {
             return Err(runtime_error("a streaming generation is still active"));
         }
+
+        let resolved = {
+            let mut quality = self.quality.lock().await;
+            quality.resolve_turn(turn_id, transcript.clone(), None)
+        };
+        let resolved = match resolved {
+            Ok(Some(resolved)) => resolved,
+            Ok(None) => {
+                self.generation_guard
+                    .deactivate(turn_id, generation_id)
+                    .await;
+                return Err(runtime_error("a streaming turn transcript cannot be empty"));
+            }
+            Err(error) => {
+                self.generation_guard
+                    .deactivate(turn_id, generation_id)
+                    .await;
+                return Err(error);
+            }
+        };
+        let language_input = match LanguageModelInput::with_quality(
+            transcript,
+            resolved.history_messages().iter().cloned(),
+            resolved.decision().clone(),
+            resolved.system_guidance(),
+        ) {
+            Ok(input) => input,
+            Err(error) => {
+                let mut quality = self.quality.lock().await;
+                let _ = quality.discard_turn(turn_id);
+                drop(quality);
+                self.generation_guard
+                    .deactivate(turn_id, generation_id)
+                    .await;
+                return Err(adapter_runtime_error(RuntimeStage::LanguageModel, error));
+            }
+        };
 
         let external_interruption = CancellationToken::new();
         let work_cancellation = CancellationToken::new();
         {
             let mut active = self.active.lock().await;
             if active.is_some() {
+                drop(active);
+                let mut quality = self.quality.lock().await;
+                let _ = quality.discard_turn(turn_id);
+                drop(quality);
                 self.generation_guard
                     .deactivate(turn_id, generation_id)
                     .await;
@@ -209,15 +263,27 @@ impl StreamingTurnRuntime {
 
         let (event_sender, event_receiver) = mpsc::channel(EVENT_BUFFER_SIZE);
         let (terminal_sender, terminal_receiver) = oneshot::channel();
-        event_sender
+        if event_sender
             .send(RuntimeEvent::TurnStarted { turn_id })
             .await
-            .map_err(|_| runtime_error("streaming turn event stream closed before start"))?;
+            .is_err()
+        {
+            let mut quality = self.quality.lock().await;
+            let _ = quality.discard_turn(turn_id);
+            drop(quality);
+            self.generation_guard
+                .deactivate(turn_id, generation_id)
+                .await;
+            *self.active.lock().await = None;
+            return Err(runtime_error(
+                "streaming turn event stream closed before start",
+            ));
+        }
         let tasks = TurnTaskGroup::default();
         let task = StreamingTurnTask {
             turn_id,
             generation_id,
-            transcript: transcript.into(),
+            language_input,
             language_model: Arc::clone(&self.language_model),
             speech_synthesizer: Arc::clone(&self.speech_synthesizer),
             audio_output: Arc::clone(&self.audio_output),
@@ -226,15 +292,47 @@ impl StreamingTurnRuntime {
             external_interruption: external_interruption.clone(),
             work_cancellation,
             tasks: tasks.clone(),
+            generated_text: Arc::new(StdMutex::new(String::new())),
         };
         let active = Arc::clone(&self.active);
+        let quality = Arc::clone(&self.quality);
         let generation_guard = self.generation_guard.clone();
         let terminal_interruption = external_interruption;
+        let generated_text = Arc::clone(&task.generated_text);
 
         let task = tasks.spawn(async move {
-            let terminal_event = run_streaming_turn(task, &event_sender).await;
+            let mut terminal_event = run_streaming_turn(task, &event_sender).await;
             drop(event_sender);
             generation_guard.deactivate(turn_id, generation_id).await;
+
+            if terminal_interruption.is_cancelled() {
+                terminal_event = RuntimeEvent::TurnCancelled { turn_id };
+            }
+
+            let quality_result = {
+                let mut quality = quality.lock().await;
+                match &terminal_event {
+                    RuntimeEvent::TurnCompleted { .. } => {
+                        let generated_text = generated_text
+                            .lock()
+                            .expect("generated text lock poisoned")
+                            .clone();
+                        if generated_text.trim().is_empty() {
+                            quality.discard_turn(turn_id)
+                        } else {
+                            quality.complete_turn(turn_id, generated_text)
+                        }
+                    }
+                    RuntimeEvent::TurnCancelled { .. } => quality.interrupt_turn(turn_id),
+                    RuntimeEvent::TurnFailed { .. } => quality.discard_turn(turn_id),
+                    _ => Err(runtime_error(
+                        "streaming turn produced a nonterminal result",
+                    )),
+                }
+            };
+            if let Err(error) = quality_result {
+                terminal_event = RuntimeEvent::TurnFailed { turn_id, error };
+            }
 
             let mut active = active.lock().await;
             if active.as_ref().is_some_and(|current| {
@@ -244,11 +342,6 @@ impl StreamingTurnRuntime {
             }
             drop(active);
 
-            let terminal_event = if terminal_interruption.is_cancelled() {
-                RuntimeEvent::TurnCancelled { turn_id }
-            } else {
-                terminal_event
-            };
             let _ = terminal_sender.send(terminal_event);
         });
 
@@ -304,6 +397,9 @@ impl StreamingTurnRuntime {
         events: &mut StreamingTurnEventStream,
     ) -> Result<(), RuntimeError> {
         events.abort_and_reap().await?;
+        let mut quality = self.quality.lock().await;
+        let _ = quality.interrupt_turn(turn_id);
+        drop(quality);
         self.generation_guard
             .deactivate(turn_id, generation_id)
             .await;
@@ -321,7 +417,7 @@ impl StreamingTurnRuntime {
 struct StreamingTurnTask {
     turn_id: TurnId,
     generation_id: GenerationId,
-    transcript: String,
+    language_input: LanguageModelInput,
     language_model: Arc<dyn GenerationLanguageModel>,
     speech_synthesizer: Arc<dyn StreamingSpeechSynthesizer>,
     audio_output: Arc<dyn ContinuousAudioOutput>,
@@ -330,6 +426,7 @@ struct StreamingTurnTask {
     external_interruption: CancellationToken,
     work_cancellation: CancellationToken,
     tasks: TurnTaskGroup,
+    generated_text: Arc<StdMutex<String>>,
 }
 
 #[derive(Debug)]
@@ -345,7 +442,7 @@ async fn run_streaming_turn(
     let StreamingTurnTask {
         turn_id,
         generation_id,
-        transcript,
+        language_input,
         language_model,
         speech_synthesizer,
         audio_output,
@@ -354,13 +451,14 @@ async fn run_streaming_turn(
         external_interruption,
         work_cancellation,
         tasks,
+        generated_text,
     } = task;
 
     match send_event(
         events,
         RuntimeEvent::TranscriptFinal {
             turn_id,
-            text: transcript.clone(),
+            text: language_input.transcript().to_owned(),
         },
         &external_interruption,
         &work_cancellation,
@@ -376,6 +474,34 @@ async fn run_streaming_turn(
             return runtime_failure(
                 turn_id,
                 "streaming generation became stale during transcript",
+            );
+        }
+    }
+
+    let decision = language_input
+        .quality_decision()
+        .expect("streaming turns always carry a quality decision")
+        .clone();
+    match send_event(
+        events,
+        RuntimeEvent::QualityResolved { decision },
+        &external_interruption,
+        &work_cancellation,
+    )
+    .await
+    {
+        SendOutcome::Sent => {}
+        SendOutcome::Interrupted => return RuntimeEvent::TurnCancelled { turn_id },
+        SendOutcome::Closed => {
+            return runtime_failure(
+                turn_id,
+                "streaming event consumer closed during quality resolution",
+            );
+        }
+        SendOutcome::Stale => {
+            return runtime_failure(
+                turn_id,
+                "streaming generation became stale during quality resolution",
             );
         }
     }
@@ -396,11 +522,18 @@ async fn run_streaming_turn(
     }));
 
     let language_cancellation = work_cancellation.child_token();
+    let generation_request =
+        match GenerationLanguageRequest::from_input(turn_id, generation_id, language_input) {
+            Ok(request) => request,
+            Err(error) => {
+                work_cancellation.cancel();
+                utterance_sender.take();
+                let _ = (&mut speech_worker).await;
+                return adapter_failure(turn_id, RuntimeStage::LanguageModel, error);
+            }
+        };
     let deltas = catch_unwind(AssertUnwindSafe(|| {
-        language_model.stream(
-            GenerationLanguageRequest::new(turn_id, generation_id, transcript),
-            language_cancellation.clone(),
-        )
+        language_model.stream(generation_request, language_cancellation.clone())
     }));
     let mut deltas = match deltas {
         Ok(deltas) => deltas,
@@ -514,7 +647,13 @@ async fn run_streaming_turn(
                 )
                 .await;
                 match publication {
-                    SendOutcome::Sent => emitted_first_text = true,
+                    SendOutcome::Sent => {
+                        emitted_first_text = true;
+                        generated_text
+                            .lock()
+                            .expect("generated text lock poisoned")
+                            .push_str(delta.delta());
+                    }
                     SendOutcome::Interrupted | SendOutcome::Stale => {
                         stop_streaming_pipeline(
                             &mut utterance_sender,

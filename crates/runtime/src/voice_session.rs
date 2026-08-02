@@ -9,8 +9,9 @@ use conversation_model_adapters::{
     RecognitionEvent, StreamingSpeechSynthesizer, VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
 };
 use conversation_protocol::{
-    GenerationId, PlaybackState, RecoveryDisposition, RuntimeError, RuntimeErrorKind, RuntimeEvent,
-    RuntimeStage, RuntimeTimingMilestone, SessionId, TurnId, VoiceActivity, VoiceSessionEvent,
+    ConversationMode, GenerationId, PersonaProfile, PlaybackState, RecoveryDisposition,
+    ResponseControls, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage,
+    RuntimeTimingMilestone, SessionId, TurnId, VoiceActivity, VoiceSessionEvent,
     VoiceSessionPolicy, VoiceTimingMilestone,
 };
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -18,8 +19,8 @@ use tokio::task::{JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    validate_voice_policy, SessionClock, StreamingTurnEventStream, StreamingTurnRuntime,
-    TurnFinalizationDeadline, TurnFinalizer,
+    validate_voice_policy, ConversationQualityController, SessionClock, StreamingTurnEventStream,
+    StreamingTurnRuntime, TurnFinalizationDeadline, TurnFinalizer,
 };
 
 const SESSION_EVENT_BUFFER_SIZE: usize = 32;
@@ -34,6 +35,7 @@ pub struct VoiceSessionAdapters {
     voice_io: Arc<dyn VoiceIoFactory>,
     language_model: Arc<dyn GenerationLanguageModel>,
     speech_synthesizer: Arc<dyn StreamingSpeechSynthesizer>,
+    quality_controller: ConversationQualityController,
 }
 
 impl VoiceSessionAdapters {
@@ -46,7 +48,20 @@ impl VoiceSessionAdapters {
             voice_io,
             language_model,
             speech_synthesizer,
+            quality_controller: ConversationQualityController::new(
+                PersonaProfile::default(),
+                ResponseControls::default(),
+                ConversationMode::DirectAnswer,
+            ),
         }
+    }
+
+    pub fn with_quality_controller(
+        mut self,
+        quality_controller: ConversationQualityController,
+    ) -> Self {
+        self.quality_controller = quality_controller;
+        self
     }
 }
 
@@ -267,7 +282,8 @@ async fn run_voice_session(
         adapters.language_model,
         adapters.speech_synthesizer,
         output.clone(),
-    );
+    )
+    .with_quality_controller(adapters.quality_controller);
     VoiceLoop::new(
         policy,
         input_events,

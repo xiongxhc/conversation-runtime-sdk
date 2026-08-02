@@ -8,7 +8,7 @@ The SDK is cross-platform by design. The first validated product target is macOS
 
 ## Current Status
 
-The repository now contains the deterministic runtime foundation, reviewed local text-to-audio reference paths, and the deterministic R3 real-time voice implementation:
+The repository now contains the deterministic runtime foundation, reviewed local text-to-audio reference paths, the deterministic R3 real-time voice implementation, and bounded R4 conversation quality controls:
 
 - typed commands, events, turn identifiers, and errors;
 - cancellation-aware language-model and speech-synthesis adapter contracts;
@@ -29,10 +29,26 @@ The repository now contains the deterministic runtime foundation, reviewed local
 - an integrated voice probe that composes replaceable language, speech, and audio-output adapters behind `ConversationRuntime`;
 - schema-v2 local voice-session policy, generation-safe streaming contracts, and a managed macOS sidecar protocol;
 - a Swift macOS voice-processing sidecar with local recognition and continuous generation-tagged PCM playback;
-- explicit buffered and streaming OpenAI-compatible speech modes, with checked concatenated-RIFF parsing and no streaming-to-buffered fallback; and
-- a bounded ten-minute acceptance harness plus an external acoustic measurement procedure.
+- explicit buffered and streaming OpenAI-compatible speech modes, with checked concatenated-RIFF parsing and no streaming-to-buffered fallback;
+- a bounded ten-minute acceptance harness plus an external acoustic measurement procedure;
+- typed persona, mode, response, signal, bounded-history, and content-free
+  quality-decision contracts;
+- completed-only in-session context with transient correction and interruption
+  state;
+- typed generation envelopes with ordered provider translation and a resolved
+  spoken-duration output cap; and
+- strict schema-v2 persona, response, and content-free quality-metric settings.
 
-The integrated typed-text-to-audio path and deterministic R3 contracts are implemented and test-covered. The latest gate recorded `446` passing Rust tests plus one intentionally ignored fixture writer and `109` passing Swift tests. A private local-only configuration and local ASR model now pass preflight, the current macOS source passes an opt-in full-duplex capture/playback smoke, and the release CLI starts under `LocalOnly`. A complete post-fix human-spoken turn, a ten-minute device run, and the 30-sample acoustic procedure have not been performed. R3 is not complete, and no first-audible or audible-stop latency is claimed. See [the R3 evaluation](docs/r3-real-time-voice-evaluation.md) and [ROADMAP.md](ROADMAP.md).
+The complete Rust workspace, strict Clippy and formatting gates, acceptance
+harness suite, and `109` Swift sidecar tests pass. R4 is complete for bounded
+in-session controls. A private local-only configuration and local ASR model pass
+R3 preflight, and the current macOS source passes an opt-in full-duplex
+capture/playback smoke. A complete post-fix human-spoken turn, a ten-minute
+device run, and the 30-sample acoustic procedure have not been performed. R3
+remains `ACCEPTANCE BLOCKED`, and no first-audible or audible-stop latency is
+claimed. See [the R3 evaluation](docs/r3-real-time-voice-evaluation.md),
+[the R4 evaluation](docs/r4-conversation-quality-evaluation.md), and
+[ROADMAP.md](ROADMAP.md).
 
 ## R3 Target Architecture
 
@@ -61,6 +77,57 @@ continuity and acoustic output remain separate unvalidated evidence classes. See
 [docs/architecture.md](docs/architecture.md) for the canonical diagram and
 [the R3 design](docs/superpowers/specs/2026-07-28-r3-real-time-voice-loop-design.md)
 for the complete privacy, protocol, lifecycle, and acceptance rules.
+
+## Conversation Quality Controls
+
+The R4 quality layer resolves a typed decision before language generation. It
+combines visible persona dimensions, one explicit conversation mode, response
+defaults, bounded completed history, and temporary signals such as a shorter
+request, rejected question, hesitation, topic change, or interruption.
+
+Schema-v2 session configuration accepts these optional sections and applies
+explicit defaults when they are absent:
+
+```toml
+[persona]
+warmth = 0.8
+humor = 0.6
+teasing = 0.4
+initiative = 0.35
+directness = 0.8
+intimacy = 0.3
+verbosity = 0.2
+follow_up_frequency = 0.25
+
+[response]
+mode = "direct-answer"
+maximum_spoken_seconds = 20
+pace = "natural"
+allow_silence = true
+ask_follow_up_by_default = false
+
+[quality_metrics]
+enabled = true
+record_content = false
+```
+
+Supported modes are `direct-answer`, `companionship`, `brainstorming`, and
+`reflective`; supported pace values are `measured`, `natural`, and `brisk`.
+Persona values are finite `0.0..=1.0` inputs converted to validated SDK levels.
+`record_content = true` is rejected because quality metrics are content-free by
+contract.
+
+Temporary corrections never overwrite the saved persona. Only completed user
+and assistant exchanges enter the bounded in-session history; cancelled and
+failed partial responses are excluded. The runtime exposes selected controls,
+signal kinds, history count, and context-source kinds without exposing
+transcripts or generated text. SQLite persistence remains R5.
+
+Relationship behavior follows shared context, pacing, reciprocity, and rapport.
+The runtime has no affection switch, scripted special moment, unlock level,
+counter, or expression-frequency target. See
+[the R4 evaluation](docs/r4-conversation-quality-evaluation.md) and
+[the architecture](docs/architecture.md).
 
 ## Test Local Inference
 
@@ -222,8 +289,14 @@ mkdir -m 700 "$HOME/conversation-runtime-r3-evidence"
 tests/voice/acceptance-macos.sh \
   --config "$PRIVATE_SESSION_CONFIG" \
   --duration-seconds 600 \
+  --minimum-completed-turns 10 \
+  --minimum-interruptions 5 \
   --metrics "$HOME/conversation-runtime-r3-evidence/session.jsonl"
 ```
+
+The duration and interaction thresholds are independent. A silent process that
+stays alive for ten minutes fails acceptance. The canonical run includes at
+least ten completed English and Chinese turns and five user interruptions.
 
 `first_playable_audio_ms`, sidecar acceptance, and render acknowledgement are
 process milestones. First audible sound and audible interruption stop require

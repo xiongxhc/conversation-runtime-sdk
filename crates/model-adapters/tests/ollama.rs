@@ -2,9 +2,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use conversation_model_adapters::{
-    LanguageModel, LanguageModelRequest, OllamaConfig, OllamaLanguageModel, OllamaThinkingLevel,
+    LanguageModel, LanguageModelInput, LanguageModelRequest, OllamaConfig, OllamaLanguageModel,
+    OllamaThinkingLevel,
 };
-use conversation_protocol::TurnId;
+use conversation_protocol::{
+    ContextSource, ConversationMessage, ConversationMode, ConversationRole, QualityDecision,
+    ResponseControls, TurnId,
+};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -125,6 +129,60 @@ async fn serializes_optional_configuration() {
     );
     assert_eq!(server.request_json().await["messages"][1]["role"], "user");
     assert_eq!(server.request_json().await["messages"][1]["content"], "hi");
+}
+
+#[tokio::test]
+async fn serializes_runtime_guidance_history_and_current_input_in_order() {
+    let server = FakeOllamaServer::streaming([
+        r#"{"message":{"role":"assistant","content":""},"done":true}"#,
+    ])
+    .await;
+    let model = OllamaLanguageModel::new(
+        OllamaConfig::new("test-model")
+            .unwrap()
+            .with_endpoint(server.endpoint())
+            .unwrap()
+            .with_system_prompt("Deployment safety guidance."),
+    );
+    let turn_id = TurnId::new(1);
+    let input = LanguageModelInput::with_quality(
+        "current request",
+        [
+            ConversationMessage::new(ConversationRole::User, "previous request").unwrap(),
+            ConversationMessage::new(ConversationRole::Assistant, "previous answer").unwrap(),
+        ],
+        QualityDecision::new(
+            turn_id,
+            ConversationMode::DirectAnswer,
+            ResponseControls::default(),
+            [],
+            2,
+            [ContextSource::SavedPersona, ContextSource::RecentHistory],
+        )
+        .unwrap(),
+        "Runtime quality guidance.",
+    )
+    .unwrap();
+    let mut output = model.stream(
+        LanguageModelRequest::from_input(turn_id, input).unwrap(),
+        CancellationToken::new(),
+    );
+
+    assert!(output.recv().await.is_none());
+    let request = server.request_json().await;
+    let messages = request["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 5);
+    assert_eq!(messages[0]["role"], "system");
+    assert_eq!(messages[0]["content"], "Deployment safety guidance.");
+    assert_eq!(messages[1]["role"], "system");
+    assert_eq!(messages[1]["content"], "Runtime quality guidance.");
+    assert_eq!(messages[2]["role"], "user");
+    assert_eq!(messages[2]["content"], "previous request");
+    assert_eq!(messages[3]["role"], "assistant");
+    assert_eq!(messages[3]["content"], "previous answer");
+    assert_eq!(messages[4]["role"], "user");
+    assert_eq!(messages[4]["content"], "current request");
+    assert_eq!(request["options"]["num_predict"], 80);
 }
 
 #[tokio::test]

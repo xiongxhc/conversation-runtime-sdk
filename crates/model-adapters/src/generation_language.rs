@@ -2,13 +2,14 @@ use conversation_protocol::{GenerationId, TurnId};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::AdapterError;
+use crate::language_model::validate_decision_turn;
+use crate::{AdapterError, LanguageModelInput};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GenerationLanguageRequest {
     turn_id: TurnId,
     generation_id: GenerationId,
-    transcript: String,
+    input: LanguageModelInput,
 }
 
 impl GenerationLanguageRequest {
@@ -20,8 +21,21 @@ impl GenerationLanguageRequest {
         Self {
             turn_id,
             generation_id,
-            transcript: transcript.into(),
+            input: LanguageModelInput::text_only(transcript),
         }
+    }
+
+    pub fn from_input(
+        turn_id: TurnId,
+        generation_id: GenerationId,
+        input: LanguageModelInput,
+    ) -> Result<Self, AdapterError> {
+        validate_decision_turn(turn_id, &input)?;
+        Ok(Self {
+            turn_id,
+            generation_id,
+            input,
+        })
     }
 
     pub const fn turn_id(&self) -> TurnId {
@@ -33,7 +47,11 @@ impl GenerationLanguageRequest {
     }
 
     pub fn transcript(&self) -> &str {
-        &self.transcript
+        self.input.transcript()
+    }
+
+    pub const fn input(&self) -> &LanguageModelInput {
+        &self.input
     }
 }
 

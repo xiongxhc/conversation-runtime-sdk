@@ -10,6 +10,7 @@ const MAX_NDJSON_RECORD_BYTES: usize = 64 * 1024;
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_MAX_ASSISTANT_CONTENT_BYTES: usize = 64 * 1024;
 const MAX_ERROR_BODY_PREFIX_BYTES: usize = 4 * 1024;
+const MAX_GENERATION_TOKENS_PER_SPOKEN_SECOND: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -277,7 +278,7 @@ async fn run_chat(
     sender: &mpsc::Sender<Result<String, AdapterError>>,
 ) -> Result<ChatOutcome, AdapterError> {
     let chat_url = chat_url(&config.endpoint);
-    let chat_request = ChatRequest::new(&config, request.transcript());
+    let chat_request = ChatRequest::new(&config, request.input())?;
     let mut response = tokio::select! {
         biased;
         _ = cancellation.cancelled() => return Ok(ChatOutcome::Cancelled),
@@ -489,14 +490,33 @@ struct ChatRequest<'a> {
 }
 
 impl<'a> ChatRequest<'a> {
-    fn new(config: &'a OllamaConfig, transcript: &'a str) -> Self {
-        let mut messages = Vec::with_capacity(2);
+    fn new(
+        config: &'a OllamaConfig,
+        input: &'a crate::LanguageModelInput,
+    ) -> Result<Self, AdapterError> {
+        let mut messages = Vec::with_capacity(input.recent_messages().len() + 3);
         if let Some(system_prompt) = config.system_prompt.as_deref() {
             messages.push(ChatMessage::system(system_prompt));
         }
-        messages.push(ChatMessage::user(transcript));
+        if let Some(runtime_guidance) = input.runtime_guidance() {
+            messages.push(ChatMessage::system(runtime_guidance));
+        }
+        for message in input.recent_messages() {
+            messages.push(match message.role() {
+                conversation_protocol::ConversationRole::User => ChatMessage::user(message.text()),
+                conversation_protocol::ConversationRole::Assistant => {
+                    ChatMessage::assistant(message.text())
+                }
+                _ => {
+                    return Err(AdapterError::new(
+                        "conversation history contains an unsupported role",
+                    ));
+                }
+            });
+        }
+        messages.push(ChatMessage::user(input.transcript()));
 
-        Self {
+        Ok(Self {
             model: &config.model,
             messages,
             stream: true,
@@ -505,10 +525,25 @@ impl<'a> ChatRequest<'a> {
             options: ChatOptions {
                 temperature: config.temperature,
                 seed: config.seed,
-                num_predict: config.num_predict,
+                num_predict: resolved_num_predict(config.num_predict, input),
                 num_ctx: config.num_ctx,
             },
-        }
+        })
+    }
+}
+
+fn resolved_num_predict(
+    configured: Option<usize>,
+    input: &crate::LanguageModelInput,
+) -> Option<usize> {
+    let quality_limit = input.quality_decision().map(|decision| {
+        usize::from(decision.controls().maximum_spoken_seconds())
+            .saturating_mul(MAX_GENERATION_TOKENS_PER_SPOKEN_SECOND)
+            .max(1)
+    });
+    match (configured, quality_limit) {
+        (Some(configured), Some(quality_limit)) => Some(configured.min(quality_limit)),
+        (configured, quality_limit) => configured.or(quality_limit),
     }
 }
 
@@ -529,6 +564,13 @@ impl<'a> ChatMessage<'a> {
     fn user(content: &'a str) -> Self {
         Self {
             role: "user",
+            content,
+        }
+    }
+
+    fn assistant(content: &'a str) -> Self {
+        Self {
+            role: "assistant",
             content,
         }
     }

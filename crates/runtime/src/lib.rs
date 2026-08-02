@@ -13,6 +13,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::{JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
 
+mod conversation_quality;
 mod generation;
 mod phrase_chunker;
 mod session_clock;
@@ -24,6 +25,7 @@ mod utterance_assembler;
 mod voice_privacy;
 mod voice_session;
 
+pub use conversation_quality::{ConversationQualityController, ResolvedConversationQuality};
 pub use phrase_chunker::PhraseChunkingConfig;
 pub use session_clock::{SessionClock, TurnFinalizationDeadline};
 pub use streaming_turn::{StreamingTurnEventStream, StreamingTurnRuntime};

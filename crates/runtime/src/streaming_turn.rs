@@ -4,15 +4,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 
+use conversation_memory::{MemoryContextProvider, MemoryStoreError, MemoryStoreErrorKind};
 use conversation_model_adapters::{
     AdapterError, AudioFrame, ContinuousAudioOutput, GenerationLanguageModel,
     GenerationLanguageRequest, GenerationTextDelta, LanguageModelInput, PcmFormat,
     StreamingSpeechRequest, StreamingSpeechSynthesizer,
 };
 use conversation_protocol::{
-    ConversationMode, GenerationId, PersonaProfile, PlaybackState, ResponseControls, RuntimeError,
-    RuntimeErrorKind, RuntimeEvent, RuntimeStage, RuntimeTimingMilestone, SessionId, TurnId,
-    UtteranceId,
+    ConversationMode, ExecutionLocation, GenerationId, PersonaProfile, PlaybackState,
+    ResponseControls, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage,
+    RuntimeTimingMilestone, SessionId, TurnId, UtteranceId,
 };
 use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 use tokio::task::{AbortHandle, JoinError, JoinHandle};
@@ -150,6 +151,7 @@ pub struct StreamingTurnRuntime {
     generation_guard: GenerationGuard,
     quality: Arc<Mutex<ConversationQualityController>>,
     session_id: Option<SessionId>,
+    memory_provider: Option<Arc<dyn MemoryContextProvider>>,
 }
 
 #[derive(Clone)]
@@ -178,6 +180,7 @@ impl StreamingTurnRuntime {
                 ConversationMode::DirectAnswer,
             ))),
             session_id: None,
+            memory_provider: None,
         }
     }
 
@@ -189,6 +192,24 @@ impl StreamingTurnRuntime {
     pub fn with_session_id(mut self, session_id: SessionId) -> Self {
         self.session_id = Some(session_id);
         self
+    }
+
+    pub fn with_memory_provider(
+        mut self,
+        provider: Arc<dyn MemoryContextProvider>,
+        language_execution: ExecutionLocation,
+    ) -> Result<Self, RuntimeError> {
+        if provider.execution_location() != ExecutionLocation::Local
+            || language_execution != ExecutionLocation::Local
+        {
+            return Err(RuntimeError::new(
+                RuntimeErrorKind::Configuration,
+                RuntimeStage::Memory,
+                "memory context requires local memory and language execution",
+            ));
+        }
+        self.memory_provider = Some(provider);
+        Ok(self)
     }
 
     pub async fn start_turn(
@@ -293,6 +314,7 @@ impl StreamingTurnRuntime {
             work_cancellation,
             tasks: tasks.clone(),
             generated_text: Arc::new(StdMutex::new(String::new())),
+            memory_provider: self.memory_provider.as_ref().map(Arc::clone),
         };
         let active = Arc::clone(&self.active);
         let quality = Arc::clone(&self.quality);
@@ -427,6 +449,7 @@ struct StreamingTurnTask {
     work_cancellation: CancellationToken,
     tasks: TurnTaskGroup,
     generated_text: Arc<StdMutex<String>>,
+    memory_provider: Option<Arc<dyn MemoryContextProvider>>,
 }
 
 #[derive(Debug)]
@@ -442,7 +465,7 @@ async fn run_streaming_turn(
     let StreamingTurnTask {
         turn_id,
         generation_id,
-        language_input,
+        mut language_input,
         language_model,
         speech_synthesizer,
         audio_output,
@@ -452,6 +475,7 @@ async fn run_streaming_turn(
         work_cancellation,
         tasks,
         generated_text,
+        memory_provider,
     } = task;
 
     match send_event(
@@ -503,6 +527,69 @@ async fn run_streaming_turn(
                 turn_id,
                 "streaming generation became stale during quality resolution",
             );
+        }
+    }
+
+    if let Some(memory_provider) = memory_provider {
+        let memory_cancellation = work_cancellation.child_token();
+        let mut retrieval = memory_provider.retrieve(
+            turn_id,
+            language_input.transcript().to_owned(),
+            memory_cancellation.clone(),
+        );
+        let retrieval = tokio::select! {
+            biased;
+            _ = external_interruption.cancelled() => {
+                memory_cancellation.cancel();
+                let _ = retrieval.await;
+                return RuntimeEvent::TurnCancelled { turn_id };
+            }
+            _ = work_cancellation.cancelled() => {
+                memory_cancellation.cancel();
+                let _ = retrieval.await;
+                return RuntimeEvent::TurnCancelled { turn_id };
+            }
+            _ = events.closed() => {
+                memory_cancellation.cancel();
+                let _ = retrieval.await;
+                return runtime_failure(
+                    turn_id,
+                    "streaming event consumer closed during memory retrieval",
+                );
+            }
+            result = &mut retrieval => result,
+        };
+        let retrieval = match retrieval {
+            Ok(retrieval) => retrieval,
+            Err(_) if external_interruption.is_cancelled() || work_cancellation.is_cancelled() => {
+                return RuntimeEvent::TurnCancelled { turn_id };
+            }
+            Err(error) => return memory_failure(turn_id, error),
+        };
+        language_input = match language_input.with_memory_items(retrieval.items().iter().cloned()) {
+            Ok(input) => input,
+            Err(error) => return adapter_failure(turn_id, RuntimeStage::Memory, error),
+        };
+        match send_event(
+            events,
+            RuntimeEvent::MemoryRetrieved {
+                trace: retrieval.trace().clone(),
+            },
+            &external_interruption,
+            &work_cancellation,
+        )
+        .await
+        {
+            SendOutcome::Sent => {}
+            SendOutcome::Interrupted | SendOutcome::Stale => {
+                return RuntimeEvent::TurnCancelled { turn_id };
+            }
+            SendOutcome::Closed => {
+                return runtime_failure(
+                    turn_id,
+                    "streaming event consumer closed during memory publication",
+                );
+            }
         }
     }
 
@@ -1361,6 +1448,26 @@ fn adapter_failure(turn_id: TurnId, stage: RuntimeStage, error: AdapterError) ->
     RuntimeEvent::TurnFailed {
         turn_id,
         error: adapter_runtime_error(stage, error),
+    }
+}
+
+fn memory_failure(turn_id: TurnId, error: MemoryStoreError) -> RuntimeEvent {
+    let message = match error.kind() {
+        MemoryStoreErrorKind::InvalidPath => "memory provider path is invalid",
+        MemoryStoreErrorKind::NotInitialized => "memory provider is not initialized",
+        MemoryStoreErrorKind::UnsupportedSchema => "memory provider schema is unsupported",
+        MemoryStoreErrorKind::InvalidDatabase => "memory provider database is invalid",
+        MemoryStoreErrorKind::NotFound => "memory provider record was not found",
+        MemoryStoreErrorKind::Conflict => "memory provider request conflicted",
+        MemoryStoreErrorKind::Busy => "memory provider is busy",
+        MemoryStoreErrorKind::Cancelled => "memory retrieval was cancelled",
+        MemoryStoreErrorKind::LimitExceeded => "memory retrieval scan limit was exceeded",
+        MemoryStoreErrorKind::Storage => "memory provider operation failed",
+        _ => "memory provider operation failed",
+    };
+    RuntimeEvent::TurnFailed {
+        turn_id,
+        error: RuntimeError::new(RuntimeErrorKind::Adapter, RuntimeStage::Memory, message),
     }
 }
 

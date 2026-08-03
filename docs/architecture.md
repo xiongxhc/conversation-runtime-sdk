@@ -4,11 +4,16 @@
 
 ```text
 protocol <- model-adapters <- runtime
+protocol <- memory         <- runtime
 ```
 
 `protocol` defines client-visible commands, events, identifiers, and failures. It has no dependency on Tokio, model implementations, or runtime internals.
 
 `model-adapters` defines the capabilities required from language and speech models. Its mock implementations are deterministic test doubles, not deployment backends.
+
+`memory` defines a backend-neutral context-provider boundary and the explicitly
+initialized SQLite reference store. It depends on portable protocol types, not
+on runtime orchestration or model-specific payloads.
 
 `runtime` owns turn state, adapter coordination, event ordering, and cancellation. Clients should not depend on adapter implementation details.
 
@@ -115,6 +120,45 @@ content-free context sources. An adapter translates those values into its
 native message format; it does not own conversation policy. Quality events
 expose the decision but never the transcript, prompt, response, provider
 payload, or model identifier.
+
+## R5 Controlled Memory Layer
+
+R5 inserts optional bounded retrieval after the quality decision and before
+language generation:
+
+```mermaid
+flowchart LR
+    Transcript["Final transcript"] --> Quality["Quality decision"]
+    Quality --> Retrieval["Bounded memory retrieval"]
+    Store["Explicit local SQLite store"] --> Retrieval
+    Retrieval --> Trace["Content-free retrieval trace"]
+    Retrieval --> Context["Typed fallible context items"]
+    Context --> Envelope["Language-model input"]
+    Envelope --> LLM["Local language adapter"]
+    Controls["Inspect, edit, approve, pin, expire, delete"] --> Store
+```
+
+The store is absent until an operator calls `initialize` with an absolute path.
+Voice startup only opens an existing database. Its enabled `[[memory]]`
+descriptor must match one local `[memory_store]`, and language execution must
+also be local. The reference runtime does not export memory to remote language
+providers and does not fall back silently when configured retrieval fails.
+
+Records carry kind, state, content, provenance, confidence, timestamps,
+retention, pin state, revision, last-use metadata, and optional approval
+evidence. Identity and relationship content begins as a candidate and requires
+a separate confirmation identifier, actor, time, expected revision, and
+content digest before activation. Editing approved identity or relationship
+content demotes it for reapproval. Working memory expires within 24 hours and
+cannot be pinned.
+
+Retrieval uses deterministic multilingual lexical units, skips whole records
+that exceed the item or byte budget, and persists selected identifiers and
+reasons atomically with a content-free trace. The query is not persisted.
+Cancellation waits for blocking SQLite cleanup and commits neither trace nor
+last-use metadata after cancellation. Retrieved context is serialized as a
+separate message labeled fallible and untrusted; it cannot replace system policy
+or directly command relationship behavior.
 
 ## Streaming Speech Boundary
 
@@ -286,10 +330,11 @@ The public SDK defines portable contracts, reference adapters, reproducible eval
 
 Exact checkpoint identifiers may appear only when required to reproduce benchmark evidence. They are measurements, not endorsements. Public examples use generic identifiers, while application configuration and deployment decisions remain outside this repository.
 
-Desktop controls, SQLite conversation memory, authenticated iPhone/LAN access,
-Linux and Windows media implementations, and cloud/provider adapters remain
-deferred boundaries. The deterministic macOS source does not imply those
-platform or deployment capabilities.
+Desktop controls, authenticated iPhone/LAN access, Linux and Windows media
+implementations, encrypted application storage, semantic retrieval, and
+cloud/provider memory export remain deferred boundaries. The deterministic
+macOS and SQLite reference paths do not imply those platform or deployment
+capabilities.
 
 ## Why the Desktop Shell Is Deferred
 

@@ -215,6 +215,11 @@ fn render_turn_event(event: &RuntimeEvent, quality_metrics_enabled: bool) -> boo
                 eprintln!("quality={metric}");
             }
         }
+        RuntimeEvent::MemoryRetrieved { .. } => {
+            if let Some(metric) = event.memory_metric_json() {
+                eprintln!("memory={metric}");
+            }
+        }
         RuntimeEvent::TurnCompleted { turn_id } => {
             eprintln!("turn={} status=completed", turn_id.get());
             return true;

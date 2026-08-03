@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::PermissionsExt;
@@ -9,6 +9,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use conversation_memory::{MemoryStore, SqliteMemoryStore};
+use conversation_protocol::{
+    MemoryConfidence, MemoryDraft, MemoryKind, MemoryProvenance, MemoryProvenanceKind,
+    MemoryRetention, UnixTimestampMillis,
+};
 
 const SCENARIO_ENV: &str = "CONVERSATION_FAKE_VOICE_SIDECAR_SCENARIO";
 const SPAWN_MARKER_ENV: &str = "CONVERSATION_FAKE_VOICE_SIDECAR_SPAWN_MARKER";
@@ -169,6 +175,145 @@ fn non_local_privacy_modes_reject_local_adapters_before_sidecar_spawn() {
             "{mode} spawned local sidecar"
         );
     }
+}
+
+#[test]
+fn memory_opt_in_requires_one_matching_local_sqlite_descriptor_before_sidecar_spawn() {
+    let cases = [
+        ("store-without-descriptor", MemoryConfigCase::StoreOnly),
+        ("descriptor-without-store", MemoryConfigCase::DescriptorOnly),
+        ("wrong-provider", MemoryConfigCase::WrongProvider),
+        ("remote-memory", MemoryConfigCase::RemoteMemory),
+        (
+            "multiple-descriptors",
+            MemoryConfigCase::MultipleDescriptors,
+        ),
+        ("remote-language", MemoryConfigCase::RemoteLanguage),
+    ];
+
+    for (name, case) in cases {
+        let harness = CliHarness::new("crash");
+        let database_path = harness.fixture_path("memory.sqlite3");
+        SqliteMemoryStore::initialize(&database_path).unwrap();
+        let base = harness.valid_config("http://127.0.0.1:9", "http://127.0.0.1:9/v1");
+        let config = match case {
+            MemoryConfigCase::StoreOnly => {
+                format!("{base}\n{}", memory_store_table(&database_path, 4, 4096))
+            }
+            MemoryConfigCase::DescriptorOnly => format!("{base}\n{}", memory_descriptor()),
+            MemoryConfigCase::WrongProvider => with_memory_store(&base, &database_path, 4, 4096)
+                .replacen("provider = \"sqlite\"", "provider = \"other\"", 1),
+            MemoryConfigCase::RemoteMemory => with_memory_store(&base, &database_path, 4, 4096)
+                .replacen(
+                    "provider = \"sqlite\"\nexecution = \"local\"",
+                    "provider = \"sqlite\"\nexecution = \"remote\"",
+                    1,
+                ),
+            MemoryConfigCase::MultipleDescriptors => format!(
+                "{}\n{}",
+                with_memory_store(&base, &database_path, 4, 4096),
+                memory_descriptor()
+            ),
+            MemoryConfigCase::RemoteLanguage => replace_execution(
+                &with_memory_store(&base, &database_path, 4, 4096),
+                "language",
+                "remote",
+            ),
+        };
+
+        assert_memory_preflight_rejected(name, &harness, &config);
+    }
+}
+
+#[test]
+fn memory_store_rejects_invalid_path_database_and_budgets_before_sidecar_spawn() {
+    let cases = [
+        ("relative-path", MemoryStoreCase::RelativePath),
+        ("missing-database", MemoryStoreCase::MissingDatabase),
+        ("unsupported-schema", MemoryStoreCase::UnsupportedSchema),
+        ("zero-items", MemoryStoreCase::Limits(0, 4096)),
+        ("too-many-items", MemoryStoreCase::Limits(9, 4096)),
+        ("zero-bytes", MemoryStoreCase::Limits(4, 0)),
+        ("too-many-bytes", MemoryStoreCase::Limits(4, 8193)),
+    ];
+
+    for (name, case) in cases {
+        let harness = CliHarness::new("crash");
+        let database_path = harness.fixture_path("memory.sqlite3");
+        let (configured_path, max_items, max_bytes) = match case {
+            MemoryStoreCase::RelativePath => (PathBuf::from("memory.sqlite3"), 4, 4096),
+            MemoryStoreCase::MissingDatabase => (harness.fixture_path("missing.sqlite3"), 4, 4096),
+            MemoryStoreCase::UnsupportedSchema => {
+                create_unsupported_memory_database(&database_path);
+                (database_path, 4, 4096)
+            }
+            MemoryStoreCase::Limits(max_items, max_bytes) => {
+                SqliteMemoryStore::initialize(&database_path).unwrap();
+                (database_path, max_items, max_bytes)
+            }
+        };
+        let config = with_memory_store(
+            &harness.valid_config("http://127.0.0.1:9", "http://127.0.0.1:9/v1"),
+            &configured_path,
+            max_items,
+            max_bytes,
+        );
+
+        assert_memory_preflight_rejected(name, &harness, &config);
+    }
+}
+
+#[test]
+fn configured_memory_reaches_language_input_and_renders_only_content_free_trace() {
+    const MEMORY_CONTENT: &str = "hello memory signal";
+
+    let harness = CliHarness::new("partial-final");
+    let database_path = harness.fixture_path("memory.sqlite3");
+    create_semantic_memory(&database_path, MEMORY_CONTENT);
+    let language = FixtureServer::immediate(
+        harness.fixture_path("language-request"),
+        "application/x-ndjson",
+        LANGUAGE_RESPONSE,
+    );
+    let speech = FixtureServer::immediate(
+        harness.fixture_path("speech-request"),
+        "audio/wav",
+        &pcm_wav(1),
+    );
+    let config = with_memory_store(
+        &harness.valid_config(language.endpoint(), &speech.endpoint_with_path("/v1")),
+        &database_path,
+        4,
+        4096,
+    );
+
+    let output = harness.run_once(&config);
+    let language_request = language.finish_with_request();
+    let language_payload = request_json(&language_request);
+    let messages = language_payload["messages"].as_array().unwrap();
+    let memory_message = messages
+        .iter()
+        .find_map(|message| {
+            message["content"]
+                .as_str()
+                .filter(|content| content.starts_with("Conversation memory is fallible"))
+        })
+        .expect("configured memory was not sent to the language adapter");
+    let stderr = output.stderr_text();
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(memory_message.contains(MEMORY_CONTENT));
+    let trace = stderr
+        .lines()
+        .find(|line| line.starts_with("memory="))
+        .expect("content-free memory trace was not rendered");
+    assert!(trace.contains("\"event\":\"memory_retrieved\""));
+    assert!(trace.contains("\"selected_items\":1"));
+    assert!(trace.contains("\"used_bytes\":19"));
+    assert!(!stderr.contains(MEMORY_CONTENT));
+    assert!(!trace.contains("content"));
+    harness.assert_sidecar_reaped();
+    speech.finish();
 }
 
 #[test]
@@ -1129,6 +1274,106 @@ record_content = false
 "#,
         1,
     )
+}
+
+#[derive(Clone, Copy)]
+enum MemoryConfigCase {
+    StoreOnly,
+    DescriptorOnly,
+    WrongProvider,
+    RemoteMemory,
+    MultipleDescriptors,
+    RemoteLanguage,
+}
+
+#[derive(Clone, Copy)]
+enum MemoryStoreCase {
+    RelativePath,
+    MissingDatabase,
+    UnsupportedSchema,
+    Limits(usize, usize),
+}
+
+fn assert_memory_preflight_rejected(name: &str, harness: &CliHarness, config: &str) {
+    let output = harness.run_once(config);
+
+    assert!(!output.status.success(), "{name}: {output:?}");
+    assert!(
+        output.stderr_text().contains("stage=configuration"),
+        "{name}: {}",
+        output.stderr_text()
+    );
+    assert!(
+        !harness.spawn_marker().exists(),
+        "{name} spawned sidecar before memory preflight completed"
+    );
+}
+
+fn memory_descriptor() -> &'static str {
+    r#"[[memory]]
+provider = "sqlite"
+execution = "local"
+enabled = true
+"#
+}
+
+fn memory_store_table(database_path: &Path, max_items: usize, max_bytes: usize) -> String {
+    format!(
+        r#"[memory_store]
+database_path = "{}"
+max_items = {max_items}
+max_bytes = {max_bytes}
+"#,
+        toml_path(database_path),
+    )
+}
+
+fn with_memory_store(
+    config: &str,
+    database_path: &Path,
+    max_items: usize,
+    max_bytes: usize,
+) -> String {
+    format!(
+        "{config}\n{}\n{}",
+        memory_descriptor(),
+        memory_store_table(database_path, max_items, max_bytes)
+    )
+}
+
+fn create_semantic_memory(database_path: &Path, content: &str) {
+    let created_at = UnixTimestampMillis::new(1_000).unwrap();
+    let store = SqliteMemoryStore::initialize(database_path).unwrap();
+    let draft = MemoryDraft::new(
+        MemoryKind::Semantic,
+        content,
+        MemoryProvenance::new(
+            MemoryProvenanceKind::UserProvided,
+            "voice-test",
+            created_at,
+            "local-user",
+            None,
+        )
+        .unwrap(),
+        MemoryConfidence::new(900).unwrap(),
+        created_at,
+        MemoryRetention::UntilDeleted,
+    )
+    .unwrap();
+    store.create(draft).unwrap();
+}
+
+fn create_unsupported_memory_database(database_path: &Path) {
+    let store = SqliteMemoryStore::initialize(database_path).unwrap();
+    drop(store);
+    let mut database = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(database_path)
+        .unwrap();
+    database.seek(SeekFrom::Start(60)).unwrap();
+    database.write_all(&2_u32.to_be_bytes()).unwrap();
+    database.sync_all().unwrap();
 }
 
 fn remote_component(config: &str, component: &str) -> String {

@@ -8,7 +8,7 @@ The SDK is cross-platform by design. The first validated product target is macOS
 
 ## Current Status
 
-The repository now contains the deterministic runtime foundation, reviewed local text-to-audio reference paths, the deterministic R3 real-time voice implementation, and bounded R4 conversation quality controls:
+The repository now contains the deterministic runtime foundation, reviewed local text-to-audio reference paths, the deterministic R3 real-time voice implementation, bounded R4 conversation quality controls, and the R5 controlled-memory reference path:
 
 - typed commands, events, turn identifiers, and errors;
 - cancellation-aware language-model and speech-synthesis adapter contracts;
@@ -36,18 +36,25 @@ The repository now contains the deterministic runtime foundation, reviewed local
 - completed-only in-session context with transient correction and interruption
   state;
 - typed generation envelopes with ordered provider translation and a resolved
-  spoken-duration output cap; and
-- strict schema-v2 persona, response, and content-free quality-metric settings.
+  spoken-duration output cap;
+- explicit SQLite initialization with typed working, episodic, semantic,
+  identity, and relationship records;
+- revision-checked inspection, editing, approval, pinning, expiration, deletion,
+  bounded retrieval, and content-free trace contracts;
+- a local memory control probe plus optional schema-v2 voice-session wiring; and
+- strict schema-v2 persona, response, quality-metric, and memory settings.
 
 The complete Rust workspace, strict Clippy and formatting gates, acceptance
-harness suite, and `109` Swift sidecar tests pass. R4 is complete for bounded
-in-session controls. A private local-only configuration and local ASR model pass
-R3 preflight, and the current macOS source passes an opt-in full-duplex
-capture/playback smoke. A complete post-fix human-spoken turn, a ten-minute
-device run, and the 30-sample acoustic procedure have not been performed. R3
+harness suite, and `109` Swift sidecar tests pass. R5 is complete for the
+deterministic local control surface; it does not add automatic transcript
+capture or a desktop UI. A private local-only configuration and local ASR model
+pass R3 preflight, and the current macOS source passes an opt-in full-duplex
+capture/playback smoke. A complete post-fix human-spoken turn, a ten-minute device
+run, and the 30-sample acoustic procedure have not been performed. R3
 remains `ACCEPTANCE BLOCKED`, and no first-audible or audible-stop latency is
 claimed. See [the R3 evaluation](docs/r3-real-time-voice-evaluation.md),
-[the R4 evaluation](docs/r4-conversation-quality-evaluation.md), and
+[the R4 evaluation](docs/r4-conversation-quality-evaluation.md),
+[the R5 evaluation](docs/r5-controlled-memory-evaluation.md), and
 [ROADMAP.md](ROADMAP.md).
 
 ## R3 Target Architecture
@@ -121,13 +128,82 @@ Temporary corrections never overwrite the saved persona. Only completed user
 and assistant exchanges enter the bounded in-session history; cancelled and
 failed partial responses are excluded. The runtime exposes selected controls,
 signal kinds, history count, and context-source kinds without exposing
-transcripts or generated text. SQLite persistence remains R5.
+transcripts or generated text. Persistent memory is a separate opt-in path and
+never captures either automatically.
 
 Relationship behavior follows shared context, pacing, reciprocity, and rapport.
 The runtime has no affection switch, scripted special moment, unlock level,
 counter, or expression-frequency target. See
 [the R4 evaluation](docs/r4-conversation-quality-evaluation.md) and
 [the architecture](docs/architecture.md).
+
+## Controlled Local Memory
+
+R5 adds an explicitly initialized SQLite reference store. The runtime never
+creates it during voice startup and never turns transcripts or responses into
+durable records automatically. Display the documented macOS location without
+creating a directory or database:
+
+```bash
+cargo run --locked -p conversation-memory-probe -- default-path
+```
+
+Initialize a chosen absolute path, then add and inspect a record:
+
+```bash
+MEMORY_DB="$HOME/Library/Application Support/Conversation Runtime/runtime.sqlite3"
+
+cargo run --locked -p conversation-memory-probe -- \
+  --database "$MEMORY_DB" init
+
+cargo run --locked -p conversation-memory-probe -- \
+  --database "$MEMORY_DB" add \
+  --kind semantic \
+  --content "Prefers concise technical explanations"
+
+cargo run --locked -p conversation-memory-probe -- \
+  --database "$MEMORY_DB" list
+```
+
+The probe also supports `inspect`, `edit`, `pin`, `unpin`, `approve`, `expire`,
+`delete`, and bounded `retrieve`. Record-targeting edits, approvals, pin changes,
+and deletion require the current revision. Identity and relationship records
+remain candidates until a separate `approve` operation binds explicit
+confirmation evidence to the exact revision and content digest. Working memory
+requires an expiry within 24 hours and cannot be pinned.
+
+Retrieval defaults to four whole records and `4096` content bytes, with hard
+SDK ceilings of eight records and `8192` bytes. It records selected identifiers,
+reasons, limits, and exclusion totals without storing the query in trace data.
+Retrieved memory is labeled fallible, untrusted context and is serialized as a
+separate language-model message rather than merged into the current transcript.
+
+To opt a local voice session into the existing database, uncomment both memory
+blocks in the private copy of `configs/voice-session.example.toml` and set an
+absolute existing database path:
+
+```toml
+[[memory]]
+provider = "sqlite"
+execution = "local"
+enabled = true
+
+[memory_store]
+database_path = "/absolute/path/to/runtime.sqlite3"
+max_items = 4
+max_bytes = 4096
+```
+
+The descriptor and store must appear together. Memory and language execution
+must both be local; missing, relative, unsupported, mismatched, or remote
+configurations fail before sidecar startup. There is no silent empty-memory or
+remote fallback after opt-in.
+
+Hard deletion removes the record, provenance, approval, and retrieval-item
+rows. It is not cryptographic secure erasure of filesystem or backup remnants.
+Deletion also cannot retract context already copied into an in-flight language
+request; interrupt that turn before deleting when immediate exclusion matters.
+See [the R5 evaluation](docs/r5-controlled-memory-evaluation.md).
 
 ## Test Local Inference
 
@@ -310,10 +386,12 @@ apps/desktop/          Desktop reference-app boundary
 configs/               Safe, portable configuration examples
 crates/protocol/       Public commands, events, identifiers, and errors
 crates/model-adapters/ Replaceable model contracts and test doubles
+crates/memory/         Backend-neutral memory contracts and SQLite reference store
 crates/runtime/        Turn orchestration and interruption behavior
 docs/                  Architecture, design, and benchmark guidance
 models/                Registry schema and local model instructions
 tests/latency/         Runnable mock latency probe and metric definitions
+tests/memory/          Explicit local memory control probe
 tests/ollama/          Runnable local Ollama text probe
 tests/tts/             Runnable macOS system-speech and playback probe
 tests/voice/           Typed and real-time voice CLIs, sidecar fixtures, and acceptance harnesses

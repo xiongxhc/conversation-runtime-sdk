@@ -2,6 +2,7 @@ mod command;
 mod error;
 mod event;
 mod ids;
+mod memory;
 mod privacy;
 mod quality;
 mod voice_event;
@@ -10,6 +11,14 @@ pub use command::RuntimeCommand;
 pub use error::{RuntimeError, RuntimeErrorKind, RuntimeStage};
 pub use event::{RuntimeEvent, RuntimeTimingMilestone};
 pub use ids::{GenerationId, SessionId, TurnId, UtteranceId};
+pub use memory::{
+    MemoryApproval, MemoryApprovalEvidence, MemoryConfidence, MemoryContextItem, MemoryDraft,
+    MemoryId, MemoryInspection, MemoryKind, MemoryPatch, MemoryProvenance, MemoryProvenanceKind,
+    MemoryRecord, MemoryRetention, MemoryRetrievalReason, MemoryRetrievalRequest,
+    MemoryRetrievalTrace, MemoryState, MemoryTraceExclusions, MemoryTraceItem, RetrievalTraceId,
+    UnixTimestampMillis, MAX_MEMORY_CONTENT_BYTES, MAX_MEMORY_QUERY_BYTES,
+    MAX_MEMORY_RETRIEVAL_BYTES, MAX_MEMORY_RETRIEVAL_ITEMS, MAX_WORKING_RETENTION_MILLIS,
+};
 pub use privacy::{
     ComponentDescriptor, ComponentKind, ExecutionLocation, PrivacyMode, PrivacySummary,
     VoiceSessionPolicy,

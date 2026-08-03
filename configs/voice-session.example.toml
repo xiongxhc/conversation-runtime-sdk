@@ -75,3 +75,14 @@ provider = "macos-system-audio"
 # Optional development override. It must be absolute when present.
 # sidecar_executable = "/opt/conversation-runtime/bin/conversation-voice-sidecar"
 max_error_bytes = 65536
+
+# Memory is disabled unless both blocks are explicitly enabled.
+# [[memory]]
+# provider = "sqlite"
+# execution = "local"
+# enabled = true
+
+# [memory_store]
+# database_path = "/opt/conversation-runtime/data/memory.sqlite3"
+# max_items = 4
+# max_bytes = 4096

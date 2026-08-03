@@ -1,9 +1,11 @@
 [workspace]
 members = [
     "crates/model-adapters",
+    "crates/memory",
     "crates/protocol",
     "crates/runtime",
     "tests/latency",
+    "tests/memory",
     "tests/ollama",
     "tests/tts",
     "tests/voice",
@@ -16,13 +18,16 @@ edition = "2021"
 
 [workspace.dependencies]
 conversation-model-adapters = { path = "crates/model-adapters" }
+conversation-memory = { path = "crates/memory" }
 conversation-protocol = { path = "crates/protocol" }
 command-fds = "0.3.3"
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "test-util", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 tempfile = "3"
 
 [workspace.lints.rust]

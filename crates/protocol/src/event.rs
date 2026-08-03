@@ -1,4 +1,6 @@
-use crate::{GenerationId, PlaybackState, QualityDecision, RuntimeError, TurnId};
+use crate::{
+    GenerationId, MemoryRetrievalTrace, PlaybackState, QualityDecision, RuntimeError, TurnId,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -41,6 +43,9 @@ pub enum RuntimeEvent {
     QualityResolved {
         decision: QualityDecision,
     },
+    MemoryRetrieved {
+        trace: MemoryRetrievalTrace,
+    },
     TurnCompleted {
         turn_id: TurnId,
     },
@@ -67,6 +72,7 @@ impl RuntimeEvent {
             | Self::TurnCancelled { turn_id }
             | Self::TurnFailed { turn_id, .. } => *turn_id,
             Self::QualityResolved { decision } => decision.turn_id(),
+            Self::MemoryRetrieved { trace } => trace.turn_id(),
         }
     }
 
@@ -82,6 +88,21 @@ impl RuntimeEvent {
             Self::QualityResolved { decision } => Some(format!(
                 "{{\"event\":\"quality_resolved\",\"decision\":{}}}",
                 decision.metric_json()
+            )),
+            _ => None,
+        }
+    }
+
+    pub fn memory_metric_json(&self) -> Option<String> {
+        match self {
+            Self::MemoryRetrieved { trace } => Some(format!(
+                concat!(
+                    "{{\"event\":\"memory_retrieved\",\"trace_id\":{},",
+                    "\"selected_items\":{},\"used_bytes\":{}}}"
+                ),
+                trace.trace_id().get(),
+                trace.selected_items(),
+                trace.used_bytes(),
             )),
             _ => None,
         }

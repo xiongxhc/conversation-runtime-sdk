@@ -13,6 +13,24 @@ pub enum RuntimeStage {
     AudioOutput,
     VoiceSidecar,
     ContinuousAudioOutput,
+    Memory,
+}
+
+impl RuntimeStage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Runtime => "runtime",
+            Self::PrivacyPolicy => "privacy_policy",
+            Self::AudioCapture => "audio_capture",
+            Self::SpeechRecognizer => "speech_recognizer",
+            Self::LanguageModel => "language_model",
+            Self::SpeechSynthesizer => "speech_synthesizer",
+            Self::AudioOutput => "audio_output",
+            Self::VoiceSidecar => "voice_sidecar",
+            Self::ContinuousAudioOutput => "continuous_audio_output",
+            Self::Memory => "memory",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

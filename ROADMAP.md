@@ -235,6 +235,23 @@ remains R5 and application controls remain R6.
 
 **Outcome:** Add useful memory without turning conversation history into opaque surveillance.
 
+### Source Status
+
+Complete for the deterministic local control surface. The SDK now exposes typed
+records, explicit SQLite initialization, revision-checked controls,
+confirmation-backed identity and relationship approval, exact expiration,
+bounded deterministic retrieval, content-free traces, runtime injection, a
+memory probe, and opt-in local voice configuration. Deterministic tests prove
+that deletion prevents later retrieval and that configured failures stop before
+language generation or sidecar startup.
+
+R5 does not automatically persist transcripts or generated responses, provide a
+desktop editor, claim semantic-search quality, encrypt SQLite independently of
+the host filesystem, or provide cryptographic secure erasure. Relationship
+memory remains fallible context and never directly authorizes an expression.
+R3 human, ten-minute, and acoustic acceptance remain separate and blocked on
+their documented external evidence.
+
 ### Deliverables
 
 - SQLite persistence for working, episodic, semantic, identity, and relationship memory.
@@ -252,6 +269,10 @@ remains R5 and application controls remain R6.
 - One playful or unusual exchange cannot silently become durable identity.
 - Working memory expires automatically.
 - Memory retrieval stays within a declared turn budget.
+
+All R5 exit criteria are covered by deterministic protocol, store, runtime,
+adapter, probe, and voice-CLI tests. See
+[the R5 evaluation](docs/r5-controlled-memory-evaluation.md).
 
 ## R6 — Desktop Reference App and SDK Boundary
 

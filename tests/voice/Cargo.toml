@@ -22,6 +22,7 @@ name = "conversation-acoustic-report"
 path = "src/bin/conversation-acoustic-report.rs"
 
 [dependencies]
+conversation-memory.workspace = true
 conversation-model-adapters.workspace = true
 conversation-protocol.workspace = true
 conversation-runtime = { path = "../../crates/runtime" }

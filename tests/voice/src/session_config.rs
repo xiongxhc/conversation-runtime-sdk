@@ -2,6 +2,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use conversation_memory::{SqliteMemoryContextProvider, SqliteMemoryStore, SystemMemoryClock};
 use conversation_model_adapters::{
     AdapterError, BufferedStreamingSpeechSynthesizer, GenerationLanguageModel,
     GenerationLanguageRequest, GenerationTextDelta, LanguageModel, LanguageModelRequest,
@@ -13,7 +14,8 @@ use conversation_model_adapters::{
 use conversation_protocol::{
     ComponentDescriptor, ComponentKind, ConversationMode, ExecutionLocation, FollowUpPolicy,
     PersonaLevel, PersonaProfile, PrivacyMode, ResponseControls, RuntimeError, SessionId,
-    SilencePolicy, SpeechPace, VoiceSessionPolicy,
+    SilencePolicy, SpeechPace, VoiceSessionPolicy, MAX_MEMORY_RETRIEVAL_BYTES,
+    MAX_MEMORY_RETRIEVAL_ITEMS,
 };
 use conversation_runtime::{ConversationQualityController, VoiceSessionAdapters};
 use serde::Deserialize;
@@ -48,6 +50,7 @@ pub struct SessionConfig {
     tools: Vec<OptionalComponentConfig>,
     #[serde(default)]
     memory: Vec<OptionalComponentConfig>,
+    memory_store: Option<MemoryStoreConfig>,
     #[serde(default)]
     telemetry: Vec<OptionalComponentConfig>,
 }
@@ -263,6 +266,14 @@ struct OptionalComponentConfig {
     enabled: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryStoreConfig {
+    database_path: PathBuf,
+    max_items: usize,
+    max_bytes: usize,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 enum ExecutionConfig {
@@ -312,6 +323,7 @@ impl SessionConfig {
             return Err("voice session configuration schema_version must be 2".to_owned());
         }
         self.require_local_execution_adapters()?;
+        self.validate_memory_configuration()?;
         if !SPEECH_START_MS.contains(&self.turn.speech_start_ms) {
             return Err("speech start threshold is outside the supported range".to_owned());
         }
@@ -379,6 +391,7 @@ impl SessionConfig {
     }
 
     pub fn adapters(&self) -> Result<VoiceSessionAdapters, String> {
+        let memory_provider = self.memory_provider()?;
         self.require_local_execution_adapters()?;
         let language_model = Arc::new(IdentityTaggedLanguageModel::new(self.language_model()?));
         self.validate_speech_mode()?;
@@ -400,10 +413,14 @@ impl SessionConfig {
             }
         };
         let voice_io = Arc::new(self.voice_io()?);
-        Ok(
-            VoiceSessionAdapters::new(voice_io, language_model, speech_synthesizer)
-                .with_quality_controller(self.quality_controller()?),
-        )
+        let mut adapters = VoiceSessionAdapters::new(voice_io, language_model, speech_synthesizer)
+            .with_quality_controller(self.quality_controller()?);
+        if let Some(provider) = memory_provider {
+            adapters = adapters
+                .with_memory_provider(Arc::new(provider), self.language.execution.into())
+                .map_err(runtime_message)?;
+        }
+        Ok(adapters)
     }
 
     pub const fn quality_metrics_enabled(&self) -> bool {
@@ -416,6 +433,65 @@ impl SessionConfig {
         } else {
             Err("privacy mode requires unavailable execution-specific adapters".to_owned())
         }
+    }
+
+    fn validate_memory_configuration(&self) -> Result<(), String> {
+        let enabled = self
+            .memory
+            .iter()
+            .filter(|component| component.enabled)
+            .collect::<Vec<_>>();
+        let Some(store) = &self.memory_store else {
+            if enabled.is_empty() {
+                return Ok(());
+            }
+            if enabled
+                .iter()
+                .any(|component| matches!(component.execution, ExecutionConfig::Remote))
+            {
+                return Ok(());
+            }
+            return Err("enabled memory descriptor requires memory_store configuration".to_owned());
+        };
+        if enabled.len() != 1 {
+            return Err(
+                "memory_store configuration requires exactly one enabled memory descriptor"
+                    .to_owned(),
+            );
+        }
+        let descriptor = enabled[0];
+        if descriptor.provider != "sqlite" {
+            return Err("memory descriptor provider must match the sqlite store".to_owned());
+        }
+        if !matches!(descriptor.execution, ExecutionConfig::Local) {
+            return Err("memory descriptor execution must be local".to_owned());
+        }
+        if !matches!(self.language.execution, ExecutionConfig::Local) {
+            return Err("memory-enabled language execution must be local".to_owned());
+        }
+        if !store.database_path.is_absolute() {
+            return Err("memory database path must be absolute".to_owned());
+        }
+        if !(1..=MAX_MEMORY_RETRIEVAL_ITEMS).contains(&store.max_items) {
+            return Err("memory max_items must be within 1..=8".to_owned());
+        }
+        if !(1..=MAX_MEMORY_RETRIEVAL_BYTES).contains(&store.max_bytes) {
+            return Err("memory max_bytes must be within 1..=8192".to_owned());
+        }
+        Ok(())
+    }
+
+    fn memory_provider(&self) -> Result<Option<SqliteMemoryContextProvider>, String> {
+        self.validate_memory_configuration()?;
+        let Some(config) = &self.memory_store else {
+            return Ok(None);
+        };
+        let store =
+            SqliteMemoryStore::open(&config.database_path).map_err(|error| error.to_string())?;
+        let provider = SqliteMemoryContextProvider::new(store, Arc::new(SystemMemoryClock))
+            .with_limits(config.max_items, config.max_bytes)
+            .map_err(|error| error.to_string())?;
+        Ok(Some(provider))
     }
 
     fn language_model(&self) -> Result<OllamaLanguageModel, String> {
@@ -608,6 +684,10 @@ fn optional_descriptors(
 }
 
 fn adapter_message(error: AdapterError) -> String {
+    error.message().to_owned()
+}
+
+fn runtime_message(error: RuntimeError) -> String {
     error.message().to_owned()
 }
 

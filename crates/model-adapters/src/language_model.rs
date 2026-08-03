@@ -1,6 +1,7 @@
 use conversation_protocol::{
-    ConversationMessage, QualityDecision, TurnId, MAX_CONVERSATION_MESSAGE_BYTES,
-    MAX_HISTORY_MESSAGE_COUNT,
+    ConversationMessage, MemoryContextItem, QualityDecision, TurnId,
+    MAX_CONVERSATION_MESSAGE_BYTES, MAX_HISTORY_MESSAGE_COUNT, MAX_MEMORY_RETRIEVAL_BYTES,
+    MAX_MEMORY_RETRIEVAL_ITEMS,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -8,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 use crate::AdapterError;
 
 pub const MAX_RUNTIME_GUIDANCE_BYTES: usize = 4 * 1024;
+pub const MAX_LANGUAGE_MODEL_INPUT_BYTES: usize = 40 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LanguageModelInput {
@@ -15,6 +17,7 @@ pub struct LanguageModelInput {
     recent_messages: Vec<ConversationMessage>,
     quality_decision: Option<QualityDecision>,
     runtime_guidance: Option<String>,
+    memory_items: Vec<MemoryContextItem>,
 }
 
 impl LanguageModelInput {
@@ -24,6 +27,7 @@ impl LanguageModelInput {
             recent_messages: Vec::new(),
             quality_decision: None,
             runtime_guidance: None,
+            memory_items: Vec::new(),
         }
     }
 
@@ -32,6 +36,22 @@ impl LanguageModelInput {
         recent_messages: impl IntoIterator<Item = ConversationMessage>,
         quality_decision: QualityDecision,
         runtime_guidance: impl Into<String>,
+    ) -> Result<Self, AdapterError> {
+        Self::with_quality_and_memory(
+            transcript,
+            recent_messages,
+            quality_decision,
+            runtime_guidance,
+            [],
+        )
+    }
+
+    pub fn with_quality_and_memory(
+        transcript: impl Into<String>,
+        recent_messages: impl IntoIterator<Item = ConversationMessage>,
+        quality_decision: QualityDecision,
+        runtime_guidance: impl Into<String>,
+        memory_items: impl IntoIterator<Item = MemoryContextItem>,
     ) -> Result<Self, AdapterError> {
         let transcript = transcript.into();
         validate_input_text(&transcript)?;
@@ -56,13 +76,67 @@ impl LanguageModelInput {
         if runtime_guidance.len() > MAX_RUNTIME_GUIDANCE_BYTES {
             return Err(AdapterError::new("runtime quality guidance exceeds 4 KiB"));
         }
+        let memory_items = memory_items.into_iter().collect::<Vec<_>>();
+        if memory_items.len() > MAX_MEMORY_RETRIEVAL_ITEMS {
+            return Err(AdapterError::new(
+                "language-model memory exceeds eight items",
+            ));
+        }
+        let memory_bytes = memory_items.iter().try_fold(0_usize, |total, item| {
+            total.checked_add(item.content_bytes())
+        });
+        if memory_bytes.is_none_or(|bytes| bytes > MAX_MEMORY_RETRIEVAL_BYTES) {
+            return Err(AdapterError::new("language-model memory exceeds 8 KiB"));
+        }
+        for (index, item) in memory_items.iter().enumerate() {
+            if memory_items[..index]
+                .iter()
+                .any(|prior| prior.memory_id() == item.memory_id())
+            {
+                return Err(AdapterError::new(
+                    "language-model memory contains a duplicate item",
+                ));
+            }
+        }
+        let aggregate_bytes = transcript
+            .len()
+            .checked_add(history_bytes.expect("validated history byte total"))
+            .and_then(|total| total.checked_add(runtime_guidance.len()))
+            .and_then(|total| {
+                total.checked_add(memory_bytes.expect("validated memory byte total"))
+            });
+        if aggregate_bytes.is_none_or(|bytes| bytes > MAX_LANGUAGE_MODEL_INPUT_BYTES) {
+            return Err(AdapterError::new(
+                "language-model aggregate input exceeds 40 KiB",
+            ));
+        }
 
         Ok(Self {
             transcript,
             recent_messages,
             quality_decision: Some(quality_decision),
             runtime_guidance: Some(runtime_guidance),
+            memory_items,
         })
+    }
+
+    pub fn with_memory_items(
+        self,
+        memory_items: impl IntoIterator<Item = MemoryContextItem>,
+    ) -> Result<Self, AdapterError> {
+        let quality_decision = self
+            .quality_decision
+            .ok_or_else(|| AdapterError::new("language-model memory requires quality input"))?;
+        let runtime_guidance = self
+            .runtime_guidance
+            .ok_or_else(|| AdapterError::new("language-model memory requires runtime guidance"))?;
+        Self::with_quality_and_memory(
+            self.transcript,
+            self.recent_messages,
+            quality_decision,
+            runtime_guidance,
+            memory_items,
+        )
     }
 
     pub fn transcript(&self) -> &str {
@@ -79,6 +153,10 @@ impl LanguageModelInput {
 
     pub fn runtime_guidance(&self) -> Option<&str> {
         self.runtime_guidance.as_deref()
+    }
+
+    pub fn memory_items(&self) -> &[MemoryContextItem] {
+        &self.memory_items
     }
 }
 

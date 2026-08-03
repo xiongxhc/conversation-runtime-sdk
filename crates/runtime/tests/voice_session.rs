@@ -2,17 +2,24 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use conversation_memory::{
+    MemoryClock, MemoryContextProvider, MemoryProviderFuture, MemoryStore, MemoryStoreResult,
+    SqliteMemoryContextProvider, SqliteMemoryStore,
+};
 use conversation_model_adapters::{
     AdapterError, AdapterFuture, AudioFrame, ContinuousAudioOutput, MockContinuousAudioOutput,
     MockGenerationLanguageModel, MockStreamingSpeechSynthesizer, PcmFormat, PcmSampleFormat,
     PlaybackReceipt, VoiceInput, VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
 };
 use conversation_protocol::{
-    ComponentDescriptor, ComponentKind, ExecutionLocation, GenerationId, PlaybackState,
-    PrivacyMode, RecoveryDisposition, RuntimeEvent, RuntimeStage, SessionId, TurnId, UtteranceId,
-    VoiceActivity, VoiceSessionEvent, VoiceSessionPolicy, VoiceTimingMilestone,
+    ComponentDescriptor, ComponentKind, ExecutionLocation, GenerationId, MemoryConfidence,
+    MemoryDraft, MemoryKind, MemoryProvenance, MemoryProvenanceKind, MemoryRetention,
+    PlaybackState, PrivacyMode, RecoveryDisposition, RuntimeEvent, RuntimeStage, SessionId, TurnId,
+    UnixTimestampMillis, UtteranceId, VoiceActivity, VoiceSessionEvent, VoiceSessionPolicy,
+    VoiceTimingMilestone,
 };
 use conversation_runtime::{VoiceSessionAdapters, VoiceSessionEventStream, VoiceSessionRuntime};
+use tempfile::TempDir;
 use tokio::sync::{mpsc, Notify};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -215,6 +222,75 @@ async fn rejected_policy_never_starts_the_voice_factory() {
     );
     assert_eq!(harness.factory.start_count(), 0);
     assert!(!harness.factory.input_started.load(Ordering::Acquire));
+}
+
+struct RemoteMemoryProvider;
+
+impl MemoryContextProvider for RemoteMemoryProvider {
+    fn execution_location(&self) -> ExecutionLocation {
+        ExecutionLocation::Remote
+    }
+
+    fn retrieve(
+        &self,
+        _turn_id: TurnId,
+        _query: String,
+        _cancellation: CancellationToken,
+    ) -> MemoryProviderFuture<'_> {
+        unreachable!()
+    }
+}
+
+#[test]
+fn remote_memory_is_rejected_before_a_voice_session_can_start() {
+    let harness = VoiceSessionHarness::new();
+    let adapters = VoiceSessionAdapters::new(
+        harness.factory.clone(),
+        harness.language.clone(),
+        Arc::new(MockStreamingSpeechSynthesizer::new([])),
+    );
+
+    let error = adapters
+        .with_memory_provider(Arc::new(RemoteMemoryProvider), ExecutionLocation::Local)
+        .err()
+        .expect("remote memory should be rejected");
+
+    assert_eq!(error.stage(), RuntimeStage::Memory);
+    assert_eq!(harness.factory.start_count(), 0);
+}
+
+struct FixedMemoryClock(UnixTimestampMillis);
+
+impl MemoryClock for FixedMemoryClock {
+    fn now(&self) -> MemoryStoreResult<UnixTimestampMillis> {
+        Ok(self.0)
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn configured_local_memory_reaches_the_voice_language_request() {
+    let harness = VoiceSessionHarness::with_memory();
+    let mut events = harness.start().await;
+    assert_session_started(events.recv().await);
+
+    harness.engine_final(1, "local project").await;
+    harness.speech_ended(0).await;
+    tokio::time::advance(Duration::from_millis(600)).await;
+
+    let observed = drain_until_turn_terminal(&mut events).await;
+    assert!(observed.iter().any(|event| matches!(
+        event,
+        VoiceSessionEvent::Turn {
+            event: RuntimeEvent::MemoryRetrieved { trace },
+            ..
+        } if trace.selected_items() == 1
+    )));
+    assert_eq!(harness.language.requests().len(), 1);
+    assert_eq!(
+        harness.language.requests()[0].input().memory_items()[0].content(),
+        "Local project context"
+    );
+    harness.shutdown(&mut events).await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -439,6 +515,7 @@ struct VoiceSessionHarness {
     input: mpsc::Sender<Result<VoiceInputEvent, AdapterError>>,
     language: Arc<MockGenerationLanguageModel>,
     playback_gate: Option<Arc<GatedAcceptOutput>>,
+    _memory_directory: Option<TempDir>,
 }
 
 impl VoiceSessionHarness {
@@ -459,6 +536,54 @@ impl VoiceSessionHarness {
             input,
             language,
             playback_gate: None,
+            _memory_directory: None,
+        }
+    }
+
+    fn with_memory() -> Self {
+        let memory_directory = tempfile::tempdir().unwrap();
+        let store =
+            SqliteMemoryStore::initialize(memory_directory.path().join("memory.sqlite3")).unwrap();
+        let created_at = UnixTimestampMillis::new(1_000).unwrap();
+        store
+            .create(
+                MemoryDraft::new(
+                    MemoryKind::Semantic,
+                    "Local project context",
+                    MemoryProvenance::new(
+                        MemoryProvenanceKind::UserProvided,
+                        "settings",
+                        created_at,
+                        "local-user",
+                        None,
+                    )
+                    .unwrap(),
+                    MemoryConfidence::new(900).unwrap(),
+                    created_at,
+                    MemoryRetention::UntilDeleted,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let provider = Arc::new(SqliteMemoryContextProvider::new(
+            store,
+            Arc::new(FixedMemoryClock(UnixTimestampMillis::new(2_000).unwrap())),
+        ));
+        let (input, input_receiver) = mpsc::channel(32);
+        let output = Arc::new(MockContinuousAudioOutput::new());
+        let factory = Arc::new(TestVoiceIoFactory::new(input_receiver, output));
+        let language = Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new()));
+        let speech = Arc::new(MockStreamingSpeechSynthesizer::new([]));
+        let adapters = VoiceSessionAdapters::new(factory.clone(), language.clone(), speech)
+            .with_memory_provider(provider, ExecutionLocation::Local)
+            .unwrap();
+        Self {
+            runtime: VoiceSessionRuntime::new(adapters),
+            factory,
+            input,
+            language,
+            playback_gate: None,
+            _memory_directory: Some(memory_directory),
         }
     }
 
@@ -494,6 +619,7 @@ impl VoiceSessionHarness {
             input,
             language,
             playback_gate: Some(playback_gate),
+            _memory_directory: None,
         }
     }
 

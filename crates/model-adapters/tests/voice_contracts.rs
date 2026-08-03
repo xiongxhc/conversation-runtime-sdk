@@ -8,7 +8,8 @@ use conversation_model_adapters::{
 };
 use conversation_protocol::{
     ContextSource, ConversationMessage, ConversationMode, ConversationRole, GenerationId,
-    PlaybackState, QualityDecision, ResponseControls, SessionId, TurnId, UtteranceId,
+    MemoryContextItem, MemoryId, MemoryKind, MemoryRetrievalReason, PlaybackState, QualityDecision,
+    ResponseControls, SessionId, TurnId, UtteranceId,
 };
 use tokio::time::{timeout, Duration};
 use tokio_util::sync::CancellationToken;
@@ -167,6 +168,61 @@ fn generation_language_carries_bounded_typed_quality_input() {
     assert_eq!(
         request.input().runtime_guidance(),
         Some("Answer directly within the resolved spoken-duration limit.")
+    );
+}
+
+#[test]
+fn language_input_enforces_a_forty_kib_aggregate_with_typed_memory() {
+    let turn_id = TurnId::new(5);
+    let decision = QualityDecision::new(
+        turn_id,
+        ConversationMode::DirectAnswer,
+        ResponseControls::default(),
+        [],
+        0,
+        [],
+    )
+    .unwrap();
+    let transcript = "t".repeat(16 * 1024);
+    let history =
+        [ConversationMessage::new(ConversationRole::User, "h".repeat(16 * 1024)).unwrap()];
+    let guidance = "g".repeat(4 * 1024);
+    let full_item = MemoryContextItem::new(
+        MemoryId::new(1).unwrap(),
+        MemoryKind::Semantic,
+        "m".repeat(4 * 1024),
+        MemoryRetrievalReason::ExactPhrase,
+    )
+    .unwrap();
+
+    let exact = LanguageModelInput::with_quality_and_memory(
+        transcript.clone(),
+        history.clone(),
+        decision.clone(),
+        guidance.clone(),
+        [full_item.clone()],
+    )
+    .unwrap();
+    assert_eq!(exact.memory_items(), std::slice::from_ref(&full_item));
+
+    let extra_item = MemoryContextItem::new(
+        MemoryId::new(2).unwrap(),
+        MemoryKind::Episodic,
+        "x",
+        MemoryRetrievalReason::SharedTerm,
+    )
+    .unwrap();
+    let error = LanguageModelInput::with_quality_and_memory(
+        transcript,
+        history,
+        decision,
+        guidance,
+        [full_item, extra_item],
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.message(),
+        "language-model aggregate input exceeds 40 KiB"
     );
 }
 

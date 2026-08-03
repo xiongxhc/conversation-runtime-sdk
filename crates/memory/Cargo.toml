@@ -1,12 +1,11 @@
 [package]
-name = "conversation-runtime"
+name = "conversation-memory"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-conversation-model-adapters.workspace = true
-conversation-memory.workspace = true
 conversation-protocol.workspace = true
+rusqlite.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 

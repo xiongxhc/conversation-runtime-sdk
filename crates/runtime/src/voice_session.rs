@@ -4,14 +4,15 @@ use std::future::{pending, Future};
 use std::sync::Arc;
 use std::time::Duration;
 
+use conversation_memory::MemoryContextProvider;
 use conversation_model_adapters::{
     AdapterError, ContinuousAudioOutput, GenerationLanguageModel, PlaybackReceipt,
     RecognitionEvent, StreamingSpeechSynthesizer, VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
 };
 use conversation_protocol::{
-    ConversationMode, GenerationId, PersonaProfile, PlaybackState, RecoveryDisposition,
-    ResponseControls, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage,
-    RuntimeTimingMilestone, SessionId, TurnId, VoiceActivity, VoiceSessionEvent,
+    ConversationMode, ExecutionLocation, GenerationId, PersonaProfile, PlaybackState,
+    RecoveryDisposition, ResponseControls, RuntimeError, RuntimeErrorKind, RuntimeEvent,
+    RuntimeStage, RuntimeTimingMilestone, SessionId, TurnId, VoiceActivity, VoiceSessionEvent,
     VoiceSessionPolicy, VoiceTimingMilestone,
 };
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -36,6 +37,7 @@ pub struct VoiceSessionAdapters {
     language_model: Arc<dyn GenerationLanguageModel>,
     speech_synthesizer: Arc<dyn StreamingSpeechSynthesizer>,
     quality_controller: ConversationQualityController,
+    memory_provider: Option<(Arc<dyn MemoryContextProvider>, ExecutionLocation)>,
 }
 
 impl VoiceSessionAdapters {
@@ -53,6 +55,7 @@ impl VoiceSessionAdapters {
                 ResponseControls::default(),
                 ConversationMode::DirectAnswer,
             ),
+            memory_provider: None,
         }
     }
 
@@ -62,6 +65,24 @@ impl VoiceSessionAdapters {
     ) -> Self {
         self.quality_controller = quality_controller;
         self
+    }
+
+    pub fn with_memory_provider(
+        mut self,
+        provider: Arc<dyn MemoryContextProvider>,
+        language_execution: ExecutionLocation,
+    ) -> Result<Self, RuntimeError> {
+        if provider.execution_location() != ExecutionLocation::Local
+            || language_execution != ExecutionLocation::Local
+        {
+            return Err(RuntimeError::new(
+                RuntimeErrorKind::Configuration,
+                RuntimeStage::Memory,
+                "memory context requires local memory and language execution",
+            ));
+        }
+        self.memory_provider = Some((provider, language_execution));
+        Ok(self)
     }
 }
 
@@ -278,12 +299,24 @@ async fn run_voice_session(
         }
     };
 
-    let turn_runtime = StreamingTurnRuntime::new(
+    let mut turn_runtime = StreamingTurnRuntime::new(
         adapters.language_model,
         adapters.speech_synthesizer,
         output.clone(),
     )
     .with_quality_controller(adapters.quality_controller);
+    if let Some((provider, language_execution)) = adapters.memory_provider {
+        turn_runtime = match turn_runtime.with_memory_provider(provider, language_execution) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                cancellation.cancel();
+                if let Err(cleanup_error) = await_completion_cleanup(completion).await {
+                    return session_failure(session_id, cleanup_error);
+                }
+                return session_failure(session_id, error);
+            }
+        };
+    }
     VoiceLoop::new(
         policy,
         input_events,

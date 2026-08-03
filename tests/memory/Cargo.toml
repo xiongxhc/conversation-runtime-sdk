@@ -1,14 +1,17 @@
 [package]
-name = "conversation-runtime"
+name = "conversation-memory-probe"
 version.workspace = true
 edition.workspace = true
+publish = false
+
+[[bin]]
+name = "conversation-memory-probe"
+path = "src/main.rs"
 
 [dependencies]
-conversation-model-adapters.workspace = true
 conversation-memory.workspace = true
 conversation-protocol.workspace = true
-tokio.workspace = true
-tokio-util.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

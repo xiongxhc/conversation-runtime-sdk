@@ -187,7 +187,12 @@ fn rejects_a_leaf_configuration_symlink_before_reading_its_target() {
     let link = fixture.path().join("gateway.toml");
     std::os::unix::fs::symlink(&target, &link).unwrap();
 
-    assert!(GatewayConfig::load(&link).is_err());
+    let error = GatewayConfig::load(&link).unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "gateway configuration file could not be opened"
+    );
 }
 
 #[cfg(unix)]
@@ -212,6 +217,10 @@ fn rejects_a_fifo_configuration_before_opening_it() {
     });
 
     assert_eq!(receiver.recv_timeout(Duration::from_millis(100)), Ok(true));
+    assert_eq!(
+        GatewayConfig::load(&fifo).unwrap_err().to_string(),
+        "gateway configuration file could not be opened"
+    );
 }
 
 fn memory_config(database: &Path) -> String {

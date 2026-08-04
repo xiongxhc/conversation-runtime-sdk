@@ -126,22 +126,7 @@ fn load_toml(path: &Path) -> Result<GatewayConfig, GatewayConfigError> {
     if !path.is_absolute() {
         return Err(config_error("gateway configuration path must be absolute"));
     }
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_file() => {}
-        Ok(_) => {
-            return Err(config_error(
-                "gateway configuration path must be a regular file and not a symbolic link",
-            ));
-        }
-        Err(_) => {
-            return Err(config_error(
-                "gateway configuration file could not be opened",
-            ));
-        }
-    }
-
-    let file = fs::File::open(path)
-        .map_err(|_| config_error("gateway configuration file could not be opened"))?;
+    let file = open_config_file(path)?;
     let mut contents = Vec::new();
     file.take(MAX_CONFIG_BYTES + 1)
         .read_to_end(&mut contents)
@@ -153,6 +138,35 @@ fn load_toml(path: &Path) -> Result<GatewayConfig, GatewayConfigError> {
         .map_err(|_| config_error("gateway configuration file was not valid UTF-8"))?;
     toml::from_str(contents)
         .map_err(|_| config_error("gateway configuration file was not valid TOML"))
+}
+
+#[cfg(unix)]
+fn open_config_file(path: &Path) -> Result<fs::File, GatewayConfigError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|_| config_error("gateway configuration file could not be opened"))?;
+    if !file
+        .metadata()
+        .map_err(|_| config_error("gateway configuration file could not be opened"))?
+        .file_type()
+        .is_file()
+    {
+        return Err(config_error(
+            "gateway configuration file could not be opened",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_config_file(_path: &Path) -> Result<fs::File, GatewayConfigError> {
+    Err(config_error(
+        "gateway configuration file could not be opened",
+    ))
 }
 
 fn validate_loopback_http_endpoint(endpoint: &str) -> Result<(), GatewayConfigError> {

@@ -113,25 +113,33 @@ async fn streams_chat_content_and_serializes_the_request() {
 
 #[tokio::test]
 async fn direct_constructor_bypasses_system_http_proxies() {
-    let proxy = FakeOllamaServer::streaming([
-        r#"{"message":{"role":"assistant","content":"proxy"},"done":true}"#,
-    ])
-    .await;
-    let child = Command::new(std::env::current_exe().unwrap())
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_endpoint = format!("http://{}", proxy.local_addr().unwrap());
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
         .args(["--exact", "direct_constructor_proxy_child"])
         .env(DIRECT_PROXY_TEST_CHILD, "1")
-        .env("HTTP_PROXY", proxy.endpoint())
-        .env("http_proxy", proxy.endpoint())
-        .env("ALL_PROXY", proxy.endpoint())
-        .env("all_proxy", proxy.endpoint())
+        .env("HTTP_PROXY", &proxy_endpoint)
+        .env("http_proxy", &proxy_endpoint)
+        .env("ALL_PROXY", &proxy_endpoint)
+        .env("all_proxy", &proxy_endpoint)
         .env("NO_PROXY", "")
         .env("no_proxy", "")
-        .output()
-        .await
-        .unwrap();
+        .kill_on_drop(true);
+    let child = command.spawn().unwrap();
 
-    assert!(child.status.success());
-    assert!(!proxy.request_received().await);
+    let output = tokio::select! {
+        biased;
+        accepted = proxy.accept() => panic!("direct client contacted proxy: {accepted:?}"),
+        output = timeout(Duration::from_secs(2), child.wait_with_output()) => {
+            output.expect("direct proxy child timed out").unwrap()
+        }
+    };
+
+    assert!(output.status.success());
+    assert!(timeout(Duration::from_millis(20), proxy.accept())
+        .await
+        .is_err());
 }
 
 #[tokio::test]

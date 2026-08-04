@@ -129,8 +129,8 @@ The commit containing this report uses:
 feat: add local gateway chat example
 ```
 
-Author and committer are `Chris Xiong <xionghc713@gmail.com>`. No co-author
-trailer is present.
+The repository-configured author and committer were used. No co-author trailer
+is present.
 
 ## Concerns
 
@@ -227,5 +227,5 @@ The commit containing this review fix uses:
 fix: harden Node chat shutdown races
 ```
 
-Author and committer are `Chris Xiong <xionghc713@gmail.com>`. No co-author
-trailer is present.
+The repository-configured author and committer were used. No co-author trailer
+is present.

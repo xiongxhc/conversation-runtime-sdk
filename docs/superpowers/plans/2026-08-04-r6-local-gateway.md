@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Work only in `feature/r6-local-gateway` at `/Users/cx/Workspace/conversation-runtime-sdk/.worktrees/r6-local-gateway`.
+- Work only in the isolated `feature/r6-local-gateway` worktree.
 - Preserve `protocol <- model-adapters <- runtime`; the gateway composes core crates and no core crate depends on the gateway or TypeScript package.
 - Keep all public content backend-neutral; Ollama-compatible details stay in the reference adapter and gateway configuration.
 - R6 is local-only: no listener, LAN binding, socket, discovery, pairing, TLS, cloud fallback, telemetry, or generic host switch.
@@ -22,7 +22,7 @@
 - Standard output is protocol-only. Standard error and tests must not log transcripts, prompts, generated text, or memory content.
 - Cancellation acceptance is not terminal completion; clients drain until exactly one completed, cancelled, or failed event.
 - Use test-first red-green-refactor for every production behavior.
-- Use Conventional Commits with `Chris Xiong <xionghc713@gmail.com>` and no co-author trailers.
+- Use Conventional Commits, the repository-configured author, and no co-author trailers.
 
 ---
 

@@ -19,7 +19,7 @@
    zero limits, and immediate deltas plus all final Ollama metrics before production changes.
 
    ```text
-   PATH=/Users/cx/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin:$PATH \
+   PATH="$HOME/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin:$PATH" \
      cargo test -p conversation-model-adapters --test ollama --locked
 
    RED: E0599 for missing OllamaConfig::with_seed, with_num_predict, and with_num_ctx,
@@ -39,7 +39,7 @@
    `model`, `status=timeout`, `timeout_stage=first_delta`, and `elapsed_ms` on standard error.
 
    ```text
-   PATH=/Users/cx/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin:$PATH \
+   PATH="$HOME/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin:$PATH" \
      cargo test -p conversation-ollama-probe --locked
 
    RED: E0432 for missing format_success_report and ProbeTimeouts; E0061 because
@@ -112,7 +112,7 @@ PASS
    control-character model identifier, before adapter changes.
 
    ```text
-   PATH=/Users/cx/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin:$PATH \
+   PATH="$HOME/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin:$PATH" \
      cargo test -p conversation-model-adapters --test ollama --locked
 
    RED: control-character model identifiers were accepted. The backpressured cancellation test
@@ -124,7 +124,7 @@ PASS
    subprocess configuration failures.
 
    ```text
-   PATH=/Users/cx/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin:$PATH \
+   PATH="$HOME/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin:$PATH" \
      cargo test -p conversation-ollama-probe --locked
 
    RED: E0432 for missing await_next_delta, format_failure_report, and ReceiveOutcome; the

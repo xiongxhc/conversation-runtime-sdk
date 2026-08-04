@@ -58,10 +58,11 @@ its sibling tests ran in parallel.
 
 The focused default-parallel target reproduced the defect with 1 pass and 26
 failures. The serial target passed all 27 tests. The smallest test-only fix
-moved the proxy environment into a dedicated child test process, retaining the
-real proxy-bypass assertion without changing production code. The focused
-default-parallel target then passed all 28 tests, and the final default-parallel
-Rust workspace gate passed.
+moved the proxy environment into a dedicated, deadline-bounded child process.
+The parent observes proxy TCP acceptance directly and terminates the child on
+timeout, retaining the real proxy-bypass assertion without changing production
+code. The focused default-parallel target then passed all 28 tests, and the
+final default-parallel Rust workspace gate passed.
 
 One intermediate full run also exposed an unchanged R3 voice pressure test
 exceeding its fixed deadline. That file is byte-identical to `master`; the

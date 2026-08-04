@@ -106,6 +106,44 @@ test("closes an active gateway on a second SIGINT without sending another interr
   assert.equal(transport.closeCount, 1);
 });
 
+test("treats SIGINT at the visible assistant prompt as an active-turn interruption", async () => {
+  const transport = new ScriptedTransport("cancel-on-interrupt");
+  const fixture = chatFixture(transport, { signalAtAssistantPrompt: true });
+  const running = runChat(validArguments, fixture.io, fixture.dependencies);
+  fixture.input.write("prompt boundary turn\n");
+
+  await withDeadline(
+    transport.waitFor("interrupt_turn"),
+    250,
+    "assistant prompt SIGINT did not interrupt the active turn",
+  );
+  fixture.input.end();
+
+  assert.equal(await running, 0);
+  assert.equal(transport.commands("interrupt_turn").length, 1);
+  assert.equal(transport.closeCount, 1);
+  assert.match(fixture.output.text, /assistant> \n\[cancelled\]/);
+  assert.equal(fixture.diagnostics.text, "");
+});
+
+test("closes a stalled active turn on EOF without sending an interruption", async () => {
+  const transport = new ScriptedTransport("stall-after-interrupt");
+  const fixture = chatFixture(transport);
+  const running = runChat(validArguments, fixture.io, fixture.dependencies);
+  fixture.input.write("active EOF turn\n");
+  await transport.waitFor("start_turn");
+
+  fixture.input.end();
+
+  assert.equal(
+    await withDeadline(running, 250, "active-turn EOF did not close the client"),
+    0,
+  );
+  assert.equal(transport.closeCount, 1);
+  assert.equal(transport.commands("interrupt_turn").length, 0);
+  assert.equal(fixture.diagnostics.text, "");
+});
+
 test("closes cleanly on idle SIGINT and EOF", async () => {
   const signalTransport = new ScriptedTransport("complete");
   const signalFixture = chatFixture(signalTransport);
@@ -214,6 +252,39 @@ test("cancels independently through a second compiled Rust gateway process", { t
     } finally {
       await transport.close();
     }
+  });
+});
+
+test("active EOF closes a compiled Rust gateway with a stalled provider", { timeout: 10_000 }, async () => {
+  await withGatewayFixture("stall", async (fixture) => {
+    const input = new PassThrough();
+    let resolvePrompt!: () => void;
+    const promptVisible = new Promise<void>((resolve) => {
+      resolvePrompt = resolve;
+    });
+    const output = new TextSink((text) => {
+      if (text === "you> ") {
+        resolvePrompt();
+      }
+    });
+    const diagnostics = new TextSink();
+    const signals = new EventEmitter();
+    const running = runChat(
+      ["--gateway", fixture.gatewayPath, "--config", fixture.configPath],
+      { input, output, diagnostics, signals },
+    );
+    await withDeadline(promptVisible, 2_000, "compiled gateway chat prompt was not ready");
+    input.write("compiled gateway EOF turn\n");
+    await fixture.waitForRequestStart();
+
+    input.end();
+
+    assert.equal(
+      await withDeadline(running, 2_000, "compiled gateway did not close after active EOF"),
+      0,
+    );
+    await fixture.waitForConnectionClose();
+    assert.equal(diagnostics.text, "");
   });
 });
 
@@ -544,17 +615,26 @@ class AsyncChannel<T> implements AsyncIterable<T> {
 class TextSink extends Writable {
   text = "";
 
+  constructor(private readonly onWrite?: (text: string) => void) {
+    super();
+  }
+
   override _write(
     chunk: Buffer | string,
     _encoding: BufferEncoding,
     callback: (error?: Error | null) => void,
   ): void {
-    this.text += chunk.toString();
+    const text = chunk.toString();
+    this.text += text;
+    this.onWrite?.(text);
     callback();
   }
 }
 
-function chatFixture(transport: ScriptedTransport): {
+function chatFixture(
+  transport: ScriptedTransport,
+  options: { signalAtAssistantPrompt?: boolean } = {},
+): {
   dependencies: ChatDependencies;
   diagnostics: TextSink;
   input: PassThrough;
@@ -564,9 +644,13 @@ function chatFixture(transport: ScriptedTransport): {
   startCount(): number;
 } {
   const input = new PassThrough();
-  const output = new TextSink();
-  const diagnostics = new TextSink();
   const signals = new EventEmitter();
+  const output = new TextSink((text) => {
+    if (options.signalAtAssistantPrompt && text === "assistant> ") {
+      signals.emit("SIGINT");
+    }
+  });
+  const diagnostics = new TextSink();
   let starts = 0;
   const dependencies: ChatDependencies = {
     async startTransport() {

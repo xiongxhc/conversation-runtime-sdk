@@ -142,3 +142,90 @@ trailer is present.
 - The TypeScript package metadata correction should remain covered by a future
   package-artifact verification gate so its declared public entrypoint cannot
   drift from emitted files again.
+
+## Review Fix: Active EOF and Prompt-Boundary SIGINT
+
+### Findings
+
+1. EOF was observed only by the readline iterator between turns. While
+   `renderTurn` awaited a stalled provider, active-turn EOF could not reach the
+   close path and the client and gateway remained open.
+2. The CLI wrote `assistant> ` before calling `startTurn` and assigning the
+   active-turn state. A `SIGINT` synchronized to that visible prompt therefore
+   took the idle shutdown path instead of sending exactly one interruption.
+
+### RED Evidence
+
+The new focused test command was run before changing `src/main.ts`:
+
+```text
+npm run build --workspace conversation-node-chat
+node --test \
+  --test-name-pattern='visible assistant prompt|stalled active turn on EOF' \
+  examples/node-chat/dist/test/cli.test.js
+```
+
+Both regressions failed for the reviewed reasons:
+
+```text
+assistant prompt SIGINT did not interrupt the active turn
+active-turn EOF did not close the client
+```
+
+The prompt regression emits `SIGINT` synchronously from the output sink when
+the exact `assistant> ` write becomes visible. The EOF regression starts a
+stalled accepted turn, ends stdin, and requires bounded completion without an
+interrupt command, duplicate close, or diagnostic output.
+
+### Fix
+
+- `runChat` now calls `startTurn` and assigns `active` before writing the
+  assistant prompt. Once the prompt is visible, the first `SIGINT` therefore
+  always sees the active turn and sends one interrupt command.
+- One input `end` observer is installed while the client is running. EOF during
+  an active turn calls the same idempotent `stop` function used by second or
+  idle `SIGINT`, closes the client and gateway once, and does not synthesize an
+  interrupt command.
+- The input observer is removed during final cleanup. Expected rejection of the
+  active event iterator after client closure remains handled by the existing
+  `stopping` path, so no raw error becomes a diagnostic and no losing promise is
+  left unhandled.
+
+### Real Process Coverage
+
+A new smoke starts the actual compiled `conversation-runtime-gateway` through
+`runChat`, waits for the visible input prompt, starts a turn against the
+loopback-only provider fixture, waits until the provider request is active, and
+then ends stdin. The client returns success within the bounded deadline, the
+gateway closes, and the stalled provider connection is reaped without
+diagnostic content.
+
+### Final GREEN Evidence
+
+```text
+npm test --workspace conversation-node-chat
+  PASS: 11 tests
+
+npm run build --workspaces
+  PASS: @conversation/runtime and conversation-node-chat
+
+npm test --workspaces
+  PASS: 40 @conversation/runtime tests
+  PASS: 11 conversation-node-chat tests
+  PASS: compiled-gateway completion, cancellation, and active-EOF smokes
+```
+
+The focused signal suite also reruns first-active-`SIGINT`, second-active
+`SIGINT`, idle `SIGINT`, and idle EOF behavior. No Rust, SDK, documentation, or
+unrelated file changed in this review fix.
+
+### Fix Commit
+
+The commit containing this review fix uses:
+
+```text
+fix: harden Node chat shutdown races
+```
+
+Author and committer are `Chris Xiong <xionghc713@gmail.com>`. No co-author
+trailer is present.

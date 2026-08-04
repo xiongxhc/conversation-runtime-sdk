@@ -85,12 +85,18 @@ export async function runChat(
     }
     stop();
   };
+  const onInputEnd = (): void => {
+    if (active) {
+      stop();
+    }
+  };
 
   try {
     const transport = await dependencies.startTransport(options);
     client = await RuntimeClient.connect(transport);
     lines = createInterface({ input: io.input, crlfDelay: Infinity });
     io.signals.on("SIGINT", onSigint);
+    io.input.on("end", onInputEnd);
 
     const status = await client.status();
     assertLocalOnly(status);
@@ -107,9 +113,9 @@ export async function runChat(
         continue;
       }
 
-      io.output.write("assistant> ");
       const turn = client.startTurn(next.value);
       active = { turn, interruptRequested: false };
+      io.output.write("assistant> ");
       const terminal = await renderTurn(turn, io.output);
       active = undefined;
       if (terminal === "failed") {
@@ -125,6 +131,7 @@ export async function runChat(
   } finally {
     active = undefined;
     io.signals.off("SIGINT", onSigint);
+    io.input.off("end", onInputEnd);
     lines?.close();
     if (client && !closePromise) {
       closePromise = client.close();

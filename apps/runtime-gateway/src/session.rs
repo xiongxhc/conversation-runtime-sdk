@@ -13,7 +13,9 @@ use tokio::time::timeout;
 
 use crate::{FrameError, FrameReader, FrameWriter};
 
-const WRITER_BUFFER_SIZE: usize = 1;
+const URGENT_WRITER_BUFFER_SIZE: usize = 2;
+const NORMAL_WRITER_BUFFER_SIZE: usize = 4;
+const EVENT_WRITER_BUFFER_SIZE: usize = 1;
 const WRITER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 const INVALID_COMMAND_REQUEST_ID: &str = "invalid-command";
 
@@ -33,13 +35,19 @@ impl GatewaySession {
         W: AsyncWrite + Unpin + Send + 'static,
     {
         let mut reader = FrameReader::new(reader);
-        let (control_sender, control_receiver) = mpsc::unbounded_channel();
-        let (event_sender, event_receiver) = mpsc::channel(WRITER_BUFFER_SIZE);
-        let mut writer_task = tokio::spawn(writer_loop(writer, control_receiver, event_receiver));
+        let (urgent_sender, urgent_receiver) = mpsc::channel(URGENT_WRITER_BUFFER_SIZE);
+        let (normal_sender, normal_receiver) = mpsc::channel(NORMAL_WRITER_BUFFER_SIZE);
+        let (event_sender, event_receiver) = mpsc::channel(EVENT_WRITER_BUFFER_SIZE);
+        let mut writer_task = tokio::spawn(writer_loop(
+            writer,
+            urgent_receiver,
+            normal_receiver,
+            event_receiver,
+        ));
         let mut active: Option<ActiveForwarder> = None;
 
-        let exit = if let Err(error) = send_control(
-            &control_sender,
+        let exit = if let Err(error) = send_normal(
+            &normal_sender,
             GatewayMessage::Ready {
                 status: self.status.clone(),
             },
@@ -88,7 +96,7 @@ impl GatewaySession {
                             Ok(command) => command,
                             Err(_) => {
                                 if let Err(error) = send_rejection(
-                                    &control_sender,
+                                    &normal_sender,
                                     INVALID_COMMAND_REQUEST_ID,
                                     command_error("client command could not be decoded"),
                                 ) {
@@ -98,7 +106,13 @@ impl GatewaySession {
                             }
                         };
                         if let Err(failure) = self
-                            .handle_command(command, &control_sender, &event_sender, &mut active)
+                            .handle_command(
+                                command,
+                                &urgent_sender,
+                                &normal_sender,
+                                &event_sender,
+                                &mut active,
+                            )
                             .await
                         {
                             break SessionExit::Failure {
@@ -120,10 +134,11 @@ impl GatewaySession {
 
         shutdown_active(&self.runtime, &mut active).await;
         if let Some(message) = exit.fatal_message() {
-            let _ = send_control(&control_sender, fatal_message(message));
+            let _ = send_urgent(&urgent_sender, fatal_message(message));
         }
         drop(event_sender);
-        drop(control_sender);
+        drop(normal_sender);
+        drop(urgent_sender);
 
         let writer_shutdown = if matches!(exit, SessionExit::Writer(_)) {
             Ok(())
@@ -142,15 +157,16 @@ impl GatewaySession {
     async fn handle_command(
         &self,
         command: ClientCommand,
-        control: &mpsc::UnboundedSender<GatewayMessage>,
+        urgent: &mpsc::Sender<GatewayMessage>,
+        normal: &mpsc::Sender<GatewayMessage>,
         events: &mpsc::Sender<GatewayMessage>,
         active: &mut Option<ActiveForwarder>,
     ) -> Result<(), CommandFailure> {
         match command {
             ClientCommand::Status { request_id } => {
-                send_accepted(control, &request_id).map_err(CommandFailure::response)?;
-                send_control(
-                    control,
+                send_accepted(normal, &request_id).map_err(CommandFailure::response)?;
+                send_normal(
+                    normal,
                     GatewayMessage::Status {
                         request_id,
                         status: self.status.clone(),
@@ -165,7 +181,7 @@ impl GatewaySession {
             } => {
                 if active.is_some() {
                     return send_rejection(
-                        control,
+                        normal,
                         &request_id,
                         command_error("an active turn already exists"),
                     )
@@ -181,7 +197,7 @@ impl GatewaySession {
                     Ok(event_stream) => event_stream,
                     Err(error) => {
                         return send_rejection(
-                            control,
+                            normal,
                             &request_id,
                             ClientRuntimeError::from(error),
                         )
@@ -194,7 +210,7 @@ impl GatewaySession {
                     generation_id,
                     event_stream,
                 ));
-                send_accepted(control, &request_id).map_err(CommandFailure::response)?;
+                send_accepted(normal, &request_id).map_err(CommandFailure::response)?;
                 active
                     .as_mut()
                     .expect("accepted text turn remains active")
@@ -207,7 +223,7 @@ impl GatewaySession {
             } => {
                 let Some(active_turn) = active.as_ref() else {
                     return send_rejection(
-                        control,
+                        normal,
                         &request_id,
                         command_error("there is no active text generation"),
                     )
@@ -215,7 +231,7 @@ impl GatewaySession {
                 };
                 if active_turn.turn_id != turn_id {
                     return send_rejection(
-                        control,
+                        normal,
                         &request_id,
                         command_error("a different turn is active"),
                     )
@@ -223,7 +239,8 @@ impl GatewaySession {
                 }
 
                 let generation_id = active_turn.generation_id;
-                send_accepted(control, &request_id).map_err(CommandFailure::response)?;
+                send_urgent(urgent, accepted_message(&request_id))
+                    .map_err(CommandFailure::response)?;
                 self.runtime
                     .interrupt(turn_id, generation_id)
                     .await
@@ -391,45 +408,59 @@ async fn shutdown_active(runtime: &TextTurnRuntime, active: &mut Option<ActiveFo
 
 async fn writer_loop<W>(
     writer: W,
-    mut control: mpsc::UnboundedReceiver<GatewayMessage>,
+    mut urgent: mpsc::Receiver<GatewayMessage>,
+    mut normal: mpsc::Receiver<GatewayMessage>,
     mut events: mpsc::Receiver<GatewayMessage>,
 ) -> Result<(), GatewaySessionError>
 where
     W: AsyncWrite + Unpin,
 {
     let mut writer = FrameWriter::new(writer);
-    let mut control_open = true;
+    let mut urgent_open = true;
+    let mut normal_open = true;
     let mut events_open = true;
-    while control_open || events_open {
-        let message = match (control_open, events_open) {
-            (true, true) => {
+    let mut next_regular = RegularLane::Normal;
+    while urgent_open || normal_open || events_open {
+        let input = match next_regular {
+            RegularLane::Normal => {
                 tokio::select! {
                     biased;
-                    message = control.recv() => match message {
-                        Some(message) => Some(message),
-                        None => {
-                            control_open = false;
-                            None
-                        }
-                    },
-                    message = events.recv() => match message {
-                        Some(message) => Some(message),
-                        None => {
-                            events_open = false;
-                            None
-                        }
-                    },
+                    message = urgent.recv(), if urgent_open => WriterInput::Urgent(message),
+                    message = normal.recv(), if normal_open => WriterInput::Normal(message),
+                    message = events.recv(), if events_open => WriterInput::Event(message),
                 }
             }
-            (true, false) => control.recv().await.or_else(|| {
-                control_open = false;
+            RegularLane::Event => {
+                tokio::select! {
+                    biased;
+                    message = urgent.recv(), if urgent_open => WriterInput::Urgent(message),
+                    message = events.recv(), if events_open => WriterInput::Event(message),
+                    message = normal.recv(), if normal_open => WriterInput::Normal(message),
+                }
+            }
+        };
+        let message = match input {
+            WriterInput::Urgent(Some(message)) => Some(message),
+            WriterInput::Urgent(None) => {
+                urgent_open = false;
                 None
-            }),
-            (false, true) => events.recv().await.or_else(|| {
+            }
+            WriterInput::Normal(Some(message)) => {
+                next_regular = RegularLane::Event;
+                Some(message)
+            }
+            WriterInput::Normal(None) => {
+                normal_open = false;
+                None
+            }
+            WriterInput::Event(Some(message)) => {
+                next_regular = RegularLane::Normal;
+                Some(message)
+            }
+            WriterInput::Event(None) => {
                 events_open = false;
                 None
-            }),
-            (false, false) => None,
+            }
         };
         let Some(message) = message else {
             continue;
@@ -437,6 +468,18 @@ where
         write_gateway_message(&mut writer, message).await?;
     }
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum RegularLane {
+    Normal,
+    Event,
+}
+
+enum WriterInput {
+    Urgent(Option<GatewayMessage>),
+    Normal(Option<GatewayMessage>),
+    Event(Option<GatewayMessage>),
 }
 
 async fn write_gateway_message<W>(
@@ -467,23 +510,18 @@ async fn shutdown_writer(
 }
 
 fn send_accepted(
-    writer: &mpsc::UnboundedSender<GatewayMessage>,
+    writer: &mpsc::Sender<GatewayMessage>,
     request_id: &str,
 ) -> Result<(), GatewaySessionError> {
-    send_control(
-        writer,
-        GatewayMessage::CommandAccepted {
-            request_id: request_id.to_owned(),
-        },
-    )
+    send_normal(writer, accepted_message(request_id))
 }
 
 fn send_rejection(
-    writer: &mpsc::UnboundedSender<GatewayMessage>,
+    writer: &mpsc::Sender<GatewayMessage>,
     request_id: &str,
     error: ClientRuntimeError,
 ) -> Result<(), GatewaySessionError> {
-    send_control(
+    send_normal(
         writer,
         GatewayMessage::CommandRejected {
             request_id: request_id.to_owned(),
@@ -492,13 +530,34 @@ fn send_rejection(
     )
 }
 
-fn send_control(
-    writer: &mpsc::UnboundedSender<GatewayMessage>,
+fn accepted_message(request_id: &str) -> GatewayMessage {
+    GatewayMessage::CommandAccepted {
+        request_id: request_id.to_owned(),
+    }
+}
+
+fn send_normal(
+    writer: &mpsc::Sender<GatewayMessage>,
     message: GatewayMessage,
 ) -> Result<(), GatewaySessionError> {
-    writer
-        .send(message)
-        .map_err(|_| GatewaySessionError::WriterUnavailable)
+    send_bounded(writer, message)
+}
+
+fn send_urgent(
+    writer: &mpsc::Sender<GatewayMessage>,
+    message: GatewayMessage,
+) -> Result<(), GatewaySessionError> {
+    send_bounded(writer, message)
+}
+
+fn send_bounded(
+    writer: &mpsc::Sender<GatewayMessage>,
+    message: GatewayMessage,
+) -> Result<(), GatewaySessionError> {
+    writer.try_send(message).map_err(|error| match error {
+        mpsc::error::TrySendError::Full(_) => GatewaySessionError::WriterBackpressure,
+        mpsc::error::TrySendError::Closed(_) => GatewaySessionError::WriterUnavailable,
+    })
 }
 
 fn fatal_message(message: &'static str) -> GatewayMessage {
@@ -545,6 +604,7 @@ pub enum GatewaySessionError {
     Interruption,
     Projection,
     WriterTask,
+    WriterBackpressure,
     WriterShutdownTimeout,
     WriterUnavailable,
     Writing(FrameError),
@@ -559,6 +619,7 @@ impl fmt::Display for GatewaySessionError {
             Self::Interruption => "gateway interruption failed",
             Self::Projection => "gateway event projection failed",
             Self::WriterTask => "gateway writer task failed",
+            Self::WriterBackpressure => "gateway writer backpressure limit reached",
             Self::WriterShutdownTimeout => "gateway writer shutdown timed out",
             Self::WriterUnavailable => "gateway writer became unavailable",
             Self::Writing(_) => "gateway output framing failed",
@@ -584,10 +645,13 @@ mod tests {
     use std::time::Duration;
 
     use conversation_model_adapters::{OllamaConfig, OllamaLanguageModel};
-    use conversation_protocol::{GenerationId, RuntimeStatus, TurnId, MAX_CLIENT_FRAME_BYTES};
+    use conversation_protocol::{
+        ClientRuntimeEvent, GatewayMessage, GenerationId, RuntimeStatus, TurnId,
+        MAX_CLIENT_FRAME_BYTES,
+    };
     use tokio::io::{duplex, AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
-    use tokio::sync::Notify;
+    use tokio::sync::{mpsc, Notify};
     use tokio::time::timeout;
 
     use super::GatewaySession;
@@ -751,6 +815,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn normal_control_saturation_fails_closed_and_reaps_active_generation() {
+        let language = HoldOpenLanguageServer::start().await;
+        let runtime = runtime_for(language.endpoint());
+        let cleanup_runtime = runtime.clone();
+        let session = GatewaySession::new(runtime, status());
+        let (mut input, reader) = duplex(4096);
+        let (writer, writer_state) = BlockingWriter::new(2);
+        let session_task = tokio::spawn(session.run(reader, writer));
+
+        write_command(
+            &mut input,
+            r#"{"protocol_version":1,"type":"start_turn","request_id":"start-saturation","turn_id":"1","transcript":"fixture saturation"}"#,
+        )
+        .await;
+        timeout(TEST_TIMEOUT, writer_state.blocked.wait())
+            .await
+            .expect("gateway writer never blocked on the start acknowledgement");
+        timeout(TEST_TIMEOUT, language.request_started.wait())
+            .await
+            .expect("fake language request never started");
+
+        let mut commands = Vec::new();
+        for index in 0..8 {
+            append_command(
+                &mut commands,
+                &format!(
+                    r#"{{"protocol_version":1,"type":"status","request_id":"status-saturation-{index}"}}"#
+                ),
+            );
+        }
+        input.write_all(&commands).await.unwrap();
+        input.flush().await.unwrap();
+
+        if timeout(TEST_TIMEOUT, language.connection_reaped.wait())
+            .await
+            .is_err()
+        {
+            let _ = cleanup_runtime
+                .interrupt(TurnId::new(1), GenerationId::new(1))
+                .await;
+            writer_state.release();
+            drop(input);
+            let _ = timeout(TEST_TIMEOUT, session_task).await;
+            panic!("normal control saturation did not fail closed through active cleanup");
+        }
+        assert!(writer_state.blocked.is_set());
+
+        writer_state.release();
+        drop(input);
+        let result = timeout(TEST_TIMEOUT, session_task)
+            .await
+            .expect("saturated gateway session did not finish")
+            .unwrap();
+        assert!(result.is_err());
+        writer_state.dropped.wait().await;
+    }
+
+    #[tokio::test]
+    async fn continuous_normal_controls_do_not_starve_a_terminal_event() {
+        let (urgent_sender, urgent_receiver) = mpsc::channel(2);
+        let (normal_sender, normal_receiver) = mpsc::channel(4);
+        let (event_sender, event_receiver) = mpsc::channel(1);
+        normal_sender
+            .send(GatewayMessage::CommandAccepted {
+                request_id: "status-0".to_owned(),
+            })
+            .await
+            .unwrap();
+        event_sender
+            .send(GatewayMessage::RuntimeEvent {
+                event: ClientRuntimeEvent::TurnCancelled {
+                    turn_id: TurnId::new(1),
+                },
+            })
+            .await
+            .unwrap();
+        let normal_producer = tokio::spawn(async move {
+            for index in 1..16 {
+                normal_sender
+                    .send(GatewayMessage::CommandAccepted {
+                        request_id: format!("status-{index}"),
+                    })
+                    .await
+                    .unwrap();
+            }
+        });
+        drop(urgent_sender);
+        drop(event_sender);
+
+        let (writer, writer_state) = BlockingWriter::new(usize::MAX);
+        super::writer_loop(writer, urgent_receiver, normal_receiver, event_receiver)
+            .await
+            .unwrap();
+        normal_producer.await.unwrap();
+
+        let messages = decode_frames(&writer_state.bytes());
+        let terminal = message_index(&messages, is_terminal);
+        assert!(
+            terminal <= 2,
+            "terminal was starved behind {terminal} normal controls"
+        );
+    }
+
+    #[tokio::test]
     async fn stale_active_interrupt_is_accepted_before_fatal_cleanup() {
         let language = HoldOpenLanguageServer::completing().await;
         let runtime = runtime_for(language.endpoint());
@@ -862,6 +1030,11 @@ mod tests {
             .unwrap();
         writer.write_all(payload.as_bytes()).await.unwrap();
         writer.flush().await.unwrap();
+    }
+
+    fn append_command(output: &mut Vec<u8>, payload: &str) {
+        output.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        output.extend_from_slice(payload.as_bytes());
     }
 
     struct BlockingWriter {

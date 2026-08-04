@@ -327,6 +327,7 @@ pub fn decode_client_command(payload: &[u8]) -> Result<ClientCommand, ClientWire
 }
 
 pub fn encode_gateway_message(message: &GatewayMessage) -> Result<Vec<u8>, ClientWireError> {
+    validate_gateway_message(message)?;
     let encoded = serde_json::to_vec(&GatewayMessageEnvelope::from(message))
         .expect("client wire DTOs must serialize");
     validate_payload_size(encoded.len())?;
@@ -459,6 +460,43 @@ fn validate_payload_size(actual: usize) -> Result<(), ClientWireError> {
 fn validate_request_id(request_id: &str) -> Result<(), ClientWireError> {
     if request_id.is_empty() || request_id.len() > 64 {
         return Err(ClientWireError::InvalidRequestId);
+    }
+    Ok(())
+}
+
+fn validate_gateway_message(message: &GatewayMessage) -> Result<(), ClientWireError> {
+    match message {
+        GatewayMessage::CommandAccepted { request_id }
+        | GatewayMessage::CommandRejected { request_id, .. }
+        | GatewayMessage::Status { request_id, .. } => validate_request_id(request_id),
+        GatewayMessage::RuntimeEvent { event } => validate_client_runtime_event(event),
+        GatewayMessage::Ready { .. } | GatewayMessage::Fatal { .. } => Ok(()),
+    }
+}
+
+fn validate_client_runtime_event(event: &ClientRuntimeEvent) -> Result<(), ClientWireError> {
+    match event {
+        ClientRuntimeEvent::TurnStarted { turn_id }
+        | ClientRuntimeEvent::TextDelta { turn_id, .. }
+        | ClientRuntimeEvent::Timing { turn_id, .. }
+        | ClientRuntimeEvent::TurnCompleted { turn_id }
+        | ClientRuntimeEvent::TurnCancelled { turn_id }
+        | ClientRuntimeEvent::TurnFailed { turn_id, .. } => validate_turn_id(*turn_id),
+        ClientRuntimeEvent::QualityResolved { decision } => validate_turn_id(decision.turn_id),
+        ClientRuntimeEvent::MemoryRetrieved { trace } => {
+            validate_identifier(trace.trace_id.get())?;
+            validate_turn_id(trace.turn_id)
+        }
+    }
+}
+
+fn validate_turn_id(turn_id: TurnId) -> Result<(), ClientWireError> {
+    validate_identifier(turn_id.get())
+}
+
+fn validate_identifier(identifier: u64) -> Result<(), ClientWireError> {
+    if identifier == 0 {
+        return Err(ClientWireError::InvalidIdentifier);
     }
     Ok(())
 }

@@ -1,14 +1,38 @@
 use conversation_protocol::{
-    decode_client_command, encode_gateway_message, ClientCommand, ClientRuntimeEvent,
-    ContextSource, ConversationMode, ConversationSignal, FollowUpPolicy, GatewayMessage, MemoryId,
-    MemoryKind, MemoryRetrievalReason, MemoryRetrievalTrace, MemoryTraceExclusions,
-    MemoryTraceItem, PersonaLevel, QualityDecision, ResponseControls, RetrievalTraceId,
-    RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage, SilencePolicy, SpeechPace, TurnId,
-    UnixTimestampMillis, CLIENT_PROTOCOL_VERSION, MAX_CLIENT_FRAME_BYTES,
+    decode_client_command, encode_gateway_message, ClientCommand, ClientMemoryTrace,
+    ClientQualityDecision, ClientResponseControls, ClientRuntimeError, ClientRuntimeEvent,
+    ClientWireError, ContextSource, ConversationMode, ConversationSignal, FollowUpPolicy,
+    GatewayMessage, MemoryId, MemoryKind, MemoryRetrievalReason, MemoryRetrievalTrace,
+    MemoryTraceExclusions, MemoryTraceItem, PersonaLevel, QualityDecision, ResponseControls,
+    RetrievalTraceId, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage, RuntimeStatus,
+    SilencePolicy, SpeechPace, TurnId, UnixTimestampMillis, CLIENT_PROTOCOL_VERSION,
+    MAX_CLIENT_FRAME_BYTES,
 };
+use serde::{Deserialize, Deserializer};
 
 fn gateway_value(message: &GatewayMessage) -> serde_json::Value {
     serde_json::from_slice(&encode_gateway_message(message).unwrap()).unwrap()
+}
+
+fn status() -> RuntimeStatus {
+    RuntimeStatus {
+        transport: "stdio".to_owned(),
+        privacy_mode: "local_only".to_owned(),
+        language_location: "local".to_owned(),
+        model_id: "local-model".to_owned(),
+        memory_enabled: false,
+        memory_location: None,
+        telemetry_enabled: false,
+        capabilities: vec!["text".to_owned()],
+    }
+}
+
+fn runtime_error() -> ClientRuntimeError {
+    ClientRuntimeError {
+        kind: "invalid_state".to_owned(),
+        stage: "runtime".to_owned(),
+        message: "an active turn already exists".to_owned(),
+    }
 }
 
 #[test]
@@ -95,10 +119,19 @@ fn fixture_commands_and_events_parse_as_version_one_contracts() {
     }
 
     for (line_number, line) in events.lines().enumerate() {
-        let event: serde_json::Value = serde_json::from_str(line)
+        parse_event_fixture(line)
             .unwrap_or_else(|error| panic!("event fixture line {}: {error}", line_number + 1));
-        assert_eq!(event["protocol_version"], CLIENT_PROTOCOL_VERSION);
-        assert!(event["type"].is_string());
+    }
+}
+
+#[test]
+fn event_fixtures_reject_numeric_or_malformed_nested_identifiers() {
+    for payload in [
+        r#"{"protocol_version":1,"type":"runtime_event","event":{"type":"turn_started","turn_id":1}}"#,
+        r#"{"protocol_version":1,"type":"runtime_event","event":{"type":"quality_resolved","decision":{"turn_id":"0","mode":"direct_answer","controls":{"maximum_spoken_seconds":20,"directness":80,"pace":"natural","follow_up_policy":"contextual","silence_policy":"allow_without_filler"},"signals":[],"history_message_count":0,"context_sources":["saved_persona","current_turn"]}}}"#,
+        r#"{"protocol_version":1,"type":"runtime_event","event":{"type":"memory_retrieved","trace":{"trace_id":"01","turn_id":"1","selected_items":1,"used_bytes":12}}}"#,
+    ] {
+        assert!(parse_event_fixture(payload).is_err(), "{payload}");
     }
 }
 
@@ -200,4 +233,296 @@ fn encoded_messages_never_use_numeric_u64_ids_and_are_frame_bounded() {
         .unwrap(),
     };
     assert!(encode_gateway_message(&oversized).is_err());
+}
+
+#[test]
+fn outgoing_response_messages_reject_invalid_request_ids() {
+    for request_id in [String::new(), "r".repeat(65)] {
+        for message in [
+            GatewayMessage::CommandAccepted {
+                request_id: request_id.clone(),
+            },
+            GatewayMessage::CommandRejected {
+                request_id: request_id.clone(),
+                error: runtime_error(),
+            },
+            GatewayMessage::Status {
+                request_id: request_id.clone(),
+                status: status(),
+            },
+        ] {
+            assert!(matches!(
+                encode_gateway_message(&message),
+                Err(ClientWireError::InvalidRequestId)
+            ));
+        }
+    }
+}
+
+#[test]
+fn outgoing_events_reject_zero_turn_identifiers_in_every_wire_position() {
+    let zero_turn_id = TurnId::new(0);
+    let controls = ClientResponseControls {
+        maximum_spoken_seconds: 20,
+        directness: 80,
+        pace: "natural".to_owned(),
+        follow_up_policy: "contextual".to_owned(),
+        silence_policy: "allow_without_filler".to_owned(),
+    };
+    let messages = [
+        GatewayMessage::RuntimeEvent {
+            event: ClientRuntimeEvent::TurnStarted {
+                turn_id: zero_turn_id,
+            },
+        },
+        GatewayMessage::RuntimeEvent {
+            event: ClientRuntimeEvent::TextDelta {
+                turn_id: zero_turn_id,
+                delta: "hello".to_owned(),
+            },
+        },
+        GatewayMessage::RuntimeEvent {
+            event: ClientRuntimeEvent::Timing {
+                turn_id: zero_turn_id,
+                milestone: "first_text_delta".to_owned(),
+                elapsed_ms: 42,
+            },
+        },
+        GatewayMessage::RuntimeEvent {
+            event: ClientRuntimeEvent::TurnCompleted {
+                turn_id: zero_turn_id,
+            },
+        },
+        GatewayMessage::RuntimeEvent {
+            event: ClientRuntimeEvent::TurnCancelled {
+                turn_id: zero_turn_id,
+            },
+        },
+        GatewayMessage::RuntimeEvent {
+            event: ClientRuntimeEvent::TurnFailed {
+                turn_id: zero_turn_id,
+                error: runtime_error(),
+            },
+        },
+        GatewayMessage::RuntimeEvent {
+            event: ClientRuntimeEvent::QualityResolved {
+                decision: ClientQualityDecision {
+                    turn_id: zero_turn_id,
+                    mode: "direct_answer".to_owned(),
+                    controls,
+                    signals: Vec::new(),
+                    history_message_count: 0,
+                    context_sources: vec!["current_turn".to_owned()],
+                },
+            },
+        },
+        GatewayMessage::RuntimeEvent {
+            event: ClientRuntimeEvent::MemoryRetrieved {
+                trace: ClientMemoryTrace {
+                    trace_id: RetrievalTraceId::new(1).unwrap(),
+                    turn_id: zero_turn_id,
+                    selected_items: 0,
+                    used_bytes: 0,
+                },
+            },
+        },
+    ];
+
+    for message in messages {
+        assert!(matches!(
+            encode_gateway_message(&message),
+            Err(ClientWireError::InvalidIdentifier)
+        ));
+    }
+}
+
+fn parse_event_fixture(payload: &str) -> Result<(), String> {
+    let message: FixtureGatewayMessage =
+        serde_json::from_str(payload).map_err(|error| error.to_string())?;
+    if message.protocol_version() != CLIENT_PROTOCOL_VERSION {
+        return Err("unsupported protocol version".to_owned());
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[allow(dead_code)]
+enum FixtureGatewayMessage {
+    Ready {
+        protocol_version: u64,
+        status: FixtureRuntimeStatus,
+    },
+    CommandAccepted {
+        protocol_version: u64,
+        request_id: FixtureRequestId,
+    },
+    CommandRejected {
+        protocol_version: u64,
+        request_id: FixtureRequestId,
+        error: FixtureRuntimeError,
+    },
+    Status {
+        protocol_version: u64,
+        request_id: FixtureRequestId,
+        status: FixtureRuntimeStatus,
+    },
+    RuntimeEvent {
+        protocol_version: u64,
+        event: FixtureRuntimeEvent,
+    },
+    Fatal {
+        protocol_version: u64,
+        error: FixtureRuntimeError,
+    },
+}
+
+impl FixtureGatewayMessage {
+    fn protocol_version(&self) -> u64 {
+        match self {
+            Self::Ready {
+                protocol_version, ..
+            }
+            | Self::CommandAccepted {
+                protocol_version, ..
+            }
+            | Self::CommandRejected {
+                protocol_version, ..
+            }
+            | Self::Status {
+                protocol_version, ..
+            }
+            | Self::RuntimeEvent {
+                protocol_version, ..
+            }
+            | Self::Fatal {
+                protocol_version, ..
+            } => *protocol_version,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct FixtureRuntimeStatus {
+    transport: String,
+    privacy_mode: String,
+    language_location: String,
+    model_id: String,
+    memory_enabled: bool,
+    memory_location: Option<String>,
+    telemetry_enabled: bool,
+    capabilities: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct FixtureRuntimeError {
+    kind: String,
+    stage: String,
+    message: String,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[allow(dead_code)]
+enum FixtureRuntimeEvent {
+    TurnStarted {
+        turn_id: FixtureIdentifier,
+    },
+    QualityResolved {
+        decision: FixtureQualityDecision,
+    },
+    MemoryRetrieved {
+        trace: FixtureMemoryTrace,
+    },
+    TextDelta {
+        turn_id: FixtureIdentifier,
+        delta: String,
+    },
+    Timing {
+        turn_id: FixtureIdentifier,
+        milestone: String,
+        elapsed_ms: u64,
+    },
+    TurnCompleted {
+        turn_id: FixtureIdentifier,
+    },
+    TurnCancelled {
+        turn_id: FixtureIdentifier,
+    },
+    TurnFailed {
+        turn_id: FixtureIdentifier,
+        error: FixtureRuntimeError,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct FixtureQualityDecision {
+    turn_id: FixtureIdentifier,
+    mode: String,
+    controls: FixtureResponseControls,
+    signals: Vec<String>,
+    history_message_count: usize,
+    context_sources: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct FixtureResponseControls {
+    maximum_spoken_seconds: u16,
+    directness: u8,
+    pace: String,
+    follow_up_policy: String,
+    silence_policy: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct FixtureMemoryTrace {
+    trace_id: FixtureIdentifier,
+    turn_id: FixtureIdentifier,
+    selected_items: usize,
+    used_bytes: usize,
+}
+
+struct FixtureRequestId;
+
+impl<'de> Deserialize<'de> for FixtureRequestId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        if value.is_empty() || value.len() > 64 {
+            return Err(serde::de::Error::custom("invalid request identifier"));
+        }
+        Ok(Self)
+    }
+}
+
+struct FixtureIdentifier;
+
+impl<'de> Deserialize<'de> for FixtureIdentifier {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        if value.is_empty()
+            || value == "0"
+            || value.starts_with('0')
+            || !value.bytes().all(|byte| byte.is_ascii_digit())
+            || value.parse::<u64>().is_err()
+        {
+            return Err(serde::de::Error::custom("invalid decimal identifier"));
+        }
+        Ok(Self)
+    }
 }

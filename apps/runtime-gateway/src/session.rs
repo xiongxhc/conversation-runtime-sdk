@@ -46,8 +46,8 @@ impl GatewaySession {
         ));
         let mut active: Option<ActiveForwarder> = None;
 
-        let exit = if let Err(error) = send_normal(
-            &normal_sender,
+        let exit = if let Err(error) = send_urgent(
+            &urgent_sender,
             GatewayMessage::Ready {
                 status: self.status.clone(),
             },
@@ -210,7 +210,8 @@ impl GatewaySession {
                     generation_id,
                     event_stream,
                 ));
-                send_accepted(normal, &request_id).map_err(CommandFailure::response)?;
+                send_urgent(urgent, accepted_message(&request_id))
+                    .map_err(CommandFailure::response)?;
                 active
                     .as_mut()
                     .expect("accepted text turn remains active")
@@ -739,6 +740,62 @@ mod tests {
         assert!(interrupt_accepted < terminal);
     }
 
+    #[tokio::test]
+    async fn start_acceptance_precedes_turn_started_when_both_are_queued() {
+        let language = HoldOpenLanguageServer::start().await;
+        let session = GatewaySession::new(runtime_for(language.endpoint()), status());
+        let (mut input, reader) = duplex(4096);
+        let (writer, writer_state) = ReadyFlushBlockingWriter::new();
+        let session_task = tokio::spawn(session.run(reader, writer));
+
+        timeout(TEST_TIMEOUT, writer_state.blocked.wait())
+            .await
+            .expect("gateway writer did not block while flushing ready");
+        write_command(
+            &mut input,
+            r#"{"protocol_version":1,"type":"start_turn","request_id":"start-tie","turn_id":"1","transcript":"fixture start tie"}"#,
+        )
+        .await;
+        timeout(TEST_TIMEOUT, language.request_started.wait())
+            .await
+            .expect("fake language request never started while output was blocked");
+        tokio::task::yield_now().await;
+        assert!(!writer_state.released.load(Ordering::SeqCst));
+
+        writer_state.release();
+        timeout(
+            TEST_TIMEOUT,
+            writer_state.wait_for_bytes(r#""request_id":"start-tie""#),
+        )
+        .await
+        .expect("start acceptance was not written after output resumed");
+        timeout(
+            TEST_TIMEOUT,
+            writer_state.wait_for_bytes(r#""type":"turn_started""#),
+        )
+        .await
+        .expect("turn_started was not written after output resumed");
+        drop(input);
+        timeout(TEST_TIMEOUT, session_task)
+            .await
+            .expect("gateway session did not clean up after start-order test")
+            .unwrap()
+            .unwrap();
+        timeout(TEST_TIMEOUT, language.connection_reaped.wait())
+            .await
+            .expect("start-order test did not reap its language request");
+
+        let messages = decode_frames(&writer_state.bytes());
+        let accepted = message_index(&messages, |message| {
+            message_type(message) == "command_accepted"
+                && message.contains(r#""request_id":"start-tie""#)
+        });
+        let started = message_index(&messages, |message| {
+            message.contains(r#""type":"turn_started""#)
+        });
+        assert!(accepted < started);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn fatal_framing_aborts_and_reaps_a_blocked_writer_after_the_deadline() {
         let session = GatewaySession::new(unused_runtime(), status());
@@ -1132,6 +1189,92 @@ mod tests {
 
         fn resolve(&self, resolution: u8) {
             self.resolution.store(resolution, Ordering::SeqCst);
+            if let Some(waker) = self.waker.lock().unwrap().take() {
+                waker.wake();
+            }
+        }
+
+        fn bytes(&self) -> Vec<u8> {
+            self.bytes.lock().unwrap().clone()
+        }
+
+        async fn wait_for_bytes(&self, expected: &str) {
+            loop {
+                let notified = self.write_notify.notified();
+                if String::from_utf8_lossy(&self.bytes()).contains(expected) {
+                    return;
+                }
+                notified.await;
+            }
+        }
+    }
+
+    struct ReadyFlushBlockingWriter {
+        state: Arc<ReadyFlushBlockingWriterState>,
+    }
+
+    struct ReadyFlushBlockingWriterState {
+        bytes: StdMutex<Vec<u8>>,
+        blocked: Condition,
+        released: AtomicBool,
+        waker: StdMutex<Option<Waker>>,
+        write_notify: Notify,
+    }
+
+    impl ReadyFlushBlockingWriter {
+        fn new() -> (Self, Arc<ReadyFlushBlockingWriterState>) {
+            let state = Arc::new(ReadyFlushBlockingWriterState {
+                bytes: StdMutex::new(Vec::new()),
+                blocked: Condition::default(),
+                released: AtomicBool::new(false),
+                waker: StdMutex::new(None),
+                write_notify: Notify::new(),
+            });
+            (
+                Self {
+                    state: Arc::clone(&state),
+                },
+                state,
+            )
+        }
+    }
+
+    impl AsyncWrite for ReadyFlushBlockingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.state.bytes.lock().unwrap().extend_from_slice(bytes);
+            self.state.write_notify.notify_waiters();
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if !self.state.released.load(Ordering::SeqCst) {
+                self.state.blocked.set();
+                *self.state.waker.lock().unwrap() = Some(context.waker().clone());
+                if !self.state.released.load(Ordering::SeqCst) {
+                    return Poll::Pending;
+                }
+            }
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl ReadyFlushBlockingWriterState {
+        fn release(&self) {
+            self.released.store(true, Ordering::SeqCst);
             if let Some(waker) = self.waker.lock().unwrap().take() {
                 waker.wake();
             }

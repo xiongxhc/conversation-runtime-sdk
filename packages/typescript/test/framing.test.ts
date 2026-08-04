@@ -64,7 +64,7 @@ test("decodes a maximal frame delivered one byte at a time", { timeout: 5_000 },
 test("compacts consumed chunks during sustained misaligned frame traffic", () => {
   const decoder = new FrameDecoder();
   const frames = Array.from({ length: 4_097 }, (_, index) => encodeFrame(new Uint8Array([index % 256])));
-  const metric = decoder as unknown as { retainedChunkCount(): number };
+  const metric = decoder as unknown as { retainedStorageChunkCount(): number };
 
   decoder.push(frames[0]!.subarray(0, 1));
   for (let index = 0; index < 4_096; index += 1) {
@@ -74,6 +74,6 @@ test("compacts consumed chunks during sustained misaligned frame traffic", () =>
     chunk.set(current.subarray(1));
     chunk.set(next.subarray(0, 1), current.length - 1);
     decoder.push(chunk);
-    assert.ok(metric.retainedChunkCount() <= 1_024);
+    assert.ok(metric.retainedStorageChunkCount() <= 1_024);
   }
 });

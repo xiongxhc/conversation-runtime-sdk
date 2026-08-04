@@ -39,8 +39,8 @@ export class FrameDecoder {
     }
   }
 
-  private retainedChunkCount(): number {
-    return this.chunks.length - this.head;
+  private retainedStorageChunkCount(): number {
+    return this.chunks.length;
   }
 
   private peekLength(): number {

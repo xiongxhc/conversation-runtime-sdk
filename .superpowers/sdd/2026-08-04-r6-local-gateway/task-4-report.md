@@ -54,3 +54,48 @@ Results:
 ## Concerns
 
 - No concerns within Task 4 scope.
+
+## Fix Round 1 — Local Proxy and Config-Path Hardening
+
+### RED
+
+The new focused gateway run failed before implementation because a FIFO blocked
+configuration loading and a leaf symlink was followed:
+
+```text
+test rejects_a_fifo_configuration_before_opening_it ... FAILED
+test rejects_a_leaf_configuration_symlink_before_reading_its_target ... FAILED
+```
+
+The new adapter regression failed to compile before implementation because the
+required direct constructor was absent:
+
+```text
+no associated function or constant named `new_direct` found for struct `OllamaLanguageModel`
+```
+
+### Resolution
+
+- Added public `OllamaLanguageModel::new_direct`, which uses
+  `reqwest::ClientBuilder::no_proxy()` while preserving `new` unchanged for
+  existing consumers.
+- Gateway adapter construction uses only `new_direct`, so local-only prompts
+  cannot use `HTTP_PROXY`, `http_proxy`, `ALL_PROXY`, or `all_proxy`.
+- Gateway configuration now calls `symlink_metadata` before opening and accepts
+  only a regular, non-symlink leaf; Unix regression tests cover a leaf symlink
+  and FIFO.
+- The missing-memory test now proves rejection does not create the absent path.
+
+### GREEN
+
+- `cargo test --locked -p conversation-runtime-gateway --test config --test framing -- --test-threads=1` passed: 24 tests.
+- `cargo test --locked -p conversation-model-adapters --test ollama -- --test-threads=1` passed: 27 tests.
+- `cargo fmt --all -- --check` passed.
+- `cargo clippy --locked -p conversation-runtime-gateway --tests -- -D warnings` passed.
+- `cargo clippy --locked -p conversation-model-adapters --test ollama -- -D warnings` passed.
+- `git diff --check` passed.
+
+### Environment Note
+
+- The adapter suite requires loopback fixture binding and therefore ran outside
+  the filesystem sandbox after its restricted run failed with `PermissionDenied`.

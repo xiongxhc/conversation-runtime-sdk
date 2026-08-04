@@ -1,4 +1,5 @@
 use std::fmt;
+use std::fs;
 use std::io::Read;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -110,7 +111,7 @@ impl GatewayConfig {
         let memory = self.memory.as_ref().map(memory_provider).transpose()?;
 
         Ok(GatewayAdapters {
-            language: OllamaLanguageModel::new(language),
+            language: OllamaLanguageModel::new_direct(language),
             quality: ConversationQualityController::new(
                 persona,
                 controls,
@@ -125,8 +126,21 @@ fn load_toml(path: &Path) -> Result<GatewayConfig, GatewayConfigError> {
     if !path.is_absolute() {
         return Err(config_error("gateway configuration path must be absolute"));
     }
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => {
+            return Err(config_error(
+                "gateway configuration path must be a regular file and not a symbolic link",
+            ));
+        }
+        Err(_) => {
+            return Err(config_error(
+                "gateway configuration file could not be opened",
+            ));
+        }
+    }
 
-    let file = std::fs::File::open(path)
+    let file = fs::File::open(path)
         .map_err(|_| config_error("gateway configuration file could not be opened"))?;
     let mut contents = Vec::new();
     file.take(MAX_CONFIG_BYTES + 1)

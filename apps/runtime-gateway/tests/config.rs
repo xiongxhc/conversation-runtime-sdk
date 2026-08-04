@@ -165,6 +165,7 @@ fn rejects_a_missing_memory_database() {
     let path = write_config(fixture.path(), &memory_config(&database));
 
     assert!(GatewayConfig::load(&path).is_err());
+    assert!(!database.exists());
 }
 
 #[test]
@@ -175,6 +176,42 @@ fn rejects_an_uninitialized_memory_database() {
     let path = write_config(fixture.path(), &memory_config(&database));
 
     assert!(GatewayConfig::load(&path).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_a_leaf_configuration_symlink_before_reading_its_target() {
+    let fixture = tempfile::tempdir().unwrap();
+    let target = fixture.path().join("target.toml");
+    std::fs::write(&target, VALID_CONFIG).unwrap();
+    let link = fixture.path().join("gateway.toml");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    assert!(GatewayConfig::load(&link).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_a_fifo_configuration_before_opening_it() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let fixture = tempfile::tempdir().unwrap();
+    let fifo = fixture.path().join("gateway.toml");
+    assert!(std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap()
+        .success());
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let loader_path = fifo.clone();
+    std::thread::spawn(move || {
+        sender
+            .send(GatewayConfig::load(&loader_path).is_err())
+            .unwrap();
+    });
+
+    assert_eq!(receiver.recv_timeout(Duration::from_millis(100)), Ok(true));
 }
 
 fn memory_config(database: &Path) -> String {

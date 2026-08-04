@@ -165,8 +165,16 @@ pub struct OllamaLanguageModel {
 
 impl OllamaLanguageModel {
     pub fn new(config: OllamaConfig) -> Self {
+        Self::with_client(config, reqwest::Client::builder())
+    }
+
+    pub fn new_direct(config: OllamaConfig) -> Self {
+        Self::with_client(config, reqwest::Client::builder().no_proxy())
+    }
+
+    fn with_client(config: OllamaConfig, builder: reqwest::ClientBuilder) -> Self {
         Self {
-            client: reqwest::Client::builder()
+            client: builder
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("Ollama HTTP client configuration is valid"),

@@ -1,20 +1,85 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use conversation_model_adapters::{
-    LanguageModel, LanguageModelInput, LanguageModelRequest, OllamaConfig, OllamaLanguageModel,
-    OllamaThinkingLevel,
+    GenerationLanguageRequest, LanguageModel, LanguageModelInput, LanguageModelRequest,
+    OllamaConfig, OllamaLanguageModel, OllamaThinkingLevel,
 };
 use conversation_protocol::{
-    ContextSource, ConversationMessage, ConversationMode, ConversationRole, MemoryContextItem,
-    MemoryId, MemoryKind, MemoryRetrievalReason, QualityDecision, ResponseControls, TurnId,
+    ContextSource, ConversationMessage, ConversationMode, ConversationRole, GenerationId,
+    MemoryContextItem, MemoryId, MemoryKind, MemoryRetrievalReason, QualityDecision,
+    ResponseControls, TurnId,
 };
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
+
+#[tokio::test]
+async fn generation_language_stream_preserves_turn_and_generation_identity() {
+    let server = FakeOllamaServer::streaming([
+        r#"{"message":{"role":"assistant","content":"hello"},"done":false}"#,
+        r#"{"message":{"role":"assistant","content":""},"done":true}"#,
+    ])
+    .await;
+    let model = OllamaLanguageModel::new(
+        OllamaConfig::new("test-model")
+            .unwrap()
+            .with_endpoint(server.endpoint())
+            .unwrap(),
+    );
+    let request = GenerationLanguageRequest::new(TurnId::new(7), GenerationId::new(11), "hello");
+    let mut deltas = conversation_model_adapters::GenerationLanguageModel::stream(
+        &model,
+        request,
+        CancellationToken::new(),
+    );
+
+    let delta = deltas.recv().await.unwrap().unwrap();
+
+    assert_eq!(delta.turn_id(), TurnId::new(7));
+    assert_eq!(delta.generation_id(), GenerationId::new(11));
+    assert_eq!(delta.delta(), "hello");
+    assert!(deltas.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn generation_language_cancellation_reaps_the_inner_request_before_closing() {
+    let server = FakeOllamaServer::delayed_streaming(
+        [
+            r#"{"message":{"role":"assistant","content":"hello"},"done":false}"#,
+            r#"{"message":{"role":"assistant","content":" world"},"done":false}"#,
+        ],
+        Duration::from_secs(1),
+    )
+    .await;
+    let model = OllamaLanguageModel::new(
+        OllamaConfig::new("test-model")
+            .unwrap()
+            .with_endpoint(server.endpoint())
+            .unwrap(),
+    );
+    let cancellation = CancellationToken::new();
+    let mut deltas = conversation_model_adapters::GenerationLanguageModel::stream(
+        &model,
+        GenerationLanguageRequest::new(TurnId::new(7), GenerationId::new(11), "hello"),
+        cancellation.clone(),
+    );
+
+    assert_eq!(deltas.recv().await.unwrap().unwrap().delta(), "hello");
+    cancellation.cancel();
+
+    timeout(Duration::from_millis(100), server.connection_reaped())
+        .await
+        .unwrap();
+    assert!(timeout(Duration::from_millis(100), deltas.recv())
+        .await
+        .unwrap()
+        .is_none());
+}
 
 #[tokio::test]
 async fn streams_chat_content_and_serializes_the_request() {
@@ -764,6 +829,7 @@ struct FakeOllamaServer {
     endpoint: String,
     request: Arc<Mutex<Option<Value>>>,
     request_target: Arc<Mutex<Option<String>>>,
+    connection_reaped: Arc<ConnectionReaped>,
 }
 
 impl FakeOllamaServer {
@@ -837,10 +903,13 @@ impl FakeOllamaServer {
         let stored_request = request.clone();
         let request_target = Arc::new(Mutex::new(None));
         let stored_request_target = request_target.clone();
+        let connection_reaped = Arc::new(ConnectionReaped::default());
+        let stored_connection_reaped = connection_reaped.clone();
 
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let (request_json, target) = read_request_json(stream, response).await;
+            let (request_json, target) =
+                read_request_json(stream, response, stored_connection_reaped).await;
             *stored_request.lock().await = Some(request_json);
             *stored_request_target.lock().await = Some(target);
         });
@@ -849,6 +918,7 @@ impl FakeOllamaServer {
             endpoint,
             request,
             request_target,
+            connection_reaped,
         }
     }
 
@@ -871,6 +941,36 @@ impl FakeOllamaServer {
     async fn request_received(&self) -> bool {
         self.request.lock().await.is_some()
     }
+
+    async fn connection_reaped(&self) {
+        self.connection_reaped.wait().await;
+    }
+}
+
+#[derive(Default)]
+struct ConnectionReaped {
+    observed: AtomicBool,
+    notify: Notify,
+}
+
+impl ConnectionReaped {
+    fn observe(&self) {
+        self.observed.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    async fn wait(&self) {
+        loop {
+            if self.observed.load(Ordering::Acquire) {
+                return;
+            }
+            let notified = self.notify.notified();
+            if self.observed.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 enum Response {
@@ -887,7 +987,11 @@ enum Response {
     },
 }
 
-async fn read_request_json(mut stream: TcpStream, response: Response) -> (Value, String) {
+async fn read_request_json(
+    mut stream: TcpStream,
+    response: Response,
+    connection_reaped: Arc<ConnectionReaped>,
+) -> (Value, String) {
     let mut request = Vec::new();
     let mut buffer = [0_u8; 1024];
     let header_end = loop {
@@ -937,10 +1041,19 @@ async fn read_request_json(mut stream: TcpStream, response: Response) -> (Value,
 
             for (index, chunk) in chunks.iter().enumerate() {
                 if index > 0 && !delay.is_zero() {
-                    sleep(delay).await;
+                    tokio::select! {
+                        _ = sleep(delay) => {}
+                        _ = wait_for_connection_close(&mut stream) => {
+                            connection_reaped.observe();
+                            return (request_json, request_target);
+                        }
+                    }
                 }
 
-                stream.write_all(chunk).await.unwrap();
+                if stream.write_all(chunk).await.is_err() {
+                    connection_reaped.observe();
+                    return (request_json, request_target);
+                }
             }
         }
         Response::Failure { status, body } => {
@@ -959,6 +1072,16 @@ async fn read_request_json(mut stream: TcpStream, response: Response) -> (Value,
     }
 
     (request_json, request_target)
+}
+
+async fn wait_for_connection_close(stream: &mut TcpStream) {
+    let mut buffer = [0_u8; 1];
+    loop {
+        match stream.read(&mut buffer).await {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+    }
 }
 
 fn find_header_end(request: &[u8]) -> Option<usize> {

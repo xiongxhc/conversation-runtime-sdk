@@ -3,11 +3,15 @@ use std::borrow::Cow;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::{AdapterError, LanguageModel, LanguageModelRequest};
+use crate::{
+    AdapterError, GenerationLanguageModel, GenerationLanguageRequest, GenerationTextDelta,
+    LanguageModel, LanguageModelRequest,
+};
 
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:11434";
 const DEFAULT_TEMPERATURE: f32 = 0.7;
 const STREAM_BUFFER_SIZE: usize = 16;
+const GENERATION_STREAM_BUFFER_SIZE: usize = 32;
 const MAX_NDJSON_RECORD_BYTES: usize = 64 * 1024;
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_MAX_ASSISTANT_CONTENT_BYTES: usize = 64 * 1024;
@@ -271,6 +275,58 @@ impl LanguageModel for OllamaLanguageModel {
     ) -> mpsc::Receiver<Result<String, AdapterError>> {
         self.stream_chat(request, cancellation)
             .into_delta_receiver()
+    }
+}
+
+impl GenerationLanguageModel for OllamaLanguageModel {
+    fn stream(
+        &self,
+        request: GenerationLanguageRequest,
+        cancellation: CancellationToken,
+    ) -> mpsc::Receiver<Result<GenerationTextDelta, AdapterError>> {
+        let (sender, receiver) = mpsc::channel(GENERATION_STREAM_BUFFER_SIZE);
+        let turn_id = request.turn_id();
+        let generation_id = request.generation_id();
+        let language_request =
+            match LanguageModelRequest::from_input(turn_id, request.input().clone()) {
+                Ok(request) => request,
+                Err(error) => {
+                    let _ = sender.try_send(Err(error));
+                    return receiver;
+                }
+            };
+        let mut deltas = LanguageModel::stream(self, language_request, cancellation.clone());
+
+        tokio::spawn(async move {
+            loop {
+                let delta = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => {
+                        while deltas.recv().await.is_some() {}
+                        return;
+                    }
+                    delta = deltas.recv() => delta,
+                };
+                let Some(delta) = delta else {
+                    return;
+                };
+                let tagged =
+                    delta.map(|delta| GenerationTextDelta::new(turn_id, generation_id, delta));
+                let sent = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => {
+                        while deltas.recv().await.is_some() {}
+                        return;
+                    }
+                    sent = sender.send(tagged) => sent,
+                };
+                if sent.is_err() {
+                    return;
+                }
+            }
+        });
+
+        receiver
     }
 }
 

@@ -4,12 +4,11 @@ use std::sync::Arc;
 
 use conversation_memory::{SqliteMemoryContextProvider, SqliteMemoryStore, SystemMemoryClock};
 use conversation_model_adapters::{
-    AdapterError, BufferedStreamingSpeechSynthesizer, GenerationLanguageModel,
-    GenerationLanguageRequest, GenerationTextDelta, LanguageModel, LanguageModelRequest,
-    MacOsVoiceSidecar, MacOsVoiceSidecarConfig, OllamaConfig, OllamaLanguageModel,
-    OpenAiCompatibleSpeechConfig, OpenAiCompatibleSpeechSynthesizer,
-    OpenAiCompatibleStreamingSpeechConfig, OpenAiCompatibleStreamingSpeechSynthesizer,
-    SpeechSynthesizer, StreamingSpeechSynthesizer, SystemDevice,
+    AdapterError, BufferedStreamingSpeechSynthesizer, MacOsVoiceSidecar, MacOsVoiceSidecarConfig,
+    OllamaConfig, OllamaLanguageModel, OpenAiCompatibleSpeechConfig,
+    OpenAiCompatibleSpeechSynthesizer, OpenAiCompatibleStreamingSpeechConfig,
+    OpenAiCompatibleStreamingSpeechSynthesizer, SpeechSynthesizer, StreamingSpeechSynthesizer,
+    SystemDevice,
 };
 use conversation_protocol::{
     ComponentDescriptor, ComponentKind, ConversationMode, ExecutionLocation, FollowUpPolicy,
@@ -19,14 +18,11 @@ use conversation_protocol::{
 };
 use conversation_runtime::{ConversationQualityController, VoiceSessionAdapters};
 use serde::Deserialize;
-use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 
 use crate::config_file::load_toml;
 
 const SPEECH_START_MS: std::ops::RangeInclusive<u64> = 100..=1_000;
 const FINAL_SILENCE_MS: std::ops::RangeInclusive<u64> = 200..=3_000;
-const GENERATION_BUFFER_SIZE: usize = 16;
 const BUNDLED_SIDECAR_NAME: &str = "conversation-voice-sidecar";
 
 #[derive(Debug, Deserialize)]
@@ -393,7 +389,7 @@ impl SessionConfig {
     pub fn adapters(&self) -> Result<VoiceSessionAdapters, String> {
         let memory_provider = self.memory_provider()?;
         self.require_local_execution_adapters()?;
-        let language_model = Arc::new(IdentityTaggedLanguageModel::new(self.language_model()?));
+        let language_model = Arc::new(self.language_model()?);
         self.validate_speech_mode()?;
         let speech_synthesizer: Arc<dyn StreamingSpeechSynthesizer> = match self.speech.mode {
             SpeechMode::Buffered => {
@@ -734,62 +730,4 @@ fn validate_http_endpoint(
         }
     }
     Ok(())
-}
-
-#[derive(Clone)]
-struct IdentityTaggedLanguageModel {
-    inner: OllamaLanguageModel,
-}
-
-impl IdentityTaggedLanguageModel {
-    const fn new(inner: OllamaLanguageModel) -> Self {
-        Self { inner }
-    }
-}
-
-impl GenerationLanguageModel for IdentityTaggedLanguageModel {
-    fn stream(
-        &self,
-        request: GenerationLanguageRequest,
-        cancellation: CancellationToken,
-    ) -> mpsc::Receiver<Result<GenerationTextDelta, AdapterError>> {
-        let (sender, receiver) = mpsc::channel(GENERATION_BUFFER_SIZE);
-        let turn_id = request.turn_id();
-        let generation_id = request.generation_id();
-        let language_request =
-            match LanguageModelRequest::from_input(turn_id, request.input().clone()) {
-                Ok(request) => request,
-                Err(error) => {
-                    let _ = sender.try_send(Err(error));
-                    return receiver;
-                }
-            };
-        let mut deltas = self.inner.stream(language_request, cancellation.clone());
-
-        tokio::spawn(async move {
-            loop {
-                let delta = tokio::select! {
-                    biased;
-                    _ = cancellation.cancelled() => return,
-                    delta = deltas.recv() => delta,
-                };
-                let Some(delta) = delta else {
-                    return;
-                };
-                let tagged =
-                    delta.map(|delta| GenerationTextDelta::new(turn_id, generation_id, delta));
-                tokio::select! {
-                    biased;
-                    _ = cancellation.cancelled() => return,
-                    result = sender.send(tagged) => {
-                        if result.is_err() {
-                            return;
-                        }
-                    }
-                }
-            }
-        });
-
-        receiver
-    }
 }

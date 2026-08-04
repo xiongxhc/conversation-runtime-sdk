@@ -1,7 +1,5 @@
-use std::ffi::{OsStr, OsString};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use conversation_model_adapters::{
@@ -16,9 +14,12 @@ use conversation_protocol::{
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::process::Command;
 use tokio::sync::{Mutex, Notify};
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
+
+const DIRECT_PROXY_TEST_CHILD: &str = "CONVERSATION_OLLAMA_DIRECT_PROXY_TEST_CHILD";
 
 #[tokio::test]
 async fn generation_language_stream_preserves_turn_and_generation_identity() {
@@ -112,19 +113,32 @@ async fn streams_chat_content_and_serializes_the_request() {
 
 #[tokio::test]
 async fn direct_constructor_bypasses_system_http_proxies() {
-    let _environment_lock = environment_lock().lock().await;
     let proxy = FakeOllamaServer::streaming([
         r#"{"message":{"role":"assistant","content":"proxy"},"done":true}"#,
     ])
     .await;
-    let _environment = ScopedEnvironment::set([
-        ("HTTP_PROXY", proxy.endpoint()),
-        ("http_proxy", proxy.endpoint()),
-        ("ALL_PROXY", proxy.endpoint()),
-        ("all_proxy", proxy.endpoint()),
-        ("NO_PROXY", ""),
-        ("no_proxy", ""),
-    ]);
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "direct_constructor_proxy_child"])
+        .env(DIRECT_PROXY_TEST_CHILD, "1")
+        .env("HTTP_PROXY", proxy.endpoint())
+        .env("http_proxy", proxy.endpoint())
+        .env("ALL_PROXY", proxy.endpoint())
+        .env("all_proxy", proxy.endpoint())
+        .env("NO_PROXY", "")
+        .env("no_proxy", "")
+        .output()
+        .await
+        .unwrap();
+
+    assert!(child.status.success());
+    assert!(!proxy.request_received().await);
+}
+
+#[tokio::test]
+async fn direct_constructor_proxy_child() {
+    if std::env::var_os(DIRECT_PROXY_TEST_CHILD).is_none() {
+        return;
+    }
     let model = OllamaLanguageModel::new_direct(
         OllamaConfig::new("test-model")
             .unwrap()
@@ -138,7 +152,6 @@ async fn direct_constructor_bypasses_system_http_proxies() {
     );
 
     sleep(Duration::from_millis(100)).await;
-    assert!(!proxy.request_received().await);
     cancellation.cancel();
     assert!(timeout(Duration::from_millis(100), output.recv())
         .await
@@ -1127,36 +1140,4 @@ fn find_header_end(request: &[u8]) -> Option<usize> {
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
         .map(|position| position + 4)
-}
-
-fn environment_lock() -> &'static tokio::sync::Mutex<()> {
-    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
-}
-
-struct ScopedEnvironment {
-    previous: Vec<(&'static str, Option<OsString>)>,
-}
-
-impl ScopedEnvironment {
-    fn set<'a>(values: impl IntoIterator<Item = (&'static str, &'a str)>) -> Self {
-        let mut previous = Vec::new();
-        for (name, value) in values {
-            previous.push((name, std::env::var_os(name)));
-            std::env::set_var(name, OsStr::new(value));
-        }
-        Self { previous }
-    }
-}
-
-impl Drop for ScopedEnvironment {
-    fn drop(&mut self) {
-        for (name, value) in self.previous.drain(..).rev() {
-            if let Some(value) = value {
-                std::env::set_var(name, value);
-            } else {
-                std::env::remove_var(name);
-            }
-        }
-    }
 }

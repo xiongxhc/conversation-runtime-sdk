@@ -1,3 +1,4 @@
+mod client_wire;
 mod command;
 mod error;
 mod event;
@@ -7,6 +8,12 @@ mod privacy;
 mod quality;
 mod voice_event;
 
+pub use client_wire::{
+    decode_client_command, encode_gateway_message, ClientCommand, ClientMemoryTrace,
+    ClientQualityDecision, ClientResponseControls, ClientRuntimeError, ClientRuntimeEvent,
+    ClientWireError, GatewayMessage, RuntimeStatus, CLIENT_PROTOCOL_VERSION,
+    MAX_CLIENT_FRAME_BYTES,
+};
 pub use command::RuntimeCommand;
 pub use error::{RuntimeError, RuntimeErrorKind, RuntimeStage};
 pub use event::{RuntimeEvent, RuntimeTimingMilestone};

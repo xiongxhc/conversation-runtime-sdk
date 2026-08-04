@@ -1,0 +1,13 @@
+{"protocol_version":1,"type":"ready","status":{"transport":"stdio","privacy_mode":"local_only","language_location":"local","model_id":"local-model","memory_enabled":false,"memory_location":null,"telemetry_enabled":false,"capabilities":["text"]}}
+{"protocol_version":1,"type":"command_accepted","request_id":"req-status-1"}
+{"protocol_version":1,"type":"command_rejected","request_id":"req-start-1","error":{"kind":"invalid_state","stage":"runtime","message":"an active turn already exists"}}
+{"protocol_version":1,"type":"status","request_id":"req-status-1","status":{"transport":"stdio","privacy_mode":"local_only","language_location":"local","model_id":"local-model","memory_enabled":false,"memory_location":null,"telemetry_enabled":false,"capabilities":["text"]}}
+{"protocol_version":1,"type":"runtime_event","event":{"type":"turn_started","turn_id":"1"}}
+{"protocol_version":1,"type":"runtime_event","event":{"type":"quality_resolved","decision":{"turn_id":"1","mode":"direct_answer","controls":{"maximum_spoken_seconds":20,"directness":80,"pace":"natural","follow_up_policy":"contextual","silence_policy":"allow_without_filler"},"signals":[],"history_message_count":0,"context_sources":["saved_persona","current_turn"]}}}
+{"protocol_version":1,"type":"runtime_event","event":{"type":"memory_retrieved","trace":{"trace_id":"4","turn_id":"1","selected_items":1,"used_bytes":12}}}
+{"protocol_version":1,"type":"runtime_event","event":{"type":"text_delta","turn_id":"1","delta":"hello"}}
+{"protocol_version":1,"type":"runtime_event","event":{"type":"timing","turn_id":"1","milestone":"first_text_delta","elapsed_ms":42}}
+{"protocol_version":1,"type":"runtime_event","event":{"type":"turn_completed","turn_id":"1"}}
+{"protocol_version":1,"type":"runtime_event","event":{"type":"turn_cancelled","turn_id":"2"}}
+{"protocol_version":1,"type":"runtime_event","event":{"type":"turn_failed","turn_id":"3","error":{"kind":"adapter","stage":"language_model","message":"generation stopped"}}}
+{"protocol_version":1,"type":"fatal","error":{"kind":"configuration","stage":"runtime","message":"stdout is unavailable"}}

@@ -52,16 +52,25 @@ export class StdioGatewayTransport implements RuntimeTransport {
     if (!isAbsolute(options.configPath)) {
       throw new Error("absolute configuration path is required");
     }
-    const child = spawn(options.gatewayPath, ["--config", options.configPath], {
-      shell: false,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
+    let child: ChildProcessWithoutNullStreams;
+    try {
+      child = spawn(options.gatewayPath, ["--config", options.configPath], {
+        shell: false,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    } catch {
+      throw new Error("gateway spawn failed");
+    }
     const transport = new StdioGatewayTransport(child);
     await new Promise<void>((resolve, reject) => {
       child.once("spawn", resolve);
       child.once("error", () => reject(new Error("gateway spawn failed")));
     });
     return transport;
+  }
+
+  private static startWithChildForTest(child: ChildProcessWithoutNullStreams): StdioGatewayTransport {
+    return new StdioGatewayTransport(child);
   }
 
   async send(message: ClientCommand): Promise<void> {

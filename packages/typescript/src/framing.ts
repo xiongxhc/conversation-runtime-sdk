@@ -39,6 +39,10 @@ export class FrameDecoder {
     }
   }
 
+  private retainedChunkCount(): number {
+    return this.chunks.length - this.head;
+  }
+
   private peekLength(): number {
     let value = 0;
     let remaining = 4;
@@ -87,6 +91,9 @@ export class FrameDecoder {
       this.chunks.length = 0;
       this.head = 0;
       this.chunkOffset = 0;
+    } else if (this.head >= 1_024 && this.head * 2 >= this.chunks.length) {
+      this.chunks.splice(0, this.head);
+      this.head = 0;
     }
   }
 }

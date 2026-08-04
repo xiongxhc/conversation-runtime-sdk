@@ -1,4 +1,5 @@
 use std::fmt;
+use std::time::Duration;
 
 use conversation_protocol::{
     decode_client_command, encode_gateway_message, ClientCommand, ClientRuntimeError,
@@ -8,10 +9,12 @@ use conversation_runtime::{TextTurnEventStream, TextTurnRuntime};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinError, JoinHandle};
+use tokio::time::timeout;
 
 use crate::{FrameError, FrameReader, FrameWriter};
 
 const WRITER_BUFFER_SIZE: usize = 1;
+const WRITER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 const INVALID_COMMAND_REQUEST_ID: &str = "invalid-command";
 
 pub struct GatewaySession {
@@ -30,81 +33,108 @@ impl GatewaySession {
         W: AsyncWrite + Unpin + Send + 'static,
     {
         let mut reader = FrameReader::new(reader);
-        let (writer_sender, writer_receiver) = mpsc::channel(WRITER_BUFFER_SIZE);
-        let mut writer_task = tokio::spawn(writer_loop(writer, writer_receiver));
+        let (control_sender, control_receiver) = mpsc::unbounded_channel();
+        let (event_sender, event_receiver) = mpsc::channel(WRITER_BUFFER_SIZE);
+        let mut writer_task = tokio::spawn(writer_loop(writer, control_receiver, event_receiver));
         let mut active: Option<ActiveForwarder> = None;
 
-        send_message(
-            &writer_sender,
+        let exit = if let Err(error) = send_control(
+            &control_sender,
             GatewayMessage::Ready {
                 status: self.status.clone(),
             },
-        )
-        .await?;
+        ) {
+            SessionExit::failure(error)
+        } else {
+            loop {
+                let next = if let Some(active_task) = active
+                    .as_mut()
+                    .and_then(|active_turn| active_turn.task.as_mut())
+                {
+                    tokio::select! {
+                        writer = &mut writer_task => SessionInput::Writer(writer),
+                        forwarding = active_task => SessionInput::Forwarder(forwarding),
+                        frame = reader.read_frame() => SessionInput::Frame(frame),
+                    }
+                } else {
+                    tokio::select! {
+                        writer = &mut writer_task => SessionInput::Writer(writer),
+                        frame = reader.read_frame() => SessionInput::Frame(frame),
+                    }
+                };
 
-        loop {
-            let next = if let Some(active_turn) = active.as_mut() {
-                tokio::select! {
-                    writer = &mut writer_task => SessionInput::Writer(writer),
-                    forwarding = &mut active_turn.task => SessionInput::Forwarder(forwarding),
-                    frame = reader.read_frame() => SessionInput::Frame(frame),
-                }
-            } else {
-                tokio::select! {
-                    writer = &mut writer_task => SessionInput::Writer(writer),
-                    frame = reader.read_frame() => SessionInput::Frame(frame),
-                }
-            };
-
-            match next {
-                SessionInput::Writer(result) => {
-                    shutdown_active(&self.runtime, &mut active).await;
-                    drop(writer_sender);
-                    return match writer_result(result) {
-                        Ok(()) => Err(GatewaySessionError::WriterUnavailable),
-                        Err(error) => Err(error),
-                    };
-                }
-                SessionInput::Forwarder(result) => {
-                    active = None;
-                    match forwarder_result(result) {
-                        Ok(()) => {}
-                        Err(error) => {
-                            send_fatal(&writer_sender, "gateway event forwarding failed").await;
-                            drop(writer_sender);
-                            let _ = writer_result(writer_task.await);
-                            return Err(error);
+                match next {
+                    SessionInput::Writer(result) => {
+                        let error = writer_result(result)
+                            .err()
+                            .unwrap_or(GatewaySessionError::WriterUnavailable);
+                        break SessionExit::Writer(error);
+                    }
+                    SessionInput::Forwarder(result) => {
+                        let active_turn = active
+                            .as_mut()
+                            .expect("a completed forwarder has an active turn");
+                        active_turn.task.take();
+                        active_turn.shutdown.take();
+                        match forwarder_result(result) {
+                            Ok(()) => active = None,
+                            Err(error) => {
+                                break SessionExit::fatal(error, "gateway event forwarding failed");
+                            }
                         }
                     }
-                }
-                SessionInput::Frame(Ok(Some(payload))) => {
-                    let command = match decode_client_command(&payload) {
-                        Ok(command) => command,
-                        Err(_) => {
-                            send_rejection(
-                                &writer_sender,
-                                INVALID_COMMAND_REQUEST_ID,
-                                command_error("client command could not be decoded"),
-                            )
-                            .await?;
-                            continue;
+                    SessionInput::Frame(Ok(Some(payload))) => {
+                        let command = match decode_client_command(&payload) {
+                            Ok(command) => command,
+                            Err(_) => {
+                                if let Err(error) = send_rejection(
+                                    &control_sender,
+                                    INVALID_COMMAND_REQUEST_ID,
+                                    command_error("client command could not be decoded"),
+                                ) {
+                                    break SessionExit::failure(error);
+                                }
+                                continue;
+                            }
+                        };
+                        if let Err(failure) = self
+                            .handle_command(command, &control_sender, &event_sender, &mut active)
+                            .await
+                        {
+                            break SessionExit::Failure {
+                                error: failure.error,
+                                fatal: failure.fatal,
+                            };
                         }
-                    };
-                    self.handle_command(command, &writer_sender, &mut active)
-                        .await?;
+                    }
+                    SessionInput::Frame(Ok(None)) => break SessionExit::Normal,
+                    SessionInput::Frame(Err(error)) => {
+                        break SessionExit::fatal(
+                            GatewaySessionError::Framing(error),
+                            "gateway input framing failed",
+                        );
+                    }
                 }
-                SessionInput::Frame(Ok(None)) => {
-                    shutdown_active(&self.runtime, &mut active).await;
-                    drop(writer_sender);
-                    return writer_result(writer_task.await);
-                }
-                SessionInput::Frame(Err(error)) => {
-                    shutdown_active(&self.runtime, &mut active).await;
-                    send_fatal(&writer_sender, "gateway input framing failed").await;
-                    drop(writer_sender);
-                    let _ = writer_result(writer_task.await);
-                    return Err(GatewaySessionError::Framing(error));
-                }
+            }
+        };
+
+        shutdown_active(&self.runtime, &mut active).await;
+        if let Some(message) = exit.fatal_message() {
+            let _ = send_control(&control_sender, fatal_message(message));
+        }
+        drop(event_sender);
+        drop(control_sender);
+
+        let writer_shutdown = if matches!(exit, SessionExit::Writer(_)) {
+            Ok(())
+        } else {
+            shutdown_writer(&mut writer_task).await
+        };
+        match exit {
+            SessionExit::Normal => writer_shutdown,
+            SessionExit::Failure { error, .. } | SessionExit::Writer(error) => {
+                let _ = writer_shutdown;
+                Err(error)
             }
         }
     }
@@ -112,20 +142,21 @@ impl GatewaySession {
     async fn handle_command(
         &self,
         command: ClientCommand,
-        writer: &mpsc::Sender<GatewayMessage>,
+        control: &mpsc::UnboundedSender<GatewayMessage>,
+        events: &mpsc::Sender<GatewayMessage>,
         active: &mut Option<ActiveForwarder>,
-    ) -> Result<(), GatewaySessionError> {
+    ) -> Result<(), CommandFailure> {
         match command {
             ClientCommand::Status { request_id } => {
-                send_accepted(writer, &request_id).await?;
-                send_message(
-                    writer,
+                send_accepted(control, &request_id).map_err(CommandFailure::response)?;
+                send_control(
+                    control,
                     GatewayMessage::Status {
                         request_id,
                         status: self.status.clone(),
                     },
                 )
-                .await
+                .map_err(CommandFailure::response)
             }
             ClientCommand::StartTurn {
                 request_id,
@@ -134,44 +165,40 @@ impl GatewaySession {
             } => {
                 if active.is_some() {
                     return send_rejection(
-                        writer,
+                        control,
                         &request_id,
                         command_error("an active turn already exists"),
                     )
-                    .await;
+                    .map_err(CommandFailure::response);
                 }
 
                 let generation_id = GenerationId::new(turn_id.get());
-                let events = match self
+                let event_stream = match self
                     .runtime
                     .start_turn(turn_id, generation_id, transcript)
                     .await
                 {
-                    Ok(events) => events,
+                    Ok(event_stream) => event_stream,
                     Err(error) => {
                         return send_rejection(
-                            writer,
+                            control,
                             &request_id,
                             ClientRuntimeError::from(error),
                         )
-                        .await;
+                        .map_err(CommandFailure::response);
                     }
                 };
 
-                if let Err(error) = send_accepted(writer, &request_id).await {
-                    reap_unforwarded_turn(&self.runtime, turn_id, generation_id, events).await;
-                    return Err(error);
-                }
-
-                let (shutdown, shutdown_receiver) = oneshot::channel();
-                let writer = writer.clone();
-                let task = tokio::spawn(forward_events(events, writer, shutdown_receiver));
-                *active = Some(ActiveForwarder {
+                *active = Some(ActiveForwarder::pending(
                     turn_id,
                     generation_id,
-                    shutdown: Some(shutdown),
-                    task,
-                });
+                    event_stream,
+                ));
+                send_accepted(control, &request_id).map_err(CommandFailure::response)?;
+                active
+                    .as_mut()
+                    .expect("accepted text turn remains active")
+                    .start(events.clone());
                 Ok(())
             }
             ClientCommand::InterruptTurn {
@@ -180,32 +207,80 @@ impl GatewaySession {
             } => {
                 let Some(active_turn) = active.as_ref() else {
                     return send_rejection(
-                        writer,
+                        control,
                         &request_id,
                         command_error("there is no active text generation"),
                     )
-                    .await;
+                    .map_err(CommandFailure::response);
                 };
                 if active_turn.turn_id != turn_id {
                     return send_rejection(
-                        writer,
+                        control,
                         &request_id,
                         command_error("a different turn is active"),
                     )
-                    .await;
+                    .map_err(CommandFailure::response);
                 }
 
-                match self
-                    .runtime
-                    .interrupt(turn_id, active_turn.generation_id)
+                let generation_id = active_turn.generation_id;
+                send_accepted(control, &request_id).map_err(CommandFailure::response)?;
+                self.runtime
+                    .interrupt(turn_id, generation_id)
                     .await
-                {
-                    Ok(()) => send_accepted(writer, &request_id).await,
-                    Err(error) => {
-                        send_rejection(writer, &request_id, ClientRuntimeError::from(error)).await
-                    }
-                }
+                    .map_err(|_| {
+                        CommandFailure::fatal(
+                            GatewaySessionError::Interruption,
+                            "gateway interruption failed",
+                        )
+                    })
             }
+        }
+    }
+}
+
+enum SessionExit {
+    Normal,
+    Failure {
+        error: GatewaySessionError,
+        fatal: Option<&'static str>,
+    },
+    Writer(GatewaySessionError),
+}
+
+impl SessionExit {
+    fn failure(error: GatewaySessionError) -> Self {
+        Self::Failure { error, fatal: None }
+    }
+
+    fn fatal(error: GatewaySessionError, message: &'static str) -> Self {
+        Self::Failure {
+            error,
+            fatal: Some(message),
+        }
+    }
+
+    fn fatal_message(&self) -> Option<&'static str> {
+        match self {
+            Self::Failure { fatal, .. } => *fatal,
+            Self::Normal | Self::Writer(_) => None,
+        }
+    }
+}
+
+struct CommandFailure {
+    error: GatewaySessionError,
+    fatal: Option<&'static str>,
+}
+
+impl CommandFailure {
+    fn response(error: GatewaySessionError) -> Self {
+        Self { error, fatal: None }
+    }
+
+    fn fatal(error: GatewaySessionError, message: &'static str) -> Self {
+        Self {
+            error,
+            fatal: Some(message),
         }
     }
 }
@@ -219,8 +294,39 @@ enum SessionInput {
 struct ActiveForwarder {
     turn_id: TurnId,
     generation_id: GenerationId,
+    event_stream: Option<TextTurnEventStream>,
     shutdown: Option<oneshot::Sender<()>>,
-    task: JoinHandle<Result<(), GatewaySessionError>>,
+    task: Option<JoinHandle<Result<(), GatewaySessionError>>>,
+}
+
+impl ActiveForwarder {
+    fn pending(
+        turn_id: TurnId,
+        generation_id: GenerationId,
+        event_stream: TextTurnEventStream,
+    ) -> Self {
+        Self {
+            turn_id,
+            generation_id,
+            event_stream: Some(event_stream),
+            shutdown: None,
+            task: None,
+        }
+    }
+
+    fn start(&mut self, writer: mpsc::Sender<GatewayMessage>) {
+        let event_stream = self
+            .event_stream
+            .take()
+            .expect("a pending text turn has an event stream");
+        let (shutdown, shutdown_receiver) = oneshot::channel();
+        self.shutdown = Some(shutdown);
+        self.task = Some(tokio::spawn(forward_events(
+            event_stream,
+            writer,
+            shutdown_receiver,
+        )));
+    }
 }
 
 async fn forward_events(
@@ -265,16 +371,6 @@ async fn forward_events(
     Ok(())
 }
 
-async fn reap_unforwarded_turn(
-    runtime: &TextTurnRuntime,
-    turn_id: TurnId,
-    generation_id: GenerationId,
-    mut events: TextTurnEventStream,
-) {
-    let _ = runtime.interrupt(turn_id, generation_id).await;
-    while events.recv().await.is_some() {}
-}
-
 async fn shutdown_active(runtime: &TextTurnRuntime, active: &mut Option<ActiveForwarder>) {
     let Some(mut active_turn) = active.take() else {
         return;
@@ -285,78 +381,134 @@ async fn shutdown_active(runtime: &TextTurnRuntime, active: &mut Option<ActiveFo
     let _ = runtime
         .interrupt(active_turn.turn_id, active_turn.generation_id)
         .await;
-    let _ = active_turn.task.await;
+    if let Some(mut event_stream) = active_turn.event_stream.take() {
+        while event_stream.recv().await.is_some() {}
+    }
+    if let Some(task) = active_turn.task.take() {
+        let _ = task.await;
+    }
 }
 
 async fn writer_loop<W>(
     writer: W,
-    mut messages: mpsc::Receiver<GatewayMessage>,
+    mut control: mpsc::UnboundedReceiver<GatewayMessage>,
+    mut events: mpsc::Receiver<GatewayMessage>,
 ) -> Result<(), GatewaySessionError>
 where
     W: AsyncWrite + Unpin,
 {
     let mut writer = FrameWriter::new(writer);
-    while let Some(message) = messages.recv().await {
-        let payload =
-            encode_gateway_message(&message).map_err(|_| GatewaySessionError::Encoding)?;
-        writer
-            .write_frame(&payload)
-            .await
-            .map_err(GatewaySessionError::Writing)?;
+    let mut control_open = true;
+    let mut events_open = true;
+    while control_open || events_open {
+        let message = match (control_open, events_open) {
+            (true, true) => {
+                tokio::select! {
+                    biased;
+                    message = control.recv() => match message {
+                        Some(message) => Some(message),
+                        None => {
+                            control_open = false;
+                            None
+                        }
+                    },
+                    message = events.recv() => match message {
+                        Some(message) => Some(message),
+                        None => {
+                            events_open = false;
+                            None
+                        }
+                    },
+                }
+            }
+            (true, false) => control.recv().await.or_else(|| {
+                control_open = false;
+                None
+            }),
+            (false, true) => events.recv().await.or_else(|| {
+                events_open = false;
+                None
+            }),
+            (false, false) => None,
+        };
+        let Some(message) = message else {
+            continue;
+        };
+        write_gateway_message(&mut writer, message).await?;
     }
     Ok(())
 }
 
-async fn send_accepted(
-    writer: &mpsc::Sender<GatewayMessage>,
+async fn write_gateway_message<W>(
+    writer: &mut FrameWriter<W>,
+    message: GatewayMessage,
+) -> Result<(), GatewaySessionError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let payload = encode_gateway_message(&message).map_err(|_| GatewaySessionError::Encoding)?;
+    writer
+        .write_frame(&payload)
+        .await
+        .map_err(GatewaySessionError::Writing)
+}
+
+async fn shutdown_writer(
+    writer_task: &mut JoinHandle<Result<(), GatewaySessionError>>,
+) -> Result<(), GatewaySessionError> {
+    match timeout(WRITER_SHUTDOWN_TIMEOUT, &mut *writer_task).await {
+        Ok(result) => writer_result(result),
+        Err(_) => {
+            writer_task.abort();
+            let _ = writer_task.await;
+            Err(GatewaySessionError::WriterShutdownTimeout)
+        }
+    }
+}
+
+fn send_accepted(
+    writer: &mpsc::UnboundedSender<GatewayMessage>,
     request_id: &str,
 ) -> Result<(), GatewaySessionError> {
-    send_message(
+    send_control(
         writer,
         GatewayMessage::CommandAccepted {
             request_id: request_id.to_owned(),
         },
     )
-    .await
 }
 
-async fn send_rejection(
-    writer: &mpsc::Sender<GatewayMessage>,
+fn send_rejection(
+    writer: &mpsc::UnboundedSender<GatewayMessage>,
     request_id: &str,
     error: ClientRuntimeError,
 ) -> Result<(), GatewaySessionError> {
-    send_message(
+    send_control(
         writer,
         GatewayMessage::CommandRejected {
             request_id: request_id.to_owned(),
             error,
         },
     )
-    .await
 }
 
-async fn send_message(
-    writer: &mpsc::Sender<GatewayMessage>,
+fn send_control(
+    writer: &mpsc::UnboundedSender<GatewayMessage>,
     message: GatewayMessage,
 ) -> Result<(), GatewaySessionError> {
     writer
         .send(message)
-        .await
         .map_err(|_| GatewaySessionError::WriterUnavailable)
 }
 
-async fn send_fatal(writer: &mpsc::Sender<GatewayMessage>, message: &'static str) {
-    let _ = send_message(
-        writer,
-        GatewayMessage::Fatal {
-            error: ClientRuntimeError {
-                kind: "configuration".to_owned(),
-                stage: "runtime".to_owned(),
-                message: message.to_owned(),
-            },
+fn fatal_message(message: &'static str) -> GatewayMessage {
+    GatewayMessage::Fatal {
+        error: ClientRuntimeError {
+            kind: "configuration".to_owned(),
+            stage: "runtime".to_owned(),
+            message: message.to_owned(),
         },
-    )
-    .await;
+    }
 }
 
 fn command_error(message: &'static str) -> ClientRuntimeError {
@@ -390,8 +542,10 @@ pub enum GatewaySessionError {
     Encoding,
     ForwarderTask,
     Framing(FrameError),
+    Interruption,
     Projection,
     WriterTask,
+    WriterShutdownTimeout,
     WriterUnavailable,
     Writing(FrameError),
 }
@@ -402,8 +556,10 @@ impl fmt::Display for GatewaySessionError {
             Self::Encoding => "gateway message encoding failed",
             Self::ForwarderTask => "gateway event forwarding task failed",
             Self::Framing(_) => "gateway input framing failed",
+            Self::Interruption => "gateway interruption failed",
             Self::Projection => "gateway event projection failed",
             Self::WriterTask => "gateway writer task failed",
+            Self::WriterShutdownTimeout => "gateway writer shutdown timed out",
             Self::WriterUnavailable => "gateway writer became unavailable",
             Self::Writing(_) => "gateway output framing failed",
         })
@@ -422,13 +578,13 @@ impl std::error::Error for GatewaySessionError {
 #[cfg(test)]
 mod tests {
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
     use std::task::{Context, Poll, Waker};
     use std::time::Duration;
 
     use conversation_model_adapters::{OllamaConfig, OllamaLanguageModel};
-    use conversation_protocol::RuntimeStatus;
+    use conversation_protocol::{GenerationId, RuntimeStatus, TurnId, MAX_CLIENT_FRAME_BYTES};
     use tokio::io::{duplex, AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::Notify;
@@ -474,7 +630,7 @@ mod tests {
             .await
             .expect("language cancellation did not reap the request while stdout was blocked");
         assert!(writer_state.blocked.is_set());
-        assert!(!writer_state.released.load(Ordering::SeqCst));
+        assert!(!writer_state.is_released());
         assert!(!session_task.is_finished());
 
         writer_state.release();
@@ -511,6 +667,179 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(terminals.len(), 1);
         assert!(terminals[0].contains(r#""type":"turn_cancelled""#));
+        let interrupt_accepted = message_index(&messages, |message| {
+            message_type(message) == "command_accepted"
+                && message.contains(r#""request_id":"interrupt-1""#)
+        });
+        let terminal = message_index(&messages, is_terminal);
+        assert!(interrupt_accepted < terminal);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fatal_framing_aborts_and_reaps_a_blocked_writer_after_the_deadline() {
+        let session = GatewaySession::new(unused_runtime(), status());
+        let (mut input, reader) = duplex(64);
+        let (writer, writer_state) = BlockingWriter::new(2);
+        let session_task = tokio::spawn(session.run(reader, writer));
+
+        input
+            .write_all(&((MAX_CLIENT_FRAME_BYTES as u32) + 1).to_be_bytes())
+            .await
+            .unwrap();
+        writer_state.blocked.wait().await;
+        assert!(!session_task.is_finished());
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        if !session_task.is_finished() {
+            writer_state.release();
+            let _ = session_task.await;
+            panic!("fatal framing did not bound and reap its blocked writer");
+        }
+
+        let result = session_task.await.unwrap();
+        assert!(matches!(
+            result,
+            Err(super::GatewaySessionError::Framing(_))
+        ));
+        writer_state.dropped.wait().await;
+    }
+
+    #[tokio::test]
+    async fn command_response_writer_failure_reaps_active_generation_before_returning() {
+        let language = HoldOpenLanguageServer::start().await;
+        let runtime = runtime_for(language.endpoint());
+        let cleanup_runtime = runtime.clone();
+        let session = GatewaySession::new(runtime, status());
+        let (mut input, reader) = duplex(4096);
+        let (writer, writer_state) = FailOnPayloadWriter::new(b"status-writer-failure".to_vec());
+        let session_task = tokio::spawn(session.run(reader, writer));
+
+        write_command(
+            &mut input,
+            r#"{"protocol_version":1,"type":"start_turn","request_id":"start-writer-failure","turn_id":"1","transcript":"fixture writer failure"}"#,
+        )
+        .await;
+        timeout(TEST_TIMEOUT, language.request_started.wait())
+            .await
+            .expect("fake language request never started");
+
+        write_command(
+            &mut input,
+            r#"{"protocol_version":1,"type":"status","request_id":"status-writer-failure"}"#,
+        )
+        .await;
+
+        let result = timeout(TEST_TIMEOUT, session_task)
+            .await
+            .expect("gateway session did not return after writer failure")
+            .unwrap();
+        writer_state.dropped.wait().await;
+        if timeout(TEST_TIMEOUT, language.connection_reaped.wait())
+            .await
+            .is_err()
+        {
+            let _ = cleanup_runtime
+                .interrupt(TurnId::new(1), GenerationId::new(1))
+                .await;
+            timeout(TEST_TIMEOUT, language.connection_reaped.wait())
+                .await
+                .expect("test cleanup could not reap the leaked language request");
+            panic!("gateway returned before reaping the active language request");
+        }
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn stale_active_interrupt_is_accepted_before_fatal_cleanup() {
+        let language = HoldOpenLanguageServer::completing().await;
+        let runtime = runtime_for(language.endpoint());
+        let runtime_probe = runtime.clone();
+        let session = GatewaySession::new(runtime, status());
+        let (mut input, reader) = duplex(4096);
+        let (writer, writer_state) = BlockingWriter::new(4);
+        let session_task = tokio::spawn(session.run(reader, writer));
+
+        write_command(
+            &mut input,
+            r#"{"protocol_version":1,"type":"start_turn","request_id":"start-stale","turn_id":"1","transcript":"fixture completed while output blocked"}"#,
+        )
+        .await;
+        timeout(TEST_TIMEOUT, writer_state.blocked.wait())
+            .await
+            .expect("gateway writer never blocked on the completed turn");
+        timeout(TEST_TIMEOUT, language.connection_reaped.wait())
+            .await
+            .expect("fake completed language request did not close");
+        wait_for_runtime_reuse(&runtime_probe).await;
+
+        write_command(
+            &mut input,
+            r#"{"protocol_version":1,"type":"interrupt_turn","request_id":"interrupt-stale","turn_id":"1"}"#,
+        )
+        .await;
+        tokio::task::yield_now().await;
+        drop(input);
+        writer_state.release();
+
+        let result = timeout(TEST_TIMEOUT, session_task)
+            .await
+            .expect("gateway session did not finish stale interrupt cleanup")
+            .unwrap();
+        assert!(result.is_err());
+        writer_state.dropped.wait().await;
+
+        let messages = decode_frames(&writer_state.bytes());
+        let accepted = message_index(&messages, |message| {
+            message_type(message) == "command_accepted"
+                && message.contains(r#""request_id":"interrupt-stale""#)
+        });
+        let fatal = message_index(&messages, |message| message_type(message) == "fatal");
+        assert!(accepted < fatal);
+        assert!(!messages.iter().any(|message| {
+            message_type(message) == "command_rejected"
+                && message.contains(r#""request_id":"interrupt-stale""#)
+        }));
+    }
+
+    fn unused_runtime() -> conversation_runtime::TextTurnRuntime {
+        runtime_for("http://127.0.0.1:9")
+    }
+
+    fn runtime_for(endpoint: &str) -> conversation_runtime::TextTurnRuntime {
+        let model = OllamaLanguageModel::new_direct(
+            OllamaConfig::new("test-model")
+                .unwrap()
+                .with_endpoint(endpoint)
+                .unwrap(),
+        );
+        conversation_runtime::TextTurnRuntime::new(Arc::new(model))
+    }
+
+    async fn wait_for_runtime_reuse(runtime: &conversation_runtime::TextTurnRuntime) {
+        timeout(TEST_TIMEOUT, async {
+            loop {
+                match runtime
+                    .start_turn(
+                        TurnId::new(2),
+                        GenerationId::new(2),
+                        "runtime cleanup probe",
+                    )
+                    .await
+                {
+                    Ok(mut events) => {
+                        let _ = runtime
+                            .interrupt(TurnId::new(2), GenerationId::new(2))
+                            .await;
+                        while events.recv().await.is_some() {}
+                        return;
+                    }
+                    Err(_) => tokio::task::yield_now().await,
+                }
+            }
+        })
+        .await
+        .expect("text runtime never released its completed turn");
     }
 
     fn status() -> RuntimeStatus {
@@ -544,7 +873,8 @@ mod tests {
     struct BlockingWriterState {
         bytes: StdMutex<Vec<u8>>,
         blocked: Condition,
-        released: AtomicBool,
+        resolution: AtomicU8,
+        dropped: Condition,
         waker: StdMutex<Option<Waker>>,
         write_notify: Notify,
     }
@@ -554,7 +884,8 @@ mod tests {
             let state = Arc::new(BlockingWriterState {
                 bytes: StdMutex::new(Vec::new()),
                 blocked: Condition::default(),
-                released: AtomicBool::new(false),
+                resolution: AtomicU8::new(0),
+                dropped: Condition::default(),
                 waker: StdMutex::new(None),
                 write_notify: Notify::new(),
             });
@@ -575,13 +906,19 @@ mod tests {
             context: &mut Context<'_>,
             bytes: &[u8],
         ) -> Poll<std::io::Result<usize>> {
-            if self.completed_writes >= self.writes_before_block
-                && !self.state.released.load(Ordering::SeqCst)
-            {
+            if self.completed_writes >= self.writes_before_block {
                 self.state.blocked.set();
                 *self.state.waker.lock().unwrap() = Some(context.waker().clone());
-                if !self.state.released.load(Ordering::SeqCst) {
-                    return Poll::Pending;
+                match self.state.resolution.load(Ordering::SeqCst) {
+                    0 => return Poll::Pending,
+                    1 => {}
+                    2 => {
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "fixture writer failure",
+                        )))
+                    }
+                    _ => unreachable!(),
                 }
             }
             self.state.bytes.lock().unwrap().extend_from_slice(bytes);
@@ -605,9 +942,23 @@ mod tests {
         }
     }
 
+    impl Drop for BlockingWriter {
+        fn drop(&mut self) {
+            self.state.dropped.set();
+        }
+    }
+
     impl BlockingWriterState {
         fn release(&self) {
-            self.released.store(true, Ordering::SeqCst);
+            self.resolve(1);
+        }
+
+        fn is_released(&self) -> bool {
+            self.resolution.load(Ordering::SeqCst) == 1
+        }
+
+        fn resolve(&self, resolution: u8) {
+            self.resolution.store(resolution, Ordering::SeqCst);
             if let Some(waker) = self.waker.lock().unwrap().take() {
                 waker.wake();
             }
@@ -625,6 +976,66 @@ mod tests {
                 }
                 notified.await;
             }
+        }
+    }
+
+    struct FailOnPayloadWriter {
+        needle: Vec<u8>,
+        state: Arc<FailOnPayloadWriterState>,
+    }
+
+    struct FailOnPayloadWriterState {
+        dropped: Condition,
+    }
+
+    impl FailOnPayloadWriter {
+        fn new(needle: Vec<u8>) -> (Self, Arc<FailOnPayloadWriterState>) {
+            let state = Arc::new(FailOnPayloadWriterState {
+                dropped: Condition::default(),
+            });
+            (
+                Self {
+                    needle,
+                    state: Arc::clone(&state),
+                },
+                state,
+            )
+        }
+    }
+
+    impl AsyncWrite for FailOnPayloadWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if find_bytes(bytes, &self.needle).is_some() {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "fixture status response failure",
+                )));
+            }
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Drop for FailOnPayloadWriter {
+        fn drop(&mut self) {
+            self.state.dropped.set();
         }
     }
 
@@ -664,6 +1075,14 @@ mod tests {
 
     impl HoldOpenLanguageServer {
         async fn start() -> Self {
+            Self::start_with_completion(false).await
+        }
+
+        async fn completing() -> Self {
+            Self::start_with_completion(true).await
+        }
+
+        async fn start_with_completion(completes: bool) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let endpoint = format!("http://{}", listener.local_addr().unwrap());
             let request_started = Arc::new(Condition::default());
@@ -675,18 +1094,26 @@ mod tests {
                 read_request(&mut stream).await;
                 stream
                     .write_all(
-                        b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n\
-{\"message\":{\"role\":\"assistant\",\"content\":\"partial\"},\"done\":false}\n",
+                        if completes {
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n\
+{\"message\":{\"role\":\"assistant\",\"content\":\"complete\"},\"done\":false}\n\
+{\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true}\n"
+                        } else {
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n\
+{\"message\":{\"role\":\"assistant\",\"content\":\"partial\"},\"done\":false}\n"
+                        },
                     )
                     .await
                     .unwrap();
                 stream.flush().await.unwrap();
                 task_request_started.set();
-                let mut byte = [0_u8; 1];
-                loop {
-                    match stream.read(&mut byte).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => {}
+                if !completes {
+                    let mut byte = [0_u8; 1];
+                    loop {
+                        match stream.read(&mut byte).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
                     }
                 }
                 task_connection_reaped.set();

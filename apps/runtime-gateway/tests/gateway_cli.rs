@@ -1,9 +1,10 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use conversation_memory::SqliteMemoryStore;
 use conversation_protocol::MAX_CLIENT_FRAME_BYTES;
 use conversation_runtime_gateway::FrameReader;
 use tempfile::TempDir;
@@ -15,6 +16,7 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(5);
+const FIXTURE_MODEL_ID: &str = "fixture-private-local-model";
 
 #[tokio::test]
 async fn persistent_session_reports_local_status_and_preserves_completed_history() {
@@ -23,7 +25,7 @@ async fn persistent_session_reports_local_status_and_preserves_completed_history
 
     let ready = gateway.read_message().await;
     assert_eq!(ready.message_type(), "ready");
-    assert_local_status(&ready);
+    assert_local_status(&ready, false);
 
     gateway
         .write_message(r#"{"protocol_version":1,"type":"status","request_id":"status-1"}"#)
@@ -32,7 +34,7 @@ async fn persistent_session_reports_local_status_and_preserves_completed_history
     let status = gateway.read_message().await;
     assert_eq!(status.message_type(), "status");
     assert_eq!(status.request_id(), Some("status-1"));
-    assert_local_status(&status);
+    assert_local_status(&status, false);
 
     gateway
         .write_message(&start_turn("start-1", "1", "fixture-first-transcript"))
@@ -58,14 +60,70 @@ async fn persistent_session_reports_local_status_and_preserves_completed_history
 
     let exit = gateway.close().await;
     assert!(exit.status.success());
-    assert_content_free_stderr(
-        &exit.stderr,
-        &[
-            "fixture-first-transcript",
-            "fixture-second-transcript",
-            "fixture-answer",
-        ],
-    );
+    exit.assert_content_free_stderr(&[
+        "fixture-first-transcript",
+        "fixture-second-transcript",
+        "fixture-answer",
+    ]);
+}
+
+#[tokio::test]
+async fn status_reports_exact_model_and_enabled_local_memory() {
+    let server = FakeOllamaServer::completing(0).await;
+    let mut gateway = GatewayProcess::start_with_memory(server.endpoint()).await;
+
+    let ready = gateway.read_message().await;
+    assert_eq!(ready.message_type(), "ready");
+    assert_local_status(&ready, true);
+
+    gateway
+        .write_message(r#"{"protocol_version":1,"type":"status","request_id":"status-memory"}"#)
+        .await;
+    assert_accepted(&gateway.read_message().await, "status-memory");
+    assert_local_status(&gateway.read_message().await, true);
+
+    let exit = gateway.close().await;
+    assert!(exit.status.success());
+    exit.assert_content_free_stderr(&["status-memory"]);
+}
+
+#[tokio::test]
+async fn interrupt_is_accepted_before_one_cancelled_terminal() {
+    let server = FakeOllamaServer::holding_open().await;
+    let mut gateway = GatewayProcess::start(server.endpoint()).await;
+    assert_eq!(gateway.read_message().await.message_type(), "ready");
+
+    gateway
+        .write_message(&start_turn(
+            "start-interrupt",
+            "1",
+            "fixture-interrupt-transcript",
+        ))
+        .await;
+    assert_accepted(&gateway.read_message().await, "start-interrupt");
+    gateway.read_until_text_delta("1").await;
+
+    gateway
+        .write_message(
+            r#"{"protocol_version":1,"type":"interrupt_turn","request_id":"interrupt-1","turn_id":"1"}"#,
+        )
+        .await;
+    let before_ack = gateway
+        .read_until(|message| is_accepted(message, "interrupt-1") || message.is_terminal())
+        .await;
+    assert!(is_accepted(before_ack.last().unwrap(), "interrupt-1"));
+    let events = gateway.read_turn("1").await;
+    assert_eq!(terminal_count(&events), 1);
+    assert_eq!(terminal_type(&events), "turn_cancelled");
+    server.wait_for_connection_reaped().await;
+
+    let exit = gateway.close().await;
+    assert!(exit.status.success());
+    exit.assert_content_free_stderr(&[
+        "fixture-interrupt-transcript",
+        "fixture-partial",
+        "interrupt-1",
+    ]);
 }
 
 #[tokio::test]
@@ -89,7 +147,7 @@ async fn malformed_command_is_rejected_and_the_session_survives() {
 
     let exit = gateway.close().await;
     assert!(exit.status.success());
-    assert_content_free_stderr(&exit.stderr, &[]);
+    exit.assert_content_free_stderr(&["status-after-rejection"]);
 }
 
 #[tokio::test]
@@ -123,7 +181,7 @@ async fn oversized_and_truncated_frames_emit_one_fatal_and_exit_nonzero() {
         assert!(fatal.raw.contains(r#""stage":"runtime""#));
         let exit = gateway.finish().await;
         assert!(!exit.status.success());
-        assert_content_free_stderr(&exit.stderr, &[]);
+        exit.assert_content_free_stderr(&["gateway input framing failed"]);
     }
 }
 
@@ -143,7 +201,7 @@ async fn stdin_eof_cancels_and_reaps_active_generation() {
     let exit = gateway.finish().await;
     assert!(exit.status.success());
     server.wait_for_connection_reaped().await;
-    assert_content_free_stderr(&exit.stderr, &["fixture-eof-transcript", "fixture-partial"]);
+    exit.assert_content_free_stderr(&["fixture-eof-transcript", "fixture-partial"]);
 }
 
 #[derive(Clone, Copy)]
@@ -154,6 +212,8 @@ enum FatalInput {
 
 struct GatewayProcess {
     _temporary: TempDir,
+    config_path: PathBuf,
+    memory_path: Option<PathBuf>,
     child: Child,
     stdin: Option<ChildStdin>,
     stdout: FrameReader<tokio::process::ChildStdout>,
@@ -162,9 +222,21 @@ struct GatewayProcess {
 
 impl GatewayProcess {
     async fn start(endpoint: &str) -> Self {
+        Self::start_with_options(endpoint, false).await
+    }
+
+    async fn start_with_memory(endpoint: &str) -> Self {
+        Self::start_with_options(endpoint, true).await
+    }
+
+    async fn start_with_options(endpoint: &str, memory_enabled: bool) -> Self {
         let temporary = tempfile::tempdir().unwrap();
         let config = temporary.path().join("gateway.toml");
-        tokio::fs::write(&config, config_contents(endpoint))
+        let memory_path = memory_enabled.then(|| temporary.path().join("private-memory.sqlite3"));
+        if let Some(memory_path) = memory_path.as_ref() {
+            SqliteMemoryStore::initialize(memory_path).unwrap();
+        }
+        tokio::fs::write(&config, config_contents(endpoint, memory_path.as_deref()))
             .await
             .unwrap();
         let mut child = gateway_command(&config).spawn().unwrap();
@@ -173,6 +245,8 @@ impl GatewayProcess {
         let stderr = child.stderr.take().unwrap();
         Self {
             _temporary: temporary,
+            config_path: config,
+            memory_path,
             child,
             stdin: Some(stdin),
             stdout: FrameReader::new(stdout),
@@ -246,7 +320,12 @@ impl GatewayProcess {
             .expect("gateway process did not exit")
             .unwrap();
         let stderr = String::from_utf8(self.stderr.await.unwrap()).unwrap();
-        ProcessExit { status, stderr }
+        ProcessExit {
+            status,
+            stderr,
+            config_path: self.config_path,
+            memory_path: self.memory_path,
+        }
     }
 }
 
@@ -296,6 +375,28 @@ impl WireMessage {
 struct ProcessExit {
     status: std::process::ExitStatus,
     stderr: String,
+    config_path: PathBuf,
+    memory_path: Option<PathBuf>,
+}
+
+impl ProcessExit {
+    fn assert_content_free_stderr(&self, fixture_values: &[&str]) {
+        let mut private_values = vec![
+            FIXTURE_MODEL_ID,
+            self.config_path
+                .to_str()
+                .expect("fixture config path is not UTF-8"),
+        ];
+        if let Some(memory_path) = self.memory_path.as_ref() {
+            private_values.push(
+                memory_path
+                    .to_str()
+                    .expect("fixture memory path is not UTF-8"),
+            );
+        }
+        private_values.extend_from_slice(fixture_values);
+        assert_content_free_stderr(&self.stderr, &private_values);
+    }
 }
 
 fn gateway_command(config: &Path) -> Command {
@@ -318,15 +419,15 @@ fn stderr_task(mut stderr: ChildStderr) -> JoinHandle<Vec<u8>> {
     })
 }
 
-fn config_contents(endpoint: &str) -> String {
-    format!(
+fn config_contents(endpoint: &str, memory_path: Option<&Path>) -> String {
+    let mut config = format!(
         r#"schema_version = 1
 privacy_mode = "local-only"
 
 [language]
 backend = "ollama-compatible"
 endpoint = "{endpoint}"
-model = "local-model"
+model = "{FIXTURE_MODEL_ID}"
 thinking = false
 temperature = 0.0
 seed = 1
@@ -345,7 +446,19 @@ intimacy = 50
 verbosity = 50
 follow_up_frequency = 50
 "#
-    )
+    );
+    if let Some(memory_path) = memory_path {
+        config.push_str(&format!(
+            r#"
+[memory]
+database = "{}"
+maximum_items = 4
+maximum_bytes = 4096
+"#,
+            memory_path.display()
+        ));
+    }
+    config
 }
 
 fn start_turn(request_id: &str, turn_id: &str, transcript: &str) -> String {
@@ -362,12 +475,21 @@ fn is_accepted(message: &WireMessage, request_id: &str) -> bool {
     message.message_type() == "command_accepted" && message.request_id() == Some(request_id)
 }
 
-fn assert_local_status(message: &WireMessage) {
+fn assert_local_status(message: &WireMessage, memory_enabled: bool) {
     assert!(message.raw.contains(r#""transport":"stdio""#));
     assert!(message.raw.contains(r#""privacy_mode":"local_only""#));
     assert!(message.raw.contains(r#""language_location":"local""#));
-    assert!(message.raw.contains(r#""memory_enabled":false"#));
-    assert!(message.raw.contains(r#""memory_location":null"#));
+    assert!(message
+        .raw
+        .contains(&format!(r#""model_id":"{FIXTURE_MODEL_ID}""#)));
+    assert!(message
+        .raw
+        .contains(&format!(r#""memory_enabled":{memory_enabled}"#)));
+    if memory_enabled {
+        assert!(message.raw.contains(r#""memory_location":"local""#));
+    } else {
+        assert!(message.raw.contains(r#""memory_location":null"#));
+    }
     assert!(message.raw.contains(r#""telemetry_enabled":false"#));
     assert!(message.raw.contains(r#""capabilities":["text"]"#));
 }
@@ -592,7 +714,9 @@ fn find_bytes(bytes: &[u8], pattern: &[u8]) -> Option<usize> {
 }
 
 fn assert_content_free_stderr(stderr: &str, private_values: &[&str]) {
+    assert!(!private_values.is_empty());
     for private_value in private_values {
+        assert!(!private_value.is_empty());
         assert!(
             !stderr.contains(private_value),
             "stderr disclosed private content: {stderr}"

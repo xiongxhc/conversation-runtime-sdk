@@ -15,6 +15,7 @@ use conversation_runtime::ConversationQualityController;
 use serde::Deserialize;
 
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
+const MAX_MODEL_ID_BYTES: usize = 256;
 
 #[derive(Debug)]
 pub struct GatewayConfigError(String);
@@ -41,6 +42,13 @@ pub struct GatewayAdapters {
     pub language: OllamaLanguageModel,
     pub quality: ConversationQualityController,
     pub memory: Option<SqliteMemoryContextProvider>,
+    model_id: String,
+}
+
+impl GatewayAdapters {
+    pub fn model_id(&self) -> &str {
+        &self.model_id
+    }
 }
 
 impl GatewayConfig {
@@ -71,6 +79,9 @@ impl GatewayConfig {
     }
 
     fn build_adapters(&self) -> Result<GatewayAdapters, GatewayConfigError> {
+        if self.language.model.len() > MAX_MODEL_ID_BYTES {
+            return Err(config_error("language model identifier exceeded 256 bytes"));
+        }
         let language = OllamaConfig::new(&self.language.model)
             .map_err(adapter_error)?
             .with_endpoint(&self.language.endpoint)
@@ -118,6 +129,7 @@ impl GatewayConfig {
                 self.persona.mode.into(),
             ),
             memory,
+            model_id: self.language.model.clone(),
         })
     }
 }

@@ -22,17 +22,15 @@ async fn run() -> Result<(), ()> {
     let config = GatewayConfig::load(&config_path).map_err(|_| {
         eprintln!("gateway configuration failed");
     })?;
-    let GatewayAdapters {
-        language,
-        quality,
-        memory,
-    } = config.into_adapters().map_err(|_| {
+    let adapters: GatewayAdapters = config.into_adapters().map_err(|_| {
         eprintln!("gateway adapter initialization failed");
     })?;
 
-    let memory_enabled = memory.is_some();
-    let mut runtime = TextTurnRuntime::new(Arc::new(language)).with_quality_controller(quality);
-    if let Some(memory) = memory {
+    let model_id = adapters.model_id().to_owned();
+    let memory_enabled = adapters.memory.is_some();
+    let mut runtime =
+        TextTurnRuntime::new(Arc::new(adapters.language)).with_quality_controller(adapters.quality);
+    if let Some(memory) = adapters.memory {
         runtime = runtime
             .with_memory_provider(Arc::new(memory), ExecutionLocation::Local)
             .map_err(|_| {
@@ -43,7 +41,7 @@ async fn run() -> Result<(), ()> {
         transport: "stdio".to_owned(),
         privacy_mode: "local_only".to_owned(),
         language_location: "local".to_owned(),
-        model_id: "configured-local-model".to_owned(),
+        model_id,
         memory_enabled,
         memory_location: memory_enabled.then(|| "local".to_owned()),
         telemetry_enabled: false,

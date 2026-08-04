@@ -35,7 +35,8 @@ fn loads_an_explicit_valid_local_only_configuration() {
     let path = write_config(fixture.path(), VALID_CONFIG);
 
     let config = GatewayConfig::load(&path).unwrap();
-    let _: GatewayAdapters = config.into_adapters().unwrap();
+    let adapters: GatewayAdapters = config.into_adapters().unwrap();
+    assert_eq!(adapters.model_id(), "local-model-id");
 }
 
 #[test]
@@ -125,6 +126,22 @@ fn rejects_an_empty_model_identifier() {
     let path = write_config(
         fixture.path(),
         &VALID_CONFIG.replacen("model = \"local-model-id\"", "model = \"\"", 1),
+    );
+
+    assert!(GatewayConfig::load(&path).is_err());
+}
+
+#[test]
+fn rejects_a_model_identifier_larger_than_256_bytes() {
+    let fixture = tempfile::tempdir().unwrap();
+    let oversized_model = "x".repeat(257);
+    let path = write_config(
+        fixture.path(),
+        &VALID_CONFIG.replacen(
+            "model = \"local-model-id\"",
+            &format!("model = \"{oversized_model}\""),
+            1,
+        ),
     );
 
     assert!(GatewayConfig::load(&path).is_err());

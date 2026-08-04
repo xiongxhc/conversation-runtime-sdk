@@ -13,11 +13,11 @@ use conversation_model_adapters::{
 use conversation_protocol::{
     ConversationMode, ExecutionLocation, GenerationId, PersonaProfile, ResponseControls,
     RuntimeErrorKind, RuntimeEvent, RuntimeStage, RuntimeTimingMilestone, SessionId, TurnId,
-    UnixTimestampMillis,
+    UnixTimestampMillis, MAX_CONVERSATION_MESSAGE_BYTES,
 };
 use conversation_runtime::{ConversationQualityController, TextTurnEventStream, TextTurnRuntime};
 use tempfile::tempdir;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
@@ -402,6 +402,112 @@ async fn memory_failure_prevents_language_and_allows_reuse() {
     assert!(language.requests().is_empty());
 }
 
+#[tokio::test]
+async fn async_memory_panic_fails_at_memory_stage_and_allows_reuse() {
+    let temporary = tempdir().unwrap();
+    let store = SqliteMemoryStore::initialize(temporary.path().join("runtime.sqlite3")).unwrap();
+    let provider = Arc::new(PanicOnceMemoryProvider {
+        inner: SqliteMemoryContextProvider::new(
+            store,
+            Arc::new(FixedClock(UnixTimestampMillis::new(2_000).unwrap())),
+        ),
+        panicked: AtomicBool::new(false),
+    });
+    let language = Arc::new(MockGenerationLanguageModel::new(["recovered"]));
+    let runtime = TextTurnRuntime::new(language.clone())
+        .with_memory_provider(provider, ExecutionLocation::Local)
+        .unwrap();
+
+    let first_turn = TurnId::new(1);
+    let mut first = runtime
+        .start_turn(first_turn, GenerationId::new(1), "panic in memory")
+        .await
+        .unwrap();
+    let first_observed = drain_with_timeout(&mut first).await;
+    let terminal = single_terminal(&first_observed);
+    assert!(matches!(
+        terminal,
+        RuntimeEvent::TurnFailed { turn_id, error }
+            if *turn_id == first_turn
+                && error.stage() == RuntimeStage::Memory
+                && error.message() == "memory context provider panicked"
+    ));
+
+    let second_turn = TurnId::new(2);
+    let mut second = runtime
+        .start_turn(second_turn, GenerationId::new(2), "after memory panic")
+        .await
+        .unwrap();
+    let second_observed = drain_with_timeout(&mut second).await;
+    assert_single_terminal(
+        &second_observed,
+        RuntimeEvent::TurnCompleted {
+            turn_id: second_turn,
+        },
+    );
+    assert_eq!(language.requests().len(), 1);
+    assert!(language.requests()[0].input().recent_messages().is_empty());
+}
+
+#[tokio::test]
+async fn empty_language_output_fails_and_is_absent_from_next_history() {
+    assert_uncommittable_output_fails(
+        FirstBehavior::Empty,
+        "generation language response is empty",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn over_history_limit_output_fails_and_is_absent_from_next_history() {
+    assert_uncommittable_output_fails(
+        FirstBehavior::OverHistoryLimit,
+        "generation language response exceeds the completed history limit",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn dropped_event_consumer_cleans_owned_work_and_allows_reuse() {
+    let language = Arc::new(ReusableLanguage::new(FirstBehavior::WaitForCancellation));
+    let runtime = TextTurnRuntime::new(language.clone());
+    let mut dropped = runtime
+        .start_turn(TurnId::new(1), GenerationId::new(1), "drop this stream")
+        .await
+        .unwrap();
+    receive_through_first_delta(&mut dropped).await;
+
+    drop(dropped);
+    timeout(Duration::from_secs(1), language.wait_for_cleanup())
+        .await
+        .expect("dropped consumer did not clean language work");
+    let mut retained = timeout(Duration::from_secs(1), async {
+        loop {
+            match runtime
+                .start_turn(TurnId::new(2), GenerationId::new(2), "reuse after drop")
+                .await
+            {
+                Ok(events) => break events,
+                Err(error) if error.kind() == RuntimeErrorKind::InvalidState => {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => panic!("unexpected reuse error: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("dropped consumer did not release the active turn");
+
+    let observed = drain_with_timeout(&mut retained).await;
+    assert_single_terminal(
+        &observed,
+        RuntimeEvent::TurnCompleted {
+            turn_id: TurnId::new(2),
+        },
+    );
+    assert!(language.requests()[1].input().recent_messages().is_empty());
+}
+
 async fn drain(events: &mut TextTurnEventStream) -> Vec<RuntimeEvent> {
     let mut observed = Vec::new();
     while let Some(event) = events.recv().await {
@@ -440,6 +546,39 @@ async fn receive_through_first_delta(events: &mut TextTurnEventStream) {
     })
     .await
     .expect("text turn did not publish its first delta");
+}
+
+async fn assert_uncommittable_output_fails(first_behavior: FirstBehavior, expected_message: &str) {
+    let language = Arc::new(ReusableLanguage::new(first_behavior));
+    let runtime = TextTurnRuntime::new(language.clone());
+    let first_turn = TurnId::new(1);
+    let mut first = runtime
+        .start_turn(first_turn, GenerationId::new(1), "first request")
+        .await
+        .unwrap();
+    let first_observed = drain_with_timeout(&mut first).await;
+    let terminal = single_terminal(&first_observed);
+    assert!(matches!(
+        terminal,
+        RuntimeEvent::TurnFailed { turn_id, error }
+            if *turn_id == first_turn
+                && error.stage() == RuntimeStage::LanguageModel
+                && error.message() == expected_message
+    ));
+
+    let second_turn = TurnId::new(2);
+    let mut second = runtime
+        .start_turn(second_turn, GenerationId::new(2), "second request")
+        .await
+        .unwrap();
+    let second_observed = drain_with_timeout(&mut second).await;
+    assert_single_terminal(
+        &second_observed,
+        RuntimeEvent::TurnCompleted {
+            turn_id: second_turn,
+        },
+    );
+    assert!(language.requests()[1].input().recent_messages().is_empty());
 }
 
 fn event_index(events: &[RuntimeEvent], predicate: impl Fn(&RuntimeEvent) -> bool) -> usize {
@@ -483,12 +622,15 @@ enum FirstBehavior {
     WaitForCancellation,
     Error,
     Panic,
+    Empty,
+    OverHistoryLimit,
 }
 
 struct ReusableLanguage {
     first_behavior: FirstBehavior,
     requests: StdMutex<Vec<GenerationLanguageRequest>>,
     cleanup_finished: Arc<AtomicBool>,
+    cleanup_notified: Arc<Notify>,
 }
 
 impl ReusableLanguage {
@@ -497,6 +639,7 @@ impl ReusableLanguage {
             first_behavior,
             requests: StdMutex::new(Vec::new()),
             cleanup_finished: Arc::new(AtomicBool::new(false)),
+            cleanup_notified: Arc::new(Notify::new()),
         }
     }
 
@@ -505,6 +648,16 @@ impl ReusableLanguage {
             .lock()
             .expect("reusable language requests lock poisoned")
             .clone()
+    }
+
+    async fn wait_for_cleanup(&self) {
+        loop {
+            let notified = self.cleanup_notified.notified();
+            if self.cleanup_finished.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -527,16 +680,22 @@ impl GenerationLanguageModel for ReusableLanguage {
         let (sender, receiver) = mpsc::channel(1);
         let first_behavior = self.first_behavior;
         let cleanup_finished = Arc::clone(&self.cleanup_finished);
+        let cleanup_notified = Arc::clone(&self.cleanup_notified);
         tokio::spawn(async move {
-            let delta = GenerationTextDelta::new(
-                request.turn_id(),
-                request.generation_id(),
-                if request.generation_id() == GenerationId::new(1) {
-                    "partial"
-                } else {
-                    "recovered"
-                },
-            );
+            if request.generation_id() == GenerationId::new(1)
+                && matches!(first_behavior, FirstBehavior::Empty)
+            {
+                return;
+            }
+            let delta_text = if request.generation_id() != GenerationId::new(1) {
+                "recovered".to_owned()
+            } else if matches!(first_behavior, FirstBehavior::OverHistoryLimit) {
+                "x".repeat(MAX_CONVERSATION_MESSAGE_BYTES)
+            } else {
+                "partial".to_owned()
+            };
+            let delta =
+                GenerationTextDelta::new(request.turn_id(), request.generation_id(), delta_text);
             if sender.send(Ok(delta)).await.is_err() {
                 return;
             }
@@ -547,14 +706,17 @@ impl GenerationLanguageModel for ReusableLanguage {
                 FirstBehavior::WaitForCancellation => {
                     cancellation.cancelled().await;
                     cleanup_finished.store(true, Ordering::Release);
+                    cleanup_notified.notify_waiters();
                 }
                 FirstBehavior::Error => {
                     let _ = sender
                         .send(Err(AdapterError::new("generation failed")))
                         .await;
                     cleanup_finished.store(true, Ordering::Release);
+                    cleanup_notified.notify_waiters();
                 }
                 FirstBehavior::Panic => unreachable!(),
+                FirstBehavior::Empty | FirstBehavior::OverHistoryLimit => {}
             }
         });
         receiver
@@ -575,5 +737,31 @@ impl MemoryContextProvider for FailingMemoryProvider {
         _cancellation: CancellationToken,
     ) -> MemoryProviderFuture<'_> {
         Box::pin(async { Err(MemoryStoreError::cancelled()) })
+    }
+}
+
+struct PanicOnceMemoryProvider {
+    inner: SqliteMemoryContextProvider,
+    panicked: AtomicBool,
+}
+
+impl MemoryContextProvider for PanicOnceMemoryProvider {
+    fn execution_location(&self) -> ExecutionLocation {
+        ExecutionLocation::Local
+    }
+
+    fn retrieve(
+        &self,
+        turn_id: TurnId,
+        query: String,
+        cancellation: CancellationToken,
+    ) -> MemoryProviderFuture<'_> {
+        if !self.panicked.swap(true, Ordering::AcqRel) {
+            return Box::pin(async {
+                tokio::task::yield_now().await;
+                panic!("scripted async memory panic");
+            });
+        }
+        self.inner.retrieve(turn_id, query, cancellation)
     }
 }

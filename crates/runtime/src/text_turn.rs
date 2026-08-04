@@ -10,16 +10,15 @@ use conversation_model_adapters::{
 use conversation_protocol::{
     ConversationMode, ExecutionLocation, GenerationId, PersonaProfile, ResponseControls,
     RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage, RuntimeTimingMilestone, SessionId,
-    TurnId,
+    TurnId, MAX_CONVERSATION_MESSAGE_BYTES,
 };
 use tokio::sync::{mpsc, oneshot, Mutex};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use crate::ConversationQualityController;
 
 const EVENT_BUFFER_SIZE: usize = 32;
-const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
 pub struct TextTurnEventStream {
     events: mpsc::Receiver<RuntimeEvent>,
@@ -197,6 +196,8 @@ impl TextTurnRuntime {
         let task = TextTurnTask {
             turn_id,
             generation_id,
+            maximum_response_bytes: MAX_CONVERSATION_MESSAGE_BYTES
+                .saturating_sub(language_input.transcript().len()),
             language_input,
             language_model: Arc::clone(&self.language_model),
             memory_provider: self.memory_provider.as_ref().map(Arc::clone),
@@ -219,11 +220,6 @@ impl TextTurnRuntime {
             let quality_result = {
                 let mut quality = quality.lock().await;
                 match &terminal {
-                    RuntimeEvent::TurnCompleted { .. }
-                        if outcome.generated_text.trim().is_empty() =>
-                    {
-                        quality.discard_turn(turn_id)
-                    }
                     RuntimeEvent::TurnCompleted { .. } => {
                         quality.complete_turn(turn_id, outcome.generated_text)
                     }
@@ -286,6 +282,7 @@ impl TextTurnRuntime {
 struct TextTurnTask {
     turn_id: TurnId,
     generation_id: GenerationId,
+    maximum_response_bytes: usize,
     language_input: LanguageModelInput,
     language_model: Arc<dyn GenerationLanguageModel>,
     memory_provider: Option<Arc<dyn MemoryContextProvider>>,
@@ -303,6 +300,7 @@ async fn run_text_turn(task: TextTurnTask, events: &mpsc::Sender<RuntimeEvent>) 
     let TextTurnTask {
         turn_id,
         generation_id,
+        maximum_response_bytes,
         mut language_input,
         language_model,
         memory_provider,
@@ -336,41 +334,28 @@ async fn run_text_turn(task: TextTurnTask, events: &mpsc::Sender<RuntimeEvent>) 
 
     if let Some(memory_provider) = memory_provider {
         let memory_cancellation = work_cancellation.child_token();
-        let retrieval = catch_unwind(AssertUnwindSafe(|| {
-            memory_provider.retrieve(
-                turn_id,
-                language_input.transcript().to_owned(),
-                memory_cancellation.clone(),
-            )
-        }));
-        let mut retrieval = match retrieval {
-            Ok(retrieval) => retrieval,
-            Err(_) => {
-                return TextTurnOutcome {
-                    terminal: adapter_failure(
-                        turn_id,
-                        RuntimeStage::Memory,
-                        AdapterError::new("memory context provider panicked"),
-                    ),
-                    generated_text,
-                };
-            }
-        };
+        let retrieval_query = language_input.transcript().to_owned();
+        let retrieval_cancellation = memory_cancellation.clone();
+        let mut retrieval = tokio::spawn(async move {
+            memory_provider
+                .retrieve(turn_id, retrieval_query, retrieval_cancellation)
+                .await
+        });
         let retrieval = tokio::select! {
             biased;
             _ = external_interruption.cancelled() => {
                 memory_cancellation.cancel();
-                let _ = retrieval.await;
+                let _ = (&mut retrieval).await;
                 return cancelled_outcome(turn_id, generated_text);
             }
             _ = work_cancellation.cancelled() => {
                 memory_cancellation.cancel();
-                let _ = retrieval.await;
+                let _ = (&mut retrieval).await;
                 return cancelled_outcome(turn_id, generated_text);
             }
             _ = events.closed() => {
                 memory_cancellation.cancel();
-                let _ = retrieval.await;
+                let _ = (&mut retrieval).await;
                 return failed_outcome(
                     turn_id,
                     "text event consumer closed during memory retrieval",
@@ -379,13 +364,21 @@ async fn run_text_turn(task: TextTurnTask, events: &mpsc::Sender<RuntimeEvent>) 
             result = &mut retrieval => result,
         };
         let retrieval = match retrieval {
-            Ok(retrieval) => retrieval,
-            Err(_) if external_interruption.is_cancelled() || work_cancellation.is_cancelled() => {
+            Ok(Ok(retrieval)) => retrieval,
+            Ok(Err(_))
+                if external_interruption.is_cancelled() || work_cancellation.is_cancelled() =>
+            {
                 return cancelled_outcome(turn_id, generated_text);
+            }
+            Ok(Err(error)) => {
+                return TextTurnOutcome {
+                    terminal: memory_failure(turn_id, error),
+                    generated_text,
+                };
             }
             Err(error) => {
                 return TextTurnOutcome {
-                    terminal: memory_failure(turn_id, error),
+                    terminal: memory_task_failure(turn_id, error),
                     generated_text,
                 };
             }
@@ -488,16 +481,16 @@ async fn run_text_turn(task: TextTurnTask, events: &mpsc::Sender<RuntimeEvent>) 
                 if delta
                     .delta()
                     .len()
-                    .gt(&MAX_RESPONSE_BYTES.saturating_sub(generated_text.len()))
+                    .gt(&maximum_response_bytes.saturating_sub(generated_text.len()))
                 {
                     cleanup_language_stream(&language_cancellation, &mut deltas).await;
                     return TextTurnOutcome {
                         terminal: adapter_failure(
                             turn_id,
                             RuntimeStage::LanguageModel,
-                            AdapterError::new(format!(
-                                "generation language response exceeds the maximum size of {MAX_RESPONSE_BYTES} bytes"
-                            )),
+                            AdapterError::new(
+                                "generation language response exceeds the completed history limit",
+                            ),
                         ),
                         generated_text,
                     };
@@ -539,6 +532,16 @@ async fn run_text_turn(task: TextTurnTask, events: &mpsc::Sender<RuntimeEvent>) 
                 };
             }
             None => {
+                if generated_text.trim().is_empty() {
+                    return TextTurnOutcome {
+                        terminal: adapter_failure(
+                            turn_id,
+                            RuntimeStage::LanguageModel,
+                            AdapterError::new("generation language response is empty"),
+                        ),
+                        generated_text,
+                    };
+                }
                 return TextTurnOutcome {
                     terminal: RuntimeEvent::TurnCompleted { turn_id },
                     generated_text,
@@ -668,6 +671,15 @@ fn memory_failure(turn_id: TurnId, error: MemoryStoreError) -> RuntimeEvent {
         turn_id,
         error: RuntimeError::new(RuntimeErrorKind::Adapter, RuntimeStage::Memory, message),
     }
+}
+
+fn memory_task_failure(turn_id: TurnId, error: JoinError) -> RuntimeEvent {
+    let message = if error.is_panic() {
+        "memory context provider panicked"
+    } else {
+        "memory context provider task failed"
+    };
+    adapter_failure(turn_id, RuntimeStage::Memory, AdapterError::new(message))
 }
 
 fn adapter_runtime_error(stage: RuntimeStage, error: AdapterError) -> RuntimeError {

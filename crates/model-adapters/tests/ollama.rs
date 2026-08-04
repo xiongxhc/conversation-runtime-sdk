@@ -126,20 +126,50 @@ async fn direct_constructor_bypasses_system_http_proxies() {
         .env("NO_PROXY", "")
         .env("no_proxy", "")
         .kill_on_drop(true);
-    let child = command.spawn().unwrap();
+    let mut child = command.spawn().unwrap();
 
-    let output = tokio::select! {
+    let outcome = tokio::select! {
         biased;
-        accepted = proxy.accept() => panic!("direct client contacted proxy: {accepted:?}"),
-        output = timeout(Duration::from_secs(2), child.wait_with_output()) => {
-            output.expect("direct proxy child timed out").unwrap()
+        accepted = proxy.accept() => DirectProxyChildOutcome::ProxyAccepted(accepted),
+        status = timeout(Duration::from_secs(2), child.wait()) => {
+            match status {
+                Ok(status) => DirectProxyChildOutcome::Exited(status),
+                Err(_) => DirectProxyChildOutcome::TimedOut,
+            }
         }
     };
 
-    assert!(output.status.success());
+    let status = match outcome {
+        DirectProxyChildOutcome::ProxyAccepted(accepted) => {
+            kill_and_reap(&mut child).await;
+            panic!("direct client contacted proxy: {accepted:?}");
+        }
+        DirectProxyChildOutcome::TimedOut => {
+            kill_and_reap(&mut child).await;
+            panic!("direct proxy child timed out");
+        }
+        DirectProxyChildOutcome::Exited(status) => status.unwrap(),
+    };
+
+    assert!(status.success());
     assert!(timeout(Duration::from_millis(20), proxy.accept())
         .await
         .is_err());
+}
+
+enum DirectProxyChildOutcome {
+    ProxyAccepted(std::io::Result<(TcpStream, std::net::SocketAddr)>),
+    Exited(std::io::Result<std::process::ExitStatus>),
+    TimedOut,
+}
+
+async fn kill_and_reap(child: &mut tokio::process::Child) {
+    if child.kill().await.is_err() {
+        assert!(
+            child.try_wait().unwrap().is_some(),
+            "direct proxy child could not be terminated"
+        );
+    }
 }
 
 #[tokio::test]

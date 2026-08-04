@@ -1,0 +1,14 @@
+{
+  "name": "conversation-node-chat",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@conversation/runtime": "0.1.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "chat": "npm run build --silent && node dist/src/main.js",
+    "test": "npm run build && cargo build --locked --manifest-path ../../Cargo.toml -p conversation-runtime-gateway && node --test dist/test/*.test.js"
+  }
+}

@@ -34,6 +34,14 @@ The first release is not a directory-complete platform. It is one local voice lo
   regression-tested: visible persona dimensions, four modes, response limits,
   temporary corrections, completed-only history, typed provider envelopes,
   content-free decisions, and context-derived relationship guidance.
+- R5 controlled local memory is complete for its deterministic SDK and probe
+  surface, including explicit initialization, revision-bound mutation,
+  confirmation-backed promotion, bounded retrieval, and content-free traces.
+- The first R6 local-gateway slice is complete: a persistent local-only Rust
+  gateway, bounded framed stdio protocol, public TypeScript client, and minimal
+  Node chat example pass deterministic completion and cancellation tests across
+  the real Rust-binary-to-Node process boundary. R6 remains open for the desktop
+  UI, persona and memory mutation controls, packaging, and model setup.
 - First-audible timing, audible-stop p95, representative warm measurements,
   subjective English and Chinese quality, and the 1.2-second
   time-to-useful-audio goal remain unvalidated.
@@ -278,20 +286,53 @@ adapter, probe, and voice-CLI tests. See
 
 **Outcome:** Prove that the runtime can serve a product without becoming coupled to desktop UI code.
 
-### Deliverables
+### Source Status
+
+The first local-gateway slice is complete. `conversation-runtime-gateway` owns
+one local-only text runtime and exchanges bounded versioned frames over its
+child-process stdin and stdout without opening a network listener.
+`@conversation/runtime` exposes the validated protocol, transport-neutral
+client, and Node stdio transport. The `conversation-node-chat` example consumes
+only those public exports, keeps one gateway alive across turns, streams UTF-8
+text deltas, and maps interruption and shutdown independently.
+
+The deterministic cross-language smoke compiles the actual Rust binary and
+uses a temporary loopback Ollama-compatible fixture to prove ready, command
+acceptance, text streaming, completion, and a separate cancellation run. It is
+interoperability evidence only; it does not select a model, measure latency or
+quality, or close any R3 human, device, or acoustic acceptance gate.
+
+R6 remains open overall. The Tauri and React app, microphone and playback UI,
+persona and memory mutation controls, model setup and benchmark UI, packaging,
+signing, and installation flows are not implemented by this slice.
+
+See [the R6 local-gateway evaluation](docs/r6-local-gateway-evaluation.md).
+
+### Completed Local-Gateway Slice
+
+- Persistent local-only Rust text gateway with no network listener.
+- Stable bounded framed-stdio commands, events, status, and cancellation.
+- Backend-neutral `@conversation/runtime` TypeScript SDK.
+- Minimal persistent Node chat client using public SDK exports only.
+- Real Rust-binary-to-Node completion and cancellation smoke coverage.
+
+### Remaining Deliverables
 
 - Tauri and React desktop reference app.
 - Microphone, playback, interruption, persona, and memory controls.
 - Local model setup and benchmark reporting.
-- Stable client-facing event transport.
-- An application-owned runtime gateway boundary that remains local-only in R6 and can be extended with opt-in LAN binding and pairing in R7.
-- TypeScript SDK generated or maintained from the public protocol.
-- Integration documentation and a second minimal client.
+- Persona and memory inspection and mutation flows backed by actual runtime
+  state.
+- Packaging, signing, installation, and private configuration workflows that
+  contain no model weights.
+- Later application-owned transport work required before any opt-in LAN binding
+  and pairing in R7.
 
 ### Exit Criteria
 
-- The desktop app imports public runtime interfaces only.
-- A second client can run a turn without importing desktop application code.
+- The Node client already runs turns without importing desktop application
+  code; the desktop app must still import the same public runtime interfaces
+  only.
 - Memory and persona controls expose actual runtime state.
 - Model and hardware requirements are documented from measured results.
 - Packaging contains no model weights or private local configuration.

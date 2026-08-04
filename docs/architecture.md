@@ -17,6 +17,42 @@ on runtime orchestration or model-specific payloads.
 
 `runtime` owns turn state, adapter coordination, event ordering, and cancellation. Clients should not depend on adapter implementation details.
 
+## R6 Local Gateway Slice
+
+The first R6 slice adds a process boundary without adding a network service:
+
+```mermaid
+flowchart LR
+    Client["Node client / later Tauri host"] <-->|"bounded framed stdio"| Gateway["Local-only Rust gateway"]
+    Gateway <-->|"typed commands and lifecycle events"| Runtime["Text runtime"]
+    Runtime <-->|"streaming generation and cancellation"| Adapter["Local language adapter"]
+    Adapter <-->|"loopback HTTP"| Provider["Operator-selected local provider"]
+    NoListener["Gateway opens no TCP, HTTP, WebSocket, Unix, or LAN listener"] -.-> Gateway
+```
+
+The client spawns exactly one `conversation-runtime-gateway` process with an
+explicit absolute configuration path. Four-byte big-endian length prefixes
+frame bounded versioned JSON over child stdin and stdout. Standard error carries
+only bounded content-free diagnostics; transcripts, generated text, provider
+payloads, model identifiers, and memory contents do not become diagnostics.
+
+The gateway owns one `TextTurnRuntime`, accepts at most one active turn, and
+acknowledges an accepted start before forwarding that turn's events. The same
+process remains reusable after completion or cancellation. EOF closes the
+session and cancels owned work. The gateway itself never binds a listener; the
+configured local provider is a separate loopback service and is not exposed by
+the public protocol.
+
+`@conversation/runtime` contains validated protocol unions, incremental frame
+handling, a transport-neutral `RuntimeClient`, and the Node
+`StdioGatewayTransport`. The Node chat example consumes only those public
+exports. A later Tauri host can implement the same transport boundary without
+moving provider-specific types into the SDK.
+
+This slice does not implement the Tauri or React UI, microphone or playback
+controls, persona or memory mutation commands, model installation, packaging,
+signing, LAN access, or pairing. Those remain later R6 or R7 work.
+
 ## R3 Target: Real-Time Voice Loop
 
 R3 keeps the public runtime backend-neutral while adding one managed macOS
@@ -338,4 +374,9 @@ capabilities.
 
 ## Why the Desktop Shell Is Deferred
 
-Creating the Tauri and React application before runtime contracts exist would couple the first protocol to desktop UI needs. The current boundary is documentation-only until deterministic turn and cancellation tests pass and feasibility benchmarks validate concrete reference adapters.
+The first R6 gateway slice now proves that a non-desktop client can use the
+public TypeScript SDK for persistent turns and cancellation over a local
+process boundary. Tauri and React remain deferred so desktop UI requirements do
+not redefine the validated protocol prematurely. The later desktop slice must
+reuse this public boundary while adding visible controls, packaging, and
+application policy rather than importing Rust or provider internals.

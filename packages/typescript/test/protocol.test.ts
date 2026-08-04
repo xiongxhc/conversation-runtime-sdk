@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   encodeClientCommand,
+  MAX_CONVERSATION_MESSAGE_BYTES,
   parseClientCommand,
   parseGatewayMessage,
 } from "../src/protocol.js";
@@ -140,3 +141,123 @@ test("encodes bigint command identifiers as canonical decimals", () => {
     turn_id: "18446744073709551615",
   });
 });
+
+test("enforces the 16 KiB UTF-8 transcript boundary for parsed and encoded commands", () => {
+  const boundary = "🙂".repeat(MAX_CONVERSATION_MESSAGE_BYTES / 4);
+  const oversized = `${boundary}🙂`;
+  const command = {
+    protocol_version: 1,
+    type: "start_turn",
+    request_id: "request-1",
+    turn_id: "1",
+    transcript: boundary,
+  };
+
+  const parsed = parseClientCommand(command);
+  assert.equal(parsed.type, "start_turn");
+  if (parsed.type !== "start_turn") {
+    throw new Error("expected a start_turn command");
+  }
+  assert.equal(parsed.transcript, boundary);
+  assert.throws(() => parseClientCommand({ ...command, transcript: oversized }), /16 KiB/);
+  assert.doesNotThrow(() =>
+    encodeClientCommand({ type: "start_turn", requestId: "request-1", turnId: 1n, transcript: boundary }),
+  );
+  assert.throws(
+    () => encodeClientCommand({ type: "start_turn", requestId: "request-1", turnId: 1n, transcript: oversized }),
+    /16 KiB/,
+  );
+});
+
+test("mirrors the complete v1 timing, quality, and status vocabulary", () => {
+  for (const milestone of ["first_text_delta", "first_synthesis_request", "first_playable_audio"]) {
+    const parsed = parseGatewayMessage(runtimeEvent({
+      type: "timing",
+      turn_id: "1",
+      milestone,
+      elapsed_ms: 1,
+    }));
+    assert.equal(parsed.type, "runtime_event");
+    assert.equal(parsed.event.type, "timing");
+    assert.equal(parsed.event.milestone, milestone);
+  }
+
+  const parsed = parseGatewayMessage(runtimeEvent(qualityResolved({
+    signals: [
+      "interrupted",
+      "shorter_requested",
+      "stop_explaining",
+      "question_rejected",
+      "hesitation",
+      "rapid_topic_change",
+    ],
+    context_sources: ["saved_persona", "recent_history", "current_turn", "barge_in", "temporary_correction"],
+    history_message_count: 16,
+    controls: {
+      maximum_spoken_seconds: 65535,
+      directness: 100,
+      pace: "brisk",
+      follow_up_policy: "allowed",
+      silence_policy: "allow_without_filler",
+    },
+  })));
+  assert.equal(parsed.type, "runtime_event");
+  assert.equal(parsed.event.type, "quality_resolved");
+  assert.equal(parsed.event.decision.historyMessageCount, 16);
+
+  assert.throws(() => parseGatewayMessage(runtimeEvent(qualityResolved({ signals: ["unknown"] }))));
+  assert.throws(() => parseGatewayMessage(runtimeEvent(qualityResolved({ signals: ["interrupted", "interrupted"] }))));
+  assert.throws(() => parseGatewayMessage(runtimeEvent(qualityResolved({ context_sources: ["unknown"] }))));
+  assert.throws(() => parseGatewayMessage(runtimeEvent(qualityResolved({ history_message_count: 17 }))));
+  assert.throws(() => parseGatewayMessage(runtimeEvent(qualityResolved({ controls: { ...qualityControls(), maximum_spoken_seconds: 0 } }))));
+  assert.throws(() => parseGatewayMessage(runtimeEvent(qualityResolved({ controls: { ...qualityControls(), maximum_spoken_seconds: 65536 } }))));
+  assert.throws(() => parseGatewayMessage(runtimeEvent(qualityResolved({ controls: { ...qualityControls(), directness: 101 } }))));
+  assert.throws(() => parseGatewayMessage({
+    protocol_version: 1,
+    type: "ready",
+    status: { ...wireStatus(), capabilities: ["voice"] },
+  }));
+});
+
+function runtimeEvent(event: Record<string, unknown>): Record<string, unknown> {
+  return { protocol_version: 1, type: "runtime_event", event };
+}
+
+function qualityDecision(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    turn_id: "1",
+    mode: "direct_answer",
+    controls: qualityControls(),
+    signals: [],
+    history_message_count: 0,
+    context_sources: ["saved_persona", "current_turn"],
+    ...overrides,
+  };
+}
+
+function qualityResolved(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return { type: "quality_resolved", decision: qualityDecision(overrides) };
+}
+
+function qualityControls(): Record<string, unknown> {
+  return {
+    maximum_spoken_seconds: 20,
+    directness: 80,
+    pace: "natural",
+    follow_up_policy: "contextual",
+    silence_policy: "allow_without_filler",
+  };
+}
+
+function wireStatus(): Record<string, unknown> {
+  return {
+    transport: "stdio",
+    privacy_mode: "local_only",
+    language_location: "local",
+    model_id: "local-model",
+    memory_enabled: false,
+    memory_location: null,
+    telemetry_enabled: false,
+    capabilities: ["text"],
+  };
+}

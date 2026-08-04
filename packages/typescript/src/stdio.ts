@@ -6,24 +6,36 @@ import { encodeClientCommand, type ClientCommand } from "./protocol.js";
 import type { RuntimeTransport } from "./client.js";
 
 const MAX_STDERR_BYTES = 64 * 1024;
+const GRACEFUL_CLOSE_TIMEOUT_MS = 100;
+const FORCE_KILL_DEADLINE_MS = 100;
 
 export class StdioGatewayTransport implements RuntimeTransport {
   private readonly decoder = new FrameDecoder();
   private readonly inbound = new AsyncQueue<unknown>();
   private closePromise: Promise<void> | undefined;
+  private childExited = false;
+  private readonly exitPromise: Promise<void>;
   private failure: Error | undefined;
   private closing = false;
+  private resolveExit!: () => void;
   private stderrLength = 0;
   private writeChain = Promise.resolve();
 
   readonly messages = this.inbound;
 
   private constructor(private readonly child: ChildProcessWithoutNullStreams) {
+    this.exitPromise = new Promise<void>((resolve) => {
+      this.resolveExit = resolve;
+    });
     child.stdout.on("data", (chunk: Buffer) => this.onStdout(chunk));
     child.stdout.once("end", () => this.onStdoutEnd());
+    child.stdout.once("error", () => this.fail(new Error("gateway stdout failed")));
     child.stderr.on("data", (chunk: Buffer) => this.onStderr(chunk));
+    child.stderr.once("error", () => this.fail(new Error("gateway stderr failed")));
     child.once("error", () => this.fail(new Error("gateway process failed")));
     child.once("exit", () => {
+      this.childExited = true;
+      this.resolveExit();
       if (this.closing) {
         this.inbound.finish();
       } else {
@@ -47,7 +59,7 @@ export class StdioGatewayTransport implements RuntimeTransport {
     const transport = new StdioGatewayTransport(child);
     await new Promise<void>((resolve, reject) => {
       child.once("spawn", resolve);
-      child.once("error", reject);
+      child.once("error", () => reject(new Error("gateway spawn failed")));
     });
     return transport;
   }
@@ -70,16 +82,7 @@ export class StdioGatewayTransport implements RuntimeTransport {
       return this.closePromise;
     }
     this.closing = true;
-    this.closePromise = new Promise<void>((resolve, reject) => {
-      if (this.child.exitCode !== null) {
-        this.inbound.finish();
-        resolve();
-        return;
-      }
-      this.child.once("exit", () => resolve());
-      this.child.once("error", reject);
-      this.child.stdin.end();
-    });
+    this.closePromise = this.closeChild();
     return this.closePromise;
   }
 
@@ -111,6 +114,43 @@ export class StdioGatewayTransport implements RuntimeTransport {
 
   private onStderr(chunk: Buffer): void {
     this.stderrLength = Math.min(MAX_STDERR_BYTES, this.stderrLength + chunk.length);
+  }
+
+  private async closeChild(): Promise<void> {
+    if (this.childExited) {
+      this.inbound.finish();
+      return;
+    }
+    try {
+      this.child.stdin.end();
+    } catch {
+      this.fail(new Error("gateway stdin failed"));
+    }
+    if (await this.waitForExit(GRACEFUL_CLOSE_TIMEOUT_MS)) {
+      this.inbound.finish();
+      return;
+    }
+    this.child.kill("SIGTERM");
+    if (await this.waitForExit(FORCE_KILL_DEADLINE_MS)) {
+      this.inbound.finish();
+      return;
+    }
+    this.child.kill("SIGKILL");
+    await this.exitPromise;
+    this.inbound.finish();
+  }
+
+  private async waitForExit(timeoutMs: number): Promise<boolean> {
+    if (this.childExited) {
+      return true;
+    }
+    return new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => resolve(false), timeoutMs);
+      void this.exitPromise.then(() => {
+        clearTimeout(timer);
+        resolve(true);
+      });
+    });
   }
 
   private write(frame: Uint8Array): Promise<void> {
@@ -166,6 +206,7 @@ class AsyncQueue<T> implements AsyncIterable<T> {
   }
 
   fail(error: Error): void {
+    this.values.length = 0;
     this.error = error;
     this.end();
   }
@@ -173,11 +214,11 @@ class AsyncQueue<T> implements AsyncIterable<T> {
   [Symbol.asyncIterator](): AsyncIterator<T> {
     return {
       next: () => {
-        if (this.values.length > 0) {
-          return Promise.resolve({ value: this.values.shift()!, done: false });
-        }
         if (this.error) {
           return Promise.reject(this.error);
+        }
+        if (this.values.length > 0) {
+          return Promise.resolve({ value: this.values.shift()!, done: false });
         }
         if (this.finished) {
           return Promise.resolve({ value: undefined, done: true });

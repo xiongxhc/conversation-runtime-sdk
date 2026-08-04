@@ -46,3 +46,17 @@ test("rejects a stream ending with an incomplete frame", () => {
 
   assert.throws(() => decoder.finish());
 });
+
+test("decodes a maximal frame delivered one byte at a time", { timeout: 5_000 }, () => {
+  const payload = new Uint8Array(MAX_FRAME_BYTES).fill(7);
+  const frame = encodeFrame(payload);
+  const decoder = new FrameDecoder();
+  let decoded: Uint8Array[] = [];
+
+  for (const byte of frame) {
+    decoded = decoder.push(new Uint8Array([byte]));
+  }
+
+  assert.deepEqual(decoded, [payload]);
+  decoder.finish();
+});

@@ -1,4 +1,6 @@
 export const CLIENT_PROTOCOL_VERSION = 1;
+export const MAX_CONVERSATION_MESSAGE_BYTES = 16 * 1024;
+export const MAX_HISTORY_MESSAGE_COUNT = 16;
 export const MAX_U64 = 2n ** 64n - 1n;
 
 export type ClientCommand =
@@ -30,8 +32,23 @@ export type RuntimeStatus = {
   memoryEnabled: boolean;
   memoryLocation: "local" | null;
   telemetryEnabled: false;
-  capabilities: string[];
+  capabilities: ["text"];
 };
+
+type ConversationSignal =
+  | "interrupted"
+  | "shorter_requested"
+  | "stop_explaining"
+  | "question_rejected"
+  | "hesitation"
+  | "rapid_topic_change";
+
+type ContextSource =
+  | "saved_persona"
+  | "recent_history"
+  | "current_turn"
+  | "barge_in"
+  | "temporary_correction";
 
 export type RuntimeEvent =
   | { type: "turn_started"; turnId: bigint }
@@ -47,9 +64,9 @@ export type RuntimeEvent =
           followUpPolicy: "never" | "contextual" | "allowed";
           silencePolicy: "allow_without_filler";
         };
-        signals: string[];
+        signals: ConversationSignal[];
         historyMessageCount: number;
-        contextSources: string[];
+        contextSources: ContextSource[];
       };
     }
   | {
@@ -57,7 +74,12 @@ export type RuntimeEvent =
       trace: { traceId: bigint; turnId: bigint; selectedItems: number; usedBytes: number };
     }
   | { type: "text_delta"; turnId: bigint; delta: string }
-  | { type: "timing"; turnId: bigint; milestone: "first_text_delta"; elapsedMs: number }
+  | {
+      type: "timing";
+      turnId: bigint;
+      milestone: "first_text_delta" | "first_synthesis_request" | "first_playable_audio";
+      elapsedMs: number;
+    }
   | { type: "turn_completed"; turnId: bigint }
   | { type: "turn_cancelled"; turnId: bigint }
   | { type: "turn_failed"; turnId: bigint; error: RuntimeFailure };
@@ -92,7 +114,7 @@ export function parseClientCommand(value: unknown): ClientCommand {
         type,
         requestId: requireRequestId(object),
         turnId: parseIdentifier(object.turn_id),
-        transcript: requireNonEmptyString(object, "transcript"),
+        transcript: requireTranscript(object, "transcript"),
       };
     case "interrupt_turn":
       requireExactKeys(object, ["protocol_version", "type", "request_id", "turn_id"]);
@@ -137,7 +159,7 @@ export function parseGatewayMessage(value: unknown): GatewayMessage {
 }
 
 export function encodeClientCommand(command: ClientCommand): Uint8Array {
-  validateOutboundCommand(command);
+  validateClientCommand(command);
   const wire =
     command.type === "status"
       ? { protocol_version: CLIENT_PROTOCOL_VERSION, type: command.type, request_id: command.requestId }
@@ -156,6 +178,21 @@ export function encodeClientCommand(command: ClientCommand): Uint8Array {
             turn_id: command.turnId.toString(),
           };
   return new TextEncoder().encode(JSON.stringify(wire));
+}
+
+export function validateClientCommand(command: ClientCommand): void {
+  if (!isRecord(command)) {
+    throw new ProtocolError("client command must be an object");
+  }
+  if (!isCanonicalRequestId(command.requestId)) {
+    throw new ProtocolError("request identifier must be non-empty and at most 64 bytes");
+  }
+  if (command.type === "start_turn") {
+    validateTranscript(command.transcript);
+  }
+  if (command.type !== "status" && (command.turnId < 1n || command.turnId > MAX_U64)) {
+    throw new ProtocolError("turn identifier is outside u64 range");
+  }
 }
 
 function parseRuntimeStatus(value: unknown): RuntimeStatus {
@@ -182,7 +219,7 @@ function parseRuntimeStatus(value: unknown): RuntimeStatus {
     memoryEnabled: requireBoolean(object, "memory_enabled"),
     memoryLocation: requireMemoryLocation(memoryLocation),
     telemetryEnabled: requireOneOf(object, "telemetry_enabled", [false] as const),
-    capabilities: requireStringArray(object, "capabilities"),
+    capabilities: requireCapabilities(object),
   };
 }
 
@@ -207,7 +244,11 @@ function parseRuntimeEvent(value: unknown): RuntimeEvent {
       return {
         type,
         turnId: parseIdentifier(object.turn_id),
-        milestone: requireOneOf(object, "milestone", ["first_text_delta"] as const),
+        milestone: requireOneOf(
+          object,
+          "milestone",
+          ["first_text_delta", "first_synthesis_request", "first_playable_audio"] as const,
+        ),
         elapsedMs: requireNonNegativeInteger(object, "elapsed_ms"),
       };
     case "turn_completed":
@@ -229,9 +270,29 @@ function parseQualityDecision(value: unknown): Extract<RuntimeEvent, { type: "qu
     turnId: parseIdentifier(object.turn_id),
     mode: requireOneOf(object, "mode", ["direct_answer", "companionship", "brainstorming", "reflective"] as const),
     controls: parseResponseControls(object.controls),
-    signals: requireStringArray(object, "signals"),
-    historyMessageCount: requireNonNegativeInteger(object, "history_message_count"),
-    contextSources: requireStringArray(object, "context_sources"),
+    signals: requireUniqueEnumArray(
+      object,
+      "signals",
+      [
+        "interrupted",
+        "shorter_requested",
+        "stop_explaining",
+        "question_rejected",
+        "hesitation",
+        "rapid_topic_change",
+      ] as const,
+    ),
+    historyMessageCount: requireIntegerInRange(
+      object,
+      "history_message_count",
+      0,
+      MAX_HISTORY_MESSAGE_COUNT,
+    ),
+    contextSources: requireUniqueEnumArray(
+      object,
+      "context_sources",
+      ["saved_persona", "recent_history", "current_turn", "barge_in", "temporary_correction"] as const,
+    ),
   };
 }
 
@@ -239,8 +300,8 @@ function parseResponseControls(value: unknown): Extract<RuntimeEvent, { type: "q
   const object = requireRecord(value, "response controls");
   requireExactKeys(object, ["maximum_spoken_seconds", "directness", "pace", "follow_up_policy", "silence_policy"]);
   return {
-    maximumSpokenSeconds: requireNonNegativeInteger(object, "maximum_spoken_seconds"),
-    directness: requireNonNegativeInteger(object, "directness"),
+    maximumSpokenSeconds: requireIntegerInRange(object, "maximum_spoken_seconds", 1, 65535),
+    directness: requireIntegerInRange(object, "directness", 0, 100),
     pace: requireOneOf(object, "pace", ["measured", "natural", "brisk"] as const),
     followUpPolicy: requireOneOf(object, "follow_up_policy", ["never", "contextual", "allowed"] as const),
     silencePolicy: requireOneOf(object, "silence_policy", ["allow_without_filler"] as const),
@@ -301,21 +362,6 @@ function parseIdentifier(value: unknown): bigint {
   return identifier;
 }
 
-function validateOutboundCommand(command: ClientCommand): void {
-  if (!isRecord(command)) {
-    throw new ProtocolError("client command must be an object");
-  }
-  if (!isCanonicalRequestId(command.requestId)) {
-    throw new ProtocolError("request identifier must be non-empty and at most 64 bytes");
-  }
-  if (command.type === "start_turn" && command.transcript.length === 0) {
-    throw new ProtocolError("transcript must be non-empty");
-  }
-  if (command.type !== "status" && (command.turnId < 1n || command.turnId > MAX_U64)) {
-    throw new ProtocolError("turn identifier is outside u64 range");
-  }
-}
-
 function validateProtocolVersion(object: Record<string, unknown>): void {
   if (object.protocol_version !== CLIENT_PROTOCOL_VERSION) {
     throw new ProtocolError("unsupported protocol version");
@@ -364,12 +410,20 @@ function requireString(object: Record<string, unknown>, key: string): string {
   return value;
 }
 
-function requireNonEmptyString(object: Record<string, unknown>, key: string): string {
-  const value = requireString(object, key);
-  if (value.length === 0) {
-    throw new ProtocolError(`${key} must be non-empty`);
+function requireTranscript(object: Record<string, unknown>, key: string): string {
+  const transcript = requireString(object, key);
+  validateTranscript(transcript);
+  return transcript;
+}
+
+function validateTranscript(transcript: string): void {
+  const bytes = new TextEncoder().encode(transcript).length;
+  if (bytes === 0) {
+    throw new ProtocolError("transcript must be non-empty");
   }
-  return value;
+  if (bytes > MAX_CONVERSATION_MESSAGE_BYTES) {
+    throw new ProtocolError("transcript exceeds 16 KiB");
+  }
 }
 
 function requireBoolean(object: Record<string, unknown>, key: string): boolean {
@@ -388,12 +442,52 @@ function requireStringArray(object: Record<string, unknown>, key: string): strin
   return [...value];
 }
 
+function requireCapabilities(object: Record<string, unknown>): ["text"] {
+  const capabilities = requireStringArray(object, "capabilities");
+  if (capabilities.length !== 1 || capabilities[0] !== "text") {
+    throw new ProtocolError("capabilities has an unsupported value");
+  }
+  return ["text"];
+}
+
 function requireNonNegativeInteger(object: Record<string, unknown>, key: string): number {
   const value = object[key];
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
     throw new ProtocolError(`${key} must be a non-negative safe integer`);
   }
   return value;
+}
+
+function requireIntegerInRange(
+  object: Record<string, unknown>,
+  key: string,
+  minimum: number,
+  maximum: number,
+): number {
+  const value = requireNonNegativeInteger(object, key);
+  if (value < minimum || value > maximum) {
+    throw new ProtocolError(`${key} must be within ${minimum}..=${maximum}`);
+  }
+  return value;
+}
+
+function requireUniqueEnumArray<const T extends readonly string[]>(
+  object: Record<string, unknown>,
+  key: string,
+  values: T,
+): T[number][] {
+  const value = object[key];
+  if (!Array.isArray(value) || value.length > values.length) {
+    throw new ProtocolError(`${key} has an unsupported value`);
+  }
+  const result: T[number][] = [];
+  for (const item of value) {
+    if (typeof item !== "string" || !values.some((candidate) => candidate === item) || result.includes(item as T[number])) {
+      throw new ProtocolError(`${key} has an unsupported value`);
+    }
+    result.push(item as T[number]);
+  }
+  return result;
 }
 
 function requireOneOf<const T extends readonly (string | boolean)[]>(

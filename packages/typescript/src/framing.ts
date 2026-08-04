@@ -8,40 +8,85 @@ export class FrameError extends Error {
 }
 
 export class FrameDecoder {
-  private buffered = new Uint8Array();
+  private readonly chunks: Uint8Array[] = [];
+  private available = 0;
+  private chunkOffset = 0;
+  private head = 0;
 
   push(chunk: Uint8Array): Uint8Array[] {
     if (chunk.length === 0) {
       return [];
     }
-
-    const combined = new Uint8Array(this.buffered.length + chunk.length);
-    combined.set(this.buffered);
-    combined.set(chunk, this.buffered.length);
-    this.buffered = combined;
+    this.chunks.push(chunk);
+    this.available += chunk.length;
 
     const frames: Uint8Array[] = [];
-    let offset = 0;
-    while (this.buffered.length - offset >= 4) {
-      const length = new DataView(
-        this.buffered.buffer,
-        this.buffered.byteOffset + offset,
-        4,
-      ).getUint32(0);
+    while (this.available >= 4) {
+      const length = this.peekLength();
       validateFrameLength(length);
-      if (this.buffered.length - offset - 4 < length) {
+      if (this.available < 4 + length) {
         break;
       }
-      frames.push(this.buffered.slice(offset + 4, offset + 4 + length));
-      offset += 4 + length;
+      this.consume(4);
+      frames.push(this.read(length));
     }
-    this.buffered = this.buffered.slice(offset);
     return frames;
   }
 
   finish(): void {
-    if (this.buffered.length !== 0) {
+    if (this.available !== 0) {
       throw new FrameError("framed input ended before a complete frame");
+    }
+  }
+
+  private peekLength(): number {
+    let value = 0;
+    let remaining = 4;
+    let chunkIndex = this.head;
+    let offset = this.chunkOffset;
+    while (remaining > 0) {
+      const chunk = this.chunks[chunkIndex]!;
+      const count = Math.min(remaining, chunk.length - offset);
+      for (let index = 0; index < count; index += 1) {
+        value = (value << 8) | chunk[offset + index]!;
+      }
+      remaining -= count;
+      chunkIndex += 1;
+      offset = 0;
+    }
+    return value >>> 0;
+  }
+
+  private read(length: number): Uint8Array {
+    const output = new Uint8Array(length);
+    let written = 0;
+    while (written < length) {
+      const chunk = this.chunks[this.head]!;
+      const count = Math.min(length - written, chunk.length - this.chunkOffset);
+      output.set(chunk.subarray(this.chunkOffset, this.chunkOffset + count), written);
+      this.consume(count);
+      written += count;
+    }
+    return output;
+  }
+
+  private consume(length: number): void {
+    let remaining = length;
+    while (remaining > 0) {
+      const chunk = this.chunks[this.head]!;
+      const count = Math.min(remaining, chunk.length - this.chunkOffset);
+      this.chunkOffset += count;
+      this.available -= count;
+      remaining -= count;
+      if (this.chunkOffset === chunk.length) {
+        this.head += 1;
+        this.chunkOffset = 0;
+      }
+    }
+    if (this.available === 0) {
+      this.chunks.length = 0;
+      this.head = 0;
+      this.chunkOffset = 0;
     }
   }
 }

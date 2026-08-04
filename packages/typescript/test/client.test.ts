@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { setImmediate } from "node:timers/promises";
 
 import { RuntimeClient, type RuntimeTransport } from "../src/client.js";
 import type { ClientCommand, RuntimeEvent, RuntimeStatus } from "../src/protocol.js";
@@ -118,6 +119,79 @@ test("closes the transport cleanly", async () => {
   assert.equal(connected.transport.closed, true);
 });
 
+test("discards buffered turn events when transport failure follows", async () => {
+  const connected = await connectedClient();
+  const turn = connected.client.startTurn("hello");
+  const start = command(connected.transport, "start_turn");
+  connected.transport.push(accepted(start.requestId));
+  connected.transport.push(event("turn_started", turn.turnId));
+  await setImmediate();
+  connected.transport.fail(new Error("transport disconnected"));
+
+  await assert.rejects(turn.events[Symbol.asyncIterator]().next(), /transport disconnected/);
+  await connected.client.close();
+});
+
+test("rejects an accepted command rejection as a correlation violation", async () => {
+  const connected = await connectedClient();
+  const pending = connected.client.status();
+  const statusCommand = command(connected.transport, "status");
+  connected.transport.push(accepted(statusCommand.requestId));
+  connected.transport.push({
+    type: "command_rejected",
+    protocol_version: 1,
+    request_id: statusCommand.requestId,
+    error: { kind: "invalid_state", stage: "runtime", message: "rejected" },
+  });
+
+  await assert.rejects(pending, /rejected an accepted command/);
+  await connected.client.close();
+});
+
+test("rejects an accepted start rejection as a correlation violation", async () => {
+  const connected = await connectedClient();
+  const turn = connected.client.startTurn("hello");
+  const startCommand = command(connected.transport, "start_turn");
+  connected.transport.push(accepted(startCommand.requestId));
+  connected.transport.push({
+    type: "command_rejected",
+    protocol_version: 1,
+    request_id: startCommand.requestId,
+    error: { kind: "invalid_state", stage: "runtime", message: "rejected" },
+  });
+
+  await assert.rejects(turn.events[Symbol.asyncIterator]().next(), /rejected an accepted command/);
+  await connected.client.close();
+});
+
+test("rejects oversized starts before registering pending work", async () => {
+  const connected = await connectedClient();
+  const oversized = "🙂".repeat(4097);
+
+  assert.throws(() => connected.client.startTurn(oversized), /16 KiB/);
+  assert.equal(connected.transport.sent.length, 0);
+
+  const pending = connected.client.status();
+  const statusCommand = command(connected.transport, "status");
+  connected.transport.push(accepted(statusCommand.requestId));
+  connected.transport.push({ type: "status", protocol_version: 1, request_id: statusCommand.requestId, status: wireStatus() });
+  assert.deepEqual(await pending, status);
+  await connected.client.close();
+});
+
+test("converts synchronous transport send failures into rejected work", async () => {
+  const statusTransport = new ThrowingTransport();
+  const statusClient = await connectThrowingTransport(statusTransport);
+  await assert.rejects(statusClient.status(), /synchronous send failure/);
+  await statusClient.close();
+
+  const turnTransport = new ThrowingTransport();
+  const turnClient = await connectThrowingTransport(turnTransport);
+  const turn = turnClient.startTurn("hello");
+  await assert.rejects(turn.events[Symbol.asyncIterator]().next(), /synchronous send failure/);
+  await turnClient.close();
+});
+
 class InMemoryTransport implements RuntimeTransport {
   readonly inbox = new AsyncChannel<unknown>();
   readonly messages = this.inbox;
@@ -139,6 +213,12 @@ class InMemoryTransport implements RuntimeTransport {
 
   fail(error: Error): void {
     this.inbox.finish(error);
+  }
+}
+
+class ThrowingTransport extends InMemoryTransport {
+  send(_message: ClientCommand): Promise<void> {
+    throw new Error("synchronous send failure");
   }
 }
 
@@ -198,6 +278,12 @@ async function connectedClient(): Promise<{ client: RuntimeClient; transport: In
   const connecting = RuntimeClient.connect(transport);
   transport.push(ready());
   return { client: await connecting, transport };
+}
+
+async function connectThrowingTransport(transport: ThrowingTransport): Promise<RuntimeClient> {
+  const connecting = RuntimeClient.connect(transport);
+  transport.push(ready());
+  return connecting;
 }
 
 function command<T extends ClientCommand["type"]>(

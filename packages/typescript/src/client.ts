@@ -1,5 +1,6 @@
 import {
   parseGatewayMessage,
+  validateClientCommand,
   type ClientCommand,
   type GatewayMessage,
   type RuntimeEvent,
@@ -51,11 +52,14 @@ export class RuntimeClient {
   }
 
   startTurn(transcript: string): RuntimeTurn {
-    const turnId = ++this.turnCounter;
+    const turnId = this.turnCounter + 1n;
     const requestId = this.nextRequestId();
+    validateClientCommand({ type: "start_turn", requestId, turnId, transcript });
+    this.turnCounter = turnId;
     const state: TurnState = {
       accepted: new Deferred<void>(),
       events: new AsyncQueue<RuntimeEvent>(),
+      startRequestId: requestId,
       turnId,
     };
     this.turns.set(turnId, state);
@@ -195,6 +199,10 @@ export class RuntimeClient {
 
   private reject(requestId: string, error: Error): void {
     const control = this.controls.get(requestId);
+    if (control?.accepted || this.hasAcceptedStartRequest(requestId)) {
+      this.fail(new Error("gateway rejected an accepted command"));
+      return;
+    }
     if (!control) {
       this.fail(new Error("gateway rejected an unknown command"));
       return;
@@ -210,7 +218,20 @@ export class RuntimeClient {
       this.controls.delete(command.requestId);
       return;
     }
-    void this.transport.send(command).catch((error: unknown) => this.fail(asError(error)));
+    try {
+      void Promise.resolve(this.transport.send(command)).catch((error: unknown) => this.fail(asError(error)));
+    } catch (error) {
+      this.fail(asError(error));
+    }
+  }
+
+  private hasAcceptedStartRequest(requestId: string): boolean {
+    for (const state of this.turns.values()) {
+      if (state.accepted.settled && state.startRequestId === requestId) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private fail(error: Error, closeTransport = true): void {
@@ -247,6 +268,7 @@ type PendingControl =
 type TurnState = {
   accepted: Deferred<void>;
   events: AsyncQueue<RuntimeEvent>;
+  startRequestId: string;
   turnId: bigint;
 };
 
@@ -305,6 +327,7 @@ class AsyncQueue<T> implements AsyncIterable<T> {
   }
 
   fail(error: Error): void {
+    this.values.length = 0;
     this.error = error;
     this.end();
   }
@@ -312,11 +335,11 @@ class AsyncQueue<T> implements AsyncIterable<T> {
   [Symbol.asyncIterator](): AsyncIterator<T> {
     return {
       next: () => {
-        if (this.values.length > 0) {
-          return Promise.resolve({ value: this.values.shift()!, done: false });
-        }
         if (this.error) {
           return Promise.reject(this.error);
+        }
+        if (this.values.length > 0) {
+          return Promise.resolve({ value: this.values.shift()!, done: false });
         }
         if (this.finished) {
           return Promise.resolve({ value: undefined, done: true });

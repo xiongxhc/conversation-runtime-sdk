@@ -3,6 +3,7 @@ import { access, chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { setTimeout } from "node:timers/promises";
 
 import { RuntimeClient } from "../src/client.js";
 import { StdioGatewayTransport } from "../src/stdio.js";
@@ -57,6 +58,69 @@ test("rejects client work when the gateway exits", async () => {
   );
 });
 
+test("discards buffered ready and responses when the process fails", async () => {
+  await withGateway(
+    "emit({ type: 'ready', protocol_version: 1, status }); setTimeout(() => { writeFileSync(`${process.argv[3]}.exit`, ''); process.exit(1); }, 10);",
+    async ({ gatewayPath, configPath }) => {
+      const transport = await StdioGatewayTransport.start({ gatewayPath, configPath });
+      await waitForFile(`${configPath}.exit`);
+      await setTimeout(10);
+      await assert.rejects(RuntimeClient.connect(transport), /gateway (stdout ended|process exited)/);
+    },
+  );
+});
+
+test("discards buffered status responses when exit follows", async () => {
+  await withGateway(
+    "emit({ type: 'ready', protocol_version: 1, status }); process.stdin.once('data', () => { emit({ type: 'command_accepted', protocol_version: 1, request_id: 'request-1' }); emit({ type: 'status', protocol_version: 1, request_id: 'request-1', status }); writeFileSync(`${process.argv[3]}.exit`, ''); process.exit(1); });",
+    async ({ gatewayPath, configPath }) => {
+      const transport = await StdioGatewayTransport.start({ gatewayPath, configPath });
+      const iterator = transport.messages[Symbol.asyncIterator]();
+      await iterator.next();
+      await transport.send({ type: "status", requestId: "request-1" });
+      await waitForFile(`${configPath}.exit`);
+      await setTimeout(10);
+
+      await assert.rejects(iterator.next(), /gateway (stdout ended|process exited)/);
+    },
+  );
+});
+
+test("closes an EOF-ignoring child with bounded termination and reaping", { timeout: 2_000 }, async () => {
+  await withGateway(
+    "process.stdin.resume(); process.on('SIGTERM', () => {}); setTimeout(() => process.exit(0), 700); emit({ type: 'ready', protocol_version: 1, status });",
+    async ({ gatewayPath, configPath }) => {
+      const transport = await StdioGatewayTransport.start({ gatewayPath, configPath });
+      await transport.messages[Symbol.asyncIterator]().next();
+      await Promise.race([
+        transport.close(),
+        setTimeout(500).then(() => Promise.reject(new Error("close did not finish within deadline"))),
+      ]);
+    },
+  );
+});
+
+test("uses content-free errors for spawn and child stream failures", async () => {
+  const privatePath = join(tmpdir(), "private-gateway-path");
+  await assert.rejects(
+    StdioGatewayTransport.start({ gatewayPath: privatePath, configPath: join(tmpdir(), "private-config.toml") }),
+    (error: Error) => error.message === "gateway spawn failed" && !error.message.includes(privatePath),
+  );
+
+  await withGateway(
+    "emit({ type: 'ready', protocol_version: 1, status }); process.stdin.once('data', () => { process.stderr.write('private-stderr-value'); process.exit(1); });",
+    async ({ gatewayPath, configPath }) => {
+      const transport = await StdioGatewayTransport.start({ gatewayPath, configPath });
+      const client = await RuntimeClient.connect(transport);
+      await assert.rejects(
+        client.status(),
+        (error: Error) => /gateway (stdout ended|process exited|stdin failed)/.test(error.message) && !error.message.includes("private-stderr-value"),
+      );
+      await client.close();
+    },
+  );
+});
+
 async function withGateway(
   body: string,
   run: (paths: { gatewayPath: string; configPath: string; directory: string }) => Promise<void>,
@@ -65,6 +129,7 @@ async function withGateway(
   const gatewayPath = join(directory, "fake-gateway.mjs");
   const configPath = join(directory, "gateway.toml");
   const program = `#!/usr/bin/env node
+import { writeFileSync } from 'node:fs';
 const status = { transport: 'stdio', privacy_mode: 'local_only', language_location: 'local', model_id: 'local-model', memory_enabled: false, memory_location: null, telemetry_enabled: false, capabilities: ['text'] };
 const emit = (value) => { const payload = Buffer.from(JSON.stringify(value)); const header = Buffer.alloc(4); header.writeUInt32BE(payload.length); process.stdout.write(Buffer.concat([header, payload])); };
 ${body}
@@ -77,4 +142,16 @@ ${body}
   } finally {
     await rm(directory, { force: true, recursive: true });
   }
+}
+
+async function waitForFile(path: string): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    try {
+      await access(path);
+      return;
+    } catch {
+      await setTimeout(10);
+    }
+  }
+  throw new Error("child did not write its exit marker");
 }

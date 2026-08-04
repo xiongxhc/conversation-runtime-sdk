@@ -24,6 +24,31 @@ pub struct GatewaySession {
     status: RuntimeStatus,
 }
 
+struct WriterLanes {
+    urgent_sender: mpsc::Sender<GatewayMessage>,
+    urgent_receiver: mpsc::Receiver<GatewayMessage>,
+    normal_sender: mpsc::Sender<GatewayMessage>,
+    normal_receiver: mpsc::Receiver<GatewayMessage>,
+    event_sender: mpsc::Sender<GatewayMessage>,
+    event_receiver: mpsc::Receiver<GatewayMessage>,
+}
+
+impl WriterLanes {
+    fn new() -> Self {
+        let (urgent_sender, urgent_receiver) = mpsc::channel(URGENT_WRITER_BUFFER_SIZE);
+        let (normal_sender, normal_receiver) = mpsc::channel(NORMAL_WRITER_BUFFER_SIZE);
+        let (event_sender, event_receiver) = mpsc::channel(EVENT_WRITER_BUFFER_SIZE);
+        Self {
+            urgent_sender,
+            urgent_receiver,
+            normal_sender,
+            normal_receiver,
+            event_sender,
+            event_receiver,
+        }
+    }
+}
+
 impl GatewaySession {
     pub fn new(runtime: TextTurnRuntime, status: RuntimeStatus) -> Self {
         Self { runtime, status }
@@ -34,10 +59,29 @@ impl GatewaySession {
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin + Send + 'static,
     {
+        self.run_with_writer_lanes(reader, writer, WriterLanes::new())
+            .await
+    }
+
+    async fn run_with_writer_lanes<R, W>(
+        self,
+        reader: R,
+        writer: W,
+        writer_lanes: WriterLanes,
+    ) -> Result<(), GatewaySessionError>
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
         let mut reader = FrameReader::new(reader);
-        let (urgent_sender, urgent_receiver) = mpsc::channel(URGENT_WRITER_BUFFER_SIZE);
-        let (normal_sender, normal_receiver) = mpsc::channel(NORMAL_WRITER_BUFFER_SIZE);
-        let (event_sender, event_receiver) = mpsc::channel(EVENT_WRITER_BUFFER_SIZE);
+        let WriterLanes {
+            urgent_sender,
+            urgent_receiver,
+            normal_sender,
+            normal_receiver,
+            event_sender,
+            event_receiver,
+        } = writer_lanes;
         let mut writer_task = tokio::spawn(writer_loop(
             writer,
             urgent_receiver,
@@ -746,21 +790,37 @@ mod tests {
         let session = GatewaySession::new(runtime_for(language.endpoint()), status());
         let (mut input, reader) = duplex(4096);
         let (writer, writer_state) = ReadyFlushBlockingWriter::new();
-        let session_task = tokio::spawn(session.run(reader, writer));
+        let writer_lanes = super::WriterLanes::new();
+        let urgent_monitor = writer_lanes.urgent_sender.clone();
+        let event_monitor = writer_lanes.event_sender.clone();
+        let session_task =
+            tokio::spawn(session.run_with_writer_lanes(reader, writer, writer_lanes));
 
         timeout(TEST_TIMEOUT, writer_state.blocked.wait())
             .await
             .expect("gateway writer did not block while flushing ready");
+        assert_eq!(
+            urgent_monitor.max_capacity(),
+            super::URGENT_WRITER_BUFFER_SIZE
+        );
+        assert_eq!(
+            event_monitor.max_capacity(),
+            super::EVENT_WRITER_BUFFER_SIZE
+        );
+        assert_eq!(queued_messages(&urgent_monitor), 0);
+        assert_eq!(queued_messages(&event_monitor), 0);
         write_command(
             &mut input,
             r#"{"protocol_version":1,"type":"start_turn","request_id":"start-tie","turn_id":"1","transcript":"fixture start tie"}"#,
         )
         .await;
+        wait_for_queued_start_acceptance_and_turn_started(&urgent_monitor, &event_monitor).await;
         timeout(TEST_TIMEOUT, language.request_started.wait())
             .await
             .expect("fake language request never started while output was blocked");
-        tokio::task::yield_now().await;
         assert!(!writer_state.released.load(Ordering::SeqCst));
+        drop(event_monitor);
+        drop(urgent_monitor);
 
         writer_state.release();
         timeout(
@@ -1087,6 +1147,26 @@ mod tests {
             .unwrap();
         writer.write_all(payload.as_bytes()).await.unwrap();
         writer.flush().await.unwrap();
+    }
+
+    async fn wait_for_queued_start_acceptance_and_turn_started(
+        urgent: &mpsc::Sender<GatewayMessage>,
+        events: &mpsc::Sender<GatewayMessage>,
+    ) {
+        timeout(TEST_TIMEOUT, async {
+            loop {
+                if queued_messages(urgent) == 1 && queued_messages(events) == 1 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("start acceptance and turn_started were not both queued");
+    }
+
+    fn queued_messages(sender: &mpsc::Sender<GatewayMessage>) -> usize {
+        sender.max_capacity() - sender.capacity()
     }
 
     fn append_command(output: &mut Vec<u8>, payload: &str) {

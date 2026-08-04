@@ -1,0 +1,21 @@
+[package]
+name = "conversation-runtime-gateway"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+conversation-memory.workspace = true
+conversation-model-adapters.workspace = true
+conversation-protocol.workspace = true
+conversation-runtime.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+tokio.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

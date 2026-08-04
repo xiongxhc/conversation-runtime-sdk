@@ -205,6 +205,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "conversation-runtime-gateway"
+version = "0.1.0"
+dependencies = [
+ "conversation-memory",
+ "conversation-model-adapters",
+ "conversation-protocol",
+ "conversation-runtime",
+ "reqwest",
+ "serde",
+ "tempfile",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "conversation-tts-probe"
 version = "0.1.0"
 dependencies = [

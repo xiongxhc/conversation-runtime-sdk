@@ -20,6 +20,7 @@ mod session_clock;
 mod speech_text;
 mod speech_worker;
 mod streaming_turn;
+mod text_turn;
 mod turn_finalizer;
 mod utterance_assembler;
 mod voice_privacy;
@@ -29,6 +30,7 @@ pub use conversation_quality::{ConversationQualityController, ResolvedConversati
 pub use phrase_chunker::PhraseChunkingConfig;
 pub use session_clock::{SessionClock, TurnFinalizationDeadline};
 pub use streaming_turn::{StreamingTurnEventStream, StreamingTurnRuntime};
+pub use text_turn::{TextTurnEventStream, TextTurnRuntime};
 pub use turn_finalizer::{FinalizedTranscript, TurnFinalizer};
 pub use utterance_assembler::UtteranceAssembler;
 pub use voice_privacy::validate_voice_policy;

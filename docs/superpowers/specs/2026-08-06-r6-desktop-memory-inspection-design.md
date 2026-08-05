@@ -44,7 +44,9 @@ This slice delivers:
 - keyset-paginated local memory summaries with bounded content previews;
 - full record inspection with kind, state, confidence, retention, timestamps,
   pin state, revision, last use, and last retrieval reason;
-- ordered provenance and approval history without exposing stored digests;
+- the latest 32 provenance entries and latest 32 approval entries in ordered,
+  bounded history windows, with explicit truncation indicators and no stored
+  digests;
 - explicit empty, disabled, not-found, unavailable, and error states;
 - public Rust and TypeScript inspection contracts;
 - real compiled-gateway interoperability tests using a temporary initialized
@@ -84,8 +86,9 @@ affectionate expression.
 
 The detail view groups metadata, provenance, and approval history. Source and
 confirmation identifiers are shown because they are existing inspectable
-provenance. SHA-256 content digests are not sent to or rendered by the desktop
-because they add no user value in this read-only surface.
+provenance. Each history is limited to its latest 32 entries and the UI states
+when older entries exist. SHA-256 content digests are not sent to or rendered
+by the desktop because they add no user value in this read-only surface.
 
 The first page loads when Memory opens. A `Load more` control appears only when
 the gateway returns another cursor. The UI never reports that all records are
@@ -157,9 +160,13 @@ Retention is a tagged object containing its kind and only the applicable
 expiry timestamp or session identifier. Provenance contains kind, source
 identifier, source timestamp, and actor. Approval history contains
 confirmation identifier, actor, confirmation timestamp, and approved revision.
+The inspection response also carries `sources_truncated` and
+`approvals_truncated` booleans beside the two bounded history arrays.
 
-Provenance and approval arrays are oldest-to-newest. The latest provenance is
-always last. When current approval evidence exists, the latest approval is
+Provenance and approval arrays contain at most 32 entries each and are
+oldest-to-newest within that latest-entry window. `sources_truncated` and
+`approvals_truncated` state whether older entries exist. The latest provenance
+is always last. When current approval evidence exists, the latest approval is
 always last. The gateway projects only already-validated `MemoryInspection`
 values, preserving the R5 invariant even though content digests are omitted.
 
@@ -178,12 +185,16 @@ serialization, identifier encoding, enum projection, and frame-size checks.
 Unknown fields, invalid enum values, malformed identifiers, invalid cursor
 shapes or `before_id` values, and oversized frames fail closed.
 
-`conversation-memory` adds a bounded keyset page operation to `MemoryStore` and
-the SQLite implementation. The operation applies existing expiry housekeeping
-and queries one page plus one lookahead record so `next_cursor` is exact without
-loading all memory content. The SQL order is `id DESC`; a cursor adds
-`WHERE id < before_id`. Record updates and expiry therefore cannot move records
-across the traversal boundary.
+`conversation-memory` adds a bounded keyset page operation and a bounded
+inspection operation to `MemoryStore` and the SQLite implementation. List
+applies existing expiry housekeeping and queries one page plus one lookahead
+record so `next_cursor` is exact without loading all memory content. The SQL
+order is `id DESC`; a cursor adds `WHERE id < before_id`. Record updates and
+expiry therefore cannot move records across the traversal boundary. Inspection
+loads the latest 33 provenance and approval rows separately, drops the lookahead
+row, reverses each retained window to oldest-to-newest, and reports whether
+older rows were truncated. This prevents unbounded history from exceeding the
+512 KiB frame limit or exhausting memory before encoding.
 
 Gateway configuration retains cloned access to one `SqliteMemoryStore` when
 memory is configured. The same store path backs both the runtime retrieval
@@ -261,8 +272,9 @@ History and Memory remain separate:
   selections.
 - Logs, diagnostics, rejection messages, and telemetry contain no memory
   content, source identifiers, actors, confirmation identifiers, or paths.
-- Frame, 50-record page, 192-byte preview, field, cursor, timestamp, and
-  identifier bounds apply before allocation or rendering.
+- Frame, 50-record page, 192-byte preview, 32-entry history-window, field,
+  cursor, timestamp, and identifier bounds apply before allocation or
+  rendering.
 - The UI escapes content through normal React text rendering and does not render
   memory content as HTML or Markdown.
 
@@ -274,12 +286,14 @@ preview truncation, and maximum frame behavior.
 
 Memory-store tests cover immutable-ID keyset ordering, exact page boundaries,
 lookahead behavior, expiry visibility, concurrent create/edit/delete behavior,
-and no retrieval metadata changes.
+bounded latest-history windows, truncation flags, and no retrieval metadata
+changes.
 
 Gateway tests cover disabled rejection, enabled list and inspect, not-found
 rejection, continued use after rejection, active-turn rejection followed by
-successful interruption, and content-free coded failures. A compiled gateway
-test uses an initialized temporary SQLite database through framed stdio.
+successful interruption, oversized stored history remaining within one frame,
+and content-free coded failures. A compiled gateway test uses an initialized
+temporary SQLite database through framed stdio.
 
 TypeScript tests cover parsing, encoding, request correlation, transport
 failure, close behavior, pagination, and browser-safe exports.
@@ -290,7 +304,10 @@ approval history, retryable errors, separation from History, and absence of
 mutation controls.
 
 The final gate runs formatting, strict Clippy, the full locked Rust workspace,
-all npm workspace tests, all npm workspace builds, and a native launch smoke.
+all npm workspace tests, all npm workspace builds, and a native launch smoke
+using temporary configuration and a temporary initialized memory database.
+Enabling or inspecting an operator's existing private database remains a
+separate explicit action outside this implementation plan.
 
 ## Delivery
 

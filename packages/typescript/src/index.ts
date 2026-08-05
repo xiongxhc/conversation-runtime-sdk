@@ -1,9 +1,13 @@
-export { RuntimeClient, type RuntimeTransport, type RuntimeTurn } from "./client.js";
+export { CommandRejectedError, RuntimeClient, type RuntimeTransport, type RuntimeTurn } from "./client.js";
 export { FrameDecoder, FrameError, MAX_FRAME_BYTES, encodeFrame } from "./framing.js";
 export {
   CLIENT_PROTOCOL_VERSION,
   MAX_CONVERSATION_MESSAGE_BYTES,
   MAX_HISTORY_MESSAGE_COUNT,
+  MAX_MEMORY_CONTENT_BYTES,
+  MAX_MEMORY_INSPECTION_HISTORY_ITEMS,
+  MAX_MEMORY_LIST_PAGE_ITEMS,
+  MAX_MEMORY_PREVIEW_BYTES,
   MAX_U64,
   ProtocolError,
   encodeClientCommand,
@@ -12,6 +16,14 @@ export {
   validateClientCommand,
   type ClientCommand,
   type GatewayMessage,
+  type MemoryApproval,
+  type MemoryCursor,
+  type MemoryInspection,
+  type MemoryPage,
+  type MemoryProvenance,
+  type MemoryRecord,
+  type MemoryRetention,
+  type MemorySummary,
   type RuntimeEvent,
   type RuntimeFailure,
   type RuntimeStatus,

@@ -42,7 +42,8 @@ pub struct GatewayConfig {
 pub struct GatewayAdapters {
     pub language: OllamaLanguageModel,
     pub quality: ConversationQualityController,
-    pub memory: Option<SqliteMemoryContextProvider>,
+    pub memory_provider: Option<SqliteMemoryContextProvider>,
+    pub memory_store: Option<SqliteMemoryStore>,
     model_id: String,
 }
 
@@ -129,7 +130,11 @@ impl GatewayConfig {
             SilencePolicy::AllowWithoutFiller,
         )
         .map_err(|error| config_error(error.message()))?;
-        let memory = self.memory.as_ref().map(memory_provider).transpose()?;
+        let memory = self.memory.as_ref().map(memory_adapters).transpose()?;
+        let (memory_provider, memory_store) = match memory {
+            Some((provider, store)) => (Some(provider), Some(store)),
+            None => (None, None),
+        };
 
         Ok(GatewayAdapters {
             language: OllamaLanguageModel::new_direct(language),
@@ -138,7 +143,8 @@ impl GatewayConfig {
                 controls,
                 self.persona.mode.into(),
             ),
-            memory,
+            memory_provider,
+            memory_store,
             model_id: self.language.model.clone(),
         })
     }
@@ -218,16 +224,17 @@ fn validate_loopback_http_endpoint(endpoint: &str) -> Result<(), GatewayConfigEr
     Ok(())
 }
 
-fn memory_provider(
+fn memory_adapters(
     config: &MemoryConfig,
-) -> Result<SqliteMemoryContextProvider, GatewayConfigError> {
+) -> Result<(SqliteMemoryContextProvider, SqliteMemoryStore), GatewayConfigError> {
     if !config.database.is_absolute() {
         return Err(config_error("memory database path must be absolute"));
     }
     let store = SqliteMemoryStore::open(&config.database).map_err(memory_error)?;
-    SqliteMemoryContextProvider::new(store, Arc::new(SystemMemoryClock))
+    let provider = SqliteMemoryContextProvider::new(store.clone(), Arc::new(SystemMemoryClock))
         .with_limits(config.maximum_items, config.maximum_bytes)
-        .map_err(memory_error)
+        .map_err(memory_error)?;
+    Ok((provider, store))
 }
 
 fn persona_level(value: u8) -> Result<PersonaLevel, GatewayConfigError> {

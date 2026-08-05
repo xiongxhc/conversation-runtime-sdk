@@ -1,15 +1,17 @@
 # R6 Desktop App Evaluation
 
-**Date:** 2026-08-05
-**Branch:** `feature/r6-desktop-app`
-**Scope:** first macOS Tauri text-chat and Voice Focus visual slice
+**Date:** 2026-08-06
+**Scope:** macOS Tauri text-chat, Voice Focus preview, and protocol-v2
+read-only runtime-memory inspection
 
 ## Result
 
-The first R6 desktop slice is developer-runnable and its bounded automated
-checks pass. R6 is not complete: the production gateway still reports
-text-only capabilities, and no live voice, persona/memory mutation, packaged
-release, or R3 human/acoustic acceptance claim is made.
+The R6 desktop surface is developer-runnable with bounded automated checks.
+Memory inspection is optional and explicit: the desktop uses the public local
+runtime protocol only after an existing initialized local memory store is
+configured. R6 is not complete: the production gateway reports text and, when
+enabled, memory-inspection capabilities only; no live voice, persona or memory
+mutation, packaged release, or R3 human/acoustic acceptance claim is made.
 
 ## Testable Surface
 
@@ -20,6 +22,7 @@ release, or R3 human/acoustic acceptance claim is made.
 | Voice Focus shell | Preview entry, scene selection, hidden transcript default, explicit transcript reveal, `Escape`, reduced motion, and scene failure fallbacks are covered by tests and the production build. | Preview is intentionally idle and cannot imply microphone or playback activity. |
 | Focus scenes | Soft Aurora, Silk, Threads, Prism, Orb, Still Gradient, and None are selectable; Soft Aurora is the default. | The five animated scenes have separate lazy chunks; final human GPU visual review remains open. |
 | Local gateway bridge | Absolute-path validation, idempotent close, process reaping, and reopen ordering pass Rust tests. | The desktop validation in this report does not claim model quality, latency, or acoustic behavior. |
+| Runtime memory inspection | With enabled local memory and advertised protocol-v2 `memory_inspection`, the Memory destination lists at most 50 summaries per page and opens read-only details through the browser-safe SDK. Provenance and approval histories retain at most their latest 32 entries and visibly mark truncation. | The desktop has no SQLite access, does not initialize memory, and does not copy conversations into it. Due expiry may be applied while inspecting; persona and all memory mutation remain open. |
 
 ## Reproduce the Developer Run
 
@@ -57,46 +60,54 @@ After connecting:
    with `Escape`.
 5. Close the runtime and reconnect through setup.
 
+To use the optional Memory destination, first initialize a disposable or
+operator-chosen database explicitly with `conversation-memory-probe`, then add
+its absolute path under `[memory]` in the selected gateway configuration. The
+desktop shows Memory only when gateway status reports enabled local memory and
+the `memory_inspection` capability. Open the list and a detail to verify
+read-only navigation and any truncation notice. History is a separate
+app-owned transcript store and does not become runtime memory automatically.
+
 ## Focused Validation Evidence
 
-Observed on the branch above with Node `v24.9.0`, npm `11.6.0`, and Rust
-`1.97.1`:
+Observed on 2026-08-06 with Node `v24.14.0`, npm `9.6.7`, and Rust `1.97.1`:
 
 ```text
-$ npm test --workspace conversation-desktop
-Test Files  8 passed (8)
-Tests       82 passed (82)
+$ cargo fmt --all -- --check
+$ cargo clippy --workspace --all-targets --locked -- -D warnings
+$ cargo test --workspace --locked --no-fail-fast
+all workspace, integration, and doc-test targets passed
 
-$ cargo test -p conversation-desktop
-gateway_bridge.rs: 5 passed; 0 failed
-all package and doc-test targets passed
+$ npm test --workspaces
+@conversation/runtime: 58 passed
+conversation-node-chat: 11 passed
+conversation-desktop: 10 files and 108 passed
 
-$ npm run build --workspace conversation-desktop
-TypeScript app check passed
-TypeScript config check passed
-Vite 8.2.0 transformed 112 modules
-SoftAurora, Silk, Threads, Prism, and Orb lazy-chunk assertion passed
+$ npm run build --workspaces
+TypeScript, desktop type checks, Vite production build, and scene-chunk checks passed
 
-$ npm run desktop:dev -- --help
-Reached the pinned Tauri 2.11.0 `dev` command
+$ node --input-type=module ...
+compiled TypeScript client: status returned ["text", "memory_inspection"]
+compiled gateway: listed and inspected the one disposable memory record
 
 $ npm run desktop:dev
-Ran the configured Vite before-dev command
-Vite served http://localhost:1420/
-Started target/debug/conversation-desktop
-Process was then stopped intentionally
+Vite served the local development app and started target/debug/conversation-desktop
+The process was closed cleanly. The Mac was locked, so this run did not make a
+human visual claim about the Memory list, detail, or truncation presentation.
 ```
 
 ## Open Work and Acceptance Boundaries
 
 - **Live voice activation:** typed desktop voice-session events and production
   microphone capture, recognition, playback, and barge-in are not connected.
-- **Persona and memory:** the app displays bounded status but does not inspect
-  or mutate persona or memory through actual runtime controls.
+- **Persona and memory mutation:** the app does not inspect or mutate persona;
+  runtime memory is inspectable only, with no create, edit, approval, pin,
+  expiry, deletion, or retrieval control.
 - **Distribution:** packaging, model-free bundle review, signing,
   notarization, installation, and upgrade flows are not validated.
 - **Human visual review:** final scene appearance and GPU behavior in the Tauri
-  window have not received a recorded human acceptance pass.
+  window have not received a recorded human acceptance pass; the current native
+  launch could not be visually inspected while the Mac was locked.
 - **Interactive model run:** this evaluation does not record a live local-model
   text turn or make latency, usefulness, or model-quality claims.
 - **R3 acceptance:** a post-fix human-spoken turn, ten-minute device run,

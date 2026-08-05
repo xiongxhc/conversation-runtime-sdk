@@ -4,8 +4,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use conversation_memory::SqliteMemoryStore;
-use conversation_protocol::MAX_CLIENT_FRAME_BYTES;
+use conversation_memory::{MemoryStore, SqliteMemoryStore};
+use conversation_protocol::{
+    MemoryConfidence, MemoryDraft, MemoryKind, MemoryPatch, MemoryProvenance, MemoryProvenanceKind,
+    MemoryRetention, UnixTimestampMillis, MAX_CLIENT_FRAME_BYTES,
+};
 use conversation_runtime_gateway::FrameReader;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -28,7 +31,7 @@ async fn persistent_session_reports_local_status_and_preserves_completed_history
     assert_local_status(&ready, false);
 
     gateway
-        .write_message(r#"{"protocol_version":1,"type":"status","request_id":"status-1"}"#)
+        .write_message(r#"{"protocol_version":2,"type":"status","request_id":"status-1"}"#)
         .await;
     assert_accepted(&gateway.read_message().await, "status-1");
     let status = gateway.read_message().await;
@@ -77,7 +80,7 @@ async fn status_reports_exact_model_and_enabled_local_memory() {
     assert_local_status(&ready, true);
 
     gateway
-        .write_message(r#"{"protocol_version":1,"type":"status","request_id":"status-memory"}"#)
+        .write_message(r#"{"protocol_version":2,"type":"status","request_id":"status-memory"}"#)
         .await;
     assert_accepted(&gateway.read_message().await, "status-memory");
     assert_local_status(&gateway.read_message().await, true);
@@ -85,6 +88,142 @@ async fn status_reports_exact_model_and_enabled_local_memory() {
     let exit = gateway.close().await;
     assert!(exit.status.success());
     exit.assert_content_free_stderr(&["status-memory"]);
+}
+
+#[tokio::test]
+async fn compiled_gateway_lists_and_inspects_memory_with_exact_correlation() {
+    let server = FakeOllamaServer::completing(0).await;
+    let mut gateway = GatewayProcess::start_with_memory(server.endpoint()).await;
+    let ready = gateway.read_message().await;
+    assert_local_status(&ready, true);
+    let store = gateway.memory_store();
+    let record = create_memory_with_oversized_history(&store, "compiled gateway private memory");
+
+    gateway
+        .write_message(
+            r#"{"protocol_version":2,"type":"memory_list","request_id":"compiled-list","cursor":null}"#,
+        )
+        .await;
+    assert_accepted(&gateway.read_message().await, "compiled-list");
+    let list = gateway.read_message().await;
+    assert_eq!(list.message_type(), "memory_list");
+    assert_eq!(list.request_id(), Some("compiled-list"));
+    assert!(list
+        .raw
+        .contains(&format!(r#""id":"{}""#, record.id().get())));
+    assert!(list
+        .raw
+        .contains(r#""content_preview":"compiled gateway private memory""#));
+
+    gateway
+        .write_message(&format!(
+            r#"{{"protocol_version":2,"type":"memory_inspect","request_id":"compiled-inspect","memory_id":"{}"}}"#,
+            record.id().get()
+        ))
+        .await;
+    assert_accepted(&gateway.read_message().await, "compiled-inspect");
+    let inspection = gateway.read_message().await;
+    assert_eq!(inspection.message_type(), "memory_inspection");
+    assert_eq!(inspection.request_id(), Some("compiled-inspect"));
+    assert!(inspection
+        .raw
+        .contains(r#""content":"compiled gateway private memory""#));
+    assert_eq!(inspection.raw.matches(r#""source_id""#).count(), 32);
+    assert!(inspection.raw.contains(r#""sources_truncated":true"#));
+    assert!(inspection.raw.len() < MAX_CLIENT_FRAME_BYTES);
+
+    gateway
+        .write_message(r#"{"protocol_version":2,"type":"status","request_id":"compiled-status"}"#)
+        .await;
+    assert_accepted(&gateway.read_message().await, "compiled-status");
+    let status = gateway.read_message().await;
+    assert_eq!(status.message_type(), "status");
+    assert_eq!(status.request_id(), Some("compiled-status"));
+
+    let exit = gateway.close().await;
+    assert!(exit.status.success());
+    exit.assert_content_free_stderr(&[
+        "compiled gateway private memory",
+        "compiled-gateway-test",
+        "compiled-list",
+        "compiled-inspect",
+    ]);
+}
+
+#[tokio::test]
+async fn compiled_gateway_rejects_active_memory_before_interrupt_and_reaps() {
+    let server = FakeOllamaServer::holding_open().await;
+    let mut gateway = GatewayProcess::start_with_memory(server.endpoint()).await;
+    assert_eq!(gateway.read_message().await.message_type(), "ready");
+
+    gateway
+        .write_message(&start_turn(
+            "start-active-memory",
+            "1",
+            "compiled active memory transcript",
+        ))
+        .await;
+    assert_accepted(&gateway.read_message().await, "start-active-memory");
+    gateway.read_until_text_delta("1").await;
+
+    gateway
+        .write_message(
+            r#"{"protocol_version":2,"type":"memory_list","request_id":"compiled-list-active","cursor":null}"#,
+        )
+        .await;
+    let rejection = gateway
+        .read_until(|message| {
+            message.message_type() == "command_rejected"
+                && message.request_id() == Some("compiled-list-active")
+        })
+        .await;
+    assert_rejected(
+        rejection.last().unwrap(),
+        "compiled-list-active",
+        "memory_turn_active",
+    );
+    gateway
+        .write_message(
+            r#"{"protocol_version":2,"type":"status","request_id":"compiled-status-after-active"}"#,
+        )
+        .await;
+    assert_accepted(
+        &gateway.read_message().await,
+        "compiled-status-after-active",
+    );
+    assert_eq!(gateway.read_message().await.message_type(), "status");
+
+    gateway
+        .write_message(
+            r#"{"protocol_version":2,"type":"interrupt_turn","request_id":"compiled-interrupt-after-memory","turn_id":"1"}"#,
+        )
+        .await;
+    let before_terminal = gateway.read_until(|message| message.is_terminal()).await;
+    let accepted = before_terminal
+        .iter()
+        .position(|message| is_accepted(message, "compiled-interrupt-after-memory"))
+        .unwrap();
+    let terminal = before_terminal
+        .iter()
+        .position(WireMessage::is_terminal)
+        .unwrap();
+    assert!(accepted < terminal);
+    assert_eq!(terminal_type(&before_terminal), "turn_cancelled");
+    server.wait_for_connection_reaped().await;
+
+    let (exit, trailing) = gateway.close_with_messages().await;
+    let all_messages = before_terminal
+        .into_iter()
+        .chain(trailing)
+        .collect::<Vec<_>>();
+    assert_eq!(terminal_count(&all_messages), 1);
+    assert!(exit.status.success());
+    exit.assert_content_free_stderr(&[
+        "compiled active memory transcript",
+        "fixture-partial",
+        "compiled-list-active",
+        "compiled-interrupt-after-memory",
+    ]);
 }
 
 #[tokio::test]
@@ -105,7 +244,7 @@ async fn interrupt_is_accepted_before_one_cancelled_terminal() {
 
     gateway
         .write_message(
-            r#"{"protocol_version":1,"type":"interrupt_turn","request_id":"interrupt-1","turn_id":"1"}"#,
+            r#"{"protocol_version":2,"type":"interrupt_turn","request_id":"interrupt-1","turn_id":"1"}"#,
         )
         .await;
     let before_ack = gateway
@@ -139,7 +278,7 @@ async fn malformed_command_is_rejected_and_the_session_survives() {
 
     gateway
         .write_message(
-            r#"{"protocol_version":1,"type":"status","request_id":"status-after-rejection"}"#,
+            r#"{"protocol_version":2,"type":"status","request_id":"status-after-rejection"}"#,
         )
         .await;
     assert_accepted(&gateway.read_message().await, "status-after-rejection");
@@ -254,6 +393,15 @@ impl GatewayProcess {
         }
     }
 
+    fn memory_store(&self) -> SqliteMemoryStore {
+        SqliteMemoryStore::open(
+            self.memory_path
+                .as_ref()
+                .expect("gateway memory is not enabled"),
+        )
+        .unwrap()
+    }
+
     async fn write_message(&mut self, message: &str) {
         self.write_payload(message.as_bytes()).await;
     }
@@ -274,9 +422,7 @@ impl GatewayProcess {
             .expect("gateway did not produce a frame")
             .unwrap()
             .expect("gateway stdout closed before the expected frame");
-        WireMessage {
-            raw: String::from_utf8(payload).expect("gateway frame was not UTF-8 JSON"),
-        }
+        WireMessage::from_payload(payload)
     }
 
     async fn read_turn(&mut self, turn_id: &str) -> Vec<WireMessage> {
@@ -308,24 +454,38 @@ impl GatewayProcess {
         self.finish().await
     }
 
-    async fn finish(mut self) -> ProcessExit {
-        while timeout(PROCESS_TIMEOUT, self.stdout.read_frame())
+    async fn close_with_messages(mut self) -> (ProcessExit, Vec<WireMessage>) {
+        self.stdin.take();
+        self.finish_with_messages().await
+    }
+
+    async fn finish(self) -> ProcessExit {
+        self.finish_with_messages().await.0
+    }
+
+    async fn finish_with_messages(mut self) -> (ProcessExit, Vec<WireMessage>) {
+        let mut messages = Vec::new();
+        while let Some(payload) = timeout(PROCESS_TIMEOUT, self.stdout.read_frame())
             .await
             .expect("gateway did not close stdout")
             .unwrap()
-            .is_some()
-        {}
+        {
+            messages.push(WireMessage::from_payload(payload));
+        }
         let status = timeout(PROCESS_TIMEOUT, self.child.wait())
             .await
             .expect("gateway process did not exit")
             .unwrap();
         let stderr = String::from_utf8(self.stderr.await.unwrap()).unwrap();
-        ProcessExit {
-            status,
-            stderr,
-            config_path: self.config_path,
-            memory_path: self.memory_path,
-        }
+        (
+            ProcessExit {
+                status,
+                stderr,
+                config_path: self.config_path,
+                memory_path: self.memory_path,
+            },
+            messages,
+        )
     }
 }
 
@@ -334,6 +494,12 @@ struct WireMessage {
 }
 
 impl WireMessage {
+    fn from_payload(payload: Vec<u8>) -> Self {
+        Self {
+            raw: String::from_utf8(payload).expect("gateway frame was not UTF-8 JSON"),
+        }
+    }
+
     fn message_type(&self) -> &str {
         string_after(&self.raw, r#""type":""#).expect("message type missing")
     }
@@ -463,7 +629,7 @@ maximum_bytes = 4096
 
 fn start_turn(request_id: &str, turn_id: &str, transcript: &str) -> String {
     format!(
-        r#"{{"protocol_version":1,"type":"start_turn","request_id":"{request_id}","turn_id":"{turn_id}","transcript":"{transcript}"}}"#
+        r#"{{"protocol_version":2,"type":"start_turn","request_id":"{request_id}","turn_id":"{turn_id}","transcript":"{transcript}"}}"#
     )
 }
 
@@ -473,6 +639,16 @@ fn assert_accepted(message: &WireMessage, request_id: &str) {
 
 fn is_accepted(message: &WireMessage, request_id: &str) -> bool {
     message.message_type() == "command_accepted" && message.request_id() == Some(request_id)
+}
+
+fn assert_rejected(message: &WireMessage, request_id: &str, code: &str) {
+    assert_eq!(message.message_type(), "command_rejected");
+    assert_eq!(message.request_id(), Some(request_id));
+    assert!(
+        message.raw.contains(&format!(r#""code":"{code}""#)),
+        "{}",
+        message.raw
+    );
 }
 
 fn assert_local_status(message: &WireMessage, memory_enabled: bool) {
@@ -491,7 +667,69 @@ fn assert_local_status(message: &WireMessage, memory_enabled: bool) {
         assert!(message.raw.contains(r#""memory_location":null"#));
     }
     assert!(message.raw.contains(r#""telemetry_enabled":false"#));
-    assert!(message.raw.contains(r#""capabilities":["text"]"#));
+    if memory_enabled {
+        assert!(message
+            .raw
+            .contains(r#""capabilities":["text","memory_inspection"]"#));
+    } else {
+        assert!(message.raw.contains(r#""capabilities":["text"]"#));
+    }
+}
+
+fn create_memory_with_oversized_history(
+    store: &SqliteMemoryStore,
+    content: &str,
+) -> conversation_protocol::MemoryRecord {
+    let mut record = store
+        .create(
+            MemoryDraft::new(
+                MemoryKind::Semantic,
+                content,
+                MemoryProvenance::new(
+                    MemoryProvenanceKind::UserProvided,
+                    "compiled-gateway-test",
+                    UnixTimestampMillis::new(1_000).unwrap(),
+                    "local-user",
+                    None,
+                )
+                .unwrap(),
+                MemoryConfidence::new(900).unwrap(),
+                UnixTimestampMillis::new(1_000).unwrap(),
+                MemoryRetention::UntilDeleted,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    for revision in 1..=40 {
+        let changed_at = 1_000 + revision;
+        let revised_content = if revision % 2 == 0 {
+            content.to_owned()
+        } else {
+            format!("{content} revision")
+        };
+        record = store
+            .edit(
+                record.id(),
+                MemoryPatch::new(
+                    record.revision(),
+                    Some(revised_content),
+                    None,
+                    None,
+                    UnixTimestampMillis::new(changed_at).unwrap(),
+                    MemoryProvenance::new(
+                        MemoryProvenanceKind::UserEdited,
+                        format!("{revision:02}-{}", "s".repeat(500)),
+                        UnixTimestampMillis::new(changed_at).unwrap(),
+                        "local-user",
+                        None,
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+    }
+    record
 }
 
 fn history_count(messages: &[WireMessage]) -> u64 {

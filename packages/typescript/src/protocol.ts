@@ -1,14 +1,88 @@
-export const CLIENT_PROTOCOL_VERSION = 1;
+export const CLIENT_PROTOCOL_VERSION = 2;
 export const MAX_CONVERSATION_MESSAGE_BYTES = 16 * 1024;
 export const MAX_HISTORY_MESSAGE_COUNT = 16;
 export const MAX_U64 = 2n ** 64n - 1n;
+export const MAX_MEMORY_LIST_PAGE_ITEMS = 50;
+export const MAX_MEMORY_PREVIEW_BYTES = 192;
+export const MAX_MEMORY_INSPECTION_HISTORY_ITEMS = 32;
+export const MAX_MEMORY_CONTENT_BYTES = 4 * 1024;
+
+const MAX_U64_DECIMAL = "18446744073709551615";
+const MAX_I64_DECIMAL = "9223372036854775807";
+const MAX_MEMORY_CONFIDENCE_DECIMAL = "1000";
 
 export type ClientCommand =
   | { type: "status"; requestId: string }
   | { type: "start_turn"; requestId: string; turnId: bigint; transcript: string }
-  | { type: "interrupt_turn"; requestId: string; turnId: bigint };
+  | { type: "interrupt_turn"; requestId: string; turnId: bigint }
+  | { type: "memory_list"; requestId: string; cursor: MemoryCursor | null }
+  | { type: "memory_inspect"; requestId: string; memoryId: bigint };
+
+export type MemoryCursor = { beforeId: bigint };
+
+export type MemorySummary = {
+  id: bigint;
+  contentPreview: string;
+  kind: "working" | "episodic" | "semantic" | "identity" | "relationship";
+  state: "candidate" | "active" | "expired";
+  pinned: boolean;
+  updatedAtMs: bigint;
+};
+
+export type MemoryPage = { records: MemorySummary[]; nextCursor: MemoryCursor | null };
+
+export type MemoryRetention =
+  | { kind: "working"; expiresAtMs: bigint }
+  | { kind: "session"; sessionId: bigint }
+  | { kind: "until"; expiresAtMs: bigint }
+  | { kind: "until_deleted" };
+
+export type MemoryRecord = {
+  id: bigint;
+  kind: MemorySummary["kind"];
+  content: string;
+  state: MemorySummary["state"];
+  confidence: bigint;
+  createdAtMs: bigint;
+  updatedAtMs: bigint;
+  pinned: boolean;
+  revision: bigint;
+  retention: MemoryRetention;
+  lastUsedAtMs: bigint | null;
+  lastRetrievalReason: "pinned_match" | "exact_phrase" | "shared_term" | "recent_working" | null;
+};
+
+export type MemoryProvenance = {
+  kind: "user_provided" | "user_edited" | "completed_exchange" | "application_imported";
+  sourceId: string;
+  sourceTimestampMs: bigint;
+  actor: string;
+};
+
+export type MemoryApproval = {
+  confirmationId: string;
+  actor: string;
+  confirmedAtMs: bigint;
+  approvedRevision: bigint;
+};
+
+export type MemoryInspection = {
+  record: MemoryRecord;
+  sources: MemoryProvenance[];
+  approvals: MemoryApproval[];
+  sourcesTruncated: boolean;
+  approvalsTruncated: boolean;
+};
 
 export type RuntimeFailure = {
+  code:
+    | "adapter_failure"
+    | "configuration_invalid"
+    | "invalid_state"
+    | "memory_disabled"
+    | "memory_turn_active"
+    | "memory_not_found"
+    | "memory_unavailable";
   kind: "adapter" | "configuration" | "invalid_state";
   stage:
     | "runtime"
@@ -32,7 +106,7 @@ export type RuntimeStatus = {
   memoryEnabled: boolean;
   memoryLocation: "local" | null;
   telemetryEnabled: false;
-  capabilities: ["text"];
+  capabilities: ["text"] | ["text", "memory_inspection"];
 };
 
 type ConversationSignal =
@@ -89,6 +163,8 @@ export type GatewayMessage =
   | { type: "command_accepted"; requestId: string }
   | { type: "command_rejected"; requestId: string; error: RuntimeFailure }
   | { type: "status"; requestId: string; status: RuntimeStatus }
+  | { type: "memory_list"; requestId: string; records: MemorySummary[]; nextCursor: MemoryCursor | null }
+  | { type: "memory_inspection"; requestId: string; inspection: MemoryInspection }
   | { type: "runtime_event"; event: RuntimeEvent }
   | { type: "fatal"; error: RuntimeFailure };
 
@@ -120,6 +196,14 @@ export function parseClientCommand(value: unknown): ClientCommand {
       requireExactKeys(object, ["protocol_version", "type", "request_id", "turn_id"]);
       validateProtocolVersion(object);
       return { type, requestId: requireRequestId(object), turnId: parseIdentifier(object.turn_id) };
+    case "memory_list":
+      requireExactKeys(object, ["protocol_version", "type", "request_id", "cursor"]);
+      validateProtocolVersion(object);
+      return { type, requestId: requireRequestId(object), cursor: parseMemoryCursor(object.cursor) };
+    case "memory_inspect":
+      requireExactKeys(object, ["protocol_version", "type", "request_id", "memory_id"]);
+      validateProtocolVersion(object);
+      return { type, requestId: requireRequestId(object), memoryId: parseIdentifier(object.memory_id) };
     default:
       throw new ProtocolError("unsupported client command type");
   }
@@ -145,6 +229,14 @@ export function parseGatewayMessage(value: unknown): GatewayMessage {
       requireExactKeys(object, ["protocol_version", "type", "request_id", "status"]);
       validateProtocolVersion(object);
       return { type, requestId: requireRequestId(object), status: parseRuntimeStatus(object.status) };
+    case "memory_list":
+      requireExactKeys(object, ["protocol_version", "type", "request_id", "records", "next_cursor"]);
+      validateProtocolVersion(object);
+      return parseMemoryList(object);
+    case "memory_inspection":
+      requireExactKeys(object, ["protocol_version", "type", "request_id", "inspection"]);
+      validateProtocolVersion(object);
+      return { type, requestId: requireRequestId(object), inspection: parseMemoryInspection(object.inspection) };
     case "runtime_event":
       requireExactKeys(object, ["protocol_version", "type", "event"]);
       validateProtocolVersion(object);
@@ -160,23 +252,41 @@ export function parseGatewayMessage(value: unknown): GatewayMessage {
 
 export function encodeClientCommand(command: ClientCommand): Uint8Array {
   validateClientCommand(command);
-  const wire =
-    command.type === "status"
-      ? { protocol_version: CLIENT_PROTOCOL_VERSION, type: command.type, request_id: command.requestId }
-      : command.type === "start_turn"
-        ? {
-            protocol_version: CLIENT_PROTOCOL_VERSION,
-            type: command.type,
-            request_id: command.requestId,
-            turn_id: command.turnId.toString(),
-            transcript: command.transcript,
-          }
-        : {
-            protocol_version: CLIENT_PROTOCOL_VERSION,
-            type: command.type,
-            request_id: command.requestId,
-            turn_id: command.turnId.toString(),
-          };
+  const wire = (() => {
+    switch (command.type) {
+      case "status":
+        return { protocol_version: CLIENT_PROTOCOL_VERSION, type: command.type, request_id: command.requestId };
+      case "start_turn":
+        return {
+          protocol_version: CLIENT_PROTOCOL_VERSION,
+          type: command.type,
+          request_id: command.requestId,
+          turn_id: command.turnId.toString(),
+          transcript: command.transcript,
+        };
+      case "interrupt_turn":
+        return {
+          protocol_version: CLIENT_PROTOCOL_VERSION,
+          type: command.type,
+          request_id: command.requestId,
+          turn_id: command.turnId.toString(),
+        };
+      case "memory_list":
+        return {
+          protocol_version: CLIENT_PROTOCOL_VERSION,
+          type: command.type,
+          request_id: command.requestId,
+          cursor: command.cursor === null ? null : { before_id: command.cursor.beforeId.toString() },
+        };
+      case "memory_inspect":
+        return {
+          protocol_version: CLIENT_PROTOCOL_VERSION,
+          type: command.type,
+          request_id: command.requestId,
+          memory_id: command.memoryId.toString(),
+        };
+    }
+  })();
   return new TextEncoder().encode(JSON.stringify(wire));
 }
 
@@ -190,8 +300,17 @@ export function validateClientCommand(command: ClientCommand): void {
   if (command.type === "start_turn") {
     validateTranscript(command.transcript);
   }
-  if (command.type !== "status" && (command.turnId < 1n || command.turnId > MAX_U64)) {
+  if (
+    (command.type === "start_turn" || command.type === "interrupt_turn")
+    && (command.turnId < 1n || command.turnId > MAX_U64)
+  ) {
     throw new ProtocolError("turn identifier is outside u64 range");
+  }
+  if (command.type === "memory_list") {
+    validateMemoryCursor(command.cursor);
+  }
+  if (command.type === "memory_inspect" && (command.memoryId < 1n || command.memoryId > MAX_U64)) {
+    throw new ProtocolError("memory identifier is outside u64 range");
   }
 }
 
@@ -211,16 +330,193 @@ function parseRuntimeStatus(value: unknown): RuntimeStatus {
   if (memoryLocation !== null && typeof memoryLocation !== "string") {
     throw new ProtocolError("runtime status memory_location must be a string or null");
   }
+  const memoryEnabled = requireBoolean(object, "memory_enabled");
+  const parsedMemoryLocation = requireMemoryLocation(memoryLocation);
+  const capabilities = requireCapabilities(object);
+  validateRuntimeMemoryStatus(memoryEnabled, parsedMemoryLocation, capabilities);
   return {
     transport: requireOneOf(object, "transport", ["stdio"] as const),
     privacyMode: requireOneOf(object, "privacy_mode", ["local_only"] as const),
     languageLocation: requireOneOf(object, "language_location", ["local"] as const),
     modelId: requireString(object, "model_id"),
-    memoryEnabled: requireBoolean(object, "memory_enabled"),
-    memoryLocation: requireMemoryLocation(memoryLocation),
+    memoryEnabled,
+    memoryLocation: parsedMemoryLocation,
     telemetryEnabled: requireOneOf(object, "telemetry_enabled", [false] as const),
-    capabilities: requireCapabilities(object),
+    capabilities,
   };
+}
+
+function parseMemoryList(object: Record<string, unknown>): Extract<GatewayMessage, { type: "memory_list" }> {
+  const recordsValue = object.records;
+  if (!Array.isArray(recordsValue) || recordsValue.length > MAX_MEMORY_LIST_PAGE_ITEMS) {
+    throw new ProtocolError("memory list records has an unsupported value");
+  }
+  const records = recordsValue.map(parseMemorySummary);
+  for (let index = 1; index < records.length; index += 1) {
+    if (records[index - 1]!.id <= records[index]!.id) {
+      throw new ProtocolError("memory list records must have descending unique identifiers");
+    }
+  }
+  const nextCursor = parseMemoryCursor(object.next_cursor);
+  if (nextCursor !== null && records.at(-1)?.id !== nextCursor.beforeId) {
+    throw new ProtocolError("memory list cursor must match the last record");
+  }
+  return { type: "memory_list", requestId: requireRequestId(object), records, nextCursor };
+}
+
+function parseMemorySummary(value: unknown): MemorySummary {
+  const object = requireRecord(value, "memory summary");
+  requireExactKeys(object, ["id", "content_preview", "kind", "state", "pinned", "updated_at_ms"]);
+  const contentPreview = requireString(object, "content_preview");
+  requireMaximumUtf8Bytes(contentPreview, MAX_MEMORY_PREVIEW_BYTES, "memory preview");
+  return {
+    id: parseIdentifier(object.id),
+    contentPreview,
+    kind: requireMemoryKind(object, "kind"),
+    state: requireMemoryState(object, "state"),
+    pinned: requireBoolean(object, "pinned"),
+    updatedAtMs: parseTimestamp(object.updated_at_ms),
+  };
+}
+
+function parseMemoryInspection(value: unknown): MemoryInspection {
+  const object = requireRecord(value, "memory inspection");
+  requireExactKeys(object, ["record", "sources", "approvals", "sources_truncated", "approvals_truncated"]);
+  const record = parseMemoryRecord(object.record);
+  const sources = parseBoundedArray(object.sources, MAX_MEMORY_INSPECTION_HISTORY_ITEMS, "memory sources", parseMemoryProvenance);
+  const approvals = parseBoundedArray(object.approvals, MAX_MEMORY_INSPECTION_HISTORY_ITEMS, "memory approvals", parseMemoryApproval);
+  const sourcesTruncated = requireBoolean(object, "sources_truncated");
+  const approvalsTruncated = requireBoolean(object, "approvals_truncated");
+  validateMemoryHistory(record, sources, approvals);
+  return { record, sources, approvals, sourcesTruncated, approvalsTruncated };
+}
+
+function parseMemoryRecord(value: unknown): MemoryRecord {
+  const object = requireRecord(value, "memory record");
+  requireExactKeys(object, [
+    "id",
+    "kind",
+    "content",
+    "state",
+    "confidence",
+    "created_at_ms",
+    "updated_at_ms",
+    "pinned",
+    "revision",
+    "retention",
+    "last_used_at_ms",
+    "last_retrieval_reason",
+  ]);
+  const content = requireString(object, "content");
+  if (new TextEncoder().encode(content).length === 0) {
+    throw new ProtocolError("memory content must be non-empty");
+  }
+  requireMaximumUtf8Bytes(content, MAX_MEMORY_CONTENT_BYTES, "memory content");
+  const lastUsedAtMs = object.last_used_at_ms === null ? null : parseTimestamp(object.last_used_at_ms);
+  const lastRetrievalReason = object.last_retrieval_reason === null
+    ? null
+    : requireOneOf(object, "last_retrieval_reason", ["pinned_match", "exact_phrase", "shared_term", "recent_working"] as const);
+  return {
+    id: parseIdentifier(object.id),
+    kind: requireMemoryKind(object, "kind"),
+    content,
+    state: requireMemoryState(object, "state"),
+    confidence: parseBoundedDecimal(
+      object.confidence,
+      "memory confidence",
+      MAX_MEMORY_CONFIDENCE_DECIMAL,
+      "memory confidence exceeds 1000",
+    ),
+    createdAtMs: parseTimestamp(object.created_at_ms),
+    updatedAtMs: parseTimestamp(object.updated_at_ms),
+    pinned: requireBoolean(object, "pinned"),
+    revision: parseIdentifier(object.revision),
+    retention: parseMemoryRetention(object.retention),
+    lastUsedAtMs,
+    lastRetrievalReason,
+  };
+}
+
+function parseMemoryRetention(value: unknown): MemoryRetention {
+  const object = requireRecord(value, "memory retention");
+  const kind = requireString(object, "kind");
+  switch (kind) {
+    case "working":
+    case "until":
+      requireExactKeys(object, ["kind", "expires_at_ms"]);
+      return { kind, expiresAtMs: parseTimestamp(object.expires_at_ms) };
+    case "session":
+      requireExactKeys(object, ["kind", "session_id"]);
+      return { kind, sessionId: parseIdentifier(object.session_id) };
+    case "until_deleted":
+      requireExactKeys(object, ["kind"]);
+      return { kind };
+    default:
+      throw new ProtocolError("memory retention kind has an unsupported value");
+  }
+}
+
+function parseMemoryProvenance(value: unknown): MemoryProvenance {
+  const object = requireRecord(value, "memory provenance");
+  requireExactKeys(object, ["kind", "source_id", "source_timestamp_ms", "actor"]);
+  const sourceId = requireString(object, "source_id");
+  const actor = requireString(object, "actor");
+  requireNonEmptyMaximumUtf8Bytes(sourceId, 512, "memory source identifier");
+  requireNonEmptyMaximumUtf8Bytes(actor, 256, "memory source actor");
+  return {
+    kind: requireOneOf(object, "kind", ["user_provided", "user_edited", "completed_exchange", "application_imported"] as const),
+    sourceId,
+    sourceTimestampMs: parseTimestamp(object.source_timestamp_ms),
+    actor,
+  };
+}
+
+function parseMemoryApproval(value: unknown): MemoryApproval {
+  const object = requireRecord(value, "memory approval");
+  requireExactKeys(object, ["confirmation_id", "actor", "confirmed_at_ms", "approved_revision"]);
+  const confirmationId = requireString(object, "confirmation_id");
+  const actor = requireString(object, "actor");
+  requireNonEmptyMaximumUtf8Bytes(confirmationId, 512, "memory confirmation identifier");
+  requireNonEmptyMaximumUtf8Bytes(actor, 256, "memory approval actor");
+  return {
+    confirmationId,
+    actor,
+    confirmedAtMs: parseTimestamp(object.confirmed_at_ms),
+    approvedRevision: parseIdentifier(object.approved_revision),
+  };
+}
+
+function parseBoundedArray<T>(
+  value: unknown,
+  maximum: number,
+  name: string,
+  parse: (item: unknown) => T,
+): T[] {
+  if (!Array.isArray(value) || value.length > maximum) {
+    throw new ProtocolError(`${name} has an unsupported value`);
+  }
+  return value.map(parse);
+}
+
+function validateMemoryHistory(record: MemoryRecord, sources: MemoryProvenance[], approvals: MemoryApproval[]): void {
+  if (sources.length === 0) {
+    throw new ProtocolError("memory inspection requires provenance");
+  }
+  for (let index = 1; index < sources.length; index += 1) {
+    if (sources[index - 1]!.sourceTimestampMs > sources[index]!.sourceTimestampMs) {
+      throw new ProtocolError("memory sources must be ordered oldest to newest");
+    }
+  }
+  for (let index = 1; index < approvals.length; index += 1) {
+    if (approvals[index - 1]!.confirmedAtMs > approvals[index]!.confirmedAtMs) {
+      throw new ProtocolError("memory approvals must be ordered oldest to newest");
+    }
+  }
+  if (sources.some((source) => source.sourceTimestampMs > record.updatedAtMs)
+    || approvals.some((approval) => approval.confirmedAtMs > record.updatedAtMs)
+    || approvals.some((approval) => approval.approvedRevision >= record.revision)) {
+    throw new ProtocolError("memory history does not correspond to the current record");
+  }
 }
 
 function parseRuntimeEvent(value: unknown): RuntimeEvent {
@@ -321,8 +617,21 @@ function parseMemoryTrace(value: unknown): Extract<RuntimeEvent, { type: "memory
 
 function parseRuntimeFailure(value: unknown): RuntimeFailure {
   const object = requireRecord(value, "runtime error");
-  requireExactKeys(object, ["kind", "stage", "message"]);
+  requireExactKeys(object, ["code", "kind", "stage", "message"]);
   return {
+    code: requireOneOf(
+      object,
+      "code",
+      [
+        "adapter_failure",
+        "configuration_invalid",
+        "invalid_state",
+        "memory_disabled",
+        "memory_turn_active",
+        "memory_not_found",
+        "memory_unavailable",
+      ] as const,
+    ),
     kind: requireOneOf(object, "kind", ["adapter", "configuration", "invalid_state"] as const),
     stage: requireOneOf(
       object,
@@ -355,11 +664,53 @@ function parseIdentifier(value: unknown): bigint {
   if (typeof value !== "string" || !/^[1-9][0-9]*$/.test(value)) {
     throw new ProtocolError("identifier must be a canonical non-zero decimal string");
   }
-  const identifier = BigInt(value);
-  if (identifier > MAX_U64) {
+  if (exceedsDecimalBound(value, MAX_U64_DECIMAL)) {
     throw new ProtocolError("identifier exceeds u64");
   }
-  return identifier;
+  return BigInt(value);
+}
+
+function parseBoundedDecimal(
+  value: unknown,
+  name: string,
+  maximum: string,
+  overflowMessage: string,
+): bigint {
+  if (typeof value !== "string" || !/^(0|[1-9][0-9]*)$/.test(value)) {
+    throw new ProtocolError(`${name} must be a canonical decimal string`);
+  }
+  if (exceedsDecimalBound(value, maximum)) {
+    throw new ProtocolError(overflowMessage);
+  }
+  return BigInt(value);
+}
+
+function parseTimestamp(value: unknown): bigint {
+  return parseBoundedDecimal(value, "timestamp", MAX_I64_DECIMAL, "timestamp exceeds i64");
+}
+
+function exceedsDecimalBound(value: string, maximum: string): boolean {
+  return value.length > maximum.length
+    || (value.length === maximum.length && value > maximum);
+}
+
+function parseMemoryCursor(value: unknown): MemoryCursor | null {
+  if (value === null) {
+    return null;
+  }
+  const object = requireRecord(value, "memory cursor");
+  requireExactKeys(object, ["before_id"]);
+  return { beforeId: parseIdentifier(object.before_id) };
+}
+
+function validateMemoryCursor(cursor: MemoryCursor | null): void {
+  if (cursor === null) {
+    return;
+  }
+  if (!isRecord(cursor) || Object.keys(cursor).length !== 1 || !("beforeId" in cursor)
+    || typeof cursor.beforeId !== "bigint" || cursor.beforeId < 1n || cursor.beforeId > MAX_U64) {
+    throw new ProtocolError("memory cursor must contain a u64 before identifier");
+  }
 }
 
 function validateProtocolVersion(object: Record<string, unknown>): void {
@@ -442,12 +793,52 @@ function requireStringArray(object: Record<string, unknown>, key: string): strin
   return [...value];
 }
 
-function requireCapabilities(object: Record<string, unknown>): ["text"] {
+function requireCapabilities(object: Record<string, unknown>): RuntimeStatus["capabilities"] {
   const capabilities = requireStringArray(object, "capabilities");
-  if (capabilities.length !== 1 || capabilities[0] !== "text") {
+  if (
+    (capabilities.length !== 1 || capabilities[0] !== "text")
+    && (capabilities.length !== 2 || capabilities[0] !== "text" || capabilities[1] !== "memory_inspection")
+  ) {
     throw new ProtocolError("capabilities has an unsupported value");
   }
-  return ["text"];
+  return capabilities.length === 1 ? ["text"] : ["text", "memory_inspection"];
+}
+
+function validateRuntimeMemoryStatus(
+  memoryEnabled: boolean,
+  memoryLocation: RuntimeStatus["memoryLocation"],
+  capabilities: RuntimeStatus["capabilities"],
+): void {
+  const disabled = !memoryEnabled
+    && memoryLocation === null
+    && capabilities.length === 1;
+  const inspectableLocal = memoryEnabled
+    && memoryLocation === "local"
+    && capabilities.length === 2;
+  if (!disabled && !inspectableLocal) {
+    throw new ProtocolError("runtime memory status is incoherent");
+  }
+}
+
+function requireMemoryKind(object: Record<string, unknown>, key: string): MemorySummary["kind"] {
+  return requireOneOf(object, key, ["working", "episodic", "semantic", "identity", "relationship"] as const);
+}
+
+function requireMemoryState(object: Record<string, unknown>, key: string): MemorySummary["state"] {
+  return requireOneOf(object, key, ["candidate", "active", "expired"] as const);
+}
+
+function requireMaximumUtf8Bytes(value: string, maximum: number, name: string): void {
+  if (new TextEncoder().encode(value).length > maximum) {
+    throw new ProtocolError(`${name} exceeds ${maximum} bytes`);
+  }
+}
+
+function requireNonEmptyMaximumUtf8Bytes(value: string, maximum: number, name: string): void {
+  if (new TextEncoder().encode(value).length === 0) {
+    throw new ProtocolError(`${name} must be non-empty`);
+  }
+  requireMaximumUtf8Bytes(value, maximum, name);
 }
 
 function requireNonNegativeInteger(object: Record<string, unknown>, key: string): number {

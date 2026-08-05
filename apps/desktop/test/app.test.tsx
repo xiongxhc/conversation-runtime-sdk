@@ -5,12 +5,23 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { App, type DesktopSession } from "../src/App.js";
 import type {
+  MemoryCursor,
+  MemoryInspection,
+  MemoryPage,
+} from "@conversation/runtime/browser";
+import type {
   ConversationHistory,
   ConversationHistoryStore,
   ConversationSummary,
 } from "../src/history/conversation-history.js";
 import { setupStorageKey } from "../src/preferences/setup.js";
 import type { ConversationSessionState } from "../src/runtime/conversation-session.js";
+
+type Assert<T extends true> = T;
+type IsRequired<T, Key extends keyof T> = object extends Pick<T, Key> ? false : true;
+type DesktopMemoryMethodsAreRequired = Assert<
+  IsRequired<DesktopSession, "listMemories"> & IsRequired<DesktopSession, "inspectMemory">
+>;
 
 afterEach(cleanup);
 
@@ -201,6 +212,54 @@ describe("desktop app", () => {
     expect(screen.queryByRole("button", { name: "Enter Voice Focus" })).toBeNull();
     expect(screen.getByText(/Microphone and speech playback are not connected/i)).toBeTruthy();
     expect(screen.getByRole("button", { name: "Preview Voice Focus" })).toBeTruthy();
+  });
+
+  it("shows Memory only for verified local inspection capability", async () => {
+    const session = new FakeSession(memoryState());
+    session.listMemories.mockResolvedValueOnce({ records: [], nextCursor: null });
+    render(
+      <App
+        connectSession={vi.fn(async () => session)}
+        historyStore={new FakeHistoryStore()}
+        storage={memoryStorage()}
+      />,
+    );
+
+    connectWithAbsolutePaths();
+    const memory = await screen.findByRole("button", { name: "Memory" });
+    fireEvent.click(memory);
+
+    expect(await screen.findByRole("heading", { name: "Runtime memory" })).toBeTruthy();
+    expect(memory.getAttribute("aria-current")).toBe("page");
+    expect(screen.queryByRole("button", { name: "Persona" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Settings" })).toBeNull();
+  });
+
+  it("disables Memory during an active response but keeps History available", async () => {
+    const session = new FakeSession(memoryState({
+      phase: "streaming",
+      turns: [conversationTurn(1n, "Active question", "Partial", "streaming")],
+      activeTurn: conversationTurn(1n, "Active question", "Partial", "streaming"),
+    }));
+    render(
+      <App
+        connectSession={vi.fn(async () => session)}
+        historyStore={new FakeHistoryStore()}
+        storage={memoryStorage()}
+      />,
+    );
+
+    connectWithAbsolutePaths();
+    const memory = await screen.findByRole("button", { name: "Memory" });
+
+    expect(memory.hasAttribute("disabled")).toBe(true);
+    expect(screen.getByText(
+      "Finish or stop the active response before opening Memory.",
+    )).toBeTruthy();
+    const history = screen.getByRole("button", { name: "History" });
+    expect(history.hasAttribute("disabled")).toBe(false);
+    fireEvent.click(history);
+    expect(await screen.findByRole("heading", { name: "Conversation history" })).toBeTruthy();
   });
 
   it("persists completed chats locally and opens prior chats read-only", async () => {
@@ -495,6 +554,8 @@ class FakeSession implements DesktopSession {
   state: ConversationSessionState;
   readonly close = vi.fn(async () => undefined);
   readonly interrupt = vi.fn(async () => undefined);
+  readonly inspectMemory = vi.fn<(memoryId: bigint) => Promise<MemoryInspection>>();
+  readonly listMemories = vi.fn<(cursor?: MemoryCursor | null) => Promise<MemoryPage>>();
   readonly send = vi.fn(() => 1n);
   private readonly listeners = new Set<(state: ConversationSessionState) => void>();
 
@@ -512,6 +573,20 @@ class FakeSession implements DesktopSession {
     this.state = state;
     for (const listener of this.listeners) listener(state);
   }
+}
+
+function memoryState(
+  overrides: Partial<ConversationSessionState> = {},
+): ConversationSessionState {
+  return localState({
+    status: {
+      ...localState().status,
+      memoryEnabled: true,
+      memoryLocation: "local",
+      capabilities: ["text", "memory_inspection"],
+    },
+    ...overrides,
+  });
 }
 
 function connectWithAbsolutePaths() {

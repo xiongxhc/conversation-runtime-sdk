@@ -15,6 +15,7 @@ import {
   textOnlyComponentStatus,
   type ComponentStatusSnapshot,
 } from "./PrivacyStatus.js";
+import { MemoryPane } from "./MemoryPane.js";
 import { VoiceFocus } from "./VoiceFocus.js";
 
 export interface VoiceCapabilitySnapshot {
@@ -37,7 +38,7 @@ export interface WorkspaceProps {
 }
 
 type FocusMode = "live" | "preview";
-type WorkspaceView = "conversation" | "history";
+type WorkspaceView = "conversation" | "history" | "memory";
 
 export function Workspace({
   session,
@@ -64,6 +65,10 @@ export function Workspace({
   const focusReturn = useRef<HTMLButtonElement>(null);
   const restoreFocusOnWorkspace = useRef(false);
   const runtimeHealthy = sessionState.phase === "ready" || sessionState.phase === "streaming";
+  const memoryAvailable =
+    sessionState.status.memoryEnabled &&
+    sessionState.status.memoryLocation === "local" &&
+    sessionState.status.capabilities[1] === "memory_inspection";
   const canRenderLiveFocus =
     focusMode === "live" &&
     runtimeHealthy &&
@@ -104,6 +109,11 @@ export function Workspace({
       focusReturn.current?.focus();
     }
   }, [focusMode]);
+  useEffect(() => {
+    if (workspaceView === "memory" && sessionState.phase !== "ready") {
+      setWorkspaceView("conversation");
+    }
+  }, [sessionState.phase, workspaceView]);
 
   const updatePreferences = (nextPreferences: Preferences) => {
     setPreferences(nextPreferences);
@@ -299,6 +309,26 @@ export function Workspace({
         >
           History
         </button>
+        {memoryAvailable ? (
+          <>
+            <button
+              aria-current={workspaceView === "memory" ? "page" : undefined}
+              aria-describedby={sessionState.phase === "streaming"
+                ? "memory-navigation-explanation"
+                : undefined}
+              disabled={sessionState.phase === "streaming"}
+              onClick={() => setWorkspaceView("memory")}
+              type="button"
+            >
+              Memory
+            </button>
+            {sessionState.phase === "streaming" ? (
+              <p className="visually-hidden" id="memory-navigation-explanation">
+                Finish or stop the active response before opening Memory.
+              </p>
+            ) : null}
+          </>
+        ) : null}
       </nav>
 
       {workspaceView === "history" ? (
@@ -310,6 +340,12 @@ export function Workspace({
           onOpen={(id) => void openHistory(id)}
           selected={selectedHistory}
           storagePath={historyPath}
+        />
+      ) : workspaceView === "memory" ? (
+        <MemoryPane
+          onBack={() => setWorkspaceView("conversation")}
+          session={session}
+          status={sessionState.status}
         />
       ) : (
         <section className="conversation-pane" aria-labelledby="conversation-title">

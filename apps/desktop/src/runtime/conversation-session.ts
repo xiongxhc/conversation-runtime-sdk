@@ -1,5 +1,8 @@
 import {
   RuntimeClient,
+  type MemoryCursor,
+  type MemoryInspection,
+  type MemoryPage,
   type RuntimeEvent,
   type RuntimeFailure,
   type RuntimeStatus,
@@ -87,6 +90,16 @@ export class ConversationSession {
     return turn.turnId;
   }
 
+  async listMemories(cursor: MemoryCursor | null = null): Promise<MemoryPage> {
+    this.ensureMemoryReady();
+    return this.client.listMemories(cursor);
+  }
+
+  async inspectMemory(memoryId: bigint): Promise<MemoryInspection> {
+    this.ensureMemoryReady();
+    return this.client.inspectMemory(memoryId);
+  }
+
   async interrupt(): Promise<void> {
     const activeTurn = this.activeTurn;
     if (!activeTurn) {
@@ -164,6 +177,18 @@ export class ConversationSession {
     }
     if (this.activeTurn) {
       throw new Error("a conversation turn is already active");
+    }
+  }
+
+  private ensureMemoryReady(): void {
+    if (this.phase === "streaming") {
+      throw new Error("finish or stop the active response before inspecting memory");
+    }
+    if (this.phase === "closed") {
+      throw new Error("conversation session is closed");
+    }
+    if (this.phase === "failed") {
+      throw this.error ?? new Error("conversation session failed");
     }
   }
 

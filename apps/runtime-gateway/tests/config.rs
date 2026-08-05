@@ -1,6 +1,10 @@
 use std::path::{Path, PathBuf};
 
-use conversation_memory::SqliteMemoryStore;
+use conversation_memory::{MemoryContextProvider, MemoryStore, SqliteMemoryStore};
+use conversation_protocol::{
+    MemoryConfidence, MemoryDraft, MemoryKind, MemoryProvenance, MemoryProvenanceKind,
+    MemoryRetention, TurnId, UnixTimestampMillis,
+};
 use conversation_runtime_gateway::{GatewayAdapters, GatewayConfig};
 
 const VALID_CONFIG: &str = r#"schema_version = 1
@@ -179,8 +183,8 @@ fn rejects_a_model_identifier_larger_than_256_bytes() {
     assert!(GatewayConfig::load(&path).is_err());
 }
 
-#[test]
-fn accepts_an_existing_initialized_absolute_memory_database() {
+#[tokio::test]
+async fn memory_configuration_returns_shared_retrieval_and_inspection_handles() {
     let fixture = tempfile::tempdir().unwrap();
     let database = fixture.path().join("runtime.sqlite3");
     SqliteMemoryStore::initialize(&database).unwrap();
@@ -193,7 +197,53 @@ fn accepts_an_existing_initialized_absolute_memory_database() {
     );
 
     let config = GatewayConfig::load(&path).unwrap();
-    let _: GatewayAdapters = config.into_adapters().unwrap();
+    let adapters: GatewayAdapters = config.into_adapters().unwrap();
+    let store = adapters.memory_store.as_ref().unwrap();
+    let record = store
+        .create(
+            MemoryDraft::new(
+                MemoryKind::Semantic,
+                "shared gateway memory fixture",
+                MemoryProvenance::new(
+                    MemoryProvenanceKind::UserProvided,
+                    "gateway-config-test",
+                    UnixTimestampMillis::new(1_000).unwrap(),
+                    "local-user",
+                    None,
+                )
+                .unwrap(),
+                MemoryConfidence::new(900).unwrap(),
+                UnixTimestampMillis::new(1_000).unwrap(),
+                MemoryRetention::UntilDeleted,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let retrieval = adapters
+        .memory_provider
+        .as_ref()
+        .unwrap()
+        .retrieve(
+            TurnId::new(1),
+            "shared gateway memory".to_owned(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(retrieval.items().len(), 1);
+    assert_eq!(retrieval.items()[0].memory_id(), record.id());
+}
+
+#[test]
+fn configuration_without_memory_returns_no_memory_handles() {
+    let fixture = tempfile::tempdir().unwrap();
+    let path = write_config(fixture.path(), VALID_CONFIG);
+
+    let adapters = GatewayConfig::load(&path).unwrap().into_adapters().unwrap();
+
+    assert!(adapters.memory_provider.is_none());
+    assert!(adapters.memory_store.is_none());
 }
 
 #[test]

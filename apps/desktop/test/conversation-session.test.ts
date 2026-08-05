@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import type { ClientCommand, RuntimeTransport } from "@conversation/runtime/browser";
+import type {
+  ClientCommand,
+  MemoryInspection,
+  MemoryPage,
+  RuntimeTransport,
+} from "@conversation/runtime/browser";
 
 import { AsyncQueue } from "../src/runtime/async-queue.js";
 import { ConversationSession } from "../src/runtime/conversation-session.js";
@@ -14,6 +19,44 @@ const localStatus = {
   memory_location: null,
   telemetry_enabled: false,
   capabilities: ["text"],
+};
+
+const memoryPage: MemoryPage = {
+  records: [{
+    id: 7n,
+    contentPreview: "Prefers concise explanations",
+    kind: "semantic",
+    state: "active",
+    pinned: false,
+    updatedAtMs: 1_750_000_000_000n,
+  }],
+  nextCursor: null,
+};
+
+const memoryInspection: MemoryInspection = {
+  record: {
+    id: 7n,
+    kind: "semantic",
+    content: "Prefers concise explanations",
+    state: "active",
+    confidence: 840n,
+    createdAtMs: 1_740_000_000_000n,
+    updatedAtMs: 1_750_000_000_000n,
+    pinned: false,
+    revision: 2n,
+    retention: { kind: "until_deleted" },
+    lastUsedAtMs: null,
+    lastRetrievalReason: null,
+  },
+  sources: [{
+    kind: "user_provided",
+    sourceId: "conversation-1",
+    sourceTimestampMs: 1_740_000_000_000n,
+    actor: "local-user",
+  }],
+  approvals: [],
+  sourcesTruncated: false,
+  approvalsTruncated: false,
 };
 
 describe("ConversationSession", () => {
@@ -64,15 +107,36 @@ describe("ConversationSession", () => {
     expect(session.state.turns[0]).toMatchObject({ response: "Done", state: "completed" });
   });
 
+  it("forwards memory list and inspection requests only while ready", async () => {
+    const transport = connectedTransport();
+    const session = await ConversationSession.connect(transport);
+
+    await expect(session.listMemories()).resolves.toEqual(memoryPage);
+    await expect(session.inspectMemory(7n)).resolves.toEqual(memoryInspection);
+    expect(transport.sent.slice(-2)).toEqual([
+      { type: "memory_list", requestId: "request-2", cursor: null },
+      { type: "memory_inspect", requestId: "request-3", memoryId: 7n },
+    ]);
+
+    session.send("active turn");
+    await expect(session.listMemories()).rejects.toThrow(
+      "finish or stop the active response",
+    );
+    await expect(session.inspectMemory(7n)).rejects.toThrow(
+      "finish or stop the active response",
+    );
+  });
+
   it("surfaces a gateway failure", async () => {
     const transport = connectedTransport();
     const session = await ConversationSession.connect(transport);
     session.send("Hello");
 
     transport.emit({
-      protocol_version: 1,
+      protocol_version: 2,
       type: "fatal",
       error: {
+        code: "adapter_failure",
         kind: "adapter",
         stage: "runtime",
         message: "gateway failed",
@@ -147,9 +211,55 @@ class InMemoryTransport implements RuntimeTransport {
 
   async send(command: ClientCommand): Promise<void> {
     this.sent.push(command);
-    this.emit({ protocol_version: 1, type: "command_accepted", request_id: command.requestId });
+    this.emit({ protocol_version: 2, type: "command_accepted", request_id: command.requestId });
     if (command.type === "status") {
-      this.emit({ protocol_version: 1, type: "status", request_id: command.requestId, status: this.status });
+      this.emit({ protocol_version: 2, type: "status", request_id: command.requestId, status: this.status });
+    } else if (command.type === "memory_list") {
+      this.emit({
+        protocol_version: 2,
+        type: "memory_list",
+        request_id: command.requestId,
+        records: memoryPage.records.map((record) => ({
+          id: record.id.toString(),
+          content_preview: record.contentPreview,
+          kind: record.kind,
+          state: record.state,
+          pinned: record.pinned,
+          updated_at_ms: record.updatedAtMs.toString(),
+        })),
+        next_cursor: null,
+      });
+    } else if (command.type === "memory_inspect") {
+      this.emit({
+        protocol_version: 2,
+        type: "memory_inspection",
+        request_id: command.requestId,
+        inspection: {
+          record: {
+            id: "7",
+            kind: "semantic",
+            content: "Prefers concise explanations",
+            state: "active",
+            confidence: "840",
+            created_at_ms: "1740000000000",
+            updated_at_ms: "1750000000000",
+            pinned: false,
+            revision: "2",
+            retention: { kind: "until_deleted" },
+            last_used_at_ms: null,
+            last_retrieval_reason: null,
+          },
+          sources: [{
+            kind: "user_provided",
+            source_id: "conversation-1",
+            source_timestamp_ms: "1740000000000",
+            actor: "local-user",
+          }],
+          approvals: [],
+          sources_truncated: false,
+          approvals_truncated: false,
+        },
+      });
     }
   }
 
@@ -159,11 +269,11 @@ class InMemoryTransport implements RuntimeTransport {
   }
 
   ready(): void {
-    this.emit({ protocol_version: 1, type: "ready", status: localStatus });
+    this.emit({ protocol_version: 2, type: "ready", status: localStatus });
   }
 
   turnEvent(event: Record<string, unknown>): void {
-    this.emit({ protocol_version: 1, type: "runtime_event", event });
+    this.emit({ protocol_version: 2, type: "runtime_event", event });
   }
 
   emit(message: unknown): void {

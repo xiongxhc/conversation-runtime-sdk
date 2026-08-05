@@ -1,5 +1,11 @@
 import { useRef, useState } from "react";
 
+import type {
+  MemoryCursor,
+  MemoryInspection,
+  MemoryPage,
+} from "@conversation/runtime/browser";
+
 import { SetupView } from "./components/SetupView.js";
 import { Workspace, type VoiceCapabilitySnapshot } from "./components/Workspace.js";
 import {
@@ -26,6 +32,8 @@ export interface DesktopSession {
   readonly state: ConversationSessionState;
   subscribe(listener: (state: ConversationSessionState) => void): () => void;
   send(transcript: string): bigint;
+  listMemories(cursor?: MemoryCursor | null): Promise<MemoryPage>;
+  inspectMemory(memoryId: bigint): Promise<MemoryInspection>;
   interrupt(): Promise<void>;
   close(): Promise<void>;
 }

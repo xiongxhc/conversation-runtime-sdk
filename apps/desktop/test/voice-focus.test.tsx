@@ -250,7 +250,9 @@ describe("Voice Focus", () => {
 class FakeSession implements DesktopSession {
   state = localState();
   readonly close = vi.fn(async () => undefined);
+  readonly inspectMemory = vi.fn<DesktopSession["inspectMemory"]>();
   readonly interrupt = vi.fn(async () => undefined);
+  readonly listMemories = vi.fn<DesktopSession["listMemories"]>();
   readonly send = vi.fn(() => 1n);
   private readonly listeners = new Set<(state: ConversationSessionState) => void>();
 

@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { setImmediate } from "node:timers/promises";
 
-import { RuntimeClient, type RuntimeTransport } from "../src/client.js";
-import type { ClientCommand, RuntimeEvent, RuntimeStatus } from "../src/protocol.js";
+import { CommandRejectedError, RuntimeClient, type RuntimeTransport } from "../src/client.js";
+import type { ClientCommand, RuntimeEvent, RuntimeFailure, RuntimeStatus } from "../src/protocol.js";
 
 const status: RuntimeStatus = {
   transport: "stdio",
@@ -27,7 +27,7 @@ test("connects, correlates status, and streams an accepted turn", async () => {
   transport.push(accepted(statusCommand.requestId));
   transport.push({
     type: "status",
-    protocol_version: 1,
+    protocol_version: 2,
     request_id: statusCommand.requestId,
     status: wireStatus(),
   });
@@ -101,7 +101,7 @@ test("rejects every pending operation after text arrives after terminal", async 
 test("propagates malformed inbound messages and transport failures", async () => {
   const malformed = await connectedClient();
   const pendingMalformed = malformed.client.status();
-  malformed.transport.push({ type: "status", protocol_version: 1 });
+  malformed.transport.push({ type: "status", protocol_version: 2 });
   await assert.rejects(pendingMalformed, /message contains missing or unknown fields/);
   await malformed.client.close();
 
@@ -181,12 +181,16 @@ test("rejects an accepted command rejection as a correlation violation", async (
   connected.transport.push(accepted(statusCommand.requestId));
   connected.transport.push({
     type: "command_rejected",
-    protocol_version: 1,
+    protocol_version: 2,
     request_id: statusCommand.requestId,
-    error: { kind: "invalid_state", stage: "runtime", message: "rejected" },
+    error: { code: "invalid_state", kind: "invalid_state", stage: "runtime", message: "rejected" },
   });
 
-  await assert.rejects(pending, /rejected an accepted command/);
+  await assert.rejects(pending, (error: Error) => {
+    assert.notEqual(error.name, "CommandRejectedError");
+    assert.match(error.message, /rejected an accepted command/);
+    return true;
+  });
   await connected.client.close();
 });
 
@@ -197,9 +201,9 @@ test("rejects an accepted start rejection as a correlation violation", async () 
   connected.transport.push(accepted(startCommand.requestId));
   connected.transport.push({
     type: "command_rejected",
-    protocol_version: 1,
+    protocol_version: 2,
     request_id: startCommand.requestId,
-    error: { kind: "invalid_state", stage: "runtime", message: "rejected" },
+    error: { code: "invalid_state", kind: "invalid_state", stage: "runtime", message: "rejected" },
   });
 
   await assert.rejects(turn.events[Symbol.asyncIterator]().next(), /rejected an accepted command/);
@@ -216,7 +220,7 @@ test("rejects oversized starts before registering pending work", async () => {
   const pending = connected.client.status();
   const statusCommand = command(connected.transport, "status");
   connected.transport.push(accepted(statusCommand.requestId));
-  connected.transport.push({ type: "status", protocol_version: 1, request_id: statusCommand.requestId, status: wireStatus() });
+  connected.transport.push({ type: "status", protocol_version: 2, request_id: statusCommand.requestId, status: wireStatus() });
   assert.deepEqual(await pending, status);
   await connected.client.close();
 });
@@ -232,6 +236,145 @@ test("converts synchronous transport send failures into rejected work", async ()
   const turn = turnClient.startTurn("hello");
   await assert.rejects(turn.events[Symbol.asyncIterator]().next(), /synchronous send failure/);
   await turnClient.close();
+});
+
+test("lists keyset pages and inspects accepted memory requests", async () => {
+  const connected = await connectedClient();
+  const memory = connected.client;
+
+  const firstPage = memory.listMemories();
+  const first = command(connected.transport, "memory_list");
+  assert.equal(first.cursor, null);
+  connected.transport.push(acceptedV2(first.requestId));
+  connected.transport.push(memoryList(first.requestId, "7", { before_id: "7" }));
+  assert.deepEqual(await firstPage, {
+    records: [{ id: 7n, contentPreview: "Local preference", kind: "semantic", state: "active", pinned: false, updatedAtMs: 9_007_199_254_740_993n }],
+    nextCursor: { beforeId: 7n },
+  });
+
+  const nextPage = memory.listMemories({ beforeId: 7n });
+  const next = latestCommand(connected.transport, "memory_list");
+  assert.deepEqual(next.cursor, { beforeId: 7n });
+  connected.transport.push(acceptedV2(next.requestId));
+  connected.transport.push(memoryList(next.requestId, "6", null));
+  assert.equal((await nextPage).records[0]?.id, 6n);
+
+  const inspection = memory.inspectMemory(7n);
+  const inspect = command(connected.transport, "memory_inspect");
+  connected.transport.push(acceptedV2(inspect.requestId));
+  connected.transport.push(memoryInspection(inspect.requestId));
+  assert.equal((await inspection).record.revision, 3n);
+  await connected.client.close();
+});
+
+test("exposes exact typed memory command rejection fields", async () => {
+  const connected = await connectedClient();
+  const missingFailure: RuntimeFailure = {
+    code: "memory_not_found",
+    kind: "invalid_state",
+    stage: "memory",
+    message: "memory record was not found",
+  };
+  const missing = connected.client.inspectMemory(7n);
+  const inspect = command(connected.transport, "memory_inspect");
+  connected.transport.push(rejected(inspect.requestId, missingFailure));
+  await assert.rejects(missing, (error: Error) => assertCommandRejectedError(error, missingFailure));
+
+  const unavailableFailure: RuntimeFailure = {
+    code: "memory_unavailable",
+    kind: "adapter",
+    stage: "memory",
+    message: "memory inspection is unavailable",
+  };
+  const unavailable = connected.client.listMemories();
+  const list = command(connected.transport, "memory_list");
+  connected.transport.push(rejected(list.requestId, unavailableFailure));
+  await assert.rejects(unavailable, (error: Error) => assertCommandRejectedError(error, unavailableFailure));
+  await connected.client.close();
+});
+
+test("preserves client health after a rejected memory request", async () => {
+  const connected = await connectedClient();
+  const memory = connected.client;
+  const pendingMemory = memory.listMemories();
+  const list = command(connected.transport, "memory_list");
+  const failure: RuntimeFailure = {
+    code: "memory_disabled",
+    kind: "invalid_state",
+    stage: "memory",
+    message: "memory inspection is disabled",
+  };
+  connected.transport.push(rejected(list.requestId, failure));
+  await assert.rejects(pendingMemory, (error: Error) => assertCommandRejectedError(error, failure));
+
+  const pendingStatus = connected.client.status();
+  const statusCommand = command(connected.transport, "status");
+  connected.transport.push(acceptedV2(statusCommand.requestId));
+  connected.transport.push({ type: "status", protocol_version: 2, request_id: statusCommand.requestId, status: wireStatusV2() });
+  assert.deepEqual(await pendingStatus, {
+    ...status,
+    memoryEnabled: true,
+    memoryLocation: "local",
+    capabilities: ["text", "memory_inspection"],
+  });
+  await connected.client.close();
+});
+
+test("treats an early memory response as fatal", async () => {
+  const connected = await connectedClient();
+  const pending = connected.client.listMemories();
+  const list = command(connected.transport, "memory_list");
+  connected.transport.push(memoryList(list.requestId, "7", null));
+  await assert.rejects(pending, /uncorrelated memory list response/);
+  await connected.client.close();
+});
+
+test("treats mismatched and duplicate memory responses as fatal", async () => {
+  const mismatched = await connectedClient();
+  const mismatchedPending = mismatched.client.listMemories();
+  const mismatchedList = command(mismatched.transport, "memory_list");
+  mismatched.transport.push(acceptedV2(mismatchedList.requestId));
+  mismatched.transport.push(memoryInspection(mismatchedList.requestId));
+  await assert.rejects(mismatchedPending, /uncorrelated memory inspection response/);
+  await mismatched.client.close();
+
+  const duplicate = await connectedClient();
+  const duplicatePending = duplicate.client.listMemories();
+  const duplicateList = command(duplicate.transport, "memory_list");
+  duplicate.transport.push(acceptedV2(duplicateList.requestId));
+  duplicate.transport.push(memoryList(duplicateList.requestId, "7", null));
+  await duplicatePending;
+  const pendingStatus = duplicate.client.status();
+  duplicate.transport.push(memoryList(duplicateList.requestId, "7", null));
+  await assert.rejects(pendingStatus, /uncorrelated memory list response/);
+  await duplicate.client.close();
+});
+
+test("rejects pending memory work once on transport failure and close", async () => {
+  const failed = await connectedClient();
+  const failedPending = failed.client.inspectMemory(7n);
+  failed.transport.fail(new Error("transport disconnected"));
+  await assert.rejects(failedPending, /transport disconnected/);
+  await failed.client.close();
+
+  const closing = await connectedClient();
+  const memory = closing.client;
+  const pendingList = memory.listMemories();
+  const pendingInspection = memory.inspectMemory(7n);
+  await closing.client.close();
+  await Promise.all([
+    assert.rejects(pendingList, /runtime client closed/),
+    assert.rejects(pendingInspection, /runtime client closed/),
+  ]);
+  assert.equal(closing.transport.closeCalls, 1);
+});
+
+test("rejects out-of-range memory identifiers before sending", async () => {
+  const connected = await connectedClient();
+  assert.throws(() => connected.client.inspectMemory(0n), /u64 range/);
+  assert.throws(() => connected.client.inspectMemory(2n ** 64n), /u64 range/);
+  assert.equal(connected.transport.sent.length, 0);
+  await connected.client.close();
 });
 
 class InMemoryTransport implements RuntimeTransport {
@@ -341,12 +484,91 @@ function command<T extends ClientCommand["type"]>(
   return result as Extract<ClientCommand, { type: T }>;
 }
 
+function latestCommand<T extends ClientCommand["type"]>(
+  transport: InMemoryTransport,
+  type: T,
+): Extract<ClientCommand, { type: T }> {
+  const result = transport.sent.filter((item) => item.type === type).at(-1);
+  if (!result || result.type !== type) {
+    throw new Error(`missing ${type} command`);
+  }
+  return result as Extract<ClientCommand, { type: T }>;
+}
+
 function ready(): unknown {
-  return { type: "ready", protocol_version: 1, status: wireStatus() };
+  return { type: "ready", protocol_version: 2, status: wireStatus() };
 }
 
 function accepted(requestId: string): unknown {
-  return { type: "command_accepted", protocol_version: 1, request_id: requestId };
+  return { type: "command_accepted", protocol_version: 2, request_id: requestId };
+}
+
+function acceptedV2(requestId: string): unknown {
+  return { type: "command_accepted", protocol_version: 2, request_id: requestId };
+}
+
+function rejected(requestId: string, error: RuntimeFailure): unknown {
+  return { type: "command_rejected", protocol_version: 2, request_id: requestId, error };
+}
+
+function assertCommandRejectedError(error: Error, failure: RuntimeFailure): boolean {
+  assert.ok(error instanceof CommandRejectedError);
+  assert.equal(error.code, failure.code);
+  assert.equal(error.kind, failure.kind);
+  assert.equal(error.stage, failure.stage);
+  assert.equal(error.message, failure.message);
+  assert.deepEqual(error.failure, failure);
+  return true;
+}
+
+function memoryList(requestId: string, id: string, nextCursor: Record<string, string> | null): unknown {
+  return {
+    type: "memory_list",
+    protocol_version: 2,
+    request_id: requestId,
+    records: [{
+      id,
+      content_preview: "Local preference",
+      kind: "semantic",
+      state: "active",
+      pinned: false,
+      updated_at_ms: "9007199254740993",
+    }],
+    next_cursor: nextCursor,
+  };
+}
+
+function memoryInspection(requestId: string): unknown {
+  return {
+    type: "memory_inspection",
+    protocol_version: 2,
+    request_id: requestId,
+    inspection: {
+      record: {
+        id: "7",
+        kind: "semantic",
+        content: "Local preference",
+        state: "active",
+        confidence: "900",
+        created_at_ms: "9007199254740993",
+        updated_at_ms: "9007199254740993",
+        pinned: false,
+        revision: "3",
+        retention: { kind: "until_deleted" },
+        last_used_at_ms: null,
+        last_retrieval_reason: null,
+      },
+      sources: [{
+        kind: "user_provided",
+        source_id: "source-1",
+        source_timestamp_ms: "9007199254740993",
+        actor: "local-user",
+      }],
+      approvals: [],
+      sources_truncated: false,
+      approvals_truncated: false,
+    },
+  };
 }
 
 function event(type: "turn_started" | "turn_completed" | "turn_cancelled", turnId: bigint): unknown;
@@ -354,7 +576,7 @@ function event(type: "text_delta", turnId: bigint, delta: string): unknown;
 function event(type: "turn_started" | "turn_completed" | "turn_cancelled" | "text_delta", turnId: bigint, delta?: string): unknown {
   return {
     type: "runtime_event",
-    protocol_version: 1,
+    protocol_version: 2,
     event:
       type === "text_delta"
         ? { type, turn_id: turnId.toString(), delta }
@@ -372,6 +594,15 @@ function wireStatus(): Record<string, unknown> {
     memory_location: null,
     telemetry_enabled: false,
     capabilities: ["text"],
+  };
+}
+
+function wireStatusV2(): Record<string, unknown> {
+  return {
+    ...wireStatus(),
+    memory_enabled: true,
+    memory_location: "local",
+    capabilities: ["text", "memory_inspection"],
   };
 }
 

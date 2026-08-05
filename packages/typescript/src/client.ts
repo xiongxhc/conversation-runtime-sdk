@@ -3,7 +3,11 @@ import {
   validateClientCommand,
   type ClientCommand,
   type GatewayMessage,
+  type MemoryCursor,
+  type MemoryInspection,
+  type MemoryPage,
   type RuntimeEvent,
+  type RuntimeFailure,
   type RuntimeStatus,
 } from "./protocol.js";
 
@@ -16,6 +20,22 @@ export interface RuntimeTransport {
 export interface RuntimeTurn {
   readonly turnId: bigint;
   readonly events: AsyncIterable<RuntimeEvent>;
+}
+
+export class CommandRejectedError extends Error {
+  readonly code: RuntimeFailure["code"];
+  readonly kind: RuntimeFailure["kind"];
+  readonly stage: RuntimeFailure["stage"];
+  readonly failure: RuntimeFailure;
+
+  constructor(failure: RuntimeFailure) {
+    super(failure.message);
+    this.name = "CommandRejectedError";
+    this.code = failure.code;
+    this.kind = failure.kind;
+    this.stage = failure.stage;
+    this.failure = failure;
+  }
 }
 
 export class RuntimeClient {
@@ -49,6 +69,36 @@ export class RuntimeClient {
       fail: (error) => result.reject(error),
     });
     this.send({ type: "status", requestId });
+    return result.promise;
+  }
+
+  listMemories(cursor: MemoryCursor | null = null): Promise<MemoryPage> {
+    const requestId = this.nextRequestId();
+    const command: ClientCommand = { type: "memory_list", requestId, cursor };
+    validateClientCommand(command);
+    const result = new Deferred<MemoryPage>();
+    this.controls.set(requestId, {
+      kind: "memory_list",
+      accepted: false,
+      result,
+      fail: (error) => result.reject(error),
+    });
+    this.send(command);
+    return result.promise;
+  }
+
+  inspectMemory(memoryId: bigint): Promise<MemoryInspection> {
+    const requestId = this.nextRequestId();
+    const command: ClientCommand = { type: "memory_inspect", requestId, memoryId };
+    validateClientCommand(command);
+    const result = new Deferred<MemoryInspection>();
+    this.controls.set(requestId, {
+      kind: "memory_inspect",
+      accepted: false,
+      result,
+      fail: (error) => result.reject(error),
+    });
+    this.send(command);
     return result.promise;
   }
 
@@ -153,7 +203,7 @@ export class RuntimeClient {
       return;
     }
     if (message.type === "command_rejected") {
-      this.reject(message.requestId, new Error("gateway rejected a command"));
+      this.reject(message.requestId, new CommandRejectedError(message.error));
       return;
     }
     if (message.type === "status") {
@@ -164,6 +214,26 @@ export class RuntimeClient {
       }
       this.controls.delete(message.requestId);
       control.result.resolve(message.status);
+      return;
+    }
+    if (message.type === "memory_list") {
+      const control = this.controls.get(message.requestId);
+      if (!control || control.kind !== "memory_list" || !control.accepted) {
+        this.fail(new Error("gateway sent an uncorrelated memory list response"));
+        return;
+      }
+      this.controls.delete(message.requestId);
+      control.result.resolve({ records: message.records, nextCursor: message.nextCursor });
+      return;
+    }
+    if (message.type === "memory_inspection") {
+      const control = this.controls.get(message.requestId);
+      if (!control || control.kind !== "memory_inspect" || !control.accepted) {
+        this.fail(new Error("gateway sent an uncorrelated memory inspection response"));
+        return;
+      }
+      this.controls.delete(message.requestId);
+      control.result.resolve(message.inspection);
       return;
     }
 
@@ -189,6 +259,8 @@ export class RuntimeClient {
     control.accepted = true;
     switch (control.kind) {
       case "status":
+      case "memory_list":
+      case "memory_inspect":
         return;
       case "start_turn": {
         this.controls.delete(requestId);
@@ -282,6 +354,8 @@ export class RuntimeClient {
 
 type PendingControl =
   | { kind: "status"; accepted: boolean; result: Deferred<RuntimeStatus>; fail(error: Error): void }
+  | { kind: "memory_list"; accepted: boolean; result: Deferred<MemoryPage>; fail(error: Error): void }
+  | { kind: "memory_inspect"; accepted: boolean; result: Deferred<MemoryInspection>; fail(error: Error): void }
   | { kind: "start_turn"; accepted: boolean; turnId: bigint; fail(error: Error): void }
   | { kind: "interrupt_turn"; accepted: boolean; result: Deferred<void>; fail(error: Error): void };
 

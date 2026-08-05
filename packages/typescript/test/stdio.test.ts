@@ -22,7 +22,7 @@ test("requires absolute gateway and configuration paths", async () => {
 
 test("spawns without a shell", async () => {
   await withGateway(
-    "emit({ type: 'ready', protocol_version: 1, status }); process.stdin.once('end', () => process.exit(0));",
+    "emit({ type: 'ready', protocol_version: 2, status }); process.stdin.once('end', () => process.exit(0));",
     async ({ gatewayPath, directory }) => {
       const marker = join(directory, "shell-executed");
       const configPath = join(directory, `$(touch ${marker})`);
@@ -36,7 +36,7 @@ test("spawns without a shell", async () => {
 
 test("continuously drains bounded stderr until the child exits", async () => {
   await withGateway(
-    "emit({ type: 'ready', protocol_version: 1, status }); (async () => { const chunk = 'x'.repeat(65536); for (let index = 0; index < 8; index += 1) { if (!process.stderr.write(chunk)) await new Promise((resolve) => process.stderr.once('drain', resolve)); } process.exit(0); })();",
+    "emit({ type: 'ready', protocol_version: 2, status }); (async () => { const chunk = 'x'.repeat(65536); for (let index = 0; index < 8; index += 1) { if (!process.stderr.write(chunk)) await new Promise((resolve) => process.stderr.once('drain', resolve)); } process.exit(0); })();",
     async ({ gatewayPath, configPath }) => {
       const transport = await StdioGatewayTransport.start({ gatewayPath, configPath });
       const iterator = transport.messages[Symbol.asyncIterator]();
@@ -48,7 +48,7 @@ test("continuously drains bounded stderr until the child exits", async () => {
 
 test("rejects client work when the gateway exits", async () => {
   await withGateway(
-    "emit({ type: 'ready', protocol_version: 1, status }); process.stdin.once('data', () => setTimeout(() => process.exit(1), 10));",
+    "emit({ type: 'ready', protocol_version: 2, status }); process.stdin.once('data', () => setTimeout(() => process.exit(1), 10));",
     async ({ gatewayPath, configPath }) => {
       const transport = await StdioGatewayTransport.start({ gatewayPath, configPath });
       const client = await RuntimeClient.connect(transport);
@@ -61,7 +61,7 @@ test("rejects client work when the gateway exits", async () => {
 
 test("discards buffered ready and responses when the process fails", async () => {
   await withGateway(
-    "emit({ type: 'ready', protocol_version: 1, status }); setTimeout(() => { writeFileSync(`${process.argv[3]}.exit`, ''); process.exit(1); }, 10);",
+    "emit({ type: 'ready', protocol_version: 2, status }); setTimeout(() => { writeFileSync(`${process.argv[3]}.exit`, ''); process.exit(1); }, 10);",
     async ({ gatewayPath, configPath }) => {
       const transport = await StdioGatewayTransport.start({ gatewayPath, configPath });
       await waitForFile(`${configPath}.exit`);
@@ -73,7 +73,7 @@ test("discards buffered ready and responses when the process fails", async () =>
 
 test("discards buffered status responses when exit follows", async () => {
   await withGateway(
-    "emit({ type: 'ready', protocol_version: 1, status }); process.stdin.once('data', () => { emit({ type: 'command_accepted', protocol_version: 1, request_id: 'request-1' }); emit({ type: 'status', protocol_version: 1, request_id: 'request-1', status }); writeFileSync(`${process.argv[3]}.exit`, ''); process.exit(1); });",
+    "emit({ type: 'ready', protocol_version: 2, status }); process.stdin.once('data', () => { emit({ type: 'command_accepted', protocol_version: 2, request_id: 'request-1' }); emit({ type: 'status', protocol_version: 2, request_id: 'request-1', status }); writeFileSync(`${process.argv[3]}.exit`, ''); process.exit(1); });",
     async ({ gatewayPath, configPath }) => {
       const transport = await StdioGatewayTransport.start({ gatewayPath, configPath });
       const iterator = transport.messages[Symbol.asyncIterator]();
@@ -89,7 +89,7 @@ test("discards buffered status responses when exit follows", async () => {
 
 test("closes an EOF-ignoring child with bounded termination and reaping", { timeout: 2_000 }, async () => {
   await withGateway(
-    "process.stdin.resume(); process.on('SIGTERM', () => {}); setTimeout(() => process.exit(0), 700); emit({ type: 'ready', protocol_version: 1, status });",
+    "process.stdin.resume(); process.on('SIGTERM', () => {}); setTimeout(() => process.exit(0), 700); emit({ type: 'ready', protocol_version: 2, status });",
     async ({ gatewayPath, configPath }) => {
       const transport = await StdioGatewayTransport.start({ gatewayPath, configPath });
       await transport.messages[Symbol.asyncIterator]().next();
@@ -109,7 +109,7 @@ test("uses content-free errors for spawn and child stream failures", async () =>
   );
 
   await withGateway(
-    "emit({ type: 'ready', protocol_version: 1, status }); process.stdin.once('data', () => { process.stderr.write('private-stderr-value'); process.exit(1); });",
+    "emit({ type: 'ready', protocol_version: 2, status }); process.stdin.once('data', () => { process.stderr.write('private-stderr-value'); process.exit(1); });",
     async ({ gatewayPath, configPath }) => {
       const transport = await StdioGatewayTransport.start({ gatewayPath, configPath });
       const client = await RuntimeClient.connect(transport);
@@ -192,7 +192,7 @@ function startWithChild(child: FakeChild): StdioGatewayTransport {
 }
 
 function framedReady(): Buffer {
-  const payload = Buffer.from(JSON.stringify({ type: "ready", protocol_version: 1, status: {
+  const payload = Buffer.from(JSON.stringify({ type: "ready", protocol_version: 2, status: {
     transport: "stdio",
     privacy_mode: "local_only",
     language_location: "local",

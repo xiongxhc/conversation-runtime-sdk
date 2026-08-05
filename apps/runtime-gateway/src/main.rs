@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use conversation_memory::SystemMemoryClock;
 use conversation_protocol::{ExecutionLocation, RuntimeStatus};
 use conversation_runtime::TextTurnRuntime;
 use conversation_runtime_gateway::{GatewayAdapters, GatewayConfig, GatewaySession};
@@ -27,15 +28,27 @@ async fn run() -> Result<(), ()> {
     })?;
 
     let model_id = adapters.model_id().to_owned();
-    let memory_enabled = adapters.memory.is_some();
     let mut runtime =
         TextTurnRuntime::new(Arc::new(adapters.language)).with_quality_controller(adapters.quality);
-    if let Some(memory) = adapters.memory {
-        runtime = runtime
-            .with_memory_provider(Arc::new(memory), ExecutionLocation::Local)
-            .map_err(|_| {
-                eprintln!("gateway memory initialization failed");
-            })?;
+    let memory_store = match (adapters.memory_provider, adapters.memory_store) {
+        (Some(provider), Some(store)) => {
+            runtime = runtime
+                .with_memory_provider(Arc::new(provider), ExecutionLocation::Local)
+                .map_err(|_| {
+                    eprintln!("gateway memory initialization failed");
+                })?;
+            Some(store)
+        }
+        (None, None) => None,
+        _ => {
+            eprintln!("gateway memory initialization failed");
+            return Err(());
+        }
+    };
+    let memory_enabled = memory_store.is_some();
+    let mut capabilities = vec!["text".to_owned()];
+    if memory_enabled {
+        capabilities.push("memory_inspection".to_owned());
     }
     let status = RuntimeStatus {
         transport: "stdio".to_owned(),
@@ -45,9 +58,12 @@ async fn run() -> Result<(), ()> {
         memory_enabled,
         memory_location: memory_enabled.then(|| "local".to_owned()),
         telemetry_enabled: false,
-        capabilities: vec!["text".to_owned()],
+        capabilities,
     };
-    let session = GatewaySession::new(runtime, status);
+    let mut session = GatewaySession::new(runtime, status);
+    if let Some(store) = memory_store {
+        session = session.with_memory_inspection(Arc::new(store), Arc::new(SystemMemoryClock));
+    }
     session
         .run(tokio::io::stdin(), tokio::io::stdout())
         .await

@@ -11,6 +11,6 @@ pub use provider::{
 };
 pub use retrieval::{MemoryRetrieval, NeverCancelled, RetrievalCancellation};
 pub use sqlite::{SqliteMemoryStore, SCHEMA_VERSION, SQLITE_APPLICATION_ID};
-pub use store::MemoryStore;
+pub use store::{BoundedMemoryInspection, MemoryPage, MemoryStore};
 
 pub const MAX_MEMORY_SCAN_RECORDS: usize = 1_024;

@@ -1,0 +1,30 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Conversation Runtime",
+  "version": "0.1.0",
+  "identifier": "com.conversation.runtime",
+  "build": {
+    "beforeDevCommand": "npm run dev --workspace conversation-desktop",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build --workspace conversation-desktop",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "security": {
+      "csp": null
+    },
+    "windows": [
+      {
+        "label": "main",
+        "title": "Conversation Runtime",
+        "width": 1120,
+        "height": 760,
+        "minWidth": 900,
+        "minHeight": 680
+      }
+    ]
+  },
+  "bundle": {
+    "icon": []
+  }
+}

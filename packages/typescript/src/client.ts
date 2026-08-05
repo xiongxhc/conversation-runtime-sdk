@@ -21,6 +21,7 @@ export interface RuntimeTurn {
 export class RuntimeClient {
   private readonly ready = new Deferred<void>();
   private readonly controls = new Map<string, PendingControl>();
+  private readonly unexpectedFailureListeners = new Set<(error: Error) => void>();
   private readonly turns = new Map<bigint, TurnState>();
   private failure: Error | undefined;
   private closing = false;
@@ -101,6 +102,14 @@ export class RuntimeClient {
     this.fail(new Error("runtime client closed"), false);
     this.closePromise = this.transport.close();
     return this.closePromise;
+  }
+
+  onUnexpectedFailure(listener: (error: Error) => void): () => void {
+    this.unexpectedFailureListeners.add(listener);
+    if (this.failure && !this.closing) {
+      this.notifyUnexpectedFailureListener(listener, this.failure);
+    }
+    return () => this.unexpectedFailureListeners.delete(listener);
   }
 
   private async consumeMessages(): Promise<void> {
@@ -251,6 +260,17 @@ export class RuntimeClient {
     this.turns.clear();
     if (closeTransport && !this.closing) {
       void this.transport.close().catch(() => undefined);
+      for (const listener of this.unexpectedFailureListeners) {
+        this.notifyUnexpectedFailureListener(listener, error);
+      }
+    }
+  }
+
+  private notifyUnexpectedFailureListener(listener: (error: Error) => void, error: Error): void {
+    try {
+      listener(error);
+    } catch {
+      return;
     }
   }
 

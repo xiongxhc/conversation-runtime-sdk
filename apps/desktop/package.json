@@ -1,0 +1,37 @@
+{
+  "name": "conversation-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  },
+  "scripts": {
+    "build": "npm run typecheck && npm run typecheck:config && vite build && node scripts/assert-scene-chunks.mjs",
+    "dev": "vite",
+    "tauri:dev": "tauri dev",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json",
+    "typecheck:config": "tsc -p tsconfig.config.json"
+  },
+  "dependencies": {
+    "@conversation/runtime": "0.1.0",
+    "@react-three/fiber": "9.3.0",
+    "@tauri-apps/api": "2.11.0",
+    "ogl": "1.0.11",
+    "react": "19.2.0",
+    "react-dom": "19.2.0",
+    "three": "0.180.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.11.0",
+    "@testing-library/react": "16.3.0",
+    "@types/react": "19.2.0",
+    "@types/react-dom": "19.2.0",
+    "@types/three": "0.180.0",
+    "@vitejs/plugin-react": "6.0.5",
+    "jsdom": "26.1.0",
+    "vite": "8.2.0",
+    "vitest": "4.1.0"
+  }
+}

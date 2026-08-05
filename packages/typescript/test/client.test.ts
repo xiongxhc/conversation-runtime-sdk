@@ -119,6 +119,48 @@ test("closes the transport cleanly", async () => {
   assert.equal(connected.transport.closed, true);
 });
 
+test("reports an idle transport failure to passive subscribers", async () => {
+  const connected = await connectedClient();
+  let observed: Error | undefined;
+  connected.client.onUnexpectedFailure((error) => {
+    observed = error;
+  });
+
+  connected.transport.fail(new Error("transport disconnected"));
+
+  await setImmediate();
+  assert.equal(observed?.message, "transport disconnected");
+  await connected.client.close();
+});
+
+test("does not report normal client close to passive subscribers", async () => {
+  const connected = await connectedClient();
+  const observed: Error[] = [];
+  connected.client.onUnexpectedFailure((error) => observed.push(error));
+
+  await connected.client.close();
+  await setImmediate();
+
+  assert.deepEqual(observed, []);
+});
+
+test("isolates throwing passive failure subscribers and closes the transport", async () => {
+  const connected = await connectedClient();
+  let delivered = 0;
+  connected.client.onUnexpectedFailure(() => {
+    throw new Error("listener failed");
+  });
+  connected.client.onUnexpectedFailure(() => {
+    delivered += 1;
+  });
+
+  connected.transport.fail(new Error("transport disconnected"));
+
+  await setImmediate();
+  assert.equal(delivered, 1);
+  assert.equal(connected.transport.closeCalls, 1);
+});
+
 test("discards buffered turn events when transport failure follows", async () => {
   const connected = await connectedClient();
   const turn = connected.client.startTurn("hello");
@@ -197,6 +239,7 @@ class InMemoryTransport implements RuntimeTransport {
   readonly messages = this.inbox;
   readonly sent: ClientCommand[] = [];
   closed = false;
+  closeCalls = 0;
 
   async send(message: ClientCommand): Promise<void> {
     this.sent.push(message);
@@ -204,6 +247,7 @@ class InMemoryTransport implements RuntimeTransport {
 
   async close(): Promise<void> {
     this.closed = true;
+    this.closeCalls += 1;
     this.inbox.finish();
   }
 

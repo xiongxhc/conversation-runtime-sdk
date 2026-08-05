@@ -5,6 +5,7 @@ members = [
     "crates/protocol",
     "crates/runtime",
     "apps/runtime-gateway",
+    "apps/desktop/src-tauri",
     "tests/latency",
     "tests/memory",
     "tests/ollama",

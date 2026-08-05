@@ -8,7 +8,7 @@ The SDK is cross-platform by design. The first validated product target is macOS
 
 ## Current Status
 
-The repository now contains the deterministic runtime foundation, reviewed local text-to-audio reference paths, the deterministic R3 real-time voice implementation, bounded R4 conversation quality controls, the R5 controlled-memory reference path, and the first R6 local-gateway slice:
+The repository now contains the deterministic runtime foundation, reviewed local text-to-audio reference paths, the deterministic R3 real-time voice implementation, bounded R4 conversation quality controls, the R5 controlled-memory reference path, and the first R6 local-gateway and desktop slices:
 
 - typed commands, events, turn identifiers, and errors;
 - cancellation-aware language-model and speech-synthesis adapter contracts;
@@ -46,9 +46,14 @@ The repository now contains the deterministic runtime foundation, reviewed local
 - a persistent local-only Rust gateway using bounded framed standard I/O with no
   network listener;
 - the backend-neutral `@conversation/runtime` TypeScript client and Node stdio
-  transport; and
+  transport;
 - a minimal Node chat example with streamed UTF-8 text, persistent multi-turn
-  process reuse, and two-stage interruption and shutdown behavior.
+  process reuse, and two-stage interruption and shutdown behavior;
+- a browser-safe SDK entry and macOS Tauri bridge for the same bounded local
+  gateway protocol; and
+- a desktop text-chat workspace with streamed output, Stop and reconnect
+  behavior, plus an idle Voice Focus preview containing Soft Aurora, Silk,
+  Threads, Prism, Orb, Still Gradient, and None.
 
 The complete Rust workspace, strict Clippy and formatting gates, acceptance
 harness suite, and `109` Swift sidecar tests pass. R5 is complete for the
@@ -61,7 +66,8 @@ remains `ACCEPTANCE BLOCKED`, and no first-audible or audible-stop latency is
 claimed. See [the R3 evaluation](docs/r3-real-time-voice-evaluation.md),
 [the R4 evaluation](docs/r4-conversation-quality-evaluation.md),
 [the R5 evaluation](docs/r5-controlled-memory-evaluation.md),
-[the R6 local-gateway evaluation](docs/r6-local-gateway-evaluation.md), and
+[the R6 local-gateway evaluation](docs/r6-local-gateway-evaluation.md),
+[the R6 desktop-app evaluation](docs/r6-desktop-app-evaluation.md), and
 [ROADMAP.md](ROADMAP.md).
 
 ## R3 Target Architecture
@@ -248,6 +254,56 @@ and stdout. It opens no TCP, HTTP, WebSocket, or Unix-domain listener. A
 configured Ollama-compatible provider remains a separate loopback-only local
 service. See [the R6 evaluation](docs/r6-local-gateway-evaluation.md) for the
 deterministic cross-language evidence and manual smoke template.
+
+## Run the Desktop Reference App
+
+The first macOS desktop slice uses the public browser-safe TypeScript SDK and
+the same compiled local gateway as the Node example. From a clean checkout,
+install the exact dependencies and build both prerequisites:
+
+```bash
+npm ci
+npm run build --workspace @conversation/runtime
+cargo build --locked -p conversation-runtime-gateway
+```
+
+Create a private gateway configuration, then set its loopback endpoint and
+generic model placeholder to a local service already running on this Mac:
+
+```bash
+PRIVATE_GATEWAY_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/conversation-runtime/gateway.toml"
+mkdir -p "$(dirname "$PRIVATE_GATEWAY_CONFIG")"
+cp configs/gateway.example.toml "$PRIVATE_GATEWAY_CONFIG"
+${EDITOR:-vi} "$PRIVATE_GATEWAY_CONFIG"
+```
+
+Launch the Tauri development app from the repository root:
+
+```bash
+npm run desktop:dev
+```
+
+The setup screen requires the absolute paths printed by:
+
+```bash
+printf 'Gateway: %s\nConfig: %s\n' \
+  "$PWD/target/debug/conversation-runtime-gateway" \
+  "$PRIVATE_GATEWAY_CONFIG"
+```
+
+With the configured loopback model service running, the app exposes local text
+chat, streamed assistant output, Stop, close, and reconnect for developer
+testing. `Preview Voice Focus` exposes all seven scenes for manual review: Soft
+Aurora (the default), Silk, Threads, Prism, Orb, Still Gradient, and None. The
+preview is deliberately idle and its transcript is hidden by default. This
+evaluation does not record a live local-model desktop turn or native GPU scene
+acceptance.
+
+The gateway still advertises text-only capabilities. Live microphone and
+playback activation, real voice-session events, persona and memory mutation,
+packaging and signing, and R3 human, ten-minute, and acoustic acceptance remain
+open. See [the desktop README](apps/desktop/README.md) and
+[the desktop evaluation](docs/r6-desktop-app-evaluation.md).
 
 ## Test Local Inference
 

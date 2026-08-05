@@ -3,10 +3,12 @@
   "private": true,
   "workspaces": [
     "packages/*",
-    "examples/*"
+    "examples/*",
+    "apps/*"
   ],
   "scripts": {
     "build": "npm run build --workspaces",
+    "desktop:dev": "npm run tauri:dev --workspace conversation-desktop --",
     "test": "npm test --workspaces"
   },
   "devDependencies": {

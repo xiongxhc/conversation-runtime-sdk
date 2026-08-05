@@ -1,0 +1,10 @@
+.silk-container {
+  height: 100%;
+  pointer-events: none;
+  position: relative;
+  width: 100%;
+}
+
+.silk-container canvas {
+  display: block;
+}

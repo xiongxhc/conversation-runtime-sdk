@@ -1,0 +1,12 @@
+.threads-container {
+  height: 100%;
+  pointer-events: none;
+  position: relative;
+  width: 100%;
+}
+
+.threads-container canvas {
+  display: block;
+  height: 100%;
+  width: 100%;
+}

@@ -1,0 +1,22 @@
+[package]
+name = "conversation-desktop"
+version.workspace = true
+edition.workspace = true
+publish = false
+build = "build.rs"
+
+[build-dependencies]
+tauri-build = { version = "2.6", features = [] }
+
+[dependencies]
+conversation-protocol.workspace = true
+conversation-runtime-gateway = { path = "../../runtime-gateway" }
+serde_json.workspace = true
+tauri = { version = "2.11", features = [] }
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

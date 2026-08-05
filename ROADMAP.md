@@ -37,11 +37,16 @@ The first release is not a directory-complete platform. It is one local voice lo
 - R5 controlled local memory is complete for its deterministic SDK and probe
   surface, including explicit initialization, revision-bound mutation,
   confirmation-backed promotion, bounded retrieval, and content-free traces.
-- The first R6 local-gateway slice is complete: a persistent local-only Rust
-  gateway, bounded framed stdio protocol, public TypeScript client, and minimal
-  Node chat example pass deterministic completion and cancellation tests across
-  the real Rust-binary-to-Node process boundary. R6 remains open for the desktop
-  UI, persona and memory mutation controls, packaging, and model setup.
+- The first R6 local-gateway and desktop implementation slices are complete
+  under deterministic and automated gates: a persistent
+  local-only Rust gateway, bounded framed stdio protocol, public TypeScript
+  client, minimal Node chat example, macOS Tauri bridge, text workspace, and
+  seven-scene Voice Focus preview are implemented. A native launch smoke passes,
+  but a live local-model desktop turn and native GPU scene acceptance have not
+  been recorded. The real
+  gateway remains text-only, so live microphone/playback activation, persona
+  and memory mutation, packaging/signing, model setup, and the separate R3
+  human and acoustic acceptance gates remain open.
 - First-audible timing, audible-stop p95, representative warm measurements,
   subjective English and Chinese quality, and the 1.2-second
   time-to-useful-audio goal remain unvalidated.
@@ -288,13 +293,20 @@ adapter, probe, and voice-CLI tests. See
 
 ### Source Status
 
-The first local-gateway slice is complete. `conversation-runtime-gateway` owns
-one local-only text runtime and exchanges bounded versioned frames over its
-child-process stdin and stdout without opening a network listener.
-`@conversation/runtime` exposes the validated protocol, transport-neutral
-client, and Node stdio transport. The `conversation-node-chat` example consumes
-only those public exports, keeps one gateway alive across turns, streams UTF-8
-text deltas, and maps interruption and shutdown independently.
+The first local-gateway and macOS desktop implementation slices are complete
+under deterministic and automated gates.
+`conversation-runtime-gateway` owns one local-only text runtime and exchanges
+bounded versioned frames over its child-process stdin and stdout without
+opening a network listener. `@conversation/runtime` exposes the validated
+protocol, transport-neutral client, browser-safe entry, and Node stdio
+transport. The Node example and desktop app both consume the public boundary.
+
+The Tauri bridge starts only the selected absolute gateway executable and
+forwards the bounded protocol without adding a network listener. The React app
+supports setup with absolute paths, verified local-only status, streamed text
+chat, Stop, close, and reconnect. Its idle Voice Focus preview makes Soft Aurora
+(the default), Silk, Threads, Prism, Orb, Still Gradient, and None selectable;
+the transcript remains hidden by default.
 
 The deterministic cross-language smoke compiles the actual Rust binary and
 uses a temporary loopback Ollama-compatible fixture to prove ready, command
@@ -302,37 +314,47 @@ acceptance, text streaming, completion, and a separate cancellation run. It is
 interoperability evidence only; it does not select a model, measure latency or
 quality, or close any R3 human, device, or acoustic acceptance gate.
 
-R6 remains open overall. The Tauri and React app, microphone and playback UI,
-persona and memory mutation controls, model setup and benchmark UI, packaging,
-signing, and installation flows are not implemented by this slice.
+R6 remains open overall. The current gateway reports text-only capabilities,
+so production Voice Focus cannot activate microphone capture, recognition,
+playback, or barge-in. Persona and memory inspection/mutation backed by runtime
+state, model setup and benchmark UI, packaging, signing, and installation flows
+also remain open. R3 human-spoken, ten-minute, and acoustic acceptance remains
+a separate blocked milestone and is not advanced by desktop scene rendering.
 
-See [the R6 local-gateway evaluation](docs/r6-local-gateway-evaluation.md).
+See [the R6 local-gateway evaluation](docs/r6-local-gateway-evaluation.md) and
+[the R6 desktop-app evaluation](docs/r6-desktop-app-evaluation.md).
 
-### Completed Local-Gateway Slice
+### Completed First Slices
 
 - Persistent local-only Rust text gateway with no network listener.
 - Stable bounded framed-stdio commands, events, status, and cancellation.
-- Backend-neutral `@conversation/runtime` TypeScript SDK.
+- Backend-neutral `@conversation/runtime` TypeScript SDK with a browser-safe
+  desktop entry.
 - Minimal persistent Node chat client using public SDK exports only.
 - Real Rust-binary-to-Node completion and cancellation smoke coverage.
+- macOS Tauri process bridge using explicit absolute gateway and configuration
+  paths.
+- Local text-chat workspace with streamed output, Stop, close, and reconnect.
+- Idle Voice Focus preview with seven selectable scenes, hidden transcript by
+  default, reduced-motion fallback, and explicit visual-preview labeling.
 
 ### Remaining Deliverables
 
-- Tauri and React desktop reference app.
-- Microphone, playback, interruption, persona, and memory controls.
-- Local model setup and benchmark reporting.
-- Persona and memory inspection and mutation flows backed by actual runtime
+- Typed voice-session events and production microphone, recognition, playback,
+  and barge-in activation in the desktop app.
+- Persona and memory inspection and mutation controls backed by actual runtime
   state.
+- Local model setup and benchmark reporting.
 - Packaging, signing, installation, and private configuration workflows that
   contain no model weights.
+- Human-spoken, ten-minute, and 30-sample acoustic evidence required by R3.
 - Later application-owned transport work required before any opt-in LAN binding
   and pairing in R7.
 
 ### Exit Criteria
 
-- The Node client already runs turns without importing desktop application
-  code; the desktop app must still import the same public runtime interfaces
-  only.
+- The Node client and desktop app run through public runtime interfaces without
+  importing each other's application code.
 - Memory and persona controls expose actual runtime state.
 - Model and hardware requirements are documented from measured results.
 - Packaging contains no model weights or private local configuration.

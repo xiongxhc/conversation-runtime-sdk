@@ -325,17 +325,18 @@ async fn serializes_runtime_guidance_history_and_current_input_in_order() {
     assert!(output.recv().await.is_none());
     let request = server.request_json().await;
     let messages = request["messages"].as_array().unwrap();
-    assert_eq!(messages.len(), 5);
+    assert_eq!(messages.len(), 4);
     assert_eq!(messages[0]["role"], "system");
-    assert_eq!(messages[0]["content"], "Deployment safety guidance.");
-    assert_eq!(messages[1]["role"], "system");
-    assert_eq!(messages[1]["content"], "Runtime quality guidance.");
-    assert_eq!(messages[2]["role"], "user");
-    assert_eq!(messages[2]["content"], "previous request");
-    assert_eq!(messages[3]["role"], "assistant");
-    assert_eq!(messages[3]["content"], "previous answer");
-    assert_eq!(messages[4]["role"], "user");
-    assert_eq!(messages[4]["content"], "current request");
+    assert_eq!(
+        messages[0]["content"],
+        "Deployment safety guidance.\n\nRuntime quality guidance."
+    );
+    assert_eq!(messages[1]["role"], "user");
+    assert_eq!(messages[1]["content"], "previous request");
+    assert_eq!(messages[2]["role"], "assistant");
+    assert_eq!(messages[2]["content"], "previous answer");
+    assert_eq!(messages[3]["role"], "user");
+    assert_eq!(messages[3]["content"], "current request");
     assert_eq!(request["options"]["num_predict"], 80);
 }
 

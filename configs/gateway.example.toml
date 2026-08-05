@@ -5,6 +5,8 @@ privacy_mode = "local-only"
 backend = "ollama-compatible"
 endpoint = "http://127.0.0.1:11434"
 model = "local-model-id"
+# Deployment policy only. Keep this public and backend-neutral.
+system_prompt = "Describe only application capabilities explicitly present in the conversation. Never invent tabs, menus, settings, storage locations, or unavailable features."
 thinking = false
 temperature = 0.7
 seed = 42

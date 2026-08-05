@@ -1,9 +1,9 @@
 # Desktop Reference App
 
 This macOS Tauri reference app exercises the public browser-safe runtime SDK
-against the compiled local gateway. The first R6 desktop slice supports local
-text chat and an idle Voice Focus preview; it does not activate a microphone or
-play audio.
+against the compiled local gateway. The desktop app supports local text chat,
+locally persisted transcript history, and an idle Voice Focus preview. It does
+not activate a microphone or play audio.
 
 ## Run from a Clean Checkout
 
@@ -55,6 +55,8 @@ The app requires the configured loopback model service to be running before
 
 - Send local text turns, observe streamed assistant text, stop an active turn,
   close the runtime, and reconnect through setup.
+- Open `History`, reopen a prior transcript read-only, verify the displayed
+  SQLite storage path, and delete a saved conversation.
 - Open `Preview Voice Focus` and switch among Soft Aurora, Silk, Threads,
   Prism, Orb, Still Gradient, and None. Soft Aurora is the default.
 - Verify the Focus transcript is hidden by default, reveal it explicitly, and
@@ -65,10 +67,17 @@ The app requires the configured loopback model service to be running before
 advertises text-only capabilities, so live Focus cannot imply listening,
 recognition, speech playback, or barge-in.
 
+Conversation transcripts are stored by the native app in
+`conversations.sqlite3` under the operating system's private app-data
+directory. The exact resolved path is shown at the bottom of `History`.
+Transcript history is separate from the runtime's optional semantic memory,
+and opening a past transcript does not restore it to the model's active
+context.
+
 ## Open Work
 
 - Live microphone and playback activation through typed voice-session events.
-- Persona and memory inspection and mutation backed by runtime state.
+- Persona and semantic-memory inspection and mutation backed by runtime state.
 - Packaging, signing, notarization, installation, and upgrade validation.
 - R3 human-spoken, ten-minute, first-audible, audible-stop, and acoustic
   acceptance.

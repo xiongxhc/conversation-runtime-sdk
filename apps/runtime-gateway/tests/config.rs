@@ -30,6 +30,38 @@ follow_up_frequency = 25
 "#;
 
 #[test]
+fn accepts_an_optional_deployment_system_prompt() {
+    let fixture = tempfile::tempdir().unwrap();
+    let path = write_config(
+        fixture.path(),
+        &VALID_CONFIG.replacen(
+            "thinking = false",
+            "thinking = false\nsystem_prompt = \"Describe only deployment capabilities explicitly supplied here.\"",
+            1,
+        ),
+    );
+
+    let config = GatewayConfig::load(&path).unwrap();
+    let _: GatewayAdapters = config.into_adapters().unwrap();
+}
+
+#[test]
+fn rejects_an_oversized_deployment_system_prompt() {
+    let fixture = tempfile::tempdir().unwrap();
+    let prompt = "x".repeat(4 * 1024 + 1);
+    let path = write_config(
+        fixture.path(),
+        &VALID_CONFIG.replacen(
+            "thinking = false",
+            &format!("thinking = false\nsystem_prompt = \"{prompt}\""),
+            1,
+        ),
+    );
+
+    assert!(GatewayConfig::load(&path).is_err());
+}
+
+#[test]
 fn loads_an_explicit_valid_local_only_configuration() {
     let fixture = tempfile::tempdir().unwrap();
     let path = write_config(fixture.path(), VALID_CONFIG);

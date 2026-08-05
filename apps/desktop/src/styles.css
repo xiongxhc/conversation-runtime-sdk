@@ -191,6 +191,107 @@ textarea {
   padding: 28px clamp(24px, 5vw, 72px) 24px;
 }
 
+.history-pane {
+  display: flex;
+  flex-direction: column;
+  max-height: 100vh;
+  min-width: 0;
+  padding: 28px clamp(24px, 5vw, 72px) 24px;
+}
+
+.history-header {
+  align-items: flex-start;
+  display: flex;
+  justify-content: space-between;
+}
+
+.history-header h1 {
+  font-size: clamp(1.8rem, 4vw, 3.5rem);
+  font-weight: 520;
+  letter-spacing: -0.045em;
+  margin: 10px 0 18px;
+}
+
+.history-disclosure {
+  color: #696b68;
+  font-size: 0.86rem;
+  line-height: 1.55;
+  margin: 0 0 24px;
+  max-width: 650px;
+}
+
+.history-list {
+  border-top: 1px solid rgba(40, 42, 43, 0.12);
+  flex: 1;
+  min-height: 180px;
+  overflow: auto;
+}
+
+.history-item {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid rgba(40, 42, 43, 0.12);
+  cursor: pointer;
+  display: flex;
+  gap: 24px;
+  justify-content: space-between;
+  padding: 18px 4px;
+  text-align: left;
+  width: 100%;
+}
+
+.history-item span {
+  font-weight: 620;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-item time {
+  color: #777a76;
+  flex: 0 0 auto;
+  font-size: 0.76rem;
+}
+
+.empty-history {
+  color: #777a76;
+  margin: 28px 0;
+}
+
+.history-location {
+  border-top: 1px solid rgba(40, 42, 43, 0.12);
+  padding-top: 18px;
+}
+
+.history-location code {
+  display: block;
+  font-size: 0.75rem;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.history-transcript {
+  flex: 1;
+}
+
+.delete-history-action {
+  align-self: flex-start;
+  background: transparent;
+  border: 1px solid rgba(138, 64, 57, 0.45);
+  border-radius: 9px;
+  color: #8a4039;
+  cursor: pointer;
+  margin-top: 18px;
+  padding: 9px 12px;
+}
+
+.delete-history-controls {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+}
+
 .conversation-header {
   align-items: flex-start;
   display: flex;
@@ -640,6 +741,9 @@ textarea {
   .runtime-sidebar,
   .turn,
   .composer,
+  .history-list,
+  .history-item,
+  .history-location,
   .voice-unavailable,
   .runtime-details div {
     border-color: rgba(255, 255, 255, 0.12);
@@ -651,6 +755,8 @@ textarea {
 
   .setup-introduction,
   .empty-transcript,
+  .empty-history,
+  .history-disclosure,
   .turn-user,
   .voice-unavailable p,
   .runtime-details dt {
@@ -660,6 +766,7 @@ textarea {
   .field-error,
   .setup-error,
   .turn-error,
+  .delete-history-action,
   .workspace-error {
     color: #ffb4ab;
   }

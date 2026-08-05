@@ -16,6 +16,7 @@ use serde::Deserialize;
 
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const MAX_MODEL_ID_BYTES: usize = 256;
+const MAX_SYSTEM_PROMPT_BYTES: usize = 4 * 1024;
 
 #[derive(Debug)]
 pub struct GatewayConfigError(String);
@@ -82,7 +83,7 @@ impl GatewayConfig {
         if self.language.model.len() > MAX_MODEL_ID_BYTES {
             return Err(config_error("language model identifier exceeded 256 bytes"));
         }
-        let language = OllamaConfig::new(&self.language.model)
+        let mut language = OllamaConfig::new(&self.language.model)
             .map_err(adapter_error)?
             .with_endpoint(&self.language.endpoint)
             .map_err(adapter_error)?
@@ -95,6 +96,15 @@ impl GatewayConfig {
             .map_err(adapter_error)?
             .with_max_assistant_content_bytes(self.language.max_assistant_content_bytes)
             .map_err(adapter_error)?;
+        if let Some(system_prompt) = self.language.system_prompt.as_deref() {
+            if system_prompt.trim().is_empty() {
+                return Err(config_error("language system_prompt cannot be empty"));
+            }
+            if system_prompt.len() > MAX_SYSTEM_PROMPT_BYTES {
+                return Err(config_error("language system_prompt exceeded 4 KiB"));
+            }
+            language = language.with_system_prompt(system_prompt);
+        }
         if !self.language.temperature.is_finite() || self.language.temperature < 0.0 {
             return Err(config_error(
                 "language temperature must be finite and non-negative",
@@ -248,6 +258,8 @@ struct LanguageConfig {
     backend: LanguageBackend,
     endpoint: String,
     model: String,
+    #[serde(default)]
+    system_prompt: Option<String>,
     thinking: bool,
     temperature: f32,
     seed: u64,

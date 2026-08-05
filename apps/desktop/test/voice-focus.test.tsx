@@ -29,12 +29,12 @@ afterEach(() => {
 });
 
 describe("Voice Focus", () => {
-  it("disables live voice for the text gateway but offers a labeled visual preview", async () => {
+  it("hides live voice for the text gateway but offers a labeled visual preview", async () => {
     renderConnectedApp();
 
-    const liveEntry = await screen.findByRole("button", { name: "Enter Voice Focus" });
-    expect(liveEntry.hasAttribute("disabled")).toBe(true);
-    expect(screen.getByText(/Voice setup is the next R6 slice/)).toBeTruthy();
+    await screen.findByRole("button", { name: "Preview Voice Focus" });
+    expect(screen.queryByRole("button", { name: "Enter Voice Focus" })).toBeNull();
+    expect(screen.getByText(/Microphone and speech playback are not connected/)).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "Preview Voice Focus" }));
 
@@ -60,13 +60,13 @@ describe("Voice Focus", () => {
     );
   });
 
-  it("does not enable live Focus for a voice capability without an active session", async () => {
+  it("does not advertise live Focus for a voice capability without an active session", async () => {
     renderConnectedApp({
       voiceCapability: voiceCapability({ sessionStatus: "inactive" }),
     });
 
-    const entry = await screen.findByRole("button", { name: "Enter Voice Focus" });
-    expect(entry.hasAttribute("disabled")).toBe(true);
+    await screen.findByRole("button", { name: "Preview Voice Focus" });
+    expect(screen.queryByRole("button", { name: "Enter Voice Focus" })).toBeNull();
     expect(screen.getByText("Start a voice session before entering Voice Focus.")).toBeTruthy();
     expect(screen.queryByRole("dialog", { name: "Voice Focus" })).toBeNull();
   });
@@ -102,8 +102,7 @@ describe("Voice Focus", () => {
 
     expect(renderedStates).toEqual([]);
     expect(screen.queryByRole("dialog", { name: "Voice Focus" })).toBeNull();
-    expect(screen.getByRole("button", { name: "Enter Voice Focus" }).hasAttribute("disabled"))
-      .toBe(true);
+    expect(screen.queryByRole("button", { name: "Enter Voice Focus" })).toBeNull();
   });
 
   it("renders disconnected recovery immediately when the runtime fails in live Focus", async () => {

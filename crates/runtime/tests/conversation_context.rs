@@ -12,7 +12,7 @@ use conversation_runtime::{
     ConversationContext, ConversationQualityController, ConversationTurnSource,
     StreamingTurnEventStream, StreamingTurnRuntime,
 };
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, Barrier, Notify};
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
@@ -122,28 +122,75 @@ async fn failed_completion_releases_the_context_for_a_new_turn() {
 #[tokio::test]
 async fn text_and_voice_starts_admit_only_one_context_claimant() {
     let context = ConversationContext::new(quality());
-    let text = context
-        .begin_turn(ConversationTurnSource::Text, "typed")
-        .await
-        .unwrap();
-    let voice = StreamingTurnRuntime::new(
-        context.clone(),
-        Arc::new(BlockingLanguage::default()),
-        Arc::new(MockStreamingSpeechSynthesizer::new([])),
-        Arc::new(MockContinuousAudioOutput::new()),
+    let barrier = Arc::new(Barrier::new(3));
+
+    let text_attempt = {
+        let context = context.clone();
+        let barrier = barrier.clone();
+        tokio::spawn(async move {
+            barrier.wait().await;
+            context
+                .begin_turn(ConversationTurnSource::Text, "typed")
+                .await
+        })
+    };
+    let voice_attempt = {
+        let context = context.clone();
+        let barrier = barrier.clone();
+        tokio::spawn(async move {
+            barrier.wait().await;
+            context
+                .begin_turn(
+                    ConversationTurnSource::Voice {
+                        session_id: conversation_protocol::SessionId::new(1),
+                    },
+                    "spoken",
+                )
+                .await
+        })
+    };
+
+    barrier.wait().await;
+    let text_result = text_attempt.await.unwrap();
+    let voice_result = voice_attempt.await.unwrap();
+
+    let successful_claim = match (text_result, voice_result) {
+        (Ok(text), Err(error)) | (Err(error), Ok(text)) => {
+            assert_eq!(error.kind(), RuntimeErrorKind::InvalidState);
+            text
+        }
+        (Ok(_), Ok(_)) => panic!("both text and voice claims succeeded"),
+        (Err(text_error), Err(voice_error)) => {
+            panic!("both text and voice claims failed: {text_error:?}, {voice_error:?}")
+        }
+    };
+
+    assert_eq!(successful_claim.identity().turn_id(), TurnId::new(1));
+    assert_eq!(
+        successful_claim.identity().generation_id(),
+        GenerationId::new(1)
+    );
+    assert_eq!(
+        context.active_turn().await,
+        Some(successful_claim.identity())
     );
 
-    assert!(voice
-        .start_turn(
-            ConversationTurnSource::Voice {
-                session_id: conversation_protocol::SessionId::new(1),
-            },
-            "spoken",
-        )
+    context
+        .discard_turn(successful_claim.identity(), false)
         .await
-        .is_err());
-    assert_eq!(context.active_turn().await, Some(text.identity()));
-    context.discard_turn(text.identity(), false).await.unwrap();
+        .unwrap();
+    assert_eq!(context.active_turn().await, None);
+
+    let next_claim = context
+        .begin_turn(ConversationTurnSource::Text, "next")
+        .await
+        .unwrap();
+    assert_eq!(next_claim.identity().turn_id(), TurnId::new(2));
+    assert_eq!(next_claim.identity().generation_id(), GenerationId::new(2));
+    context
+        .discard_turn(next_claim.identity(), false)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

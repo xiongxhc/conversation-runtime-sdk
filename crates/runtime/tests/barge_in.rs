@@ -286,6 +286,68 @@ async fn barge_in_cleanup_is_not_blocked_by_full_lifecycle_output() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn barge_in_purges_deferred_partials_before_cancelled_terminal() {
+    let harness = VoiceSessionHarness::speaking_generations([GenerationId::new(1)]);
+    let mut events = harness.start().await;
+    harness
+        .start_speaking_generation_without_draining(&mut events, GenerationId::new(1))
+        .await;
+
+    for segment_id in 100..196 {
+        harness
+            .input
+            .send(Ok(VoiceInputEvent::Recognition(
+                RecognitionEvent::Hypothesis(RecognitionHypothesis::partial(
+                    segment_id,
+                    format!("deferred-{segment_id}"),
+                )),
+            )))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+    }
+
+    harness
+        .runtime
+        .barge_in(TurnId::new(1), GenerationId::new(1))
+        .await
+        .unwrap();
+    let observed = drain_until_turn_terminal(&mut events).await;
+
+    let barge_in_index = observed
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                VoiceSessionEvent::BargeIn { generation_id, .. }
+                    if *generation_id == GenerationId::new(1)
+            )
+        })
+        .unwrap();
+    let cancellation_index = observed
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                VoiceSessionEvent::Turn {
+                    event: RuntimeEvent::TurnCancelled { turn_id },
+                    ..
+                } if *turn_id == TurnId::new(1)
+            )
+        })
+        .unwrap();
+    assert!(barge_in_index < cancellation_index);
+
+    tokio::task::yield_now().await;
+    tokio::select! {
+        event = events.recv() => panic!("cancelled turn emitted deferred event after terminal: {event:?}"),
+        _ = tokio::time::sleep(Duration::from_millis(1)) => {}
+    }
+
+    harness.shutdown(&mut events).await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn dropped_event_consumer_cleans_turn_and_sidecar_work() {
     let harness = VoiceSessionHarness::speaking_generations([GenerationId::new(1)]);
     let mut events = harness.start().await;

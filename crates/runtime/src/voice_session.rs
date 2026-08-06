@@ -823,6 +823,9 @@ impl VoiceLoop {
                 event,
                 RuntimeEvent::TurnCancelled { turn_id } if turn_id == expected_turn_id
             );
+            if terminal {
+                self.partials.clear();
+            }
             self.publish_runtime_timing(&event);
             let published = if matches!(
                 event,

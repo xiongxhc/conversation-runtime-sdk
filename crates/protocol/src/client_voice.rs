@@ -263,9 +263,11 @@ pub(crate) fn validate_component_descriptors(
     for component in components {
         let rank =
             component_kind_rank(&component.kind).ok_or(ClientWireError::InvalidRuntimeStatus)?;
+        let trimmed_provider_label = component.provider_label.trim();
         if previous_rank.is_some_and(|previous| previous > rank)
             || !matches!(component.execution_location.as_str(), "local" | "remote")
-            || component.provider_label.trim().is_empty()
+            || trimmed_provider_label.is_empty()
+            || trimmed_provider_label != component.provider_label
             || component.provider_label.len() > MAX_CLIENT_PROVIDER_LABEL_BYTES
         {
             return Err(ClientWireError::InvalidRuntimeStatus);
@@ -373,11 +375,29 @@ pub(crate) fn validate_client_voice_event(
             }
             crate::client_wire::validate_client_runtime_event(event)
         }
-        ClientVoiceSessionEvent::VoiceTiming { turn_id, .. } => turn_id
-            .map(|turn_id| validate_identifier(turn_id.get()))
-            .unwrap_or(Ok(())),
-        ClientVoiceSessionEvent::VoicePlayback { generation_id, .. } => {
-            validate_identifier(generation_id.get())
+        ClientVoiceSessionEvent::VoiceTiming {
+            turn_id, milestone, ..
+        } => {
+            turn_id
+                .map(|turn_id| validate_identifier(turn_id.get()))
+                .unwrap_or(Ok(()))?;
+            if is_voice_timing_milestone(milestone) {
+                Ok(())
+            } else {
+                Err(ClientWireError::InvalidVoiceEvent)
+            }
+        }
+        ClientVoiceSessionEvent::VoicePlayback {
+            generation_id,
+            state,
+            ..
+        } => {
+            validate_identifier(generation_id.get())?;
+            if is_playback_state(state) {
+                Ok(())
+            } else {
+                Err(ClientWireError::InvalidVoiceEvent)
+            }
         }
         ClientVoiceSessionEvent::VoiceSessionFailed {
             error, recovery, ..
@@ -488,12 +508,33 @@ fn voice_timing_milestone_name(milestone: VoiceTimingMilestone) -> &'static str 
     }
 }
 
+fn is_voice_timing_milestone(milestone: &str) -> bool {
+    matches!(
+        milestone,
+        "speech_end"
+            | "transcript_final"
+            | "first_text_delta"
+            | "first_synthesis_request"
+            | "first_playable_audio"
+            | "first_sidecar_accept"
+            | "playback_render_acknowledged"
+            | "barge_in_onset"
+            | "barge_in_threshold"
+            | "playback_flush_acknowledged"
+            | "cleanup"
+    )
+}
+
 fn playback_state_name(state: PlaybackState) -> &'static str {
     match state {
         PlaybackState::Accepted => "accepted",
         PlaybackState::Rendered => "rendered",
         PlaybackState::Flushed => "flushed",
     }
+}
+
+fn is_playback_state(state: &str) -> bool {
+    matches!(state, "accepted" | "rendered" | "flushed")
 }
 
 fn recovery_name(recovery: RecoveryDisposition) -> &'static str {

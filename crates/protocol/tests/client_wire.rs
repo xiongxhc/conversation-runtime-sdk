@@ -2,18 +2,19 @@ use conversation_protocol::{
     decode_client_command, encode_gateway_message, memory_preview, ClientCommand,
     ClientComponentDescriptor, ClientMemoryApproval, ClientMemoryCursor, ClientMemoryInspection,
     ClientMemoryProvenance, ClientMemoryRecord, ClientMemoryRetention, ClientMemorySummary,
-    ClientMemoryTrace, ClientQualityDecision, ClientResponseControls, ClientRuntimeError,
-    ClientRuntimeEvent, ClientVoiceSessionEvent, ClientWireError, ComponentDescriptor,
-    ComponentKind, ContextSource, ConversationMode, ConversationSignal, ExecutionLocation,
-    FollowUpPolicy, GatewayMessage, GenerationId, MemoryApproval, MemoryConfidence, MemoryDraft,
-    MemoryId, MemoryInspection, MemoryKind, MemoryProvenance, MemoryProvenanceKind, MemoryRecord,
-    MemoryRetention, MemoryRetrievalReason, MemoryRetrievalTrace, MemoryTraceExclusions,
-    MemoryTraceItem, PersonaLevel, PlaybackState, PrivacyMode, PrivacySummary, QualityDecision,
-    RecoveryDisposition, ResponseControls, RetrievalTraceId, RuntimeError, RuntimeErrorKind,
-    RuntimeEvent, RuntimeStage, RuntimeStatus, SessionId, SilencePolicy, SpeechPace, TurnId,
-    UnixTimestampMillis, VoiceActivity, VoiceSessionEvent, VoiceTimingMilestone,
-    CLIENT_PROTOCOL_VERSION, MAX_CLIENT_COMPONENT_DESCRIPTORS, MAX_CLIENT_FRAME_BYTES,
-    MAX_CLIENT_PROVIDER_LABEL_BYTES, MAX_CONVERSATION_MESSAGE_BYTES, MAX_MEMORY_PREVIEW_BYTES,
+    ClientMemoryTrace, ClientPrivacySummary, ClientQualityDecision, ClientResponseControls,
+    ClientRuntimeError, ClientRuntimeEvent, ClientVoiceSessionEvent, ClientWireError,
+    ComponentDescriptor, ComponentKind, ContextSource, ConversationMode, ConversationSignal,
+    ExecutionLocation, FollowUpPolicy, GatewayMessage, GenerationId, MemoryApproval,
+    MemoryConfidence, MemoryDraft, MemoryId, MemoryInspection, MemoryKind, MemoryProvenance,
+    MemoryProvenanceKind, MemoryRecord, MemoryRetention, MemoryRetrievalReason,
+    MemoryRetrievalTrace, MemoryTraceExclusions, MemoryTraceItem, PersonaLevel, PlaybackState,
+    PrivacyMode, PrivacySummary, QualityDecision, RecoveryDisposition, ResponseControls,
+    RetrievalTraceId, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage, RuntimeStatus,
+    SessionId, SilencePolicy, SpeechPace, TurnId, UnixTimestampMillis, VoiceActivity,
+    VoiceSessionEvent, VoiceTimingMilestone, CLIENT_PROTOCOL_VERSION,
+    MAX_CLIENT_COMPONENT_DESCRIPTORS, MAX_CLIENT_FRAME_BYTES, MAX_CLIENT_PROVIDER_LABEL_BYTES,
+    MAX_CONVERSATION_MESSAGE_BYTES, MAX_MEMORY_PREVIEW_BYTES,
 };
 use serde::{Deserialize, Deserializer};
 
@@ -433,6 +434,135 @@ fn runtime_status_accepts_only_canonical_capability_and_component_combinations()
             encode_gateway_message(&GatewayMessage::Ready { status: invalid }),
             Err(ClientWireError::InvalidRuntimeStatus)
         ));
+    }
+}
+
+#[test]
+fn public_voice_string_enums_reject_unknown_values_at_encode_time() {
+    let invalid_statuses = [
+        RuntimeStatus {
+            components: vec![client_component("unknown", "Local language")],
+            ..status()
+        },
+        RuntimeStatus {
+            components: vec![ClientComponentDescriptor {
+                execution_location: "unknown".to_owned(),
+                ..client_component("language_model", "Local language")
+            }],
+            ..status()
+        },
+    ];
+    for status in invalid_statuses {
+        assert!(matches!(
+            encode_gateway_message(&GatewayMessage::Ready { status }),
+            Err(ClientWireError::InvalidRuntimeStatus)
+        ));
+    }
+
+    let invalid_events = [
+        ClientVoiceSessionEvent::VoiceSessionStarted {
+            session_id: SessionId::new(1),
+            privacy: ClientPrivacySummary {
+                privacy_mode: "unknown".to_owned(),
+                components: voice_components(),
+            },
+        },
+        ClientVoiceSessionEvent::VoiceTiming {
+            session_id: SessionId::new(1),
+            turn_id: None,
+            milestone: "unknown_milestone".to_owned(),
+            elapsed_ms: 1,
+        },
+        ClientVoiceSessionEvent::VoicePlayback {
+            session_id: SessionId::new(1),
+            generation_id: GenerationId::new(1),
+            state: "unknown_state".to_owned(),
+        },
+        ClientVoiceSessionEvent::VoiceSessionFailed {
+            session_id: SessionId::new(1),
+            error: runtime_error(),
+            recovery: "unknown_recovery".to_owned(),
+        },
+    ];
+    for event in invalid_events {
+        assert!(matches!(
+            encode_gateway_message(&GatewayMessage::VoiceEvent { event }),
+            Err(ClientWireError::InvalidVoiceEvent)
+        ));
+    }
+}
+
+#[test]
+fn public_voice_timing_and_playback_accept_every_approved_value() {
+    for milestone in [
+        "speech_end",
+        "transcript_final",
+        "first_text_delta",
+        "first_synthesis_request",
+        "first_playable_audio",
+        "first_sidecar_accept",
+        "playback_render_acknowledged",
+        "barge_in_onset",
+        "barge_in_threshold",
+        "playback_flush_acknowledged",
+        "cleanup",
+    ] {
+        let event = ClientVoiceSessionEvent::VoiceTiming {
+            session_id: SessionId::new(1),
+            turn_id: None,
+            milestone: milestone.to_owned(),
+            elapsed_ms: 1,
+        };
+        encode_gateway_message(&GatewayMessage::VoiceEvent { event }).unwrap();
+    }
+
+    for state in ["accepted", "rendered", "flushed"] {
+        let event = ClientVoiceSessionEvent::VoicePlayback {
+            session_id: SessionId::new(1),
+            generation_id: GenerationId::new(1),
+            state: state.to_owned(),
+        };
+        encode_gateway_message(&GatewayMessage::VoiceEvent { event }).unwrap();
+    }
+}
+
+#[test]
+fn production_and_fixture_provider_labels_share_exact_boundary_rules() {
+    let cases = [
+        ("x".repeat(MAX_CLIENT_PROVIDER_LABEL_BYTES), true),
+        ("x".repeat(MAX_CLIENT_PROVIDER_LABEL_BYTES + 1), false),
+        (String::new(), false),
+        (" Local language".to_owned(), false),
+        ("Local language ".to_owned(), false),
+        ("\u{2003}Local language".to_owned(), false),
+        ("Local language\u{2003}".to_owned(), false),
+    ];
+
+    for (provider_label, expected_valid) in cases {
+        let production = RuntimeStatus {
+            components: vec![client_component("language_model", &provider_label)],
+            ..status()
+        };
+        let production_valid =
+            encode_gateway_message(&GatewayMessage::Ready { status: production }).is_ok();
+
+        let mut fixture: serde_json::Value = serde_json::from_str(
+            include_str!("../../../tests/fixtures/client-wire-v3/events.jsonl")
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        fixture["status"]["components"][0]["provider_label"] =
+            serde_json::Value::String(provider_label.clone());
+        let fixture_valid = parse_event_fixture(&fixture.to_string()).is_ok();
+
+        assert_eq!(
+            production_valid, expected_valid,
+            "production: {provider_label:?}"
+        );
+        assert_eq!(fixture_valid, expected_valid, "fixture: {provider_label:?}");
+        assert_eq!(production_valid, fixture_valid, "{provider_label:?}");
     }
 }
 
@@ -1382,7 +1512,9 @@ fn validate_fixture_components(components: &[FixtureComponentDescriptor]) -> Res
         }
     }
     if components.iter().any(|component| {
-        component.provider_label.trim().is_empty()
+        let trimmed_provider_label = component.provider_label.trim();
+        trimmed_provider_label.is_empty()
+            || trimmed_provider_label != component.provider_label
             || component.provider_label.len() > MAX_CLIENT_PROVIDER_LABEL_BYTES
     }) {
         return Err("component provider label is invalid".to_owned());

@@ -406,7 +406,7 @@ public enum ChildProtocol {
              let .captureStarted(sessionID, operationID),
              let .capturePaused(sessionID, operationID),
              let .captureResumed(sessionID, operationID):
-            guard operationID > 0 else {
+            guard sessionID > 0, operationID > 0 else {
                 throw ChildProtocolError.invalidControlJSON
             }
             return Data(
@@ -637,7 +637,7 @@ public enum ChildProtocol {
                     keys: ["session_id", "operation_id"],
                     integerKeys: ["session_id", "operation_id"]
                 )
-                guard value.operationID > 0 else {
+                guard value.sessionID > 0, value.operationID > 0 else {
                     throw ChildProtocolError.invalidControlJSON
                 }
                 switch kind {

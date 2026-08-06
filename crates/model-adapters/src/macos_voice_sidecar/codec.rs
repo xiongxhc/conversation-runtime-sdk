@@ -594,7 +594,7 @@ fn encode_control(control: &SidecarControl) -> Result<Vec<u8>, SidecarCodecError
             session_id,
             operation_id,
         } => {
-            require_operation_id(*operation_id)?;
+            require_capture_identity(*session_id, *operation_id)?;
             serialize(&CaptureIdentityDto {
                 session_id: session_id.get(),
                 operation_id: *operation_id,
@@ -708,8 +708,8 @@ fn decode_control(
         | SidecarFrameKind::CapturePaused
         | SidecarFrameKind::CaptureResumed => {
             let value: CaptureIdentityDto = deserialize(json)?;
-            require_operation_id(value.operation_id)?;
             let session_id = SessionId::new(value.session_id);
+            require_capture_identity(session_id, value.operation_id)?;
             Ok(match kind {
                 SidecarFrameKind::StartCapture => SidecarControl::StartCapture {
                     session_id,
@@ -833,6 +833,17 @@ fn require_operation_id(operation_id: u64) -> Result<(), SidecarCodecError> {
         Err(SidecarCodecError::InvalidControlJson)
     } else {
         Ok(())
+    }
+}
+
+fn require_capture_identity(
+    session_id: SessionId,
+    operation_id: u64,
+) -> Result<(), SidecarCodecError> {
+    if session_id.get() == 0 {
+        Err(SidecarCodecError::InvalidControlJson)
+    } else {
+        require_operation_id(operation_id)
     }
 }
 

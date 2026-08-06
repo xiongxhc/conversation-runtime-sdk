@@ -129,3 +129,21 @@ fn voice_policy_rejects_invalid_thresholds_and_components() {
     )
     .is_ok());
 }
+
+#[test]
+fn voice_policy_rejects_zero_session_identity() {
+    let error = VoiceSessionPolicy::new(
+        SessionId::new(0),
+        PrivacyMode::LocalOnly,
+        200,
+        600,
+        [ComponentDescriptor::new(
+            ComponentKind::SpeechRecognition,
+            "local-asr",
+            ExecutionLocation::Local,
+        )],
+    )
+    .unwrap_err();
+
+    assert_eq!(error.message(), "voice session identity must not be zero");
+}

@@ -110,6 +110,62 @@ fn capture_controls_reject_zero_operation_identity() {
 }
 
 #[test]
+fn capture_controls_reject_zero_session_identity() {
+    let controls = [
+        SidecarControl::StartCapture {
+            session_id: SessionId::new(0),
+            operation_id: 1,
+        },
+        SidecarControl::PauseCapture {
+            session_id: SessionId::new(0),
+            operation_id: 1,
+        },
+        SidecarControl::ResumeCapture {
+            session_id: SessionId::new(0),
+            operation_id: 1,
+        },
+        SidecarControl::CaptureStarted {
+            session_id: SessionId::new(0),
+            operation_id: 1,
+        },
+        SidecarControl::CapturePaused {
+            session_id: SessionId::new(0),
+            operation_id: 1,
+        },
+        SidecarControl::CaptureResumed {
+            session_id: SessionId::new(0),
+            operation_id: 1,
+        },
+    ];
+    for control in controls {
+        assert_eq!(
+            encode_frame(&SidecarFrame::control(control)),
+            Err(SidecarCodecError::InvalidControlJson)
+        );
+    }
+
+    let kinds = [
+        SidecarFrameKind::StartCapture,
+        SidecarFrameKind::PauseCapture,
+        SidecarFrameKind::ResumeCapture,
+        SidecarFrameKind::CaptureStarted,
+        SidecarFrameKind::CapturePaused,
+        SidecarFrameKind::CaptureResumed,
+    ];
+    for kind in kinds {
+        let bytes = raw_frame(
+            PROTOCOL_VERSION,
+            kind.code(),
+            br#"{"session_id":0,"operation_id":1}"#,
+        );
+        assert_eq!(
+            decode_frame(&bytes),
+            Err(SidecarCodecError::InvalidControlJson)
+        );
+    }
+}
+
+#[test]
 fn start_session_fixture_round_trips_exactly() {
     let bytes =
         include_bytes!("../../../../tests/fixtures/voice-sidecar-v2/control/start-session.bin");

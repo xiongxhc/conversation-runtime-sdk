@@ -79,6 +79,42 @@ func captureControlsRejectZeroOperationIdentity() {
 }
 
 @Test
+func captureControlsRejectZeroSessionIdentity() {
+    let controls: [ChildControl] = [
+        .startCapture(sessionID: 0, operationID: 1),
+        .pauseCapture(sessionID: 0, operationID: 1),
+        .resumeCapture(sessionID: 0, operationID: 1),
+        .captureStarted(sessionID: 0, operationID: 1),
+        .capturePaused(sessionID: 0, operationID: 1),
+        .captureResumed(sessionID: 0, operationID: 1),
+    ]
+    for control in controls {
+        #expect(throws: ChildProtocolError.invalidControlJSON) {
+            try ChildProtocol.encode(ChildFrame(control: control))
+        }
+    }
+
+    let kinds: [ChildFrameKind] = [
+        .startCapture,
+        .pauseCapture,
+        .resumeCapture,
+        .captureStarted,
+        .capturePaused,
+        .captureResumed,
+    ]
+    for kind in kinds {
+        #expect(throws: ChildProtocolError.invalidControlJSON) {
+            try ChildProtocol.decode(
+                rawFrame(
+                    kind: kind,
+                    payload: Data(#"{"session_id":0,"operation_id":1}"#.utf8)
+                )
+            )
+        }
+    }
+}
+
+@Test
 func startSessionFixtureRoundTrips() throws {
     let data = try Data(contentsOf: fixture("control/start-session.bin"))
     let frame = try ChildProtocol.decode(data)

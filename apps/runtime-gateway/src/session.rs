@@ -858,7 +858,7 @@ mod tests {
         let mut gateway = InMemoryGateway::start(inspection_session(store)).await;
 
         gateway
-            .write(r#"{"protocol_version":2,"type":"memory_list","request_id":"list-1","cursor":null}"#)
+            .write(r#"{"protocol_version":3,"type":"memory_list","request_id":"list-1","cursor":null}"#)
             .await;
 
         assert_accepted_message(&gateway.read_message().await, "list-1");
@@ -878,7 +878,7 @@ mod tests {
 
         gateway
             .write(&format!(
-                r#"{{"protocol_version":2,"type":"memory_inspect","request_id":"inspect-1","memory_id":"{}"}}"#,
+                r#"{{"protocol_version":3,"type":"memory_inspect","request_id":"inspect-1","memory_id":"{}"}}"#,
                 record.id().get()
             ))
             .await;
@@ -898,7 +898,7 @@ mod tests {
 
         gateway
             .write(
-                r#"{"protocol_version":2,"type":"memory_inspect","request_id":"inspect-missing","memory_id":"999"}"#,
+                r#"{"protocol_version":3,"type":"memory_inspect","request_id":"inspect-missing","memory_id":"999"}"#,
             )
             .await;
 
@@ -919,7 +919,7 @@ mod tests {
 
         gateway
             .write(
-                r#"{"protocol_version":2,"type":"memory_list","request_id":"list-disabled","cursor":null}"#,
+                r#"{"protocol_version":3,"type":"memory_list","request_id":"list-disabled","cursor":null}"#,
             )
             .await;
 
@@ -949,7 +949,7 @@ mod tests {
 
         gateway
             .write(
-                r#"{"protocol_version":2,"type":"memory_list","request_id":"private-request-content","cursor":null}"#,
+                r#"{"protocol_version":3,"type":"memory_list","request_id":"private-request-content","cursor":null}"#,
             )
             .await;
 
@@ -958,7 +958,7 @@ mod tests {
         assert!(!rejection.contains("private-request-content could not be read"));
         gateway
             .write(
-                r#"{"protocol_version":2,"type":"status","request_id":"status-after-unavailable"}"#,
+                r#"{"protocol_version":3,"type":"status","request_id":"status-after-unavailable"}"#,
             )
             .await;
         assert_accepted_message(&gateway.read_message().await, "status-after-unavailable");
@@ -966,7 +966,7 @@ mod tests {
 
         gateway
             .write(
-                r#"{"protocol_version":2,"type":"memory_inspect","request_id":"inspect-clock-not-found","memory_id":"999"}"#,
+                r#"{"protocol_version":3,"type":"memory_inspect","request_id":"inspect-clock-not-found","memory_id":"999"}"#,
             )
             .await;
         assert_rejection_then_status(
@@ -989,7 +989,7 @@ mod tests {
 
         gateway
             .write(
-                r#"{"protocol_version":2,"type":"start_turn","request_id":"start-memory-active","transcript":"fixture active memory rejection"}"#,
+                r#"{"protocol_version":3,"type":"start_turn","request_id":"start-memory-active","transcript":"fixture active memory rejection"}"#,
             )
             .await;
         assert_accepted_message(&gateway.read_message().await, "start-memory-active");
@@ -999,7 +999,7 @@ mod tests {
 
         gateway
             .write(
-                r#"{"protocol_version":2,"type":"memory_list","request_id":"list-active","cursor":null}"#,
+                r#"{"protocol_version":3,"type":"memory_list","request_id":"list-active","cursor":null}"#,
             )
             .await;
         let rejection = gateway
@@ -1014,14 +1014,14 @@ mod tests {
             "memory_turn_active",
         );
         gateway
-            .write(r#"{"protocol_version":2,"type":"status","request_id":"status-after-active"}"#)
+            .write(r#"{"protocol_version":3,"type":"status","request_id":"status-after-active"}"#)
             .await;
         assert_accepted_message(&gateway.read_message().await, "status-after-active");
         assert!(gateway.read_message().await.contains(r#""type":"status""#));
 
         gateway
             .write(
-                r#"{"protocol_version":2,"type":"interrupt_turn","request_id":"interrupt-after-memory","turn_id":"1"}"#,
+                r#"{"protocol_version":3,"type":"interrupt_turn","request_id":"interrupt-after-memory","turn_id":"1"}"#,
             )
             .await;
         let messages = gateway
@@ -1082,7 +1082,7 @@ mod tests {
         let mut gateway = InMemoryGateway::start(inspection_session(store)).await;
         gateway
             .write(&format!(
-                r#"{{"protocol_version":2,"type":"memory_inspect","request_id":"inspect-bounded","memory_id":"{}"}}"#,
+                r#"{{"protocol_version":3,"type":"memory_inspect","request_id":"inspect-bounded","memory_id":"{}"}}"#,
                 record.id().get()
             ))
             .await;
@@ -1122,7 +1122,7 @@ mod tests {
 
         write_command(
             &mut input,
-            r#"{"protocol_version":2,"type":"start_turn","request_id":"start-1","transcript":"fixture question"}"#,
+            r#"{"protocol_version":3,"type":"start_turn","request_id":"start-1","transcript":"fixture question"}"#,
         )
         .await;
         timeout(TEST_TIMEOUT, writer_state.blocked.wait())
@@ -1134,7 +1134,7 @@ mod tests {
 
         write_command(
             &mut input,
-            r#"{"protocol_version":2,"type":"interrupt_turn","request_id":"interrupt-1","turn_id":"1"}"#,
+            r#"{"protocol_version":3,"type":"interrupt_turn","request_id":"interrupt-1","turn_id":"1"}"#,
         )
         .await;
         timeout(TEST_TIMEOUT, language.connection_reaped.wait())
@@ -1213,7 +1213,7 @@ mod tests {
         assert_eq!(queued_messages(&event_monitor), 0);
         write_command(
             &mut input,
-            r#"{"protocol_version":2,"type":"start_turn","request_id":"start-tie","transcript":"fixture start tie"}"#,
+            r#"{"protocol_version":3,"type":"start_turn","request_id":"start-tie","transcript":"fixture start tie"}"#,
         )
         .await;
         wait_for_queued_start_acceptance_and_turn_started(&urgent_monitor, &event_monitor).await;
@@ -1300,7 +1300,7 @@ mod tests {
 
         write_command(
             &mut input,
-            r#"{"protocol_version":2,"type":"start_turn","request_id":"start-writer-failure","transcript":"fixture writer failure"}"#,
+            r#"{"protocol_version":3,"type":"start_turn","request_id":"start-writer-failure","transcript":"fixture writer failure"}"#,
         )
         .await;
         timeout(TEST_TIMEOUT, language.request_started.wait())
@@ -1309,7 +1309,7 @@ mod tests {
 
         write_command(
             &mut input,
-            r#"{"protocol_version":2,"type":"status","request_id":"status-writer-failure"}"#,
+            r#"{"protocol_version":3,"type":"status","request_id":"status-writer-failure"}"#,
         )
         .await;
 
@@ -1343,7 +1343,7 @@ mod tests {
 
         write_command(
             &mut input,
-            r#"{"protocol_version":2,"type":"start_turn","request_id":"start-saturation","transcript":"fixture saturation"}"#,
+            r#"{"protocol_version":3,"type":"start_turn","request_id":"start-saturation","transcript":"fixture saturation"}"#,
         )
         .await;
         timeout(TEST_TIMEOUT, writer_state.blocked.wait())
@@ -1358,7 +1358,7 @@ mod tests {
             append_command(
                 &mut commands,
                 &format!(
-                    r#"{{"protocol_version":2,"type":"status","request_id":"status-saturation-{index}"}}"#
+                    r#"{{"protocol_version":3,"type":"status","request_id":"status-saturation-{index}"}}"#
                 ),
             );
         }
@@ -1447,7 +1447,7 @@ mod tests {
 
         write_command(
             &mut input,
-            r#"{"protocol_version":2,"type":"start_turn","request_id":"start-stale","transcript":"fixture completed while output blocked"}"#,
+            r#"{"protocol_version":3,"type":"start_turn","request_id":"start-stale","transcript":"fixture completed while output blocked"}"#,
         )
         .await;
         timeout(TEST_TIMEOUT, writer_state.blocked.wait())
@@ -1460,7 +1460,7 @@ mod tests {
 
         write_command(
             &mut input,
-            r#"{"protocol_version":2,"type":"interrupt_turn","request_id":"interrupt-stale","turn_id":"1"}"#,
+            r#"{"protocol_version":3,"type":"interrupt_turn","request_id":"interrupt-stale","turn_id":"1"}"#,
         )
         .await;
         tokio::task::yield_now().await;
@@ -1629,7 +1629,7 @@ mod tests {
         assert_rejected_message(&gateway.read_message().await, request_id, code);
         gateway
             .write(&format!(
-                r#"{{"protocol_version":2,"type":"status","request_id":"{status_request_id}"}}"#
+                r#"{{"protocol_version":3,"type":"status","request_id":"{status_request_id}"}}"#
             ))
             .await;
         assert_accepted_message(&gateway.read_message().await, status_request_id);

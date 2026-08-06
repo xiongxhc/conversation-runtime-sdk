@@ -307,7 +307,7 @@ supports setup with absolute paths, verified local-only status, streamed text
 chat, Stop, close, and reconnect. Its idle Voice Focus preview makes Soft Aurora
 (the default), Silk, Threads, Prism, Orb, Still Gradient, and None selectable;
 the transcript remains hidden by default. When an explicitly initialized local
-memory store is configured and the gateway advertises protocol-v2
+memory store is configured and the gateway advertises protocol-v3
 `memory_inspection`, the desktop uses the public browser-safe SDK to provide
 read-only list and detail inspection. History remains separately owned local
 transcript storage; the desktop neither initializes runtime memory nor

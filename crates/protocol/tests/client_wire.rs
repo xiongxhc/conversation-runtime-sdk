@@ -120,15 +120,19 @@ fn approval(
 }
 
 #[test]
-fn start_turn_commands_do_not_accept_client_selected_identifiers() {
+fn version_three_start_turns_reject_version_two_and_client_selected_identifiers() {
     let command = decode_client_command(
-        br#"{"protocol_version":2,"type":"start_turn","request_id":"req-1","transcript":"hello"}"#,
+        br#"{"protocol_version":3,"type":"start_turn","request_id":"req-1","transcript":"hello"}"#,
     )
     .unwrap();
 
     assert!(matches!(command, ClientCommand::StartTurn { .. }));
     assert!(decode_client_command(
-        br#"{"protocol_version":2,"type":"start_turn","request_id":"req-1","turn_id":"1","transcript":"hello"}"#,
+        br#"{"protocol_version":2,"type":"start_turn","request_id":"req-1","transcript":"hello"}"#,
+    )
+    .is_err());
+    assert!(decode_client_command(
+        br#"{"protocol_version":3,"type":"start_turn","request_id":"req-1","turn_id":"1","transcript":"hello"}"#,
     )
     .is_err());
 }
@@ -141,14 +145,15 @@ fn accepted_start_turns_carry_the_gateway_allocated_identifier() {
     });
 
     assert_eq!(value["type"], "command_accepted");
+    assert_eq!(value["protocol_version"], 3);
     assert_eq!(value["request_id"], "req-1");
     assert_eq!(value["turn_id"], "9");
 }
 
 #[test]
-fn version_two_memory_commands_decode_and_version_one_commands_are_rejected() {
+fn version_three_memory_commands_decode_and_older_versions_are_rejected() {
     let list = decode_client_command(
-        br#"{"protocol_version":2,"type":"memory_list","request_id":"req-1","cursor":null}"#,
+        br#"{"protocol_version":3,"type":"memory_list","request_id":"req-1","cursor":null}"#,
     )
     .unwrap();
     assert!(matches!(
@@ -160,7 +165,7 @@ fn version_two_memory_commands_decode_and_version_one_commands_are_rejected() {
     ));
 
     let inspect = decode_client_command(
-        br#"{"protocol_version":2,"type":"memory_inspect","request_id":"req-2","memory_id":"7"}"#,
+        br#"{"protocol_version":3,"type":"memory_inspect","request_id":"req-2","memory_id":"7"}"#,
     )
     .unwrap();
     assert!(matches!(
@@ -169,6 +174,9 @@ fn version_two_memory_commands_decode_and_version_one_commands_are_rejected() {
     ));
 
     for line in include_str!("../../../tests/fixtures/client-wire-v1/commands.jsonl").lines() {
+        assert!(decode_client_command(line.as_bytes()).is_err());
+    }
+    for line in include_str!("../../../tests/fixtures/client-wire-v1/invalid.jsonl").lines() {
         assert!(decode_client_command(line.as_bytes()).is_err());
     }
 }
@@ -180,7 +188,7 @@ fn unknown_fields_and_versions_are_rejected() {
     )
     .is_err());
     assert!(decode_client_command(
-        br#"{"protocol_version":2,"type":"status","request_id":"req-1","extra":true}"#
+        br#"{"protocol_version":3,"type":"status","request_id":"req-1","extra":true}"#
     )
     .is_err());
 }
@@ -189,7 +197,7 @@ fn unknown_fields_and_versions_are_rejected() {
 fn identifiers_must_be_canonical_non_zero_decimal_strings() {
     for identifier in ["0", "01", "+1", " 1", "1 ", "-1"] {
         let payload = format!(
-            r#"{{"protocol_version":2,"type":"interrupt_turn","request_id":"req-1","turn_id":"{identifier}"}}"#
+            r#"{{"protocol_version":3,"type":"interrupt_turn","request_id":"req-1","turn_id":"{identifier}"}}"#
         );
         assert!(
             decode_client_command(payload.as_bytes()).is_err(),
@@ -198,7 +206,7 @@ fn identifiers_must_be_canonical_non_zero_decimal_strings() {
     }
 
     assert!(decode_client_command(
-        br#"{"protocol_version":2,"type":"interrupt_turn","request_id":"req-1","turn_id":1}"#
+        br#"{"protocol_version":3,"type":"interrupt_turn","request_id":"req-1","turn_id":1}"#
     )
     .is_err());
 }
@@ -206,24 +214,24 @@ fn identifiers_must_be_canonical_non_zero_decimal_strings() {
 #[test]
 fn commands_reject_invalid_request_ids_and_transcripts() {
     assert!(
-        decode_client_command(br#"{"protocol_version":2,"type":"status","request_id":""}"#)
+        decode_client_command(br#"{"protocol_version":3,"type":"status","request_id":""}"#)
             .is_err()
     );
     assert!(decode_client_command(
         format!(
-            r#"{{"protocol_version":2,"type":"status","request_id":"{}"}}"#,
+            r#"{{"protocol_version":3,"type":"status","request_id":"{}"}}"#,
             "r".repeat(65)
         )
         .as_bytes()
     )
     .is_err());
     assert!(decode_client_command(
-        br#"{"protocol_version":2,"type":"start_turn","request_id":"req-1","transcript":""}"#
+        br#"{"protocol_version":3,"type":"start_turn","request_id":"req-1","transcript":""}"#
     )
     .is_err());
     assert!(decode_client_command(
         format!(
-            r#"{{"protocol_version":2,"type":"start_turn","request_id":"req-1","transcript":"{}"}}"#,
+            r#"{{"protocol_version":3,"type":"start_turn","request_id":"req-1","transcript":"{}"}}"#,
             "x".repeat(16 * 1024 + 1)
         )
         .as_bytes()
@@ -247,9 +255,9 @@ fn version_one_command_fixtures_are_rejected() {
 #[test]
 fn event_fixtures_reject_numeric_or_malformed_nested_identifiers() {
     for payload in [
-        r#"{"protocol_version":2,"type":"runtime_event","event":{"type":"turn_started","turn_id":1}}"#,
-        r#"{"protocol_version":2,"type":"runtime_event","event":{"type":"quality_resolved","decision":{"turn_id":"0","mode":"direct_answer","controls":{"maximum_spoken_seconds":20,"directness":80,"pace":"natural","follow_up_policy":"contextual","silence_policy":"allow_without_filler"},"signals":[],"history_message_count":0,"context_sources":["saved_persona","current_turn"]}}}"#,
-        r#"{"protocol_version":2,"type":"runtime_event","event":{"type":"memory_retrieved","trace":{"trace_id":"01","turn_id":"1","selected_items":1,"used_bytes":12}}}"#,
+        r#"{"protocol_version":3,"type":"runtime_event","event":{"type":"turn_started","turn_id":1}}"#,
+        r#"{"protocol_version":3,"type":"runtime_event","event":{"type":"quality_resolved","decision":{"turn_id":"0","mode":"direct_answer","controls":{"maximum_spoken_seconds":20,"directness":80,"pace":"natural","follow_up_policy":"contextual","silence_policy":"allow_without_filler"},"signals":[],"history_message_count":0,"context_sources":["saved_persona","current_turn"]}}}"#,
+        r#"{"protocol_version":3,"type":"runtime_event","event":{"type":"memory_retrieved","trace":{"trace_id":"01","turn_id":"1","selected_items":1,"used_bytes":12}}}"#,
     ] {
         assert!(parse_event_fixture(payload).is_err(), "{payload}");
     }
@@ -380,8 +388,8 @@ fn maximum_memory_inspection_response_stays_within_frame_limit() {
 }
 
 #[test]
-fn version_two_fixtures_parse_and_invalid_cases_are_rejected() {
-    for (line_number, line) in include_str!("../../../tests/fixtures/client-wire-v2/commands.jsonl")
+fn version_three_fixtures_parse_and_invalid_cases_are_rejected() {
+    for (line_number, line) in include_str!("../../../tests/fixtures/client-wire-v3/commands.jsonl")
         .lines()
         .enumerate()
     {
@@ -389,7 +397,7 @@ fn version_two_fixtures_parse_and_invalid_cases_are_rejected() {
             .unwrap_or_else(|error| panic!("command fixture line {}: {error}", line_number + 1));
     }
 
-    for (line_number, line) in include_str!("../../../tests/fixtures/client-wire-v2/events.jsonl")
+    for (line_number, line) in include_str!("../../../tests/fixtures/client-wire-v3/events.jsonl")
         .lines()
         .enumerate()
     {
@@ -397,13 +405,13 @@ fn version_two_fixtures_parse_and_invalid_cases_are_rejected() {
             .unwrap_or_else(|error| panic!("event fixture line {}: {error}", line_number + 1));
     }
 
-    for (line_number, line) in include_str!("../../../tests/fixtures/client-wire-v2/invalid.jsonl")
+    for (line_number, line) in include_str!("../../../tests/fixtures/client-wire-v3/invalid.jsonl")
         .lines()
         .enumerate()
     {
         assert!(
             decode_client_command(line.as_bytes()).is_err() && parse_event_fixture(line).is_err(),
-            "invalid fixture line {} must be rejected by every v2 envelope",
+            "invalid fixture line {} must be rejected by every v3 envelope",
             line_number + 1
         );
     }

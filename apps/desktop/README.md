@@ -90,7 +90,7 @@ runtime-owned semantic storage with its own provenance, approval, retention,
 and retrieval rules.
 
 The Memory destination appears only when the connected local gateway reports
-enabled local memory and the protocol-v2 `memory_inspection` capability. The
+enabled local memory and the protocol-v3 `memory_inspection` capability. The
 desktop reads summaries and individual records only through the public
 browser-safe SDK and local framed-stdio protocol. It has no SQLite access and
 offers no create, edit, approval, pin, expiry, deletion, or retrieval control.

@@ -56,7 +56,7 @@ describe("TauriGatewayTransport", () => {
         command: "send_runtime",
         args: {
           payload: JSON.stringify({
-            protocol_version: 2,
+            protocol_version: 3,
             type: "start_turn",
             request_id: "request-1",
             transcript: "Hello",

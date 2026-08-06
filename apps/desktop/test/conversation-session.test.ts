@@ -133,7 +133,7 @@ describe("ConversationSession", () => {
     await session.send("Hello");
 
     transport.emit({
-      protocol_version: 2,
+      protocol_version: 3,
       type: "fatal",
       error: {
         code: "adapter_failure",
@@ -215,18 +215,18 @@ class InMemoryTransport implements RuntimeTransport {
     this.emit(
       command.type === "start_turn"
         ? {
-          protocol_version: 2,
+          protocol_version: 3,
           type: "command_accepted",
           request_id: command.requestId,
           turn_id: (++this.turnCounter).toString(),
         }
-        : { protocol_version: 2, type: "command_accepted", request_id: command.requestId },
+        : { protocol_version: 3, type: "command_accepted", request_id: command.requestId },
     );
     if (command.type === "status") {
-      this.emit({ protocol_version: 2, type: "status", request_id: command.requestId, status: this.status });
+      this.emit({ protocol_version: 3, type: "status", request_id: command.requestId, status: this.status });
     } else if (command.type === "memory_list") {
       this.emit({
-        protocol_version: 2,
+        protocol_version: 3,
         type: "memory_list",
         request_id: command.requestId,
         records: memoryPage.records.map((record) => ({
@@ -241,7 +241,7 @@ class InMemoryTransport implements RuntimeTransport {
       });
     } else if (command.type === "memory_inspect") {
       this.emit({
-        protocol_version: 2,
+        protocol_version: 3,
         type: "memory_inspection",
         request_id: command.requestId,
         inspection: {
@@ -279,11 +279,11 @@ class InMemoryTransport implements RuntimeTransport {
   }
 
   ready(): void {
-    this.emit({ protocol_version: 2, type: "ready", status: localStatus });
+    this.emit({ protocol_version: 3, type: "ready", status: localStatus });
   }
 
   turnEvent(event: Record<string, unknown>): void {
-    this.emit({ protocol_version: 2, type: "runtime_event", event });
+    this.emit({ protocol_version: 3, type: "runtime_event", event });
   }
 
   emit(message: unknown): void {

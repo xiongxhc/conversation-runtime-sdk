@@ -301,7 +301,7 @@ acceptance.
 
 Memory is an optional, explicitly initialized runtime store. When the selected
 local gateway config points to an existing initialized database and advertises
-the protocol-v2 `memory_inspection` capability, the desktop can list and inspect
+the protocol-v3 `memory_inspection` capability, the desktop can list and inspect
 it through the public browser-safe SDK only. The first Memory screen is
 read-only: it does not create a database, mutate memory, or automatically copy
 conversations into memory. History remains a separate app-owned transcript

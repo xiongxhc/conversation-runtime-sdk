@@ -463,7 +463,7 @@ class ScriptedTransport implements RuntimeTransport {
   closeCount = 0;
 
   constructor(private readonly script: Script) {
-    this.inbox.push({ type: "ready", protocol_version: 2, status: wireStatus() });
+    this.inbox.push({ type: "ready", protocol_version: 3, status: wireStatus() });
   }
 
   async send(command: ClientCommand): Promise<void> {
@@ -504,14 +504,14 @@ class ScriptedTransport implements RuntimeTransport {
   private respond(command: ClientCommand): void {
     this.inbox.push({
       type: "command_accepted",
-      protocol_version: 2,
+      protocol_version: 3,
       request_id: command.requestId,
       ...(command.type === "start_turn" ? { turn_id: (++this.turnCounter).toString() } : {}),
     });
     if (command.type === "status") {
       this.inbox.push({
         type: "status",
-        protocol_version: 2,
+        protocol_version: 3,
         request_id: command.requestId,
         status: wireStatus(),
       });
@@ -674,7 +674,7 @@ function chatFixture(
 }
 
 function runtimeEvent(event: Record<string, unknown>): Record<string, unknown> {
-  return { type: "runtime_event", protocol_version: 2, event };
+  return { type: "runtime_event", protocol_version: 3, event };
 }
 
 function wireStatus(): RuntimeStatusWire {

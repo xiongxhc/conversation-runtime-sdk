@@ -31,7 +31,7 @@ async fn persistent_session_reports_local_status_and_preserves_completed_history
     assert_local_status(&ready, false);
 
     gateway
-        .write_message(r#"{"protocol_version":2,"type":"status","request_id":"status-1"}"#)
+        .write_message(r#"{"protocol_version":3,"type":"status","request_id":"status-1"}"#)
         .await;
     assert_accepted(&gateway.read_message().await, "status-1");
     let status = gateway.read_message().await;
@@ -82,7 +82,7 @@ async fn status_reports_exact_model_and_enabled_local_memory() {
     assert_local_status(&ready, true);
 
     gateway
-        .write_message(r#"{"protocol_version":2,"type":"status","request_id":"status-memory"}"#)
+        .write_message(r#"{"protocol_version":3,"type":"status","request_id":"status-memory"}"#)
         .await;
     assert_accepted(&gateway.read_message().await, "status-memory");
     assert_local_status(&gateway.read_message().await, true);
@@ -103,7 +103,7 @@ async fn compiled_gateway_lists_and_inspects_memory_with_exact_correlation() {
 
     gateway
         .write_message(
-            r#"{"protocol_version":2,"type":"memory_list","request_id":"compiled-list","cursor":null}"#,
+            r#"{"protocol_version":3,"type":"memory_list","request_id":"compiled-list","cursor":null}"#,
         )
         .await;
     assert_accepted(&gateway.read_message().await, "compiled-list");
@@ -119,7 +119,7 @@ async fn compiled_gateway_lists_and_inspects_memory_with_exact_correlation() {
 
     gateway
         .write_message(&format!(
-            r#"{{"protocol_version":2,"type":"memory_inspect","request_id":"compiled-inspect","memory_id":"{}"}}"#,
+            r#"{{"protocol_version":3,"type":"memory_inspect","request_id":"compiled-inspect","memory_id":"{}"}}"#,
             record.id().get()
         ))
         .await;
@@ -135,7 +135,7 @@ async fn compiled_gateway_lists_and_inspects_memory_with_exact_correlation() {
     assert!(inspection.raw.len() < MAX_CLIENT_FRAME_BYTES);
 
     gateway
-        .write_message(r#"{"protocol_version":2,"type":"status","request_id":"compiled-status"}"#)
+        .write_message(r#"{"protocol_version":3,"type":"status","request_id":"compiled-status"}"#)
         .await;
     assert_accepted(&gateway.read_message().await, "compiled-status");
     let status = gateway.read_message().await;
@@ -169,7 +169,7 @@ async fn compiled_gateway_rejects_active_memory_before_interrupt_and_reaps() {
 
     gateway
         .write_message(
-            r#"{"protocol_version":2,"type":"memory_list","request_id":"compiled-list-active","cursor":null}"#,
+            r#"{"protocol_version":3,"type":"memory_list","request_id":"compiled-list-active","cursor":null}"#,
         )
         .await;
     let rejection = gateway
@@ -185,7 +185,7 @@ async fn compiled_gateway_rejects_active_memory_before_interrupt_and_reaps() {
     );
     gateway
         .write_message(
-            r#"{"protocol_version":2,"type":"status","request_id":"compiled-status-after-active"}"#,
+            r#"{"protocol_version":3,"type":"status","request_id":"compiled-status-after-active"}"#,
         )
         .await;
     assert_accepted(
@@ -196,7 +196,7 @@ async fn compiled_gateway_rejects_active_memory_before_interrupt_and_reaps() {
 
     gateway
         .write_message(
-            r#"{"protocol_version":2,"type":"interrupt_turn","request_id":"compiled-interrupt-after-memory","turn_id":"1"}"#,
+            r#"{"protocol_version":3,"type":"interrupt_turn","request_id":"compiled-interrupt-after-memory","turn_id":"1"}"#,
         )
         .await;
     let before_terminal = gateway.read_until(|message| message.is_terminal()).await;
@@ -244,7 +244,7 @@ async fn interrupt_is_accepted_before_one_cancelled_terminal() {
 
     gateway
         .write_message(
-            r#"{"protocol_version":2,"type":"interrupt_turn","request_id":"interrupt-1","turn_id":"1"}"#,
+            r#"{"protocol_version":3,"type":"interrupt_turn","request_id":"interrupt-1","turn_id":"1"}"#,
         )
         .await;
     let before_ack = gateway
@@ -278,7 +278,16 @@ async fn malformed_command_is_rejected_and_the_session_survives() {
 
     gateway
         .write_message(
-            r#"{"protocol_version":2,"type":"status","request_id":"status-after-rejection"}"#,
+            r#"{"protocol_version":2,"type":"start_turn","request_id":"version-two-start","transcript":"old peer"}"#,
+        )
+        .await;
+    let rejection = gateway.read_message().await;
+    assert_eq!(rejection.message_type(), "command_rejected");
+    assert_eq!(rejection.request_id(), Some("invalid-command"));
+
+    gateway
+        .write_message(
+            r#"{"protocol_version":3,"type":"status","request_id":"status-after-rejection"}"#,
         )
         .await;
     assert_accepted(&gateway.read_message().await, "status-after-rejection");
@@ -629,7 +638,7 @@ maximum_bytes = 4096
 
 fn start_turn(request_id: &str, transcript: &str) -> String {
     format!(
-        r#"{{"protocol_version":2,"type":"start_turn","request_id":"{request_id}","transcript":"{transcript}"}}"#
+        r#"{{"protocol_version":3,"type":"start_turn","request_id":"{request_id}","transcript":"{transcript}"}}"#
     )
 }
 

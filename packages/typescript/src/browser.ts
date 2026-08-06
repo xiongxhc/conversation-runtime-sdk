@@ -24,6 +24,9 @@ export {
   type MemoryRetention,
   type MemorySummary,
   type RuntimeEvent,
+  type RuntimeComponentDescriptor,
   type RuntimeFailure,
   type RuntimeStatus,
+  type VoiceActivity,
+  type VoiceSessionEvent,
 } from "./protocol.js";

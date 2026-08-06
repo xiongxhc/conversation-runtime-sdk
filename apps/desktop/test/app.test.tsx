@@ -623,6 +623,7 @@ function localState(
       memoryLocation: null,
       telemetryEnabled: false,
       capabilities: ["text"],
+      components: [{ kind: "language_model", executionLocation: "local", providerLabel: "Local language" }],
     },
     turns: [],
     activeTurn: undefined,

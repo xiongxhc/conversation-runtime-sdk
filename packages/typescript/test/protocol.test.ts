@@ -38,13 +38,15 @@ test("parses every shared v3 command fixture with bigint identifiers", async () 
   assert.deepEqual(parsed[1], { type: "start_turn", requestId: "req-start-1", transcript: "hello" });
   assert.equal(parsed[2]?.type, "interrupt_turn");
   assert.equal(parsed[2]?.turnId, 1n);
-  assert.deepEqual(parsed[3], { type: "memory_list", requestId: "req-list-first", cursor: null });
-  assert.deepEqual(parsed[4], {
+  assert.deepEqual(parsed[3], { type: "start_voice_session", requestId: "req-voice-start" });
+  assert.deepEqual(parsed[6], { type: "resume_voice_capture", requestId: "req-voice-resume" });
+  assert.deepEqual(parsed[7], { type: "memory_list", requestId: "req-list-first", cursor: null });
+  assert.deepEqual(parsed[8], {
     type: "memory_list",
     requestId: "req-list-next",
     cursor: { beforeId: 7n },
   });
-  assert.deepEqual(parsed[5], { type: "memory_inspect", requestId: "req-inspect-1", memoryId: 7n });
+  assert.deepEqual(parsed[9], { type: "memory_inspect", requestId: "req-inspect-1", memoryId: 7n });
 });
 
 test("rejects v2 while correlating typed starts through v3 acceptance", () => {
@@ -84,10 +86,11 @@ test("parses every shared v3 gateway fixture with bigint-safe memory values", as
   const messages = await fixtureLines("events.jsonl");
   const parsed = messages.map(parseGatewayMessage);
 
-  assert.equal(parsed[6]?.type, "runtime_event");
-  assert.equal(parsed[6]?.event.type, "turn_started");
-  assert.equal(parsed[6]?.event.turnId, 1n);
-  assert.deepEqual(parsed[4], {
+  assert.equal(parsed[9]?.type, "runtime_event");
+  assert.equal(parsed[9]?.event.type, "turn_started");
+  assert.equal(parsed[9]?.event.turnId, 1n);
+  assert.equal(parsed[9]?.event.type === "turn_started" ? parsed[9].event.requestId : undefined, "req-start-1");
+  assert.deepEqual(parsed[7], {
     type: "memory_list",
     requestId: "req-list-first",
     records: [{
@@ -100,7 +103,7 @@ test("parses every shared v3 gateway fixture with bigint-safe memory values", as
     }],
     nextCursor: { beforeId: 7n },
   });
-  assert.deepEqual(parsed[5], {
+  assert.deepEqual(parsed[8], {
     type: "memory_inspection",
     requestId: "req-inspect-1",
     inspection: {
@@ -137,7 +140,17 @@ test("rejects every shared invalid v3 command and gateway fixture", async () => 
       ? value as Record<string, unknown>
       : {};
     const type = object.type;
-    const parse = (type === "status" || type === "start_turn" || type === "interrupt_turn" || type === "memory_inspect" || (type === "memory_list" && "cursor" in object))
+    const parse = (
+      type === "status"
+      || type === "start_turn"
+      || type === "interrupt_turn"
+      || type === "start_voice_session"
+      || type === "stop_voice_session"
+      || type === "pause_voice_capture"
+      || type === "resume_voice_capture"
+      || type === "memory_inspect"
+      || (type === "memory_list" && "cursor" in object)
+    )
       ? parseClientCommand
       : parseGatewayMessage;
     assert.throws(() => parse(value));
@@ -222,6 +235,20 @@ test("rejects explicit v1 compatibility and unsupported inbound protocol version
   );
 });
 
+test("rejects voice-only runtime events outside the voice envelope", () => {
+  for (const event of [
+    { type: "transcript_final", turn_id: "1", text: "hello" },
+    { type: "speech_started", turn_id: "1" },
+    { type: "speech_completed", turn_id: "1" },
+  ]) {
+    assert.throws(() => parseGatewayMessage({
+      protocol_version: 3,
+      type: "runtime_event",
+      event,
+    }));
+  }
+});
+
 test("rejects unsupported status and error enum values", () => {
   assert.throws(() =>
     parseGatewayMessage({
@@ -257,6 +284,10 @@ test("rejects incoherent runtime memory status combinations", () => {
       memory_enabled: true,
       memory_location: "local",
       capabilities: ["text", "memory_inspection"],
+      components: [
+        { kind: "language_model", execution_location: "local", provider_label: "Local language" },
+        { kind: "memory", execution_location: "local", provider_label: "Local memory" },
+      ],
     },
   }));
 
@@ -533,6 +564,9 @@ function wireStatus(): Record<string, unknown> {
     memory_location: null,
     telemetry_enabled: false,
     capabilities: ["text"],
+    components: [
+      { kind: "language_model", execution_location: "local", provider_label: "Local language" },
+    ],
   };
 }
 

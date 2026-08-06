@@ -27,6 +27,10 @@ const localMemoryStatus: RuntimeStatus = {
   memoryLocation: "local",
   telemetryEnabled: false,
   capabilities: ["text", "memory_inspection"],
+  components: [
+    { kind: "language_model", executionLocation: "local", providerLabel: "Local language" },
+    { kind: "memory", executionLocation: "local", providerLabel: "Local memory" },
+  ],
 };
 
 describe("MemoryPane", () => {

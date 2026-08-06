@@ -221,6 +221,10 @@ export class RuntimeClient {
       control.result.resolve(message.inspection);
       return;
     }
+    if (message.type === "voice_event") {
+      this.fail(new Error("gateway sent a voice event before voice client support was active"));
+      return;
+    }
 
     const turnId = eventTurnId(message.event);
     const state = this.turns.get(turnId);

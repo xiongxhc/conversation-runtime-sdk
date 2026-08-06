@@ -10,11 +10,17 @@ export const MAX_MEMORY_CONTENT_BYTES = 4 * 1024;
 const MAX_U64_DECIMAL = "18446744073709551615";
 const MAX_I64_DECIMAL = "9223372036854775807";
 const MAX_MEMORY_CONFIDENCE_DECIMAL = "1000";
+const MAX_COMPONENT_DESCRIPTORS = 32;
+const MAX_PROVIDER_LABEL_BYTES = 128;
 
 export type ClientCommand =
   | { type: "status"; requestId: string }
   | { type: "start_turn"; requestId: string; transcript: string }
   | { type: "interrupt_turn"; requestId: string; turnId: bigint }
+  | { type: "start_voice_session"; requestId: string }
+  | { type: "stop_voice_session"; requestId: string }
+  | { type: "pause_voice_capture"; requestId: string }
+  | { type: "resume_voice_capture"; requestId: string }
   | { type: "memory_list"; requestId: string; cursor: MemoryCursor | null }
   | { type: "memory_inspect"; requestId: string; memoryId: bigint };
 
@@ -106,7 +112,25 @@ export type RuntimeStatus = {
   memoryEnabled: boolean;
   memoryLocation: "local" | null;
   telemetryEnabled: false;
-  capabilities: ["text"] | ["text", "memory_inspection"];
+  capabilities:
+    | ["text"]
+    | ["text", "memory_inspection"]
+    | ["text", "voice_session"]
+    | ["text", "memory_inspection", "voice_session"];
+  components: RuntimeComponentDescriptor[];
+};
+
+export type RuntimeComponentDescriptor = {
+  kind:
+    | "speech_recognition"
+    | "language_model"
+    | "speech_synthesis"
+    | "audio_io"
+    | "tool"
+    | "memory"
+    | "telemetry";
+  executionLocation: "local" | "remote";
+  providerLabel: string;
 };
 
 type ConversationSignal =
@@ -125,7 +149,8 @@ type ContextSource =
   | "temporary_correction";
 
 export type RuntimeEvent =
-  | { type: "turn_started"; turnId: bigint }
+  | { type: "turn_started"; requestId: string | null; turnId: bigint }
+  | { type: "transcript_final"; turnId: bigint; text: string }
   | {
       type: "quality_resolved";
       decision: {
@@ -149,6 +174,8 @@ export type RuntimeEvent =
     }
   | { type: "text_delta"; turnId: bigint; delta: string }
   | { type: "text_completed"; turnId: bigint; text: string }
+  | { type: "speech_started"; turnId: bigint }
+  | { type: "speech_completed"; turnId: bigint }
   | {
       type: "timing";
       turnId: bigint;
@@ -159,6 +186,56 @@ export type RuntimeEvent =
   | { type: "turn_cancelled"; turnId: bigint }
   | { type: "turn_failed"; turnId: bigint; error: RuntimeFailure };
 
+export type VoiceActivity =
+  | { type: "speech_started"; atMs: number }
+  | { type: "speech_continued"; atMs: number }
+  | { type: "speech_ended"; atMs: number };
+
+export type VoiceSessionEvent =
+  | {
+      type: "voice_session_started";
+      sessionId: bigint;
+      privacy: { privacyMode: "local_only"; components: RuntimeComponentDescriptor[] };
+    }
+  | { type: "voice_capture_paused"; sessionId: bigint }
+  | { type: "voice_capture_resumed"; sessionId: bigint }
+  | { type: "voice_activity"; sessionId: bigint; activity: VoiceActivity }
+  | { type: "voice_transcript_partial"; sessionId: bigint; segmentId: bigint; text: string }
+  | { type: "voice_transcript_final"; sessionId: bigint; turnId: bigint; text: string }
+  | { type: "voice_barge_in"; sessionId: bigint; turnId: bigint; generationId: bigint }
+  | { type: "voice_turn_event"; sessionId: bigint; generationId: bigint; event: RuntimeEvent }
+  | {
+      type: "voice_timing";
+      sessionId: bigint;
+      turnId: bigint | null;
+      milestone:
+        | "speech_end"
+        | "transcript_final"
+        | "first_text_delta"
+        | "first_synthesis_request"
+        | "first_playable_audio"
+        | "first_sidecar_accept"
+        | "playback_render_acknowledged"
+        | "barge_in_onset"
+        | "barge_in_threshold"
+        | "playback_flush_acknowledged"
+        | "cleanup";
+      elapsedMs: number;
+    }
+  | {
+      type: "voice_playback";
+      sessionId: bigint;
+      generationId: bigint;
+      state: "accepted" | "rendered" | "flushed";
+    }
+  | {
+      type: "voice_session_failed";
+      sessionId: bigint;
+      error: RuntimeFailure;
+      recovery: "continue_session" | "new_session";
+    }
+  | { type: "voice_session_ended"; sessionId: bigint };
+
 export type GatewayMessage =
   | { type: "ready"; status: RuntimeStatus }
   | { type: "command_accepted"; requestId: string; turnId?: bigint }
@@ -167,6 +244,7 @@ export type GatewayMessage =
   | { type: "memory_list"; requestId: string; records: MemorySummary[]; nextCursor: MemoryCursor | null }
   | { type: "memory_inspection"; requestId: string; inspection: MemoryInspection }
   | { type: "runtime_event"; event: RuntimeEvent }
+  | { type: "voice_event"; event: VoiceSessionEvent }
   | { type: "fatal"; error: RuntimeFailure };
 
 export class ProtocolError extends Error {
@@ -196,6 +274,13 @@ export function parseClientCommand(value: unknown): ClientCommand {
       requireExactKeys(object, ["protocol_version", "type", "request_id", "turn_id"]);
       validateProtocolVersion(object);
       return { type, requestId: requireRequestId(object), turnId: parseIdentifier(object.turn_id) };
+    case "start_voice_session":
+    case "stop_voice_session":
+    case "pause_voice_capture":
+    case "resume_voice_capture":
+      requireExactKeys(object, ["protocol_version", "type", "request_id"]);
+      validateProtocolVersion(object);
+      return { type, requestId: requireRequestId(object) };
     case "memory_list":
       requireExactKeys(object, ["protocol_version", "type", "request_id", "cursor"]);
       validateProtocolVersion(object);
@@ -250,6 +335,10 @@ export function parseGatewayMessage(value: unknown): GatewayMessage {
       requireExactKeys(object, ["protocol_version", "type", "event"]);
       validateProtocolVersion(object);
       return { type, event: parseRuntimeEvent(object.event) };
+    case "voice_event":
+      requireExactKeys(object, ["protocol_version", "type", "event"]);
+      validateProtocolVersion(object);
+      return { type, event: parseVoiceSessionEvent(object.event) };
     case "fatal":
       requireExactKeys(object, ["protocol_version", "type", "error"]);
       validateProtocolVersion(object);
@@ -278,6 +367,15 @@ export function encodeClientCommand(command: ClientCommand): Uint8Array {
           type: command.type,
           request_id: command.requestId,
           turn_id: command.turnId.toString(),
+        };
+      case "start_voice_session":
+      case "stop_voice_session":
+      case "pause_voice_capture":
+      case "resume_voice_capture":
+        return {
+          protocol_version: CLIENT_PROTOCOL_VERSION,
+          type: command.type,
+          request_id: command.requestId,
         };
       case "memory_list":
         return {
@@ -332,6 +430,7 @@ function parseRuntimeStatus(value: unknown): RuntimeStatus {
     "memory_location",
     "telemetry_enabled",
     "capabilities",
+    "components",
   ]);
   const memoryLocation = object.memory_location;
   if (memoryLocation !== null && typeof memoryLocation !== "string") {
@@ -340,7 +439,9 @@ function parseRuntimeStatus(value: unknown): RuntimeStatus {
   const memoryEnabled = requireBoolean(object, "memory_enabled");
   const parsedMemoryLocation = requireMemoryLocation(memoryLocation);
   const capabilities = requireCapabilities(object);
-  validateRuntimeMemoryStatus(memoryEnabled, parsedMemoryLocation, capabilities);
+  const components = requireRuntimeComponents(object);
+  validateRuntimeStatusComponents(capabilities, components);
+  validateRuntimeMemoryStatus(memoryEnabled, parsedMemoryLocation, capabilities, components);
   return {
     transport: requireOneOf(object, "transport", ["stdio"] as const),
     privacyMode: requireOneOf(object, "privacy_mode", ["local_only"] as const),
@@ -350,6 +451,7 @@ function parseRuntimeStatus(value: unknown): RuntimeStatus {
     memoryLocation: parsedMemoryLocation,
     telemetryEnabled: requireOneOf(object, "telemetry_enabled", [false] as const),
     capabilities,
+    components,
   };
 }
 
@@ -526,13 +628,31 @@ function validateMemoryHistory(record: MemoryRecord, sources: MemoryProvenance[]
   }
 }
 
-function parseRuntimeEvent(value: unknown): RuntimeEvent {
+function parseRuntimeEvent(value: unknown, voiceEvent = false): RuntimeEvent {
   const object = requireRecord(value, "runtime event");
   const type = requireString(object, "type");
   switch (type) {
-    case "turn_started":
-      requireExactKeys(object, ["type", "turn_id"]);
-      return { type, turnId: parseIdentifier(object.turn_id) };
+    case "turn_started": {
+      requireExactKeys(object, ["type", "request_id", "turn_id"]);
+      if (voiceEvent) {
+        if (object.request_id !== null) {
+          throw new ProtocolError("voice turn_started request_id must be null");
+        }
+      } else {
+        requireCanonicalRequestIdValue(object.request_id);
+      }
+      return {
+        type,
+        requestId: voiceEvent ? null : object.request_id as string,
+        turnId: parseIdentifier(object.turn_id),
+      };
+    }
+    case "transcript_final":
+      if (!voiceEvent) {
+        throw new ProtocolError("transcript_final is only valid inside a voice turn event");
+      }
+      requireExactKeys(object, ["type", "turn_id", "text"]);
+      return { type, turnId: parseIdentifier(object.turn_id), text: requireTranscript(object, "text") };
     case "quality_resolved":
       requireExactKeys(object, ["type", "decision"]);
       return { type, decision: parseQualityDecision(object.decision) };
@@ -544,7 +664,14 @@ function parseRuntimeEvent(value: unknown): RuntimeEvent {
       return { type, turnId: parseIdentifier(object.turn_id), delta: requireString(object, "delta") };
     case "text_completed":
       requireExactKeys(object, ["type", "turn_id", "text"]);
-      return { type, turnId: parseIdentifier(object.turn_id), text: requireString(object, "text") };
+      return { type, turnId: parseIdentifier(object.turn_id), text: requireTranscript(object, "text") };
+    case "speech_started":
+    case "speech_completed":
+      if (!voiceEvent) {
+        throw new ProtocolError(`${type} is only valid inside a voice turn event`);
+      }
+      requireExactKeys(object, ["type", "turn_id"]);
+      return { type, turnId: parseIdentifier(object.turn_id) };
     case "timing":
       requireExactKeys(object, ["type", "turn_id", "milestone", "elapsed_ms"]);
       return {
@@ -567,6 +694,140 @@ function parseRuntimeEvent(value: unknown): RuntimeEvent {
     default:
       throw new ProtocolError("unsupported runtime event type");
   }
+}
+
+function parseVoiceSessionEvent(value: unknown): VoiceSessionEvent {
+  const object = requireRecord(value, "voice session event");
+  const type = requireString(object, "type");
+  const sessionId = (): bigint => parseIdentifier(object.session_id);
+  switch (type) {
+    case "voice_session_started": {
+      requireExactKeys(object, ["type", "session_id", "privacy"]);
+      const privacy = requireRecord(object.privacy, "voice privacy summary");
+      requireExactKeys(privacy, ["privacy_mode", "components"]);
+      const components = requireRuntimeComponents(privacy);
+      validateVoiceComponents(components);
+      return {
+        type,
+        sessionId: sessionId(),
+        privacy: {
+          privacyMode: requireOneOf(privacy, "privacy_mode", ["local_only"] as const),
+          components,
+        },
+      };
+    }
+    case "voice_capture_paused":
+    case "voice_capture_resumed":
+    case "voice_session_ended":
+      requireExactKeys(object, ["type", "session_id"]);
+      return { type, sessionId: sessionId() };
+    case "voice_activity": {
+      requireExactKeys(object, ["type", "session_id", "activity"]);
+      const activity = requireRecord(object.activity, "voice activity");
+      requireExactKeys(activity, ["type", "at_ms"]);
+      return {
+        type,
+        sessionId: sessionId(),
+        activity: {
+          type: requireOneOf(
+            activity,
+            "type",
+            ["speech_started", "speech_continued", "speech_ended"] as const,
+          ),
+          atMs: requireNonNegativeInteger(activity, "at_ms"),
+        },
+      };
+    }
+    case "voice_transcript_partial":
+      requireExactKeys(object, ["type", "session_id", "segment_id", "text"]);
+      return {
+        type,
+        sessionId: sessionId(),
+        segmentId: parseIdentifier(object.segment_id),
+        text: requireTranscript(object, "text"),
+      };
+    case "voice_transcript_final":
+      requireExactKeys(object, ["type", "session_id", "turn_id", "text"]);
+      return {
+        type,
+        sessionId: sessionId(),
+        turnId: parseIdentifier(object.turn_id),
+        text: requireTranscript(object, "text"),
+      };
+    case "voice_barge_in": {
+      requireExactKeys(object, ["type", "session_id", "turn_id", "generation_id"]);
+      const turnId = parseIdentifier(object.turn_id);
+      const generationId = parseIdentifier(object.generation_id);
+      requireMatchingVoiceIdentity(turnId, generationId);
+      return { type, sessionId: sessionId(), turnId, generationId };
+    }
+    case "voice_turn_event": {
+      requireExactKeys(object, ["type", "session_id", "generation_id", "event"]);
+      const generationId = parseIdentifier(object.generation_id);
+      const event = parseRuntimeEvent(object.event, true);
+      requireMatchingVoiceIdentity(runtimeEventTurnId(event), generationId);
+      return { type, sessionId: sessionId(), generationId, event };
+    }
+    case "voice_timing":
+      requireExactKeys(object, ["type", "session_id", "turn_id", "milestone", "elapsed_ms"]);
+      return {
+        type,
+        sessionId: sessionId(),
+        turnId: object.turn_id === null ? null : parseIdentifier(object.turn_id),
+        milestone: requireOneOf(
+          object,
+          "milestone",
+          [
+            "speech_end",
+            "transcript_final",
+            "first_text_delta",
+            "first_synthesis_request",
+            "first_playable_audio",
+            "first_sidecar_accept",
+            "playback_render_acknowledged",
+            "barge_in_onset",
+            "barge_in_threshold",
+            "playback_flush_acknowledged",
+            "cleanup",
+          ] as const,
+        ),
+        elapsedMs: requireNonNegativeInteger(object, "elapsed_ms"),
+      };
+    case "voice_playback":
+      requireExactKeys(object, ["type", "session_id", "generation_id", "state"]);
+      return {
+        type,
+        sessionId: sessionId(),
+        generationId: parseIdentifier(object.generation_id),
+        state: requireOneOf(object, "state", ["accepted", "rendered", "flushed"] as const),
+      };
+    case "voice_session_failed":
+      requireExactKeys(object, ["type", "session_id", "error", "recovery"]);
+      return {
+        type,
+        sessionId: sessionId(),
+        error: parseRuntimeFailure(object.error),
+        recovery: requireOneOf(object, "recovery", ["continue_session", "new_session"] as const),
+      };
+    default:
+      throw new ProtocolError("unsupported voice session event type");
+  }
+}
+
+function requireMatchingVoiceIdentity(turnId: bigint, generationId: bigint): void {
+  if (turnId !== generationId) {
+    throw new ProtocolError("voice turn and generation identifiers must match");
+  }
+}
+
+function runtimeEventTurnId(event: RuntimeEvent): bigint {
+  if (event.type === "quality_resolved") {
+    return event.decision.turnId;
+  }
+  if (event.type === "memory_retrieved") {
+    return event.trace.turnId;
+  }
+  return event.turnId;
 }
 
 function parseQualityDecision(value: unknown): Extract<RuntimeEvent, { type: "quality_resolved" }>["decision"] {
@@ -731,10 +992,14 @@ function validateProtocolVersion(object: Record<string, unknown>): void {
 
 function requireRequestId(object: Record<string, unknown>): string {
   const requestId = requireString(object, "request_id");
-  if (!isCanonicalRequestId(requestId)) {
+  requireCanonicalRequestIdValue(requestId);
+  return requestId;
+}
+
+function requireCanonicalRequestIdValue(value: unknown): asserts value is string {
+  if (typeof value !== "string" || !isCanonicalRequestId(value)) {
     throw new ProtocolError("request identifier must be non-empty and at most 64 bytes");
   }
-  return requestId;
 }
 
 function isCanonicalRequestId(value: string): boolean {
@@ -805,28 +1070,116 @@ function requireStringArray(object: Record<string, unknown>, key: string): strin
 
 function requireCapabilities(object: Record<string, unknown>): RuntimeStatus["capabilities"] {
   const capabilities = requireStringArray(object, "capabilities");
-  if (
-    (capabilities.length !== 1 || capabilities[0] !== "text")
-    && (capabilities.length !== 2 || capabilities[0] !== "text" || capabilities[1] !== "memory_inspection")
-  ) {
-    throw new ProtocolError("capabilities has an unsupported value");
+  const canonical = capabilities.join(",");
+  switch (canonical) {
+    case "text":
+      return ["text"];
+    case "text,memory_inspection":
+      return ["text", "memory_inspection"];
+    case "text,voice_session":
+      return ["text", "voice_session"];
+    case "text,memory_inspection,voice_session":
+      return ["text", "memory_inspection", "voice_session"];
+    default:
+      throw new ProtocolError("capabilities has an unsupported value");
   }
-  return capabilities.length === 1 ? ["text"] : ["text", "memory_inspection"];
 }
 
 function validateRuntimeMemoryStatus(
   memoryEnabled: boolean,
   memoryLocation: RuntimeStatus["memoryLocation"],
   capabilities: RuntimeStatus["capabilities"],
+  components: RuntimeComponentDescriptor[],
 ): void {
+  const memoryCapability = capabilities.some((capability) => capability === "memory_inspection");
+  const memoryComponents = components.filter((component) => component.kind === "memory").length;
   const disabled = !memoryEnabled
     && memoryLocation === null
-    && capabilities.length === 1;
+    && !memoryCapability
+    && memoryComponents === 0;
   const inspectableLocal = memoryEnabled
     && memoryLocation === "local"
-    && capabilities.length === 2;
+    && memoryCapability
+    && memoryComponents === 1;
   if (!disabled && !inspectableLocal) {
     throw new ProtocolError("runtime memory status is incoherent");
+  }
+}
+
+function requireRuntimeComponents(
+  object: Record<string, unknown>,
+): RuntimeComponentDescriptor[] {
+  const value = object.components;
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_COMPONENT_DESCRIPTORS) {
+    throw new ProtocolError("runtime status components has an unsupported value");
+  }
+  const ranks: Record<RuntimeComponentDescriptor["kind"], number> = {
+    speech_recognition: 0,
+    language_model: 1,
+    speech_synthesis: 2,
+    audio_io: 3,
+    tool: 4,
+    memory: 5,
+    telemetry: 6,
+  };
+  let previousRank = -1;
+  return value.map((item) => {
+    const component = requireRecord(item, "runtime component");
+    requireExactKeys(component, ["kind", "execution_location", "provider_label"]);
+    const kind = requireOneOf(
+      component,
+      "kind",
+      Object.keys(ranks) as RuntimeComponentDescriptor["kind"][],
+    );
+    const rank = ranks[kind];
+    if (rank < previousRank) {
+      throw new ProtocolError("runtime status components must use canonical order");
+    }
+    previousRank = rank;
+    const providerLabel = requireString(component, "provider_label");
+    if (providerLabel.trim() !== providerLabel || providerLabel.length === 0) {
+      throw new ProtocolError("runtime component provider_label must be non-empty and trimmed");
+    }
+    requireMaximumUtf8Bytes(providerLabel, MAX_PROVIDER_LABEL_BYTES, "runtime component provider_label");
+    return {
+      kind,
+      executionLocation: requireOneOf(component, "execution_location", ["local", "remote"] as const),
+      providerLabel,
+    };
+  });
+}
+
+function validateRuntimeStatusComponents(
+  capabilities: RuntimeStatus["capabilities"],
+  components: RuntimeComponentDescriptor[],
+): void {
+  const voiceCapability = capabilities.some((capability) => capability === "voice_session");
+  if (
+    components.some((component) => component.executionLocation !== "local")
+    || components.filter((component) => component.kind === "language_model").length !== 1
+    || components.some((component) => component.kind === "telemetry")
+  ) {
+    throw new ProtocolError("runtime status components are incoherent");
+  }
+  if (voiceCapability) {
+    validateVoiceComponents(components);
+  } else if (components.some((component) =>
+    component.kind === "speech_recognition"
+    || component.kind === "speech_synthesis"
+    || component.kind === "audio_io"
+  )) {
+    throw new ProtocolError("runtime status components are incoherent");
+  }
+}
+
+function validateVoiceComponents(components: RuntimeComponentDescriptor[]): void {
+  for (const required of ["speech_recognition", "language_model", "speech_synthesis", "audio_io"] as const) {
+    if (components.filter((component) => component.kind === required).length !== 1) {
+      throw new ProtocolError("voice components are incoherent");
+    }
+  }
+  if (components.some((component) => component.executionLocation !== "local")) {
+    throw new ProtocolError("voice components must be local");
   }
 }
 

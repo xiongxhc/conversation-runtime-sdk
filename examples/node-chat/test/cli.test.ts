@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import test from "node:test";
+import { setImmediate } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -88,6 +89,61 @@ test("maps the first active SIGINT to exactly one interruption", async () => {
   assert.equal(transport.commands("interrupt_turn").length, 1);
   assert.match(fixture.output.text, /\[cancelled\]/);
   assert.doesNotMatch(fixture.diagnostics.text, /interrupt this turn/);
+});
+
+test("queues one SIGINT while turn allocation is pending", async () => {
+  const transport = new ScriptedTransport("hold-start");
+  const fixture = chatFixture(transport);
+  const running = runChat(validArguments, fixture.io, fixture.dependencies);
+  fixture.input.write("pending allocation\n");
+  await transport.waitFor("start_turn");
+  await setImmediate();
+
+  fixture.signals.emit("SIGINT");
+  assert.equal(transport.commands("interrupt_turn").length, 0);
+  transport.releaseStart();
+  await transport.waitFor("interrupt_turn");
+  await waitForOutput(fixture.output, "[cancelled]");
+  fixture.input.write("second turn\n");
+  await waitForOutput(fixture.output, "[completed]");
+  fixture.input.end();
+
+  assert.equal(await running, 0);
+  assert.equal(transport.commands("interrupt_turn").length, 1);
+  assert.equal((fixture.output.text.match(/\[cancelled\]/g) ?? []).length, 1);
+  assert.equal((fixture.output.text.match(/\[completed\]/g) ?? []).length, 1);
+  assert.equal(transport.commands("start_turn").length, 2);
+});
+
+test("second SIGINT closes while turn allocation is pending", async () => {
+  const transport = new ScriptedTransport("hold-start");
+  const fixture = chatFixture(transport);
+  const running = runChat(validArguments, fixture.io, fixture.dependencies);
+  fixture.input.write("pending allocation\n");
+  await transport.waitFor("start_turn");
+  await setImmediate();
+
+  fixture.signals.emit("SIGINT");
+  fixture.signals.emit("SIGINT");
+
+  assert.equal(await running, 0);
+  assert.equal(transport.commands("interrupt_turn").length, 0);
+  assert.equal(transport.closeCount, 1);
+});
+
+test("EOF closes while turn allocation is pending", async () => {
+  const transport = new ScriptedTransport("hold-start");
+  const fixture = chatFixture(transport);
+  const running = runChat(validArguments, fixture.io, fixture.dependencies);
+  fixture.input.write("pending allocation\n");
+  await transport.waitFor("start_turn");
+  await setImmediate();
+
+  fixture.input.end();
+
+  assert.equal(await running, 0);
+  assert.equal(transport.commands("interrupt_turn").length, 0);
+  assert.equal(transport.closeCount, 1);
 });
 
 test("closes an active gateway on a second SIGINT without sending another interruption", async () => {
@@ -286,7 +342,7 @@ test("active EOF closes a compiled Rust gateway with a stalled provider", { time
   });
 });
 
-type Script = "complete" | "cancel-on-interrupt" | "stall-after-interrupt" | "fail-turn";
+type Script = "complete" | "cancel-on-interrupt" | "stall-after-interrupt" | "fail-turn" | "hold-start";
 
 type ProviderScript = "complete" | "stall";
 
@@ -373,11 +429,13 @@ function writeProviderRecord(response: ServerResponse, value: unknown): void {
 }
 
 function gatewayConfig(port: number): string {
-  return `schema_version = 1
+  return `schema_version = 2
 privacy_mode = "local-only"
 
 [language]
 backend = "ollama-compatible"
+execution = "local"
+provider = "local-language"
 endpoint = "http://127.0.0.1:${port}"
 model = "fixture-model"
 thinking = false
@@ -454,10 +512,22 @@ function withDeadline<T>(operation: Promise<T>, milliseconds: number, message: s
   });
 }
 
+async function waitForOutput(output: TextSink, expected: string): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (output.text.includes(expected)) {
+      return;
+    }
+    await setImmediate();
+  }
+  throw new Error(`chat output did not contain ${expected}`);
+}
+
 class ScriptedTransport implements RuntimeTransport {
   private readonly inbox = new AsyncChannel<unknown>();
   private readonly waiters = new Map<ClientCommand["type"], Array<() => void>>();
   private turnCounter = 0n;
+  private heldStart: Extract<ClientCommand, { type: "start_turn" }> | undefined;
+  private startReleased = false;
   readonly messages = this.inbox;
   readonly sent: ClientCommand[] = [];
   closeCount = 0;
@@ -501,7 +571,21 @@ class ScriptedTransport implements RuntimeTransport {
     });
   }
 
+  releaseStart(): void {
+    const command = this.heldStart;
+    if (!command) {
+      throw new Error("no start command is awaiting allocation");
+    }
+    this.heldStart = undefined;
+    this.startReleased = true;
+    queueMicrotask(() => this.respond(command));
+  }
+
   private respond(command: ClientCommand): void {
+    if (command.type === "start_turn" && this.script === "hold-start" && !this.startReleased) {
+      this.heldStart = command;
+      return;
+    }
     this.inbox.push({
       type: "command_accepted",
       protocol_version: 3,
@@ -518,7 +602,7 @@ class ScriptedTransport implements RuntimeTransport {
       return;
     }
     if (command.type === "interrupt_turn") {
-      if (this.script === "cancel-on-interrupt") {
+      if (this.script === "cancel-on-interrupt" || this.script === "hold-start") {
         this.inbox.push(runtimeEvent({
           type: "turn_cancelled",
           turn_id: command.turnId.toString(),
@@ -536,7 +620,7 @@ class ScriptedTransport implements RuntimeTransport {
       request_id: command.requestId,
       turn_id: turnId.toString(),
     }));
-    if (this.script === "complete") {
+    if (this.script === "complete" || (this.script === "hold-start" && turnId > 1n)) {
       const deltas = turnId === 1n ? ["你", "好🙂"] : ["مرح", "با"];
       for (const delta of deltas) {
         this.inbox.push(runtimeEvent({

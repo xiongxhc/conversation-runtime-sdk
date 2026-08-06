@@ -158,7 +158,7 @@ async function withGateway(
   const configPath = join(directory, "gateway.toml");
   const program = `#!/usr/bin/env node
 import { writeFileSync } from 'node:fs';
-const status = { transport: 'stdio', privacy_mode: 'local_only', language_location: 'local', model_id: 'local-model', memory_enabled: false, memory_location: null, telemetry_enabled: false, capabilities: ['text'] };
+const status = { transport: 'stdio', privacy_mode: 'local_only', language_location: 'local', model_id: 'local-model', memory_enabled: false, memory_location: null, telemetry_enabled: false, capabilities: ['text'], components: [{ kind: 'language_model', execution_location: 'local', provider_label: 'Local language' }] };
 const emit = (value) => { const payload = Buffer.from(JSON.stringify(value)); const header = Buffer.alloc(4); header.writeUInt32BE(payload.length); process.stdout.write(Buffer.concat([header, payload])); };
 ${body}
 `;
@@ -201,6 +201,9 @@ function framedReady(): Buffer {
     memory_location: null,
     telemetry_enabled: false,
     capabilities: ["text"],
+    components: [
+      { kind: "language_model", execution_location: "local", provider_label: "Local language" },
+    ],
   } }));
   const header = Buffer.alloc(4);
   header.writeUInt32BE(payload.length);

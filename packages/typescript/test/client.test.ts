@@ -14,6 +14,7 @@ const status: RuntimeStatus = {
   memoryLocation: null,
   telemetryEnabled: false,
   capabilities: ["text"],
+  components: [{ kind: "language_model", executionLocation: "local", providerLabel: "Local language" }],
 };
 
 test("connects, correlates status, and streams an accepted turn", async () => {
@@ -49,7 +50,7 @@ test("connects, correlates status, and streams an accepted turn", async () => {
   transport.push(event("turn_completed", turn.turnId));
 
   assert.deepEqual(await collect(turn.events), [
-    { type: "turn_started", turnId: 41n },
+    { type: "turn_started", requestId: "request-start", turnId: 41n },
     { type: "text_delta", turnId: 41n, delta: "hello" },
     { type: "turn_completed", turnId: 41n },
   ]);
@@ -78,7 +79,7 @@ test("resolves interruption after acceptance and retains the turn until terminal
   transport.push(event("turn_cancelled", turn.turnId));
 
   assert.deepEqual(await collect(turn.events), [
-    { type: "turn_started", turnId: 1n },
+    { type: "turn_started", requestId: "request-start", turnId: 1n },
     { type: "turn_cancelled", turnId: 1n },
   ]);
   await client.client.close();
@@ -326,6 +327,10 @@ test("preserves client health after a rejected memory request", async () => {
     memoryEnabled: true,
     memoryLocation: "local",
     capabilities: ["text", "memory_inspection"],
+    components: [
+      ...status.components,
+      { kind: "memory", executionLocation: "local", providerLabel: "Local memory" },
+    ],
   });
   await connected.client.close();
 });
@@ -605,7 +610,9 @@ function event(type: "turn_started" | "turn_completed" | "turn_cancelled" | "tex
     event:
       type === "text_delta"
         ? { type, turn_id: turnId.toString(), delta }
-        : { type, turn_id: turnId.toString() },
+        : type === "turn_started"
+          ? { type, request_id: "request-start", turn_id: turnId.toString() }
+          : { type, turn_id: turnId.toString() },
   };
 }
 
@@ -619,6 +626,9 @@ function wireStatus(): Record<string, unknown> {
     memory_location: null,
     telemetry_enabled: false,
     capabilities: ["text"],
+    components: [
+      { kind: "language_model", execution_location: "local", provider_label: "Local language" },
+    ],
   };
 }
 
@@ -628,6 +638,10 @@ function wireStatusV2(): Record<string, unknown> {
     memory_enabled: true,
     memory_location: "local",
     capabilities: ["text", "memory_inspection"],
+    components: [
+      { kind: "language_model", execution_location: "local", provider_label: "Local language" },
+      { kind: "memory", execution_location: "local", provider_label: "Local memory" },
+    ],
   };
 }
 

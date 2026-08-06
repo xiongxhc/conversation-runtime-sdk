@@ -257,7 +257,7 @@ async fn run_voice_session(
     privacy: PrivacySummary,
     context: ConversationContext,
     adapters: VoiceSessionAdapters,
-    commands: mpsc::Receiver<SessionCommand>,
+    mut commands: mpsc::Receiver<SessionCommand>,
     events: mpsc::Sender<VoiceSessionEvent>,
     cancellation: CancellationToken,
 ) -> VoiceSessionEvent {
@@ -274,24 +274,33 @@ async fn run_voice_session(
     {
         Ok(session) => session,
         Err(error) => {
-            return session_failure(
-                session_id,
-                adapter_runtime_error(RuntimeStage::VoiceSidecar, error),
-            );
+            return session_failure(session_id, voice_input_error(error));
         }
     };
 
-    let input_events = match input.start(session_id, cancellation.clone()).await {
-        Ok(input_events) => input_events,
-        Err(error) => {
+    let input_events = tokio::select! {
+        biased;
+        shutdown = wait_for_startup_shutdown(&mut commands) => {
             cancellation.cancel();
-            if let Err(cleanup_error) = await_completion_cleanup(completion).await {
-                return session_failure(session_id, cleanup_error);
+            let cleanup_error = await_completion_cleanup(completion).await.err();
+            let _ = shutdown.send(());
+            return match cleanup_error {
+                Some(error) => session_failure(session_id, error),
+                None => VoiceSessionEvent::SessionEnded { session_id },
+            };
+        }
+        result = input.start(session_id, cancellation.clone()) => match result {
+            Ok(input_events) => input_events,
+            Err(error) => {
+                cancellation.cancel();
+                if let Err(cleanup_error) = await_completion_cleanup(completion).await {
+                    return session_failure(session_id, cleanup_error);
+                }
+                return session_failure(
+                    session_id,
+                    voice_input_error(error),
+                );
             }
-            return session_failure(
-                session_id,
-                adapter_runtime_error(RuntimeStage::AudioCapture, error),
-            );
         }
     };
 
@@ -1499,6 +1508,26 @@ fn cleanup_timeout_error(operation: &'static str) -> RuntimeError {
     runtime_error(format!(
         "voice session cleanup timed out during {operation}"
     ))
+}
+
+async fn wait_for_startup_shutdown(
+    commands: &mut mpsc::Receiver<SessionCommand>,
+) -> oneshot::Sender<()> {
+    loop {
+        match commands.recv().await {
+            Some(SessionCommand::BargeIn { completion, .. }) => {
+                let _ = completion.send(());
+            }
+            Some(SessionCommand::PauseCapture { completion }) => {
+                let _ = completion.send(Err(runtime_error("voice capture is not active")));
+            }
+            Some(SessionCommand::ResumeCapture { completion }) => {
+                let _ = completion.send(Err(runtime_error("voice capture is not paused")));
+            }
+            Some(SessionCommand::Shutdown { completion }) => return completion,
+            None => return closed_completion(),
+        }
+    }
 }
 
 fn closed_completion() -> oneshot::Sender<()> {

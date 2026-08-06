@@ -342,6 +342,39 @@ async fn session_started_waits_until_capture_start_completes() {
 }
 
 #[tokio::test]
+async fn shutdown_during_capture_start_cancels_start_and_completes() {
+    let input = Arc::new(DelayedVoiceInput::new());
+    let factory = Arc::new(DelayedVoiceIoFactory {
+        input: input.clone(),
+    });
+    let runtime = VoiceSessionRuntime::new(
+        conversation_context(),
+        VoiceSessionAdapters::new(
+            factory,
+            Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new())),
+            Arc::new(MockStreamingSpeechSynthesizer::new([])),
+        ),
+    );
+    let mut events = runtime.start(policy()).await.unwrap();
+    timeout(Duration::from_secs(1), input.wait_until_starting())
+        .await
+        .expect("voice input start was not attempted");
+
+    timeout(Duration::from_secs(1), runtime.shutdown())
+        .await
+        .expect("shutdown blocked behind capture-start acknowledgement")
+        .unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("shutdown did not publish a terminal event"),
+        Some(VoiceSessionEvent::SessionEnded {
+            session_id: SESSION_ID,
+        })
+    );
+}
+
+#[tokio::test]
 async fn pause_and_resume_publish_only_after_adapter_acknowledgement() {
     let harness = VoiceSessionHarness::new();
     let capture = harness.factory.capture();

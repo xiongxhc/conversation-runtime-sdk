@@ -814,7 +814,11 @@ fn sigint_during_playback_flushes_and_cleans_the_sidecar() {
 
 #[test]
 fn malformed_permission_and_crash_failures_reap_the_sidecar() {
-    for scenario in ["malformed-frame", "permission-denied", "crash"] {
+    for (scenario, expected_stage) in [
+        ("malformed-frame", "voice_sidecar"),
+        ("permission-denied", "audio_capture"),
+        ("crash", "voice_sidecar"),
+    ] {
         let harness = CliHarness::new(scenario);
         let config = harness.valid_config("http://127.0.0.1:9", "http://127.0.0.1:9/v1");
         let output = harness.run_once(&config);
@@ -826,7 +830,9 @@ fn malformed_permission_and_crash_failures_reap_the_sidecar() {
             output.stderr_text()
         );
         assert!(
-            output.stderr_text().contains("stage=voice_sidecar"),
+            output
+                .stderr_text()
+                .contains(&format!("stage={expected_stage}")),
             "{scenario}: {}",
             output.stderr_text()
         );

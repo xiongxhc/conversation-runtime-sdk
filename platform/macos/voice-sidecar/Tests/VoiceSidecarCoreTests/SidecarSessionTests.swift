@@ -51,7 +51,7 @@ func injectedServicesStartOnlyAfterStartCapture() async throws {
     await callLog.clear()
 
     try await session.handleControl(
-        ChildFrame(control: .startCapture(sessionID: 7))
+        ChildFrame(control: .startCapture(sessionID: 7, operationID: 1))
     )
 
     let expected = SidecarConfiguration(
@@ -68,6 +68,52 @@ func injectedServicesStartOnlyAfterStartCapture() async throws {
                 "recognition.prepare",
                 "audio.start",
                 "recognition.start",
+            ]
+    )
+}
+
+@Test
+func pauseStopsCaptureBeforeAcknowledgementAndResumeRestartsIt() async throws {
+    let callLog = CallLog()
+    let audio = RecordingAudioService(callLog: callLog)
+    let recognition = RecordingRecognitionService(callLog: callLog)
+    let events = RecordingEventSink(callLog: callLog)
+    let session = SidecarSession(
+        audioService: audio,
+        recognitionService: recognition,
+        playbackService: RecordingPlaybackService(),
+        eventSink: events
+    )
+    try await startSession(session)
+    try await session.handleControl(
+        ChildFrame(control: .startCapture(sessionID: 7, operationID: 1))
+    )
+    await callLog.clear()
+
+    try await session.handleControl(
+        ChildFrame(control: .pauseCapture(sessionID: 7, operationID: 2))
+    )
+    #expect(await audio.pauseCaptureCount == 1)
+    #expect(
+        await callLog.entries
+            == ["recognition.stop", "audio.pause", "event.capturePaused"]
+    )
+
+    await callLog.clear()
+    try await session.handleControl(
+        ChildFrame(control: .resumeCapture(sessionID: 7, operationID: 3))
+    )
+    #expect(await audio.resumeCaptureCount == 1)
+    #expect(
+        await callLog.entries
+            == ["audio.resume", "recognition.start", "event.captureResumed"]
+    )
+    #expect(
+        await events.frames.suffix(3)
+            == [
+                ChildFrame(control: .captureStarted(sessionID: 7, operationID: 1)),
+                ChildFrame(control: .capturePaused(sessionID: 7, operationID: 2)),
+                ChildFrame(control: .captureResumed(sessionID: 7, operationID: 3)),
             ]
     )
 }
@@ -251,6 +297,7 @@ func suspendedEnqueueCannotResurrectFlushedGenerationOrEmitLateAccepted() async 
         await events.frames
             == [
                 ChildFrame(control: .ready(sessionID: 7)),
+                ChildFrame(control: .captureStarted(sessionID: 7, operationID: 1)),
                 ChildFrame(
                     control: .playbackFlushed(
                         sessionID: 7,
@@ -417,7 +464,7 @@ func playbackInactiveSpeechCannotTriggerLocalFlush() async throws {
     )
 
     #expect(await playback.flushedGenerations.isEmpty)
-    #expect(await events.frames.count == 1)
+    #expect(await events.frames.count == 2)
 }
 
 @Test
@@ -535,6 +582,7 @@ func suspendedFlushAndShutdownCannotInterleaveDuplicateLifecycle() async throws 
         await events.frames
             == [
                 ChildFrame(control: .ready(sessionID: 7)),
+                ChildFrame(control: .captureStarted(sessionID: 7, operationID: 1)),
                 ChildFrame(
                     control: .playbackFlushed(
                         sessionID: 7,
@@ -567,7 +615,7 @@ func startAndShutdownCannotInterleaveDuplicateLifecycle() async throws {
 
     let firstStart = Task {
         try await session.handleControl(
-            ChildFrame(control: .startCapture(sessionID: 7))
+            ChildFrame(control: .startCapture(sessionID: 7, operationID: 1))
         )
     }
     await audio.waitUntilStarted()
@@ -576,7 +624,7 @@ func startAndShutdownCannotInterleaveDuplicateLifecycle() async throws {
     let duplicateStart = Task { () -> SidecarSessionError? in
         do {
             try await session.handleControl(
-                ChildFrame(control: .startCapture(sessionID: 7))
+                ChildFrame(control: .startCapture(sessionID: 7, operationID: 1))
             )
             await duplicateDone.complete()
             return nil
@@ -622,7 +670,13 @@ func startAndShutdownCannotInterleaveDuplicateLifecycle() async throws {
     #expect(await duplicateDone.isComplete)
     #expect(await audio.startCount == 1)
     #expect(await recognition.configurations.count == 1)
-    #expect(await events.frames == [ChildFrame(control: .ready(sessionID: 7))])
+    #expect(
+        await events.frames
+            == [
+                ChildFrame(control: .ready(sessionID: 7)),
+                ChildFrame(control: .captureStarted(sessionID: 7, operationID: 1)),
+            ]
+    )
 
     try await session.handleControl(
         ChildFrame(control: .shutdown(sessionID: 7))
@@ -721,7 +775,7 @@ func partialAudioStartFailureStopsAttemptedServiceOnceBeforeFailure() async thro
 
     do {
         try await session.handleControl(
-            ChildFrame(control: .startCapture(sessionID: 7))
+            ChildFrame(control: .startCapture(sessionID: 7, operationID: 1))
         )
         Issue.record("expected partial audio startup failure")
     } catch let error as SidecarServiceFailure {
@@ -769,7 +823,7 @@ func recognitionPreflightFailureDoesNotActivateCapture() async throws {
 
     do {
         try await session.handleControl(
-            ChildFrame(control: .startCapture(sessionID: 7))
+            ChildFrame(control: .startCapture(sessionID: 7, operationID: 1))
         )
         Issue.record("expected recognition preflight failure")
     } catch let error as SidecarServiceFailure {
@@ -816,7 +870,7 @@ func partialRecognitionStartFailureCleansUpInReverseOrderOnce() async throws {
 
     do {
         try await session.handleControl(
-            ChildFrame(control: .startCapture(sessionID: 7))
+            ChildFrame(control: .startCapture(sessionID: 7, operationID: 1))
         )
         Issue.record("expected partial recognition startup failure")
     } catch let error as SidecarServiceFailure {
@@ -894,6 +948,6 @@ private func startAndCapture(
         speechStartMilliseconds: speechStartMilliseconds
     )
     try await session.handleControl(
-        ChildFrame(control: .startCapture(sessionID: 7))
+        ChildFrame(control: .startCapture(sessionID: 7, operationID: 1))
     )
 }

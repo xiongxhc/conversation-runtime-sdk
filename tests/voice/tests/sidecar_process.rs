@@ -253,6 +253,106 @@ async fn voice_input_receives_activity_and_partial_final_hypotheses() {
 }
 
 #[tokio::test]
+async fn capture_start_and_pause_resolve_only_after_exact_acknowledgements() {
+    let harness = FakeSidecarHarness::new("delay-capture-acks");
+    let cancellation = CancellationToken::new();
+    let session = harness.start(cancellation.clone()).await.unwrap();
+
+    let starting = session.input.start(SESSION_ID, CancellationToken::new());
+    tokio::pin!(starting);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut starting)
+            .await
+            .is_err()
+    );
+    let _input = starting.await.unwrap();
+
+    let pausing = session.capture.pause(SESSION_ID, CancellationToken::new());
+    tokio::pin!(pausing);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut pausing)
+            .await
+            .is_err()
+    );
+    pausing.await.unwrap();
+
+    session
+        .capture
+        .resume(SESSION_ID, CancellationToken::new())
+        .await
+        .unwrap();
+    cancellation.cancel();
+    assert!(await_completion(session.completion).await.is_err());
+    harness.assert_process_gone().await;
+}
+
+#[tokio::test]
+async fn wrong_capture_acknowledgement_fails_the_session() {
+    for scenario in ["wrong-pause-operation", "wrong-pause-session"] {
+        let harness = FakeSidecarHarness::new(scenario);
+        let cancellation = CancellationToken::new();
+        let session = harness.start(cancellation).await.unwrap();
+        let _input = session
+            .input
+            .start(SESSION_ID, CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert!(session
+            .capture
+            .pause(SESSION_ID, CancellationToken::new())
+            .await
+            .is_err());
+        assert!(await_completion(session.completion).await.is_err());
+        harness.assert_process_gone().await;
+    }
+}
+
+#[tokio::test]
+async fn capture_control_cancellation_releases_its_waiter_and_reaps() {
+    let harness = FakeSidecarHarness::new("hold-pause-ack");
+    let cancellation = CancellationToken::new();
+    let session = harness.start(cancellation.clone()).await.unwrap();
+    let _input = session
+        .input
+        .start(SESSION_ID, CancellationToken::new())
+        .await
+        .unwrap();
+    let operation_cancellation = CancellationToken::new();
+    let pausing = session
+        .capture
+        .pause(SESSION_ID, operation_cancellation.clone());
+    tokio::pin!(pausing);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    operation_cancellation.cancel();
+
+    assert!(pausing.await.is_err());
+    cancellation.cancel();
+    assert!(await_completion(session.completion).await.is_err());
+    harness.assert_process_gone().await;
+}
+
+#[tokio::test]
+async fn capture_start_cancellation_cancels_the_session_and_reaps() {
+    let harness = FakeSidecarHarness::new("hold-start-capture-ack");
+    let session_cancellation = CancellationToken::new();
+    let session = harness.start(session_cancellation).await.unwrap();
+    let start_cancellation = CancellationToken::new();
+    let starting = session.input.start(SESSION_ID, start_cancellation.clone());
+    tokio::pin!(starting);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut starting)
+            .await
+            .is_err()
+    );
+    start_cancellation.cancel();
+
+    assert!(starting.await.is_err());
+    assert!(await_completion(session.completion).await.is_err());
+    harness.assert_process_gone().await;
+}
+
+#[tokio::test]
 async fn recognition_failure_keeps_real_factory_completion_alive() {
     let harness = FakeSidecarHarness::new("recognition-failure-nonfatal");
     let cancellation = CancellationToken::new();

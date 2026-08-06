@@ -8,8 +8,9 @@ use conversation_memory::{
 };
 use conversation_model_adapters::{
     AdapterError, AdapterFuture, AudioFrame, ContinuousAudioOutput, MockContinuousAudioOutput,
-    MockGenerationLanguageModel, MockStreamingSpeechSynthesizer, PcmFormat, PcmSampleFormat,
-    PlaybackReceipt, VoiceInput, VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
+    MockGenerationLanguageModel, MockStreamingSpeechSynthesizer, MockVoiceCaptureControl,
+    PcmFormat, PcmSampleFormat, PlaybackReceipt, VoiceCaptureControl, VoiceInput, VoiceInputEvent,
+    VoiceIoFactory, VoiceIoSession,
 };
 use conversation_protocol::{
     ComponentDescriptor, ComponentKind, ExecutionLocation, GenerationId, MemoryConfidence,
@@ -306,6 +307,247 @@ async fn rejected_policy_never_starts_the_voice_factory() {
     );
     assert_eq!(harness.factory.start_count(), 0);
     assert!(!harness.factory.input_started.load(Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn session_started_waits_until_capture_start_completes() {
+    let input = Arc::new(DelayedVoiceInput::new());
+    let factory = Arc::new(DelayedVoiceIoFactory {
+        input: input.clone(),
+    });
+    let runtime = VoiceSessionRuntime::new(
+        conversation_context(),
+        VoiceSessionAdapters::new(
+            factory,
+            Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new())),
+            Arc::new(MockStreamingSpeechSynthesizer::new([])),
+        ),
+    );
+    let mut events = runtime.start(policy()).await.unwrap();
+    timeout(Duration::from_secs(1), input.wait_until_starting())
+        .await
+        .expect("voice input start was not attempted");
+
+    assert!(timeout(Duration::from_millis(20), events.recv())
+        .await
+        .is_err());
+
+    input.release();
+    assert_session_started(
+        timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("session start acknowledgement was not published"),
+    );
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn pause_and_resume_publish_only_after_adapter_acknowledgement() {
+    let harness = VoiceSessionHarness::new();
+    let capture = harness.factory.capture();
+    capture.gate_pause.store(true, Ordering::Release);
+    capture.gate_resume.store(true, Ordering::Release);
+    let mut events = harness.start().await;
+    assert_session_started(events.recv().await);
+
+    let runtime = harness.runtime.clone();
+    let pause = tokio::spawn(async move { runtime.pause_capture().await });
+    capture.wait_for_pause_calls(1).await;
+    assert!(timeout(Duration::from_millis(20), events.recv())
+        .await
+        .is_err());
+    capture.pause_release.notify_one();
+    pause.await.unwrap().unwrap();
+    assert_eq!(
+        events.recv().await,
+        Some(VoiceSessionEvent::CapturePaused {
+            session_id: SESSION_ID,
+        })
+    );
+
+    let runtime = harness.runtime.clone();
+    let resume = tokio::spawn(async move { runtime.resume_capture().await });
+    capture.wait_for_resume_calls(1).await;
+    assert!(timeout(Duration::from_millis(20), events.recv())
+        .await
+        .is_err());
+    capture.resume_release.notify_one();
+    resume.await.unwrap().unwrap();
+    assert_eq!(
+        events.recv().await,
+        Some(VoiceSessionEvent::CaptureResumed {
+            session_id: SESSION_ID,
+        })
+    );
+
+    harness.shutdown(&mut events).await;
+}
+
+#[tokio::test]
+async fn repeated_capture_controls_are_rejected_without_state_change() {
+    let harness = VoiceSessionHarness::new();
+    let mut events = harness.start().await;
+    assert_session_started(events.recv().await);
+
+    harness.runtime.pause_capture().await.unwrap();
+    assert!(harness.runtime.pause_capture().await.is_err());
+    assert_eq!(
+        events.recv().await,
+        Some(VoiceSessionEvent::CapturePaused {
+            session_id: SESSION_ID,
+        })
+    );
+    assert!(timeout(Duration::from_millis(20), events.recv())
+        .await
+        .is_err());
+
+    harness.runtime.resume_capture().await.unwrap();
+    assert!(harness.runtime.resume_capture().await.is_err());
+    assert_eq!(
+        events.recv().await,
+        Some(VoiceSessionEvent::CaptureResumed {
+            session_id: SESSION_ID,
+        })
+    );
+    harness.shutdown(&mut events).await;
+}
+
+#[tokio::test]
+async fn shutdown_from_paused_state_completes_once() {
+    let harness = VoiceSessionHarness::new();
+    let mut events = harness.start().await;
+    assert_session_started(events.recv().await);
+    harness.runtime.pause_capture().await.unwrap();
+    assert!(matches!(
+        events.recv().await,
+        Some(VoiceSessionEvent::CapturePaused { .. })
+    ));
+
+    harness.shutdown(&mut events).await;
+}
+
+#[tokio::test]
+async fn dropping_the_session_cancels_a_pending_capture_control() {
+    let harness = VoiceSessionHarness::new();
+    let capture = harness.factory.capture();
+    capture.gate_pause.store(true, Ordering::Release);
+    let mut events = harness.start().await;
+    assert_session_started(events.recv().await);
+
+    let runtime = harness.runtime.clone();
+    let pause = tokio::spawn(async move { runtime.pause_capture().await });
+    capture.wait_for_pause_calls(1).await;
+    drop(events);
+
+    assert!(timeout(Duration::from_secs(1), pause)
+        .await
+        .expect("pause command did not finish")
+        .unwrap()
+        .is_err());
+    timeout(
+        Duration::from_secs(1),
+        harness.factory.wait_for_completion(),
+    )
+    .await
+    .expect("voice I/O completion did not finish");
+}
+
+#[tokio::test(start_paused = true)]
+async fn pause_during_an_active_turn_does_not_interrupt_the_turn() {
+    let harness = VoiceSessionHarness::with_playback();
+    let mut events = harness.start().await;
+    assert_session_started(events.recv().await);
+    harness.engine_final(1, "hello").await;
+    harness.speech_ended(0).await;
+    tokio::time::advance(Duration::from_millis(600)).await;
+    harness.wait_for_frame_count(1).await;
+
+    harness.runtime.pause_capture().await.unwrap();
+    let mut saw_paused = false;
+    while !saw_paused {
+        saw_paused = matches!(
+            timeout(Duration::from_secs(1), events.recv())
+                .await
+                .unwrap(),
+            Some(VoiceSessionEvent::CapturePaused { .. })
+        );
+    }
+    harness.release_playback_acceptance();
+    assert!(drain_until_turn_terminal(&mut events)
+        .await
+        .iter()
+        .any(|event| matches!(
+            event,
+            VoiceSessionEvent::Turn {
+                event: RuntimeEvent::TurnCompleted { .. },
+                ..
+            }
+        )));
+    harness.shutdown(&mut events).await;
+}
+
+#[tokio::test]
+async fn capture_resumes_after_a_typed_turn_uses_the_shared_context() {
+    let context = conversation_context();
+    let harness = VoiceSessionHarness::with_context_for_turn(
+        context.clone(),
+        Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new())),
+        TurnId::new(2),
+    );
+    let mut events = harness.start().await;
+    assert_session_started(events.recv().await);
+    harness.runtime.pause_capture().await.unwrap();
+    assert!(matches!(
+        events.recv().await,
+        Some(VoiceSessionEvent::CapturePaused { .. })
+    ));
+
+    let typed = TextTurnRuntime::new(
+        context,
+        Arc::new(MockGenerationLanguageModel::new(["typed answer"])),
+    )
+    .start_turn("typed while paused")
+    .await
+    .unwrap();
+    assert_eq!(typed.identity().turn_id(), TurnId::new(1));
+    drain_text_turn(typed.into_events()).await;
+
+    harness.runtime.resume_capture().await.unwrap();
+    assert!(matches!(
+        events.recv().await,
+        Some(VoiceSessionEvent::CaptureResumed { .. })
+    ));
+    harness.shutdown(&mut events).await;
+}
+
+#[tokio::test]
+async fn shutdown_cancels_an_in_flight_pause() {
+    let harness = VoiceSessionHarness::new();
+    let capture = harness.factory.capture();
+    capture.gate_pause.store(true, Ordering::Release);
+    let mut events = harness.start().await;
+    assert_session_started(events.recv().await);
+
+    let runtime = harness.runtime.clone();
+    let pause = tokio::spawn(async move { runtime.pause_capture().await });
+    capture.wait_for_pause_calls(1).await;
+    let runtime = harness.runtime.clone();
+    let shutdown = tokio::spawn(async move { runtime.shutdown().await });
+
+    assert!(timeout(Duration::from_secs(1), pause)
+        .await
+        .expect("pause did not cancel")
+        .unwrap()
+        .is_err());
+    timeout(Duration::from_secs(1), shutdown)
+        .await
+        .expect("shutdown did not complete")
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        events.recv().await,
+        Some(VoiceSessionEvent::SessionEnded { .. })
+    ));
 }
 
 struct RemoteMemoryProvider;
@@ -840,9 +1082,88 @@ impl VoiceSessionHarness {
 struct TestVoiceIoFactory {
     input: Arc<TestVoiceInput>,
     output: Arc<dyn ContinuousAudioOutput>,
+    capture: Arc<TestVoiceCaptureControl>,
     start_count: AtomicUsize,
     input_started: Arc<AtomicBool>,
     completion_finished: Arc<AtomicBool>,
+}
+
+struct DelayedVoiceIoFactory {
+    input: Arc<DelayedVoiceInput>,
+}
+
+impl VoiceIoFactory for DelayedVoiceIoFactory {
+    fn start<'a>(
+        &'a self,
+        _session_id: SessionId,
+        cancellation: CancellationToken,
+    ) -> AdapterFuture<'a, VoiceIoSession> {
+        Box::pin(async move {
+            Ok(VoiceIoSession {
+                input: self.input.clone(),
+                capture: Arc::new(MockVoiceCaptureControl::new()),
+                output: Arc::new(MockContinuousAudioOutput::new()),
+                completion: tokio::spawn(async move {
+                    cancellation.cancelled().await;
+                    Ok(())
+                }),
+            })
+        })
+    }
+}
+
+struct DelayedVoiceInput {
+    starting: AtomicBool,
+    starting_notify: Notify,
+    release: Notify,
+    sender: Mutex<Option<mpsc::Sender<Result<VoiceInputEvent, AdapterError>>>>,
+}
+
+impl DelayedVoiceInput {
+    fn new() -> Self {
+        Self {
+            starting: AtomicBool::new(false),
+            starting_notify: Notify::new(),
+            release: Notify::new(),
+            sender: Mutex::new(None),
+        }
+    }
+
+    async fn wait_until_starting(&self) {
+        while !self.starting.load(Ordering::Acquire) {
+            self.starting_notify.notified().await;
+        }
+    }
+
+    fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+impl VoiceInput for DelayedVoiceInput {
+    fn start<'a>(
+        &'a self,
+        _session_id: SessionId,
+        cancellation: CancellationToken,
+    ) -> AdapterFuture<'a, mpsc::Receiver<Result<VoiceInputEvent, AdapterError>>> {
+        Box::pin(async move {
+            self.starting.store(true, Ordering::Release);
+            self.starting_notify.notify_waiters();
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    return Err(AdapterError::new("voice input cancelled"));
+                }
+                _ = self.release.notified() => {}
+            }
+            let (sender, receiver) = mpsc::channel(1);
+            *self
+                .sender
+                .lock()
+                .expect("delayed input sender lock poisoned") = Some(sender);
+            Ok(receiver)
+        })
+    }
 }
 
 impl TestVoiceIoFactory {
@@ -858,6 +1179,7 @@ impl TestVoiceIoFactory {
                 started_notify: Notify::new(),
             }),
             output,
+            capture: Arc::new(TestVoiceCaptureControl::new()),
             start_count: AtomicUsize::new(0),
             input_started,
             completion_finished: Arc::new(AtomicBool::new(false)),
@@ -866,6 +1188,10 @@ impl TestVoiceIoFactory {
 
     fn start_count(&self) -> usize {
         self.start_count.load(Ordering::Acquire)
+    }
+
+    fn capture(&self) -> Arc<TestVoiceCaptureControl> {
+        self.capture.clone()
     }
 
     async fn wait_for_input_start(&self) {
@@ -892,6 +1218,7 @@ impl VoiceIoFactory for TestVoiceIoFactory {
             let completion_finished = Arc::clone(&self.completion_finished);
             Ok(VoiceIoSession {
                 input: self.input.clone(),
+                capture: self.capture.clone(),
                 output: self.output.clone(),
                 completion: tokio::spawn(async move {
                     cancellation.cancelled().await;
@@ -899,6 +1226,106 @@ impl VoiceIoFactory for TestVoiceIoFactory {
                     Ok(())
                 }),
             })
+        })
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum TestCaptureState {
+    Active,
+    Paused,
+}
+
+struct TestVoiceCaptureControl {
+    state: Mutex<TestCaptureState>,
+    pause_calls: AtomicUsize,
+    resume_calls: AtomicUsize,
+    pause_started: Notify,
+    resume_started: Notify,
+    pause_release: Notify,
+    resume_release: Notify,
+    gate_pause: AtomicBool,
+    gate_resume: AtomicBool,
+}
+
+impl TestVoiceCaptureControl {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(TestCaptureState::Active),
+            pause_calls: AtomicUsize::new(0),
+            resume_calls: AtomicUsize::new(0),
+            pause_started: Notify::new(),
+            resume_started: Notify::new(),
+            pause_release: Notify::new(),
+            resume_release: Notify::new(),
+            gate_pause: AtomicBool::new(false),
+            gate_resume: AtomicBool::new(false),
+        }
+    }
+
+    async fn wait_for_pause_calls(&self, expected: usize) {
+        while self.pause_calls.load(Ordering::Acquire) < expected {
+            self.pause_started.notified().await;
+        }
+    }
+
+    async fn wait_for_resume_calls(&self, expected: usize) {
+        while self.resume_calls.load(Ordering::Acquire) < expected {
+            self.resume_started.notified().await;
+        }
+    }
+}
+
+impl VoiceCaptureControl for TestVoiceCaptureControl {
+    fn pause<'a>(
+        &'a self,
+        _session_id: SessionId,
+        cancellation: CancellationToken,
+    ) -> AdapterFuture<'a, ()> {
+        Box::pin(async move {
+            self.pause_calls.fetch_add(1, Ordering::AcqRel);
+            self.pause_started.notify_waiters();
+            if self.gate_pause.load(Ordering::Acquire) {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => {
+                        return Err(AdapterError::new("capture pause cancelled"));
+                    }
+                    _ = self.pause_release.notified() => {}
+                }
+            }
+            let mut state = self.state.lock().expect("capture state lock poisoned");
+            if *state != TestCaptureState::Active {
+                return Err(AdapterError::new("capture is not active"));
+            }
+            *state = TestCaptureState::Paused;
+            Ok(())
+        })
+    }
+
+    fn resume<'a>(
+        &'a self,
+        _session_id: SessionId,
+        cancellation: CancellationToken,
+    ) -> AdapterFuture<'a, ()> {
+        Box::pin(async move {
+            self.resume_calls.fetch_add(1, Ordering::AcqRel);
+            self.resume_started.notify_waiters();
+            if self.gate_resume.load(Ordering::Acquire) {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => {
+                        return Err(AdapterError::new("capture resume cancelled"));
+                    }
+                    _ = self.resume_release.notified() => {}
+                }
+            }
+            let mut state = self.state.lock().expect("capture state lock poisoned");
+            if *state != TestCaptureState::Paused {
+                return Err(AdapterError::new("capture is not paused"));
+            }
+            *state = TestCaptureState::Active;
+            Ok(())
         })
     }
 }

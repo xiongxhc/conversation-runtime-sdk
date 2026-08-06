@@ -15,6 +15,7 @@ mod openai_compatible_streaming_speech;
 mod recognition;
 mod speech;
 mod streaming_speech;
+mod voice_capture_control;
 mod voice_input;
 mod voice_io;
 mod voice_mock;
@@ -56,11 +57,12 @@ pub use openai_compatible_streaming_speech::{
 pub use recognition::{RecognitionEvent, RecognitionHypothesis, SpeechRecognizer};
 pub use speech::{AudioFormat, SpeechRequest, SpeechSynthesizer, SynthesizedAudio};
 pub use streaming_speech::{StreamingSpeechRequest, StreamingSpeechSynthesizer};
+pub use voice_capture_control::VoiceCaptureControl;
 pub use voice_input::{VoiceInput, VoiceInputEvent};
 pub use voice_io::{VoiceIoFactory, VoiceIoSession};
 pub use voice_mock::{
     MockAudioCapture, MockContinuousAudioOutput, MockGenerationLanguageModel, MockSpeechRecognizer,
-    MockStreamingSpeechSynthesizer, MockVoiceInput, MockVoiceIoFactory,
+    MockStreamingSpeechSynthesizer, MockVoiceCaptureControl, MockVoiceInput, MockVoiceIoFactory,
 };
 pub use wav_pcm::WavPcmDecoder;
 

@@ -6,9 +6,10 @@ use std::time::Duration;
 
 use conversation_model_adapters::{
     AdapterError, AdapterFuture, AudioFrame, ContinuousAudioOutput, GenerationLanguageModel,
-    GenerationLanguageRequest, GenerationTextDelta, PcmFormat, PcmSampleFormat, PlaybackReceipt,
-    RecognitionEvent, RecognitionHypothesis, StreamingSpeechRequest, StreamingSpeechSynthesizer,
-    VoiceInput, VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
+    GenerationLanguageRequest, GenerationTextDelta, MockVoiceCaptureControl, PcmFormat,
+    PcmSampleFormat, PlaybackReceipt, RecognitionEvent, RecognitionHypothesis,
+    StreamingSpeechRequest, StreamingSpeechSynthesizer, VoiceInput, VoiceInputEvent,
+    VoiceIoFactory, VoiceIoSession,
 };
 use conversation_protocol::{
     ComponentDescriptor, ComponentKind, ConversationMode, ExecutionLocation, GenerationId,
@@ -1133,6 +1134,7 @@ impl VoiceIoFactory for TestVoiceIoFactory {
             let stall_completion = self.stall_completion;
             Ok(VoiceIoSession {
                 input: self.input.clone(),
+                capture: Arc::new(MockVoiceCaptureControl::new()),
                 output: self.output.clone(),
                 completion: tokio::spawn(async move {
                     let _finished = CompletionFinished(completion_finished);

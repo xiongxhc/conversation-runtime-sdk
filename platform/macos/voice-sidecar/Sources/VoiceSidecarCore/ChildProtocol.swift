@@ -5,6 +5,8 @@ public enum ChildFrameKind: UInt16, CaseIterable, Equatable, Sendable {
     case startCapture = 0x0002
     case flushGeneration = 0x0003
     case shutdown = 0x0004
+    case pauseCapture = 0x0005
+    case resumeCapture = 0x0006
     case audioFrame = 0x0100
     case ready = 0x8001
     case voiceActivity = 0x8002
@@ -12,6 +14,9 @@ public enum ChildFrameKind: UInt16, CaseIterable, Equatable, Sendable {
     case playbackAccepted = 0x8004
     case playbackRendered = 0x8005
     case playbackFlushed = 0x8006
+    case captureStarted = 0x8007
+    case capturePaused = 0x8008
+    case captureResumed = 0x8009
     case failure = 0x80FE
     case shutdownComplete = 0x80FF
 
@@ -28,7 +33,9 @@ public enum ChildControl: Equatable, Sendable {
         speechStartMilliseconds: UInt64,
         finalSilenceMilliseconds: UInt64
     )
-    case startCapture(sessionID: UInt64)
+    case startCapture(sessionID: UInt64, operationID: UInt64)
+    case pauseCapture(sessionID: UInt64, operationID: UInt64)
+    case resumeCapture(sessionID: UInt64, operationID: UInt64)
     case flushGeneration(sessionID: UInt64, generationID: UInt64, operationID: UInt64)
     case shutdown(sessionID: UInt64)
     case ready(sessionID: UInt64)
@@ -49,6 +56,9 @@ public enum ChildControl: Equatable, Sendable {
         sequence: UInt64
     )
     case playbackFlushed(sessionID: UInt64, generationID: UInt64, operationID: UInt64)
+    case captureStarted(sessionID: UInt64, operationID: UInt64)
+    case capturePaused(sessionID: UInt64, operationID: UInt64)
+    case captureResumed(sessionID: UInt64, operationID: UInt64)
     case failure(sessionID: UInt64, stage: RuntimeStage, code: SidecarFailureCode)
     case shutdownComplete(sessionID: UInt64)
 
@@ -58,6 +68,10 @@ public enum ChildControl: Equatable, Sendable {
             .startSession
         case .startCapture:
             .startCapture
+        case .pauseCapture:
+            .pauseCapture
+        case .resumeCapture:
+            .resumeCapture
         case .flushGeneration:
             .flushGeneration
         case .shutdown:
@@ -74,6 +88,12 @@ public enum ChildControl: Equatable, Sendable {
             .playbackRendered
         case .playbackFlushed:
             .playbackFlushed
+        case .captureStarted:
+            .captureStarted
+        case .capturePaused:
+            .capturePaused
+        case .captureResumed:
+            .captureResumed
         case .failure:
             .failure
         case .shutdownComplete:
@@ -84,7 +104,9 @@ public enum ChildControl: Equatable, Sendable {
     public var sessionID: UInt64 {
         switch self {
         case let .startSession(sessionID, _, _),
-             let .startCapture(sessionID),
+             let .startCapture(sessionID, _),
+             let .pauseCapture(sessionID, _),
+             let .resumeCapture(sessionID, _),
              let .flushGeneration(sessionID, _, _),
              let .shutdown(sessionID),
              let .ready(sessionID),
@@ -93,6 +115,9 @@ public enum ChildControl: Equatable, Sendable {
              let .playbackAccepted(sessionID, _, _, _, _),
              let .playbackRendered(sessionID, _, _, _, _),
              let .playbackFlushed(sessionID, _, _),
+             let .captureStarted(sessionID, _),
+             let .capturePaused(sessionID, _),
+             let .captureResumed(sessionID, _),
              let .failure(sessionID, _, _),
              let .shutdownComplete(sessionID):
             sessionID
@@ -160,7 +185,7 @@ public enum ChildProtocolError: Error, Equatable, Sendable {
 }
 
 public enum ChildProtocol {
-    public static let version: UInt16 = 1
+    public static let version: UInt16 = 2
     public static let headerBytes = 8
     public static let audioMetadataBytes = 48
     public static let maximumControlPayloadBytes = 65_536
@@ -371,11 +396,22 @@ public enum ChildProtocol {
                 {"session_id":\(sessionID),"speech_start_ms":\(speechStartMilliseconds),"final_silence_ms":\(finalSilenceMilliseconds)}
                 """.utf8
             )
-        case let .startCapture(sessionID),
-             let .shutdown(sessionID),
+        case let .shutdown(sessionID),
              let .ready(sessionID),
              let .shutdownComplete(sessionID):
             return Data(#"{"session_id":\#(sessionID)}"#.utf8)
+        case let .startCapture(sessionID, operationID),
+             let .pauseCapture(sessionID, operationID),
+             let .resumeCapture(sessionID, operationID),
+             let .captureStarted(sessionID, operationID),
+             let .capturePaused(sessionID, operationID),
+             let .captureResumed(sessionID, operationID):
+            guard operationID > 0 else {
+                throw ChildProtocolError.invalidControlJSON
+            }
+            return Data(
+                #"{"session_id":\#(sessionID),"operation_id":\#(operationID)}"#.utf8
+            )
         case let .flushGeneration(sessionID, generationID, operationID),
              let .playbackFlushed(sessionID, generationID, operationID):
             return Data(
@@ -574,21 +610,67 @@ public enum ChildProtocol {
                     speechStartMilliseconds: value.speechStartMilliseconds,
                     finalSilenceMilliseconds: value.finalSilenceMilliseconds
                 )
-            case .startCapture, .shutdown, .ready, .shutdownComplete:
+            case .shutdown, .ready, .shutdownComplete:
                 let value: SessionDTO = try decodeStrict(
                     payload,
                     keys: ["session_id"],
                     integerKeys: ["session_id"]
                 )
                 switch kind {
-                case .startCapture:
-                    return .startCapture(sessionID: value.sessionID)
                 case .shutdown:
                     return .shutdown(sessionID: value.sessionID)
                 case .ready:
                     return .ready(sessionID: value.sessionID)
                 case .shutdownComplete:
                     return .shutdownComplete(sessionID: value.sessionID)
+                default:
+                    throw ChildProtocolError.invalidControlJSON
+                }
+            case .startCapture,
+                 .pauseCapture,
+                 .resumeCapture,
+                 .captureStarted,
+                 .capturePaused,
+                 .captureResumed:
+                let value: CaptureIdentityDTO = try decodeStrict(
+                    payload,
+                    keys: ["session_id", "operation_id"],
+                    integerKeys: ["session_id", "operation_id"]
+                )
+                guard value.operationID > 0 else {
+                    throw ChildProtocolError.invalidControlJSON
+                }
+                switch kind {
+                case .startCapture:
+                    return .startCapture(
+                        sessionID: value.sessionID,
+                        operationID: value.operationID
+                    )
+                case .pauseCapture:
+                    return .pauseCapture(
+                        sessionID: value.sessionID,
+                        operationID: value.operationID
+                    )
+                case .resumeCapture:
+                    return .resumeCapture(
+                        sessionID: value.sessionID,
+                        operationID: value.operationID
+                    )
+                case .captureStarted:
+                    return .captureStarted(
+                        sessionID: value.sessionID,
+                        operationID: value.operationID
+                    )
+                case .capturePaused:
+                    return .capturePaused(
+                        sessionID: value.sessionID,
+                        operationID: value.operationID
+                    )
+                case .captureResumed:
+                    return .captureResumed(
+                        sessionID: value.sessionID,
+                        operationID: value.operationID
+                    )
                 default:
                     throw ChildProtocolError.invalidControlJSON
                 }
@@ -925,6 +1007,16 @@ private struct SessionDTO: Decodable {
 
     enum CodingKeys: String, CodingKey {
         case sessionID = "session_id"
+    }
+}
+
+private struct CaptureIdentityDTO: Decodable {
+    let sessionID: UInt64
+    let operationID: UInt64
+
+    enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+        case operationID = "operation_id"
     }
 }
 

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{AudioFrame, PcmFormat, PcmSampleFormat, RecognitionHypothesis, MAX_PCM_FRAME_BYTES};
 
-pub(crate) const PROTOCOL_VERSION: u16 = 1;
+pub(crate) const PROTOCOL_VERSION: u16 = 2;
 pub(crate) const HEADER_BYTES: usize = 8;
 pub(crate) const AUDIO_METADATA_BYTES: usize = 48;
 pub(crate) const MAX_CONTROL_PAYLOAD_BYTES: usize = 65_536;
@@ -21,6 +21,8 @@ pub(crate) enum SidecarFrameKind {
     StartCapture,
     FlushGeneration,
     Shutdown,
+    PauseCapture,
+    ResumeCapture,
     AudioFrame,
     Ready,
     VoiceActivity,
@@ -28,6 +30,9 @@ pub(crate) enum SidecarFrameKind {
     PlaybackAccepted,
     PlaybackRendered,
     PlaybackFlushed,
+    CaptureStarted,
+    CapturePaused,
+    CaptureResumed,
     Failure,
     ShutdownComplete,
 }
@@ -39,6 +44,8 @@ impl SidecarFrameKind {
             Self::StartCapture => 0x0002,
             Self::FlushGeneration => 0x0003,
             Self::Shutdown => 0x0004,
+            Self::PauseCapture => 0x0005,
+            Self::ResumeCapture => 0x0006,
             Self::AudioFrame => 0x0100,
             Self::Ready => 0x8001,
             Self::VoiceActivity => 0x8002,
@@ -46,6 +53,9 @@ impl SidecarFrameKind {
             Self::PlaybackAccepted => 0x8004,
             Self::PlaybackRendered => 0x8005,
             Self::PlaybackFlushed => 0x8006,
+            Self::CaptureStarted => 0x8007,
+            Self::CapturePaused => 0x8008,
+            Self::CaptureResumed => 0x8009,
             Self::Failure => 0x80fe,
             Self::ShutdownComplete => 0x80ff,
         }
@@ -68,6 +78,8 @@ impl TryFrom<u16> for SidecarFrameKind {
             0x0002 => Ok(Self::StartCapture),
             0x0003 => Ok(Self::FlushGeneration),
             0x0004 => Ok(Self::Shutdown),
+            0x0005 => Ok(Self::PauseCapture),
+            0x0006 => Ok(Self::ResumeCapture),
             0x0100 => Ok(Self::AudioFrame),
             0x8001 => Ok(Self::Ready),
             0x8002 => Ok(Self::VoiceActivity),
@@ -75,6 +87,9 @@ impl TryFrom<u16> for SidecarFrameKind {
             0x8004 => Ok(Self::PlaybackAccepted),
             0x8005 => Ok(Self::PlaybackRendered),
             0x8006 => Ok(Self::PlaybackFlushed),
+            0x8007 => Ok(Self::CaptureStarted),
+            0x8008 => Ok(Self::CapturePaused),
+            0x8009 => Ok(Self::CaptureResumed),
             0x80fe => Ok(Self::Failure),
             0x80ff => Ok(Self::ShutdownComplete),
             _ => Err(SidecarCodecError::UnknownKind(value)),
@@ -103,6 +118,15 @@ pub(crate) enum SidecarControl {
     },
     StartCapture {
         session_id: SessionId,
+        operation_id: u64,
+    },
+    PauseCapture {
+        session_id: SessionId,
+        operation_id: u64,
+    },
+    ResumeCapture {
+        session_id: SessionId,
+        operation_id: u64,
     },
     FlushGeneration {
         session_id: SessionId,
@@ -142,6 +166,18 @@ pub(crate) enum SidecarControl {
         generation_id: GenerationId,
         operation_id: u64,
     },
+    CaptureStarted {
+        session_id: SessionId,
+        operation_id: u64,
+    },
+    CapturePaused {
+        session_id: SessionId,
+        operation_id: u64,
+    },
+    CaptureResumed {
+        session_id: SessionId,
+        operation_id: u64,
+    },
     Failure {
         session_id: SessionId,
         stage: RuntimeStage,
@@ -157,6 +193,8 @@ impl SidecarControl {
         match self {
             Self::StartSession { .. } => SidecarFrameKind::StartSession,
             Self::StartCapture { .. } => SidecarFrameKind::StartCapture,
+            Self::PauseCapture { .. } => SidecarFrameKind::PauseCapture,
+            Self::ResumeCapture { .. } => SidecarFrameKind::ResumeCapture,
             Self::FlushGeneration { .. } => SidecarFrameKind::FlushGeneration,
             Self::Shutdown { .. } => SidecarFrameKind::Shutdown,
             Self::Ready { .. } => SidecarFrameKind::Ready,
@@ -165,6 +203,9 @@ impl SidecarControl {
             Self::PlaybackAccepted { .. } => SidecarFrameKind::PlaybackAccepted,
             Self::PlaybackRendered { .. } => SidecarFrameKind::PlaybackRendered,
             Self::PlaybackFlushed { .. } => SidecarFrameKind::PlaybackFlushed,
+            Self::CaptureStarted { .. } => SidecarFrameKind::CaptureStarted,
+            Self::CapturePaused { .. } => SidecarFrameKind::CapturePaused,
+            Self::CaptureResumed { .. } => SidecarFrameKind::CaptureResumed,
             Self::Failure { .. } => SidecarFrameKind::Failure,
             Self::ShutdownComplete { .. } => SidecarFrameKind::ShutdownComplete,
         }
@@ -304,7 +345,7 @@ impl fmt::Display for SidecarCodecError {
                 write!(formatter, "unknown sidecar PCM sample format {format}")
             }
             Self::UnsupportedFailureStage => formatter
-                .write_str("runtime stage is not supported by sidecar protocol version one"),
+                .write_str("runtime stage is not supported by sidecar protocol version two"),
             Self::TrailingBytes(count) => {
                 write!(formatter, "sidecar frame has {count} trailing bytes")
             }
@@ -524,12 +565,41 @@ fn encode_control(control: &SidecarControl) -> Result<Vec<u8>, SidecarCodecError
             speech_start_ms: *speech_start_ms,
             final_silence_ms: *final_silence_ms,
         }),
-        SidecarControl::StartCapture { session_id }
-        | SidecarControl::Shutdown { session_id }
+        SidecarControl::Shutdown { session_id }
         | SidecarControl::Ready { session_id }
         | SidecarControl::ShutdownComplete { session_id } => serialize(&SessionDto {
             session_id: session_id.get(),
         }),
+        SidecarControl::StartCapture {
+            session_id,
+            operation_id,
+        }
+        | SidecarControl::PauseCapture {
+            session_id,
+            operation_id,
+        }
+        | SidecarControl::ResumeCapture {
+            session_id,
+            operation_id,
+        }
+        | SidecarControl::CaptureStarted {
+            session_id,
+            operation_id,
+        }
+        | SidecarControl::CapturePaused {
+            session_id,
+            operation_id,
+        }
+        | SidecarControl::CaptureResumed {
+            session_id,
+            operation_id,
+        } => {
+            require_operation_id(*operation_id)?;
+            serialize(&CaptureIdentityDto {
+                session_id: session_id.get(),
+                operation_id: *operation_id,
+            })
+        }
         SidecarControl::FlushGeneration {
             session_id,
             generation_id,
@@ -617,19 +687,54 @@ fn decode_control(
                 final_silence_ms: value.final_silence_ms,
             })
         }
-        SidecarFrameKind::StartCapture
-        | SidecarFrameKind::Shutdown
+        SidecarFrameKind::Shutdown
         | SidecarFrameKind::Ready
         | SidecarFrameKind::ShutdownComplete => {
             let value: SessionDto = deserialize(json)?;
             let session_id = SessionId::new(value.session_id);
             Ok(match kind {
-                SidecarFrameKind::StartCapture => SidecarControl::StartCapture { session_id },
                 SidecarFrameKind::Shutdown => SidecarControl::Shutdown { session_id },
                 SidecarFrameKind::Ready => SidecarControl::Ready { session_id },
                 SidecarFrameKind::ShutdownComplete => {
                     SidecarControl::ShutdownComplete { session_id }
                 }
+                _ => return Err(SidecarCodecError::InvalidControlJson),
+            })
+        }
+        SidecarFrameKind::StartCapture
+        | SidecarFrameKind::PauseCapture
+        | SidecarFrameKind::ResumeCapture
+        | SidecarFrameKind::CaptureStarted
+        | SidecarFrameKind::CapturePaused
+        | SidecarFrameKind::CaptureResumed => {
+            let value: CaptureIdentityDto = deserialize(json)?;
+            require_operation_id(value.operation_id)?;
+            let session_id = SessionId::new(value.session_id);
+            Ok(match kind {
+                SidecarFrameKind::StartCapture => SidecarControl::StartCapture {
+                    session_id,
+                    operation_id: value.operation_id,
+                },
+                SidecarFrameKind::PauseCapture => SidecarControl::PauseCapture {
+                    session_id,
+                    operation_id: value.operation_id,
+                },
+                SidecarFrameKind::ResumeCapture => SidecarControl::ResumeCapture {
+                    session_id,
+                    operation_id: value.operation_id,
+                },
+                SidecarFrameKind::CaptureStarted => SidecarControl::CaptureStarted {
+                    session_id,
+                    operation_id: value.operation_id,
+                },
+                SidecarFrameKind::CapturePaused => SidecarControl::CapturePaused {
+                    session_id,
+                    operation_id: value.operation_id,
+                },
+                SidecarFrameKind::CaptureResumed => SidecarControl::CaptureResumed {
+                    session_id,
+                    operation_id: value.operation_id,
+                },
                 _ => return Err(SidecarCodecError::InvalidControlJson),
             })
         }
@@ -723,6 +828,14 @@ fn deserialize<'a, T: Deserialize<'a>>(json: &'a str) -> Result<T, SidecarCodecE
     serde_json::from_str(json).map_err(|_| SidecarCodecError::InvalidControlJson)
 }
 
+fn require_operation_id(operation_id: u64) -> Result<(), SidecarCodecError> {
+    if operation_id == 0 {
+        Err(SidecarCodecError::InvalidControlJson)
+    } else {
+        Ok(())
+    }
+}
+
 fn read_u64(payload: &[u8], offset: usize) -> u64 {
     let mut bytes = [0; 8];
     bytes.copy_from_slice(&payload[offset..offset + 8]);
@@ -753,6 +866,13 @@ struct StartSessionDto {
 #[serde(deny_unknown_fields)]
 struct SessionDto {
     session_id: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CaptureIdentityDto {
+    session_id: u64,
+    operation_id: u64,
 }
 
 #[derive(Deserialize, Serialize)]

@@ -2,10 +2,13 @@ import Foundation
 @testable import VoiceSidecarCore
 
 func fixture(_ relativePath: String) throws -> URL {
-    guard let root = ProcessInfo.processInfo.environment["VOICE_SIDECAR_FIXTURES_DIR"] else {
-        throw TestSupportError.missingFixtureDirectory
-    }
-    return URL(fileURLWithPath: root, isDirectory: true).appendingPathComponent(relativePath)
+    let root = ProcessInfo.processInfo.environment["VOICE_SIDECAR_FIXTURES_DIR"]
+        .map { URL(fileURLWithPath: $0, isDirectory: true) }
+        ?? URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .appendingPathComponent("../../../../../tests/fixtures/voice-sidecar-v2")
+        .standardizedFileURL
+    return root.appendingPathComponent(relativePath)
 }
 
 enum TestSupportError: Error {
@@ -232,6 +235,8 @@ actor RecordingAudioService: SidecarAudioService {
     private let callLog: CallLog?
     private(set) var configurations: [SidecarConfiguration] = []
     private(set) var stopCount = 0
+    private(set) var pauseCaptureCount = 0
+    private(set) var resumeCaptureCount = 0
     private var startFailure: SidecarServiceFailure?
 
     init(callLog: CallLog? = nil) {
@@ -256,6 +261,20 @@ actor RecordingAudioService: SidecarAudioService {
         stopCount += 1
         if let callLog {
             await callLog.append("audio.stop")
+        }
+    }
+
+    func pauseCapture() async throws {
+        pauseCaptureCount += 1
+        if let callLog {
+            await callLog.append("audio.pause")
+        }
+    }
+
+    func resumeCapture() async throws {
+        resumeCaptureCount += 1
+        if let callLog {
+            await callLog.append("audio.resume")
         }
     }
 }
@@ -388,6 +407,10 @@ actor SuspendingAudioService: SidecarAudioService {
             startContinuations.append(continuation)
         }
     }
+
+    func pauseCapture() async throws {}
+
+    func resumeCapture() async throws {}
 
     func stop() async {
         stopCount += 1

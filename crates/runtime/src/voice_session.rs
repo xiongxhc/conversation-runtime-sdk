@@ -6,12 +6,13 @@ use std::time::Duration;
 
 use conversation_model_adapters::{
     AdapterError, GenerationLanguageModel, PlaybackReceipt, RecognitionEvent,
-    StreamingSpeechSynthesizer, VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
+    StreamingSpeechSynthesizer, VoiceCaptureControl, VoiceInputEvent, VoiceIoFactory,
+    VoiceIoSession,
 };
 use conversation_protocol::{
-    GenerationId, PlaybackState, RecoveryDisposition, RuntimeError, RuntimeErrorKind, RuntimeEvent,
-    RuntimeStage, RuntimeTimingMilestone, SessionId, TurnId, VoiceActivity, VoiceSessionEvent,
-    VoiceSessionPolicy, VoiceTimingMilestone,
+    GenerationId, PlaybackState, PrivacySummary, RecoveryDisposition, RuntimeError,
+    RuntimeErrorKind, RuntimeEvent, RuntimeStage, RuntimeTimingMilestone, SessionId, TurnId,
+    VoiceActivity, VoiceSessionEvent, VoiceSessionPolicy, VoiceTimingMilestone,
 };
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::{JoinError, JoinHandle};
@@ -90,14 +91,6 @@ impl VoiceSessionRuntime {
         let (terminal_sender, terminal_receiver) = oneshot::channel();
         let (command_sender, command_receiver) = mpsc::channel(SESSION_COMMAND_BUFFER_SIZE);
         let cancellation = CancellationToken::new();
-        event_sender
-            .send(VoiceSessionEvent::SessionStarted {
-                session_id,
-                privacy,
-            })
-            .await
-            .map_err(|_| runtime_error("voice session event stream closed before start"))?;
-
         *active = Some(ActiveSession {
             session_id,
             commands: command_sender,
@@ -111,6 +104,7 @@ impl VoiceSessionRuntime {
         tokio::spawn(async move {
             let terminal = run_voice_session(
                 policy,
+                privacy,
                 context,
                 adapters,
                 command_receiver,
@@ -170,6 +164,31 @@ impl VoiceSessionRuntime {
             .map_err(|_| runtime_error("voice session ended before shutdown completed"))
     }
 
+    pub async fn pause_capture(&self) -> Result<(), RuntimeError> {
+        self.capture_command(true).await
+    }
+
+    pub async fn resume_capture(&self) -> Result<(), RuntimeError> {
+        self.capture_command(false).await
+    }
+
+    async fn capture_command(&self, pause: bool) -> Result<(), RuntimeError> {
+        let commands = self.active_commands().await?;
+        let (completion, completed) = oneshot::channel();
+        let command = if pause {
+            SessionCommand::PauseCapture { completion }
+        } else {
+            SessionCommand::ResumeCapture { completion }
+        };
+        commands
+            .send(command)
+            .await
+            .map_err(|_| runtime_error("voice session command channel closed"))?;
+        completed
+            .await
+            .map_err(|_| runtime_error("voice session ended before capture control completed"))?
+    }
+
     async fn active_commands(&self) -> Result<mpsc::Sender<SessionCommand>, RuntimeError> {
         self.active
             .lock()
@@ -222,6 +241,12 @@ enum SessionCommand {
         generation_id: GenerationId,
         completion: oneshot::Sender<()>,
     },
+    PauseCapture {
+        completion: oneshot::Sender<Result<(), RuntimeError>>,
+    },
+    ResumeCapture {
+        completion: oneshot::Sender<Result<(), RuntimeError>>,
+    },
     Shutdown {
         completion: oneshot::Sender<()>,
     },
@@ -229,6 +254,7 @@ enum SessionCommand {
 
 async fn run_voice_session(
     policy: VoiceSessionPolicy,
+    privacy: PrivacySummary,
     context: ConversationContext,
     adapters: VoiceSessionAdapters,
     commands: mpsc::Receiver<SessionCommand>,
@@ -238,6 +264,7 @@ async fn run_voice_session(
     let session_id = policy.session_id();
     let VoiceIoSession {
         input,
+        capture,
         output,
         completion,
     } = match adapters
@@ -268,6 +295,19 @@ async fn run_voice_session(
         }
     };
 
+    if events
+        .send(VoiceSessionEvent::SessionStarted {
+            session_id,
+            privacy,
+        })
+        .await
+        .is_err()
+    {
+        cancellation.cancel();
+        let _ = await_completion_cleanup(completion).await;
+        return VoiceSessionEvent::SessionEnded { session_id };
+    }
+
     let turn_runtime = StreamingTurnRuntime::new(
         context,
         adapters.language_model,
@@ -277,6 +317,7 @@ async fn run_voice_session(
     VoiceLoop::new(
         policy,
         input_events,
+        capture,
         completion,
         turn_runtime,
         commands,
@@ -298,6 +339,27 @@ enum VoiceLoopState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CaptureState {
+    Active,
+    Pausing,
+    Paused,
+    Resuming,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CaptureOperationKind {
+    Pause,
+    Resume,
+}
+
+struct PendingCaptureOperation {
+    kind: CaptureOperationKind,
+    cancellation: CancellationToken,
+    task: JoinHandle<Result<(), AdapterError>>,
+    completion: oneshot::Sender<Result<(), RuntimeError>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PlaybackLifecycle {
     AwaitingAcceptance {
         generation_id: GenerationId,
@@ -316,6 +378,9 @@ struct VoiceLoop {
     final_silence_ms: u64,
     final_silence: Duration,
     input: mpsc::Receiver<Result<VoiceInputEvent, AdapterError>>,
+    capture: Arc<dyn VoiceCaptureControl>,
+    capture_state: CaptureState,
+    capture_operation: Option<PendingCaptureOperation>,
     completion: Option<JoinHandle<Result<(), AdapterError>>>,
     turn_runtime: StreamingTurnRuntime,
     turn_events: Option<StreamingTurnEventStream>,
@@ -338,6 +403,7 @@ impl VoiceLoop {
     fn new(
         policy: VoiceSessionPolicy,
         input: mpsc::Receiver<Result<VoiceInputEvent, AdapterError>>,
+        capture: Arc<dyn VoiceCaptureControl>,
         completion: JoinHandle<Result<(), AdapterError>>,
         turn_runtime: StreamingTurnRuntime,
         commands: mpsc::Receiver<SessionCommand>,
@@ -350,6 +416,9 @@ impl VoiceLoop {
             final_silence_ms,
             final_silence: Duration::from_millis(final_silence_ms),
             input,
+            capture,
+            capture_state: CaptureState::Active,
+            capture_operation: None,
             completion: Some(completion),
             turn_runtime,
             turn_events: None,
@@ -371,7 +440,10 @@ impl VoiceLoop {
 
     async fn run(mut self) -> VoiceSessionEvent {
         let exit = self.run_until_exit().await;
-        let mut cleanup_error = self.cleanup_active_turn().await.err();
+        let mut cleanup_error = self.cleanup_capture_operation().await.err();
+        if let Err(error) = self.cleanup_active_turn().await {
+            cleanup_error.get_or_insert(error);
+        }
         self.state = VoiceLoopState::Ending;
         self.cancellation.cancel();
         if let Some(completion) = self.completion.take() {
@@ -416,6 +488,8 @@ impl VoiceLoop {
                 _ = self.cancellation.cancelled() => LoopSignal::ConsumerDropped,
                 _ = self.events.closed() => LoopSignal::ConsumerDropped,
                 command = self.commands.recv() => LoopSignal::Command(command),
+                capture = wait_for_capture_operation(&mut self.capture_operation),
+                    if self.capture_operation.is_some() => LoopSignal::Capture(capture),
                 completion = wait_for_completion(&mut self.completion),
                     if self.completion.is_some() => LoopSignal::Completion(completion),
                 input = self.input.recv(),
@@ -434,6 +508,7 @@ impl VoiceLoop {
             let exit = match signal {
                 LoopSignal::ConsumerDropped => Some(LoopExit::ConsumerDropped),
                 LoopSignal::Command(command) => self.handle_command(command).await,
+                LoopSignal::Capture(capture) => self.handle_capture_completion(capture).await,
                 LoopSignal::Completion(completion) => {
                     self.completion.take();
                     Some(LoopExit::Fatal(completion_failure(completion)))
@@ -467,9 +542,135 @@ impl VoiceLoop {
                 let _ = completion.send(());
                 result.err().map(LoopExit::Fatal)
             }
+            Some(SessionCommand::PauseCapture { completion }) => {
+                self.start_capture_operation(CaptureOperationKind::Pause, completion);
+                None
+            }
+            Some(SessionCommand::ResumeCapture { completion }) => {
+                self.start_capture_operation(CaptureOperationKind::Resume, completion);
+                None
+            }
             Some(SessionCommand::Shutdown { completion }) => Some(LoopExit::Shutdown(completion)),
             None => Some(LoopExit::Shutdown(closed_completion())),
         }
+    }
+
+    fn start_capture_operation(
+        &mut self,
+        kind: CaptureOperationKind,
+        completion: oneshot::Sender<Result<(), RuntimeError>>,
+    ) {
+        let valid = matches!(
+            (self.capture_state, kind),
+            (CaptureState::Active, CaptureOperationKind::Pause)
+                | (CaptureState::Paused, CaptureOperationKind::Resume)
+        );
+        if !valid || self.capture_operation.is_some() {
+            let _ = completion.send(Err(runtime_error(match kind {
+                CaptureOperationKind::Pause => "voice capture is not active",
+                CaptureOperationKind::Resume => "voice capture is not paused",
+            })));
+            return;
+        }
+
+        self.capture_state = match kind {
+            CaptureOperationKind::Pause => CaptureState::Pausing,
+            CaptureOperationKind::Resume => CaptureState::Resuming,
+        };
+        let capture = self.capture.clone();
+        let session_id = self.session_id;
+        let cancellation = CancellationToken::new();
+        let operation_cancellation = cancellation.clone();
+        let task = tokio::spawn(async move {
+            match kind {
+                CaptureOperationKind::Pause => {
+                    capture.pause(session_id, operation_cancellation).await
+                }
+                CaptureOperationKind::Resume => {
+                    capture.resume(session_id, operation_cancellation).await
+                }
+            }
+        });
+        self.capture_operation = Some(PendingCaptureOperation {
+            kind,
+            cancellation,
+            task,
+            completion,
+        });
+    }
+
+    async fn handle_capture_completion(
+        &mut self,
+        result: Result<Result<(), AdapterError>, JoinError>,
+    ) -> Option<LoopExit> {
+        let operation = self
+            .capture_operation
+            .take()
+            .expect("completed capture operation remains registered");
+        match result {
+            Ok(Ok(())) => {
+                self.capture_state = match operation.kind {
+                    CaptureOperationKind::Pause => CaptureState::Paused,
+                    CaptureOperationKind::Resume => CaptureState::Active,
+                };
+                let event = match operation.kind {
+                    CaptureOperationKind::Pause => VoiceSessionEvent::CapturePaused {
+                        session_id: self.session_id,
+                    },
+                    CaptureOperationKind::Resume => VoiceSessionEvent::CaptureResumed {
+                        session_id: self.session_id,
+                    },
+                };
+                if !self.publish_reliable(event).await {
+                    let error =
+                        runtime_error("voice session event stream closed during capture control");
+                    let _ = operation.completion.send(Err(error));
+                    return Some(LoopExit::ConsumerDropped);
+                }
+                let _ = operation.completion.send(Ok(()));
+                None
+            }
+            Ok(Err(error)) => {
+                self.restore_capture_state(operation.kind);
+                let _ = operation.completion.send(Err(adapter_runtime_error(
+                    RuntimeStage::AudioCapture,
+                    error,
+                )));
+                None
+            }
+            Err(_) => {
+                self.restore_capture_state(operation.kind);
+                let _ = operation.completion.send(Err(adapter_message(
+                    RuntimeStage::AudioCapture,
+                    "voice capture control task failed",
+                )));
+                None
+            }
+        }
+    }
+
+    fn restore_capture_state(&mut self, kind: CaptureOperationKind) {
+        self.capture_state = match kind {
+            CaptureOperationKind::Pause => CaptureState::Active,
+            CaptureOperationKind::Resume => CaptureState::Paused,
+        };
+    }
+
+    async fn cleanup_capture_operation(&mut self) -> Result<(), RuntimeError> {
+        let Some(mut operation) = self.capture_operation.take() else {
+            return Ok(());
+        };
+        operation.cancellation.cancel();
+        let result = cleanup_with_timeout("voice capture control", &mut operation.task).await;
+        if result.is_err() {
+            operation.task.abort();
+            let _ = operation.task.await;
+        }
+        self.restore_capture_state(operation.kind);
+        let _ = operation
+            .completion
+            .send(Err(runtime_error("voice capture control cancelled")));
+        result.map(|_| ())
     }
 
     async fn handle_input(
@@ -1141,11 +1342,21 @@ impl VoiceLoop {
 enum LoopSignal {
     ConsumerDropped,
     Command(Option<SessionCommand>),
+    Capture(Result<Result<(), AdapterError>, JoinError>),
     Completion(Result<Result<(), AdapterError>, JoinError>),
     Input(Option<Result<VoiceInputEvent, AdapterError>>),
     Turn(Option<RuntimeEvent>),
     Deadline,
     Delivery(Option<PendingDelivery>),
+}
+
+async fn wait_for_capture_operation(
+    operation: &mut Option<PendingCaptureOperation>,
+) -> Result<Result<(), AdapterError>, JoinError> {
+    match operation.as_mut() {
+        Some(operation) => (&mut operation.task).await,
+        None => pending().await,
+    }
 }
 
 enum LoopExit {

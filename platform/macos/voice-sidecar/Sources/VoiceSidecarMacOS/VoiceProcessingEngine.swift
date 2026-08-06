@@ -247,6 +247,7 @@ final class CaptureBufferPump: @unchecked Sendable {
     private let eventHandler: EventHandler
     private let faultHandler: FaultHandler
     private let semaphore = DispatchSemaphore(value: 0)
+    private let worker = DispatchGroup()
     private let queue = DispatchQueue(
         label: "conversation-runtime.voice-capture"
     )
@@ -261,7 +262,9 @@ final class CaptureBufferPump: @unchecked Sendable {
         self.ring = ring
         self.eventHandler = eventHandler
         self.faultHandler = faultHandler
+        worker.enter()
         queue.async { [self] in
+            defer { worker.leave() }
             run()
         }
     }
@@ -285,6 +288,7 @@ final class CaptureBufferPump: @unchecked Sendable {
     func stop() {
         _ = OSAtomicCompareAndSwap64Barrier(1, 0, &active)
         semaphore.signal()
+        worker.wait()
     }
 
     private func run() {
@@ -294,8 +298,10 @@ final class CaptureBufferPump: @unchecked Sendable {
                 return
             }
             if let fault = takeFault() {
-                faultHandler(fault)
                 _ = OSAtomicCompareAndSwap64Barrier(1, 0, &active)
+                DispatchQueue.global().async { [faultHandler] in
+                    faultHandler(fault)
+                }
                 return
             }
             ring.drain(eventHandler)
@@ -358,6 +364,7 @@ public final class VoiceProcessingEngine:
     private var inputSignature: FormatSignature?
     private var outputSignature: FormatSignature?
     private var running = false
+    private var captureActive = false
     private var resolvedPlaybackFormat: AVAudioFormat
 
     public var playbackFormat: AVAudioFormat {
@@ -369,6 +376,12 @@ public final class VoiceProcessingEngine:
     public var isRunning: Bool {
         stateLock.withLock {
             running
+        }
+    }
+
+    public var isCaptureActive: Bool {
+        stateLock.withLock {
+            captureActive
         }
     }
 
@@ -530,6 +543,7 @@ public final class VoiceProcessingEngine:
                 outputSignature = FormatSignature(outputFormat)
                 resolvedPlaybackFormat = playbackFormat
                 running = true
+                captureActive = true
             }
             installConfigurationObserver()
         } catch {
@@ -542,23 +556,97 @@ public final class VoiceProcessingEngine:
         }
     }
 
+    public func pauseCapture() async throws {
+        let pump = try stateLock.withLock {
+            guard running, captureActive, let capturePump else {
+                throw SidecarServiceFailure(
+                    stage: .audioCapture,
+                    code: .invalidState
+                )
+            }
+            captureActive = false
+            self.capturePump = nil
+            return capturePump
+        }
+        engine.inputNode.removeTap(onBus: 0)
+        pump.stop()
+    }
+
+    public func resumeCapture() async throws {
+        let expectedInput = try stateLock.withLock {
+            guard running, !captureActive, let inputSignature else {
+                throw SidecarServiceFailure(
+                    stage: .audioCapture,
+                    code: .invalidState
+                )
+            }
+            return inputSignature
+        }
+        let inputNode = engine.inputNode
+        let inputFormat = inputNode.inputFormat(forBus: 0)
+        try Self.requireUsable(inputFormat)
+        guard FormatSignature(inputFormat) == expectedInput else {
+            throw SidecarServiceFailure(
+                stage: .audioCapture,
+                code: .audioDeviceUnavailable
+            )
+        }
+        let ring = try Self.makeCaptureRing(format: inputFormat)
+        let pump = CaptureBufferPump(
+            ring: ring,
+            eventHandler: { [weak self] event in
+                self?.deliverCapture(event)
+            },
+            faultHandler: { [weak self] _ in
+                self?.captureFault()
+            }
+        )
+        inputNode.installTap(
+            onBus: 0,
+            bufferSize: Self.captureFrameCapacity,
+            format: inputFormat
+        ) { buffer, _ in
+            pump.enqueue(buffer)
+        }
+        do {
+            try stateLock.withLock {
+                guard running, !captureActive else {
+                    throw SidecarServiceFailure(
+                        stage: .audioCapture,
+                        code: .invalidState
+                    )
+                }
+                capturePump = pump
+                captureActive = true
+            }
+        } catch {
+            inputNode.removeTap(onBus: 0)
+            pump.stop()
+            throw error
+        }
+    }
+
     public func stop() async {
-        let (observer, pump) = stateLock.withLock {
+        let (observer, pump, removeCaptureTap) = stateLock.withLock {
             let value = configurationObserver
             configurationObserver = nil
             running = false
+            let removeCaptureTap = captureActive
+            captureActive = false
             sessionID = nil
             inputSignature = nil
             outputSignature = nil
             captureHandler = nil
             let pump = capturePump
             capturePump = nil
-            return (value, pump)
+            return (value, pump, removeCaptureTap)
         }
         if let observer {
             NotificationCenter.default.removeObserver(observer)
         }
-        engine.inputNode.removeTap(onBus: 0)
+        if removeCaptureTap {
+            engine.inputNode.removeTap(onBus: 0)
+        }
         pump?.stop()
         player.stop()
         player.reset()
@@ -635,20 +723,24 @@ public final class VoiceProcessingEngine:
     }
 
     private func captureFault() {
-        let fatal: (UInt64, FailureHandler?, CaptureBufferPump?)? =
+        let fatal: (UInt64, FailureHandler?, CaptureBufferPump?, Bool)? =
             stateLock.withLock {
                 guard running, let sessionID else {
                     return nil
                 }
                 running = false
+                let removeCaptureTap = captureActive
+                captureActive = false
                 let pump = capturePump
                 capturePump = nil
-                return (sessionID, failureHandler, pump)
+                return (sessionID, failureHandler, pump, removeCaptureTap)
             }
-        guard let (sessionID, handler, pump) = fatal else {
+        guard let (sessionID, handler, pump, removeCaptureTap) = fatal else {
             return
         }
-        engine.inputNode.removeTap(onBus: 0)
+        if removeCaptureTap {
+            engine.inputNode.removeTap(onBus: 0)
+        }
         pump?.stop()
         player.stop()
         engine.stop()

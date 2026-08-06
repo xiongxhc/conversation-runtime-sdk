@@ -16,7 +16,10 @@ func partialReadsAssembleOneExactFrame() async throws {
 
 @Test
 func oversizedHeaderIsRejectedBeforePayloadRead() async {
-    let data = try! Data(contentsOf: fixture("invalid/oversized-header.bin"))
+    var data = Data()
+    data.appendBigEndian(ChildProtocol.version)
+    data.appendBigEndian(ChildFrameKind.startSession.rawValue)
+    data.appendBigEndian(UInt32(65_537))
     let reader = ChunkedFrameReader(chunks: [data])
 
     do {
@@ -40,7 +43,16 @@ func oversizedHeaderIsRejectedBeforePayloadRead() async {
 
 @Test
 func truncatedReaderEOFIsTyped() async {
-    let data = try! Data(contentsOf: fixture("invalid/truncated-control.bin"))
+    let complete = try! ChildProtocol.encode(
+        ChildFrame(
+            control: .startSession(
+                sessionID: 7,
+                speechStartMilliseconds: 200,
+                finalSilenceMilliseconds: 600
+            )
+        )
+    )
+    let data = complete.dropLast(3)
     let reader = ChunkedFrameReader(chunks: [data])
 
     do {
@@ -61,7 +73,7 @@ func truncatedReaderEOFIsTyped() async {
 @Test
 func shortPayloadEOFReportsWholeFrameRequirement() async {
     var data = Data()
-    data.appendBigEndian(UInt16(1))
+    data.appendBigEndian(ChildProtocol.version)
     data.appendBigEndian(ChildFrameKind.startCapture.rawValue)
     data.appendBigEndian(UInt32(3))
     data.append(Data([0x7B, 0x7D]))

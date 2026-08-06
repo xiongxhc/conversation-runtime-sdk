@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -22,7 +22,8 @@ use super::codec::{
 };
 use crate::{
     AdapterError, AdapterFuture, AudioFrame, ContinuousAudioOutput, PlaybackReceipt,
-    RecognitionEvent, VoiceInput, VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
+    RecognitionEvent, VoiceCaptureControl, VoiceInput, VoiceInputEvent, VoiceIoFactory,
+    VoiceIoSession,
 };
 
 const SPEECH_START_MS: std::ops::RangeInclusive<u64> = 100..=1_000;
@@ -289,7 +290,15 @@ async fn start_sidecar(
             let input = Arc::new(MacOsVoiceInput {
                 session_id,
                 control_sender: control_sender.clone(),
+                shared: Arc::clone(&shared),
                 receiver: AsyncMutex::new(Some(input_receiver)),
+                session_cancellation: cancellation.clone(),
+                io_cancellation: io_cancellation.clone(),
+            });
+            let capture = Arc::new(MacOsVoiceCaptureControl {
+                session_id,
+                control_sender: control_sender.clone(),
+                shared: Arc::clone(&shared),
                 session_cancellation: cancellation.clone(),
                 io_cancellation: io_cancellation.clone(),
             });
@@ -318,6 +327,7 @@ async fn start_sidecar(
             );
             return Ok(VoiceIoSession {
                 input,
+                capture,
                 output,
                 completion,
             });
@@ -425,7 +435,16 @@ async fn reap_failed_setup(child: &mut Child) {
 struct MacOsVoiceInput {
     session_id: SessionId,
     control_sender: mpsc::Sender<SidecarFrame>,
+    shared: Arc<SessionShared>,
     receiver: AsyncMutex<Option<mpsc::Receiver<Result<VoiceInputEvent, AdapterError>>>>,
+    session_cancellation: CancellationToken,
+    io_cancellation: CancellationToken,
+}
+
+struct MacOsVoiceCaptureControl {
+    session_id: SessionId,
+    control_sender: mpsc::Sender<SidecarFrame>,
+    shared: Arc<SessionShared>,
     session_cancellation: CancellationToken,
     io_cancellation: CancellationToken,
 }
@@ -448,14 +467,39 @@ impl VoiceInput for MacOsVoiceInput {
             if receiver.is_none() {
                 return Err(AdapterError::new("voice sidecar input already started"));
             }
-            send_control(
+            let (operation_id, completion) =
+                self.shared.register_capture(CaptureOperationKind::Start)?;
+            let mut operation = CaptureOperationGuard::new(Arc::clone(&self.shared), operation_id);
+            let sent = send_control(
                 &self.control_sender,
-                SidecarFrame::control(SidecarControl::StartCapture { session_id }),
+                SidecarFrame::control(SidecarControl::StartCapture {
+                    session_id,
+                    operation_id,
+                }),
                 &cancellation,
                 &self.io_cancellation,
             )
-            .await
-            .map_err(|_| AdapterError::new("failed to start voice sidecar capture"))?;
+            .await;
+            if sent.is_err() {
+                if cancellation.is_cancelled() {
+                    self.session_cancellation.cancel();
+                }
+                return Err(AdapterError::new("failed to start voice sidecar capture"));
+            }
+            let result = wait_for_capture_acknowledgement(
+                completion,
+                &cancellation,
+                &self.session_cancellation,
+                "voice sidecar capture start",
+            )
+            .await;
+            if result.is_err() && cancellation.is_cancelled() {
+                self.session_cancellation.cancel();
+            }
+            if result.is_ok() {
+                operation.disarm();
+            }
+            result?;
             let receiver = receiver
                 .take()
                 .ok_or_else(|| AdapterError::new("voice sidecar input already started"))?;
@@ -469,6 +513,92 @@ impl VoiceInput for MacOsVoiceInput {
                 }
             });
             Ok(receiver)
+        })
+    }
+}
+
+impl VoiceCaptureControl for MacOsVoiceCaptureControl {
+    fn pause<'a>(
+        &'a self,
+        session_id: SessionId,
+        cancellation: CancellationToken,
+    ) -> AdapterFuture<'a, ()> {
+        Box::pin(self.control(session_id, CaptureOperationKind::Pause, cancellation))
+    }
+
+    fn resume<'a>(
+        &'a self,
+        session_id: SessionId,
+        cancellation: CancellationToken,
+    ) -> AdapterFuture<'a, ()> {
+        Box::pin(self.control(session_id, CaptureOperationKind::Resume, cancellation))
+    }
+}
+
+impl MacOsVoiceCaptureControl {
+    async fn control(
+        &self,
+        session_id: SessionId,
+        kind: CaptureOperationKind,
+        cancellation: CancellationToken,
+    ) -> Result<(), AdapterError> {
+        if session_id != self.session_id {
+            return Err(AdapterError::new("voice sidecar session identity mismatch"));
+        }
+        if cancellation.is_cancelled() || self.session_cancellation.is_cancelled() {
+            return Err(AdapterError::new("voice sidecar capture control cancelled"));
+        }
+        let (operation_id, completion) = self.shared.register_capture(kind)?;
+        let mut operation = CaptureOperationGuard::new(Arc::clone(&self.shared), operation_id);
+        let control = match kind {
+            CaptureOperationKind::Start => unreachable!("capture start is owned by voice input"),
+            CaptureOperationKind::Pause => SidecarControl::PauseCapture {
+                session_id,
+                operation_id,
+            },
+            CaptureOperationKind::Resume => SidecarControl::ResumeCapture {
+                session_id,
+                operation_id,
+            },
+        };
+        send_control(
+            &self.control_sender,
+            SidecarFrame::control(control),
+            &cancellation,
+            &self.io_cancellation,
+        )
+        .await
+        .map_err(|_| AdapterError::new("failed to send voice sidecar capture control"))?;
+        let result = wait_for_capture_acknowledgement(
+            completion,
+            &cancellation,
+            &self.session_cancellation,
+            "voice sidecar capture control",
+        )
+        .await;
+        if result.is_ok() {
+            operation.disarm();
+        }
+        result
+    }
+}
+
+async fn wait_for_capture_acknowledgement(
+    completion: oneshot::Receiver<Result<(), AdapterError>>,
+    cancellation: &CancellationToken,
+    session_cancellation: &CancellationToken,
+    operation: &'static str,
+) -> Result<(), AdapterError> {
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => {
+            Err(AdapterError::new(format!("{operation} cancelled")))
+        }
+        _ = session_cancellation.cancelled() => {
+            Err(AdapterError::new("voice sidecar session cancelled"))
+        }
+        result = completion => result.unwrap_or_else(|_| {
+            Err(AdapterError::new(format!("{operation} acknowledgement closed")))
         })
     }
 }
@@ -1124,6 +1254,33 @@ async fn run_stdout_reader(
                 }
                 None
             }
+            SidecarControl::CaptureStarted { operation_id, .. } => {
+                if let Err(error) =
+                    shared.resolve_capture(CaptureOperationKind::Start, operation_id)
+                {
+                    let _ = supervisor_sender.send(SupervisorEvent::Fatal(error));
+                    return;
+                }
+                None
+            }
+            SidecarControl::CapturePaused { operation_id, .. } => {
+                if let Err(error) =
+                    shared.resolve_capture(CaptureOperationKind::Pause, operation_id)
+                {
+                    let _ = supervisor_sender.send(SupervisorEvent::Fatal(error));
+                    return;
+                }
+                None
+            }
+            SidecarControl::CaptureResumed { operation_id, .. } => {
+                if let Err(error) =
+                    shared.resolve_capture(CaptureOperationKind::Resume, operation_id)
+                {
+                    let _ = supervisor_sender.send(SupervisorEvent::Fatal(error));
+                    return;
+                }
+                None
+            }
             SidecarControl::ShutdownComplete { .. } => {
                 let _ = supervisor_sender.send(SupervisorEvent::ShutdownComplete);
                 continue;
@@ -1131,6 +1288,8 @@ async fn run_stdout_reader(
             SidecarControl::Ready { .. }
             | SidecarControl::StartSession { .. }
             | SidecarControl::StartCapture { .. }
+            | SidecarControl::PauseCapture { .. }
+            | SidecarControl::ResumeCapture { .. }
             | SidecarControl::FlushGeneration { .. }
             | SidecarControl::Shutdown { .. } => {
                 send_fatal(
@@ -1288,7 +1447,9 @@ fn send_fatal(sender: &mpsc::UnboundedSender<SupervisorEvent>, message: &'static
 fn control_session_id(control: &SidecarControl) -> SessionId {
     match control {
         SidecarControl::StartSession { session_id, .. }
-        | SidecarControl::StartCapture { session_id }
+        | SidecarControl::StartCapture { session_id, .. }
+        | SidecarControl::PauseCapture { session_id, .. }
+        | SidecarControl::ResumeCapture { session_id, .. }
         | SidecarControl::FlushGeneration { session_id, .. }
         | SidecarControl::Shutdown { session_id }
         | SidecarControl::Ready { session_id }
@@ -1297,6 +1458,9 @@ fn control_session_id(control: &SidecarControl) -> SessionId {
         | SidecarControl::PlaybackAccepted { session_id, .. }
         | SidecarControl::PlaybackRendered { session_id, .. }
         | SidecarControl::PlaybackFlushed { session_id, .. }
+        | SidecarControl::CaptureStarted { session_id, .. }
+        | SidecarControl::CapturePaused { session_id, .. }
+        | SidecarControl::CaptureResumed { session_id, .. }
         | SidecarControl::Failure { session_id, .. }
         | SidecarControl::ShutdownComplete { session_id } => *session_id,
     }
@@ -1374,7 +1538,20 @@ struct SessionState {
     cancelled_media: VecDeque<CancelledMedia>,
     flush_operations: VecDeque<FlushOperation>,
     cancelled_flushes: VecDeque<CancelledFlush>,
+    capture_operations: BTreeMap<u64, CaptureOperation>,
     failure: Option<AdapterError>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CaptureOperationKind {
+    Start,
+    Pause,
+    Resume,
+}
+
+struct CaptureOperation {
+    kind: CaptureOperationKind,
+    completion: oneshot::Sender<Result<(), AdapterError>>,
 }
 
 struct MediaOperation {
@@ -1457,6 +1634,34 @@ struct FlushOperationGuard {
     armed: bool,
 }
 
+struct CaptureOperationGuard {
+    shared: Arc<SessionShared>,
+    operation_id: u64,
+    armed: bool,
+}
+
+impl CaptureOperationGuard {
+    fn new(shared: Arc<SessionShared>, operation_id: u64) -> Self {
+        Self {
+            shared,
+            operation_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CaptureOperationGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.shared.cancel_capture(self.operation_id);
+        }
+    }
+}
+
 impl FlushOperationGuard {
     fn new(shared: Arc<SessionShared>, operation_id: u64) -> Self {
         Self {
@@ -1491,9 +1696,76 @@ impl SessionShared {
                 cancelled_media: VecDeque::new(),
                 flush_operations: VecDeque::new(),
                 cancelled_flushes: VecDeque::new(),
+                capture_operations: BTreeMap::new(),
                 failure: None,
             }),
         }
+    }
+
+    fn register_capture(
+        &self,
+        kind: CaptureOperationKind,
+    ) -> Result<(u64, oneshot::Receiver<Result<(), AdapterError>>), AdapterError> {
+        let (completion, receiver) = oneshot::channel();
+        let mut state = self.state.lock().expect("sidecar state lock poisoned");
+        if let Some(error) = &state.failure {
+            return Err(error.clone());
+        }
+        if state.capture_operations.len() >= CONTROL_QUEUE_CAPACITY {
+            return Err(AdapterError::new(
+                "voice sidecar outstanding capture control limit reached",
+            ));
+        }
+        let operation_id = state.next_operation_id;
+        state.next_operation_id = state
+            .next_operation_id
+            .checked_add(1)
+            .ok_or_else(|| AdapterError::new("voice sidecar request identity overflowed"))?;
+        state
+            .capture_operations
+            .insert(operation_id, CaptureOperation { kind, completion });
+        Ok((operation_id, receiver))
+    }
+
+    fn cancel_capture(&self, operation_id: u64) {
+        let operation = self
+            .state
+            .lock()
+            .expect("sidecar state lock poisoned")
+            .capture_operations
+            .remove(&operation_id);
+        if let Some(operation) = operation {
+            let _ = operation.completion.send(Err(AdapterError::new(
+                "voice sidecar capture control discarded",
+            )));
+        }
+    }
+
+    fn resolve_capture(
+        &self,
+        kind: CaptureOperationKind,
+        operation_id: u64,
+    ) -> Result<(), AdapterError> {
+        let operation = {
+            let mut state = self.state.lock().expect("sidecar state lock poisoned");
+            if let Some(error) = &state.failure {
+                return Err(error.clone());
+            }
+            let operation = state.capture_operations.get(&operation_id).ok_or_else(|| {
+                AdapterError::new("voice sidecar capture acknowledgement mismatch")
+            })?;
+            if operation.kind != kind {
+                return Err(AdapterError::new(
+                    "voice sidecar capture acknowledgement kind mismatch",
+                ));
+            }
+            state
+                .capture_operations
+                .remove(&operation_id)
+                .expect("capture operation remains registered")
+        };
+        let _ = operation.completion.send(Ok(()));
+        Ok(())
     }
 
     fn validate_enqueue(&self, generation_id: GenerationId) -> Result<(), AdapterError> {
@@ -1938,7 +2210,7 @@ impl SessionShared {
     }
 
     fn fail(&self, error: AdapterError) {
-        let (media, flushes) = {
+        let (media, flushes, capture) = {
             let mut state = self.state.lock().expect("sidecar state lock poisoned");
             if state.failure.is_none() {
                 state.failure = Some(error.clone());
@@ -1954,6 +2226,9 @@ impl SessionShared {
             (
                 state.media_operations.drain(..).collect::<Vec<_>>(),
                 state.flush_operations.drain(..).collect::<Vec<_>>(),
+                std::mem::take(&mut state.capture_operations)
+                    .into_values()
+                    .collect::<Vec<_>>(),
             )
         };
         for operation in media {
@@ -1962,6 +2237,9 @@ impl SessionShared {
             }
         }
         for operation in flushes {
+            let _ = operation.completion.send(Err(error.clone()));
+        }
+        for operation in capture {
             let _ = operation.completion.send(Err(error.clone()));
         }
     }

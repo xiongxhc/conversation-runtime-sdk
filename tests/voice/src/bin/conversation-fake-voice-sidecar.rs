@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use serde_json::json;
 
-const PROTOCOL_VERSION: u16 = 1;
+const PROTOCOL_VERSION: u16 = 2;
 const HEADER_BYTES: usize = 8;
 const AUDIO_METADATA_BYTES: usize = 48;
 const MAX_CONTROL_PAYLOAD_BYTES: usize = 65_536;
@@ -17,6 +17,8 @@ const START_SESSION: u16 = 0x0001;
 const START_CAPTURE: u16 = 0x0002;
 const FLUSH_GENERATION: u16 = 0x0003;
 const SHUTDOWN: u16 = 0x0004;
+const PAUSE_CAPTURE: u16 = 0x0005;
+const RESUME_CAPTURE: u16 = 0x0006;
 const AUDIO_FRAME: u16 = 0x0100;
 const READY: u16 = 0x8001;
 const VOICE_ACTIVITY: u16 = 0x8002;
@@ -24,6 +26,9 @@ const TRANSCRIPT_HYPOTHESIS: u16 = 0x8003;
 const PLAYBACK_ACCEPTED: u16 = 0x8004;
 const PLAYBACK_RENDERED: u16 = 0x8005;
 const PLAYBACK_FLUSHED: u16 = 0x8006;
+const CAPTURE_STARTED: u16 = 0x8007;
+const CAPTURE_PAUSED: u16 = 0x8008;
+const CAPTURE_RESUMED: u16 = 0x8009;
 const FAILURE: u16 = 0x80fe;
 const SHUTDOWN_COMPLETE: u16 = 0x80ff;
 
@@ -154,7 +159,22 @@ fn run() -> Result<(), String> {
                         .map_err(|_| "failed to flush malformed frame".to_owned())?;
                 }
             }
-            FakeEvent::Control(ControlFrame::StartCapture { session }) if ready => {
+            FakeEvent::Control(ControlFrame::StartCapture { session, operation }) if ready => {
+                if scenario == "hold-start-capture-ack" {
+                    write_marker_from_env(HELD_MARKER_ENV, "capture-start-held", false)?;
+                    continue;
+                }
+                if scenario == "delay-capture-acks" {
+                    thread::sleep(Duration::from_millis(100));
+                }
+                write_json_frame(
+                    &mut stdout,
+                    CAPTURE_STARTED,
+                    json!({
+                        "session_id": session,
+                        "operation_id": operation
+                    }),
+                )?;
                 if scenario == "release-held-media-on-capture" {
                     acknowledge_media(
                         &mut stdout,
@@ -306,6 +326,42 @@ fn run() -> Result<(), String> {
                     )?;
                     write_marker_from_env(INPUT_FLOOD_MARKER_ENV, "flooded", false)?;
                 }
+            }
+            FakeEvent::Control(ControlFrame::PauseCapture { session, operation }) if ready => {
+                if scenario == "hold-pause-ack" {
+                    write_marker_from_env(HELD_MARKER_ENV, "pause-held", false)?;
+                    continue;
+                }
+                if scenario == "delay-capture-acks" {
+                    thread::sleep(Duration::from_millis(100));
+                }
+                let acknowledged_operation = if scenario == "wrong-pause-operation" {
+                    operation.saturating_add(1)
+                } else {
+                    operation
+                };
+                write_json_frame(
+                    &mut stdout,
+                    CAPTURE_PAUSED,
+                    json!({
+                        "session_id": if scenario == "wrong-pause-session" {
+                            session.saturating_add(1)
+                        } else {
+                            session
+                        },
+                        "operation_id": acknowledged_operation
+                    }),
+                )?;
+            }
+            FakeEvent::Control(ControlFrame::ResumeCapture { session, operation }) if ready => {
+                write_json_frame(
+                    &mut stdout,
+                    CAPTURE_RESUMED,
+                    json!({
+                        "session_id": session,
+                        "operation_id": operation
+                    }),
+                )?;
             }
             FakeEvent::Control(ControlFrame::FlushGeneration {
                 session,
@@ -617,7 +673,18 @@ fn decode_control(kind: u16, payload: &[u8]) -> Option<ControlFrame> {
     let session = value.get("session_id")?.as_u64()?;
     match kind {
         START_SESSION => Some(ControlFrame::StartSession { session }),
-        START_CAPTURE => Some(ControlFrame::StartCapture { session }),
+        START_CAPTURE => Some(ControlFrame::StartCapture {
+            session,
+            operation: value.get("operation_id")?.as_u64()?,
+        }),
+        PAUSE_CAPTURE => Some(ControlFrame::PauseCapture {
+            session,
+            operation: value.get("operation_id")?.as_u64()?,
+        }),
+        RESUME_CAPTURE => Some(ControlFrame::ResumeCapture {
+            session,
+            operation: value.get("operation_id")?.as_u64()?,
+        }),
         FLUSH_GENERATION => Some(ControlFrame::FlushGeneration {
             session,
             generation: value.get("generation_id")?.as_u64()?,
@@ -757,6 +824,15 @@ enum ControlFrame {
     },
     StartCapture {
         session: u64,
+        operation: u64,
+    },
+    PauseCapture {
+        session: u64,
+        operation: u64,
+    },
+    ResumeCapture {
+        session: u64,
+        operation: u64,
     },
     FlushGeneration {
         session: u64,

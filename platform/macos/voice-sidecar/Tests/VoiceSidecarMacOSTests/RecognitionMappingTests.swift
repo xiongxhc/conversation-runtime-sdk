@@ -1189,6 +1189,10 @@ private actor FatalRecordingAudioService: SidecarAudioService {
 
     func start(configuration _: SidecarConfiguration) {}
 
+    func pauseCapture() {}
+
+    func resumeCapture() {}
+
     func stop() {
         stopCount += 1
     }
@@ -1350,7 +1354,7 @@ private func startFatalSession(
         )
     )
     try await session.handleControl(
-        ChildFrame(control: .startCapture(sessionID: 7))
+        ChildFrame(control: .startCapture(sessionID: 7, operationID: 1))
     )
 }
 

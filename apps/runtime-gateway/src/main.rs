@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use conversation_memory::SystemMemoryClock;
 use conversation_protocol::{ExecutionLocation, RuntimeStatus};
-use conversation_runtime::TextTurnRuntime;
+use conversation_runtime::{ConversationContext, TextTurnRuntime};
 use conversation_runtime_gateway::{GatewayAdapters, GatewayConfig, GatewaySession};
 
 #[tokio::main]
@@ -28,11 +28,10 @@ async fn run() -> Result<(), ()> {
     })?;
 
     let model_id = adapters.model_id().to_owned();
-    let mut runtime =
-        TextTurnRuntime::new(Arc::new(adapters.language)).with_quality_controller(adapters.quality);
+    let mut context = ConversationContext::new(adapters.quality);
     let memory_store = match (adapters.memory_provider, adapters.memory_store) {
         (Some(provider), Some(store)) => {
-            runtime = runtime
+            context = context
                 .with_memory_provider(Arc::new(provider), ExecutionLocation::Local)
                 .map_err(|_| {
                     eprintln!("gateway memory initialization failed");
@@ -60,6 +59,7 @@ async fn run() -> Result<(), ()> {
         telemetry_enabled: false,
         capabilities,
     };
+    let runtime = TextTurnRuntime::new(context, Arc::new(adapters.language));
     let mut session = GatewaySession::new(runtime, status);
     if let Some(store) = memory_store {
         session = session.with_memory_inspection(Arc::new(store), Arc::new(SystemMemoryClock));

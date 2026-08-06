@@ -12,10 +12,12 @@ use conversation_model_adapters::{
 };
 use conversation_protocol::{
     ConversationMode, ExecutionLocation, GenerationId, PersonaProfile, ResponseControls,
-    RuntimeErrorKind, RuntimeEvent, RuntimeStage, RuntimeTimingMilestone, SessionId, TurnId,
+    RuntimeErrorKind, RuntimeEvent, RuntimeStage, RuntimeTimingMilestone, TurnId,
     UnixTimestampMillis, MAX_CONVERSATION_MESSAGE_BYTES,
 };
-use conversation_runtime::{ConversationQualityController, TextTurnEventStream, TextTurnRuntime};
+use conversation_runtime::{
+    ConversationContext, ConversationQualityController, TextTurnEventStream, TextTurnRuntime,
+};
 use tempfile::tempdir;
 use tokio::sync::{mpsc, Notify};
 use tokio::time::timeout;
@@ -25,15 +27,12 @@ use tokio_util::sync::CancellationToken;
 async fn completion_emits_ordered_text_lifecycle_without_speech() {
     let turn_id = TurnId::new(1);
     let language = Arc::new(MockGenerationLanguageModel::new(["hello", " world"]));
-    let runtime = TextTurnRuntime::new(language).with_quality_controller(controller());
+    let runtime = runtime(language);
 
-    let mut events = runtime
-        .start_turn(turn_id, GenerationId::new(1), "question")
-        .await
-        .unwrap();
+    let mut events = start_turn(&runtime, "question").await;
     let observed = drain(&mut events).await;
 
-    assert_eq!(observed.len(), 6);
+    assert_eq!(observed.len(), 7);
     assert_eq!(observed[0], RuntimeEvent::TurnStarted { turn_id });
     assert!(matches!(observed[1], RuntimeEvent::QualityResolved { .. }));
     assert_eq!(
@@ -58,7 +57,21 @@ async fn completion_emits_ordered_text_lifecycle_without_speech() {
             delta: " world".into(),
         }
     );
-    assert_eq!(observed[5], RuntimeEvent::TurnCompleted { turn_id });
+    assert_eq!(
+        observed[5],
+        RuntimeEvent::TextCompleted {
+            turn_id,
+            text: "hello world".into(),
+        }
+    );
+    assert_eq!(observed[6], RuntimeEvent::TurnCompleted { turn_id });
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|event| matches!(event, RuntimeEvent::TextCompleted { .. }))
+            .count(),
+        1
+    );
     assert_eq!(
         observed.iter().filter(|event| event.is_terminal()).count(),
         1
@@ -74,12 +87,9 @@ async fn completion_emits_ordered_text_lifecycle_without_speech() {
 #[tokio::test]
 async fn completion_adds_only_completed_exchange_to_next_history() {
     let language = Arc::new(MockGenerationLanguageModel::new(["answer"]));
-    let runtime = TextTurnRuntime::new(language.clone()).with_quality_controller(controller());
+    let runtime = runtime(language.clone());
 
-    let mut first = runtime
-        .start_turn(TurnId::new(1), GenerationId::new(1), "hello")
-        .await
-        .unwrap();
+    let mut first = start_turn(&runtime, "hello").await;
     assert_eq!(
         collect_terminal(&mut first).await,
         RuntimeEvent::TurnCompleted {
@@ -87,10 +97,7 @@ async fn completion_adds_only_completed_exchange_to_next_history() {
         }
     );
 
-    let mut second = runtime
-        .start_turn(TurnId::new(2), GenerationId::new(2), "again")
-        .await
-        .unwrap();
+    let mut second = start_turn(&runtime, "again").await;
     assert_eq!(
         collect_terminal(&mut second).await,
         RuntimeEvent::TurnCompleted {
@@ -113,15 +120,14 @@ async fn memory_is_published_between_quality_and_language() {
         Arc::new(FixedClock(UnixTimestampMillis::new(2_000).unwrap())),
     ));
     let language = Arc::new(MockGenerationLanguageModel::new(["answer"]));
-    let runtime = TextTurnRuntime::new(language.clone())
-        .with_session_id(SessionId::new(9))
-        .with_memory_provider(provider, ExecutionLocation::Local)
-        .unwrap();
+    let runtime = TextTurnRuntime::new(
+        context()
+            .with_memory_provider(provider, ExecutionLocation::Local)
+            .unwrap(),
+        language.clone(),
+    );
 
-    let mut events = runtime
-        .start_turn(TurnId::new(1), GenerationId::new(1), "question")
-        .await
-        .unwrap();
+    let mut events = start_turn(&runtime, "question").await;
     let observed = drain_with_timeout(&mut events).await;
 
     let quality = event_index(&observed, |event| {
@@ -147,19 +153,12 @@ async fn memory_is_published_between_quality_and_language() {
 #[tokio::test]
 async fn cancellation_waits_for_blocked_language_cleanup_and_excludes_partial_history() {
     let language = Arc::new(ReusableLanguage::new(FirstBehavior::WaitForCancellation));
-    let runtime = TextTurnRuntime::new(language.clone());
+    let runtime = runtime(language.clone());
     let first_turn = TurnId::new(1);
-    let first_generation = GenerationId::new(1);
-    let mut first = runtime
-        .start_turn(first_turn, first_generation, "cancel me")
-        .await
-        .unwrap();
+    let mut first = start_turn(&runtime, "cancel me").await;
 
     receive_through_first_delta(&mut first).await;
-    runtime
-        .interrupt(first_turn, first_generation)
-        .await
-        .unwrap();
+    runtime.interrupt(first_turn).await.unwrap();
     let first_observed = drain_with_timeout(&mut first).await;
     assert_single_terminal(
         &first_observed,
@@ -170,10 +169,7 @@ async fn cancellation_waits_for_blocked_language_cleanup_and_excludes_partial_hi
     assert!(language.cleanup_finished.load(Ordering::Acquire));
 
     let second_turn = TurnId::new(2);
-    let mut second = runtime
-        .start_turn(second_turn, GenerationId::new(2), "after cancellation")
-        .await
-        .unwrap();
+    let mut second = start_turn(&runtime, "after cancellation").await;
     let second_observed = drain_with_timeout(&mut second).await;
     assert_single_terminal(
         &second_observed,
@@ -190,29 +186,19 @@ async fn interruption_unblocks_a_saturated_event_consumer_before_it_drains() {
     let language = Arc::new(MockGenerationLanguageModel::new(std::iter::repeat_n(
         "x", 64,
     )));
-    let runtime = TextTurnRuntime::new(language.clone());
+    let runtime = runtime(language.clone());
     let first_turn = TurnId::new(1);
-    let first_generation = GenerationId::new(1);
-    let mut first = runtime
-        .start_turn(first_turn, first_generation, "blocked consumer")
-        .await
-        .unwrap();
+    let mut first = start_turn(&runtime, "blocked consumer").await;
 
     timeout(Duration::from_secs(1), language.wait_for_blocked_send())
         .await
         .expect("language producer never encountered bounded backpressure");
-    runtime
-        .interrupt(first_turn, first_generation)
-        .await
-        .unwrap();
+    runtime.interrupt(first_turn).await.unwrap();
 
     let mut second = timeout(Duration::from_secs(1), async {
         loop {
-            match runtime
-                .start_turn(TurnId::new(2), GenerationId::new(2), "runtime reuse")
-                .await
-            {
-                Ok(events) => break events,
+            match runtime.start_turn("runtime reuse").await {
+                Ok(started) => break started.into_events(),
                 Err(error) if error.kind() == RuntimeErrorKind::InvalidState => {
                     tokio::task::yield_now().await;
                 }
@@ -241,85 +227,47 @@ async fn interruption_unblocks_a_saturated_event_consumer_before_it_drains() {
 }
 
 #[tokio::test]
-async fn wrong_interruption_identity_is_rejected_without_cancelling_the_turn() {
+async fn wrong_interruption_turn_is_rejected_without_cancelling_the_turn() {
     let language = Arc::new(ReusableLanguage::new(FirstBehavior::WaitForCancellation));
-    let runtime = TextTurnRuntime::new(language);
+    let runtime = runtime(language);
     let turn_id = TurnId::new(1);
-    let generation_id = GenerationId::new(1);
-    let mut first = runtime
-        .start_turn(turn_id, generation_id, "keep running")
-        .await
-        .unwrap();
+    let mut first = start_turn(&runtime, "keep running").await;
     receive_through_first_delta(&mut first).await;
 
-    let wrong_turn = runtime
-        .interrupt(TurnId::new(2), generation_id)
-        .await
-        .unwrap_err();
+    let wrong_turn = runtime.interrupt(TurnId::new(2)).await.unwrap_err();
     assert_eq!(wrong_turn.kind(), RuntimeErrorKind::InvalidState);
-    let wrong_generation = runtime
-        .interrupt(turn_id, GenerationId::new(2))
-        .await
-        .unwrap_err();
-    assert_eq!(wrong_generation.kind(), RuntimeErrorKind::InvalidState);
 
-    runtime.interrupt(turn_id, generation_id).await.unwrap();
+    runtime.interrupt(turn_id).await.unwrap();
     let observed = drain_with_timeout(&mut first).await;
     assert_single_terminal(&observed, RuntimeEvent::TurnCancelled { turn_id });
 }
 
 #[tokio::test]
-async fn completed_turn_requires_both_identifiers_to_increase_strictly() {
-    for (invalid_turn, invalid_generation) in [
-        (TurnId::new(10), GenerationId::new(21)),
-        (TurnId::new(11), GenerationId::new(20)),
-        (TurnId::new(9), GenerationId::new(19)),
-    ] {
-        let language = Arc::new(MockGenerationLanguageModel::new(["answer"]));
-        let runtime = TextTurnRuntime::new(language);
-        let mut first = runtime
-            .start_turn(TurnId::new(10), GenerationId::new(20), "first")
-            .await
-            .unwrap();
-        let first_observed = drain_with_timeout(&mut first).await;
-        assert_single_terminal(
-            &first_observed,
-            RuntimeEvent::TurnCompleted {
-                turn_id: TurnId::new(10),
-            },
-        );
+async fn text_runtime_returns_gateway_owned_identifiers() {
+    let runtime = runtime(Arc::new(MockGenerationLanguageModel::new(["answer"])));
 
-        let error = runtime
-            .start_turn(invalid_turn, invalid_generation, "invalid identity")
-            .await
-            .err()
-            .expect("duplicate or lower identity was accepted");
-        assert_eq!(error.kind(), RuntimeErrorKind::InvalidState);
-        assert_eq!(error.stage(), RuntimeStage::Runtime);
+    let first = runtime.start_turn("first").await.unwrap();
+    assert_eq!(first.identity().turn_id(), TurnId::new(1));
+    assert_eq!(first.identity().generation_id(), GenerationId::new(1));
+    let mut first_events = first.into_events();
+    assert_single_terminal(
+        &drain_with_timeout(&mut first_events).await,
+        RuntimeEvent::TurnCompleted {
+            turn_id: TurnId::new(1),
+        },
+    );
 
-        let mut next = runtime
-            .start_turn(TurnId::new(11), GenerationId::new(21), "valid identity")
-            .await
-            .unwrap();
-        let next_observed = drain_with_timeout(&mut next).await;
-        assert_single_terminal(
-            &next_observed,
-            RuntimeEvent::TurnCompleted {
-                turn_id: TurnId::new(11),
-            },
-        );
-    }
+    let second = runtime.start_turn("second").await.unwrap();
+    assert_eq!(second.identity().turn_id(), TurnId::new(2));
+    assert_eq!(second.identity().generation_id(), GenerationId::new(2));
 }
 
 #[tokio::test]
 async fn adapter_error_discards_partial_history_and_allows_reuse() {
     let language = Arc::new(ReusableLanguage::new(FirstBehavior::Error));
-    let runtime = TextTurnRuntime::new(language.clone());
+    let runtime = runtime(language.clone());
     let first_turn = TurnId::new(1);
-    let mut first = runtime
-        .start_turn(first_turn, GenerationId::new(1), "first request")
-        .await
-        .unwrap();
+    let mut first = start_turn(&runtime, "first request").await;
     let first_observed = drain_with_timeout(&mut first).await;
     let terminal = single_terminal(&first_observed);
     assert!(matches!(
@@ -330,10 +278,7 @@ async fn adapter_error_discards_partial_history_and_allows_reuse() {
     assert!(language.cleanup_finished.load(Ordering::Acquire));
 
     let second_turn = TurnId::new(2);
-    let mut second = runtime
-        .start_turn(second_turn, GenerationId::new(2), "second request")
-        .await
-        .unwrap();
+    let mut second = start_turn(&runtime, "second request").await;
     let second_observed = drain_with_timeout(&mut second).await;
     assert_single_terminal(
         &second_observed,
@@ -347,12 +292,9 @@ async fn adapter_error_discards_partial_history_and_allows_reuse() {
 #[tokio::test]
 async fn adapter_panic_is_contained_discards_history_and_allows_reuse() {
     let language = Arc::new(ReusableLanguage::new(FirstBehavior::Panic));
-    let runtime = TextTurnRuntime::new(language.clone());
+    let runtime = runtime(language.clone());
     let first_turn = TurnId::new(1);
-    let mut first = runtime
-        .start_turn(first_turn, GenerationId::new(1), "panic request")
-        .await
-        .unwrap();
+    let mut first = start_turn(&runtime, "panic request").await;
     let first_observed = drain_with_timeout(&mut first).await;
     let terminal = single_terminal(&first_observed);
     assert!(matches!(
@@ -364,10 +306,7 @@ async fn adapter_panic_is_contained_discards_history_and_allows_reuse() {
     ));
 
     let second_turn = TurnId::new(2);
-    let mut second = runtime
-        .start_turn(second_turn, GenerationId::new(2), "recovery request")
-        .await
-        .unwrap();
+    let mut second = start_turn(&runtime, "recovery request").await;
     let second_observed = drain_with_timeout(&mut second).await;
     assert_single_terminal(
         &second_observed,
@@ -381,16 +320,16 @@ async fn adapter_panic_is_contained_discards_history_and_allows_reuse() {
 #[tokio::test]
 async fn memory_failure_prevents_language_and_allows_reuse() {
     let language = Arc::new(MockGenerationLanguageModel::new(["not reached"]));
-    let runtime = TextTurnRuntime::new(language.clone())
-        .with_memory_provider(Arc::new(FailingMemoryProvider), ExecutionLocation::Local)
-        .unwrap();
+    let runtime = TextTurnRuntime::new(
+        context()
+            .with_memory_provider(Arc::new(FailingMemoryProvider), ExecutionLocation::Local)
+            .unwrap(),
+        language.clone(),
+    );
 
     for value in 1..=2 {
         let turn_id = TurnId::new(value);
-        let mut events = runtime
-            .start_turn(turn_id, GenerationId::new(value), "memory request")
-            .await
-            .unwrap();
+        let mut events = start_turn(&runtime, "memory request").await;
         let observed = drain_with_timeout(&mut events).await;
         let terminal = single_terminal(&observed);
         assert!(matches!(
@@ -414,15 +353,15 @@ async fn async_memory_panic_fails_at_memory_stage_and_allows_reuse() {
         panicked: AtomicBool::new(false),
     });
     let language = Arc::new(MockGenerationLanguageModel::new(["recovered"]));
-    let runtime = TextTurnRuntime::new(language.clone())
-        .with_memory_provider(provider, ExecutionLocation::Local)
-        .unwrap();
+    let runtime = TextTurnRuntime::new(
+        context()
+            .with_memory_provider(provider, ExecutionLocation::Local)
+            .unwrap(),
+        language.clone(),
+    );
 
     let first_turn = TurnId::new(1);
-    let mut first = runtime
-        .start_turn(first_turn, GenerationId::new(1), "panic in memory")
-        .await
-        .unwrap();
+    let mut first = start_turn(&runtime, "panic in memory").await;
     let first_observed = drain_with_timeout(&mut first).await;
     let terminal = single_terminal(&first_observed);
     assert!(matches!(
@@ -434,10 +373,7 @@ async fn async_memory_panic_fails_at_memory_stage_and_allows_reuse() {
     ));
 
     let second_turn = TurnId::new(2);
-    let mut second = runtime
-        .start_turn(second_turn, GenerationId::new(2), "after memory panic")
-        .await
-        .unwrap();
+    let mut second = start_turn(&runtime, "after memory panic").await;
     let second_observed = drain_with_timeout(&mut second).await;
     assert_single_terminal(
         &second_observed,
@@ -470,11 +406,12 @@ async fn over_history_limit_output_fails_and_is_absent_from_next_history() {
 #[tokio::test]
 async fn dropped_event_consumer_cleans_owned_work_and_allows_reuse() {
     let language = Arc::new(ReusableLanguage::new(FirstBehavior::WaitForCancellation));
-    let runtime = TextTurnRuntime::new(language.clone());
+    let runtime = runtime(language.clone());
     let mut dropped = runtime
-        .start_turn(TurnId::new(1), GenerationId::new(1), "drop this stream")
+        .start_turn("drop this stream")
         .await
-        .unwrap();
+        .unwrap()
+        .into_events();
     receive_through_first_delta(&mut dropped).await;
 
     drop(dropped);
@@ -483,11 +420,8 @@ async fn dropped_event_consumer_cleans_owned_work_and_allows_reuse() {
         .expect("dropped consumer did not clean language work");
     let mut retained = timeout(Duration::from_secs(1), async {
         loop {
-            match runtime
-                .start_turn(TurnId::new(2), GenerationId::new(2), "reuse after drop")
-                .await
-            {
-                Ok(events) => break events,
+            match runtime.start_turn("reuse after drop").await {
+                Ok(started) => break started.into_events(),
                 Err(error) if error.kind() == RuntimeErrorKind::InvalidState => {
                     tokio::task::yield_now().await;
                 }
@@ -550,12 +484,9 @@ async fn receive_through_first_delta(events: &mut TextTurnEventStream) {
 
 async fn assert_uncommittable_output_fails(first_behavior: FirstBehavior, expected_message: &str) {
     let language = Arc::new(ReusableLanguage::new(first_behavior));
-    let runtime = TextTurnRuntime::new(language.clone());
+    let runtime = runtime(language.clone());
     let first_turn = TurnId::new(1);
-    let mut first = runtime
-        .start_turn(first_turn, GenerationId::new(1), "first request")
-        .await
-        .unwrap();
+    let mut first = start_turn(&runtime, "first request").await;
     let first_observed = drain_with_timeout(&mut first).await;
     let terminal = single_terminal(&first_observed);
     assert!(matches!(
@@ -565,12 +496,12 @@ async fn assert_uncommittable_output_fails(first_behavior: FirstBehavior, expect
                 && error.stage() == RuntimeStage::LanguageModel
                 && error.message() == expected_message
     ));
+    assert!(!first_observed
+        .iter()
+        .any(|event| matches!(event, RuntimeEvent::TextCompleted { .. })));
 
     let second_turn = TurnId::new(2);
-    let mut second = runtime
-        .start_turn(second_turn, GenerationId::new(2), "second request")
-        .await
-        .unwrap();
+    let mut second = start_turn(&runtime, "second request").await;
     let second_observed = drain_with_timeout(&mut second).await;
     assert_single_terminal(
         &second_observed,
@@ -607,6 +538,18 @@ fn controller() -> ConversationQualityController {
         ResponseControls::default(),
         ConversationMode::DirectAnswer,
     )
+}
+
+fn context() -> ConversationContext {
+    ConversationContext::new(controller())
+}
+
+fn runtime(language: Arc<dyn GenerationLanguageModel>) -> TextTurnRuntime {
+    TextTurnRuntime::new(context(), language)
+}
+
+async fn start_turn(runtime: &TextTurnRuntime, transcript: &str) -> TextTurnEventStream {
+    runtime.start_turn(transcript).await.unwrap().into_events()
 }
 
 struct FixedClock(UnixTimestampMillis);

@@ -8,15 +8,14 @@ use conversation_model_adapters::{
     LanguageModelInput,
 };
 use conversation_protocol::{
-    ConversationMode, ExecutionLocation, GenerationId, PersonaProfile, ResponseControls,
-    RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage, RuntimeTimingMilestone, SessionId,
-    TurnId, MAX_CONVERSATION_MESSAGE_BYTES,
+    GenerationId, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage,
+    RuntimeTimingMilestone, TurnId, MAX_CONVERSATION_MESSAGE_BYTES,
 };
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::{JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
 
-use crate::ConversationQualityController;
+use crate::{ConversationContext, ConversationTurnIdentity, ConversationTurnSource};
 
 const EVENT_BUFFER_SIZE: usize = 32;
 
@@ -45,80 +44,63 @@ impl TextTurnEventStream {
     }
 }
 
+pub struct StartedTextTurn {
+    identity: ConversationTurnIdentity,
+    events: TextTurnEventStream,
+}
+
+impl StartedTextTurn {
+    pub const fn identity(&self) -> ConversationTurnIdentity {
+        self.identity
+    }
+
+    pub fn into_events(self) -> TextTurnEventStream {
+        self.events
+    }
+}
+
 #[derive(Clone)]
 pub struct TextTurnRuntime {
     language_model: Arc<dyn GenerationLanguageModel>,
+    context: ConversationContext,
     state: Arc<Mutex<TextTurnState>>,
-    quality: Arc<Mutex<ConversationQualityController>>,
-    _session_id: Option<SessionId>,
-    memory_provider: Option<Arc<dyn MemoryContextProvider>>,
 }
 
 #[derive(Default)]
 struct TextTurnState {
     active: Option<ActiveTextTurn>,
-    last_turn_id: Option<TurnId>,
-    last_generation_id: Option<GenerationId>,
 }
 
 #[derive(Clone)]
 struct ActiveTextTurn {
-    turn_id: TurnId,
-    generation_id: GenerationId,
+    identity: ConversationTurnIdentity,
     external_interruption: CancellationToken,
     work_cancellation: CancellationToken,
 }
 
 impl TextTurnRuntime {
-    pub fn new(language_model: Arc<dyn GenerationLanguageModel>) -> Self {
+    pub fn new(
+        context: ConversationContext,
+        language_model: Arc<dyn GenerationLanguageModel>,
+    ) -> Self {
         Self {
             language_model,
+            context,
             state: Arc::new(Mutex::new(TextTurnState::default())),
-            quality: Arc::new(Mutex::new(ConversationQualityController::new(
-                PersonaProfile::default(),
-                ResponseControls::default(),
-                ConversationMode::DirectAnswer,
-            ))),
-            _session_id: None,
-            memory_provider: None,
         }
-    }
-
-    pub fn with_quality_controller(mut self, controller: ConversationQualityController) -> Self {
-        self.quality = Arc::new(Mutex::new(controller));
-        self
-    }
-
-    pub fn with_session_id(mut self, session_id: SessionId) -> Self {
-        self._session_id = Some(session_id);
-        self
-    }
-
-    pub fn with_memory_provider(
-        mut self,
-        provider: Arc<dyn MemoryContextProvider>,
-        language_execution: ExecutionLocation,
-    ) -> Result<Self, RuntimeError> {
-        if provider.execution_location() != ExecutionLocation::Local
-            || language_execution != ExecutionLocation::Local
-        {
-            return Err(RuntimeError::new(
-                RuntimeErrorKind::Configuration,
-                RuntimeStage::Memory,
-                "memory context requires local memory and language execution",
-            ));
-        }
-        self.memory_provider = Some(provider);
-        Ok(self)
     }
 
     pub async fn start_turn(
         &self,
-        turn_id: TurnId,
-        generation_id: GenerationId,
         transcript: impl Into<String>,
-    ) -> Result<TextTurnEventStream, RuntimeError> {
-        let transcript = transcript.into();
+    ) -> Result<StartedTextTurn, RuntimeError> {
+        let prepared = self
+            .context
+            .begin_turn(ConversationTurnSource::Text, transcript)
+            .await?;
+        let identity = prepared.identity();
+        let turn_id = identity.turn_id();
+        let generation_id = identity.generation_id();
         let external_interruption = CancellationToken::new();
         let work_cancellation = CancellationToken::new();
         {
@@ -126,62 +108,27 @@ impl TextTurnRuntime {
             if let Some(active) = state.active.as_ref() {
                 return Err(runtime_error(format!(
                     "turn {} generation {} is still active",
-                    active.turn_id, active.generation_id
+                    active.identity.turn_id(),
+                    active.identity.generation_id()
                 )));
             }
-            if state
-                .last_turn_id
-                .is_some_and(|last_turn_id| turn_id <= last_turn_id)
-            {
-                return Err(runtime_error(format!(
-                    "turn {turn_id} must be greater than the last started turn"
-                )));
-            }
-            if state
-                .last_generation_id
-                .is_some_and(|last_generation_id| generation_id <= last_generation_id)
-            {
-                return Err(runtime_error(format!(
-                    "generation {generation_id} must be greater than the last started generation"
-                )));
-            }
-            state.last_turn_id = Some(turn_id);
-            state.last_generation_id = Some(generation_id);
             state.active = Some(ActiveTextTurn {
-                turn_id,
-                generation_id,
+                identity,
                 external_interruption: external_interruption.clone(),
                 work_cancellation: work_cancellation.clone(),
             });
         }
 
-        let resolved = {
-            let mut quality = self.quality.lock().await;
-            quality.resolve_turn(turn_id, transcript.clone(), None)
-        };
-        let resolved = match resolved {
-            Ok(Some(resolved)) => resolved,
-            Ok(None) => {
-                self.release_start(turn_id, generation_id).await;
-                return Err(runtime_error("a text turn transcript cannot be empty"));
-            }
-            Err(error) => {
-                self.release_start(turn_id, generation_id).await;
-                return Err(error);
-            }
-        };
         let language_input = match LanguageModelInput::with_quality(
-            transcript,
-            resolved.history_messages().iter().cloned(),
-            resolved.decision().clone(),
-            resolved.system_guidance(),
+            prepared.transcript(),
+            prepared.resolved().history_messages().iter().cloned(),
+            prepared.resolved().decision().clone(),
+            prepared.resolved().system_guidance(),
         ) {
             Ok(input) => input,
             Err(error) => {
-                let mut quality = self.quality.lock().await;
-                let _ = quality.discard_turn(turn_id);
-                drop(quality);
-                self.release_start(turn_id, generation_id).await;
+                let _ = self.context.discard_turn(identity, false).await;
+                self.release_start(identity).await;
                 return Err(adapter_runtime_error(RuntimeStage::LanguageModel, error));
             }
         };
@@ -200,40 +147,53 @@ impl TextTurnRuntime {
                 .saturating_sub(language_input.transcript().len()),
             language_input,
             language_model: Arc::clone(&self.language_model),
-            memory_provider: self.memory_provider.as_ref().map(Arc::clone),
+            memory_provider: self.context.memory_provider(),
             started_at: Instant::now(),
             external_interruption: external_interruption.clone(),
-            work_cancellation,
+            work_cancellation: work_cancellation.clone(),
         };
         let state = Arc::clone(&self.state);
-        let quality = Arc::clone(&self.quality);
+        let context = self.context.clone();
         let task = tokio::spawn(async move {
             let outcome = run_text_turn(task, &event_sender).await;
-            drop(event_sender);
-
-            let mut state = state.lock().await;
             let mut terminal = if external_interruption.is_cancelled() {
                 RuntimeEvent::TurnCancelled { turn_id }
             } else {
                 outcome.terminal
             };
-            let quality_result = {
-                let mut quality = quality.lock().await;
-                match &terminal {
-                    RuntimeEvent::TurnCompleted { .. } => {
-                        quality.complete_turn(turn_id, outcome.generated_text)
-                    }
-                    RuntimeEvent::TurnCancelled { .. } => quality.interrupt_turn(turn_id),
-                    RuntimeEvent::TurnFailed { .. } => quality.discard_turn(turn_id),
-                    _ => Err(runtime_error("text turn produced a nonterminal result")),
+            let context_result = match &terminal {
+                RuntimeEvent::TurnCompleted { .. } => {
+                    context
+                        .complete_turn(identity, outcome.generated_text.clone())
+                        .await
                 }
+                RuntimeEvent::TurnCancelled { .. } => context.discard_turn(identity, true).await,
+                RuntimeEvent::TurnFailed { .. } => context.discard_turn(identity, false).await,
+                _ => Err(runtime_error("text turn produced a nonterminal result")),
             };
-            if let Err(error) = quality_result {
+            if let Err(error) = context_result {
                 terminal = RuntimeEvent::TurnFailed { turn_id, error };
             }
-            if state.active.as_ref().is_some_and(|active| {
-                active.turn_id == turn_id && active.generation_id == generation_id
-            }) {
+            if matches!(terminal, RuntimeEvent::TurnCompleted { .. }) {
+                let _ = send_event(
+                    &event_sender,
+                    RuntimeEvent::TextCompleted {
+                        turn_id,
+                        text: outcome.generated_text,
+                    },
+                    &external_interruption,
+                    &work_cancellation,
+                )
+                .await;
+            }
+            drop(event_sender);
+
+            let mut state = state.lock().await;
+            if state
+                .active
+                .as_ref()
+                .is_some_and(|active| active.identity == identity)
+            {
                 state.active = None;
             }
             drop(state);
@@ -241,39 +201,41 @@ impl TextTurnRuntime {
             let _ = terminal_sender.send(terminal);
         });
 
-        Ok(TextTurnEventStream {
-            events: event_receiver,
-            terminal: Some(terminal_receiver),
-            events_closed: false,
-            task: Some(task),
+        Ok(StartedTextTurn {
+            identity,
+            events: TextTurnEventStream {
+                events: event_receiver,
+                terminal: Some(terminal_receiver),
+                events_closed: false,
+                task: Some(task),
+            },
         })
     }
 
-    pub async fn interrupt(
-        &self,
-        turn_id: TurnId,
-        generation_id: GenerationId,
-    ) -> Result<(), RuntimeError> {
+    pub async fn interrupt(&self, turn_id: TurnId) -> Result<(), RuntimeError> {
         let state = self.state.lock().await;
         match state.active.as_ref() {
-            Some(active) if active.turn_id == turn_id && active.generation_id == generation_id => {
+            Some(active) if active.identity.turn_id() == turn_id => {
                 active.external_interruption.cancel();
                 active.work_cancellation.cancel();
                 Ok(())
             }
             Some(active) => Err(runtime_error(format!(
-                "turn {} generation {} is active, not turn {} generation {}",
-                active.turn_id, active.generation_id, turn_id, generation_id
+                "turn {} is active, not turn {}",
+                active.identity.turn_id(),
+                turn_id
             ))),
             None => Err(runtime_error("there is no active text generation")),
         }
     }
 
-    async fn release_start(&self, turn_id: TurnId, generation_id: GenerationId) {
+    async fn release_start(&self, identity: ConversationTurnIdentity) {
         let mut state = self.state.lock().await;
-        if state.active.as_ref().is_some_and(|active| {
-            active.turn_id == turn_id && active.generation_id == generation_id
-        }) {
+        if state
+            .active
+            .as_ref()
+            .is_some_and(|active| active.identity == identity)
+        {
             state.active = None;
         }
     }

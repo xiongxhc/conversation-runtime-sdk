@@ -6,7 +6,7 @@ use conversation_memory::{MemoryClock, MemoryStore, MemoryStoreErrorKind};
 use conversation_protocol::{
     decode_client_command, encode_gateway_message, ClientCommand, ClientMemoryCursor,
     ClientMemoryInspection, ClientMemorySummary, ClientRuntimeError, ClientRuntimeEvent,
-    GatewayMessage, GenerationId, RuntimeStatus, TurnId,
+    GatewayMessage, RuntimeStatus, TurnId,
 };
 use conversation_runtime::{TextTurnEventStream, TextTurnRuntime};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -242,7 +242,7 @@ impl GatewaySession {
             }
             ClientCommand::StartTurn {
                 request_id,
-                turn_id,
+                turn_id: _,
                 transcript,
             } => {
                 if active.is_some() {
@@ -254,13 +254,8 @@ impl GatewaySession {
                     .map_err(CommandFailure::response);
                 }
 
-                let generation_id = GenerationId::new(turn_id.get());
-                let event_stream = match self
-                    .runtime
-                    .start_turn(turn_id, generation_id, transcript)
-                    .await
-                {
-                    Ok(event_stream) => event_stream,
+                let started = match self.runtime.start_turn(transcript).await {
+                    Ok(started) => started,
                     Err(error) => {
                         return send_rejection(
                             normal,
@@ -272,9 +267,8 @@ impl GatewaySession {
                 };
 
                 *active = Some(ActiveForwarder::pending(
-                    turn_id,
-                    generation_id,
-                    event_stream,
+                    started.identity().turn_id(),
+                    started.into_events(),
                 ));
                 send_urgent(urgent, accepted_message(&request_id))
                     .map_err(CommandFailure::response)?;
@@ -305,18 +299,14 @@ impl GatewaySession {
                     .map_err(CommandFailure::response);
                 }
 
-                let generation_id = active_turn.generation_id;
                 send_urgent(urgent, accepted_message(&request_id))
                     .map_err(CommandFailure::response)?;
-                self.runtime
-                    .interrupt(turn_id, generation_id)
-                    .await
-                    .map_err(|_| {
-                        CommandFailure::fatal(
-                            GatewaySessionError::Interruption,
-                            "gateway interruption failed",
-                        )
-                    })
+                self.runtime.interrupt(turn_id).await.map_err(|_| {
+                    CommandFailure::fatal(
+                        GatewaySessionError::Interruption,
+                        "gateway interruption failed",
+                    )
+                })
             }
             ClientCommand::MemoryList {
                 request_id,
@@ -474,21 +464,15 @@ enum SessionInput {
 
 struct ActiveForwarder {
     turn_id: TurnId,
-    generation_id: GenerationId,
     event_stream: Option<TextTurnEventStream>,
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<Result<(), GatewaySessionError>>>,
 }
 
 impl ActiveForwarder {
-    fn pending(
-        turn_id: TurnId,
-        generation_id: GenerationId,
-        event_stream: TextTurnEventStream,
-    ) -> Self {
+    fn pending(turn_id: TurnId, event_stream: TextTurnEventStream) -> Self {
         Self {
             turn_id,
-            generation_id,
             event_stream: Some(event_stream),
             shutdown: None,
             task: None,
@@ -559,9 +543,7 @@ async fn shutdown_active(runtime: &TextTurnRuntime, active: &mut Option<ActiveFo
     if let Some(shutdown) = active_turn.shutdown.take() {
         let _ = shutdown.send(());
     }
-    let _ = runtime
-        .interrupt(active_turn.turn_id, active_turn.generation_id)
-        .await;
+    let _ = runtime.interrupt(active_turn.turn_id).await;
     if let Some(mut event_stream) = active_turn.event_stream.take() {
         while event_stream.recv().await.is_some() {}
     }
@@ -848,10 +830,9 @@ mod tests {
     };
     use conversation_model_adapters::{OllamaConfig, OllamaLanguageModel};
     use conversation_protocol::{
-        ClientRuntimeEvent, GatewayMessage, GenerationId, MemoryConfidence, MemoryDraft,
-        MemoryKind, MemoryPatch, MemoryProvenance, MemoryProvenanceKind, MemoryRetention,
-        RuntimeStatus, TurnId, UnixTimestampMillis, MAX_CLIENT_FRAME_BYTES,
-        MAX_MEMORY_CONTENT_BYTES,
+        ClientRuntimeEvent, GatewayMessage, MemoryConfidence, MemoryDraft, MemoryKind, MemoryPatch,
+        MemoryProvenance, MemoryProvenanceKind, MemoryRetention, RuntimeStatus, TurnId,
+        UnixTimestampMillis, MAX_CLIENT_FRAME_BYTES, MAX_MEMORY_CONTENT_BYTES,
     };
     use tempfile::TempDir;
     use tokio::io::{duplex, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
@@ -1119,7 +1100,16 @@ mod tests {
                 .with_endpoint(language.endpoint())
                 .unwrap(),
         );
-        let runtime = conversation_runtime::TextTurnRuntime::new(Arc::new(model));
+        let runtime = conversation_runtime::TextTurnRuntime::new(
+            conversation_runtime::ConversationContext::new(
+                conversation_runtime::ConversationQualityController::new(
+                    conversation_protocol::PersonaProfile::default(),
+                    conversation_protocol::ResponseControls::default(),
+                    conversation_protocol::ConversationMode::DirectAnswer,
+                ),
+            ),
+            Arc::new(model),
+        );
         let session = GatewaySession::new(runtime, status());
         let (mut input, reader) = duplex(4096);
         let (writer, writer_state) = BlockingWriter::new(4);
@@ -1327,9 +1317,7 @@ mod tests {
             .await
             .is_err()
         {
-            let _ = cleanup_runtime
-                .interrupt(TurnId::new(1), GenerationId::new(1))
-                .await;
+            let _ = cleanup_runtime.interrupt(TurnId::new(1)).await;
             timeout(TEST_TIMEOUT, language.connection_reaped.wait())
                 .await
                 .expect("test cleanup could not reap the leaked language request");
@@ -1376,9 +1364,7 @@ mod tests {
             .await
             .is_err()
         {
-            let _ = cleanup_runtime
-                .interrupt(TurnId::new(1), GenerationId::new(1))
-                .await;
+            let _ = cleanup_runtime.interrupt(TurnId::new(1)).await;
             writer_state.release();
             drop(input);
             let _ = timeout(TEST_TIMEOUT, session_task).await;
@@ -1656,24 +1642,26 @@ mod tests {
                 .with_endpoint(endpoint)
                 .unwrap(),
         );
-        conversation_runtime::TextTurnRuntime::new(Arc::new(model))
+        conversation_runtime::TextTurnRuntime::new(
+            conversation_runtime::ConversationContext::new(
+                conversation_runtime::ConversationQualityController::new(
+                    conversation_protocol::PersonaProfile::default(),
+                    conversation_protocol::ResponseControls::default(),
+                    conversation_protocol::ConversationMode::DirectAnswer,
+                ),
+            ),
+            Arc::new(model),
+        )
     }
 
     async fn wait_for_runtime_reuse(runtime: &conversation_runtime::TextTurnRuntime) {
         timeout(TEST_TIMEOUT, async {
             loop {
-                match runtime
-                    .start_turn(
-                        TurnId::new(2),
-                        GenerationId::new(2),
-                        "runtime cleanup probe",
-                    )
-                    .await
-                {
-                    Ok(mut events) => {
-                        let _ = runtime
-                            .interrupt(TurnId::new(2), GenerationId::new(2))
-                            .await;
+                match runtime.start_turn("runtime cleanup probe").await {
+                    Ok(started) => {
+                        let turn_id = started.identity().turn_id();
+                        let mut events = started.into_events();
+                        let _ = runtime.interrupt(turn_id).await;
                         while events.recv().await.is_some() {}
                         return;
                     }

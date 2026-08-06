@@ -148,6 +148,7 @@ export type RuntimeEvent =
       trace: { traceId: bigint; turnId: bigint; selectedItems: number; usedBytes: number };
     }
   | { type: "text_delta"; turnId: bigint; delta: string }
+  | { type: "text_completed"; turnId: bigint; text: string }
   | {
       type: "timing";
       turnId: bigint;
@@ -535,6 +536,9 @@ function parseRuntimeEvent(value: unknown): RuntimeEvent {
     case "text_delta":
       requireExactKeys(object, ["type", "turn_id", "delta"]);
       return { type, turnId: parseIdentifier(object.turn_id), delta: requireString(object, "delta") };
+    case "text_completed":
+      requireExactKeys(object, ["type", "turn_id", "text"]);
+      return { type, turnId: parseIdentifier(object.turn_id), text: requireString(object, "text") };
     case "timing":
       requireExactKeys(object, ["type", "turn_id", "milestone", "elapsed_ms"]);
       return {

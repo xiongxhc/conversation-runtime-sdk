@@ -167,6 +167,20 @@ test("rejects unknown and missing inbound fields", () => {
   );
 });
 
+test("parses an exact completed text snapshot", () => {
+  assert.deepEqual(
+    parseGatewayMessage({
+      protocol_version: 2,
+      type: "runtime_event",
+      event: { type: "text_completed", turn_id: "1", text: "complete answer" },
+    }),
+    {
+      type: "runtime_event",
+      event: { type: "text_completed", turnId: 1n, text: "complete answer" },
+    },
+  );
+});
+
 test("rejects explicit v1 compatibility and unsupported inbound protocol versions", () => {
   assert.throws(() =>
     parseGatewayMessage({

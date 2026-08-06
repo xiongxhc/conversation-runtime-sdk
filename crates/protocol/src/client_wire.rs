@@ -57,6 +57,11 @@ pub enum ClientRuntimeEvent {
         turn_id: TurnId,
         delta: String,
     },
+    TextCompleted {
+        #[serde(serialize_with = "serialize_turn_id")]
+        turn_id: TurnId,
+        text: String,
+    },
     Timing {
         #[serde(serialize_with = "serialize_turn_id")]
         turn_id: TurnId,
@@ -289,6 +294,9 @@ impl TryFrom<RuntimeEvent> for ClientRuntimeEvent {
                 trace: ClientMemoryTrace::from(&trace),
             }),
             RuntimeEvent::TextDelta { turn_id, delta } => Ok(Self::TextDelta { turn_id, delta }),
+            RuntimeEvent::TextCompleted { turn_id, text } => {
+                Ok(Self::TextCompleted { turn_id, text })
+            }
             RuntimeEvent::Timing {
                 turn_id,
                 milestone,
@@ -790,6 +798,7 @@ fn validate_client_runtime_event(event: &ClientRuntimeEvent) -> Result<(), Clien
     match event {
         ClientRuntimeEvent::TurnStarted { turn_id }
         | ClientRuntimeEvent::TextDelta { turn_id, .. }
+        | ClientRuntimeEvent::TextCompleted { turn_id, .. }
         | ClientRuntimeEvent::Timing { turn_id, .. }
         | ClientRuntimeEvent::TurnCompleted { turn_id }
         | ClientRuntimeEvent::TurnCancelled { turn_id } => validate_turn_id(*turn_id),

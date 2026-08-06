@@ -1,7 +1,17 @@
 import { useRef, useState } from "react";
 
+import type {
+  MemoryCursor,
+  MemoryInspection,
+  MemoryPage,
+} from "@conversation/runtime/browser";
+
 import { SetupView } from "./components/SetupView.js";
 import { Workspace, type VoiceCapabilitySnapshot } from "./components/Workspace.js";
+import {
+  conversationHistoryStore,
+  type ConversationHistoryStore,
+} from "./history/conversation-history.js";
 import { loadPreferences, type StorageLike } from "./preferences/preferences.js";
 import {
   loadSetupPaths,
@@ -21,13 +31,16 @@ import {
 export interface DesktopSession {
   readonly state: ConversationSessionState;
   subscribe(listener: (state: ConversationSessionState) => void): () => void;
-  send(transcript: string): bigint;
+  send(transcript: string): bigint | Promise<bigint>;
+  listMemories(cursor?: MemoryCursor | null): Promise<MemoryPage>;
+  inspectMemory(memoryId: bigint): Promise<MemoryInspection>;
   interrupt(): Promise<void>;
   close(): Promise<void>;
 }
 
 export interface AppProps {
   connectSession?: (paths: RuntimePaths) => Promise<DesktopSession>;
+  historyStore?: ConversationHistoryStore;
   storage?: StorageLike;
   voiceCapability?: VoiceCapabilitySnapshot;
 }
@@ -39,6 +52,7 @@ const defaultConnectSession = async (paths: RuntimePaths): Promise<DesktopSessio
 
 export function App({
   connectSession = defaultConnectSession,
+  historyStore = conversationHistoryStore,
   storage = window.localStorage,
   voiceCapability,
 }: AppProps) {
@@ -91,6 +105,7 @@ export function App({
 
   return (
     <Workspace
+      historyStore={historyStore}
       initialPreferences={preferences}
       onClosed={(error) => {
         setSetupError(error);

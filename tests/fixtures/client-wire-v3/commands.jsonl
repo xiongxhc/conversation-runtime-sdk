@@ -1,0 +1,10 @@
+{"protocol_version":3,"type":"status","request_id":"req-status-1"}
+{"protocol_version":3,"type":"start_turn","request_id":"req-start-1","transcript":"hello"}
+{"protocol_version":3,"type":"interrupt_turn","request_id":"req-stop-1","turn_id":"1"}
+{"protocol_version":3,"type":"start_voice_session","request_id":"req-voice-start"}
+{"protocol_version":3,"type":"stop_voice_session","request_id":"req-voice-stop"}
+{"protocol_version":3,"type":"pause_voice_capture","request_id":"req-voice-pause"}
+{"protocol_version":3,"type":"resume_voice_capture","request_id":"req-voice-resume"}
+{"protocol_version":3,"type":"memory_list","request_id":"req-list-first","cursor":null}
+{"protocol_version":3,"type":"memory_list","request_id":"req-list-next","cursor":{"before_id":"7"}}
+{"protocol_version":3,"type":"memory_inspect","request_id":"req-inspect-1","memory_id":"7"}

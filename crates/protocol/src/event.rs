@@ -24,6 +24,10 @@ pub enum RuntimeEvent {
         turn_id: TurnId,
         delta: String,
     },
+    TextCompleted {
+        turn_id: TurnId,
+        text: String,
+    },
     Timing {
         turn_id: TurnId,
         milestone: RuntimeTimingMilestone,
@@ -64,6 +68,7 @@ impl RuntimeEvent {
             Self::TurnStarted { turn_id }
             | Self::TranscriptFinal { turn_id, .. }
             | Self::TextDelta { turn_id, .. }
+            | Self::TextCompleted { turn_id, .. }
             | Self::Timing { turn_id, .. }
             | Self::SpeechStarted { turn_id }
             | Self::SpeechCompleted { turn_id }

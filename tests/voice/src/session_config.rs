@@ -16,7 +16,9 @@ use conversation_protocol::{
     SilencePolicy, SpeechPace, VoiceSessionPolicy, MAX_MEMORY_RETRIEVAL_BYTES,
     MAX_MEMORY_RETRIEVAL_ITEMS,
 };
-use conversation_runtime::{ConversationQualityController, VoiceSessionAdapters};
+use conversation_runtime::{
+    ConversationContext, ConversationQualityController, VoiceSessionAdapters,
+};
 use serde::Deserialize;
 
 use crate::config_file::load_toml;
@@ -386,7 +388,7 @@ impl SessionConfig {
         )
     }
 
-    pub fn adapters(&self) -> Result<VoiceSessionAdapters, String> {
+    pub fn runtime_parts(&self) -> Result<(ConversationContext, VoiceSessionAdapters), String> {
         let memory_provider = self.memory_provider()?;
         self.require_local_execution_adapters()?;
         let language_model = Arc::new(self.language_model()?);
@@ -409,14 +411,16 @@ impl SessionConfig {
             }
         };
         let voice_io = Arc::new(self.voice_io()?);
-        let mut adapters = VoiceSessionAdapters::new(voice_io, language_model, speech_synthesizer)
-            .with_quality_controller(self.quality_controller()?);
+        let mut context = ConversationContext::new(self.quality_controller()?);
         if let Some(provider) = memory_provider {
-            adapters = adapters
+            context = context
                 .with_memory_provider(Arc::new(provider), self.language.execution.into())
                 .map_err(runtime_message)?;
         }
-        Ok(adapters)
+        Ok((
+            context,
+            VoiceSessionAdapters::new(voice_io, language_model, speech_synthesizer),
+        ))
     }
 
     pub const fn quality_metrics_enabled(&self) -> bool {

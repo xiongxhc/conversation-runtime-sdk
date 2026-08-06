@@ -4,10 +4,11 @@ use conversation_protocol::SessionId;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::{AdapterError, AdapterFuture, ContinuousAudioOutput, VoiceInput};
+use crate::{AdapterError, AdapterFuture, ContinuousAudioOutput, VoiceCaptureControl, VoiceInput};
 
 pub struct VoiceIoSession {
     pub input: Arc<dyn VoiceInput>,
+    pub capture: Arc<dyn VoiceCaptureControl>,
     pub output: Arc<dyn ContinuousAudioOutput>,
     pub completion: JoinHandle<Result<(), AdapterError>>,
 }

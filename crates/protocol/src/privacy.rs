@@ -82,6 +82,9 @@ impl VoiceSessionPolicy {
     ) -> Result<Self, RuntimeError> {
         let components: Vec<_> = components.into_iter().collect();
 
+        if session_id.get() == 0 {
+            return Err(policy_error("voice session identity must not be zero"));
+        }
         if components.is_empty() {
             return Err(policy_error("voice session policy requires a component"));
         }

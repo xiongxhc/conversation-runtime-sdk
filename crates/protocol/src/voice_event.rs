@@ -46,6 +46,12 @@ pub enum VoiceSessionEvent {
         session_id: SessionId,
         privacy: PrivacySummary,
     },
+    CapturePaused {
+        session_id: SessionId,
+    },
+    CaptureResumed {
+        session_id: SessionId,
+    },
     VoiceActivity {
         session_id: SessionId,
         activity: VoiceActivity,

@@ -7,14 +7,14 @@ use conversation_protocol::{
     MemoryId, MemoryInspection, MemoryKind, MemoryPatch, MemoryProvenance, MemoryProvenanceKind,
     MemoryRecord, MemoryRetention, MemoryRetrievalReason, MemoryRetrievalRequest,
     MemoryRetrievalTrace, MemoryState, MemoryTraceItem, RetrievalTraceId, SessionId,
-    UnixTimestampMillis,
+    UnixTimestampMillis, MAX_MEMORY_INSPECTION_HISTORY_ITEMS, MAX_MEMORY_LIST_PAGE_ITEMS,
 };
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 
 use crate::retrieval::{check_cancellation, select_records};
 use crate::{
-    MemoryRetrieval, MemoryStore, MemoryStoreError, MemoryStoreErrorKind, MemoryStoreResult,
-    RetrievalCancellation, MAX_MEMORY_SCAN_RECORDS,
+    BoundedMemoryInspection, MemoryPage, MemoryRetrieval, MemoryStore, MemoryStoreError,
+    MemoryStoreErrorKind, MemoryStoreResult, RetrievalCancellation, MAX_MEMORY_SCAN_RECORDS,
 };
 
 pub const SQLITE_APPLICATION_ID: u32 = 0x4352_544d;
@@ -142,6 +142,42 @@ impl MemoryStore for SqliteMemoryStore {
         Ok(records)
     }
 
+    fn list_page(
+        &self,
+        now: UnixTimestampMillis,
+        before_id: Option<MemoryId>,
+        limit: usize,
+    ) -> MemoryStoreResult<MemoryPage> {
+        validate_limit(
+            limit,
+            MAX_MEMORY_LIST_PAGE_ITEMS,
+            "memory list page limit must be 1 through 50",
+        )?;
+        let mut connection = self.connection()?;
+        expire_due(&mut connection, now)?;
+        let before_id = before_id
+            .map(|memory_id| sqlite_integer(memory_id.get()))
+            .transpose()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{RECORD_QUERY} WHERE (?1 IS NULL OR m.id < ?1) ORDER BY m.id DESC LIMIT ?2"
+            ))
+            .map_err(map_sqlite_error)?;
+        let mut records = statement
+            .query_map(
+                params![before_id, sqlite_integer((limit + 1) as u64)?],
+                row_to_record,
+            )
+            .map_err(map_sqlite_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_sqlite_error)?;
+        let next_before_id = (records.len() > limit)
+            .then(|| records.pop())
+            .flatten()
+            .and_then(|_| records.last().map(MemoryRecord::id));
+        Ok(MemoryPage::new(records, next_before_id))
+    }
+
     fn inspect(
         &self,
         memory_id: MemoryId,
@@ -211,6 +247,64 @@ impl MemoryStore for SqliteMemoryStore {
             .map_err(|_| invalid_database_error())?;
         transaction.commit().map_err(map_sqlite_error)?;
         Ok(inspection)
+    }
+
+    fn inspect_bounded(
+        &self,
+        memory_id: MemoryId,
+        now: UnixTimestampMillis,
+        history_limit: usize,
+    ) -> MemoryStoreResult<BoundedMemoryInspection> {
+        validate_limit(
+            history_limit,
+            MAX_MEMORY_INSPECTION_HISTORY_ITEMS,
+            "memory inspection history limit must be 1 through 32",
+        )?;
+        let mut connection = self.connection()?;
+        expire_due(&mut connection, now)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(map_sqlite_error)?;
+        let memory_id = sqlite_integer(memory_id.get())?;
+        let record = transaction
+            .query_row(
+                &format!("{RECORD_QUERY} WHERE m.id = ?1"),
+                [memory_id],
+                row_to_record,
+            )
+            .optional()
+            .map_err(map_sqlite_error)?
+            .ok_or_else(not_found_error)?;
+        let (sources, sources_truncated) = bounded_history(
+            &transaction,
+            memory_id,
+            history_limit,
+            concat!(
+                "SELECT kind, source_id, source_timestamp_ms, actor, content_digest ",
+                "FROM memory_sources WHERE memory_id = ?1 AND kind != 'user_approved' ",
+                "ORDER BY id DESC LIMIT ?2"
+            ),
+            row_to_provenance,
+        )?;
+        let (approvals, approvals_truncated) = bounded_history(
+            &transaction,
+            memory_id,
+            history_limit,
+            concat!(
+                "SELECT confirmation_id, actor, source_timestamp_ms, approved_revision, content_digest ",
+                "FROM memory_sources WHERE memory_id = ?1 AND kind = 'user_approved' ",
+                "ORDER BY id DESC LIMIT ?2"
+            ),
+            row_to_approval,
+        )?;
+        let inspection = MemoryInspection::new(record, sources, approvals)
+            .map_err(|_| invalid_database_error())?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(BoundedMemoryInspection::new(
+            inspection,
+            sources_truncated,
+            approvals_truncated,
+        ))
     }
 
     fn edit(&self, memory_id: MemoryId, patch: MemoryPatch) -> MemoryStoreResult<MemoryRecord> {
@@ -754,6 +848,37 @@ fn row_to_approval(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryApprovalEv
         row.get::<_, String>(4)?,
     )
     .map_err(protocol_to_sql_conversion_error)
+}
+
+fn bounded_history<T>(
+    transaction: &rusqlite::Transaction<'_>,
+    memory_id: i64,
+    history_limit: usize,
+    query: &str,
+    mapper: for<'row> fn(&rusqlite::Row<'row>) -> rusqlite::Result<T>,
+) -> MemoryStoreResult<(Vec<T>, bool)> {
+    let mut statement = transaction.prepare(query).map_err(map_sqlite_error)?;
+    let mut values = statement
+        .query_map(
+            params![memory_id, sqlite_integer((history_limit + 1) as u64)?],
+            mapper,
+        )
+        .map_err(map_sqlite_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(map_sqlite_error)?;
+    let truncated = values.len() > history_limit;
+    if truncated {
+        values.pop();
+    }
+    values.reverse();
+    Ok((values, truncated))
+}
+
+fn validate_limit(limit: usize, maximum: usize, message: &'static str) -> MemoryStoreResult<()> {
+    if !(1..=maximum).contains(&limit) {
+        return Err(store_error(MemoryStoreErrorKind::LimitExceeded, message));
+    }
+    Ok(())
 }
 
 fn expire_due(connection: &mut Connection, now: UnixTimestampMillis) -> MemoryStoreResult<usize> {

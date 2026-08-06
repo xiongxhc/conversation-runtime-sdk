@@ -562,12 +562,16 @@ impl<'a> ChatRequest<'a> {
         config: &'a OllamaConfig,
         input: &'a crate::LanguageModelInput,
     ) -> Result<Self, AdapterError> {
-        let mut messages = Vec::with_capacity(input.recent_messages().len() + 4);
-        if let Some(system_prompt) = config.system_prompt.as_deref() {
-            messages.push(ChatMessage::system(system_prompt));
-        }
-        if let Some(runtime_guidance) = input.runtime_guidance() {
-            messages.push(ChatMessage::system(runtime_guidance));
+        let mut messages = Vec::with_capacity(input.recent_messages().len() + 3);
+        match (config.system_prompt.as_deref(), input.runtime_guidance()) {
+            (Some(system_prompt), Some(runtime_guidance)) => messages.push(
+                ChatMessage::owned_system(format!("{system_prompt}\n\n{runtime_guidance}")),
+            ),
+            (Some(system_prompt), None) => messages.push(ChatMessage::system(system_prompt)),
+            (None, Some(runtime_guidance)) => {
+                messages.push(ChatMessage::system(runtime_guidance));
+            }
+            (None, None) => {}
         }
         for message in input.recent_messages() {
             messages.push(match message.role() {
@@ -629,6 +633,13 @@ impl<'a> ChatMessage<'a> {
         Self {
             role: "system",
             content: Cow::Borrowed(content),
+        }
+    }
+
+    fn owned_system(content: String) -> Self {
+        Self {
+            role: "system",
+            content: Cow::Owned(content),
         }
     }
 

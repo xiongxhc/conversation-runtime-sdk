@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::ops::{Deref, DerefMut};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -11,9 +12,8 @@ use conversation_model_adapters::{
     StreamingSpeechRequest, StreamingSpeechSynthesizer,
 };
 use conversation_protocol::{
-    ConversationMode, ExecutionLocation, GenerationId, PersonaProfile, PlaybackState,
-    ResponseControls, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage,
-    RuntimeTimingMilestone, SessionId, TurnId, UtteranceId,
+    GenerationId, PlaybackState, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage,
+    RuntimeTimingMilestone, TurnId, UtteranceId,
 };
 use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 use tokio::task::{AbortHandle, JoinError, JoinHandle};
@@ -21,7 +21,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::generation::GenerationGuard;
 use crate::speech_text::normalize_speech_text;
-use crate::{ConversationQualityController, UtteranceAssembler};
+use crate::{
+    ConversationContext, ConversationTurnIdentity, ConversationTurnSource, UtteranceAssembler,
+};
 
 const EVENT_BUFFER_SIZE: usize = 32;
 const UTTERANCE_QUEUE_CAPACITY: usize = 2;
@@ -33,6 +35,35 @@ pub struct StreamingTurnEventStream {
     events_closed: bool,
     task: Option<JoinHandle<()>>,
     tasks: TurnTaskGroup,
+}
+
+pub struct StartedStreamingTurn {
+    identity: ConversationTurnIdentity,
+    events: StreamingTurnEventStream,
+}
+
+impl StartedStreamingTurn {
+    pub const fn identity(&self) -> ConversationTurnIdentity {
+        self.identity
+    }
+
+    pub fn into_events(self) -> StreamingTurnEventStream {
+        self.events
+    }
+}
+
+impl Deref for StartedStreamingTurn {
+    type Target = StreamingTurnEventStream;
+
+    fn deref(&self) -> &Self::Target {
+        &self.events
+    }
+}
+
+impl DerefMut for StartedStreamingTurn {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.events
+    }
 }
 
 impl StreamingTurnEventStream {
@@ -144,115 +175,64 @@ impl Drop for TurnTaskCompletion {
 
 #[derive(Clone)]
 pub struct StreamingTurnRuntime {
+    context: ConversationContext,
     language_model: Arc<dyn GenerationLanguageModel>,
     speech_synthesizer: Arc<dyn StreamingSpeechSynthesizer>,
     audio_output: Arc<dyn ContinuousAudioOutput>,
     active: Arc<Mutex<Option<ActiveGeneration>>>,
     generation_guard: GenerationGuard,
-    quality: Arc<Mutex<ConversationQualityController>>,
-    session_id: Option<SessionId>,
-    memory_provider: Option<Arc<dyn MemoryContextProvider>>,
 }
 
 #[derive(Clone)]
 struct ActiveGeneration {
+    identity: ConversationTurnIdentity,
     turn_id: TurnId,
     generation_id: GenerationId,
+    session_id: Option<conversation_protocol::SessionId>,
     external_interruption: CancellationToken,
     work_cancellation: CancellationToken,
 }
 
 impl StreamingTurnRuntime {
     pub fn new(
+        context: ConversationContext,
         language_model: Arc<dyn GenerationLanguageModel>,
         speech_synthesizer: Arc<dyn StreamingSpeechSynthesizer>,
         audio_output: Arc<dyn ContinuousAudioOutput>,
     ) -> Self {
         Self {
+            context,
             language_model,
             speech_synthesizer,
             audio_output,
             active: Arc::new(Mutex::new(None)),
             generation_guard: GenerationGuard::default(),
-            quality: Arc::new(Mutex::new(ConversationQualityController::new(
-                PersonaProfile::default(),
-                ResponseControls::default(),
-                ConversationMode::DirectAnswer,
-            ))),
-            session_id: None,
-            memory_provider: None,
         }
-    }
-
-    pub fn with_quality_controller(mut self, controller: ConversationQualityController) -> Self {
-        self.quality = Arc::new(Mutex::new(controller));
-        self
-    }
-
-    pub fn with_session_id(mut self, session_id: SessionId) -> Self {
-        self.session_id = Some(session_id);
-        self
-    }
-
-    pub fn with_memory_provider(
-        mut self,
-        provider: Arc<dyn MemoryContextProvider>,
-        language_execution: ExecutionLocation,
-    ) -> Result<Self, RuntimeError> {
-        if provider.execution_location() != ExecutionLocation::Local
-            || language_execution != ExecutionLocation::Local
-        {
-            return Err(RuntimeError::new(
-                RuntimeErrorKind::Configuration,
-                RuntimeStage::Memory,
-                "memory context requires local memory and language execution",
-            ));
-        }
-        self.memory_provider = Some(provider);
-        Ok(self)
     }
 
     pub async fn start_turn(
         &self,
-        turn_id: TurnId,
-        generation_id: GenerationId,
+        source: ConversationTurnSource,
         transcript: impl Into<String>,
-    ) -> Result<StreamingTurnEventStream, RuntimeError> {
-        let transcript = transcript.into();
+    ) -> Result<StartedStreamingTurn, RuntimeError> {
+        let prepared = self.context.begin_turn(source, transcript).await?;
+        let identity = prepared.identity();
+        let turn_id = identity.turn_id();
+        let generation_id = identity.generation_id();
         if !self.generation_guard.activate(turn_id, generation_id).await {
+            let _ = self.context.discard_turn(identity, false).await;
             return Err(runtime_error("a streaming generation is still active"));
         }
 
-        let resolved = {
-            let mut quality = self.quality.lock().await;
-            quality.resolve_turn(turn_id, transcript.clone(), None)
-        };
-        let resolved = match resolved {
-            Ok(Some(resolved)) => resolved,
-            Ok(None) => {
-                self.generation_guard
-                    .deactivate(turn_id, generation_id)
-                    .await;
-                return Err(runtime_error("a streaming turn transcript cannot be empty"));
-            }
-            Err(error) => {
-                self.generation_guard
-                    .deactivate(turn_id, generation_id)
-                    .await;
-                return Err(error);
-            }
-        };
         let language_input = match LanguageModelInput::with_quality(
-            transcript,
-            resolved.history_messages().iter().cloned(),
-            resolved.decision().clone(),
-            resolved.system_guidance(),
+            prepared.transcript(),
+            prepared.resolved().history_messages().iter().cloned(),
+            prepared.resolved().decision().clone(),
+            prepared.resolved().system_guidance(),
         ) {
             Ok(input) => input,
             Err(error) => {
-                let mut quality = self.quality.lock().await;
-                let _ = quality.discard_turn(turn_id);
-                drop(quality);
+                let _ = self.context.discard_turn(identity, false).await;
                 self.generation_guard
                     .deactivate(turn_id, generation_id)
                     .await;
@@ -266,17 +246,20 @@ impl StreamingTurnRuntime {
             let mut active = self.active.lock().await;
             if active.is_some() {
                 drop(active);
-                let mut quality = self.quality.lock().await;
-                let _ = quality.discard_turn(turn_id);
-                drop(quality);
+                let _ = self.context.discard_turn(identity, false).await;
                 self.generation_guard
                     .deactivate(turn_id, generation_id)
                     .await;
                 return Err(runtime_error("a streaming generation is still active"));
             }
             *active = Some(ActiveGeneration {
+                identity,
                 turn_id,
                 generation_id,
+                session_id: match source {
+                    ConversationTurnSource::Text => None,
+                    ConversationTurnSource::Voice { session_id } => Some(session_id),
+                },
                 external_interruption: external_interruption.clone(),
                 work_cancellation: work_cancellation.clone(),
             });
@@ -289,9 +272,7 @@ impl StreamingTurnRuntime {
             .await
             .is_err()
         {
-            let mut quality = self.quality.lock().await;
-            let _ = quality.discard_turn(turn_id);
-            drop(quality);
+            let _ = self.context.discard_turn(identity, false).await;
             self.generation_guard
                 .deactivate(turn_id, generation_id)
                 .await;
@@ -314,47 +295,55 @@ impl StreamingTurnRuntime {
             work_cancellation,
             tasks: tasks.clone(),
             generated_text: Arc::new(StdMutex::new(String::new())),
-            memory_provider: self.memory_provider.as_ref().map(Arc::clone),
+            memory_provider: self.context.memory_provider(),
         };
         let active = Arc::clone(&self.active);
-        let quality = Arc::clone(&self.quality);
+        let context = self.context.clone();
         let generation_guard = self.generation_guard.clone();
         let terminal_interruption = external_interruption;
         let generated_text = Arc::clone(&task.generated_text);
 
         let task = tasks.spawn(async move {
             let mut terminal_event = run_streaming_turn(task, &event_sender).await;
-            drop(event_sender);
-            generation_guard.deactivate(turn_id, generation_id).await;
 
             if terminal_interruption.is_cancelled() {
                 terminal_event = RuntimeEvent::TurnCancelled { turn_id };
             }
 
-            let quality_result = {
-                let mut quality = quality.lock().await;
-                match &terminal_event {
-                    RuntimeEvent::TurnCompleted { .. } => {
-                        let generated_text = generated_text
-                            .lock()
-                            .expect("generated text lock poisoned")
-                            .clone();
-                        if generated_text.trim().is_empty() {
-                            quality.discard_turn(turn_id)
-                        } else {
-                            quality.complete_turn(turn_id, generated_text)
-                        }
+            let generated_text = generated_text
+                .lock()
+                .expect("generated text lock poisoned")
+                .clone();
+            let context_result = match &terminal_event {
+                RuntimeEvent::TurnCompleted { .. } => {
+                    if generated_text.trim().is_empty() {
+                        context.discard_turn(identity, false).await
+                    } else {
+                        context
+                            .complete_turn(identity, generated_text.clone())
+                            .await
                     }
-                    RuntimeEvent::TurnCancelled { .. } => quality.interrupt_turn(turn_id),
-                    RuntimeEvent::TurnFailed { .. } => quality.discard_turn(turn_id),
-                    _ => Err(runtime_error(
-                        "streaming turn produced a nonterminal result",
-                    )),
                 }
+                RuntimeEvent::TurnCancelled { .. } => context.discard_turn(identity, true).await,
+                RuntimeEvent::TurnFailed { .. } => context.discard_turn(identity, false).await,
+                _ => Err(runtime_error(
+                    "streaming turn produced a nonterminal result",
+                )),
             };
-            if let Err(error) = quality_result {
+            if let Err(error) = context_result {
                 terminal_event = RuntimeEvent::TurnFailed { turn_id, error };
             }
+
+            if matches!(terminal_event, RuntimeEvent::TurnCompleted { .. }) {
+                let _ = event_sender
+                    .send(RuntimeEvent::TextCompleted {
+                        turn_id,
+                        text: generated_text,
+                    })
+                    .await;
+            }
+            drop(event_sender);
+            generation_guard.deactivate(turn_id, generation_id).await;
 
             let mut active = active.lock().await;
             if active.as_ref().is_some_and(|current| {
@@ -367,12 +356,15 @@ impl StreamingTurnRuntime {
             let _ = terminal_sender.send(terminal_event);
         });
 
-        Ok(StreamingTurnEventStream {
-            events: event_receiver,
-            terminal: Some(terminal_receiver),
-            events_closed: false,
-            task: Some(task),
-            tasks,
+        Ok(StartedStreamingTurn {
+            identity,
+            events: StreamingTurnEventStream {
+                events: event_receiver,
+                terminal: Some(terminal_receiver),
+                events_closed: false,
+                task: Some(task),
+                tasks,
+            },
         })
     }
 
@@ -401,7 +393,7 @@ impl StreamingTurnRuntime {
 
         active.external_interruption.cancel();
         active.work_cancellation.cancel();
-        if let Some(session_id) = self.session_id {
+        if let Some(session_id) = active.session_id {
             self.audio_output
                 .flush(session_id, generation_id)
                 .await
@@ -419,9 +411,16 @@ impl StreamingTurnRuntime {
         events: &mut StreamingTurnEventStream,
     ) -> Result<(), RuntimeError> {
         events.abort_and_reap().await?;
-        let mut quality = self.quality.lock().await;
-        let _ = quality.interrupt_turn(turn_id);
-        drop(quality);
+        let identity = {
+            let active = self.active.lock().await;
+            active.as_ref().and_then(|current| {
+                (current.turn_id == turn_id && current.generation_id == generation_id)
+                    .then_some(current.identity)
+            })
+        };
+        if let Some(identity) = identity {
+            self.context.discard_turn(identity, true).await?;
+        }
         self.generation_guard
             .deactivate(turn_id, generation_id)
             .await;
@@ -1522,9 +1521,19 @@ mod tests {
         MockContinuousAudioOutput, MockGenerationLanguageModel, MockStreamingSpeechSynthesizer,
         PcmSampleFormat,
     };
+    use conversation_protocol::{ConversationMode, PersonaProfile, ResponseControls};
     use tokio::time::timeout;
 
     use super::*;
+    use crate::{ConversationContext, ConversationQualityController, ConversationTurnSource};
+
+    fn context() -> ConversationContext {
+        ConversationContext::new(ConversationQualityController::new(
+            PersonaProfile::default(),
+            ResponseControls::default(),
+            ConversationMode::DirectAnswer,
+        ))
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn terminal_waits_for_active_clear_and_immediately_allows_reuse() {
@@ -1532,6 +1541,7 @@ mod tests {
         let first_generation = GenerationId::new(1);
         let format = PcmFormat::new(24_000, 1, PcmSampleFormat::Signed16LittleEndian).unwrap();
         let runtime = StreamingTurnRuntime::new(
+            context(),
             Arc::new(MockGenerationLanguageModel::new(["answer"])),
             Arc::new(MockStreamingSpeechSynthesizer::new([AudioFrame::new(
                 first_turn,
@@ -1545,7 +1555,7 @@ mod tests {
             Arc::new(MockContinuousAudioOutput::new()),
         );
         let mut first = runtime
-            .start_turn(first_turn, first_generation, "first")
+            .start_turn(ConversationTurnSource::Text, "first")
             .await
             .unwrap();
         let active = runtime.active.lock().await;
@@ -1597,7 +1607,7 @@ mod tests {
         let second_turn = TurnId::new(2);
         let second_generation = GenerationId::new(2);
         let mut second = runtime
-            .start_turn(second_turn, second_generation, "second")
+            .start_turn(ConversationTurnSource::Text, "second")
             .await
             .expect("terminal observation must imply immediate runtime reuse");
         runtime

@@ -15,6 +15,7 @@ mod openai_compatible_streaming_speech;
 mod recognition;
 mod speech;
 mod streaming_speech;
+mod voice_capture_control;
 mod voice_input;
 mod voice_io;
 mod voice_mock;
@@ -24,6 +25,8 @@ use std::error::Error;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+
+use conversation_protocol::RuntimeStage;
 
 pub use audio_frame::{AudioFrame, PcmFormat, PcmSampleFormat, MAX_PCM_FRAME_BYTES};
 pub use audio_output::{AudioOutput, AudioOutputRequest, DiscardAudioOutput};
@@ -56,11 +59,12 @@ pub use openai_compatible_streaming_speech::{
 pub use recognition::{RecognitionEvent, RecognitionHypothesis, SpeechRecognizer};
 pub use speech::{AudioFormat, SpeechRequest, SpeechSynthesizer, SynthesizedAudio};
 pub use streaming_speech::{StreamingSpeechRequest, StreamingSpeechSynthesizer};
+pub use voice_capture_control::VoiceCaptureControl;
 pub use voice_input::{VoiceInput, VoiceInputEvent};
 pub use voice_io::{VoiceIoFactory, VoiceIoSession};
 pub use voice_mock::{
     MockAudioCapture, MockContinuousAudioOutput, MockGenerationLanguageModel, MockSpeechRecognizer,
-    MockStreamingSpeechSynthesizer, MockVoiceInput, MockVoiceIoFactory,
+    MockStreamingSpeechSynthesizer, MockVoiceCaptureControl, MockVoiceInput, MockVoiceIoFactory,
 };
 pub use wav_pcm::WavPcmDecoder;
 
@@ -69,17 +73,28 @@ pub type AdapterFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, AdapterErr
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdapterError {
     message: String,
+    stage: Option<RuntimeStage>,
 }
 
 impl AdapterError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            stage: None,
         }
+    }
+
+    pub fn with_stage(mut self, stage: RuntimeStage) -> Self {
+        self.stage = Some(stage);
+        self
     }
 
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    pub const fn stage(&self) -> Option<RuntimeStage> {
+        self.stage
     }
 }
 

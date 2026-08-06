@@ -11,15 +11,18 @@ use conversation_protocol::{
     GenerationId, RuntimeStage, SessionId, TurnId, UtteranceId, VoiceActivity,
 };
 
-const FIXTURE_ROOT: &str = "../../tests/fixtures/voice-sidecar-v1";
+const FIXTURE_ROOT: &str = "../../tests/fixtures/voice-sidecar-v2";
 
 #[test]
-fn version_one_kind_codes_are_pinned() {
+fn version_two_capture_kind_codes_are_pinned() {
+    assert_eq!(PROTOCOL_VERSION, 2);
     let expected = [
         (SidecarFrameKind::StartSession, 0x0001),
         (SidecarFrameKind::StartCapture, 0x0002),
         (SidecarFrameKind::FlushGeneration, 0x0003),
         (SidecarFrameKind::Shutdown, 0x0004),
+        (SidecarFrameKind::PauseCapture, 0x0005),
+        (SidecarFrameKind::ResumeCapture, 0x0006),
         (SidecarFrameKind::AudioFrame, 0x0100),
         (SidecarFrameKind::Ready, 0x8001),
         (SidecarFrameKind::VoiceActivity, 0x8002),
@@ -27,6 +30,9 @@ fn version_one_kind_codes_are_pinned() {
         (SidecarFrameKind::PlaybackAccepted, 0x8004),
         (SidecarFrameKind::PlaybackRendered, 0x8005),
         (SidecarFrameKind::PlaybackFlushed, 0x8006),
+        (SidecarFrameKind::CaptureStarted, 0x8007),
+        (SidecarFrameKind::CapturePaused, 0x8008),
+        (SidecarFrameKind::CaptureResumed, 0x8009),
         (SidecarFrameKind::Failure, 0x80fe),
         (SidecarFrameKind::ShutdownComplete, 0x80ff),
     ];
@@ -37,12 +43,135 @@ fn version_one_kind_codes_are_pinned() {
 }
 
 #[test]
+fn capture_controls_round_trip_exact_session_and_operation_identity() {
+    let controls = [
+        SidecarControl::StartCapture {
+            session_id: SessionId::new(7),
+            operation_id: 1,
+        },
+        SidecarControl::PauseCapture {
+            session_id: SessionId::new(7),
+            operation_id: 2,
+        },
+        SidecarControl::ResumeCapture {
+            session_id: SessionId::new(7),
+            operation_id: 3,
+        },
+        SidecarControl::CaptureStarted {
+            session_id: SessionId::new(7),
+            operation_id: 1,
+        },
+        SidecarControl::CapturePaused {
+            session_id: SessionId::new(7),
+            operation_id: 2,
+        },
+        SidecarControl::CaptureResumed {
+            session_id: SessionId::new(7),
+            operation_id: 3,
+        },
+    ];
+
+    for control in controls {
+        let frame = SidecarFrame::control(control);
+        assert_eq!(decode_frame(&encode_frame(&frame).unwrap()).unwrap(), frame);
+    }
+}
+
+#[test]
+fn sidecar_protocol_v1_is_rejected_explicitly() {
+    let bytes = raw_frame(1, 0x0002, br#"{"session_id":7,"operation_id":1}"#);
+
+    assert_eq!(
+        decode_frame(&bytes),
+        Err(SidecarCodecError::UnknownVersion(1))
+    );
+}
+
+#[test]
+fn capture_controls_reject_zero_operation_identity() {
+    let frame = SidecarFrame::control(SidecarControl::PauseCapture {
+        session_id: SessionId::new(7),
+        operation_id: 0,
+    });
+    assert_eq!(
+        encode_frame(&frame),
+        Err(SidecarCodecError::InvalidControlJson)
+    );
+
+    let bytes = raw_frame(
+        PROTOCOL_VERSION,
+        SidecarFrameKind::CapturePaused.code(),
+        br#"{"session_id":7,"operation_id":0}"#,
+    );
+    assert_eq!(
+        decode_frame(&bytes),
+        Err(SidecarCodecError::InvalidControlJson)
+    );
+}
+
+#[test]
+fn capture_controls_reject_zero_session_identity() {
+    let controls = [
+        SidecarControl::StartCapture {
+            session_id: SessionId::new(0),
+            operation_id: 1,
+        },
+        SidecarControl::PauseCapture {
+            session_id: SessionId::new(0),
+            operation_id: 1,
+        },
+        SidecarControl::ResumeCapture {
+            session_id: SessionId::new(0),
+            operation_id: 1,
+        },
+        SidecarControl::CaptureStarted {
+            session_id: SessionId::new(0),
+            operation_id: 1,
+        },
+        SidecarControl::CapturePaused {
+            session_id: SessionId::new(0),
+            operation_id: 1,
+        },
+        SidecarControl::CaptureResumed {
+            session_id: SessionId::new(0),
+            operation_id: 1,
+        },
+    ];
+    for control in controls {
+        assert_eq!(
+            encode_frame(&SidecarFrame::control(control)),
+            Err(SidecarCodecError::InvalidControlJson)
+        );
+    }
+
+    let kinds = [
+        SidecarFrameKind::StartCapture,
+        SidecarFrameKind::PauseCapture,
+        SidecarFrameKind::ResumeCapture,
+        SidecarFrameKind::CaptureStarted,
+        SidecarFrameKind::CapturePaused,
+        SidecarFrameKind::CaptureResumed,
+    ];
+    for kind in kinds {
+        let bytes = raw_frame(
+            PROTOCOL_VERSION,
+            kind.code(),
+            br#"{"session_id":0,"operation_id":1}"#,
+        );
+        assert_eq!(
+            decode_frame(&bytes),
+            Err(SidecarCodecError::InvalidControlJson)
+        );
+    }
+}
+
+#[test]
 fn start_session_fixture_round_trips_exactly() {
     let bytes =
-        include_bytes!("../../../../tests/fixtures/voice-sidecar-v1/control/start-session.bin");
+        include_bytes!("../../../../tests/fixtures/voice-sidecar-v2/control/start-session.bin");
     let frame = decode_frame(bytes).unwrap();
 
-    assert_eq!(frame.version(), 1);
+    assert_eq!(frame.version(), 2);
     assert_eq!(frame.kind(), SidecarFrameKind::StartSession);
     assert_eq!(encode_frame(&frame).unwrap(), bytes);
     assert_eq!(
@@ -54,7 +183,7 @@ fn start_session_fixture_round_trips_exactly() {
 #[test]
 fn transcript_partial_fixture_round_trips_exactly() {
     let bytes = include_bytes!(
-        "../../../../tests/fixtures/voice-sidecar-v1/control/transcript-partial.bin"
+        "../../../../tests/fixtures/voice-sidecar-v2/control/transcript-partial.bin"
     );
     let frame = decode_frame(bytes).unwrap();
 
@@ -75,8 +204,20 @@ fn transcript_partial_fixture_round_trips_exactly() {
 
 #[test]
 fn signed_sixteen_audio_fixture_pins_metadata_and_pcm_bytes() {
-    let bytes = include_bytes!("../../../../tests/fixtures/voice-sidecar-v1/audio/pcm-s16le.bin");
-    let frame = decode_frame(bytes).unwrap();
+    let frame = SidecarFrame::audio(
+        SessionId::new(1),
+        AudioFrame::new(
+            TurnId::new(2),
+            GenerationId::new(3),
+            UtteranceId::new(4),
+            5,
+            PcmFormat::new(24_000, 1, PcmSampleFormat::Signed16LittleEndian).unwrap(),
+            vec![0x00, 0x80, 0xff, 0x7f],
+        )
+        .unwrap(),
+    );
+    let bytes = encode_frame(&frame).unwrap();
+    let frame = decode_frame(&bytes).unwrap();
     let (session_id, audio) = frame.as_audio().unwrap();
 
     assert_eq!(frame.kind(), SidecarFrameKind::AudioFrame);
@@ -95,7 +236,7 @@ fn signed_sixteen_audio_fixture_pins_metadata_and_pcm_bytes() {
     assert_eq!(encode_frame(&frame).unwrap(), bytes);
 
     let expected = [
-        0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x34, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00, 0x34, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x05, 0x00, 0x00, 0x5d, 0xc0, 0x00, 0x01, 0x00, 0x01, 0x00, 0x80, 0xff, 0x7f,
@@ -159,8 +300,13 @@ fn partial_payload_returns_need_more_data_until_exact_length() {
 
 #[test]
 fn eof_converts_partial_data_to_typed_truncation() {
-    let bytes =
-        include_bytes!("../../../../tests/fixtures/voice-sidecar-v1/invalid/truncated-control.bin");
+    let complete = encode_frame(&SidecarFrame::control(SidecarControl::StartSession {
+        session_id: SessionId::new(7),
+        speech_start_ms: 200,
+        final_silence_ms: 600,
+    }))
+    .unwrap();
+    let bytes = &complete[..complete.len() - 3];
     let error = decode_frame_at_eof(bytes).unwrap_err();
 
     assert!(matches!(
@@ -174,11 +320,11 @@ fn eof_converts_partial_data_to_typed_truncation() {
 
 #[test]
 fn unknown_version_fails_before_payload_decode() {
-    let bytes = raw_frame(2, SidecarFrameKind::StartCapture.code(), &[0xff]);
+    let bytes = raw_frame(1, SidecarFrameKind::StartCapture.code(), &[0xff]);
 
     assert_eq!(
         decode_frame(&bytes),
-        Err(SidecarCodecError::UnknownVersion(2))
+        Err(SidecarCodecError::UnknownVersion(1))
     );
 }
 
@@ -236,11 +382,13 @@ fn control_json_denies_unknown_fields() {
 
 #[test]
 fn declared_control_length_is_rejected_before_payload_read() {
-    let bytes =
-        include_bytes!("../../../../tests/fixtures/voice-sidecar-v1/invalid/oversized-header.bin");
+    let bytes = header(
+        SidecarFrameKind::StartSession,
+        u32::try_from(MAX_CONTROL_PAYLOAD_BYTES + 1).unwrap(),
+    );
 
     assert_eq!(
-        decode_frame(bytes),
+        decode_frame(&bytes),
         Err(SidecarCodecError::PayloadTooLarge {
             kind: SidecarFrameKind::StartSession,
             declared: MAX_CONTROL_PAYLOAD_BYTES + 1,
@@ -476,6 +624,7 @@ fn every_control_kind_round_trips_with_exact_identity_fields() {
         },
         SidecarControl::StartCapture {
             session_id: SessionId::new(1),
+            operation_id: 1,
         },
         SidecarControl::FlushGeneration {
             session_id: SessionId::new(1),
@@ -540,8 +689,8 @@ fn trailing_bytes_are_not_silently_accepted() {
 }
 
 #[test]
-#[ignore = "writes the immutable version-one cross-language fixtures once"]
-fn write_version_one_fixtures() {
+#[ignore = "writes the immutable version-two cross-language fixtures once"]
+fn write_version_two_fixtures() {
     let start_session = SidecarFrame::control(SidecarControl::StartSession {
         session_id: SessionId::new(7),
         speech_start_ms: 200,
@@ -551,18 +700,50 @@ fn write_version_one_fixtures() {
         session_id: SessionId::new(7),
         hypothesis: RecognitionHypothesis::partial(3, "hel"),
     });
-    let audio = SidecarFrame::audio(
-        SessionId::new(1),
-        AudioFrame::new(
-            TurnId::new(2),
-            GenerationId::new(3),
-            UtteranceId::new(4),
-            5,
-            PcmFormat::new(24_000, 1, PcmSampleFormat::Signed16LittleEndian).unwrap(),
-            vec![0x00, 0x80, 0xff, 0x7f],
-        )
-        .unwrap(),
-    );
+    let capture_controls = [
+        (
+            "start-capture.bin",
+            SidecarControl::StartCapture {
+                session_id: SessionId::new(7),
+                operation_id: 1,
+            },
+        ),
+        (
+            "pause-capture.bin",
+            SidecarControl::PauseCapture {
+                session_id: SessionId::new(7),
+                operation_id: 2,
+            },
+        ),
+        (
+            "resume-capture.bin",
+            SidecarControl::ResumeCapture {
+                session_id: SessionId::new(7),
+                operation_id: 3,
+            },
+        ),
+        (
+            "capture-started.bin",
+            SidecarControl::CaptureStarted {
+                session_id: SessionId::new(7),
+                operation_id: 1,
+            },
+        ),
+        (
+            "capture-paused.bin",
+            SidecarControl::CapturePaused {
+                session_id: SessionId::new(7),
+                operation_id: 2,
+            },
+        ),
+        (
+            "capture-resumed.bin",
+            SidecarControl::CaptureResumed {
+                session_id: SessionId::new(7),
+                operation_id: 3,
+            },
+        ),
+    ];
 
     write_fixture(
         "control/start-session.bin",
@@ -572,20 +753,12 @@ fn write_version_one_fixtures() {
         "control/transcript-partial.bin",
         &encode_frame(&transcript_partial).unwrap(),
     );
-    write_fixture("audio/pcm-s16le.bin", &encode_frame(&audio).unwrap());
-    write_fixture(
-        "invalid/oversized-header.bin",
-        &header(
-            SidecarFrameKind::StartSession,
-            u32::try_from(MAX_CONTROL_PAYLOAD_BYTES + 1).unwrap(),
-        ),
-    );
-
-    let complete = encode_frame(&start_session).unwrap();
-    write_fixture(
-        "invalid/truncated-control.bin",
-        &complete[..complete.len() - 3],
-    );
+    for (name, control) in capture_controls {
+        write_fixture(
+            &format!("control/{name}"),
+            &encode_frame(&SidecarFrame::control(control)).unwrap(),
+        );
+    }
 }
 
 fn valid_audio_payload() -> Vec<u8> {

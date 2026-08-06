@@ -306,7 +306,14 @@ forwards the bounded protocol without adding a network listener. The React app
 supports setup with absolute paths, verified local-only status, streamed text
 chat, Stop, close, and reconnect. Its idle Voice Focus preview makes Soft Aurora
 (the default), Silk, Threads, Prism, Orb, Still Gradient, and None selectable;
-the transcript remains hidden by default.
+the transcript remains hidden by default. When an explicitly initialized local
+memory store is configured and the gateway advertises protocol-v3
+`memory_inspection`, the desktop uses the public browser-safe SDK to provide
+read-only list and detail inspection. History remains separately owned local
+transcript storage; the desktop neither initializes runtime memory nor
+automatically captures conversations into it. Inspection exposes at most the
+latest 50 summaries per page and the latest 32 provenance and approval entries,
+and labels truncated older history; due expiry may be applied during inspection.
 
 The deterministic cross-language smoke compiles the actual Rust binary and
 uses a temporary loopback Ollama-compatible fixture to prove ready, command
@@ -314,12 +321,15 @@ acceptance, text streaming, completion, and a separate cancellation run. It is
 interoperability evidence only; it does not select a model, measure latency or
 quality, or close any R3 human, device, or acoustic acceptance gate.
 
-R6 remains open overall. The current gateway reports text-only capabilities,
-so production Voice Focus cannot activate microphone capture, recognition,
-playback, or barge-in. Persona and memory inspection/mutation backed by runtime
-state, model setup and benchmark UI, packaging, signing, and installation flows
-also remain open. R3 human-spoken, ten-minute, and acoustic acceptance remains
-a separate blocked milestone and is not advanced by desktop scene rendering.
+R6 remains open overall. The current gateway does not report voice
+capabilities, so production Voice Focus cannot activate microphone capture,
+recognition, playback, or barge-in. Persona inspection and mutation backed by
+runtime state, runtime-memory mutation and management work, model setup and
+benchmark UI, packaging, signing, and installation flows also remain open. The
+first desktop memory slice completes read-only runtime inspection; persona
+mutation and all memory mutation remain open. R3 human-spoken, ten-minute, and
+acoustic acceptance remains a separate blocked milestone and is not advanced by
+desktop scene rendering.
 
 See [the R6 local-gateway evaluation](docs/r6-local-gateway-evaluation.md) and
 [the R6 desktop-app evaluation](docs/r6-desktop-app-evaluation.md).
@@ -335,6 +345,8 @@ See [the R6 local-gateway evaluation](docs/r6-local-gateway-evaluation.md) and
 - macOS Tauri process bridge using explicit absolute gateway and configuration
   paths.
 - Local text-chat workspace with streamed output, Stop, close, and reconnect.
+- Protocol-v3 read-only runtime-memory list and detail inspection through the
+  public browser-safe SDK, gated on an explicitly configured local store.
 - Idle Voice Focus preview with seven selectable scenes, hidden transcript by
   default, reduced-motion fallback, and explicit visual-preview labeling.
 
@@ -342,8 +354,8 @@ See [the R6 local-gateway evaluation](docs/r6-local-gateway-evaluation.md) and
 
 - Typed voice-session events and production microphone, recognition, playback,
   and barge-in activation in the desktop app.
-- Persona and memory inspection and mutation controls backed by actual runtime
-  state.
+- Persona inspection and mutation controls, plus runtime-memory mutation
+  controls backed by actual runtime state.
 - Local model setup and benchmark reporting.
 - Packaging, signing, installation, and private configuration workflows that
   contain no model weights.

@@ -53,6 +53,8 @@ export async function runChat(
   let closePromise: Promise<void> | undefined;
   let exitCode = 0;
   let failureReported = false;
+  let interruptPending = false;
+  let startPending = false;
   let stopping = false;
 
   const reportFailure = (): void => {
@@ -83,10 +85,14 @@ export async function runChat(
       });
       return;
     }
+    if (startPending && !interruptPending) {
+      interruptPending = true;
+      return;
+    }
     stop();
   };
   const onInputEnd = (): void => {
-    if (active) {
+    if (active || startPending) {
       stop();
     }
   };
@@ -113,8 +119,19 @@ export async function runChat(
         continue;
       }
 
-      const turn = client.startTurn(next.value);
-      active = { turn, interruptRequested: false };
+      startPending = true;
+      const turn = await client.startTurn(next.value);
+      startPending = false;
+      active = { turn, interruptRequested: interruptPending };
+      if (interruptPending) {
+        interruptPending = false;
+        void client.interrupt(turn.turnId).catch(() => {
+          if (!stopping) {
+            reportFailure();
+            stop(1);
+          }
+        });
+      }
       io.output.write("assistant> ");
       const terminal = await renderTurn(turn, io.output);
       active = undefined;
@@ -130,6 +147,7 @@ export async function runChat(
     }
   } finally {
     active = undefined;
+    startPending = false;
     io.signals.off("SIGINT", onSigint);
     io.input.off("end", onInputEnd);
     lines?.close();

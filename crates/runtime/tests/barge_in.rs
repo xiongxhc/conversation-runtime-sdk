@@ -6,21 +6,34 @@ use std::time::Duration;
 
 use conversation_model_adapters::{
     AdapterError, AdapterFuture, AudioFrame, ContinuousAudioOutput, GenerationLanguageModel,
-    GenerationLanguageRequest, GenerationTextDelta, PcmFormat, PcmSampleFormat, PlaybackReceipt,
-    RecognitionEvent, RecognitionHypothesis, StreamingSpeechRequest, StreamingSpeechSynthesizer,
-    VoiceInput, VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
+    GenerationLanguageRequest, GenerationTextDelta, MockVoiceCaptureControl, PcmFormat,
+    PcmSampleFormat, PlaybackReceipt, RecognitionEvent, RecognitionHypothesis,
+    StreamingSpeechRequest, StreamingSpeechSynthesizer, VoiceInput, VoiceInputEvent,
+    VoiceIoFactory, VoiceIoSession,
 };
 use conversation_protocol::{
-    ComponentDescriptor, ComponentKind, ExecutionLocation, GenerationId, PlaybackState,
-    PrivacyMode, RecoveryDisposition, RuntimeErrorKind, RuntimeEvent, RuntimeStage, SessionId,
-    TurnId, VoiceActivity, VoiceSessionEvent, VoiceSessionPolicy,
+    ComponentDescriptor, ComponentKind, ConversationMode, ExecutionLocation, GenerationId,
+    PersonaProfile, PlaybackState, PrivacyMode, RecoveryDisposition, ResponseControls,
+    RuntimeErrorKind, RuntimeEvent, RuntimeStage, SessionId, TurnId, VoiceActivity,
+    VoiceSessionEvent, VoiceSessionPolicy,
 };
-use conversation_runtime::{VoiceSessionAdapters, VoiceSessionEventStream, VoiceSessionRuntime};
+use conversation_runtime::{
+    ConversationContext, ConversationQualityController, VoiceSessionAdapters,
+    VoiceSessionEventStream, VoiceSessionRuntime,
+};
 use tokio::sync::{mpsc, Notify};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 const SESSION_ID: SessionId = SessionId::new(1);
+
+fn context() -> ConversationContext {
+    ConversationContext::new(ConversationQualityController::new(
+        PersonaProfile::default(),
+        ResponseControls::default(),
+        ConversationMode::DirectAnswer,
+    ))
+}
 
 #[tokio::test(start_paused = true)]
 async fn sidecar_barge_in_flushes_and_cancels_all_generation_work() {
@@ -274,6 +287,68 @@ async fn barge_in_cleanup_is_not_blocked_by_full_lifecycle_output() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn barge_in_purges_deferred_partials_before_cancelled_terminal() {
+    let harness = VoiceSessionHarness::speaking_generations([GenerationId::new(1)]);
+    let mut events = harness.start().await;
+    harness
+        .start_speaking_generation_without_draining(&mut events, GenerationId::new(1))
+        .await;
+
+    for segment_id in 100..196 {
+        harness
+            .input
+            .send(Ok(VoiceInputEvent::Recognition(
+                RecognitionEvent::Hypothesis(RecognitionHypothesis::partial(
+                    segment_id,
+                    format!("deferred-{segment_id}"),
+                )),
+            )))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+    }
+
+    harness
+        .runtime
+        .barge_in(TurnId::new(1), GenerationId::new(1))
+        .await
+        .unwrap();
+    let observed = drain_until_turn_terminal(&mut events).await;
+
+    let barge_in_index = observed
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                VoiceSessionEvent::BargeIn { generation_id, .. }
+                    if *generation_id == GenerationId::new(1)
+            )
+        })
+        .unwrap();
+    let cancellation_index = observed
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                VoiceSessionEvent::Turn {
+                    event: RuntimeEvent::TurnCancelled { turn_id },
+                    ..
+                } if *turn_id == TurnId::new(1)
+            )
+        })
+        .unwrap();
+    assert!(barge_in_index < cancellation_index);
+
+    tokio::task::yield_now().await;
+    tokio::select! {
+        event = events.recv() => panic!("cancelled turn emitted deferred event after terminal: {event:?}"),
+        _ = tokio::time::sleep(Duration::from_millis(1)) => {}
+    }
+
+    harness.shutdown(&mut events).await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn dropped_event_consumer_cleans_turn_and_sidecar_work() {
     let harness = VoiceSessionHarness::speaking_generations([GenerationId::new(1)]);
     let mut events = harness.start().await;
@@ -404,7 +479,8 @@ async fn recognition_failure_recovers_to_listening() {
 
     harness
         .input
-        .send(Err(AdapterError::new("voice sidecar recognition failed")))
+        .send(Err(AdapterError::new("voice sidecar recognition failed")
+            .with_stage(RuntimeStage::SpeechRecognizer)))
         .await
         .unwrap();
     let failure = events
@@ -443,7 +519,8 @@ async fn recognition_failure_during_response_cleans_the_turn_before_recovery() {
 
     harness
         .input
-        .send(Err(AdapterError::new("voice sidecar recognition failed")))
+        .send(Err(AdapterError::new("voice sidecar recognition failed")
+            .with_stage(RuntimeStage::SpeechRecognizer)))
         .await
         .unwrap();
     let observed = drain_until_turn_recovery(&mut events).await;
@@ -560,6 +637,7 @@ impl VoiceSessionHarness {
         I: IntoIterator<Item = GenerationId>,
     {
         let active_generations: BTreeSet<_> = active_generations.into_iter().collect();
+        let context = context();
         let (input, input_receiver) = mpsc::channel(64);
         let output = Arc::new(CancellableOutput::new(flush_behavior, stall_turn_cleanup));
         let language = Arc::new(CancellableLanguage::new(active_generations.clone()));
@@ -569,11 +647,10 @@ impl VoiceSessionHarness {
             output.clone(),
             stall_completion,
         ));
-        let runtime = VoiceSessionRuntime::new(VoiceSessionAdapters::new(
-            factory.clone(),
-            language.clone(),
-            speech.clone(),
-        ));
+        let runtime = VoiceSessionRuntime::new(
+            context,
+            VoiceSessionAdapters::new(factory.clone(), language.clone(), speech.clone()),
+        );
         Self {
             runtime,
             factory,
@@ -1059,6 +1136,7 @@ impl VoiceIoFactory for TestVoiceIoFactory {
             let stall_completion = self.stall_completion;
             Ok(VoiceIoSession {
                 input: self.input.clone(),
+                capture: Arc::new(MockVoiceCaptureControl::new()),
                 output: self.output.clone(),
                 completion: tokio::spawn(async move {
                     let _finished = CompletionFinished(completion_finished);

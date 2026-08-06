@@ -1,5 +1,8 @@
 import {
   RuntimeClient,
+  type MemoryCursor,
+  type MemoryInspection,
+  type MemoryPage,
   type RuntimeEvent,
   type RuntimeFailure,
   type RuntimeStatus,
@@ -69,9 +72,13 @@ export class ConversationSession {
     return () => this.listeners.delete(listener);
   }
 
-  send(transcript: string): bigint {
+  async send(transcript: string): Promise<bigint> {
     this.ensureReady();
-    const turn = this.client.startTurn(transcript);
+    const turn = await this.client.startTurn(transcript).catch((error: unknown) => {
+      const failure = asError(error);
+      this.fail(failure);
+      throw failure;
+    });
     const state: ConversationTurnState = {
       turnId: turn.turnId,
       transcript,
@@ -85,6 +92,16 @@ export class ConversationSession {
     this.publish();
     void this.consumeTurn(state, turn.events);
     return turn.turnId;
+  }
+
+  async listMemories(cursor: MemoryCursor | null = null): Promise<MemoryPage> {
+    this.ensureMemoryReady();
+    return this.client.listMemories(cursor);
+  }
+
+  async inspectMemory(memoryId: bigint): Promise<MemoryInspection> {
+    this.ensureMemoryReady();
+    return this.client.inspectMemory(memoryId);
   }
 
   async interrupt(): Promise<void> {
@@ -164,6 +181,18 @@ export class ConversationSession {
     }
     if (this.activeTurn) {
       throw new Error("a conversation turn is already active");
+    }
+  }
+
+  private ensureMemoryReady(): void {
+    if (this.phase === "streaming") {
+      throw new Error("finish or stop the active response before inspecting memory");
+    }
+    if (this.phase === "closed") {
+      throw new Error("conversation session is closed");
+    }
+    if (this.phase === "failed") {
+      throw this.error ?? new Error("conversation session failed");
     }
   }
 

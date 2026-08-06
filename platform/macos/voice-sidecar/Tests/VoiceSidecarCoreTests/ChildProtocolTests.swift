@@ -3,12 +3,15 @@ import Testing
 @testable import VoiceSidecarCore
 
 @Test
-func versionOneKindCodesArePinned() {
+func versionTwoCaptureKindCodesArePinned() {
+    #expect(ChildProtocol.version == 2)
     let expected: [(ChildFrameKind, UInt16)] = [
         (.startSession, 0x0001),
         (.startCapture, 0x0002),
         (.flushGeneration, 0x0003),
         (.shutdown, 0x0004),
+        (.pauseCapture, 0x0005),
+        (.resumeCapture, 0x0006),
         (.audioFrame, 0x0100),
         (.ready, 0x8001),
         (.voiceActivity, 0x8002),
@@ -16,6 +19,9 @@ func versionOneKindCodesArePinned() {
         (.playbackAccepted, 0x8004),
         (.playbackRendered, 0x8005),
         (.playbackFlushed, 0x8006),
+        (.captureStarted, 0x8007),
+        (.capturePaused, 0x8008),
+        (.captureResumed, 0x8009),
         (.failure, 0x80FE),
         (.shutdownComplete, 0x80FF),
     ]
@@ -26,11 +32,94 @@ func versionOneKindCodesArePinned() {
 }
 
 @Test
+func captureControlsRoundTripExactSessionAndOperationIdentity() throws {
+    let controls: [ChildControl] = [
+        .startCapture(sessionID: 7, operationID: 1),
+        .pauseCapture(sessionID: 7, operationID: 2),
+        .resumeCapture(sessionID: 7, operationID: 3),
+        .captureStarted(sessionID: 7, operationID: 1),
+        .capturePaused(sessionID: 7, operationID: 2),
+        .captureResumed(sessionID: 7, operationID: 3),
+    ]
+
+    for control in controls {
+        let frame = ChildFrame(control: control)
+        #expect(try ChildProtocol.decode(ChildProtocol.encode(frame)) == frame)
+    }
+}
+
+@Test
+func protocolV1IsRejectedExplicitly() {
+    let data = rawFrame(
+        version: 1,
+        kind: .startCapture,
+        payload: Data(#"{"session_id":7,"operation_id":1}"#.utf8)
+    )
+
+    #expect(throws: ChildProtocolError.unknownVersion(1)) {
+        try ChildProtocol.decode(data)
+    }
+}
+
+@Test
+func captureControlsRejectZeroOperationIdentity() {
+    #expect(throws: ChildProtocolError.invalidControlJSON) {
+        try ChildProtocol.encode(
+            ChildFrame(control: .pauseCapture(sessionID: 7, operationID: 0))
+        )
+    }
+    #expect(throws: ChildProtocolError.invalidControlJSON) {
+        try ChildProtocol.decode(
+            rawFrame(
+                kind: .capturePaused,
+                payload: Data(#"{"session_id":7,"operation_id":0}"#.utf8)
+            )
+        )
+    }
+}
+
+@Test
+func captureControlsRejectZeroSessionIdentity() {
+    let controls: [ChildControl] = [
+        .startCapture(sessionID: 0, operationID: 1),
+        .pauseCapture(sessionID: 0, operationID: 1),
+        .resumeCapture(sessionID: 0, operationID: 1),
+        .captureStarted(sessionID: 0, operationID: 1),
+        .capturePaused(sessionID: 0, operationID: 1),
+        .captureResumed(sessionID: 0, operationID: 1),
+    ]
+    for control in controls {
+        #expect(throws: ChildProtocolError.invalidControlJSON) {
+            try ChildProtocol.encode(ChildFrame(control: control))
+        }
+    }
+
+    let kinds: [ChildFrameKind] = [
+        .startCapture,
+        .pauseCapture,
+        .resumeCapture,
+        .captureStarted,
+        .capturePaused,
+        .captureResumed,
+    ]
+    for kind in kinds {
+        #expect(throws: ChildProtocolError.invalidControlJSON) {
+            try ChildProtocol.decode(
+                rawFrame(
+                    kind: kind,
+                    payload: Data(#"{"session_id":0,"operation_id":1}"#.utf8)
+                )
+            )
+        }
+    }
+}
+
+@Test
 func startSessionFixtureRoundTrips() throws {
     let data = try Data(contentsOf: fixture("control/start-session.bin"))
     let frame = try ChildProtocol.decode(data)
 
-    #expect(frame.version == 1)
+    #expect(frame.version == 2)
     #expect(frame.kind == .startSession)
     #expect(try ChildProtocol.encode(frame) == data)
     #expect(
@@ -57,7 +146,22 @@ func transcriptFixtureRoundTrips() throws {
 
 @Test
 func signedSixteenAudioFixturePinsMetadataAndPCM() throws {
-    let data = try Data(contentsOf: fixture("audio/pcm-s16le.bin"))
+    let source = ChildFrame(
+        audioSessionID: 1,
+        frame: try PCMFrame(
+            turnID: 2,
+            generationID: 3,
+            utteranceID: 4,
+            sequence: 5,
+            format: PCMFormat(
+                sampleRateHz: 24_000,
+                channels: 1,
+                sampleFormat: .signed16LittleEndian
+            ),
+            bytes: Data([0x00, 0x80, 0xFF, 0x7F])
+        )
+    )
+    let data = try ChildProtocol.encode(source)
     let frame = try ChildProtocol.decode(data)
     let audio = try #require(frame.audio)
 
@@ -128,7 +232,16 @@ func partialPayloadNeedsTheDeclaredLength() {
 
 @Test
 func eofConvertsPartialDataToTypedTruncation() throws {
-    let data = try Data(contentsOf: fixture("invalid/truncated-control.bin"))
+    let complete = try ChildProtocol.encode(
+        ChildFrame(
+            control: .startSession(
+                sessionID: 7,
+                speechStartMilliseconds: 200,
+                finalSilenceMilliseconds: 600
+            )
+        )
+    )
+    let data = complete.dropLast(3)
 
     do {
         _ = try ChildProtocol.decodeAtEOF(data)
@@ -145,8 +258,8 @@ func eofConvertsPartialDataToTypedTruncation() throws {
 
 @Test
 func unknownVersionAndKindFailBeforePayloadDecode() {
-    #expect(throws: ChildProtocolError.unknownVersion(2)) {
-        try ChildProtocol.decode(rawFrame(version: 2, kindCode: 0x0002, payload: Data([0xFF])))
+    #expect(throws: ChildProtocolError.unknownVersion(1)) {
+        try ChildProtocol.decode(rawFrame(version: 1, kindCode: 0x0002, payload: Data([0xFF])))
     }
     #expect(throws: ChildProtocolError.unknownKind(0x7777)) {
         try ChildProtocol.decode(rawFrame(kindCode: 0x7777, payload: Data([0xFF])))
@@ -308,7 +421,7 @@ func transcriptEscapingIsPreflightedBeforeBoundedEncoding() throws {
 
 @Test
 func oversizedDeclaredControlLengthFailsFromHeaderOnly() throws {
-    let data = try Data(contentsOf: fixture("invalid/oversized-header.bin"))
+    let data = header(kind: .startSession, payloadLength: 65_537)
 
     #expect(
         throws: ChildProtocolError.payloadTooLarge(
@@ -488,7 +601,7 @@ func failurePayloadIsTypedContentFreeAndStrict() throws {
 func everyControlKindRoundTripsWithExactIdentity() throws {
     let controls: [ChildControl] = [
         .startSession(sessionID: 1, speechStartMilliseconds: 200, finalSilenceMilliseconds: 600),
-        .startCapture(sessionID: 1),
+        .startCapture(sessionID: 1, operationID: 1),
         .flushGeneration(sessionID: 1, generationID: 2, operationID: 3),
         .shutdown(sessionID: 1),
         .ready(sessionID: 1),
@@ -544,7 +657,7 @@ func trailingBytesAreRejected() {
 }
 
 private func rawFrame(
-    version: UInt16 = 1,
+    version: UInt16 = ChildProtocol.version,
     kind: ChildFrameKind,
     payload: Data
 ) -> Data {
@@ -552,7 +665,7 @@ private func rawFrame(
 }
 
 private func rawFrame(
-    version: UInt16 = 1,
+    version: UInt16 = ChildProtocol.version,
     kindCode: UInt16,
     payload: Data
 ) -> Data {
@@ -566,7 +679,7 @@ private func rawFrame(
 
 private func header(kind: ChildFrameKind, payloadLength: UInt32) -> Data {
     var data = Data()
-    data.appendBigEndian(UInt16(1))
+    data.appendBigEndian(ChildProtocol.version)
     data.appendBigEndian(kind.rawValue)
     data.appendBigEndian(payloadLength)
     return data

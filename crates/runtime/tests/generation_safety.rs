@@ -9,30 +9,46 @@ use conversation_model_adapters::{
     PlaybackReceipt, StreamingSpeechRequest, StreamingSpeechSynthesizer,
 };
 use conversation_protocol::{
-    GenerationId, PlaybackState, RuntimeEvent, RuntimeStage, SessionId, TurnId, UtteranceId,
+    ConversationMode, GenerationId, PersonaProfile, PlaybackState, ResponseControls, RuntimeEvent,
+    RuntimeStage, SessionId, TurnId, UtteranceId,
 };
-use conversation_runtime::{StreamingTurnEventStream, StreamingTurnRuntime};
+use conversation_runtime::{
+    ConversationContext, ConversationQualityController, ConversationTurnSource,
+    StreamingTurnEventStream, StreamingTurnRuntime,
+};
 use tokio::sync::{mpsc, watch, Notify};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
+fn context() -> ConversationContext {
+    ConversationContext::new(ConversationQualityController::new(
+        PersonaProfile::default(),
+        ResponseControls::default(),
+        ConversationMode::DirectAnswer,
+    ))
+}
+
+fn context_for(turn_id: TurnId) -> ConversationContext {
+    context().with_test_sequence_for_test(turn_id.get().saturating_sub(1))
+}
+
 #[tokio::test]
 async fn wrong_tagged_language_delta_fails_before_text_publication() {
     let turn_id = TurnId::new(1);
-    let generation_id = GenerationId::new(2);
     let language = Arc::new(TaggedLanguage::new([GenerationTextDelta::new(
         turn_id,
         GenerationId::new(99),
         "wrong generation",
     )]));
     let runtime = StreamingTurnRuntime::new(
+        context(),
         language,
         Arc::new(MockStreamingSpeechSynthesizer::new([])),
         Arc::new(MockContinuousAudioOutput::new()),
     );
 
     let mut stream = runtime
-        .start_turn(turn_id, generation_id, "question")
+        .start_turn(ConversationTurnSource::Text, "question")
         .await
         .unwrap();
     let observed = drain(&mut stream).await;
@@ -61,13 +77,14 @@ async fn wrong_frame_turn_generation_or_utterance_fails_before_enqueue() {
     for invalid_frame in cases {
         let output = Arc::new(MockContinuousAudioOutput::new());
         let runtime = StreamingTurnRuntime::new(
+            context(),
             Arc::new(MockGenerationLanguageModel::new(["answer"])),
             Arc::new(MockStreamingSpeechSynthesizer::new([invalid_frame])),
             output.clone(),
         );
 
         let mut stream = runtime
-            .start_turn(turn_id, generation_id, "question")
+            .start_turn(ConversationTurnSource::Text, "question")
             .await
             .unwrap();
         let observed = drain(&mut stream).await;
@@ -95,13 +112,14 @@ async fn sequence_gap_fails_before_out_of_order_frame_enqueue() {
     let first = frame(turn_id, generation_id, utterance_id, 0, pcm_format());
     let gap = frame(turn_id, generation_id, utterance_id, 2, pcm_format());
     let runtime = StreamingTurnRuntime::new(
+        context(),
         Arc::new(MockGenerationLanguageModel::new(["answer"])),
         Arc::new(MockStreamingSpeechSynthesizer::new([first.clone(), gap])),
         output.clone(),
     );
 
     let mut stream = runtime
-        .start_turn(turn_id, generation_id, "question")
+        .start_turn(ConversationTurnSource::Text, "question")
         .await
         .unwrap();
     let observed = drain(&mut stream).await;
@@ -121,6 +139,7 @@ async fn format_change_fails_before_changed_frame_enqueue() {
     let changed = frame(turn_id, generation_id, utterance_id, 1, changed_format);
     let output = Arc::new(MockContinuousAudioOutput::new());
     let runtime = StreamingTurnRuntime::new(
+        context(),
         Arc::new(MockGenerationLanguageModel::new(["answer"])),
         Arc::new(MockStreamingSpeechSynthesizer::new([
             first.clone(),
@@ -130,7 +149,7 @@ async fn format_change_fails_before_changed_frame_enqueue() {
     );
 
     let mut stream = runtime
-        .start_turn(turn_id, generation_id, "question")
+        .start_turn(ConversationTurnSource::Text, "question")
         .await
         .unwrap();
     let observed = drain(&mut stream).await;
@@ -147,12 +166,13 @@ async fn interruption_unblocks_a_saturated_lifecycle_receiver() {
         "x", 64,
     )));
     let runtime = StreamingTurnRuntime::new(
+        context(),
         language.clone(),
         Arc::new(MockStreamingSpeechSynthesizer::new([])),
         Arc::new(MockContinuousAudioOutput::new()),
     );
     let mut stream = runtime
-        .start_turn(turn_id, generation_id, "question")
+        .start_turn(ConversationTurnSource::Text, "question")
         .await
         .unwrap();
 
@@ -182,7 +202,7 @@ async fn interruption_unblocks_a_saturated_lifecycle_receiver() {
 #[tokio::test]
 async fn interruption_unblocks_full_media_enqueue_and_waits_for_cleanup() {
     let turn_id = TurnId::new(2);
-    let generation_id = GenerationId::new(3);
+    let generation_id = GenerationId::new(2);
     let output = Arc::new(BlockingOutput::new(false));
     let speech = Arc::new(MockStreamingSpeechSynthesizer::new([frame(
         turn_id,
@@ -192,12 +212,13 @@ async fn interruption_unblocks_full_media_enqueue_and_waits_for_cleanup() {
         pcm_format(),
     )]));
     let runtime = StreamingTurnRuntime::new(
+        context_for(turn_id),
         Arc::new(MockGenerationLanguageModel::new(["answer"])),
         speech,
         output.clone(),
     );
     let mut stream = runtime
-        .start_turn(turn_id, generation_id, "question")
+        .start_turn(ConversationTurnSource::Text, "question")
         .await
         .unwrap();
 
@@ -220,12 +241,13 @@ async fn interruption_unblocks_full_media_enqueue_and_waits_for_cleanup() {
 #[tokio::test(flavor = "current_thread")]
 async fn queue_interruption_awaits_speech_cleanup_before_terminal_and_reuse() {
     let first_turn = TurnId::new(20);
-    let first_generation = GenerationId::new(30);
+    let first_generation = GenerationId::new(20);
     let speech_started = Arc::new(Notify::new());
     let cleanup_started = Arc::new(Notify::new());
     let cleanup_finished = Arc::new(AtomicBool::new(false));
     let (cleanup_release_sender, cleanup_release_receiver) = watch::channel(false);
     let runtime = StreamingTurnRuntime::new(
+        context_for(first_turn),
         Arc::new(QueuePressureLanguage),
         Arc::new(LatchedCleanupSpeech {
             speech_started: Arc::clone(&speech_started),
@@ -236,7 +258,7 @@ async fn queue_interruption_awaits_speech_cleanup_before_terminal_and_reuse() {
         Arc::new(MockContinuousAudioOutput::new()),
     );
     let mut first = runtime
-        .start_turn(first_turn, first_generation, "first")
+        .start_turn(ConversationTurnSource::Text, "first")
         .await
         .unwrap();
 
@@ -252,11 +274,11 @@ async fn queue_interruption_awaits_speech_cleanup_before_terminal_and_reuse() {
         .expect("speech cleanup never started");
 
     let second_turn = TurnId::new(21);
-    let second_generation = GenerationId::new(31);
+    let second_generation = GenerationId::new(21);
     let premature_reuse = timeout(Duration::from_millis(50), async {
         loop {
             if let Ok(stream) = runtime
-                .start_turn(second_turn, second_generation, "second")
+                .start_turn(ConversationTurnSource::Text, "second")
                 .await
             {
                 break stream;
@@ -295,7 +317,7 @@ async fn queue_interruption_awaits_speech_cleanup_before_terminal_and_reuse() {
     );
 
     let mut second = runtime
-        .start_turn(second_turn, second_generation, "second")
+        .start_turn(ConversationTurnSource::Text, "second")
         .await
         .expect("terminal observation must imply runtime reuse");
     runtime
@@ -313,6 +335,7 @@ async fn dropped_consumer_cancels_owned_work_and_runtime_reuses() {
     let first_generation = GenerationId::new(1);
     let output = Arc::new(BlockingOutput::new(false));
     let runtime = StreamingTurnRuntime::new(
+        context(),
         Arc::new(MockGenerationLanguageModel::new(["answer"])),
         Arc::new(MockStreamingSpeechSynthesizer::new([frame(
             first_turn,
@@ -324,7 +347,7 @@ async fn dropped_consumer_cancels_owned_work_and_runtime_reuses() {
         output.clone(),
     );
     let stream = runtime
-        .start_turn(first_turn, first_generation, "first")
+        .start_turn(ConversationTurnSource::Text, "first")
         .await
         .unwrap();
 
@@ -343,7 +366,7 @@ async fn dropped_consumer_cancels_owned_work_and_runtime_reuses() {
     let mut next = timeout(Duration::from_secs(1), async {
         loop {
             match runtime
-                .start_turn(TurnId::new(2), GenerationId::new(2), "second")
+                .start_turn(ConversationTurnSource::Text, "second")
                 .await
             {
                 Ok(stream) => break stream,
@@ -365,9 +388,10 @@ async fn dropped_consumer_cancels_owned_work_and_runtime_reuses() {
 #[tokio::test]
 async fn output_flush_failure_still_cancels_and_cleans_the_turn() {
     let turn_id = TurnId::new(4);
-    let generation_id = GenerationId::new(5);
+    let generation_id = GenerationId::new(4);
     let output = Arc::new(BlockingOutput::new(true));
     let runtime = StreamingTurnRuntime::new(
+        context_for(turn_id),
         Arc::new(MockGenerationLanguageModel::new(["answer"])),
         Arc::new(MockStreamingSpeechSynthesizer::new([frame(
             turn_id,
@@ -377,10 +401,14 @@ async fn output_flush_failure_still_cancels_and_cleans_the_turn() {
             pcm_format(),
         )])),
         output.clone(),
-    )
-    .with_session_id(SessionId::new(6));
+    );
     let mut stream = runtime
-        .start_turn(turn_id, generation_id, "question")
+        .start_turn(
+            ConversationTurnSource::Voice {
+                session_id: SessionId::new(6),
+            },
+            "question",
+        )
         .await
         .unwrap();
 
@@ -415,11 +443,12 @@ async fn cancelled_generation_cannot_publish_late_text_or_audio() {
     let language = Arc::new(LateLanguage::default());
     let speech = Arc::new(LateSpeech::default());
     let output = Arc::new(MockContinuousAudioOutput::new());
-    let runtime = StreamingTurnRuntime::new(language.clone(), speech.clone(), output.clone());
+    let runtime =
+        StreamingTurnRuntime::new(context(), language.clone(), speech.clone(), output.clone());
     let first_turn = TurnId::new(1);
     let first_generation = GenerationId::new(1);
     let mut first = runtime
-        .start_turn(first_turn, first_generation, "first")
+        .start_turn(ConversationTurnSource::Text, "first")
         .await
         .unwrap();
 
@@ -431,10 +460,9 @@ async fn cancelled_generation_cannot_publish_late_text_or_audio() {
         .await
         .unwrap();
     let first_events = drain(&mut first).await;
-    let second_turn = TurnId::new(2);
     let second_generation = GenerationId::new(2);
     let mut second = runtime
-        .start_turn(second_turn, second_generation, "second")
+        .start_turn(ConversationTurnSource::Text, "second")
         .await
         .unwrap();
     let second_events = drain(&mut second).await;

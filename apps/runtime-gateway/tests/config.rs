@@ -1,13 +1,22 @@
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use conversation_memory::SqliteMemoryStore;
+use conversation_memory::{MemoryStore, NeverCancelled, SqliteMemoryStore};
+use conversation_protocol::{
+    encode_gateway_message, GatewayMessage, MemoryConfidence, MemoryDraft, MemoryKind,
+    MemoryProvenance, MemoryProvenanceKind, MemoryRetention, MemoryRetrievalRequest, SessionId,
+    TurnId, UnixTimestampMillis,
+};
 use conversation_runtime_gateway::{GatewayAdapters, GatewayConfig};
 
-const VALID_CONFIG: &str = r#"schema_version = 1
+const VALID_CONFIG: &str = r#"schema_version = 2
 privacy_mode = "local-only"
 
 [language]
 backend = "ollama-compatible"
+execution = "local"
+provider = "local-language"
 endpoint = "http://127.0.0.1:11434"
 model = "local-model-id"
 thinking = false
@@ -30,13 +39,53 @@ follow_up_frequency = 25
 "#;
 
 #[test]
+fn accepts_an_optional_deployment_system_prompt() {
+    let fixture = tempfile::tempdir().unwrap();
+    let path = write_config(
+        fixture.path(),
+        &VALID_CONFIG.replacen(
+            "thinking = false",
+            "thinking = false\nsystem_prompt = \"Describe only deployment capabilities explicitly supplied here.\"",
+            1,
+        ),
+    );
+
+    let config = GatewayConfig::load(&path).unwrap();
+    let _: GatewayAdapters = config.into_adapters().unwrap();
+}
+
+#[test]
+fn rejects_an_oversized_deployment_system_prompt() {
+    let fixture = tempfile::tempdir().unwrap();
+    let prompt = "x".repeat(4 * 1024 + 1);
+    let path = write_config(
+        fixture.path(),
+        &VALID_CONFIG.replacen(
+            "thinking = false",
+            &format!("thinking = false\nsystem_prompt = \"{prompt}\""),
+            1,
+        ),
+    );
+
+    assert!(GatewayConfig::load(&path).is_err());
+}
+
+#[test]
 fn loads_an_explicit_valid_local_only_configuration() {
     let fixture = tempfile::tempdir().unwrap();
     let path = write_config(fixture.path(), VALID_CONFIG);
 
     let config = GatewayConfig::load(&path).unwrap();
     let adapters: GatewayAdapters = config.into_adapters().unwrap();
-    assert_eq!(adapters.model_id(), "local-model-id");
+    assert_eq!(adapters.status.model_id, "local-model-id");
+    assert_eq!(adapters.status.capabilities, ["text"]);
+    assert_eq!(adapters.status.components.len(), 1);
+    assert_eq!(adapters.status.components[0].kind, "language_model");
+    assert_eq!(
+        adapters.status.components[0].provider_label,
+        "local-language"
+    );
+    assert!(adapters.voice.is_none());
 }
 
 #[test]
@@ -73,7 +122,7 @@ fn rejects_an_unsupported_schema_version() {
     let fixture = tempfile::tempdir().unwrap();
     let path = write_config(
         fixture.path(),
-        &VALID_CONFIG.replacen("schema_version = 1", "schema_version = 2", 1),
+        &VALID_CONFIG.replacen("schema_version = 2", "schema_version = 1", 1),
     );
 
     assert!(GatewayConfig::load(&path).is_err());
@@ -147,8 +196,8 @@ fn rejects_a_model_identifier_larger_than_256_bytes() {
     assert!(GatewayConfig::load(&path).is_err());
 }
 
-#[test]
-fn accepts_an_existing_initialized_absolute_memory_database() {
+#[tokio::test]
+async fn memory_configuration_returns_shared_retrieval_and_inspection_handles() {
     let fixture = tempfile::tempdir().unwrap();
     let database = fixture.path().join("runtime.sqlite3");
     SqliteMemoryStore::initialize(&database).unwrap();
@@ -161,7 +210,292 @@ fn accepts_an_existing_initialized_absolute_memory_database() {
     );
 
     let config = GatewayConfig::load(&path).unwrap();
-    let _: GatewayAdapters = config.into_adapters().unwrap();
+    let adapters: GatewayAdapters = config.into_adapters().unwrap();
+    let store = adapters.memory_store.as_ref().unwrap();
+    let record = store
+        .create(
+            MemoryDraft::new(
+                MemoryKind::Semantic,
+                "shared gateway memory fixture",
+                MemoryProvenance::new(
+                    MemoryProvenanceKind::UserProvided,
+                    "gateway-config-test",
+                    UnixTimestampMillis::new(1_000).unwrap(),
+                    "local-user",
+                    None,
+                )
+                .unwrap(),
+                MemoryConfidence::new(900).unwrap(),
+                UnixTimestampMillis::new(1_000).unwrap(),
+                MemoryRetention::UntilDeleted,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let retrieval = SqliteMemoryStore::open(&database)
+        .unwrap()
+        .retrieve(
+            MemoryRetrievalRequest::new(
+                TurnId::new(1),
+                "shared gateway memory",
+                UnixTimestampMillis::new(2_000).unwrap(),
+                4,
+                4_096,
+            )
+            .unwrap(),
+            &NeverCancelled,
+        )
+        .unwrap();
+
+    assert_eq!(retrieval.items().len(), 1);
+    assert_eq!(retrieval.items()[0].memory_id(), record.id());
+    assert_eq!(adapters.status.capabilities, ["text", "memory_inspection"]);
+    assert_eq!(adapters.status.components[1].kind, "memory");
+}
+
+#[test]
+fn configuration_without_memory_returns_no_memory_handles() {
+    let fixture = tempfile::tempdir().unwrap();
+    let path = write_config(fixture.path(), VALID_CONFIG);
+
+    let adapters = GatewayConfig::load(&path).unwrap().into_adapters().unwrap();
+
+    assert!(adapters.memory_store.is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn valid_voice_reuses_root_configuration_without_spawning() {
+    let fixture = GatewayFixture::voice(true);
+
+    let adapters = GatewayConfig::load(fixture.config())
+        .unwrap()
+        .into_adapters()
+        .unwrap();
+
+    assert!(adapters.voice.is_some());
+    assert_eq!(
+        adapters.status.capabilities,
+        ["text", "memory_inspection", "voice_session"]
+    );
+    assert_eq!(
+        adapters
+            .status
+            .components
+            .iter()
+            .map(|component| component.kind.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "speech_recognition",
+            "language_model",
+            "speech_synthesis",
+            "audio_io",
+            "memory",
+        ]
+    );
+    assert!(adapters
+        .status
+        .components
+        .iter()
+        .all(|component| component.execution_location == "local"));
+    let voice = adapters.voice.as_ref().unwrap();
+    let policy = voice.policy.for_session(SessionId::new(7)).unwrap();
+    assert_eq!(policy.session_id(), SessionId::new(7));
+    assert_eq!(policy.components().len(), 5);
+    encode_gateway_message(&GatewayMessage::Ready {
+        status: adapters.status.clone(),
+    })
+    .unwrap();
+    let running_status = adapters.text_only_status();
+    assert_eq!(running_status.capabilities, ["text", "memory_inspection"]);
+    assert_eq!(
+        running_status
+            .components
+            .iter()
+            .map(|component| component.kind.as_str())
+            .collect::<Vec<_>>(),
+        ["language_model", "memory"]
+    );
+    encode_gateway_message(&GatewayMessage::Ready {
+        status: running_status,
+    })
+    .unwrap();
+    assert!(!fixture.sidecar_spawned());
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_non_voice_configuration_inside_voice() {
+    for section in [
+        "language",
+        "persona",
+        "memory",
+        "privacy",
+        "tools",
+        "telemetry",
+    ] {
+        let fixture = GatewayFixture::voice(false);
+        let config = format!(
+            "{}\n[voice.{section}]\nenabled = true\n",
+            fixture.contents()
+        );
+        let path = write_config(fixture.directory(), &config);
+
+        assert!(GatewayConfig::load(&path).is_err(), "accepted {section}");
+        assert!(!fixture.sidecar_spawned());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_remote_execution_for_every_configured_component() {
+    for provider in [
+        "local-language",
+        "local-speech-recognition",
+        "local-speech-synthesis",
+        "local-audio",
+    ] {
+        let fixture = GatewayFixture::voice(false);
+        let config = fixture.contents().replacen(
+            &format!("execution = \"local\"\nprovider = \"{provider}\""),
+            &format!("execution = \"remote\"\nprovider = \"{provider}\""),
+            1,
+        );
+        let path = write_config(fixture.directory(), &config);
+
+        assert!(GatewayConfig::load(&path).is_err(), "accepted {provider}");
+        assert!(!fixture.sidecar_spawned());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_non_loopback_speech_endpoints() {
+    for endpoint in ["http://192.0.2.1:8000/v1", "http://localhost:8000/v1"] {
+        let fixture = GatewayFixture::voice(false);
+        let config = fixture
+            .contents()
+            .replacen("http://127.0.0.1:8000/v1", endpoint, 1);
+        let path = write_config(fixture.directory(), &config);
+
+        assert!(GatewayConfig::load(&path).is_err(), "accepted {endpoint}");
+        assert!(!fixture.sidecar_spawned());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_missing_or_non_absolute_asr_model_paths() {
+    for model_path in ["relative/model", "/definitely/missing/local-asr-model"] {
+        let fixture = GatewayFixture::voice(false);
+        let config = fixture.contents().replacen(
+            &format!("model_path = \"{}\"", toml_path(fixture.model_path())),
+            &format!("model_path = \"{model_path}\""),
+            1,
+        );
+        let path = write_config(fixture.directory(), &config);
+
+        assert!(GatewayConfig::load(&path).is_err(), "accepted {model_path}");
+        assert!(!fixture.sidecar_spawned());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_invalid_sidecar_executables_without_spawning() {
+    let cases = [
+        ("relative/sidecar", true),
+        ("/definitely/missing/voice-sidecar", true),
+    ];
+    for (sidecar, expected) in cases {
+        let fixture = GatewayFixture::voice(false);
+        let config = fixture.contents().replacen(
+            &format!(
+                "sidecar_executable = \"{}\"",
+                toml_path(fixture.sidecar_path())
+            ),
+            &format!("sidecar_executable = \"{sidecar}\""),
+            1,
+        );
+        let path = write_config(fixture.directory(), &config);
+
+        assert_eq!(GatewayConfig::load(&path).is_err(), expected);
+        assert!(!fixture.sidecar_spawned());
+    }
+
+    let fixture = GatewayFixture::voice(false);
+    let non_executable = fixture.directory().join("not-executable");
+    std::fs::write(&non_executable, "not executable").unwrap();
+    let config = fixture.contents().replacen(
+        &format!(
+            "sidecar_executable = \"{}\"",
+            toml_path(fixture.sidecar_path())
+        ),
+        &format!("sidecar_executable = \"{}\"", toml_path(&non_executable)),
+        1,
+    );
+    let path = write_config(fixture.directory(), &config);
+
+    assert!(GatewayConfig::load(&path).is_err());
+    assert!(!fixture.sidecar_spawned());
+}
+
+#[cfg(unix)]
+#[test]
+fn provider_labels_enforce_trimmed_utf8_byte_bounds() {
+    let valid_boundary = "é".repeat(64);
+    let fixture = GatewayFixture::voice(false);
+    let valid = fixture.contents().replacen(
+        "provider = \"local-language\"",
+        &format!("provider = \"{valid_boundary}\""),
+        1,
+    );
+    let path = write_config(fixture.directory(), &valid);
+    assert!(GatewayConfig::load(&path).is_ok());
+
+    for invalid in [
+        " local-language".to_owned(),
+        "local-language ".to_owned(),
+        String::new(),
+        "x".repeat(129),
+    ] {
+        let fixture = GatewayFixture::voice(false);
+        let config = fixture.contents().replacen(
+            "provider = \"local-language\"",
+            &format!("provider = \"{invalid}\""),
+            1,
+        );
+        let path = write_config(fixture.directory(), &config);
+
+        assert!(GatewayConfig::load(&path).is_err(), "accepted {invalid:?}");
+        assert!(!fixture.sidecar_spawned());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_zero_adapter_and_memory_limits() {
+    for (configured, zero) in [
+        ("num_predict = 1024", "num_predict = 0"),
+        ("num_ctx = 8192", "num_ctx = 0"),
+        (
+            "max_assistant_content_bytes = 65536",
+            "max_assistant_content_bytes = 0",
+        ),
+        ("maximum_items = 4", "maximum_items = 0"),
+        ("maximum_bytes = 4096", "maximum_bytes = 0"),
+        ("max_tokens = 128", "max_tokens = 0"),
+        ("max_text_bytes = 4096", "max_text_bytes = 0"),
+        ("max_audio_bytes = 8388608", "max_audio_bytes = 0"),
+        ("max_error_bytes = 65536", "max_error_bytes = 0"),
+    ] {
+        let fixture = GatewayFixture::voice(true);
+        let config = fixture.contents().replacen(configured, zero, 1);
+        let path = write_config(fixture.directory(), &config);
+
+        assert!(GatewayConfig::load(&path).is_err(), "accepted {zero}");
+        assert!(!fixture.sidecar_spawned());
+    }
 }
 
 #[test]
@@ -245,6 +579,126 @@ fn memory_config(database: &Path) -> String {
         "{VALID_CONFIG}\n[memory]\ndatabase = \"{}\"\nmaximum_items = 4\nmaximum_bytes = 4096\n",
         database.display()
     )
+}
+
+#[cfg(unix)]
+struct GatewayFixture {
+    directory: tempfile::TempDir,
+    config: PathBuf,
+    model_path: PathBuf,
+    sidecar_path: PathBuf,
+    spawn_marker: PathBuf,
+    contents: String,
+}
+
+#[cfg(unix)]
+impl GatewayFixture {
+    fn voice(with_memory: bool) -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        let model_path = directory.path().join("asr-model");
+        std::fs::create_dir(&model_path).unwrap();
+        let spawn_marker = directory.path().join("sidecar-spawned");
+        let sidecar_path = directory.path().join("voice-sidecar");
+        std::fs::write(
+            &sidecar_path,
+            format!("#!/bin/sh\nprintf spawned > '{}'\n", spawn_marker.display()),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&sidecar_path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&sidecar_path, permissions).unwrap();
+
+        let memory = if with_memory {
+            let database = directory.path().join("runtime.sqlite3");
+            SqliteMemoryStore::initialize(&database).unwrap();
+            format!(
+                "\n[memory]\ndatabase = \"{}\"\nmaximum_items = 4\nmaximum_bytes = 4096\n",
+                toml_path(&database)
+            )
+        } else {
+            String::new()
+        };
+        let contents = format!(
+            r#"{VALID_CONFIG}{memory}
+[voice.capture]
+device = "system-default"
+
+[voice.turn]
+speech_start_ms = 200
+final_silence_ms = 600
+
+[voice.asr]
+backend = "whisperkit"
+execution = "local"
+provider = "local-speech-recognition"
+model_path = "{}"
+download = false
+
+[voice.speech]
+backend = "openai-compatible"
+execution = "local"
+provider = "local-speech-synthesis"
+mode = "streaming"
+streaming_interval = 0.2
+endpoint = "http://127.0.0.1:8000/v1"
+model = "local-speech-model"
+voice = "local-voice"
+speed = 1.0
+language = "auto"
+instructions = "Speak naturally and clearly."
+max_tokens = 128
+repetition_penalty = 1.05
+max_text_bytes = 4096
+max_audio_bytes = 8388608
+
+[voice.audio]
+backend = "managed-sidecar"
+execution = "local"
+provider = "local-audio"
+sidecar_executable = "{}"
+max_error_bytes = 65536
+"#,
+            toml_path(&model_path),
+            toml_path(&sidecar_path),
+        );
+        let config = write_config(directory.path(), &contents);
+        Self {
+            directory,
+            config,
+            model_path,
+            sidecar_path,
+            spawn_marker,
+            contents,
+        }
+    }
+
+    fn config(&self) -> &Path {
+        &self.config
+    }
+
+    fn directory(&self) -> &Path {
+        self.directory.path()
+    }
+
+    fn model_path(&self) -> &Path {
+        &self.model_path
+    }
+
+    fn sidecar_path(&self) -> &Path {
+        &self.sidecar_path
+    }
+
+    fn contents(&self) -> &str {
+        &self.contents
+    }
+
+    fn sidecar_spawned(&self) -> bool {
+        self.spawn_marker.exists()
+    }
+}
+
+fn toml_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "\\\\")
 }
 
 fn write_config(directory: &Path, contents: &str) -> PathBuf {

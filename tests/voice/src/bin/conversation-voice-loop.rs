@@ -38,10 +38,10 @@ async fn run() -> Result<i32, CliFailure> {
         .map_err(|message| CliFailure::new("configuration", message))?;
     let quality_metrics_enabled = config.quality_metrics_enabled();
     let policy = config.policy(descriptors).map_err(runtime_failure)?;
-    let adapters = config
-        .adapters()
+    let (context, adapters) = config
+        .runtime_parts()
         .map_err(|message| CliFailure::new("configuration", message))?;
-    let runtime = VoiceSessionRuntime::new(adapters);
+    let runtime = VoiceSessionRuntime::new(context, adapters);
     let mut interrupts = signal(SignalKind::interrupt())
         .map_err(|_| CliFailure::new("signal", "failed to listen for SIGINT"))?;
     let mut events = runtime.start(policy).await.map_err(runtime_failure)?;

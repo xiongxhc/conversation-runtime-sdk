@@ -299,8 +299,24 @@ preview is deliberately idle and its transcript is hidden by default. This
 evaluation does not record a live local-model desktop turn or native GPU scene
 acceptance.
 
-The gateway still advertises text-only capabilities. Live microphone and
-playback activation, real voice-session events, persona and memory mutation,
+Memory is an optional, explicitly initialized runtime store. When the selected
+local gateway config points to an existing initialized database and advertises
+the protocol-v3 `memory_inspection` capability, the desktop can list and inspect
+it through the public browser-safe SDK only. The first Memory screen is
+read-only: it does not create a database, mutate memory, or automatically copy
+conversations into memory. History remains a separate app-owned transcript
+store. The Memory screen shows at most 50 summaries per page. An inspection
+shows at most the latest 32 provenance entries and 32 approval entries, and
+labels any older history that was truncated. Due expiry may be applied while a
+record is inspected.
+
+Protocol v3 is the current wire contract. It supersedes v2 because the gateway
+allocates typed start-turn identifiers and returns them only in the correlated
+acceptance; v2 and v3 peers reject each other rather than silently mixing wire
+shapes.
+
+The gateway does not advertise voice capabilities. Live microphone and playback
+activation, real voice-session events, persona mutation, memory mutation,
 packaging and signing, and R3 human, ten-minute, and acoustic acceptance remain
 open. See [the desktop README](apps/desktop/README.md) and
 [the desktop evaluation](docs/r6-desktop-app-evaluation.md).

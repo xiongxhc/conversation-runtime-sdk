@@ -1,9 +1,10 @@
 # Desktop Reference App
 
 This macOS Tauri reference app exercises the public browser-safe runtime SDK
-against the compiled local gateway. The first R6 desktop slice supports local
-text chat and an idle Voice Focus preview; it does not activate a microphone or
-play audio.
+against the compiled local gateway. The desktop app supports local text chat,
+locally persisted transcript history, optional read-only runtime-memory
+inspection, and an idle Voice Focus preview. It does not activate a microphone
+or play audio.
 
 ## Run from a Clean Checkout
 
@@ -55,20 +56,51 @@ The app requires the configured loopback model service to be running before
 
 - Send local text turns, observe streamed assistant text, stop an active turn,
   close the runtime, and reconnect through setup.
+- Open `History`, reopen a prior transcript read-only, verify the displayed
+  SQLite storage path, and delete a saved conversation.
+- When the connected local gateway explicitly advertises memory inspection,
+  open `Memory`, page through at most 50 summaries at a time, and open a
+  record's read-only detail. The detail shows at most the latest 32 provenance
+  entries and 32 approval entries, with an explicit notice when older entries
+  are truncated.
 - Open `Preview Voice Focus` and switch among Soft Aurora, Silk, Threads,
   Prism, Orb, Still Gradient, and None. Soft Aurora is the default.
 - Verify the Focus transcript is hidden by default, reveal it explicitly, and
   leave Focus with `Escape` or `Exit Focus`.
 - Verify reduced-motion selects the static fallback for animated scenes.
 
-`Preview Voice Focus` is intentionally idle. The production gateway currently
-advertises text-only capabilities, so live Focus cannot imply listening,
+`Preview Voice Focus` is intentionally idle. The production gateway does not
+advertise voice capabilities, so live Focus cannot imply listening,
 recognition, speech playback, or barge-in.
+
+Conversation transcripts are stored by the native app in
+`conversations.sqlite3` under the operating system's private app-data
+directory. The exact resolved path is shown at the bottom of `History`.
+Transcript history is separate from the runtime's optional semantic memory,
+and opening a past transcript does not restore it to the model's active
+context.
+
+## Optional Runtime Memory
+
+Runtime memory is opt-in. Initialize a chosen SQLite database explicitly with
+`conversation-memory-probe`, then configure its absolute path in the gateway;
+the desktop neither creates the database nor captures conversations into it.
+History remains app-owned transcript storage, while runtime memory remains
+runtime-owned semantic storage with its own provenance, approval, retention,
+and retrieval rules.
+
+The Memory destination appears only when the connected local gateway reports
+enabled local memory and the protocol-v3 `memory_inspection` capability. The
+desktop reads summaries and individual records only through the public
+browser-safe SDK and local framed-stdio protocol. It has no SQLite access and
+offers no create, edit, approval, pin, expiry, deletion, or retrieval control.
+Inspection can apply due expiry before returning a record, so a due item may no
+longer be active when displayed.
 
 ## Open Work
 
 - Live microphone and playback activation through typed voice-session events.
-- Persona and memory inspection and mutation backed by runtime state.
+- Persona inspection and mutation, plus runtime-memory mutation controls.
 - Packaging, signing, notarization, installation, and upgrade validation.
 - R3 human-spoken, ten-minute, first-audible, audible-stop, and acoustic
   acceptance.

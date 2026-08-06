@@ -13,6 +13,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::{JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
 
+mod conversation_context;
 mod conversation_quality;
 mod generation;
 mod phrase_chunker;
@@ -26,10 +27,13 @@ mod utterance_assembler;
 mod voice_privacy;
 mod voice_session;
 
+pub use conversation_context::{
+    ConversationContext, ConversationTurnIdentity, ConversationTurnSource, PreparedConversationTurn,
+};
 pub use conversation_quality::{ConversationQualityController, ResolvedConversationQuality};
 pub use phrase_chunker::PhraseChunkingConfig;
 pub use session_clock::{SessionClock, TurnFinalizationDeadline};
-pub use streaming_turn::{StreamingTurnEventStream, StreamingTurnRuntime};
+pub use streaming_turn::{StartedStreamingTurn, StreamingTurnEventStream, StreamingTurnRuntime};
 pub use text_turn::{TextTurnEventStream, TextTurnRuntime};
 pub use turn_finalizer::{FinalizedTranscript, TurnFinalizer};
 pub use utterance_assembler::UtteranceAssembler;

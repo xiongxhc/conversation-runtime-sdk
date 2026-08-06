@@ -1,6 +1,7 @@
 use conversation_protocol::{
-    ComponentDescriptor, ComponentKind, ExecutionLocation, GenerationId, PrivacyMode, RuntimeEvent,
-    SessionId, TurnId, UtteranceId, VoiceSessionEvent, VoiceSessionPolicy,
+    ClientVoiceSessionEvent, ClientWireError, ComponentDescriptor, ComponentKind,
+    ExecutionLocation, GenerationId, PrivacyMode, RuntimeEvent, SessionId, TurnId, UtteranceId,
+    VoiceSessionEvent, VoiceSessionPolicy,
 };
 
 #[test]
@@ -128,4 +129,69 @@ fn voice_policy_rejects_invalid_thresholds_and_components() {
         [component],
     )
     .is_ok());
+}
+
+#[test]
+fn voice_policy_rejects_zero_session_identity() {
+    let error = VoiceSessionPolicy::new(
+        SessionId::new(0),
+        PrivacyMode::LocalOnly,
+        200,
+        600,
+        [ComponentDescriptor::new(
+            ComponentKind::SpeechRecognition,
+            "local-asr",
+            ExecutionLocation::Local,
+        )],
+    )
+    .unwrap_err();
+
+    assert_eq!(error.message(), "voice session identity must not be zero");
+}
+
+#[test]
+fn public_voice_projection_rejects_zero_identifiers_in_every_position() {
+    let zero_session = VoiceSessionEvent::SessionEnded {
+        session_id: SessionId::new(0),
+    };
+    let zero_segment = VoiceSessionEvent::TranscriptPartial {
+        session_id: SessionId::new(1),
+        segment_id: 0,
+        text: "partial".to_owned(),
+    };
+    let zero_turn = VoiceSessionEvent::TranscriptFinal {
+        session_id: SessionId::new(1),
+        turn_id: TurnId::new(0),
+        text: "final".to_owned(),
+    };
+    let zero_generation = VoiceSessionEvent::Turn {
+        session_id: SessionId::new(1),
+        generation_id: GenerationId::new(0),
+        event: RuntimeEvent::TurnCompleted {
+            turn_id: TurnId::new(1),
+        },
+    };
+
+    for event in [zero_session, zero_segment, zero_turn, zero_generation] {
+        assert!(matches!(
+            ClientVoiceSessionEvent::try_from(event),
+            Err(ClientWireError::InvalidIdentifier)
+        ));
+    }
+}
+
+#[test]
+fn public_voice_turn_projection_rejects_generation_turn_mismatch() {
+    let event = VoiceSessionEvent::Turn {
+        session_id: SessionId::new(1),
+        generation_id: GenerationId::new(2),
+        event: RuntimeEvent::TurnCompleted {
+            turn_id: TurnId::new(3),
+        },
+    };
+
+    assert!(matches!(
+        ClientVoiceSessionEvent::try_from(event),
+        Err(ClientWireError::MismatchedVoiceIdentity)
+    ));
 }

@@ -21,6 +21,9 @@ const localStatus = {
   memory_location: null,
   telemetry_enabled: false,
   capabilities: ["text"],
+  components: [
+    { kind: "language_model", execution_location: "local", provider_label: "Local language" },
+  ],
 };
 
 describe("TauriGatewayTransport", () => {
@@ -45,7 +48,7 @@ describe("TauriGatewayTransport", () => {
     const native = createFakeNativeBridge();
     const transport = await TauriGatewayTransport.start(paths, native);
 
-    await transport.send({ type: "start_turn", requestId: "request-1", turnId: 7n, transcript: "Hello" });
+    await transport.send({ type: "start_turn", requestId: "request-1", transcript: "Hello" });
 
     expect(native.invocations).toEqual([
       {
@@ -56,10 +59,9 @@ describe("TauriGatewayTransport", () => {
         command: "send_runtime",
         args: {
           payload: JSON.stringify({
-            protocol_version: 1,
+            protocol_version: 3,
             type: "start_turn",
             request_id: "request-1",
-            turn_id: "7",
             transcript: "Hello",
           }),
         },

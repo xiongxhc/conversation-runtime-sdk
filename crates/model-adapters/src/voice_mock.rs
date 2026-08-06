@@ -10,7 +10,7 @@ use crate::{
     AdapterError, AdapterFuture, AudioCapture, AudioFrame, CaptureEvent, ContinuousAudioOutput,
     GenerationLanguageModel, GenerationLanguageRequest, GenerationTextDelta, PlaybackReceipt,
     RecognitionEvent, SpeechRecognizer, StreamingSpeechRequest, StreamingSpeechSynthesizer,
-    VoiceInput, VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
+    VoiceCaptureControl, VoiceInput, VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
 };
 
 #[derive(Clone, Debug)]
@@ -295,6 +295,69 @@ impl ContinuousAudioOutput for MockContinuousAudioOutput {
 }
 
 #[derive(Clone, Debug)]
+pub struct MockVoiceCaptureControl {
+    state: Arc<Mutex<MockCaptureState>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MockCaptureState {
+    Active,
+    Paused,
+}
+
+impl MockVoiceCaptureControl {
+    pub fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(MockCaptureState::Active)),
+        }
+    }
+}
+
+impl Default for MockVoiceCaptureControl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VoiceCaptureControl for MockVoiceCaptureControl {
+    fn pause<'a>(
+        &'a self,
+        _session_id: SessionId,
+        cancellation: CancellationToken,
+    ) -> AdapterFuture<'a, ()> {
+        Box::pin(async move {
+            if cancellation.is_cancelled() {
+                return Err(AdapterError::new("voice capture pause cancelled"));
+            }
+            let mut state = self.state.lock().expect("mock capture state lock poisoned");
+            if *state != MockCaptureState::Active {
+                return Err(AdapterError::new("voice capture is not active"));
+            }
+            *state = MockCaptureState::Paused;
+            Ok(())
+        })
+    }
+
+    fn resume<'a>(
+        &'a self,
+        _session_id: SessionId,
+        cancellation: CancellationToken,
+    ) -> AdapterFuture<'a, ()> {
+        Box::pin(async move {
+            if cancellation.is_cancelled() {
+                return Err(AdapterError::new("voice capture resume cancelled"));
+            }
+            let mut state = self.state.lock().expect("mock capture state lock poisoned");
+            if *state != MockCaptureState::Paused {
+                return Err(AdapterError::new("voice capture is not paused"));
+            }
+            *state = MockCaptureState::Active;
+            Ok(())
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct MockVoiceIoFactory {
     events: Vec<VoiceInputEvent>,
     start_count: Arc<AtomicUsize>,
@@ -331,6 +394,7 @@ impl VoiceIoFactory for MockVoiceIoFactory {
             let completion_cancellation = cancellation.clone();
             Ok(VoiceIoSession {
                 input: Arc::new(MockVoiceInput::new(self.events.clone())),
+                capture: Arc::new(MockVoiceCaptureControl::new()),
                 output: Arc::new(MockContinuousAudioOutput::new()),
                 completion: tokio::spawn(async move {
                     completion_cancellation.cancelled().await;

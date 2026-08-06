@@ -36,6 +36,8 @@ public enum SidecarSessionError: Error, Equatable, Sendable {
 
 public protocol SidecarAudioService: Sendable {
     func start(configuration: SidecarConfiguration) async throws
+    func pauseCapture() async throws
+    func resumeCapture() async throws
     func stop() async
 }
 
@@ -58,6 +60,7 @@ public actor SidecarSession {
     private enum StablePhase: Equatable, Sendable {
         case ready
         case capturing
+        case paused
     }
 
     private enum Phase: Equatable, Sendable {
@@ -65,7 +68,10 @@ public actor SidecarSession {
         case configuring
         case ready
         case starting
+        case pausing
         case capturing
+        case paused
+        case resuming
         case flushing(StablePhase)
         case terminating
         case failing
@@ -145,7 +151,7 @@ public actor SidecarSession {
         }
 
         do {
-            let configuration = try requireCapturing()
+            let (configuration, playbackPhase) = try requirePlaybackAvailable()
             guard audio.sessionID == configuration.sessionID else {
                 throw SidecarSessionError.sessionMismatch
             }
@@ -154,7 +160,7 @@ public actor SidecarSession {
             try nextBuffer.enqueue(audio.frame)
             playbackBuffer = nextBuffer
             try await playbackService.enqueue(audio.frame)
-            guard phase == .capturing,
+            guard phase == playbackPhase,
                   playbackBuffer.contains(audio.frame.identity)
             else {
                 return
@@ -181,7 +187,7 @@ public actor SidecarSession {
         }
         do {
             try requireAvailableOperation()
-            let configuration = try requireCapturing()
+            let (configuration, _) = try requirePlaybackAvailable()
             try playbackBuffer.markRendered(identity)
             try await eventSink.send(
                 ChildFrame(
@@ -398,7 +404,7 @@ public actor SidecarSession {
             try await eventSink.send(ChildFrame(control: .ready(sessionID: sessionID)))
             phase = .ready
 
-        case let .startCapture(sessionID):
+        case let .startCapture(sessionID, operationID):
             let configuration = try requireReady(sessionID: sessionID)
             phase = .starting
             recognitionState = .prepareAttempted
@@ -410,6 +416,53 @@ public actor SidecarSession {
             recognitionState = .startAttempted
             try await recognitionService.start(configuration: configuration)
             recognitionState = .started
+            phase = .capturing
+            try await eventSink.send(
+                ChildFrame(
+                    control: .captureStarted(
+                        sessionID: configuration.sessionID,
+                        operationID: operationID
+                    )
+                )
+            )
+
+        case let .pauseCapture(sessionID, operationID):
+            let configuration = try requireConfigured(sessionID: sessionID)
+            guard phase == .capturing else {
+                throw SidecarSessionError.invalidState
+            }
+            phase = .pausing
+            recognitionState = .stopped
+            await recognitionService.stop()
+            try await audioService.pauseCapture()
+            try await eventSink.send(
+                ChildFrame(
+                    control: .capturePaused(
+                        sessionID: configuration.sessionID,
+                        operationID: operationID
+                    )
+                )
+            )
+            phase = .paused
+
+        case let .resumeCapture(sessionID, operationID):
+            let configuration = try requireConfigured(sessionID: sessionID)
+            guard phase == .paused else {
+                throw SidecarSessionError.invalidState
+            }
+            phase = .resuming
+            try await audioService.resumeCapture()
+            recognitionState = .startAttempted
+            try await recognitionService.start(configuration: configuration)
+            recognitionState = .started
+            try await eventSink.send(
+                ChildFrame(
+                    control: .captureResumed(
+                        sessionID: configuration.sessionID,
+                        operationID: operationID
+                    )
+                )
+            )
             phase = .capturing
 
         case let .flushGeneration(sessionID, generationID, operationID):
@@ -434,7 +487,7 @@ public actor SidecarSession {
 
         case let .shutdown(sessionID):
             let configuration = try requireConfigured(sessionID: sessionID)
-            guard phase == .ready || phase == .capturing else {
+            guard phase == .ready || phase == .capturing || phase == .paused else {
                 throw SidecarSessionError.invalidState
             }
             phase = .terminating
@@ -445,6 +498,9 @@ public actor SidecarSession {
             phase = .terminated
 
         case .ready,
+             .captureStarted,
+             .capturePaused,
+             .captureResumed,
              .voiceActivity,
              .transcriptHypothesis,
              .playbackAccepted,
@@ -465,6 +521,8 @@ public actor SidecarSession {
             resumePhase = .ready
         case .capturing:
             resumePhase = .capturing
+        case .paused:
+            resumePhase = .paused
         default:
             throw SidecarSessionError.invalidState
         }
@@ -484,6 +542,8 @@ public actor SidecarSession {
             phase = .ready
         case .capturing:
             phase = .capturing
+        case .paused:
+            phase = .paused
         }
     }
 
@@ -516,13 +576,30 @@ public actor SidecarSession {
         return configuration
     }
 
+    private func requirePlaybackAvailable() throws -> (
+        SidecarConfiguration,
+        Phase
+    ) {
+        guard let configuration else {
+            throw SidecarSessionError.invalidState
+        }
+        switch phase {
+        case .capturing, .paused:
+            return (configuration, phase)
+        default:
+            throw SidecarSessionError.invalidState
+        }
+    }
+
     private func requireAvailableOperation() throws {
         switch phase {
-        case .awaitingSession, .ready, .capturing:
+        case .awaitingSession, .ready, .capturing, .paused:
             return
         case .configuring,
              .starting,
+             .pausing,
              .flushing,
+             .resuming,
              .terminating,
              .failing,
              .terminated:

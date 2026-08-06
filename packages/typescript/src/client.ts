@@ -3,7 +3,11 @@ import {
   validateClientCommand,
   type ClientCommand,
   type GatewayMessage,
+  type MemoryCursor,
+  type MemoryInspection,
+  type MemoryPage,
   type RuntimeEvent,
+  type RuntimeFailure,
   type RuntimeStatus,
 } from "./protocol.js";
 
@@ -18,17 +22,33 @@ export interface RuntimeTurn {
   readonly events: AsyncIterable<RuntimeEvent>;
 }
 
+export class CommandRejectedError extends Error {
+  readonly code: RuntimeFailure["code"];
+  readonly kind: RuntimeFailure["kind"];
+  readonly stage: RuntimeFailure["stage"];
+  readonly failure: RuntimeFailure;
+
+  constructor(failure: RuntimeFailure) {
+    super(failure.message);
+    this.name = "CommandRejectedError";
+    this.code = failure.code;
+    this.kind = failure.kind;
+    this.stage = failure.stage;
+    this.failure = failure;
+  }
+}
+
 export class RuntimeClient {
   private readonly ready = new Deferred<void>();
   private readonly controls = new Map<string, PendingControl>();
   private readonly unexpectedFailureListeners = new Set<(error: Error) => void>();
   private readonly turns = new Map<bigint, TurnState>();
+  private readonly acceptedStartRequests = new Set<string>();
   private failure: Error | undefined;
   private closing = false;
   private closePromise: Promise<void> | undefined;
   private readyReceived = false;
   private requestCounter = 0n;
-  private turnCounter = 0n;
 
   private constructor(private readonly transport: RuntimeTransport) {}
 
@@ -52,33 +72,48 @@ export class RuntimeClient {
     return result.promise;
   }
 
-  startTurn(transcript: string): RuntimeTurn {
-    const turnId = this.turnCounter + 1n;
+  listMemories(cursor: MemoryCursor | null = null): Promise<MemoryPage> {
     const requestId = this.nextRequestId();
-    validateClientCommand({ type: "start_turn", requestId, turnId, transcript });
-    this.turnCounter = turnId;
-    const state: TurnState = {
-      accepted: new Deferred<void>(),
-      events: new AsyncQueue<RuntimeEvent>(),
-      startRequestId: requestId,
-      turnId,
-    };
-    this.turns.set(turnId, state);
+    const command: ClientCommand = { type: "memory_list", requestId, cursor };
+    validateClientCommand(command);
+    const result = new Deferred<MemoryPage>();
+    this.controls.set(requestId, {
+      kind: "memory_list",
+      accepted: false,
+      result,
+      fail: (error) => result.reject(error),
+    });
+    this.send(command);
+    return result.promise;
+  }
+
+  inspectMemory(memoryId: bigint): Promise<MemoryInspection> {
+    const requestId = this.nextRequestId();
+    const command: ClientCommand = { type: "memory_inspect", requestId, memoryId };
+    validateClientCommand(command);
+    const result = new Deferred<MemoryInspection>();
+    this.controls.set(requestId, {
+      kind: "memory_inspect",
+      accepted: false,
+      result,
+      fail: (error) => result.reject(error),
+    });
+    this.send(command);
+    return result.promise;
+  }
+
+  startTurn(transcript: string): Promise<RuntimeTurn> {
+    const requestId = this.nextRequestId();
+    validateClientCommand({ type: "start_turn", requestId, transcript });
+    const result = new Deferred<RuntimeTurn>();
     this.controls.set(requestId, {
       kind: "start_turn",
       accepted: false,
-      turnId,
-      fail: (error) => {
-        this.turns.delete(turnId);
-        state.accepted.reject(error);
-        state.events.fail(error);
-      },
+      result,
+      fail: (error) => result.reject(error),
     });
-    this.send({ type: "start_turn", requestId, turnId, transcript });
-    return {
-      turnId,
-      events: acceptedEvents(state),
-    };
+    this.send({ type: "start_turn", requestId, transcript });
+    return result.promise;
   }
 
   interrupt(turnId: bigint): Promise<void> {
@@ -149,11 +184,11 @@ export class RuntimeClient {
       return;
     }
     if (message.type === "command_accepted") {
-      this.accept(message.requestId);
+      this.accept(message.requestId, message.turnId);
       return;
     }
     if (message.type === "command_rejected") {
-      this.reject(message.requestId, new Error("gateway rejected a command"));
+      this.reject(message.requestId, new CommandRejectedError(message.error));
       return;
     }
     if (message.type === "status") {
@@ -166,21 +201,46 @@ export class RuntimeClient {
       control.result.resolve(message.status);
       return;
     }
+    if (message.type === "memory_list") {
+      const control = this.controls.get(message.requestId);
+      if (!control || control.kind !== "memory_list" || !control.accepted) {
+        this.fail(new Error("gateway sent an uncorrelated memory list response"));
+        return;
+      }
+      this.controls.delete(message.requestId);
+      control.result.resolve({ records: message.records, nextCursor: message.nextCursor });
+      return;
+    }
+    if (message.type === "memory_inspection") {
+      const control = this.controls.get(message.requestId);
+      if (!control || control.kind !== "memory_inspect" || !control.accepted) {
+        this.fail(new Error("gateway sent an uncorrelated memory inspection response"));
+        return;
+      }
+      this.controls.delete(message.requestId);
+      control.result.resolve(message.inspection);
+      return;
+    }
+    if (message.type === "voice_event") {
+      this.fail(new Error("gateway sent a voice event before voice client support was active"));
+      return;
+    }
 
     const turnId = eventTurnId(message.event);
     const state = this.turns.get(turnId);
-    if (!state || !state.accepted.settled) {
+    if (!state) {
       this.fail(new Error("gateway sent an unknown or terminal turn event"));
       return;
     }
     state.events.push(message.event);
     if (isTerminal(message.event)) {
       this.turns.delete(turnId);
+      this.acceptedStartRequests.delete(state.startRequestId);
       state.events.finish();
     }
   }
 
-  private accept(requestId: string): void {
+  private accept(requestId: string, turnId: bigint | undefined): void {
     const control = this.controls.get(requestId);
     if (!control || control.accepted) {
       this.fail(new Error("gateway accepted an unknown command"));
@@ -189,15 +249,19 @@ export class RuntimeClient {
     control.accepted = true;
     switch (control.kind) {
       case "status":
+      case "memory_list":
+      case "memory_inspect":
         return;
       case "start_turn": {
         this.controls.delete(requestId);
-        const state = this.turns.get(control.turnId);
-        if (!state) {
-          this.fail(new Error("gateway accepted an unknown turn"));
+        if (turnId === undefined || this.turns.has(turnId)) {
+          control.fail(new Error("gateway accepted a start turn without a new turn identifier"));
           return;
         }
-        state.accepted.resolve();
+        const state: TurnState = { events: new AsyncQueue<RuntimeEvent>(), startRequestId: requestId };
+        this.turns.set(turnId, state);
+        this.acceptedStartRequests.add(requestId);
+        control.result.resolve({ turnId, events: state.events });
         return;
       }
       case "interrupt_turn":
@@ -208,7 +272,7 @@ export class RuntimeClient {
 
   private reject(requestId: string, error: Error): void {
     const control = this.controls.get(requestId);
-    if (control?.accepted || this.hasAcceptedStartRequest(requestId)) {
+    if (control?.accepted || this.acceptedStartRequests.has(requestId)) {
       this.fail(new Error("gateway rejected an accepted command"));
       return;
     }
@@ -234,15 +298,6 @@ export class RuntimeClient {
     }
   }
 
-  private hasAcceptedStartRequest(requestId: string): boolean {
-    for (const state of this.turns.values()) {
-      if (state.accepted.settled && state.startRequestId === requestId) {
-        return true;
-      }
-    }
-    return false;
-  }
-
   private fail(error: Error, closeTransport = true): void {
     if (this.failure) {
       return;
@@ -253,8 +308,8 @@ export class RuntimeClient {
       control.fail(error);
     }
     this.controls.clear();
+    this.acceptedStartRequests.clear();
     for (const state of this.turns.values()) {
-      state.accepted.reject(error);
       state.events.fail(error);
     }
     this.turns.clear();
@@ -282,14 +337,14 @@ export class RuntimeClient {
 
 type PendingControl =
   | { kind: "status"; accepted: boolean; result: Deferred<RuntimeStatus>; fail(error: Error): void }
-  | { kind: "start_turn"; accepted: boolean; turnId: bigint; fail(error: Error): void }
+  | { kind: "memory_list"; accepted: boolean; result: Deferred<MemoryPage>; fail(error: Error): void }
+  | { kind: "memory_inspect"; accepted: boolean; result: Deferred<MemoryInspection>; fail(error: Error): void }
+  | { kind: "start_turn"; accepted: boolean; result: Deferred<RuntimeTurn>; fail(error: Error): void }
   | { kind: "interrupt_turn"; accepted: boolean; result: Deferred<void>; fail(error: Error): void };
 
 type TurnState = {
-  accepted: Deferred<void>;
   events: AsyncQueue<RuntimeEvent>;
   startRequestId: string;
-  turnId: bigint;
 };
 
 class Deferred<T> {
@@ -381,13 +436,6 @@ class AsyncQueue<T> implements AsyncIterable<T> {
         waiter.resolve({ value: undefined, done: true });
       }
     }
-  }
-}
-
-async function* acceptedEvents(state: TurnState): AsyncGenerator<RuntimeEvent> {
-  await state.accepted.promise;
-  for await (const event of state.events) {
-    yield event;
   }
 }
 

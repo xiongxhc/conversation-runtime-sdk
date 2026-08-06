@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -47,6 +49,7 @@ async fn persistent_session_reports_local_status_and_preserves_completed_history
     assert!(start_accepted.raw.contains(r#""turn_id":"1""#));
     let first = gateway.read_turn("1").await;
     assert_eq!(first.first().unwrap().event_type(), Some("turn_started"));
+    assert_eq!(first.first().unwrap().request_id(), Some("start-1"));
     assert_eq!(terminal_count(&first), 1);
     assert_eq!(terminal_type(&first), "turn_completed");
     assert_eq!(joined_text(&first), "fixture-answer");
@@ -57,6 +60,8 @@ async fn persistent_session_reports_local_status_and_preserves_completed_history
         .await;
     assert_accepted(&gateway.read_message().await, "start-2");
     let second = gateway.read_turn("2").await;
+    assert_eq!(second.first().unwrap().event_type(), Some("turn_started"));
+    assert_eq!(second.first().unwrap().request_id(), Some("start-2"));
     assert_eq!(terminal_count(&second), 1);
     assert_eq!(terminal_type(&second), "turn_completed");
     assert_eq!(joined_text(&second), "fixture-answer");
@@ -90,6 +95,33 @@ async fn status_reports_exact_model_and_enabled_local_memory() {
     let exit = gateway.close().await;
     assert!(exit.status.success());
     exit.assert_content_free_stderr(&["status-memory"]);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn configured_voice_is_not_advertised_before_voice_hosting() {
+    let server = FakeOllamaServer::completing(0).await;
+    let mut gateway = GatewayProcess::start_with_voice(server.endpoint()).await;
+
+    let ready = gateway.read_message().await;
+    assert_eq!(ready.message_type(), "ready");
+    assert_local_status(&ready, false);
+    assert!(!gateway.sidecar_spawned());
+
+    gateway
+        .write_message(
+            r#"{"protocol_version":3,"type":"start_voice_session","request_id":"voice-before-host"}"#,
+        )
+        .await;
+    assert_rejected(
+        &gateway.read_message().await,
+        "voice-before-host",
+        "invalid_state",
+    );
+    assert!(!gateway.sidecar_spawned());
+
+    let exit = gateway.close().await;
+    assert!(exit.status.success());
 }
 
 #[tokio::test]
@@ -362,6 +394,7 @@ struct GatewayProcess {
     _temporary: TempDir,
     config_path: PathBuf,
     memory_path: Option<PathBuf>,
+    sidecar_spawn_marker: Option<PathBuf>,
     child: Child,
     stdin: Option<ChildStdin>,
     stdout: FrameReader<tokio::process::ChildStdout>,
@@ -370,23 +403,31 @@ struct GatewayProcess {
 
 impl GatewayProcess {
     async fn start(endpoint: &str) -> Self {
-        Self::start_with_options(endpoint, false).await
+        Self::start_with_options(endpoint, false, false).await
     }
 
     async fn start_with_memory(endpoint: &str) -> Self {
-        Self::start_with_options(endpoint, true).await
+        Self::start_with_options(endpoint, true, false).await
     }
 
-    async fn start_with_options(endpoint: &str, memory_enabled: bool) -> Self {
+    #[cfg(unix)]
+    async fn start_with_voice(endpoint: &str) -> Self {
+        Self::start_with_options(endpoint, false, true).await
+    }
+
+    async fn start_with_options(endpoint: &str, memory_enabled: bool, voice_enabled: bool) -> Self {
         let temporary = tempfile::tempdir().unwrap();
         let config = temporary.path().join("gateway.toml");
         let memory_path = memory_enabled.then(|| temporary.path().join("private-memory.sqlite3"));
         if let Some(memory_path) = memory_path.as_ref() {
             SqliteMemoryStore::initialize(memory_path).unwrap();
         }
-        tokio::fs::write(&config, config_contents(endpoint, memory_path.as_deref()))
-            .await
-            .unwrap();
+        let voice = voice_enabled.then(|| VoiceFixture::new(temporary.path()));
+        let mut contents = config_contents(endpoint, memory_path.as_deref());
+        if let Some(voice) = voice.as_ref() {
+            contents.push_str(&voice.config_contents());
+        }
+        tokio::fs::write(&config, contents).await.unwrap();
         let mut child = gateway_command(&config).spawn().unwrap();
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
@@ -395,6 +436,7 @@ impl GatewayProcess {
             _temporary: temporary,
             config_path: config,
             memory_path,
+            sidecar_spawn_marker: voice.map(|voice| voice.spawn_marker),
             child,
             stdin: Some(stdin),
             stdout: FrameReader::new(stdout),
@@ -409,6 +451,12 @@ impl GatewayProcess {
                 .expect("gateway memory is not enabled"),
         )
         .unwrap()
+    }
+
+    fn sidecar_spawned(&self) -> bool {
+        self.sidecar_spawn_marker
+            .as_ref()
+            .is_some_and(|marker| marker.exists())
     }
 
     async fn write_message(&mut self, message: &str) {
@@ -596,11 +644,13 @@ fn stderr_task(mut stderr: ChildStderr) -> JoinHandle<Vec<u8>> {
 
 fn config_contents(endpoint: &str, memory_path: Option<&Path>) -> String {
     let mut config = format!(
-        r#"schema_version = 1
+        r#"schema_version = 2
 privacy_mode = "local-only"
 
 [language]
 backend = "ollama-compatible"
+execution = "local"
+provider = "fixture-language"
 endpoint = "{endpoint}"
 model = "{FIXTURE_MODEL_ID}"
 thinking = false
@@ -680,8 +730,91 @@ fn assert_local_status(message: &WireMessage, memory_enabled: bool) {
         assert!(message
             .raw
             .contains(r#""capabilities":["text","memory_inspection"]"#));
+        assert!(message.raw.contains(r#""kind":"memory""#));
     } else {
         assert!(message.raw.contains(r#""capabilities":["text"]"#));
+        assert!(!message.raw.contains(r#""kind":"memory""#));
+    }
+    assert!(message.raw.contains(r#""kind":"language_model""#));
+    assert!(!message.raw.contains(r#""voice_session""#));
+    assert!(!message.raw.contains(r#""kind":"speech_recognition""#));
+    assert!(!message.raw.contains(r#""kind":"speech_synthesis""#));
+    assert!(!message.raw.contains(r#""kind":"audio_io""#));
+}
+
+#[cfg(unix)]
+struct VoiceFixture {
+    model_path: PathBuf,
+    sidecar_path: PathBuf,
+    spawn_marker: PathBuf,
+}
+
+#[cfg(unix)]
+impl VoiceFixture {
+    fn new(directory: &Path) -> Self {
+        let model_path = directory.join("asr-model");
+        std::fs::create_dir(&model_path).unwrap();
+        let sidecar_path = directory.join("voice-sidecar");
+        let spawn_marker = directory.join("sidecar-spawned");
+        std::fs::write(
+            &sidecar_path,
+            format!("#!/bin/sh\nprintf spawned > '{}'\n", spawn_marker.display()),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&sidecar_path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&sidecar_path, permissions).unwrap();
+        Self {
+            model_path,
+            sidecar_path,
+            spawn_marker,
+        }
+    }
+
+    fn config_contents(&self) -> String {
+        format!(
+            r#"
+[voice.capture]
+device = "system-default"
+
+[voice.turn]
+speech_start_ms = 200
+final_silence_ms = 600
+
+[voice.asr]
+backend = "whisperkit"
+execution = "local"
+provider = "fixture-speech-recognition"
+model_path = "{}"
+download = false
+
+[voice.speech]
+backend = "openai-compatible"
+execution = "local"
+provider = "fixture-speech-synthesis"
+mode = "streaming"
+streaming_interval = 0.2
+endpoint = "http://127.0.0.1:9/v1"
+model = "fixture-speech-model"
+voice = "fixture-voice"
+speed = 1.0
+language = "auto"
+instructions = "Speak clearly."
+max_tokens = 128
+repetition_penalty = 1.0
+max_text_bytes = 4096
+max_audio_bytes = 8388608
+
+[voice.audio]
+backend = "managed-sidecar"
+execution = "local"
+provider = "fixture-audio"
+sidecar_executable = "{}"
+max_error_bytes = 65536
+"#,
+            self.model_path.display(),
+            self.sidecar_path.display(),
+        )
     }
 }
 

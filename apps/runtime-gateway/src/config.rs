@@ -58,6 +58,22 @@ pub struct GatewayAdapters {
     pub status: RuntimeStatus,
 }
 
+impl GatewayAdapters {
+    pub fn text_only_status(&self) -> RuntimeStatus {
+        let mut status = self.status.clone();
+        status
+            .capabilities
+            .retain(|capability| capability != "voice_session");
+        status.components.retain(|component| {
+            !matches!(
+                component.kind.as_str(),
+                "speech_recognition" | "speech_synthesis" | "audio_io"
+            )
+        });
+        status
+    }
+}
+
 impl GatewayConfig {
     pub fn load(path: &Path) -> Result<Self, GatewayConfigError> {
         let config = load_toml(path)?;

@@ -25,12 +25,13 @@ async fn run() -> Result<(), ()> {
     let adapters: GatewayAdapters = config.into_adapters().map_err(|_| {
         eprintln!("gateway adapter initialization failed");
     })?;
+    let status = adapters.text_only_status();
     let GatewayAdapters {
         context,
         language,
         voice: _,
         memory_store,
-        status,
+        status: _,
     } = adapters;
     let runtime = TextTurnRuntime::new(context, language);
     let mut session = GatewaySession::new(runtime, status);

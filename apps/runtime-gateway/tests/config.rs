@@ -306,6 +306,20 @@ fn valid_voice_reuses_root_configuration_without_spawning() {
         status: adapters.status.clone(),
     })
     .unwrap();
+    let running_status = adapters.text_only_status();
+    assert_eq!(running_status.capabilities, ["text", "memory_inspection"]);
+    assert_eq!(
+        running_status
+            .components
+            .iter()
+            .map(|component| component.kind.as_str())
+            .collect::<Vec<_>>(),
+        ["language_model", "memory"]
+    );
+    encode_gateway_message(&GatewayMessage::Ready {
+        status: running_status,
+    })
+    .unwrap();
     assert!(!fixture.sidecar_spawned());
 }
 

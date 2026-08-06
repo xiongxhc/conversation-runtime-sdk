@@ -6,7 +6,7 @@ use conversation_memory::{MemoryClock, MemoryStore, MemoryStoreErrorKind};
 use conversation_protocol::{
     decode_client_command, encode_gateway_message, ClientCommand, ClientMemoryCursor,
     ClientMemoryInspection, ClientMemorySummary, ClientRuntimeError, ClientRuntimeEvent,
-    GatewayMessage, RuntimeStatus, TurnId,
+    GatewayMessage, RuntimeEvent, RuntimeStatus, TurnId,
 };
 use conversation_runtime::{TextTurnEventStream, TextTurnRuntime};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -266,7 +266,11 @@ impl GatewaySession {
                 };
 
                 let turn_id = started.identity().turn_id();
-                *active = Some(ActiveForwarder::pending(turn_id, started.into_events()));
+                *active = Some(ActiveForwarder::pending(
+                    request_id.clone(),
+                    turn_id,
+                    started.into_events(),
+                ));
                 send_urgent(urgent, accepted_turn_message(&request_id, turn_id))
                     .map_err(CommandFailure::response)?;
                 active
@@ -467,6 +471,7 @@ enum SessionInput {
 }
 
 struct ActiveForwarder {
+    request_id: String,
     turn_id: TurnId,
     event_stream: Option<TextTurnEventStream>,
     shutdown: Option<oneshot::Sender<()>>,
@@ -474,8 +479,9 @@ struct ActiveForwarder {
 }
 
 impl ActiveForwarder {
-    fn pending(turn_id: TurnId, event_stream: TextTurnEventStream) -> Self {
+    fn pending(request_id: String, turn_id: TurnId, event_stream: TextTurnEventStream) -> Self {
         Self {
+            request_id,
             turn_id,
             event_stream: Some(event_stream),
             shutdown: None,
@@ -484,6 +490,7 @@ impl ActiveForwarder {
     }
 
     fn start(&mut self, writer: mpsc::Sender<GatewayMessage>) {
+        let request_id = self.request_id.clone();
         let event_stream = self
             .event_stream
             .take()
@@ -491,6 +498,7 @@ impl ActiveForwarder {
         let (shutdown, shutdown_receiver) = oneshot::channel();
         self.shutdown = Some(shutdown);
         self.task = Some(tokio::spawn(forward_events(
+            request_id,
             event_stream,
             writer,
             shutdown_receiver,
@@ -499,6 +507,7 @@ impl ActiveForwarder {
 }
 
 async fn forward_events(
+    request_id: String,
     mut events: TextTurnEventStream,
     writer: mpsc::Sender<GatewayMessage>,
     mut shutdown: oneshot::Receiver<()>,
@@ -519,12 +528,18 @@ async fn forward_events(
         if !forwarding {
             continue;
         }
-        let event = match ClientRuntimeEvent::try_from(event) {
-            Ok(event) => event,
-            Err(_) => {
-                while events.recv().await.is_some() {}
-                return Err(GatewaySessionError::Projection);
-            }
+        let event = match event {
+            RuntimeEvent::TurnStarted { turn_id } => ClientRuntimeEvent::TurnStarted {
+                request_id: Some(request_id.clone()),
+                turn_id,
+            },
+            event => match ClientRuntimeEvent::try_from(event) {
+                Ok(event) => event,
+                Err(_) => {
+                    while events.recv().await.is_some() {}
+                    return Err(GatewaySessionError::Projection);
+                }
+            },
         };
         let message = GatewayMessage::RuntimeEvent { event };
         tokio::select! {
@@ -1261,6 +1276,7 @@ mod tests {
         });
         let started = message_index(&messages, |message| {
             message.contains(r#""type":"turn_started""#)
+                && message.contains(r#""request_id":"start-tie""#)
         });
         assert!(accepted < started);
     }

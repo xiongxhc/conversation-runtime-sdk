@@ -13,7 +13,7 @@ use conversation_model_adapters::{
     PlaybackReceipt, RecognitionEvent, SystemDevice, VoiceInputEvent, VoiceIoFactory,
 };
 use conversation_protocol::{
-    GenerationId, PlaybackState, SessionId, TurnId, UtteranceId, VoiceActivity,
+    GenerationId, PlaybackState, RuntimeStage, SessionId, TurnId, UtteranceId, VoiceActivity,
 };
 use tempfile::TempDir;
 use tokio::task::JoinHandle;
@@ -353,6 +353,64 @@ async fn capture_start_cancellation_cancels_the_session_and_reaps() {
 }
 
 #[tokio::test]
+async fn startup_failures_retain_stage_provenance_before_readiness() {
+    for (scenario, expected_stage) in [
+        ("permission-denied", Some(RuntimeStage::AudioCapture)),
+        (
+            "audio-output-failure-before-ready",
+            Some(RuntimeStage::AudioOutput),
+        ),
+        (
+            "recognition-failure-before-ready",
+            Some(RuntimeStage::SpeechRecognizer),
+        ),
+        ("malformed-frame-before-ready", None),
+        ("crash", None),
+    ] {
+        let harness = FakeSidecarHarness::new(scenario);
+        let error = match harness.start(CancellationToken::new()).await {
+            Ok(_) => panic!("{scenario} started a session"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.stage(), expected_stage, "{scenario}: {error}");
+        harness.assert_process_gone().await;
+    }
+}
+
+#[tokio::test]
+async fn startup_failures_retain_stage_provenance_before_capture_acknowledgement() {
+    for (scenario, expected_stage) in [
+        (
+            "audio-capture-failure-before-capture-ack",
+            Some(RuntimeStage::AudioCapture),
+        ),
+        (
+            "audio-output-failure-before-capture-ack",
+            Some(RuntimeStage::AudioOutput),
+        ),
+        (
+            "recognition-failure-before-capture-ack",
+            Some(RuntimeStage::SpeechRecognizer),
+        ),
+        ("malformed-frame", None),
+        ("crash-before-capture-ack", None),
+    ] {
+        let harness = FakeSidecarHarness::new(scenario);
+        let session = harness.start(CancellationToken::new()).await.unwrap();
+        let error = session
+            .input
+            .start(SESSION_ID, CancellationToken::new())
+            .await
+            .expect_err("startup failure acknowledged capture");
+
+        assert_eq!(error.stage(), expected_stage, "{scenario}: {error}");
+        assert!(await_completion(session.completion).await.is_err());
+        harness.assert_process_gone().await;
+    }
+}
+
+#[tokio::test]
 async fn recognition_failure_keeps_real_factory_completion_alive() {
     let harness = FakeSidecarHarness::new("recognition-failure-nonfatal");
     let cancellation = CancellationToken::new();
@@ -495,6 +553,11 @@ async fn malformed_frame_fails_completion_and_reaps_child() {
     let harness = FakeSidecarHarness::new("malformed-frame");
     let session = harness.start(CancellationToken::new()).await.unwrap();
 
+    assert!(session
+        .input
+        .start(SESSION_ID, CancellationToken::new())
+        .await
+        .is_err());
     assert!(await_completion(session.completion).await.is_err());
     harness.assert_process_gone().await;
 }

@@ -1,18 +1,29 @@
 use conversation_model_adapters::{
-    AudioCapture, AudioFrame, CaptureEvent, ContinuousAudioOutput, GenerationLanguageModel,
-    GenerationLanguageRequest, LanguageModelInput, MockAudioCapture, MockContinuousAudioOutput,
-    MockGenerationLanguageModel, MockSpeechRecognizer, MockStreamingSpeechSynthesizer,
-    MockVoiceInput, MockVoiceIoFactory, PcmFormat, PcmSampleFormat, RecognitionEvent,
-    RecognitionHypothesis, SpeechRecognizer, StreamingSpeechRequest, StreamingSpeechSynthesizer,
-    VoiceInput, VoiceInputEvent, VoiceIoFactory,
+    AdapterError, AudioCapture, AudioFrame, CaptureEvent, ContinuousAudioOutput,
+    GenerationLanguageModel, GenerationLanguageRequest, LanguageModelInput, MockAudioCapture,
+    MockContinuousAudioOutput, MockGenerationLanguageModel, MockSpeechRecognizer,
+    MockStreamingSpeechSynthesizer, MockVoiceInput, MockVoiceIoFactory, PcmFormat, PcmSampleFormat,
+    RecognitionEvent, RecognitionHypothesis, SpeechRecognizer, StreamingSpeechRequest,
+    StreamingSpeechSynthesizer, VoiceInput, VoiceInputEvent, VoiceIoFactory,
 };
 use conversation_protocol::{
     ContextSource, ConversationMessage, ConversationMode, ConversationRole, GenerationId,
     MemoryContextItem, MemoryId, MemoryKind, MemoryRetrievalReason, PlaybackState, QualityDecision,
-    ResponseControls, SessionId, TurnId, UtteranceId,
+    ResponseControls, RuntimeStage, SessionId, TurnId, UtteranceId,
 };
 use tokio::time::{timeout, Duration};
 use tokio_util::sync::CancellationToken;
+
+#[test]
+fn adapter_errors_keep_new_untyped_and_retain_explicit_stage_provenance() {
+    let untyped = AdapterError::new("generic adapter failure");
+    let staged =
+        AdapterError::new("output permission denied").with_stage(RuntimeStage::AudioOutput);
+
+    assert_eq!(untyped.stage(), None);
+    assert_eq!(staged.stage(), Some(RuntimeStage::AudioOutput));
+    assert_eq!(staged.message(), "output permission denied");
+}
 
 #[tokio::test]
 async fn mock_voice_input_emits_partial_without_marking_it_final() {

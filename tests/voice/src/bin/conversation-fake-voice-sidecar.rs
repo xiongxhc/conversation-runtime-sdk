@@ -106,15 +106,16 @@ fn run() -> Result<(), String> {
         match event {
             FakeEvent::Control(ControlFrame::StartSession { session }) => {
                 session_id = Some(session);
+                if scenario == "malformed-frame-before-ready" {
+                    write_malformed_frame(&mut stdout)?;
+                    return Ok(());
+                }
                 if scenario == "recognition-failure-before-ready" {
-                    write_json_frame(
+                    write_failure_frame(
                         &mut stdout,
-                        FAILURE,
-                        json!({
-                            "session_id": session,
-                            "stage": "speech_recognizer",
-                            "code": "recognition_failed"
-                        }),
+                        session,
+                        "speech_recognizer",
+                        "recognition_failed",
                     )?;
                     write_json_frame(
                         &mut stdout,
@@ -128,15 +129,16 @@ fn run() -> Result<(), String> {
                     return Ok(());
                 }
                 if scenario == "permission-denied" {
-                    write_json_frame(
+                    write_failure_frame(
                         &mut stdout,
-                        FAILURE,
-                        json!({
-                            "session_id": session,
-                            "stage": "audio_capture",
-                            "code": "permission_denied"
-                        }),
+                        session,
+                        "audio_capture",
+                        "permission_denied",
                     )?;
+                    return Ok(());
+                }
+                if scenario == "audio-output-failure-before-ready" {
+                    write_failure_frame(&mut stdout, session, "audio_output", "permission_denied")?;
                     return Ok(());
                 }
                 write_json_frame(&mut stdout, READY, json!({ "session_id": session }))?;
@@ -150,19 +152,41 @@ fn run() -> Result<(), String> {
                         thread::sleep(Duration::from_secs(60));
                     }
                 }
-                if scenario == "malformed-frame" {
-                    stdout
-                        .write_all(&[0, 2, 0, 1, 0, 0, 0, 0])
-                        .map_err(|_| "failed to write malformed frame".to_owned())?;
-                    stdout
-                        .flush()
-                        .map_err(|_| "failed to flush malformed frame".to_owned())?;
-                }
             }
             FakeEvent::Control(ControlFrame::StartCapture { session, operation }) if ready => {
                 if scenario == "hold-start-capture-ack" {
                     write_marker_from_env(HELD_MARKER_ENV, "capture-start-held", false)?;
                     continue;
+                }
+                if scenario == "audio-capture-failure-before-capture-ack" {
+                    write_failure_frame(
+                        &mut stdout,
+                        session,
+                        "audio_capture",
+                        "permission_denied",
+                    )?;
+                    return Ok(());
+                }
+                if scenario == "audio-output-failure-before-capture-ack" {
+                    write_failure_frame(&mut stdout, session, "audio_output", "permission_denied")?;
+                    return Ok(());
+                }
+                if scenario == "recognition-failure-before-capture-ack" {
+                    write_failure_frame(
+                        &mut stdout,
+                        session,
+                        "speech_recognizer",
+                        "recognition_failed",
+                    )?;
+                    return Ok(());
+                }
+                if scenario == "malformed-frame" {
+                    write_malformed_frame(&mut stdout)?;
+                    return Ok(());
+                }
+                if scenario == "crash-before-capture-ack" {
+                    eprintln!("fake-sidecar=crash-before-capture-ack");
+                    std::process::exit(17);
                 }
                 if scenario == "delay-capture-acks" {
                     thread::sleep(Duration::from_millis(100));
@@ -709,6 +733,32 @@ fn write_json_frame(
     writer
         .flush()
         .map_err(|_| "failed to flush fake frame".to_owned())
+}
+
+fn write_failure_frame(
+    writer: &mut impl Write,
+    session_id: u64,
+    stage: &str,
+    code: &str,
+) -> Result<(), String> {
+    write_json_frame(
+        writer,
+        FAILURE,
+        json!({
+            "session_id": session_id,
+            "stage": stage,
+            "code": code
+        }),
+    )
+}
+
+fn write_malformed_frame(writer: &mut impl Write) -> Result<(), String> {
+    writer
+        .write_all(&[0, 2, 0, 1, 0, 0, 0, 0])
+        .map_err(|_| "failed to write malformed frame".to_owned())?;
+    writer
+        .flush()
+        .map_err(|_| "failed to flush malformed frame".to_owned())
 }
 
 fn acknowledge_media(writer: &mut impl Write, identity: MediaFrame) -> Result<(), String> {

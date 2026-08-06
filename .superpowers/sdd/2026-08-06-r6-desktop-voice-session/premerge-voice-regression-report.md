@@ -153,3 +153,141 @@ and reaped the sidecar.
 - The current harness did not expose an independent reviewer subagent. The
   complete diff was reviewed directly and all requested mechanical gates were
   rerun.
+
+## Pre-Merge Fix Round 1
+
+This round addresses the Important and Minor findings from the static review of
+`f6f7521b400343ab470c5c972779201bd160cbb9..36950ac2e208e968f16ba95c68a6c3c80fa9c077`.
+The round starts from `36950ac2e208e968f16ba95c68a6c3c80fa9c077`;
+the final focused commit SHA is recorded in the handoff because the commit
+cannot contain its own hash. The earlier concern that `voice_input_error` still
+classified by message text is superseded by this round.
+
+### Root Causes
+
+1. `sidecar_failure` validated the protocol's `RuntimeStage`, then constructed
+   an `AdapterError` containing only a message. The runtime therefore had no
+   component provenance and guessed from `permission` and
+   `device unavailable` substrings. This mapped valid `audio_output` permission
+   failures to `audio_capture` and recognition failures to `voice_sidecar`.
+2. The sidecar reader treated recognition failure as recoverable immediately
+   after `Ready`. Before `CaptureStarted`, however, the runtime is still waiting
+   for capture acknowledgement. A recognition failure at that boundary must
+   terminate startup with `speech_recognizer`, not continue until EOF and later
+   fail as an untyped sidecar error.
+3. The early-shutdown production path already cleared the active session before
+   delivering its terminal. The focused test stopped after one `SessionEnded`,
+   so it did not pin stream EOF, terminal uniqueness, or same-runtime reuse.
+
+### Fix
+
+- `AdapterError::new` remains source-compatible and creates an untyped error.
+  `AdapterError::with_stage` and `stage` carry optional backend-neutral
+  `RuntimeStage` provenance when an adapter has validated it.
+- Valid sidecar `Failure` frames attach their validated stage. Stage/code
+  mismatches remain untyped sidecar-contract failures.
+- Runtime voice-I/O conversion uses the attached stage directly and defaults
+  only untyped errors, including malformed framing and process exit, to
+  `voice_sidecar`. Recognition recovery now tests typed provenance rather than
+  message text.
+- Recoverable recognition begins only after the exact `CaptureStarted`
+  acknowledgement.
+- The startup-shutdown regression now observes exactly one terminal followed by
+  EOF, starts a replacement session on the same runtime, shuts it down, and
+  observes its terminal and EOF.
+
+### RED / GREEN
+
+RED 1 established the error-carrier contract:
+
+```text
+cargo test --locked -p conversation-model-adapters --test voice_contracts \
+  adapter_errors_keep_new_untyped_and_retain_explicit_stage_provenance \
+  -- --exact --nocapture
+```
+
+Compilation failed because `AdapterError` had no `with_stage` or `stage` API.
+After adding only the optional-stage representation, the exact test passed.
+
+RED 2 exercised real sidecar processes before readiness and before capture
+acknowledgement:
+
+```text
+cargo test --locked -p conversation-voice-probe --test sidecar_process \
+  startup_failures_retain_stage_provenance_before_readiness \
+  -- --exact --nocapture
+cargo test --locked -p conversation-voice-probe --test sidecar_process \
+  startup_failures_retain_stage_provenance_before_capture_acknowledgement \
+  -- --exact --nocapture
+```
+
+Both failed first on `left: None` versus `Some(AudioCapture)`, proving that the
+validated protocol stage was discarded at both boundaries.
+
+RED 3 expanded the compiled CLI table to five categories at both boundaries:
+
+```text
+cargo test --locked -p conversation-voice-probe --test continuous_cli \
+  malformed_permission_and_crash_failures_reap_the_sidecar \
+  -- --exact --nocapture
+```
+
+It failed with a pre-ready valid `audio_output + permission_denied` frame
+rendered as `stage=audio_capture`. After typed attachment/consumption and the
+capture-start recovery gate, all ten cases passed:
+
+- typed: `audio_capture`, `audio_output`, and `speech_recognizer`;
+- safe default: malformed framing and process exit as `voice_sidecar`;
+- each category covered before `Ready` and before `CaptureStarted`.
+
+The strengthened shutdown test passed before and after production changes,
+confirming that the Minor finding was missing regression coverage rather than a
+remaining cleanup defect.
+
+### Files
+
+- `crates/model-adapters/src/lib.rs`: optional typed stage provenance while
+  preserving untyped `AdapterError::new` callers.
+- `crates/model-adapters/src/macos_voice_sidecar/process.rs`: validated stage
+  attachment and post-`CaptureStarted` recognition recovery boundary.
+- `crates/model-adapters/tests/voice_contracts.rs`: typed/untyped AdapterError
+  contract.
+- `crates/runtime/src/voice_session.rs`: typed voice-I/O conversion with
+  `voice_sidecar` fallback and typed recognition handling.
+- `crates/runtime/tests/barge_in.rs`: explicit recognition-stage test fixtures.
+- `crates/runtime/tests/voice_session.rs`: explicit recognition fixture plus
+  terminal EOF and replacement-session reuse coverage.
+- `tests/voice/src/bin/conversation-fake-voice-sidecar.rs`: deterministic
+  pre-ready and pre-capture-ack failure scenarios.
+- `tests/voice/tests/continuous_cli.rs`: ten compiled startup-stage cases.
+- `tests/voice/tests/sidecar_process.rs`: typed adapter provenance and reaping
+  coverage at both startup boundaries.
+
+### Verification
+
+- AdapterError contract exact test: passed.
+- Both startup-boundary `sidecar_process` exact tests: passed.
+- Both original exact `continuous_cli` regressions: passed.
+- Strengthened startup-shutdown runtime exact test: passed.
+- Post-capture recognition recovery and mismatched-stage exact tests: passed.
+- Full `conversation-model-adapters`: passed all targets; one intentional
+  fixture-writer test remained ignored. The first sandbox run was denied at
+  loopback listener binds; the identical permitted run passed.
+- Full `conversation-runtime`: passed all targets.
+- Full `continuous_cli`: 24 passed, 0 failed.
+- Full `sidecar_process`: 38 passed, 0 failed.
+- `cargo fmt --all -- --check`: passed.
+- all-target clippy for model-adapters, runtime, and voice-probe with
+  `-D warnings`: passed.
+- `git diff --check`: passed.
+
+### Concerns
+
+- Untyped adapter errors intentionally remain possible for source compatibility.
+  At voice-I/O boundaries their safe default is `voice_sidecar`; adapters that
+  know the failing component must attach a validated stage.
+- No physical microphone, permission prompt, route change, latency, or acoustic
+  acceptance was run. Those native/hardware checks remain outside this
+  deterministic pre-merge round.
+- No push or merge was performed. `README.md` and `.planning/` remain excluded
+  from staging.

@@ -274,7 +274,7 @@ async fn run_voice_session(
     {
         Ok(session) => session,
         Err(error) => {
-            return session_failure(session_id, voice_input_error(error));
+            return session_failure(session_id, voice_io_error(error));
         }
     };
 
@@ -298,7 +298,7 @@ async fn run_voice_session(
                 }
                 return session_failure(
                     session_id,
-                    voice_input_error(error),
+                    voice_io_error(error),
                 );
             }
         }
@@ -740,7 +740,7 @@ impl VoiceLoop {
                 if !self
                     .publish_reliable(VoiceSessionEvent::SessionFailed {
                         session_id: self.session_id,
-                        error: adapter_runtime_error(RuntimeStage::SpeechRecognizer, error),
+                        error: voice_io_error(error),
                         recovery: RecoveryDisposition::ContinueSession,
                     })
                     .await
@@ -749,7 +749,7 @@ impl VoiceLoop {
                 }
                 None
             }
-            Some(Err(error)) => Some(LoopExit::Fatal(voice_input_error(error))),
+            Some(Err(error)) => Some(LoopExit::Fatal(voice_io_error(error))),
             None => Some(LoopExit::Fatal(adapter_message(
                 RuntimeStage::VoiceSidecar,
                 "voice input event stream ended unexpectedly",
@@ -1457,7 +1457,7 @@ fn completion_failure(completion: Result<Result<(), AdapterError>, JoinError>) -
             RuntimeStage::VoiceSidecar,
             "voice I/O session ended unexpectedly",
         ),
-        Ok(Err(error)) => adapter_runtime_error(RuntimeStage::VoiceSidecar, error),
+        Ok(Err(error)) => voice_io_error(error),
         Err(_) => adapter_message(
             RuntimeStage::VoiceSidecar,
             "voice I/O session completion task failed",
@@ -1465,19 +1465,13 @@ fn completion_failure(completion: Result<Result<(), AdapterError>, JoinError>) -
     }
 }
 
-fn voice_input_error(error: AdapterError) -> RuntimeError {
-    let stage = if error.message().contains("permission")
-        || error.message().contains("device unavailable")
-    {
-        RuntimeStage::AudioCapture
-    } else {
-        RuntimeStage::VoiceSidecar
-    };
+fn voice_io_error(error: AdapterError) -> RuntimeError {
+    let stage = error.stage().unwrap_or(RuntimeStage::VoiceSidecar);
     adapter_runtime_error(stage, error)
 }
 
 fn is_recognition_failure(error: &AdapterError) -> bool {
-    error.message().contains("recognition failed")
+    error.stage() == Some(RuntimeStage::SpeechRecognizer)
 }
 
 fn session_failure(session_id: SessionId, error: RuntimeError) -> VoiceSessionEvent {

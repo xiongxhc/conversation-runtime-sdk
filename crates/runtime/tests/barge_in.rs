@@ -479,7 +479,8 @@ async fn recognition_failure_recovers_to_listening() {
 
     harness
         .input
-        .send(Err(AdapterError::new("voice sidecar recognition failed")))
+        .send(Err(AdapterError::new("voice sidecar recognition failed")
+            .with_stage(RuntimeStage::SpeechRecognizer)))
         .await
         .unwrap();
     let failure = events
@@ -518,7 +519,8 @@ async fn recognition_failure_during_response_cleans_the_turn_before_recovery() {
 
     harness
         .input
-        .send(Err(AdapterError::new("voice sidecar recognition failed")))
+        .send(Err(AdapterError::new("voice sidecar recognition failed")
+            .with_stage(RuntimeStage::SpeechRecognizer)))
         .await
         .unwrap();
     let observed = drain_until_turn_recovery(&mut events).await;

@@ -1138,6 +1138,7 @@ async fn run_stdout_reader(
     supervisor_sender: mpsc::UnboundedSender<SupervisorEvent>,
 ) {
     let mut ready = false;
+    let mut capture_started = false;
     loop {
         let control = tokio::select! {
             biased;
@@ -1164,7 +1165,7 @@ async fn run_stdout_reader(
         }
         if let SidecarControl::Failure { stage, code, .. } = control {
             let error = sidecar_failure(stage, code);
-            if ready
+            if capture_started
                 && stage == RuntimeStage::SpeechRecognizer
                 && code == SidecarFailureCode::RecognitionFailed
             {
@@ -1261,6 +1262,7 @@ async fn run_stdout_reader(
                     let _ = supervisor_sender.send(SupervisorEvent::Fatal(error));
                     return;
                 }
+                capture_started = true;
                 None
             }
             SidecarControl::CapturePaused { operation_id, .. } => {
@@ -1495,7 +1497,7 @@ fn sidecar_failure(stage: RuntimeStage, code: SidecarFailureCode) -> AdapterErro
         | SidecarFailureCode::Internal => stage == RuntimeStage::VoiceSidecar,
     };
     if expected_stage {
-        AdapterError::new(message)
+        AdapterError::new(message).with_stage(stage)
     } else {
         AdapterError::new("voice sidecar failure stage mismatch")
     }

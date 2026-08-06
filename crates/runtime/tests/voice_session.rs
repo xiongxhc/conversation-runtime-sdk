@@ -372,6 +372,38 @@ async fn shutdown_during_capture_start_cancels_start_and_completes() {
             session_id: SESSION_ID,
         })
     );
+    assert_eq!(
+        timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("shutdown stream did not reach EOF"),
+        None
+    );
+
+    let replacement_id = SessionId::new(2);
+    let mut replacement = runtime.start(policy_for(replacement_id)).await.unwrap();
+    input.release();
+    assert!(matches!(
+        timeout(Duration::from_secs(1), replacement.recv())
+            .await
+            .expect("replacement session did not start"),
+        Some(VoiceSessionEvent::SessionStarted { session_id, .. })
+            if session_id == replacement_id
+    ));
+    runtime.shutdown().await.unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(1), replacement.recv())
+            .await
+            .expect("replacement session did not terminate"),
+        Some(VoiceSessionEvent::SessionEnded {
+            session_id: replacement_id,
+        })
+    );
+    assert_eq!(
+        timeout(Duration::from_secs(1), replacement.recv())
+            .await
+            .expect("replacement stream did not reach EOF"),
+        None
+    );
 }
 
 #[tokio::test]
@@ -709,7 +741,8 @@ async fn stalled_consumer_backpressures_sustained_multi_turn_reliable_events() {
     let mut saw_backpressure = false;
     for segment_id in 1_000..2_000 {
         let input = if segment_id % 2 == 0 {
-            Err(AdapterError::new("voice sidecar recognition failed"))
+            Err(AdapterError::new("voice sidecar recognition failed")
+                .with_stage(RuntimeStage::SpeechRecognizer))
         } else {
             Ok(VoiceInputEvent::Recognition(
                 conversation_model_adapters::RecognitionEvent::Hypothesis(
@@ -1440,8 +1473,12 @@ impl VoiceInput for TestVoiceInput {
 }
 
 fn policy() -> VoiceSessionPolicy {
+    policy_for(SESSION_ID)
+}
+
+fn policy_for(session_id: SessionId) -> VoiceSessionPolicy {
     VoiceSessionPolicy::new(
-        SESSION_ID,
+        session_id,
         PrivacyMode::LocalOnly,
         200,
         600,

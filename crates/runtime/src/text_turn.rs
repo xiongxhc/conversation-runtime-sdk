@@ -11,6 +11,8 @@ use conversation_protocol::{
     GenerationId, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage,
     RuntimeTimingMilestone, TurnId, MAX_CONVERSATION_MESSAGE_BYTES,
 };
+#[cfg(test)]
+use tokio::sync::Notify;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::{JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
@@ -24,6 +26,33 @@ pub struct TextTurnEventStream {
     terminal: Option<oneshot::Receiver<RuntimeEvent>>,
     events_closed: bool,
     task: Option<JoinHandle<()>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TextTurnCompletionPause {
+    reached: Notify,
+    release: Notify,
+}
+
+#[cfg(test)]
+impl TextTurnCompletionPause {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    async fn wait_until_reached(&self) {
+        self.reached.notified().await;
+    }
+
+    fn release(&self) {
+        self.release.notify_one();
+    }
+
+    async fn pause(&self) {
+        self.reached.notify_one();
+        self.release.notified().await;
+    }
 }
 
 impl TextTurnEventStream {
@@ -64,6 +93,8 @@ pub struct TextTurnRuntime {
     language_model: Arc<dyn GenerationLanguageModel>,
     context: ConversationContext,
     state: Arc<Mutex<TextTurnState>>,
+    #[cfg(test)]
+    completion_pause: Option<Arc<TextTurnCompletionPause>>,
 }
 
 #[derive(Default)]
@@ -76,6 +107,7 @@ struct ActiveTextTurn {
     identity: ConversationTurnIdentity,
     external_interruption: CancellationToken,
     work_cancellation: CancellationToken,
+    finalizing: bool,
 }
 
 impl TextTurnRuntime {
@@ -87,7 +119,15 @@ impl TextTurnRuntime {
             language_model,
             context,
             state: Arc::new(Mutex::new(TextTurnState::default())),
+            #[cfg(test)]
+            completion_pause: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_completion_pause(mut self, completion_pause: Arc<TextTurnCompletionPause>) -> Self {
+        self.completion_pause = Some(completion_pause);
+        self
     }
 
     pub async fn start_turn(
@@ -103,20 +143,27 @@ impl TextTurnRuntime {
         let generation_id = identity.generation_id();
         let external_interruption = CancellationToken::new();
         let work_cancellation = CancellationToken::new();
-        {
+        let local_active_error = {
             let mut state = self.state.lock().await;
             if let Some(active) = state.active.as_ref() {
-                return Err(runtime_error(format!(
+                Some(runtime_error(format!(
                     "turn {} generation {} is still active",
                     active.identity.turn_id(),
                     active.identity.generation_id()
-                )));
+                )))
+            } else {
+                state.active = Some(ActiveTextTurn {
+                    identity,
+                    external_interruption: external_interruption.clone(),
+                    work_cancellation: work_cancellation.clone(),
+                    finalizing: false,
+                });
+                None
             }
-            state.active = Some(ActiveTextTurn {
-                identity,
-                external_interruption: external_interruption.clone(),
-                work_cancellation: work_cancellation.clone(),
-            });
+        };
+        if let Some(error) = local_active_error {
+            let _ = self.context.discard_turn(identity, false).await;
+            return Err(error);
         }
 
         let language_input = match LanguageModelInput::with_quality(
@@ -154,9 +201,15 @@ impl TextTurnRuntime {
         };
         let state = Arc::clone(&self.state);
         let context = self.context.clone();
+        #[cfg(test)]
+        let completion_pause = self.completion_pause.clone();
         let task = tokio::spawn(async move {
             let outcome = run_text_turn(task, &event_sender).await;
-            let mut terminal = if external_interruption.is_cancelled() {
+            let completed = matches!(outcome.terminal, RuntimeEvent::TurnCompleted { .. })
+                && claim_completion(&state, identity).await;
+            let mut terminal = if completed {
+                outcome.terminal
+            } else if external_interruption.is_cancelled() {
                 RuntimeEvent::TurnCancelled { turn_id }
             } else {
                 outcome.terminal
@@ -175,16 +228,16 @@ impl TextTurnRuntime {
                 terminal = RuntimeEvent::TurnFailed { turn_id, error };
             }
             if matches!(terminal, RuntimeEvent::TurnCompleted { .. }) {
-                let _ = send_event(
-                    &event_sender,
-                    RuntimeEvent::TextCompleted {
+                #[cfg(test)]
+                if let Some(completion_pause) = completion_pause {
+                    completion_pause.pause().await;
+                }
+                let _ = event_sender
+                    .send(RuntimeEvent::TextCompleted {
                         turn_id,
                         text: outcome.generated_text,
-                    },
-                    &external_interruption,
-                    &work_cancellation,
-                )
-                .await;
+                    })
+                    .await;
             }
             drop(event_sender);
 
@@ -216,6 +269,9 @@ impl TextTurnRuntime {
         let state = self.state.lock().await;
         match state.active.as_ref() {
             Some(active) if active.identity.turn_id() == turn_id => {
+                if active.finalizing {
+                    return Ok(());
+                }
                 active.external_interruption.cancel();
                 active.work_cancellation.cancel();
                 Ok(())
@@ -238,6 +294,24 @@ impl TextTurnRuntime {
         {
             state.active = None;
         }
+    }
+}
+
+async fn claim_completion(
+    state: &Arc<Mutex<TextTurnState>>,
+    identity: ConversationTurnIdentity,
+) -> bool {
+    let mut state = state.lock().await;
+    match state.active.as_mut() {
+        Some(active)
+            if active.identity == identity
+                && !active.finalizing
+                && !active.external_interruption.is_cancelled() =>
+        {
+            active.finalizing = true;
+            true
+        }
+        _ => false,
     }
 }
 
@@ -654,4 +728,54 @@ fn runtime_error(message: impl Into<String>) -> RuntimeError {
         RuntimeStage::Runtime,
         message,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use conversation_model_adapters::MockGenerationLanguageModel;
+    use conversation_protocol::{ConversationMode, PersonaProfile, ResponseControls};
+    use tokio::time::timeout;
+
+    use super::{ConversationContext, RuntimeEvent, TextTurnCompletionPause, TextTurnRuntime};
+    use crate::ConversationQualityController;
+
+    #[tokio::test]
+    async fn interrupt_after_context_commit_still_emits_the_completed_snapshot() {
+        let pause = Arc::new(TextTurnCompletionPause::new());
+        let runtime = TextTurnRuntime::new(
+            ConversationContext::new(ConversationQualityController::new(
+                PersonaProfile::default(),
+                ResponseControls::default(),
+                ConversationMode::DirectAnswer,
+            )),
+            Arc::new(MockGenerationLanguageModel::new(["answer"])),
+        )
+        .with_completion_pause(Arc::clone(&pause));
+        let started = runtime.start_turn("question").await.unwrap();
+        let turn_id = started.identity().turn_id();
+        let mut events = started.into_events();
+
+        timeout(Duration::from_secs(1), pause.wait_until_reached())
+            .await
+            .expect("text completion did not commit context");
+        runtime.interrupt(turn_id).await.unwrap();
+        pause.release();
+
+        let mut observed = Vec::new();
+        while let Some(event) = events.recv().await {
+            observed.push(event);
+        }
+        assert!(observed.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::TextCompleted { turn_id: event_turn_id, text }
+                if *event_turn_id == turn_id && text == "answer"
+        )));
+        assert_eq!(
+            observed.last(),
+            Some(&RuntimeEvent::TurnCompleted { turn_id })
+        );
+    }
 }

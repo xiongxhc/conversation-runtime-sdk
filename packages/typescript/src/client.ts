@@ -43,12 +43,12 @@ export class RuntimeClient {
   private readonly controls = new Map<string, PendingControl>();
   private readonly unexpectedFailureListeners = new Set<(error: Error) => void>();
   private readonly turns = new Map<bigint, TurnState>();
+  private readonly acceptedStartRequests = new Set<string>();
   private failure: Error | undefined;
   private closing = false;
   private closePromise: Promise<void> | undefined;
   private readyReceived = false;
   private requestCounter = 0n;
-  private turnCounter = 0n;
 
   private constructor(private readonly transport: RuntimeTransport) {}
 
@@ -102,33 +102,18 @@ export class RuntimeClient {
     return result.promise;
   }
 
-  startTurn(transcript: string): RuntimeTurn {
-    const turnId = this.turnCounter + 1n;
+  startTurn(transcript: string): Promise<RuntimeTurn> {
     const requestId = this.nextRequestId();
-    validateClientCommand({ type: "start_turn", requestId, turnId, transcript });
-    this.turnCounter = turnId;
-    const state: TurnState = {
-      accepted: new Deferred<void>(),
-      events: new AsyncQueue<RuntimeEvent>(),
-      startRequestId: requestId,
-      turnId,
-    };
-    this.turns.set(turnId, state);
+    validateClientCommand({ type: "start_turn", requestId, transcript });
+    const result = new Deferred<RuntimeTurn>();
     this.controls.set(requestId, {
       kind: "start_turn",
       accepted: false,
-      turnId,
-      fail: (error) => {
-        this.turns.delete(turnId);
-        state.accepted.reject(error);
-        state.events.fail(error);
-      },
+      result,
+      fail: (error) => result.reject(error),
     });
-    this.send({ type: "start_turn", requestId, turnId, transcript });
-    return {
-      turnId,
-      events: acceptedEvents(state),
-    };
+    this.send({ type: "start_turn", requestId, transcript });
+    return result.promise;
   }
 
   interrupt(turnId: bigint): Promise<void> {
@@ -199,7 +184,7 @@ export class RuntimeClient {
       return;
     }
     if (message.type === "command_accepted") {
-      this.accept(message.requestId);
+      this.accept(message.requestId, message.turnId);
       return;
     }
     if (message.type === "command_rejected") {
@@ -239,18 +224,19 @@ export class RuntimeClient {
 
     const turnId = eventTurnId(message.event);
     const state = this.turns.get(turnId);
-    if (!state || !state.accepted.settled) {
+    if (!state) {
       this.fail(new Error("gateway sent an unknown or terminal turn event"));
       return;
     }
     state.events.push(message.event);
     if (isTerminal(message.event)) {
       this.turns.delete(turnId);
+      this.acceptedStartRequests.delete(state.startRequestId);
       state.events.finish();
     }
   }
 
-  private accept(requestId: string): void {
+  private accept(requestId: string, turnId: bigint | undefined): void {
     const control = this.controls.get(requestId);
     if (!control || control.accepted) {
       this.fail(new Error("gateway accepted an unknown command"));
@@ -264,12 +250,14 @@ export class RuntimeClient {
         return;
       case "start_turn": {
         this.controls.delete(requestId);
-        const state = this.turns.get(control.turnId);
-        if (!state) {
-          this.fail(new Error("gateway accepted an unknown turn"));
+        if (turnId === undefined || this.turns.has(turnId)) {
+          control.fail(new Error("gateway accepted a start turn without a new turn identifier"));
           return;
         }
-        state.accepted.resolve();
+        const state: TurnState = { events: new AsyncQueue<RuntimeEvent>(), startRequestId: requestId };
+        this.turns.set(turnId, state);
+        this.acceptedStartRequests.add(requestId);
+        control.result.resolve({ turnId, events: state.events });
         return;
       }
       case "interrupt_turn":
@@ -280,7 +268,7 @@ export class RuntimeClient {
 
   private reject(requestId: string, error: Error): void {
     const control = this.controls.get(requestId);
-    if (control?.accepted || this.hasAcceptedStartRequest(requestId)) {
+    if (control?.accepted || this.acceptedStartRequests.has(requestId)) {
       this.fail(new Error("gateway rejected an accepted command"));
       return;
     }
@@ -306,15 +294,6 @@ export class RuntimeClient {
     }
   }
 
-  private hasAcceptedStartRequest(requestId: string): boolean {
-    for (const state of this.turns.values()) {
-      if (state.accepted.settled && state.startRequestId === requestId) {
-        return true;
-      }
-    }
-    return false;
-  }
-
   private fail(error: Error, closeTransport = true): void {
     if (this.failure) {
       return;
@@ -325,8 +304,8 @@ export class RuntimeClient {
       control.fail(error);
     }
     this.controls.clear();
+    this.acceptedStartRequests.clear();
     for (const state of this.turns.values()) {
-      state.accepted.reject(error);
       state.events.fail(error);
     }
     this.turns.clear();
@@ -356,14 +335,12 @@ type PendingControl =
   | { kind: "status"; accepted: boolean; result: Deferred<RuntimeStatus>; fail(error: Error): void }
   | { kind: "memory_list"; accepted: boolean; result: Deferred<MemoryPage>; fail(error: Error): void }
   | { kind: "memory_inspect"; accepted: boolean; result: Deferred<MemoryInspection>; fail(error: Error): void }
-  | { kind: "start_turn"; accepted: boolean; turnId: bigint; fail(error: Error): void }
+  | { kind: "start_turn"; accepted: boolean; result: Deferred<RuntimeTurn>; fail(error: Error): void }
   | { kind: "interrupt_turn"; accepted: boolean; result: Deferred<void>; fail(error: Error): void };
 
 type TurnState = {
-  accepted: Deferred<void>;
   events: AsyncQueue<RuntimeEvent>;
   startRequestId: string;
-  turnId: bigint;
 };
 
 class Deferred<T> {
@@ -455,13 +432,6 @@ class AsyncQueue<T> implements AsyncIterable<T> {
         waiter.resolve({ value: undefined, done: true });
       }
     }
-  }
-}
-
-async function* acceptedEvents(state: TurnState): AsyncGenerator<RuntimeEvent> {
-  await state.accepted.promise;
-  for await (const event of state.events) {
-    yield event;
   }
 }
 

@@ -190,7 +190,6 @@ test("streams completion through the compiled Rust gateway over framed pipes", {
       await transport.send({
         type: "start_turn",
         requestId: "completion-start",
-        turnId: 1n,
         transcript: "completion fixture",
       });
       const observed = await collectUntilTerminal(messages);
@@ -223,7 +222,6 @@ test("cancels independently through a second compiled Rust gateway process", { t
       await transport.send({
         type: "start_turn",
         requestId: "cancellation-start",
-        turnId: 1n,
         transcript: "cancellation fixture",
       });
 
@@ -459,6 +457,7 @@ function withDeadline<T>(operation: Promise<T>, milliseconds: number, message: s
 class ScriptedTransport implements RuntimeTransport {
   private readonly inbox = new AsyncChannel<unknown>();
   private readonly waiters = new Map<ClientCommand["type"], Array<() => void>>();
+  private turnCounter = 0n;
   readonly messages = this.inbox;
   readonly sent: ClientCommand[] = [];
   closeCount = 0;
@@ -507,6 +506,7 @@ class ScriptedTransport implements RuntimeTransport {
       type: "command_accepted",
       protocol_version: 2,
       request_id: command.requestId,
+      ...(command.type === "start_turn" ? { turn_id: (++this.turnCounter).toString() } : {}),
     });
     if (command.type === "status") {
       this.inbox.push({
@@ -529,23 +529,24 @@ class ScriptedTransport implements RuntimeTransport {
     if (command.type !== "start_turn") {
       return;
     }
+    const turnId = this.turnCounter;
 
     this.inbox.push(runtimeEvent({
       type: "turn_started",
-      turn_id: command.turnId.toString(),
+      turn_id: turnId.toString(),
     }));
     if (this.script === "complete") {
-      const deltas = command.turnId === 1n ? ["你", "好🙂"] : ["مرح", "با"];
+      const deltas = turnId === 1n ? ["你", "好🙂"] : ["مرح", "با"];
       for (const delta of deltas) {
         this.inbox.push(runtimeEvent({
           type: "text_delta",
-          turn_id: command.turnId.toString(),
+          turn_id: turnId.toString(),
           delta,
         }));
       }
       this.inbox.push(runtimeEvent({
         type: "turn_completed",
-        turn_id: command.turnId.toString(),
+        turn_id: turnId.toString(),
       }));
     } else if (this.script === "fail-turn") {
       this.inbox.fail(new Error("provider secret for diagnostic secret"));

@@ -13,7 +13,7 @@ const MAX_MEMORY_CONFIDENCE_DECIMAL = "1000";
 
 export type ClientCommand =
   | { type: "status"; requestId: string }
-  | { type: "start_turn"; requestId: string; turnId: bigint; transcript: string }
+  | { type: "start_turn"; requestId: string; transcript: string }
   | { type: "interrupt_turn"; requestId: string; turnId: bigint }
   | { type: "memory_list"; requestId: string; cursor: MemoryCursor | null }
   | { type: "memory_inspect"; requestId: string; memoryId: bigint };
@@ -161,7 +161,7 @@ export type RuntimeEvent =
 
 export type GatewayMessage =
   | { type: "ready"; status: RuntimeStatus }
-  | { type: "command_accepted"; requestId: string }
+  | { type: "command_accepted"; requestId: string; turnId?: bigint }
   | { type: "command_rejected"; requestId: string; error: RuntimeFailure }
   | { type: "status"; requestId: string; status: RuntimeStatus }
   | { type: "memory_list"; requestId: string; records: MemorySummary[]; nextCursor: MemoryCursor | null }
@@ -185,12 +185,11 @@ export function parseClientCommand(value: unknown): ClientCommand {
       validateProtocolVersion(object);
       return { type, requestId: requireRequestId(object) };
     case "start_turn":
-      requireExactKeys(object, ["protocol_version", "type", "request_id", "turn_id", "transcript"]);
+      requireExactKeys(object, ["protocol_version", "type", "request_id", "transcript"]);
       validateProtocolVersion(object);
       return {
         type,
         requestId: requireRequestId(object),
-        turnId: parseIdentifier(object.turn_id),
         transcript: requireTranscript(object, "transcript"),
       };
     case "interrupt_turn":
@@ -219,9 +218,18 @@ export function parseGatewayMessage(value: unknown): GatewayMessage {
       validateProtocolVersion(object);
       return { type, status: parseRuntimeStatus(object.status) };
     case "command_accepted":
-      requireExactKeys(object, ["protocol_version", "type", "request_id"]);
+      requireExactKeys(
+        object,
+        "turn_id" in object
+          ? ["protocol_version", "type", "request_id", "turn_id"]
+          : ["protocol_version", "type", "request_id"],
+      );
       validateProtocolVersion(object);
-      return { type, requestId: requireRequestId(object) };
+      return {
+        type,
+        requestId: requireRequestId(object),
+        ...("turn_id" in object ? { turnId: parseIdentifier(object.turn_id) } : {}),
+      };
     case "command_rejected":
       requireExactKeys(object, ["protocol_version", "type", "request_id", "error"]);
       validateProtocolVersion(object);
@@ -262,7 +270,6 @@ export function encodeClientCommand(command: ClientCommand): Uint8Array {
           protocol_version: CLIENT_PROTOCOL_VERSION,
           type: command.type,
           request_id: command.requestId,
-          turn_id: command.turnId.toString(),
           transcript: command.transcript,
         };
       case "interrupt_turn":
@@ -302,8 +309,7 @@ export function validateClientCommand(command: ClientCommand): void {
     validateTranscript(command.transcript);
   }
   if (
-    (command.type === "start_turn" || command.type === "interrupt_turn")
-    && (command.turnId < 1n || command.turnId > MAX_U64)
+    command.type === "interrupt_turn" && (command.turnId < 1n || command.turnId > MAX_U64)
   ) {
     throw new ProtocolError("turn identifier is outside u64 range");
   }

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { setImmediate } from "node:timers/promises";
 
-import { CommandRejectedError, RuntimeClient, type RuntimeTransport } from "../src/client.js";
+import { CommandRejectedError, RuntimeClient, type RuntimeTransport, type RuntimeTurn } from "../src/client.js";
 import type { ClientCommand, RuntimeEvent, RuntimeFailure, RuntimeStatus } from "../src/protocol.js";
 
 const status: RuntimeStatus = {
@@ -33,18 +33,25 @@ test("connects, correlates status, and streams an accepted turn", async () => {
   });
   assert.deepEqual(await statusResult, status);
 
-  const turn = client.startTurn("hello");
+  const starting = client.startTurn("hello");
   const start = command(transport, "start_turn");
-  assert.equal(start.turnId, turn.turnId);
-  transport.push(accepted(start.requestId));
+  assert.equal("turnId" in start, false);
+  transport.push({
+    type: "command_accepted",
+    protocol_version: 2,
+    request_id: start.requestId,
+    turn_id: "41",
+  });
+  const turn = await starting;
+  assert.equal(turn.turnId, 41n);
   transport.push(event("turn_started", turn.turnId));
   transport.push(event("text_delta", turn.turnId, "hello"));
   transport.push(event("turn_completed", turn.turnId));
 
   assert.deepEqual(await collect(turn.events), [
-    { type: "turn_started", turnId: 1n },
-    { type: "text_delta", turnId: 1n, delta: "hello" },
-    { type: "turn_completed", turnId: 1n },
+    { type: "turn_started", turnId: 41n },
+    { type: "text_delta", turnId: 41n, delta: "hello" },
+    { type: "turn_completed", turnId: 41n },
   ]);
   await client.close();
 });
@@ -52,9 +59,7 @@ test("connects, correlates status, and streams an accepted turn", async () => {
 test("resolves interruption after acceptance and retains the turn until terminal", async () => {
   const client = await connectedClient();
   const transport = client.transport;
-  const turn = client.client.startTurn("hello");
-  const start = command(transport, "start_turn");
-  transport.push(accepted(start.requestId));
+  const turn = await acceptTurn(client.client.startTurn("hello"), transport);
   transport.push(event("turn_started", turn.turnId));
 
   const interrupting = client.client.interrupt(turn.turnId);
@@ -72,9 +77,7 @@ test("resolves interruption after acceptance and retains the turn until terminal
 
 test("rejects every pending operation after a duplicate terminal event", async () => {
   const client = await connectedClient();
-  const turn = client.client.startTurn("hello");
-  const start = command(client.transport, "start_turn");
-  client.transport.push(accepted(start.requestId));
+  const turn = await acceptTurn(client.client.startTurn("hello"), client.transport);
   client.transport.push(event("turn_completed", turn.turnId));
   await collect(turn.events);
 
@@ -86,9 +89,7 @@ test("rejects every pending operation after a duplicate terminal event", async (
 
 test("rejects every pending operation after text arrives after terminal", async () => {
   const client = await connectedClient();
-  const turn = client.client.startTurn("hello");
-  const start = command(client.transport, "start_turn");
-  client.transport.push(accepted(start.requestId));
+  const turn = await acceptTurn(client.client.startTurn("hello"), client.transport);
   client.transport.push(event("turn_completed", turn.turnId));
   await collect(turn.events);
 
@@ -163,12 +164,11 @@ test("isolates throwing passive failure subscribers and closes the transport", a
 
 test("discards buffered turn events when transport failure follows", async () => {
   const connected = await connectedClient();
-  const turn = connected.client.startTurn("hello");
-  const start = command(connected.transport, "start_turn");
-  connected.transport.push(accepted(start.requestId));
+  const turn = await acceptTurn(connected.client.startTurn("hello"), connected.transport);
   connected.transport.push(event("turn_started", turn.turnId));
   await setImmediate();
   connected.transport.fail(new Error("transport disconnected"));
+  await setImmediate();
 
   await assert.rejects(turn.events[Symbol.asyncIterator]().next(), /transport disconnected/);
   await connected.client.close();
@@ -196,9 +196,10 @@ test("rejects an accepted command rejection as a correlation violation", async (
 
 test("rejects an accepted start rejection as a correlation violation", async () => {
   const connected = await connectedClient();
-  const turn = connected.client.startTurn("hello");
+  const starting = connected.client.startTurn("hello");
   const startCommand = command(connected.transport, "start_turn");
-  connected.transport.push(accepted(startCommand.requestId));
+  connected.transport.push(accepted(startCommand.requestId, 1n));
+  await starting;
   connected.transport.push({
     type: "command_rejected",
     protocol_version: 2,
@@ -206,7 +207,8 @@ test("rejects an accepted start rejection as a correlation violation", async () 
     error: { code: "invalid_state", kind: "invalid_state", stage: "runtime", message: "rejected" },
   });
 
-  await assert.rejects(turn.events[Symbol.asyncIterator]().next(), /rejected an accepted command/);
+  const pendingStatus = connected.client.status();
+  await assert.rejects(pendingStatus, /rejected an accepted command/);
   await connected.client.close();
 });
 
@@ -233,8 +235,7 @@ test("converts synchronous transport send failures into rejected work", async ()
 
   const turnTransport = new ThrowingTransport();
   const turnClient = await connectThrowingTransport(turnTransport);
-  const turn = turnClient.startTurn("hello");
-  await assert.rejects(turn.events[Symbol.asyncIterator]().next(), /synchronous send failure/);
+  await assert.rejects(turnClient.startTurn("hello"), /synchronous send failure/);
   await turnClient.close();
 });
 
@@ -499,8 +500,23 @@ function ready(): unknown {
   return { type: "ready", protocol_version: 2, status: wireStatus() };
 }
 
-function accepted(requestId: string): unknown {
-  return { type: "command_accepted", protocol_version: 2, request_id: requestId };
+async function acceptTurn(
+  starting: Promise<RuntimeTurn>,
+  transport: InMemoryTransport,
+  turnId = 1n,
+): Promise<RuntimeTurn> {
+  const start = command(transport, "start_turn");
+  transport.push(accepted(start.requestId, turnId));
+  return starting;
+}
+
+function accepted(requestId: string, turnId?: bigint): unknown {
+  return {
+    type: "command_accepted",
+    protocol_version: 2,
+    request_id: requestId,
+    ...(turnId === undefined ? {} : { turn_id: turnId.toString() }),
+  };
 }
 
 function acceptedV2(requestId: string): unknown {

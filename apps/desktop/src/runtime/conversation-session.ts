@@ -72,9 +72,13 @@ export class ConversationSession {
     return () => this.listeners.delete(listener);
   }
 
-  send(transcript: string): bigint {
+  async send(transcript: string): Promise<bigint> {
     this.ensureReady();
-    const turn = this.client.startTurn(transcript);
+    const turn = await this.client.startTurn(transcript).catch((error: unknown) => {
+      const failure = asError(error);
+      this.fail(failure);
+      throw failure;
+    });
     const state: ConversationTurnState = {
       turnId: turn.turnId,
       transcript,

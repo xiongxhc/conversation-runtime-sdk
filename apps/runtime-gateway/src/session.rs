@@ -242,7 +242,6 @@ impl GatewaySession {
             }
             ClientCommand::StartTurn {
                 request_id,
-                turn_id: _,
                 transcript,
             } => {
                 if active.is_some() {
@@ -266,11 +265,9 @@ impl GatewaySession {
                     }
                 };
 
-                *active = Some(ActiveForwarder::pending(
-                    started.identity().turn_id(),
-                    started.into_events(),
-                ));
-                send_urgent(urgent, accepted_message(&request_id))
+                let turn_id = started.identity().turn_id();
+                *active = Some(ActiveForwarder::pending(turn_id, started.into_events()));
+                send_urgent(urgent, accepted_turn_message(&request_id, turn_id))
                     .map_err(CommandFailure::response)?;
                 active
                     .as_mut()
@@ -679,6 +676,14 @@ fn send_rejection(
 fn accepted_message(request_id: &str) -> GatewayMessage {
     GatewayMessage::CommandAccepted {
         request_id: request_id.to_owned(),
+        turn_id: None,
+    }
+}
+
+fn accepted_turn_message(request_id: &str, turn_id: TurnId) -> GatewayMessage {
+    GatewayMessage::CommandAccepted {
+        request_id: request_id.to_owned(),
+        turn_id: Some(turn_id),
     }
 }
 
@@ -984,7 +989,7 @@ mod tests {
 
         gateway
             .write(
-                r#"{"protocol_version":2,"type":"start_turn","request_id":"start-memory-active","turn_id":"1","transcript":"fixture active memory rejection"}"#,
+                r#"{"protocol_version":2,"type":"start_turn","request_id":"start-memory-active","transcript":"fixture active memory rejection"}"#,
             )
             .await;
         assert_accepted_message(&gateway.read_message().await, "start-memory-active");
@@ -1117,7 +1122,7 @@ mod tests {
 
         write_command(
             &mut input,
-            r#"{"protocol_version":2,"type":"start_turn","request_id":"start-1","turn_id":"1","transcript":"fixture question"}"#,
+            r#"{"protocol_version":2,"type":"start_turn","request_id":"start-1","transcript":"fixture question"}"#,
         )
         .await;
         timeout(TEST_TIMEOUT, writer_state.blocked.wait())
@@ -1208,7 +1213,7 @@ mod tests {
         assert_eq!(queued_messages(&event_monitor), 0);
         write_command(
             &mut input,
-            r#"{"protocol_version":2,"type":"start_turn","request_id":"start-tie","turn_id":"1","transcript":"fixture start tie"}"#,
+            r#"{"protocol_version":2,"type":"start_turn","request_id":"start-tie","transcript":"fixture start tie"}"#,
         )
         .await;
         wait_for_queued_start_acceptance_and_turn_started(&urgent_monitor, &event_monitor).await;
@@ -1295,7 +1300,7 @@ mod tests {
 
         write_command(
             &mut input,
-            r#"{"protocol_version":2,"type":"start_turn","request_id":"start-writer-failure","turn_id":"1","transcript":"fixture writer failure"}"#,
+            r#"{"protocol_version":2,"type":"start_turn","request_id":"start-writer-failure","transcript":"fixture writer failure"}"#,
         )
         .await;
         timeout(TEST_TIMEOUT, language.request_started.wait())
@@ -1338,7 +1343,7 @@ mod tests {
 
         write_command(
             &mut input,
-            r#"{"protocol_version":2,"type":"start_turn","request_id":"start-saturation","turn_id":"1","transcript":"fixture saturation"}"#,
+            r#"{"protocol_version":2,"type":"start_turn","request_id":"start-saturation","transcript":"fixture saturation"}"#,
         )
         .await;
         timeout(TEST_TIMEOUT, writer_state.blocked.wait())
@@ -1390,6 +1395,7 @@ mod tests {
         normal_sender
             .send(GatewayMessage::CommandAccepted {
                 request_id: "status-0".to_owned(),
+                turn_id: None,
             })
             .await
             .unwrap();
@@ -1406,6 +1412,7 @@ mod tests {
                 normal_sender
                     .send(GatewayMessage::CommandAccepted {
                         request_id: format!("status-{index}"),
+                        turn_id: None,
                     })
                     .await
                     .unwrap();
@@ -1440,7 +1447,7 @@ mod tests {
 
         write_command(
             &mut input,
-            r#"{"protocol_version":2,"type":"start_turn","request_id":"start-stale","turn_id":"1","transcript":"fixture completed while output blocked"}"#,
+            r#"{"protocol_version":2,"type":"start_turn","request_id":"start-stale","transcript":"fixture completed while output blocked"}"#,
         )
         .await;
         timeout(TEST_TIMEOUT, writer_state.blocked.wait())

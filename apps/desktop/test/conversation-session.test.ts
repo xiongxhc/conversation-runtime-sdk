@@ -71,8 +71,8 @@ describe("ConversationSession", () => {
     const transport = connectedTransport();
     const session = await ConversationSession.connect(transport);
 
-    session.send("Hello");
-    expect(() => session.send("Another turn")).toThrow("already active");
+    await session.send("Hello");
+    await expect(session.send("Another turn")).rejects.toThrow("already active");
 
     transport.turnEvent({ type: "text_delta", turn_id: "1", delta: "Hello " });
     transport.turnEvent({ type: "text_delta", turn_id: "1", delta: "🌍" });
@@ -84,7 +84,7 @@ describe("ConversationSession", () => {
   it("interrupts the active turn and returns to ready after cancellation", async () => {
     const transport = connectedTransport();
     const session = await ConversationSession.connect(transport);
-    session.send("Hello");
+    await session.send("Hello");
 
     await session.interrupt();
     expect(transport.sent.at(-1)).toEqual({ type: "interrupt_turn", requestId: "request-3", turnId: 1n });
@@ -97,7 +97,7 @@ describe("ConversationSession", () => {
   it("records terminal completion", async () => {
     const transport = connectedTransport();
     const session = await ConversationSession.connect(transport);
-    session.send("Hello");
+    await session.send("Hello");
 
     transport.turnEvent({ type: "text_delta", turn_id: "1", delta: "Done" });
     transport.turnEvent({ type: "turn_completed", turn_id: "1" });
@@ -118,7 +118,7 @@ describe("ConversationSession", () => {
       { type: "memory_inspect", requestId: "request-3", memoryId: 7n },
     ]);
 
-    session.send("active turn");
+    await session.send("active turn");
     await expect(session.listMemories()).rejects.toThrow(
       "finish or stop the active response",
     );
@@ -130,7 +130,7 @@ describe("ConversationSession", () => {
   it("surfaces a gateway failure", async () => {
     const transport = connectedTransport();
     const session = await ConversationSession.connect(transport);
-    session.send("Hello");
+    await session.send("Hello");
 
     transport.emit({
       protocol_version: 2,
@@ -206,12 +206,22 @@ class InMemoryTransport implements RuntimeTransport {
   readonly messages = new AsyncQueue<unknown>();
   readonly sent: ClientCommand[] = [];
   closeCalls = 0;
+  private turnCounter = 0n;
 
   constructor(private readonly status: Record<string, unknown>) {}
 
   async send(command: ClientCommand): Promise<void> {
     this.sent.push(command);
-    this.emit({ protocol_version: 2, type: "command_accepted", request_id: command.requestId });
+    this.emit(
+      command.type === "start_turn"
+        ? {
+          protocol_version: 2,
+          type: "command_accepted",
+          request_id: command.requestId,
+          turn_id: (++this.turnCounter).toString(),
+        }
+        : { protocol_version: 2, type: "command_accepted", request_id: command.requestId },
+    );
     if (command.type === "status") {
       this.emit({ protocol_version: 2, type: "status", request_id: command.requestId, status: this.status });
     } else if (command.type === "memory_list") {

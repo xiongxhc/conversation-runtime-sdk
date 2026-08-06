@@ -92,6 +92,24 @@ async fn sequence_overflow_returns_a_typed_error_without_reserving_a_turn() {
     assert_eq!(context.active_turn().await, None);
 }
 
+#[tokio::test]
+async fn failed_completion_releases_the_context_for_a_new_turn() {
+    let context = ConversationContext::new(quality());
+    let first = context
+        .begin_turn(ConversationTurnSource::Text, "first")
+        .await
+        .unwrap();
+
+    assert!(context.complete_turn(first.identity(), "").await.is_err());
+    assert_eq!(context.active_turn().await, None);
+
+    let second = context
+        .begin_turn(ConversationTurnSource::Text, "second")
+        .await
+        .unwrap();
+    assert_eq!(second.identity().turn_id(), TurnId::new(2));
+}
+
 fn quality() -> ConversationQualityController {
     ConversationQualityController::new(
         PersonaProfile::default(),

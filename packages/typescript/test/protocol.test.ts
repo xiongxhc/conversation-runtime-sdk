@@ -35,7 +35,7 @@ test("parses every shared v2 command fixture with bigint identifiers", async () 
   const parsed = commands.map(parseClientCommand);
 
   assert.equal(parsed[1]?.type, "start_turn");
-  assert.equal(parsed[1]?.turnId, 1n);
+  assert.deepEqual(parsed[1], { type: "start_turn", requestId: "req-start-1", transcript: "hello" });
   assert.equal(parsed[2]?.type, "interrupt_turn");
   assert.equal(parsed[2]?.turnId, 1n);
   assert.deepEqual(parsed[3], { type: "memory_list", requestId: "req-list-first", cursor: null });
@@ -112,17 +112,15 @@ test("rejects every shared invalid v2 command and gateway fixture", async () => 
 });
 
 test("rejects noncanonical and numeric wire identifiers", () => {
-  for (const turnId of [1, "0", "01", "+1", " 1", "1 ", "-1", "18446744073709551616"]) {
-    assert.throws(() =>
-      parseClientCommand({
-        protocol_version: 2,
-        type: "start_turn",
-        request_id: "request-1",
-        turn_id: turnId,
-        transcript: "hello",
-      }),
-    );
-  }
+  assert.throws(() =>
+    parseClientCommand({
+      protocol_version: 2,
+      type: "start_turn",
+      request_id: "request-1",
+      turn_id: "1",
+      transcript: "hello",
+    }),
+  );
 });
 
 test("rejects overlong identifiers lexically before bigint conversion", () => {
@@ -370,7 +368,6 @@ test("enforces the 16 KiB UTF-8 transcript boundary for parsed and encoded comma
     protocol_version: 2,
     type: "start_turn",
     request_id: "request-1",
-    turn_id: "1",
     transcript: boundary,
   };
 
@@ -382,10 +379,10 @@ test("enforces the 16 KiB UTF-8 transcript boundary for parsed and encoded comma
   assert.equal(parsed.transcript, boundary);
   assert.throws(() => parseClientCommand({ ...command, transcript: oversized }), /16 KiB/);
   assert.doesNotThrow(() =>
-    encodeClientCommand({ type: "start_turn", requestId: "request-1", turnId: 1n, transcript: boundary }),
+    encodeClientCommand({ type: "start_turn", requestId: "request-1", transcript: boundary }),
   );
   assert.throws(
-    () => encodeClientCommand({ type: "start_turn", requestId: "request-1", turnId: 1n, transcript: oversized }),
+    () => encodeClientCommand({ type: "start_turn", requestId: "request-1", transcript: oversized }),
     /16 KiB/,
   );
 });

@@ -45,7 +45,7 @@ describe("TauriGatewayTransport", () => {
     const native = createFakeNativeBridge();
     const transport = await TauriGatewayTransport.start(paths, native);
 
-    await transport.send({ type: "start_turn", requestId: "request-1", turnId: 7n, transcript: "Hello" });
+    await transport.send({ type: "start_turn", requestId: "request-1", transcript: "Hello" });
 
     expect(native.invocations).toEqual([
       {
@@ -59,7 +59,6 @@ describe("TauriGatewayTransport", () => {
             protocol_version: 2,
             type: "start_turn",
             request_id: "request-1",
-            turn_id: "7",
             transcript: "Hello",
           }),
         },

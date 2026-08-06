@@ -113,7 +113,7 @@ export async function runChat(
         continue;
       }
 
-      const turn = client.startTurn(next.value);
+      const turn = await client.startTurn(next.value);
       active = { turn, interruptRequested: false };
       io.output.write("assistant> ");
       const terminal = await renderTurn(turn, io.output);

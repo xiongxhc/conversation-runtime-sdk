@@ -251,12 +251,12 @@ impl ConversationContext {
                 }
             }
             Err(error) => {
-                if let Some(active) = lifecycle
+                if lifecycle
                     .active
-                    .as_mut()
-                    .filter(|active| active.identity == identity)
+                    .as_ref()
+                    .is_some_and(|active| active.identity == identity)
                 {
-                    active.finalizing = false;
+                    lifecycle.active = None;
                 }
                 Err(error)
             }

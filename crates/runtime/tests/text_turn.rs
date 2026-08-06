@@ -243,6 +243,32 @@ async fn wrong_interruption_turn_is_rejected_without_cancelling_the_turn() {
 }
 
 #[tokio::test]
+async fn local_active_rejection_discards_a_new_context_reservation() {
+    let context = context();
+    let runtime = TextTurnRuntime::new(
+        context.clone(),
+        Arc::new(ReusableLanguage::new(FirstBehavior::WaitForCancellation)),
+    );
+    let first = runtime.start_turn("first").await.unwrap();
+    let first_identity = first.identity();
+    let mut first_events = first.into_events();
+    receive_through_first_delta(&mut first_events).await;
+
+    context.discard_turn(first_identity, false).await.unwrap();
+
+    let error = runtime
+        .start_turn("second")
+        .await
+        .err()
+        .expect("runtime-local active state should reject a second turn");
+    assert_eq!(error.kind(), RuntimeErrorKind::InvalidState);
+    assert_eq!(context.active_turn().await, None);
+
+    runtime.interrupt(first_identity.turn_id()).await.unwrap();
+    let _ = drain_with_timeout(&mut first_events).await;
+}
+
+#[tokio::test]
 async fn text_runtime_returns_gateway_owned_identifiers() {
     let runtime = runtime(Arc::new(MockGenerationLanguageModel::new(["answer"])));
 

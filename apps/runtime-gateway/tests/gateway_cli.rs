@@ -40,9 +40,11 @@ async fn persistent_session_reports_local_status_and_preserves_completed_history
     assert_local_status(&status, false);
 
     gateway
-        .write_message(&start_turn("start-1", "1", "fixture-first-transcript"))
+        .write_message(&start_turn("start-1", "fixture-first-transcript"))
         .await;
-    assert_accepted(&gateway.read_message().await, "start-1");
+    let start_accepted = gateway.read_message().await;
+    assert_accepted(&start_accepted, "start-1");
+    assert!(start_accepted.raw.contains(r#""turn_id":"1""#));
     let first = gateway.read_turn("1").await;
     assert_eq!(first.first().unwrap().event_type(), Some("turn_started"));
     assert_eq!(terminal_count(&first), 1);
@@ -51,7 +53,7 @@ async fn persistent_session_reports_local_status_and_preserves_completed_history
     assert_eq!(history_count(&first), 0);
 
     gateway
-        .write_message(&start_turn("start-2", "2", "fixture-second-transcript"))
+        .write_message(&start_turn("start-2", "fixture-second-transcript"))
         .await;
     assert_accepted(&gateway.read_message().await, "start-2");
     let second = gateway.read_turn("2").await;
@@ -159,7 +161,6 @@ async fn compiled_gateway_rejects_active_memory_before_interrupt_and_reaps() {
     gateway
         .write_message(&start_turn(
             "start-active-memory",
-            "1",
             "compiled active memory transcript",
         ))
         .await;
@@ -235,7 +236,6 @@ async fn interrupt_is_accepted_before_one_cancelled_terminal() {
     gateway
         .write_message(&start_turn(
             "start-interrupt",
-            "1",
             "fixture-interrupt-transcript",
         ))
         .await;
@@ -331,7 +331,7 @@ async fn stdin_eof_cancels_and_reaps_active_generation() {
     assert_eq!(gateway.read_message().await.message_type(), "ready");
 
     gateway
-        .write_message(&start_turn("start-eof", "1", "fixture-eof-transcript"))
+        .write_message(&start_turn("start-eof", "fixture-eof-transcript"))
         .await;
     assert_accepted(&gateway.read_message().await, "start-eof");
     gateway.read_until_text_delta("1").await;
@@ -627,9 +627,9 @@ maximum_bytes = 4096
     config
 }
 
-fn start_turn(request_id: &str, turn_id: &str, transcript: &str) -> String {
+fn start_turn(request_id: &str, transcript: &str) -> String {
     format!(
-        r#"{{"protocol_version":2,"type":"start_turn","request_id":"{request_id}","turn_id":"{turn_id}","transcript":"{transcript}"}}"#
+        r#"{{"protocol_version":2,"type":"start_turn","request_id":"{request_id}","transcript":"{transcript}"}}"#
     )
 }
 

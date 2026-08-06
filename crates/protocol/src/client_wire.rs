@@ -22,7 +22,6 @@ pub enum ClientCommand {
     },
     StartTurn {
         request_id: String,
-        turn_id: TurnId,
         transcript: String,
     },
     InterruptTurn {
@@ -140,6 +139,7 @@ pub enum GatewayMessage {
     },
     CommandAccepted {
         request_id: String,
+        turn_id: Option<TurnId>,
     },
     CommandRejected {
         request_id: String,
@@ -337,7 +337,6 @@ pub fn decode_client_command(payload: &[u8]) -> Result<ClientCommand, ClientWire
         WireClientCommand::StartTurn {
             protocol_version,
             request_id,
-            turn_id,
             transcript,
         } => {
             validate_protocol_version(protocol_version)?;
@@ -345,7 +344,6 @@ pub fn decode_client_command(payload: &[u8]) -> Result<ClientCommand, ClientWire
             validate_transcript(&transcript)?;
             Ok(ClientCommand::StartTurn {
                 request_id,
-                turn_id: TurnId::new(turn_id.0),
                 transcript,
             })
         }
@@ -410,7 +408,6 @@ enum WireClientCommand {
     StartTurn {
         protocol_version: u64,
         request_id: String,
-        turn_id: DecimalIdentifier,
         transcript: String,
     },
     InterruptTurn {
@@ -636,6 +633,8 @@ enum GatewayMessageEnvelope<'a> {
     CommandAccepted {
         protocol_version: u64,
         request_id: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
     },
     CommandRejected {
         protocol_version: u64,
@@ -675,9 +674,13 @@ impl<'a> From<&'a GatewayMessage> for GatewayMessageEnvelope<'a> {
                 protocol_version: CLIENT_PROTOCOL_VERSION,
                 status,
             },
-            GatewayMessage::CommandAccepted { request_id } => Self::CommandAccepted {
+            GatewayMessage::CommandAccepted {
+                request_id,
+                turn_id,
+            } => Self::CommandAccepted {
                 protocol_version: CLIENT_PROTOCOL_VERSION,
                 request_id,
+                turn_id: turn_id.map(|turn_id| turn_id.get().to_string()),
             },
             GatewayMessage::CommandRejected { request_id, error } => Self::CommandRejected {
                 protocol_version: CLIENT_PROTOCOL_VERSION,
@@ -747,7 +750,13 @@ fn validate_request_id(request_id: &str) -> Result<(), ClientWireError> {
 
 fn validate_gateway_message(message: &GatewayMessage) -> Result<(), ClientWireError> {
     match message {
-        GatewayMessage::CommandAccepted { request_id } => validate_request_id(request_id),
+        GatewayMessage::CommandAccepted {
+            request_id,
+            turn_id,
+        } => {
+            validate_request_id(request_id)?;
+            turn_id.map_or(Ok(()), validate_turn_id)
+        }
         GatewayMessage::Status { request_id, status } => {
             validate_request_id(request_id)?;
             validate_runtime_status(status)

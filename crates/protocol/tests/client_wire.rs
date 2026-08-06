@@ -120,15 +120,29 @@ fn approval(
 }
 
 #[test]
-fn identifiers_round_trip_as_decimal_strings() {
+fn start_turn_commands_do_not_accept_client_selected_identifiers() {
     let command = decode_client_command(
-        br#"{"protocol_version":2,"type":"start_turn","request_id":"req-1","turn_id":"18446744073709551615","transcript":"hello"}"#,
+        br#"{"protocol_version":2,"type":"start_turn","request_id":"req-1","transcript":"hello"}"#,
     )
     .unwrap();
 
-    assert!(
-        matches!(command, ClientCommand::StartTurn { turn_id, .. } if turn_id.get() == u64::MAX)
-    );
+    assert!(matches!(command, ClientCommand::StartTurn { .. }));
+    assert!(decode_client_command(
+        br#"{"protocol_version":2,"type":"start_turn","request_id":"req-1","turn_id":"1","transcript":"hello"}"#,
+    )
+    .is_err());
+}
+
+#[test]
+fn accepted_start_turns_carry_the_gateway_allocated_identifier() {
+    let value = gateway_value(&GatewayMessage::CommandAccepted {
+        request_id: "req-1".to_owned(),
+        turn_id: Some(TurnId::new(9)),
+    });
+
+    assert_eq!(value["type"], "command_accepted");
+    assert_eq!(value["request_id"], "req-1");
+    assert_eq!(value["turn_id"], "9");
 }
 
 #[test]
@@ -204,12 +218,12 @@ fn commands_reject_invalid_request_ids_and_transcripts() {
     )
     .is_err());
     assert!(decode_client_command(
-        br#"{"protocol_version":2,"type":"start_turn","request_id":"req-1","turn_id":"1","transcript":""}"#
+        br#"{"protocol_version":2,"type":"start_turn","request_id":"req-1","transcript":""}"#
     )
     .is_err());
     assert!(decode_client_command(
         format!(
-            r#"{{"protocol_version":2,"type":"start_turn","request_id":"req-1","turn_id":"1","transcript":"{}"}}"#,
+            r#"{{"protocol_version":2,"type":"start_turn","request_id":"req-1","transcript":"{}"}}"#,
             "x".repeat(16 * 1024 + 1)
         )
         .as_bytes()
@@ -487,6 +501,7 @@ fn outgoing_response_messages_reject_invalid_request_ids() {
         for message in [
             GatewayMessage::CommandAccepted {
                 request_id: request_id.clone(),
+                turn_id: None,
             },
             GatewayMessage::CommandRejected {
                 request_id: request_id.clone(),

@@ -220,7 +220,7 @@ export function Workspace({
     const transcript = message.trim();
     if (!transcript || sessionState.phase !== "ready") return;
     setOperationError(undefined);
-    session.send(transcript);
+    void Promise.resolve(session.send(transcript)).catch(() => undefined);
     setMessage("");
   };
 

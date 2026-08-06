@@ -4,14 +4,12 @@ use std::future::{pending, Future};
 use std::sync::Arc;
 use std::time::Duration;
 
-use conversation_memory::MemoryContextProvider;
 use conversation_model_adapters::{
-    AdapterError, ContinuousAudioOutput, GenerationLanguageModel, PlaybackReceipt,
-    RecognitionEvent, StreamingSpeechSynthesizer, VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
+    AdapterError, GenerationLanguageModel, PlaybackReceipt, RecognitionEvent,
+    StreamingSpeechSynthesizer, VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
 };
 use conversation_protocol::{
-    ConversationMode, ExecutionLocation, GenerationId, PersonaProfile, PlaybackState,
-    RecoveryDisposition, ResponseControls, RuntimeError, RuntimeErrorKind, RuntimeEvent,
+    GenerationId, PlaybackState, RecoveryDisposition, RuntimeError, RuntimeErrorKind, RuntimeEvent,
     RuntimeStage, RuntimeTimingMilestone, SessionId, TurnId, VoiceActivity, VoiceSessionEvent,
     VoiceSessionPolicy, VoiceTimingMilestone,
 };
@@ -20,8 +18,8 @@ use tokio::task::{JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    validate_voice_policy, ConversationQualityController, SessionClock, StreamingTurnEventStream,
-    StreamingTurnRuntime, TurnFinalizationDeadline, TurnFinalizer,
+    validate_voice_policy, ConversationContext, ConversationTurnSource, SessionClock,
+    StreamingTurnEventStream, StreamingTurnRuntime, TurnFinalizationDeadline, TurnFinalizer,
 };
 
 const SESSION_EVENT_BUFFER_SIZE: usize = 32;
@@ -36,8 +34,6 @@ pub struct VoiceSessionAdapters {
     voice_io: Arc<dyn VoiceIoFactory>,
     language_model: Arc<dyn GenerationLanguageModel>,
     speech_synthesizer: Arc<dyn StreamingSpeechSynthesizer>,
-    quality_controller: ConversationQualityController,
-    memory_provider: Option<(Arc<dyn MemoryContextProvider>, ExecutionLocation)>,
 }
 
 impl VoiceSessionAdapters {
@@ -50,44 +46,13 @@ impl VoiceSessionAdapters {
             voice_io,
             language_model,
             speech_synthesizer,
-            quality_controller: ConversationQualityController::new(
-                PersonaProfile::default(),
-                ResponseControls::default(),
-                ConversationMode::DirectAnswer,
-            ),
-            memory_provider: None,
         }
-    }
-
-    pub fn with_quality_controller(
-        mut self,
-        quality_controller: ConversationQualityController,
-    ) -> Self {
-        self.quality_controller = quality_controller;
-        self
-    }
-
-    pub fn with_memory_provider(
-        mut self,
-        provider: Arc<dyn MemoryContextProvider>,
-        language_execution: ExecutionLocation,
-    ) -> Result<Self, RuntimeError> {
-        if provider.execution_location() != ExecutionLocation::Local
-            || language_execution != ExecutionLocation::Local
-        {
-            return Err(RuntimeError::new(
-                RuntimeErrorKind::Configuration,
-                RuntimeStage::Memory,
-                "memory context requires local memory and language execution",
-            ));
-        }
-        self.memory_provider = Some((provider, language_execution));
-        Ok(self)
     }
 }
 
 #[derive(Clone)]
 pub struct VoiceSessionRuntime {
+    context: ConversationContext,
     adapters: VoiceSessionAdapters,
     active: Arc<Mutex<Option<ActiveSession>>>,
 }
@@ -99,8 +64,9 @@ struct ActiveSession {
 }
 
 impl VoiceSessionRuntime {
-    pub fn new(adapters: VoiceSessionAdapters) -> Self {
+    pub fn new(context: ConversationContext, adapters: VoiceSessionAdapters) -> Self {
         Self {
+            context,
             adapters,
             active: Arc::new(Mutex::new(None)),
         }
@@ -139,11 +105,13 @@ impl VoiceSessionRuntime {
         drop(active);
 
         let active_sessions = Arc::clone(&self.active);
+        let context = self.context.clone();
         let adapters = self.adapters.clone();
         let task_cancellation = cancellation.clone();
         tokio::spawn(async move {
             let terminal = run_voice_session(
                 policy,
+                context,
                 adapters,
                 command_receiver,
                 event_sender,
@@ -261,6 +229,7 @@ enum SessionCommand {
 
 async fn run_voice_session(
     policy: VoiceSessionPolicy,
+    context: ConversationContext,
     adapters: VoiceSessionAdapters,
     commands: mpsc::Receiver<SessionCommand>,
     events: mpsc::Sender<VoiceSessionEvent>,
@@ -299,28 +268,15 @@ async fn run_voice_session(
         }
     };
 
-    let mut turn_runtime = StreamingTurnRuntime::new(
+    let turn_runtime = StreamingTurnRuntime::new(
+        context,
         adapters.language_model,
         adapters.speech_synthesizer,
         output.clone(),
-    )
-    .with_quality_controller(adapters.quality_controller);
-    if let Some((provider, language_execution)) = adapters.memory_provider {
-        turn_runtime = match turn_runtime.with_memory_provider(provider, language_execution) {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                cancellation.cancel();
-                if let Err(cleanup_error) = await_completion_cleanup(completion).await {
-                    return session_failure(session_id, cleanup_error);
-                }
-                return session_failure(session_id, error);
-            }
-        };
-    }
+    );
     VoiceLoop::new(
         policy,
         input_events,
-        output,
         completion,
         turn_runtime,
         commands,
@@ -360,7 +316,6 @@ struct VoiceLoop {
     final_silence_ms: u64,
     final_silence: Duration,
     input: mpsc::Receiver<Result<VoiceInputEvent, AdapterError>>,
-    output: Arc<dyn ContinuousAudioOutput>,
     completion: Option<JoinHandle<Result<(), AdapterError>>>,
     turn_runtime: StreamingTurnRuntime,
     turn_events: Option<StreamingTurnEventStream>,
@@ -373,8 +328,6 @@ struct VoiceLoop {
     state: VoiceLoopState,
     active_segment_id: Option<u64>,
     finalization_due: bool,
-    next_turn_id: u64,
-    next_generation_id: u64,
     reliable_events: VecDeque<VoiceSessionEvent>,
     partials: BTreeMap<u64, String>,
     playback: Option<PlaybackLifecycle>,
@@ -385,7 +338,6 @@ impl VoiceLoop {
     fn new(
         policy: VoiceSessionPolicy,
         input: mpsc::Receiver<Result<VoiceInputEvent, AdapterError>>,
-        output: Arc<dyn ContinuousAudioOutput>,
         completion: JoinHandle<Result<(), AdapterError>>,
         turn_runtime: StreamingTurnRuntime,
         commands: mpsc::Receiver<SessionCommand>,
@@ -398,7 +350,6 @@ impl VoiceLoop {
             final_silence_ms,
             final_silence: Duration::from_millis(final_silence_ms),
             input,
-            output,
             completion: Some(completion),
             turn_runtime,
             turn_events: None,
@@ -412,8 +363,6 @@ impl VoiceLoop {
             state: VoiceLoopState::Listening,
             active_segment_id: None,
             finalization_due: false,
-            next_turn_id: 1,
-            next_generation_id: 1,
             reliable_events: VecDeque::new(),
             partials: BTreeMap::new(),
             playback: None,
@@ -659,16 +608,19 @@ impl VoiceLoop {
         let Some(finalized) = self.finalizer.finalize_ready(self.clock.now_ms()) else {
             return Ok(());
         };
-        let turn_id = TurnId::new(self.next_turn_id);
-        let generation_id = GenerationId::new(self.next_generation_id);
-        let next_turn_id = self
-            .next_turn_id
-            .checked_add(1)
-            .ok_or_else(|| runtime_error("voice turn identifier overflowed"))?;
-        let next_generation_id = self
-            .next_generation_id
-            .checked_add(1)
-            .ok_or_else(|| runtime_error("voice generation identifier overflowed"))?;
+        let started = self
+            .turn_runtime
+            .start_turn(
+                ConversationTurnSource::Voice {
+                    session_id: self.session_id,
+                },
+                finalized.text.clone(),
+            )
+            .await?;
+        let identity = started.identity();
+        let turn_id = identity.turn_id();
+        let generation_id = identity.generation_id();
+        let mut turn_events = started.into_events();
 
         if !self
             .publish_reliable(VoiceSessionEvent::TranscriptFinal {
@@ -678,6 +630,10 @@ impl VoiceLoop {
             })
             .await
         {
+            let _ = self
+                .turn_runtime
+                .abort_turn(turn_id, generation_id, &mut turn_events)
+                .await;
             return Err(runtime_error(
                 "voice session event stream closed during finalization",
             ));
@@ -693,10 +649,6 @@ impl VoiceLoop {
             ));
         }
 
-        let turn_events = self
-            .turn_runtime
-            .start_turn(turn_id, generation_id, finalized.text)
-            .await?;
         self.turn_events = Some(turn_events);
         self.state = VoiceLoopState::Responding {
             turn_id,
@@ -706,8 +658,6 @@ impl VoiceLoop {
             generation_id,
             pending_rendered: None,
         });
-        self.next_turn_id = next_turn_id;
-        self.next_generation_id = next_generation_id;
         Ok(())
     }
 
@@ -735,6 +685,7 @@ impl VoiceLoop {
 
         if terminal {
             self.turn_events.take();
+            self.partials.clear();
             self.state = VoiceLoopState::Listening;
             self.playback = None;
             if let Some(error) = failure {
@@ -804,7 +755,17 @@ impl VoiceLoop {
         .await;
         match interrupt_result {
             Ok(Ok(())) => {}
-            Ok(Err(error)) | Err(error) => {
+            Ok(Err(error)) => {
+                let drain_result = cleanup_with_timeout(
+                    "streaming turn drain",
+                    self.drain_interrupted_turn(turn_id, generation_id),
+                )
+                .await;
+                self.state = VoiceLoopState::Listening;
+                drain_result??;
+                return Err(error);
+            }
+            Err(error) => {
                 let abort_error = self
                     .abort_interrupted_turn(turn_id, generation_id)
                     .await
@@ -814,11 +775,6 @@ impl VoiceLoop {
             }
         }
 
-        let flush_result = cleanup_with_timeout(
-            "continuous audio flush",
-            self.output.flush(self.session_id, generation_id),
-        )
-        .await;
         let drain_result = cleanup_with_timeout(
             "streaming turn drain",
             self.drain_interrupted_turn(turn_id, generation_id),
@@ -835,12 +791,6 @@ impl VoiceLoop {
         };
         self.state = VoiceLoopState::Listening;
         drain_result?;
-        if let Err(error) = flush_result? {
-            return Err(adapter_runtime_error(
-                RuntimeStage::ContinuousAudioOutput,
-                error,
-            ));
-        }
         Ok(())
     }
 
@@ -1036,7 +986,10 @@ impl VoiceLoop {
             }
             return true;
         }
-        let reliable = event.is_terminal();
+        let reliable = matches!(
+            event,
+            RuntimeEvent::TranscriptFinal { .. } | RuntimeEvent::TextCompleted { .. }
+        ) || event.is_terminal();
         let event = VoiceSessionEvent::Turn {
             session_id: self.session_id,
             generation_id,

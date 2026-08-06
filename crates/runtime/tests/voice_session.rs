@@ -14,17 +14,101 @@ use conversation_model_adapters::{
 use conversation_protocol::{
     ComponentDescriptor, ComponentKind, ExecutionLocation, GenerationId, MemoryConfidence,
     MemoryDraft, MemoryKind, MemoryProvenance, MemoryProvenanceKind, MemoryRetention,
-    PlaybackState, PrivacyMode, RecoveryDisposition, RuntimeEvent, RuntimeStage, SessionId, TurnId,
-    UnixTimestampMillis, UtteranceId, VoiceActivity, VoiceSessionEvent, VoiceSessionPolicy,
-    VoiceTimingMilestone,
+    PersonaProfile, PlaybackState, PrivacyMode, RecoveryDisposition, ResponseControls,
+    RuntimeEvent, RuntimeStage, SessionId, TurnId, UnixTimestampMillis, UtteranceId, VoiceActivity,
+    VoiceSessionEvent, VoiceSessionPolicy, VoiceTimingMilestone,
 };
-use conversation_runtime::{VoiceSessionAdapters, VoiceSessionEventStream, VoiceSessionRuntime};
+use conversation_runtime::{
+    ConversationContext, ConversationQualityController, TextTurnEventStream, TextTurnRuntime,
+    VoiceSessionAdapters, VoiceSessionEventStream, VoiceSessionRuntime,
+};
 use tempfile::TempDir;
 use tokio::sync::{mpsc, Notify};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 const SESSION_ID: SessionId = SessionId::new(1);
+
+#[tokio::test(start_paused = true)]
+async fn typed_voice_typed_turns_share_history_and_monotonic_ids() {
+    let context = conversation_context();
+    let first_language = Arc::new(MockGenerationLanguageModel::new(["answer one"]));
+    let text = TextTurnRuntime::new(context.clone(), first_language);
+
+    let first_text = text.start_turn("typed one").await.unwrap();
+    assert_eq!(first_text.identity().turn_id(), TurnId::new(1));
+    drain_text_turn(first_text.into_events()).await;
+
+    let voice = VoiceSessionHarness::with_context(
+        context.clone(),
+        Arc::new(MockGenerationLanguageModel::new(["answer two"])),
+    );
+    let mut voice_events = voice.start().await;
+    assert_session_started(voice_events.recv().await);
+    voice.engine_final(1, "spoken").await;
+    voice.speech_ended(0).await;
+    tokio::time::advance(Duration::from_millis(600)).await;
+    let observed = drain_until_turn_terminal(&mut voice_events).await;
+    assert_final_and_completed(&observed, TurnId::new(2), "spoken");
+    voice.shutdown(&mut voice_events).await;
+
+    let second_language = Arc::new(MockGenerationLanguageModel::new(["answer three"]));
+    let second_text = TextTurnRuntime::new(context, second_language.clone())
+        .start_turn("typed two")
+        .await
+        .unwrap();
+    assert_eq!(second_text.identity().turn_id(), TurnId::new(3));
+    drain_text_turn(second_text.into_events()).await;
+
+    let requests = second_language.requests();
+    assert_eq!(
+        requests[0]
+            .input()
+            .recent_messages()
+            .iter()
+            .map(|message| message.text())
+            .collect::<Vec<_>>(),
+        ["typed one", "answer one", "spoken", "answer two"]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn restarted_voice_sessions_continue_context_identities() {
+    let context = conversation_context();
+    let first = VoiceSessionHarness::with_context_for_turn(
+        context.clone(),
+        Arc::new(MockGenerationLanguageModel::new(["first answer"])),
+        TurnId::new(1),
+    );
+    let mut first_events = first.start().await;
+    assert_session_started(first_events.recv().await);
+    first.engine_final(1, "first spoken turn").await;
+    first.speech_ended(0).await;
+    tokio::time::advance(Duration::from_millis(600)).await;
+    assert_final_and_completed(
+        &drain_until_turn_terminal(&mut first_events).await,
+        TurnId::new(1),
+        "first spoken turn",
+    );
+    first.shutdown(&mut first_events).await;
+
+    let second = VoiceSessionHarness::with_context_for_turn(
+        context,
+        Arc::new(MockGenerationLanguageModel::new(["second answer"])),
+        TurnId::new(2),
+    );
+    let mut second_events = second.start().await;
+    assert_session_started(second_events.recv().await);
+    second.engine_final(1, "second spoken turn").await;
+    second.speech_ended(600).await;
+    tokio::time::advance(Duration::from_millis(600)).await;
+    assert_final_and_completed(
+        &drain_until_turn_terminal(&mut second_events).await,
+        TurnId::new(2),
+        "second spoken turn",
+    );
+    second.shutdown(&mut second_events).await;
+}
 
 #[tokio::test(start_paused = true)]
 async fn finalizes_each_utterance_from_the_silence_timer_with_increasing_identities() {
@@ -244,13 +328,7 @@ impl MemoryContextProvider for RemoteMemoryProvider {
 #[test]
 fn remote_memory_is_rejected_before_a_voice_session_can_start() {
     let harness = VoiceSessionHarness::new();
-    let adapters = VoiceSessionAdapters::new(
-        harness.factory.clone(),
-        harness.language.clone(),
-        Arc::new(MockStreamingSpeechSynthesizer::new([])),
-    );
-
-    let error = adapters
+    let error = conversation_context()
         .with_memory_provider(Arc::new(RemoteMemoryProvider), ExecutionLocation::Local)
         .err()
         .expect("remote memory should be rejected");
@@ -525,11 +603,49 @@ impl VoiceSessionHarness {
         let factory = Arc::new(TestVoiceIoFactory::new(input_receiver, output));
         let language = Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new()));
         let speech = Arc::new(MockStreamingSpeechSynthesizer::new([]));
-        let runtime = VoiceSessionRuntime::new(VoiceSessionAdapters::new(
-            factory.clone(),
-            language.clone(),
-            speech,
-        ));
+        let runtime = VoiceSessionRuntime::new(
+            conversation_context(),
+            VoiceSessionAdapters::new(factory.clone(), language.clone(), speech),
+        );
+        Self {
+            runtime,
+            factory,
+            input,
+            language,
+            playback_gate: None,
+            _memory_directory: None,
+        }
+    }
+
+    fn with_context(
+        context: ConversationContext,
+        language: Arc<MockGenerationLanguageModel>,
+    ) -> Self {
+        Self::with_context_for_turn(context, language, TurnId::new(2))
+    }
+
+    fn with_context_for_turn(
+        context: ConversationContext,
+        language: Arc<MockGenerationLanguageModel>,
+        turn_id: TurnId,
+    ) -> Self {
+        let (input, input_receiver) = mpsc::channel(32);
+        let output = Arc::new(MockContinuousAudioOutput::new());
+        let factory = Arc::new(TestVoiceIoFactory::new(input_receiver, output));
+        let frame = AudioFrame::new(
+            turn_id,
+            GenerationId::new(turn_id.get()),
+            UtteranceId::new(1),
+            0,
+            PcmFormat::new(24_000, 1, PcmSampleFormat::Signed16LittleEndian).unwrap(),
+            vec![0; 960],
+        )
+        .unwrap();
+        let speech = Arc::new(MockStreamingSpeechSynthesizer::new([frame]));
+        let runtime = VoiceSessionRuntime::new(
+            context,
+            VoiceSessionAdapters::new(factory.clone(), language.clone(), speech),
+        );
         Self {
             runtime,
             factory,
@@ -574,11 +690,12 @@ impl VoiceSessionHarness {
         let factory = Arc::new(TestVoiceIoFactory::new(input_receiver, output));
         let language = Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new()));
         let speech = Arc::new(MockStreamingSpeechSynthesizer::new([]));
-        let adapters = VoiceSessionAdapters::new(factory.clone(), language.clone(), speech)
+        let context = conversation_context()
             .with_memory_provider(provider, ExecutionLocation::Local)
             .unwrap();
+        let adapters = VoiceSessionAdapters::new(factory.clone(), language.clone(), speech);
         Self {
-            runtime: VoiceSessionRuntime::new(adapters),
+            runtime: VoiceSessionRuntime::new(context, adapters),
             factory,
             input,
             language,
@@ -608,11 +725,10 @@ impl VoiceSessionHarness {
         ));
         let language = Arc::new(MockGenerationLanguageModel::new(["Fixture response."]));
         let speech = Arc::new(MockStreamingSpeechSynthesizer::new([frame]));
-        let runtime = VoiceSessionRuntime::new(VoiceSessionAdapters::new(
-            factory.clone(),
-            language.clone(),
-            speech,
-        ));
+        let runtime = VoiceSessionRuntime::new(
+            conversation_context(),
+            VoiceSessionAdapters::new(factory.clone(), language.clone(), speech),
+        );
         Self {
             runtime,
             factory,
@@ -879,6 +995,14 @@ fn policy() -> VoiceSessionPolicy {
     .unwrap()
 }
 
+fn conversation_context() -> ConversationContext {
+    ConversationContext::new(ConversationQualityController::new(
+        PersonaProfile::default(),
+        ResponseControls::default(),
+        conversation_protocol::ConversationMode::DirectAnswer,
+    ))
+}
+
 fn component(kind: ComponentKind, provider: &str) -> ComponentDescriptor {
     ComponentDescriptor::new(kind, provider, ExecutionLocation::Local)
 }
@@ -989,6 +1113,18 @@ async fn drain_until_turn_terminal(events: &mut VoiceSessionEventStream) -> Vec<
     })
     .await
     .expect("turn terminal timed out")
+}
+
+async fn drain_text_turn(events: TextTurnEventStream) -> Vec<RuntimeEvent> {
+    let mut events = events;
+    let mut observed = Vec::new();
+    while let Some(event) = events.recv().await {
+        observed.push(event);
+    }
+    assert!(observed
+        .iter()
+        .any(|event| matches!(event, RuntimeEvent::TurnCompleted { .. })));
+    observed
 }
 
 async fn drain_until_session_terminal(

@@ -11,16 +11,28 @@ use conversation_model_adapters::{
     VoiceInput, VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
 };
 use conversation_protocol::{
-    ComponentDescriptor, ComponentKind, ExecutionLocation, GenerationId, PlaybackState,
-    PrivacyMode, RecoveryDisposition, RuntimeErrorKind, RuntimeEvent, RuntimeStage, SessionId,
-    TurnId, VoiceActivity, VoiceSessionEvent, VoiceSessionPolicy,
+    ComponentDescriptor, ComponentKind, ConversationMode, ExecutionLocation, GenerationId,
+    PersonaProfile, PlaybackState, PrivacyMode, RecoveryDisposition, ResponseControls,
+    RuntimeErrorKind, RuntimeEvent, RuntimeStage, SessionId, TurnId, VoiceActivity,
+    VoiceSessionEvent, VoiceSessionPolicy,
 };
-use conversation_runtime::{VoiceSessionAdapters, VoiceSessionEventStream, VoiceSessionRuntime};
+use conversation_runtime::{
+    ConversationContext, ConversationQualityController, VoiceSessionAdapters,
+    VoiceSessionEventStream, VoiceSessionRuntime,
+};
 use tokio::sync::{mpsc, Notify};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 const SESSION_ID: SessionId = SessionId::new(1);
+
+fn context() -> ConversationContext {
+    ConversationContext::new(ConversationQualityController::new(
+        PersonaProfile::default(),
+        ResponseControls::default(),
+        ConversationMode::DirectAnswer,
+    ))
+}
 
 #[tokio::test(start_paused = true)]
 async fn sidecar_barge_in_flushes_and_cancels_all_generation_work() {
@@ -560,6 +572,7 @@ impl VoiceSessionHarness {
         I: IntoIterator<Item = GenerationId>,
     {
         let active_generations: BTreeSet<_> = active_generations.into_iter().collect();
+        let context = context();
         let (input, input_receiver) = mpsc::channel(64);
         let output = Arc::new(CancellableOutput::new(flush_behavior, stall_turn_cleanup));
         let language = Arc::new(CancellableLanguage::new(active_generations.clone()));
@@ -569,11 +582,10 @@ impl VoiceSessionHarness {
             output.clone(),
             stall_completion,
         ));
-        let runtime = VoiceSessionRuntime::new(VoiceSessionAdapters::new(
-            factory.clone(),
-            language.clone(),
-            speech.clone(),
-        ));
+        let runtime = VoiceSessionRuntime::new(
+            context,
+            VoiceSessionAdapters::new(factory.clone(), language.clone(), speech.clone()),
+        );
         Self {
             runtime,
             factory,

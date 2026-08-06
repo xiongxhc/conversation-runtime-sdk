@@ -1,10 +1,19 @@
+use std::sync::Arc;
+
+use conversation_model_adapters::{
+    AdapterError, GenerationLanguageModel, GenerationLanguageRequest, GenerationTextDelta,
+    MockContinuousAudioOutput, MockStreamingSpeechSynthesizer,
+};
 use conversation_protocol::{
     ConversationMode, ConversationRole, GenerationId, PersonaProfile, ResponseControls,
-    RuntimeErrorKind, RuntimeStage, TurnId,
+    RuntimeErrorKind, RuntimeEvent, RuntimeStage, TurnId,
 };
 use conversation_runtime::{
     ConversationContext, ConversationQualityController, ConversationTurnSource,
+    StreamingTurnEventStream, StreamingTurnRuntime,
 };
+use tokio::sync::{mpsc, Notify};
+use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
 async fn context_allocates_monotonic_ids_and_rejects_a_second_active_turn() {
@@ -108,6 +117,102 @@ async fn failed_completion_releases_the_context_for_a_new_turn() {
         .await
         .unwrap();
     assert_eq!(second.identity().turn_id(), TurnId::new(2));
+}
+
+#[tokio::test]
+async fn text_and_voice_starts_admit_only_one_context_claimant() {
+    let context = ConversationContext::new(quality());
+    let text = context
+        .begin_turn(ConversationTurnSource::Text, "typed")
+        .await
+        .unwrap();
+    let voice = StreamingTurnRuntime::new(
+        context.clone(),
+        Arc::new(BlockingLanguage::default()),
+        Arc::new(MockStreamingSpeechSynthesizer::new([])),
+        Arc::new(MockContinuousAudioOutput::new()),
+    );
+
+    assert!(voice
+        .start_turn(
+            ConversationTurnSource::Voice {
+                session_id: conversation_protocol::SessionId::new(1),
+            },
+            "spoken",
+        )
+        .await
+        .is_err());
+    assert_eq!(context.active_turn().await, Some(text.identity()));
+    context.discard_turn(text.identity(), false).await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_voice_output_is_excluded_from_later_text_history() {
+    let context = ConversationContext::new(quality());
+    let language = Arc::new(BlockingLanguage::default());
+    let runtime = StreamingTurnRuntime::new(
+        context.clone(),
+        language.clone(),
+        Arc::new(MockStreamingSpeechSynthesizer::new([])),
+        Arc::new(MockContinuousAudioOutput::new()),
+    );
+    let mut voice = runtime
+        .start_turn(
+            ConversationTurnSource::Voice {
+                session_id: conversation_protocol::SessionId::new(1),
+            },
+            "spoken but cancelled",
+        )
+        .await
+        .unwrap();
+    let identity = voice.identity();
+    language.started.notified().await;
+    runtime
+        .interrupt(identity.turn_id(), identity.generation_id())
+        .await
+        .unwrap();
+    let events = drain(&mut voice).await;
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, RuntimeEvent::TurnCancelled { .. })));
+    assert_eq!(context.active_turn().await, None);
+
+    let text = context
+        .begin_turn(ConversationTurnSource::Text, "typed after cancellation")
+        .await
+        .unwrap();
+    assert!(text.resolved().history_messages().is_empty());
+    context.discard_turn(text.identity(), false).await.unwrap();
+}
+
+#[derive(Default)]
+struct BlockingLanguage {
+    started: Arc<Notify>,
+}
+
+impl GenerationLanguageModel for BlockingLanguage {
+    fn stream(
+        &self,
+        _request: GenerationLanguageRequest,
+        cancellation: CancellationToken,
+    ) -> mpsc::Receiver<Result<GenerationTextDelta, AdapterError>> {
+        let (sender, receiver) = mpsc::channel(1);
+        let started = Arc::clone(&self.started);
+        tokio::spawn(async move {
+            started.notify_one();
+            cancellation.cancelled().await;
+            drop(sender);
+        });
+        receiver
+    }
+}
+
+async fn drain(stream: &mut StreamingTurnEventStream) -> Vec<RuntimeEvent> {
+    let mut events = Vec::new();
+    while let Some(event) = stream.recv().await {
+        events.push(event);
+    }
+    events
 }
 
 fn quality() -> ConversationQualityController {

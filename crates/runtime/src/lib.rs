@@ -33,7 +33,7 @@ pub use conversation_context::{
 pub use conversation_quality::{ConversationQualityController, ResolvedConversationQuality};
 pub use phrase_chunker::PhraseChunkingConfig;
 pub use session_clock::{SessionClock, TurnFinalizationDeadline};
-pub use streaming_turn::{StreamingTurnEventStream, StreamingTurnRuntime};
+pub use streaming_turn::{StartedStreamingTurn, StreamingTurnEventStream, StreamingTurnRuntime};
 pub use text_turn::{TextTurnEventStream, TextTurnRuntime};
 pub use turn_finalizer::{FinalizedTranscript, TurnFinalizer};
 pub use utterance_assembler::UtteranceAssembler;

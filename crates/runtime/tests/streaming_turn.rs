@@ -7,13 +7,28 @@ use conversation_model_adapters::{
     PlaybackReceipt, StreamingSpeechRequest, StreamingSpeechSynthesizer,
 };
 use conversation_protocol::{
-    GenerationId, PlaybackState, RuntimeEvent, RuntimeTimingMilestone, SessionId, TurnId,
-    UtteranceId,
+    ConversationMode, GenerationId, PersonaProfile, PlaybackState, ResponseControls, RuntimeEvent,
+    RuntimeTimingMilestone, SessionId, TurnId, UtteranceId,
 };
-use conversation_runtime::{StreamingTurnEventStream, StreamingTurnRuntime, UtteranceAssembler};
+use conversation_runtime::{
+    ConversationContext, ConversationQualityController, ConversationTurnSource,
+    StreamingTurnEventStream, StreamingTurnRuntime, UtteranceAssembler,
+};
 use tokio::sync::{mpsc, watch, Notify};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
+
+fn context() -> ConversationContext {
+    ConversationContext::new(ConversationQualityController::new(
+        PersonaProfile::default(),
+        ResponseControls::default(),
+        ConversationMode::DirectAnswer,
+    ))
+}
+
+fn context_for(turn_id: TurnId) -> ConversationContext {
+    context().with_test_sequence_for_test(turn_id.get().saturating_sub(1))
+}
 
 #[test]
 fn short_answer_is_one_utterance() {
@@ -62,7 +77,7 @@ fn default_assembler_uses_r3_limits() {
 #[tokio::test]
 async fn streaming_turn_publishes_original_text_and_enqueues_ordered_frames() {
     let turn_id = TurnId::new(7);
-    let generation_id = GenerationId::new(8);
+    let generation_id = GenerationId::new(7);
     let utterance_id = UtteranceId::new(1);
     let format = PcmFormat::new(24_000, 1, PcmSampleFormat::Signed16LittleEndian).unwrap();
     let expected_frames = vec![
@@ -72,10 +87,15 @@ async fn streaming_turn_publishes_original_text_and_enqueues_ordered_frames() {
     let language = Arc::new(MockGenerationLanguageModel::new(["hello", " world"]));
     let speech = Arc::new(MockStreamingSpeechSynthesizer::new(expected_frames.clone()));
     let output = Arc::new(MockContinuousAudioOutput::new());
-    let runtime = StreamingTurnRuntime::new(language.clone(), speech.clone(), output.clone());
+    let runtime = StreamingTurnRuntime::new(
+        context_for(turn_id),
+        language.clone(),
+        speech.clone(),
+        output.clone(),
+    );
 
     let mut stream = runtime
-        .start_turn(turn_id, generation_id, "question")
+        .start_turn(ConversationTurnSource::Text, "question")
         .await
         .unwrap();
     let observed = drain(&mut stream).await;
@@ -112,6 +132,12 @@ async fn streaming_turn_publishes_original_text_and_enqueues_ordered_frames() {
             .collect::<Vec<_>>(),
         vec![&RuntimeEvent::TurnCompleted { turn_id }]
     );
+    assert!(
+        observed
+            .iter()
+            .position(|event| matches!(event, RuntimeEvent::TextCompleted { .. }))
+            < observed.iter().position(RuntimeEvent::is_terminal)
+    );
     assert_eq!(output.frames(), expected_frames);
     assert_eq!(language.requests().len(), 1);
     let quality_index = observed
@@ -137,7 +163,7 @@ async fn streaming_turn_publishes_original_text_and_enqueues_ordered_frames() {
     assert_eq!(speech.requests()[0].text(), "hello world");
 
     let mut second = runtime
-        .start_turn(TurnId::new(9), GenerationId::new(10), "next question")
+        .start_turn(ConversationTurnSource::Text, "next question")
         .await
         .unwrap();
     let _ = drain(&mut second).await;
@@ -155,14 +181,10 @@ async fn interrupted_turn_constrains_the_next_generation_envelope_once() {
     let language = Arc::new(MockGenerationLanguageModel::new(["#"]));
     let speech = Arc::new(MockStreamingSpeechSynthesizer::new([]));
     let output = Arc::new(MockContinuousAudioOutput::new());
-    let runtime = StreamingTurnRuntime::new(language.clone(), speech, output);
+    let runtime = StreamingTurnRuntime::new(context(), language.clone(), speech, output);
 
     let mut interrupted = runtime
-        .start_turn(
-            TurnId::new(1),
-            GenerationId::new(1),
-            "explain this in detail",
-        )
+        .start_turn(ConversationTurnSource::Text, "explain this in detail")
         .await
         .unwrap();
     runtime
@@ -175,11 +197,7 @@ async fn interrupted_turn_constrains_the_next_generation_envelope_once() {
         .any(|event| matches!(event, RuntimeEvent::TurnCancelled { .. })));
 
     let mut constrained = runtime
-        .start_turn(
-            TurnId::new(2),
-            GenerationId::new(2),
-            "continue with enough detail",
-        )
+        .start_turn(ConversationTurnSource::Text, "continue with enough detail")
         .await
         .unwrap();
     let _ = drain(&mut constrained).await;
@@ -192,8 +210,7 @@ async fn interrupted_turn_constrains_the_next_generation_envelope_once() {
 
     let mut following = runtime
         .start_turn(
-            TurnId::new(3),
-            GenerationId::new(3),
+            ConversationTurnSource::Text,
             "continue normally with enough detail",
         )
         .await
@@ -213,7 +230,7 @@ async fn interrupted_turn_constrains_the_next_generation_envelope_once() {
 #[tokio::test]
 async fn speech_normalization_runs_after_utterance_boundary_selection() {
     let turn_id = TurnId::new(2);
-    let generation_id = GenerationId::new(3);
+    let generation_id = GenerationId::new(2);
     let language = Arc::new(MockGenerationLanguageModel::new([
         "# Heading\n\n",
         "This is **important**.",
@@ -226,10 +243,10 @@ async fn speech_normalization_runs_after_utterance_boundary_selection() {
         PcmFormat::new(24_000, 1, PcmSampleFormat::Signed16LittleEndian).unwrap(),
     )]));
     let output = Arc::new(MockContinuousAudioOutput::new());
-    let runtime = StreamingTurnRuntime::new(language, speech.clone(), output);
+    let runtime = StreamingTurnRuntime::new(context_for(turn_id), language, speech.clone(), output);
 
     let mut stream = runtime
-        .start_turn(turn_id, generation_id, "question")
+        .start_turn(ConversationTurnSource::Text, "question")
         .await
         .unwrap();
     let observed = drain(&mut stream).await;
@@ -249,7 +266,6 @@ async fn speech_normalization_runs_after_utterance_boundary_selection() {
 #[tokio::test]
 async fn long_response_reconstructs_ordered_multi_utterance_playback() {
     let turn_id = TurnId::new(12);
-    let generation_id = GenerationId::new(13);
     let format = PcmFormat::new(24_000, 2, PcmSampleFormat::Float32LittleEndian).unwrap();
     let response = format!(
         "{}\n\n{}\n\n{}",
@@ -260,10 +276,15 @@ async fn long_response_reconstructs_ordered_multi_utterance_playback() {
     let language = Arc::new(MockGenerationLanguageModel::new([response]));
     let speech = Arc::new(ReconstructingSpeech::new(format));
     let output = Arc::new(MockContinuousAudioOutput::new());
-    let runtime = StreamingTurnRuntime::new(language, speech.clone(), output.clone());
+    let runtime = StreamingTurnRuntime::new(
+        context_for(turn_id),
+        language,
+        speech.clone(),
+        output.clone(),
+    );
 
     let mut stream = runtime
-        .start_turn(turn_id, generation_id, "question")
+        .start_turn(ConversationTurnSource::Text, "question")
         .await
         .unwrap();
     let observed = drain(&mut stream).await;
@@ -308,7 +329,7 @@ async fn long_response_reconstructs_ordered_multi_utterance_playback() {
 #[tokio::test(flavor = "current_thread")]
 async fn first_playable_publication_precedes_frame_enqueue_under_backpressure() {
     let turn_id = TurnId::new(9);
-    let generation_id = GenerationId::new(10);
+    let generation_id = GenerationId::new(9);
     let format = PcmFormat::new(24_000, 1, PcmSampleFormat::Signed16LittleEndian).unwrap();
     let expected_frames = vec![
         frame(turn_id, generation_id, UtteranceId::new(1), 0, format),
@@ -329,9 +350,9 @@ async fn first_playable_publication_precedes_frame_enqueue_under_backpressure() 
         first_enqueue_release: release_receiver,
         accepted_sequences: Mutex::new(Vec::new()),
     });
-    let runtime = StreamingTurnRuntime::new(language, speech, output.clone());
+    let runtime = StreamingTurnRuntime::new(context_for(turn_id), language, speech, output.clone());
     let mut stream = runtime
-        .start_turn(turn_id, generation_id, "question")
+        .start_turn(ConversationTurnSource::Text, "question")
         .await
         .unwrap();
 

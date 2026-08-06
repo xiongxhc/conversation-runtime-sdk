@@ -10,10 +10,14 @@ use conversation_model_adapters::{
     MockContinuousAudioOutput, MockGenerationLanguageModel, MockStreamingSpeechSynthesizer,
 };
 use conversation_protocol::{
-    ExecutionLocation, GenerationId, MemoryConfidence, MemoryDraft, MemoryKind, MemoryProvenance,
-    MemoryProvenanceKind, MemoryRetention, RuntimeEvent, RuntimeStage, TurnId, UnixTimestampMillis,
+    ConversationMode, ExecutionLocation, MemoryConfidence, MemoryDraft, MemoryKind,
+    MemoryProvenance, MemoryProvenanceKind, MemoryRetention, PersonaProfile, ResponseControls,
+    RuntimeEvent, RuntimeStage, TurnId, UnixTimestampMillis,
 };
-use conversation_runtime::{StreamingTurnEventStream, StreamingTurnRuntime};
+use conversation_runtime::{
+    ConversationContext, ConversationQualityController, ConversationTurnSource,
+    StreamingTurnEventStream, StreamingTurnRuntime,
+};
 use tempfile::tempdir;
 use tokio::sync::Notify;
 use tokio::time::timeout;
@@ -50,8 +54,20 @@ fn draft(content: &str) -> MemoryDraft {
     .unwrap()
 }
 
-fn runtime(language: Arc<MockGenerationLanguageModel>) -> StreamingTurnRuntime {
+fn context() -> ConversationContext {
+    ConversationContext::new(ConversationQualityController::new(
+        PersonaProfile::default(),
+        ResponseControls::default(),
+        ConversationMode::DirectAnswer,
+    ))
+}
+
+fn runtime(
+    context: ConversationContext,
+    language: Arc<MockGenerationLanguageModel>,
+) -> StreamingTurnRuntime {
     StreamingTurnRuntime::new(
+        context,
         language,
         Arc::new(MockStreamingSpeechSynthesizer::new([])),
         Arc::new(MockContinuousAudioOutput::new()),
@@ -69,12 +85,15 @@ async fn local_memory_is_retrieved_traced_and_deleted_before_later_turns() {
         Arc::new(FixedClock(timestamp(2_000))),
     ));
     let language = Arc::new(MockGenerationLanguageModel::new(["#"]));
-    let runtime = runtime(language.clone())
-        .with_memory_provider(provider, ExecutionLocation::Local)
-        .unwrap();
+    let runtime = runtime(
+        context()
+            .with_memory_provider(provider, ExecutionLocation::Local)
+            .unwrap(),
+        language.clone(),
+    );
 
     let mut first = runtime
-        .start_turn(TurnId::new(1), GenerationId::new(1), "local project")
+        .start_turn(ConversationTurnSource::Text, "local project")
         .await
         .unwrap();
     let first_events = drain(&mut first).await;
@@ -99,7 +118,7 @@ async fn local_memory_is_retrieved_traced_and_deleted_before_later_turns() {
 
     store.delete(record.id(), record.revision()).unwrap();
     let mut second = runtime
-        .start_turn(TurnId::new(2), GenerationId::new(2), "local project")
+        .start_turn(ConversationTurnSource::Text, "local project")
         .await
         .unwrap();
     let second_events = drain(&mut second).await;
@@ -125,12 +144,15 @@ async fn configured_memory_failure_fails_closed_before_language_generation() {
     ));
     fs::remove_file(&database).unwrap();
     let language = Arc::new(MockGenerationLanguageModel::new(["not reached"]));
-    let runtime = runtime(language.clone())
-        .with_memory_provider(provider, ExecutionLocation::Local)
-        .unwrap();
+    let runtime = runtime(
+        context()
+            .with_memory_provider(provider, ExecutionLocation::Local)
+            .unwrap(),
+        language.clone(),
+    );
 
     let mut events = runtime
-        .start_turn(TurnId::new(3), GenerationId::new(3), "question")
+        .start_turn(ConversationTurnSource::Text, "question")
         .await
         .unwrap();
     let observed = drain(&mut events).await;
@@ -170,23 +192,27 @@ impl MemoryContextProvider for BlockingProvider {
 async fn interruption_cancels_and_awaits_memory_before_skipping_generation() {
     let started = Arc::new(Notify::new());
     let language = Arc::new(MockGenerationLanguageModel::new(["not reached"]));
-    let runtime = runtime(language.clone())
-        .with_memory_provider(
-            Arc::new(BlockingProvider {
-                started: Arc::clone(&started),
-            }),
-            ExecutionLocation::Local,
-        )
-        .unwrap();
+    let runtime = runtime(
+        context()
+            .with_memory_provider(
+                Arc::new(BlockingProvider {
+                    started: Arc::clone(&started),
+                }),
+                ExecutionLocation::Local,
+            )
+            .unwrap(),
+        language.clone(),
+    );
     let mut events = runtime
-        .start_turn(TurnId::new(4), GenerationId::new(4), "question")
+        .start_turn(ConversationTurnSource::Text, "question")
         .await
         .unwrap();
+    let identity = events.identity();
     timeout(Duration::from_secs(1), started.notified())
         .await
         .unwrap();
     runtime
-        .interrupt(TurnId::new(4), GenerationId::new(4))
+        .interrupt(identity.turn_id(), identity.generation_id())
         .await
         .unwrap();
 
@@ -216,8 +242,7 @@ impl MemoryContextProvider for RemoteProvider {
 
 #[test]
 fn memory_attachment_rejects_remote_memory_or_language_execution() {
-    let language = Arc::new(MockGenerationLanguageModel::new(["not reached"]));
-    let remote_store = runtime(language.clone())
+    let remote_store = context()
         .with_memory_provider(Arc::new(RemoteProvider), ExecutionLocation::Local)
         .err()
         .expect("remote memory provider should be rejected");
@@ -229,7 +254,7 @@ fn memory_attachment_rejects_remote_memory_or_language_execution() {
         store,
         Arc::new(FixedClock(timestamp(2_000))),
     ));
-    let remote_language = runtime(language)
+    let remote_language = context()
         .with_memory_provider(local_provider, ExecutionLocation::Remote)
         .err()
         .expect("remote language execution should be rejected");

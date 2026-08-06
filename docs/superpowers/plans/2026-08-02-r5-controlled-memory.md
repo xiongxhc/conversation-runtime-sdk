@@ -368,7 +368,7 @@ Run: `VOICE_SIDECAR_FIXTURES_DIR="$PWD/tests/fixtures/voice-sidecar-v1" swift te
 
 Run: `git diff --check`
 
-Run: `grep -R -n -E 'TBD|TODO|FIXME|/Users/[^/]+|@(gmail|ctechm)\.com|abliterated' --exclude-dir=.git --exclude-dir=target --exclude-dir=.build .`
+Run: `grep -R -n -E 'TBD|TODO|FIXME|/Users/[^/]+|@(gmail|example)\.com|abliterated' --exclude-dir=.git --exclude-dir=target --exclude-dir=.build .`
 
 Classify pre-existing historical benchmark identifiers separately; remove new
 private paths, placeholders, or venture-specific content.

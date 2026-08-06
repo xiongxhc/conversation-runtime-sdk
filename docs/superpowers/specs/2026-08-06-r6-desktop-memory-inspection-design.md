@@ -115,14 +115,13 @@ retrieval trace and does not update `last_used_at` or retrieval reason.
 
 ## Public Wire Contract
 
-The shared typed-start slice advances the client protocol from version 2 to
-version 3. The gateway-owned start identifier and its correlated acceptance are
-not silently added to v2 because existing clients validate exact command and
-response shapes. A v2 client therefore rejects a v3 gateway as unsupported,
-and a v3 gateway rejects v2 commands. The Rust gateway, shared fixtures,
-TypeScript SDK, Node example, and desktop app move together.
+This slice advances the client protocol from version 1 to version 2. Memory
+inspection is not silently added to v1 because existing v1 clients validate
+the exact status capability set. A v1 client therefore rejects a v2 gateway as
+unsupported, and a v2 gateway rejects v1 commands. The Rust gateway, shared
+fixtures, TypeScript SDK, Node example, and desktop app move together.
 
-The protocol-v3 commands are:
+The protocol-v2 commands are:
 
 ```text
 memory_list(request_id, cursor)
@@ -207,7 +206,7 @@ turn is active. The session rejects memory commands before spawning work when a
 turn exists, so the command loop remains immediately available for
 `interrupt_turn` and inspection cannot contend with that turn's retrieval.
 
-The gateway advertises `memory_inspection` only in protocol-v3 status and only
+The gateway advertises `memory_inspection` only in protocol-v2 status and only
 when the local inspection store exists. `ClientRuntimeError` gains a required,
 stable `code`. Memory request codes are `memory_disabled`, `memory_turn_active`,
 `memory_not_found`, and `memory_unavailable`. Initialization, schema, path,

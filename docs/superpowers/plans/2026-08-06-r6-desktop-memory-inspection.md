@@ -33,12 +33,12 @@
 ### Public Rust protocol
 
 - `crates/protocol/src/client_memory.rs` — browser-facing memory DTOs, projections, cursor, preview normalization, enum names, and decimal serialization.
-- `crates/protocol/src/client_wire.rs` — protocol-v3 commands, correlated responses, stable error codes, strict decode/encode, and frame validation.
+- `crates/protocol/src/client_wire.rs` — protocol-v2 commands, correlated responses, stable error codes, strict decode/encode, and frame validation.
 - `crates/protocol/src/lib.rs` — exports client memory DTOs and page/preview constants.
 - `crates/protocol/tests/client_wire.rs` — v2 command/message fixtures, v1 rejection, identifiers, timestamps, cursors, errors, and frame bounds.
-- `tests/fixtures/client-wire-v3/commands.jsonl` — canonical valid v3 commands.
-- `tests/fixtures/client-wire-v3/events.jsonl` — canonical valid v3 gateway messages.
-- `tests/fixtures/client-wire-v3/invalid.jsonl` — malformed v3 commands and messages.
+- `tests/fixtures/client-wire-v2/commands.jsonl` — canonical valid v2 commands.
+- `tests/fixtures/client-wire-v2/events.jsonl` — canonical valid v2 gateway messages.
+- `tests/fixtures/client-wire-v2/invalid.jsonl` — malformed v2 commands and messages.
 - `tests/fixtures/client-wire-v1/*` — retained historical fixtures used only to prove v2 rejects v1.
 
 ### Controlled memory store
@@ -51,7 +51,7 @@
 ### Gateway
 
 - `apps/runtime-gateway/src/config.rs` — retain one cloned `SqliteMemoryStore` beside the retrieval provider.
-- `apps/runtime-gateway/src/main.rs` — attach optional inspection store and advertise protocol-v3 capability.
+- `apps/runtime-gateway/src/main.rs` — attach optional inspection store and advertise protocol-v2 capability.
 - `apps/runtime-gateway/src/session.rs` — memory commands, no-active-turn gate, blocking store work, typed rejections, and correlated responses.
 - `apps/runtime-gateway/tests/config.rs` — configured store/provider share the validated path.
 - `apps/runtime-gateway/tests/gateway_cli.rs` — compiled framed-stdio memory list/inspect and rejection behavior.
@@ -82,7 +82,7 @@
 ### Documentation and temporary acceptance state
 
 - `apps/desktop/README.md` — explain real Memory versus History and local setup.
-- `README.md` — document protocol-v3 inspection and initialization commands.
+- `README.md` — document protocol-v2 inspection and initialization commands.
 - `ROADMAP.md` — mark read-only Memory inspection complete while mutation, Persona, voice, and packaging remain open.
 - `docs/r6-desktop-app-evaluation.md` — record exact deterministic, compiled, native, and unvalidated evidence.
 - Temporary gateway configuration and initialized SQLite database — created under a test temporary directory and removed after acceptance.
@@ -94,15 +94,15 @@
 
 **Files:**
 - Create: `crates/protocol/src/client_memory.rs`
-- Create: `tests/fixtures/client-wire-v3/commands.jsonl`
-- Create: `tests/fixtures/client-wire-v3/events.jsonl`
-- Create: `tests/fixtures/client-wire-v3/invalid.jsonl`
+- Create: `tests/fixtures/client-wire-v2/commands.jsonl`
+- Create: `tests/fixtures/client-wire-v2/events.jsonl`
+- Create: `tests/fixtures/client-wire-v2/invalid.jsonl`
 - Modify: `crates/protocol/src/client_wire.rs`
 - Modify: `crates/protocol/src/lib.rs`
 - Modify: `crates/protocol/tests/client_wire.rs`
 
 **Interfaces:**
-- Produces: `CLIENT_PROTOCOL_VERSION = 3`, `MAX_MEMORY_LIST_PAGE_ITEMS = 50`, `MAX_MEMORY_PREVIEW_BYTES = 192`, and `MAX_MEMORY_INSPECTION_HISTORY_ITEMS = 32`.
+- Produces: `CLIENT_PROTOCOL_VERSION = 2`, `MAX_MEMORY_LIST_PAGE_ITEMS = 50`, `MAX_MEMORY_PREVIEW_BYTES = 192`, and `MAX_MEMORY_INSPECTION_HISTORY_ITEMS = 32`.
 - Produces commands: `ClientCommand::MemoryList { request_id, before_id }` and `ClientCommand::MemoryInspect { request_id, memory_id }`.
 - Produces responses: `GatewayMessage::MemoryList { request_id, records, next_cursor }` and `GatewayMessage::MemoryInspection { request_id, inspection }`.
 - Produces DTOs: `ClientMemorySummary`, `ClientMemoryPage`, `ClientMemoryRecord`, `ClientMemoryInspection`, `ClientMemoryProvenance`, `ClientMemoryApproval`, `ClientMemoryRetention`.
@@ -114,12 +114,12 @@ Add tests that decode these exact shapes and reject the retained v1 fixture line
 
 ```rust
 let list = decode_client_command(
-    br#"{"protocol_version":3,"type":"memory_list","request_id":"req-1","cursor":null}"#,
+    br#"{"protocol_version":2,"type":"memory_list","request_id":"req-1","cursor":null}"#,
 ).unwrap();
 assert!(matches!(list, ClientCommand::MemoryList { before_id: None, .. }));
 
 let inspect = decode_client_command(
-    br#"{"protocol_version":3,"type":"memory_inspect","request_id":"req-2","memory_id":"7"}"#,
+    br#"{"protocol_version":2,"type":"memory_inspect","request_id":"req-2","memory_id":"7"}"#,
 ).unwrap();
 assert!(matches!(inspect, ClientCommand::MemoryInspect { memory_id, .. } if memory_id.get() == 7));
 
@@ -152,7 +152,7 @@ assert!(!wire.approvals_truncated);
 Add preview cases for ASCII, CJK, collapsed whitespace, an exact 192-byte value, and a value truncated at a UTF-8 scalar boundary with the ellipsis included in the limit.
 Add a maximum-shape encoding test with 32 provenance rows, 32 approval rows, maximum-length identifiers and actors, and maximum content; assert the encoded gateway response remains below the 512 KiB frame limit.
 
-- [ ] **Step 4: Implement the protocol-v3 DTOs and strict wire**
+- [ ] **Step 4: Implement the protocol-v2 DTOs and strict wire**
 
 Use private serde wire envelopes and explicit conversion functions. Do not derive serde directly on domain records. Represent all decimal fields as strings and validate cursor `before_id` as canonical non-zero u64.
 
@@ -179,7 +179,7 @@ Expected: all protocol unit, integration, and fixture tests pass.
 
 - [ ] **Step 7: Check the protocol boundary without committing**
 
-Run: `git diff --check -- crates/protocol tests/fixtures/client-wire-v3`
+Run: `git diff --check -- crates/protocol tests/fixtures/client-wire-v2`
 
 Expected: the protocol slice is reviewable and clean; hold it for the feature-level validation and independent review gate.
 
@@ -494,7 +494,7 @@ Expected: the desktop slice is reviewable and clean; hold it for the feature-lev
 - Temporary only: gateway configuration and initialized database under a new `mktemp` directory.
 
 **Interfaces:**
-- Public docs explain protocol-v3 read-only inspection, History/Memory separation, explicit memory initialization, and remaining mutation/Persona/voice work.
+- Public docs explain protocol-v2 read-only inspection, History/Memory separation, explicit memory initialization, and remaining mutation/Persona/voice work.
 - Acceptance uses disposable local state; the operator's existing configuration and database remain untouched unless separately authorized after delivery.
 
 - [ ] **Step 1: Update public documentation and roadmap truthfully**
@@ -571,7 +571,7 @@ Expected: only intended repository files are modified; no operator config, appli
 - [ ] **Step 7: Commit the reviewed feature at its scope boundary**
 
 ```bash
-git add crates/protocol crates/memory apps/runtime-gateway packages/typescript examples/node-chat apps/desktop README.md ROADMAP.md docs/r6-desktop-app-evaluation.md tests/fixtures/client-wire-v3
+git add crates/protocol crates/memory apps/runtime-gateway packages/typescript examples/node-chat apps/desktop README.md ROADMAP.md docs/r6-desktop-app-evaluation.md tests/fixtures/client-wire-v2
 git diff --cached --check
 git commit -m "feat(desktop): add local memory inspection"
 ```

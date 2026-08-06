@@ -345,7 +345,7 @@ See [the R6 local-gateway evaluation](docs/r6-local-gateway-evaluation.md) and
 - macOS Tauri process bridge using explicit absolute gateway and configuration
   paths.
 - Local text-chat workspace with streamed output, Stop, close, and reconnect.
-- Protocol-v2 read-only runtime-memory list and detail inspection through the
+- Protocol-v3 read-only runtime-memory list and detail inspection through the
   public browser-safe SDK, gated on an explicitly configured local store.
 - Idle Voice Focus preview with seven selectable scenes, hidden transcript by
   default, reduced-motion fallback, and explicit visual-preview labeling.

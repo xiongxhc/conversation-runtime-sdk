@@ -310,6 +310,11 @@ shows at most the latest 32 provenance entries and 32 approval entries, and
 labels any older history that was truncated. Due expiry may be applied while a
 record is inspected.
 
+Protocol v3 is the current wire contract. It supersedes v2 because the gateway
+allocates typed start-turn identifiers and returns them only in the correlated
+acceptance; v2 and v3 peers reject each other rather than silently mixing wire
+shapes.
+
 The gateway does not advertise voice capabilities. Live microphone and playback
 activation, real voice-session events, persona mutation, memory mutation,
 packaging and signing, and R3 human, ten-minute, and acoustic acceptance remain

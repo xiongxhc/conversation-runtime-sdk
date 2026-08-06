@@ -305,6 +305,13 @@ impl GatewaySession {
                     )
                 })
             }
+            ClientCommand::StartVoiceSession { request_id }
+            | ClientCommand::StopVoiceSession { request_id }
+            | ClientCommand::PauseVoiceCapture { request_id }
+            | ClientCommand::ResumeVoiceCapture { request_id } => {
+                send_rejection(normal, &request_id, command_error("voice is unavailable"))
+                    .map_err(CommandFailure::response)
+            }
             ClientCommand::MemoryList {
                 request_id,
                 before_id,
@@ -1690,6 +1697,11 @@ mod tests {
             memory_location: None,
             telemetry_enabled: false,
             capabilities: vec!["text".to_owned()],
+            components: vec![conversation_protocol::ClientComponentDescriptor {
+                kind: "language_model".to_owned(),
+                execution_location: "local".to_owned(),
+                provider_label: "test-language".to_owned(),
+            }],
         }
     }
 
@@ -1698,6 +1710,18 @@ mod tests {
             memory_enabled: true,
             memory_location: Some("local".to_owned()),
             capabilities: vec!["text".to_owned(), "memory_inspection".to_owned()],
+            components: vec![
+                conversation_protocol::ClientComponentDescriptor {
+                    kind: "language_model".to_owned(),
+                    execution_location: "local".to_owned(),
+                    provider_label: "test-language".to_owned(),
+                },
+                conversation_protocol::ClientComponentDescriptor {
+                    kind: "memory".to_owned(),
+                    execution_location: "local".to_owned(),
+                    provider_label: "sqlite".to_owned(),
+                },
+            ],
             ..status()
         }
     }

@@ -6,13 +6,23 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use conversation_memory::{SqliteMemoryContextProvider, SqliteMemoryStore, SystemMemoryClock};
-use conversation_model_adapters::{OllamaConfig, OllamaLanguageModel};
-use conversation_protocol::{
-    ConversationMode, FollowUpPolicy, PersonaLevel, PersonaProfile, ResponseControls,
-    SilencePolicy, SpeechPace,
+use conversation_model_adapters::{
+    BufferedStreamingSpeechSynthesizer, GenerationLanguageModel, MacOsVoiceSidecar,
+    MacOsVoiceSidecarConfig, OllamaConfig, OllamaLanguageModel, OpenAiCompatibleSpeechConfig,
+    OpenAiCompatibleSpeechSynthesizer, OpenAiCompatibleStreamingSpeechConfig,
+    OpenAiCompatibleStreamingSpeechSynthesizer, SpeechSynthesizer, StreamingSpeechSynthesizer,
+    SystemDevice,
 };
-use conversation_runtime::ConversationQualityController;
+use conversation_protocol::{
+    ClientComponentDescriptor, ComponentDescriptor, ComponentKind, ConversationMode,
+    ExecutionLocation, FollowUpPolicy, PersonaLevel, PersonaProfile,
+    PrivacyMode as ProtocolPrivacyMode, ResponseControls, RuntimeStatus, SilencePolicy, SpeechPace,
+    MAX_CLIENT_PROVIDER_LABEL_BYTES,
+};
+use conversation_runtime::{ConversationContext, ConversationQualityController};
 use serde::Deserialize;
+
+use crate::voice_adapters::{GatewayVoiceAdapters, VoicePolicyTemplate};
 
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const MAX_MODEL_ID_BYTES: usize = 256;
@@ -33,24 +43,19 @@ impl std::error::Error for GatewayConfigError {}
 #[serde(deny_unknown_fields)]
 pub struct GatewayConfig {
     schema_version: u32,
-    privacy_mode: PrivacyMode,
+    privacy_mode: GatewayPrivacyMode,
     language: LanguageConfig,
     persona: PersonaConfig,
     memory: Option<MemoryConfig>,
+    voice: Option<VoiceConfig>,
 }
 
 pub struct GatewayAdapters {
-    pub language: OllamaLanguageModel,
-    pub quality: ConversationQualityController,
-    pub memory_provider: Option<SqliteMemoryContextProvider>,
+    pub context: ConversationContext,
+    pub language: Arc<dyn GenerationLanguageModel>,
+    pub voice: Option<GatewayVoiceAdapters>,
     pub memory_store: Option<SqliteMemoryStore>,
-    model_id: String,
-}
-
-impl GatewayAdapters {
-    pub fn model_id(&self) -> &str {
-        &self.model_id
-    }
+    pub status: RuntimeStatus,
 }
 
 impl GatewayConfig {
@@ -65,22 +70,103 @@ impl GatewayConfig {
     }
 
     fn validate(&self) -> Result<(), GatewayConfigError> {
-        if self.schema_version != 1 {
+        if self.schema_version != 2 {
             return Err(config_error(
-                "gateway configuration schema_version must be 1",
+                "gateway configuration schema_version must be 2",
             ));
         }
-        if !matches!(self.privacy_mode, PrivacyMode::LocalOnly) {
+        if !matches!(self.privacy_mode, GatewayPrivacyMode::LocalOnly) {
+            return Err(config_error("gateway privacy_mode must be local-only"));
+        }
+        self.build_adapters().map(|_| ())
+    }
+
+    fn build_adapters(&self) -> Result<GatewayAdapters, GatewayConfigError> {
+        if self.schema_version != 2 {
+            return Err(config_error(
+                "gateway configuration schema_version must be 2",
+            ));
+        }
+        if !matches!(self.privacy_mode, GatewayPrivacyMode::LocalOnly) {
             return Err(config_error("gateway privacy_mode must be local-only"));
         }
         if !matches!(self.language.backend, LanguageBackend::OllamaCompatible) {
             return Err(config_error("language backend must be ollama-compatible"));
         }
-        validate_loopback_http_endpoint(&self.language.endpoint)?;
-        self.build_adapters().map(|_| ())
+        require_local_execution(self.language.execution, "language")?;
+        validate_provider_label(&self.language.provider, "language")?;
+        validate_loopback_http_endpoint(&self.language.endpoint, "language")?;
+
+        let language: Arc<dyn GenerationLanguageModel> =
+            Arc::new(OllamaLanguageModel::new_direct(self.language_config()?));
+        let quality = self.quality_controller()?;
+        let memory = self.memory.as_ref().map(memory_adapters).transpose()?;
+        let (memory_provider, memory_store) = match memory {
+            Some((provider, store)) => (Some(provider), Some(store)),
+            None => (None, None),
+        };
+        let mut context = ConversationContext::new(quality);
+        if let Some(provider) = memory_provider {
+            context = context
+                .with_memory_provider(Arc::new(provider), ExecutionLocation::Local)
+                .map_err(runtime_error)?;
+        }
+
+        let language_component = local_component(
+            ComponentKind::LanguageModel,
+            &self.language.provider,
+            "language",
+        )?;
+        let memory_component = memory_store.as_ref().map(|_| {
+            ComponentDescriptor::new(ComponentKind::Memory, "sqlite", ExecutionLocation::Local)
+        });
+        let voice = self
+            .voice
+            .as_ref()
+            .map(|voice| voice.build(language_component.clone(), memory_component.clone()))
+            .transpose()?;
+
+        let component_descriptors = if let Some(voice) = voice.as_ref() {
+            voice.policy.components().to_vec()
+        } else {
+            let mut components = vec![language_component];
+            components.extend(memory_component);
+            components
+        };
+        let components = component_descriptors
+            .iter()
+            .map(ClientComponentDescriptor::from)
+            .collect();
+        let memory_enabled = memory_store.is_some();
+        let mut capabilities = vec!["text".to_owned()];
+        if memory_enabled {
+            capabilities.push("memory_inspection".to_owned());
+        }
+        if voice.is_some() {
+            capabilities.push("voice_session".to_owned());
+        }
+        let status = RuntimeStatus {
+            transport: "stdio".to_owned(),
+            privacy_mode: "local_only".to_owned(),
+            language_location: "local".to_owned(),
+            model_id: self.language.model.clone(),
+            memory_enabled,
+            memory_location: memory_enabled.then(|| "local".to_owned()),
+            telemetry_enabled: false,
+            capabilities,
+            components,
+        };
+
+        Ok(GatewayAdapters {
+            context,
+            language,
+            voice,
+            memory_store,
+            status,
+        })
     }
 
-    fn build_adapters(&self) -> Result<GatewayAdapters, GatewayConfigError> {
+    fn language_config(&self) -> Result<OllamaConfig, GatewayConfigError> {
         if self.language.model.len() > MAX_MODEL_ID_BYTES {
             return Err(config_error("language model identifier exceeded 256 bytes"));
         }
@@ -111,7 +197,10 @@ impl GatewayConfig {
                 "language temperature must be finite and non-negative",
             ));
         }
+        Ok(language)
+    }
 
+    fn quality_controller(&self) -> Result<ConversationQualityController, GatewayConfigError> {
         let persona = PersonaProfile::new(
             persona_level(self.persona.warmth)?,
             persona_level(self.persona.humor)?,
@@ -130,23 +219,133 @@ impl GatewayConfig {
             SilencePolicy::AllowWithoutFiller,
         )
         .map_err(|error| config_error(error.message()))?;
-        let memory = self.memory.as_ref().map(memory_adapters).transpose()?;
-        let (memory_provider, memory_store) = match memory {
-            Some((provider, store)) => (Some(provider), Some(store)),
-            None => (None, None),
-        };
+        Ok(ConversationQualityController::new(
+            persona,
+            controls,
+            self.persona.mode.into(),
+        ))
+    }
+}
 
-        Ok(GatewayAdapters {
-            language: OllamaLanguageModel::new_direct(language),
-            quality: ConversationQualityController::new(
-                persona,
-                controls,
-                self.persona.mode.into(),
-            ),
-            memory_provider,
-            memory_store,
-            model_id: self.language.model.clone(),
+impl VoiceConfig {
+    fn build(
+        &self,
+        language: ComponentDescriptor,
+        memory: Option<ComponentDescriptor>,
+    ) -> Result<GatewayVoiceAdapters, GatewayConfigError> {
+        match (
+            self.capture.device,
+            self.asr.backend,
+            self.speech.backend,
+            self.audio.backend,
+        ) {
+            (
+                VoiceCaptureDevice::SystemDefault,
+                VoiceAsrBackend::Whisperkit,
+                VoiceSpeechBackend::OpenaiCompatible,
+                VoiceAudioBackend::ManagedSidecar,
+            ) => {}
+        }
+        require_local_execution(self.asr.execution, "voice ASR")?;
+        require_local_execution(self.speech.execution, "voice speech")?;
+        require_local_execution(self.audio.execution, "voice audio")?;
+        if self.asr.download {
+            return Err(config_error("voice ASR model download must be disabled"));
+        }
+        if !self.asr.model_path.is_absolute() {
+            return Err(config_error("voice ASR model path must be absolute"));
+        }
+        if !self.asr.model_path.is_dir() {
+            return Err(config_error(
+                "voice ASR model path must be an existing directory",
+            ));
+        }
+        validate_loopback_http_endpoint(&self.speech.endpoint, "voice speech")?;
+
+        let recognition = local_component(
+            ComponentKind::SpeechRecognition,
+            &self.asr.provider,
+            "voice ASR",
+        )?;
+        let speech_component = local_component(
+            ComponentKind::SpeechSynthesis,
+            &self.speech.provider,
+            "voice speech",
+        )?;
+        let audio = local_component(ComponentKind::AudioIo, &self.audio.provider, "voice audio")?;
+        let mut components = vec![recognition, language, speech_component, audio];
+        components.extend(memory);
+        let policy = VoicePolicyTemplate::new(
+            ProtocolPrivacyMode::LocalOnly,
+            self.turn.speech_start_ms,
+            self.turn.final_silence_ms,
+            components,
+        )
+        .map_err(runtime_error)?;
+
+        let sidecar = MacOsVoiceSidecarConfig::new(
+            &self.audio.sidecar_executable,
+            &self.asr.model_path,
+            SystemDevice::SystemDefault,
+            self.asr.download,
+            self.turn.speech_start_ms,
+            self.turn.final_silence_ms,
+        )
+        .map_err(adapter_error)?
+        .with_max_stderr_bytes(self.audio.max_error_bytes)
+        .map_err(adapter_error)?;
+
+        Ok(GatewayVoiceAdapters {
+            io: Arc::new(MacOsVoiceSidecar::new(sidecar)),
+            speech: self.speech.synthesizer()?,
+            policy,
         })
+    }
+}
+
+impl VoiceSpeechConfig {
+    fn synthesizer(&self) -> Result<Arc<dyn StreamingSpeechSynthesizer>, GatewayConfigError> {
+        let speech = OpenAiCompatibleSpeechConfig::new(&self.model)
+            .map_err(adapter_error)?
+            .with_endpoint(&self.endpoint)
+            .map_err(adapter_error)?
+            .with_voice(&self.voice)
+            .map_err(adapter_error)?
+            .with_speed(self.speed)
+            .map_err(adapter_error)?
+            .with_language(&self.language)
+            .map_err(adapter_error)?
+            .with_instructions(&self.instructions)
+            .map_err(adapter_error)?
+            .with_max_tokens(self.max_tokens)
+            .map_err(adapter_error)?
+            .with_repetition_penalty(self.repetition_penalty)
+            .map_err(adapter_error)?
+            .with_max_text_bytes(self.max_text_bytes)
+            .map_err(adapter_error)?
+            .with_max_audio_bytes(self.max_audio_bytes)
+            .map_err(adapter_error)?;
+
+        match (self.mode, self.streaming_interval) {
+            (VoiceSpeechMode::Buffered, None) => {
+                let buffered: Arc<dyn SpeechSynthesizer> =
+                    Arc::new(OpenAiCompatibleSpeechSynthesizer::new(speech));
+                Ok(Arc::new(BufferedStreamingSpeechSynthesizer::new(buffered)))
+            }
+            (VoiceSpeechMode::Buffered, Some(_)) => Err(config_error(
+                "voice speech streaming_interval is only valid in streaming mode",
+            )),
+            (VoiceSpeechMode::Streaming, None) => Err(config_error(
+                "voice streaming speech requires streaming_interval",
+            )),
+            (VoiceSpeechMode::Streaming, Some(interval)) => {
+                let streaming = OpenAiCompatibleStreamingSpeechConfig::new(speech, interval)
+                    .map_err(adapter_error)?;
+                Ok(Arc::new(OpenAiCompatibleStreamingSpeechSynthesizer::new(
+                    streaming,
+                )))
+            }
+        }
     }
 }
 
@@ -197,31 +396,73 @@ fn open_config_file(_path: &Path) -> Result<fs::File, GatewayConfigError> {
     ))
 }
 
-fn validate_loopback_http_endpoint(endpoint: &str) -> Result<(), GatewayConfigError> {
+fn validate_loopback_http_endpoint(
+    endpoint: &str,
+    component: &str,
+) -> Result<(), GatewayConfigError> {
     let endpoint = reqwest::Url::parse(endpoint)
-        .map_err(|_| config_error("language endpoint must be a valid URL"))?;
+        .map_err(|_| config_error(format!("{component} endpoint must be a valid URL")))?;
     if endpoint.scheme() != "http" {
-        return Err(config_error("language endpoint must use plain HTTP"));
+        return Err(config_error(format!(
+            "{component} endpoint must use plain HTTP"
+        )));
     }
     if !endpoint.username().is_empty()
         || endpoint.password().is_some()
         || endpoint.query().is_some()
         || endpoint.fragment().is_some()
     {
-        return Err(config_error(
-            "language endpoint must not contain credentials, a query, or a fragment",
-        ));
+        return Err(config_error(format!(
+            "{component} endpoint must not contain credentials, a query, or a fragment"
+        )));
     }
     let address = endpoint
         .host_str()
         .and_then(|host| host.parse::<IpAddr>().ok())
-        .ok_or_else(|| config_error("language endpoint must use a loopback IP address"))?;
+        .ok_or_else(|| {
+            config_error(format!(
+                "{component} endpoint must use a loopback IP address"
+            ))
+        })?;
     if !address.is_loopback() {
-        return Err(config_error(
-            "language endpoint must use a loopback IP address",
-        ));
+        return Err(config_error(format!(
+            "{component} endpoint must use a loopback IP address"
+        )));
     }
     Ok(())
+}
+
+fn require_local_execution(
+    execution: ExecutionConfig,
+    component: &str,
+) -> Result<(), GatewayConfigError> {
+    if matches!(execution, ExecutionConfig::Local) {
+        Ok(())
+    } else {
+        Err(config_error(format!("{component} execution must be local")))
+    }
+}
+
+fn validate_provider_label(label: &str, component: &str) -> Result<(), GatewayConfigError> {
+    if label.is_empty() || label.trim() != label || label.len() > MAX_CLIENT_PROVIDER_LABEL_BYTES {
+        return Err(config_error(format!(
+            "{component} provider label must be trimmed and within 1..=128 bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn local_component(
+    kind: ComponentKind,
+    provider: &str,
+    name: &str,
+) -> Result<ComponentDescriptor, GatewayConfigError> {
+    validate_provider_label(provider, name)?;
+    Ok(ComponentDescriptor::new(
+        kind,
+        provider,
+        ExecutionLocation::Local,
+    ))
 }
 
 fn memory_adapters(
@@ -249,20 +490,28 @@ fn memory_error(error: conversation_memory::MemoryStoreError) -> GatewayConfigEr
     config_error(error.to_string())
 }
 
+fn runtime_error(error: conversation_protocol::RuntimeError) -> GatewayConfigError {
+    config_error(error.message())
+}
+
 fn config_error(message: impl Into<String>) -> GatewayConfigError {
     GatewayConfigError(message.into())
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-enum PrivacyMode {
+enum GatewayPrivacyMode {
     LocalOnly,
+    Hybrid,
+    Cloud,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LanguageConfig {
     backend: LanguageBackend,
+    execution: ExecutionConfig,
+    provider: String,
     endpoint: String,
     model: String,
     #[serde(default)]
@@ -321,4 +570,105 @@ struct MemoryConfig {
     database: PathBuf,
     maximum_items: usize,
     maximum_bytes: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VoiceConfig {
+    capture: VoiceCaptureConfig,
+    turn: VoiceTurnConfig,
+    asr: VoiceAsrConfig,
+    speech: VoiceSpeechConfig,
+    audio: VoiceAudioConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VoiceCaptureConfig {
+    device: VoiceCaptureDevice,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum VoiceCaptureDevice {
+    SystemDefault,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VoiceTurnConfig {
+    speech_start_ms: u64,
+    final_silence_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VoiceAsrConfig {
+    backend: VoiceAsrBackend,
+    execution: ExecutionConfig,
+    provider: String,
+    model_path: PathBuf,
+    download: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum VoiceAsrBackend {
+    Whisperkit,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VoiceSpeechConfig {
+    backend: VoiceSpeechBackend,
+    execution: ExecutionConfig,
+    provider: String,
+    mode: VoiceSpeechMode,
+    streaming_interval: Option<f32>,
+    endpoint: String,
+    model: String,
+    voice: String,
+    speed: f32,
+    language: String,
+    instructions: String,
+    max_tokens: usize,
+    repetition_penalty: f32,
+    max_text_bytes: usize,
+    max_audio_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum VoiceSpeechBackend {
+    OpenaiCompatible,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum VoiceSpeechMode {
+    Buffered,
+    Streaming,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VoiceAudioConfig {
+    backend: VoiceAudioBackend,
+    execution: ExecutionConfig,
+    provider: String,
+    sidecar_executable: PathBuf,
+    max_error_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum VoiceAudioBackend {
+    ManagedSidecar,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ExecutionConfig {
+    Local,
+    Remote,
 }

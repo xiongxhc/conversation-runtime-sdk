@@ -19,6 +19,9 @@ const localStatus = {
   memory_location: null,
   telemetry_enabled: false,
   capabilities: ["text"],
+  components: [
+    { kind: "language_model", execution_location: "local", provider_label: "Local language" },
+  ],
 };
 
 const memoryPage: MemoryPage = {

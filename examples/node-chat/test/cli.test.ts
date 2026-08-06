@@ -533,6 +533,7 @@ class ScriptedTransport implements RuntimeTransport {
 
     this.inbox.push(runtimeEvent({
       type: "turn_started",
+      request_id: command.requestId,
       turn_id: turnId.toString(),
     }));
     if (this.script === "complete") {
@@ -687,6 +688,9 @@ function wireStatus(): RuntimeStatusWire {
     memory_location: null,
     telemetry_enabled: false,
     capabilities: ["text"],
+    components: [
+      { kind: "language_model", execution_location: "local", provider_label: "Local language" },
+    ],
   };
 }
 
@@ -699,4 +703,9 @@ type RuntimeStatusWire = {
   memory_location: "local" | null;
   telemetry_enabled: false;
   capabilities: ["text"];
+  components: [{
+    kind: "language_model";
+    execution_location: "local";
+    provider_label: string;
+  }];
 };

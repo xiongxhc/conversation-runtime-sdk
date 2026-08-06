@@ -1,4 +1,5 @@
 mod client_memory;
+mod client_voice;
 mod client_wire;
 mod command;
 mod error;
@@ -14,6 +15,10 @@ pub use client_memory::{
     ClientMemoryPage, ClientMemoryProvenance, ClientMemoryRecord, ClientMemoryRetention,
     ClientMemorySummary, MAX_MEMORY_INSPECTION_HISTORY_ITEMS, MAX_MEMORY_LIST_PAGE_ITEMS,
     MAX_MEMORY_PREVIEW_BYTES,
+};
+pub use client_voice::{
+    ClientComponentDescriptor, ClientPrivacySummary, ClientVoiceActivity, ClientVoiceSessionEvent,
+    MAX_CLIENT_COMPONENT_DESCRIPTORS, MAX_CLIENT_PROVIDER_LABEL_BYTES,
 };
 pub use client_wire::{
     decode_client_command, encode_gateway_message, ClientCommand, ClientMemoryTrace,

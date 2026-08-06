@@ -1,15 +1,19 @@
 use conversation_protocol::{
     decode_client_command, encode_gateway_message, memory_preview, ClientCommand,
-    ClientMemoryApproval, ClientMemoryCursor, ClientMemoryInspection, ClientMemoryProvenance,
-    ClientMemoryRecord, ClientMemoryRetention, ClientMemorySummary, ClientMemoryTrace,
-    ClientQualityDecision, ClientResponseControls, ClientRuntimeError, ClientRuntimeEvent,
-    ClientWireError, ContextSource, ConversationMode, ConversationSignal, FollowUpPolicy,
-    GatewayMessage, MemoryApproval, MemoryConfidence, MemoryDraft, MemoryId, MemoryInspection,
-    MemoryKind, MemoryProvenance, MemoryProvenanceKind, MemoryRecord, MemoryRetention,
-    MemoryRetrievalReason, MemoryRetrievalTrace, MemoryTraceExclusions, MemoryTraceItem,
-    PersonaLevel, QualityDecision, ResponseControls, RetrievalTraceId, RuntimeError,
-    RuntimeErrorKind, RuntimeEvent, RuntimeStage, RuntimeStatus, SilencePolicy, SpeechPace, TurnId,
-    UnixTimestampMillis, CLIENT_PROTOCOL_VERSION, MAX_CLIENT_FRAME_BYTES, MAX_MEMORY_PREVIEW_BYTES,
+    ClientComponentDescriptor, ClientMemoryApproval, ClientMemoryCursor, ClientMemoryInspection,
+    ClientMemoryProvenance, ClientMemoryRecord, ClientMemoryRetention, ClientMemorySummary,
+    ClientMemoryTrace, ClientQualityDecision, ClientResponseControls, ClientRuntimeError,
+    ClientRuntimeEvent, ClientVoiceSessionEvent, ClientWireError, ComponentDescriptor,
+    ComponentKind, ContextSource, ConversationMode, ConversationSignal, ExecutionLocation,
+    FollowUpPolicy, GatewayMessage, GenerationId, MemoryApproval, MemoryConfidence, MemoryDraft,
+    MemoryId, MemoryInspection, MemoryKind, MemoryProvenance, MemoryProvenanceKind, MemoryRecord,
+    MemoryRetention, MemoryRetrievalReason, MemoryRetrievalTrace, MemoryTraceExclusions,
+    MemoryTraceItem, PersonaLevel, PlaybackState, PrivacyMode, PrivacySummary, QualityDecision,
+    RecoveryDisposition, ResponseControls, RetrievalTraceId, RuntimeError, RuntimeErrorKind,
+    RuntimeEvent, RuntimeStage, RuntimeStatus, SessionId, SilencePolicy, SpeechPace, TurnId,
+    UnixTimestampMillis, VoiceActivity, VoiceSessionEvent, VoiceTimingMilestone,
+    CLIENT_PROTOCOL_VERSION, MAX_CLIENT_COMPONENT_DESCRIPTORS, MAX_CLIENT_FRAME_BYTES,
+    MAX_CLIENT_PROVIDER_LABEL_BYTES, MAX_CONVERSATION_MESSAGE_BYTES, MAX_MEMORY_PREVIEW_BYTES,
 };
 use serde::{Deserialize, Deserializer};
 
@@ -27,7 +31,29 @@ fn status() -> RuntimeStatus {
         memory_location: None,
         telemetry_enabled: false,
         capabilities: vec!["text".to_owned()],
+        components: vec![client_component("language_model", "Local language")],
     }
+}
+
+fn client_component(kind: &str, provider_label: &str) -> ClientComponentDescriptor {
+    ClientComponentDescriptor {
+        kind: kind.to_owned(),
+        execution_location: "local".to_owned(),
+        provider_label: provider_label.to_owned(),
+    }
+}
+
+fn core_component(kind: ComponentKind, provider: &str) -> ComponentDescriptor {
+    ComponentDescriptor::new(kind, provider, ExecutionLocation::Local)
+}
+
+fn voice_components() -> Vec<ClientComponentDescriptor> {
+    vec![
+        client_component("speech_recognition", "Local speech recognition"),
+        client_component("language_model", "Local language"),
+        client_component("speech_synthesis", "Local speech synthesis"),
+        client_component("audio_io", "Local audio"),
+    ]
 }
 
 fn runtime_error() -> ClientRuntimeError {
@@ -148,6 +174,284 @@ fn accepted_start_turns_carry_the_gateway_allocated_identifier() {
     assert_eq!(value["protocol_version"], 3);
     assert_eq!(value["request_id"], "req-1");
     assert_eq!(value["turn_id"], "9");
+}
+
+#[test]
+fn version_three_voice_controls_decode_without_client_selected_identifiers() {
+    let cases = [
+        ("start_voice_session", "start"),
+        ("stop_voice_session", "stop"),
+        ("pause_voice_capture", "pause"),
+        ("resume_voice_capture", "resume"),
+    ];
+
+    for (command_type, expected) in cases {
+        let payload = format!(
+            r#"{{"protocol_version":3,"type":"{command_type}","request_id":"req-{expected}"}}"#
+        );
+        let command = decode_client_command(payload.as_bytes()).unwrap();
+        assert!(
+            matches!(
+                (expected, command),
+                ("start", ClientCommand::StartVoiceSession { .. })
+                    | ("stop", ClientCommand::StopVoiceSession { .. })
+                    | ("pause", ClientCommand::PauseVoiceCapture { .. })
+                    | ("resume", ClientCommand::ResumeVoiceCapture { .. })
+            ),
+            "{command_type}"
+        );
+    }
+}
+
+#[test]
+fn typed_start_projection_carries_request_correlation_and_exact_final_text() {
+    let started = ClientRuntimeEvent::TurnStarted {
+        request_id: Some("req-1".to_owned()),
+        turn_id: TurnId::new(1),
+    };
+    let completed = ClientRuntimeEvent::try_from(RuntimeEvent::TextCompleted {
+        turn_id: TurnId::new(1),
+        text: "exact answer".to_owned(),
+    })
+    .unwrap();
+
+    assert_eq!(
+        gateway_value(&GatewayMessage::RuntimeEvent { event: started }),
+        serde_json::json!({
+            "protocol_version": 3,
+            "type": "runtime_event",
+            "event": {"type": "turn_started", "request_id": "req-1", "turn_id": "1"}
+        })
+    );
+    assert_eq!(
+        gateway_value(&GatewayMessage::RuntimeEvent { event: completed }),
+        serde_json::json!({
+            "protocol_version": 3,
+            "type": "runtime_event",
+            "event": {"type": "text_completed", "turn_id": "1", "text": "exact answer"}
+        })
+    );
+}
+
+#[test]
+fn voice_events_project_every_approved_lifecycle_variant() {
+    let session_id = SessionId::new(1);
+    let turn_id = TurnId::new(1);
+    let generation_id = GenerationId::new(1);
+    let privacy = PrivacySummary::new(
+        PrivacyMode::LocalOnly,
+        [
+            core_component(ComponentKind::SpeechRecognition, "Local speech recognition"),
+            core_component(ComponentKind::LanguageModel, "Local language"),
+            core_component(ComponentKind::SpeechSynthesis, "Local speech synthesis"),
+            core_component(ComponentKind::AudioIo, "Local audio"),
+        ],
+    );
+    let failure = RuntimeError::new(
+        RuntimeErrorKind::Adapter,
+        RuntimeStage::SpeechRecognizer,
+        "recognition unavailable",
+    );
+    let events = vec![
+        VoiceSessionEvent::SessionStarted {
+            session_id,
+            privacy,
+        },
+        VoiceSessionEvent::CapturePaused { session_id },
+        VoiceSessionEvent::CaptureResumed { session_id },
+        VoiceSessionEvent::VoiceActivity {
+            session_id,
+            activity: VoiceActivity::SpeechStarted { at_ms: 10 },
+        },
+        VoiceSessionEvent::TranscriptPartial {
+            session_id,
+            segment_id: 1,
+            text: "hel".to_owned(),
+        },
+        VoiceSessionEvent::TranscriptFinal {
+            session_id,
+            turn_id,
+            text: "hello".to_owned(),
+        },
+        VoiceSessionEvent::BargeIn {
+            session_id,
+            turn_id,
+            generation_id,
+        },
+        VoiceSessionEvent::Turn {
+            session_id,
+            generation_id,
+            event: RuntimeEvent::TurnStarted { turn_id },
+        },
+        VoiceSessionEvent::Turn {
+            session_id,
+            generation_id,
+            event: RuntimeEvent::TextCompleted {
+                turn_id,
+                text: "exact answer".to_owned(),
+            },
+        },
+        VoiceSessionEvent::Timing {
+            session_id,
+            turn_id: Some(turn_id),
+            milestone: VoiceTimingMilestone::FirstPlayableAudio,
+            elapsed_ms: 42,
+        },
+        VoiceSessionEvent::Playback {
+            session_id,
+            generation_id,
+            state: PlaybackState::Rendered,
+        },
+        VoiceSessionEvent::SessionFailed {
+            session_id,
+            error: failure,
+            recovery: RecoveryDisposition::ContinueSession,
+        },
+        VoiceSessionEvent::SessionEnded { session_id },
+    ];
+
+    let encoded = events
+        .into_iter()
+        .map(|event| {
+            let event = event.try_into().unwrap();
+            gateway_value(&GatewayMessage::VoiceEvent { event })
+        })
+        .collect::<Vec<_>>();
+    let fixture_events = include_str!("../../../tests/fixtures/client-wire-v3/events.jsonl")
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|value| value["type"] == "voice_event")
+        .collect::<Vec<_>>();
+
+    assert_eq!(encoded, fixture_events);
+}
+
+#[test]
+fn runtime_status_accepts_only_canonical_capability_and_component_combinations() {
+    let memory_component = client_component("memory", "Local memory");
+    let valid_statuses = [
+        status(),
+        RuntimeStatus {
+            memory_enabled: true,
+            memory_location: Some("local".to_owned()),
+            capabilities: vec!["text".to_owned(), "memory_inspection".to_owned()],
+            components: vec![
+                client_component("language_model", "Local language"),
+                memory_component.clone(),
+            ],
+            ..status()
+        },
+        RuntimeStatus {
+            capabilities: vec!["text".to_owned(), "voice_session".to_owned()],
+            components: voice_components(),
+            ..status()
+        },
+        RuntimeStatus {
+            memory_enabled: true,
+            memory_location: Some("local".to_owned()),
+            capabilities: vec![
+                "text".to_owned(),
+                "memory_inspection".to_owned(),
+                "voice_session".to_owned(),
+            ],
+            components: voice_components()
+                .into_iter()
+                .chain([memory_component])
+                .collect(),
+            ..status()
+        },
+    ];
+
+    let encoded_statuses = valid_statuses
+        .iter()
+        .map(|status| {
+            gateway_value(&GatewayMessage::Ready {
+                status: status.clone(),
+            })["status"]
+                .clone()
+        })
+        .collect::<Vec<_>>();
+    let fixture_statuses = include_str!("../../../tests/fixtures/client-wire-v3/events.jsonl")
+        .lines()
+        .take(4)
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["status"].clone())
+        .collect::<Vec<_>>();
+
+    assert_eq!(encoded_statuses, fixture_statuses);
+
+    let invalid_statuses = [
+        RuntimeStatus {
+            capabilities: vec!["voice_session".to_owned(), "text".to_owned()],
+            components: voice_components(),
+            ..status()
+        },
+        RuntimeStatus {
+            capabilities: vec!["text".to_owned(), "voice_session".to_owned()],
+            components: voice_components().into_iter().take(3).collect(),
+            ..status()
+        },
+        RuntimeStatus {
+            capabilities: vec!["text".to_owned(), "voice_session".to_owned()],
+            components: voice_components()
+                .into_iter()
+                .map(|mut component| {
+                    if component.kind == "audio_io" {
+                        component.execution_location = "remote".to_owned();
+                    }
+                    component
+                })
+                .collect(),
+            ..status()
+        },
+        RuntimeStatus {
+            capabilities: vec!["text".to_owned(), "voice_session".to_owned()],
+            components: voice_components()
+                .into_iter()
+                .map(|mut component| {
+                    if component.kind == "audio_io" {
+                        component.provider_label = "x".repeat(MAX_CLIENT_PROVIDER_LABEL_BYTES + 1);
+                    }
+                    component
+                })
+                .collect(),
+            ..status()
+        },
+        RuntimeStatus {
+            components: [client_component("language_model", "Local language")]
+                .into_iter()
+                .chain(
+                    (0..MAX_CLIENT_COMPONENT_DESCRIPTORS)
+                        .map(|_| client_component("tool", "Local tool")),
+                )
+                .collect(),
+            ..status()
+        },
+    ];
+
+    for invalid in invalid_statuses {
+        assert!(matches!(
+            encode_gateway_message(&GatewayMessage::Ready { status: invalid }),
+            Err(ClientWireError::InvalidRuntimeStatus)
+        ));
+    }
+}
+
+#[test]
+fn maximum_valid_voice_payload_stays_below_the_frame_limit() {
+    let event = VoiceSessionEvent::Turn {
+        session_id: SessionId::new(u64::MAX),
+        generation_id: GenerationId::new(u64::MAX),
+        event: RuntimeEvent::TextCompleted {
+            turn_id: TurnId::new(u64::MAX),
+            text: "x".repeat(MAX_CONVERSATION_MESSAGE_BYTES),
+        },
+    }
+    .try_into()
+    .unwrap();
+
+    let encoded = encode_gateway_message(&GatewayMessage::VoiceEvent { event }).unwrap();
+
+    assert!(encoded.len() < MAX_CLIENT_FRAME_BYTES);
 }
 
 #[test]
@@ -475,6 +779,54 @@ fn runtime_events_project_content_free_fields_and_decimal_identifiers() {
 }
 
 #[test]
+fn root_runtime_messages_reject_voice_only_event_variants() {
+    for event in [
+        ClientRuntimeEvent::TranscriptFinal {
+            turn_id: TurnId::new(1),
+            text: "hello".to_owned(),
+        },
+        ClientRuntimeEvent::SpeechStarted {
+            turn_id: TurnId::new(1),
+        },
+        ClientRuntimeEvent::SpeechCompleted {
+            turn_id: TurnId::new(1),
+        },
+    ] {
+        assert!(matches!(
+            encode_gateway_message(&GatewayMessage::RuntimeEvent { event }),
+            Err(ClientWireError::UnsupportedRuntimeEvent { .. })
+        ));
+    }
+}
+
+#[test]
+fn voice_transcript_and_response_fields_enforce_conversation_bounds() {
+    let oversized = "x".repeat(MAX_CONVERSATION_MESSAGE_BYTES + 1);
+    for event in [
+        VoiceSessionEvent::TranscriptPartial {
+            session_id: SessionId::new(1),
+            segment_id: 1,
+            text: oversized.clone(),
+        },
+        VoiceSessionEvent::TranscriptFinal {
+            session_id: SessionId::new(1),
+            turn_id: TurnId::new(1),
+            text: oversized.clone(),
+        },
+        VoiceSessionEvent::Turn {
+            session_id: SessionId::new(1),
+            generation_id: GenerationId::new(1),
+            event: RuntimeEvent::TextCompleted {
+                turn_id: TurnId::new(1),
+                text: oversized,
+            },
+        },
+    ] {
+        assert!(ClientVoiceSessionEvent::try_from(event).is_err());
+    }
+}
+
+#[test]
 fn encoded_messages_never_use_numeric_u64_ids_and_are_frame_bounded() {
     let encoded = encode_gateway_message(&GatewayMessage::RuntimeEvent {
         event: ClientRuntimeEvent::TurnCompleted {
@@ -534,6 +886,10 @@ fn outgoing_status_rejects_incoherent_memory_capabilities() {
         memory_enabled: true,
         memory_location: Some("local".to_owned()),
         capabilities: vec!["text".to_owned(), "memory_inspection".to_owned()],
+        components: vec![
+            client_component("language_model", "Local language"),
+            client_component("memory", "Local memory"),
+        ],
         ..status()
     };
     assert!(encode_gateway_message(&GatewayMessage::Ready {
@@ -710,6 +1066,7 @@ fn outgoing_events_reject_zero_turn_identifiers_in_every_wire_position() {
     let messages = [
         GatewayMessage::RuntimeEvent {
             event: ClientRuntimeEvent::TurnStarted {
+                request_id: None,
                 turn_id: zero_turn_id,
             },
         },
@@ -775,12 +1132,46 @@ fn outgoing_events_reject_zero_turn_identifiers_in_every_wire_position() {
 }
 
 fn parse_event_fixture(payload: &str) -> Result<(), String> {
+    let value: serde_json::Value =
+        serde_json::from_str(payload).map_err(|error| error.to_string())?;
+    validate_required_nullable_keys(&value)?;
     let message: FixtureGatewayMessage =
         serde_json::from_str(payload).map_err(|error| error.to_string())?;
     if message.protocol_version() != CLIENT_PROTOCOL_VERSION {
         return Err("unsupported protocol version".to_owned());
     }
     message.validate()?;
+    Ok(())
+}
+
+fn validate_required_nullable_keys(value: &serde_json::Value) -> Result<(), String> {
+    let Some(message) = value.as_object() else {
+        return Err("gateway message is not an object".to_owned());
+    };
+    if message.get("type").and_then(serde_json::Value::as_str) != Some("voice_event") {
+        return Ok(());
+    }
+    let event = message
+        .get("event")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "voice event is not an object".to_owned())?;
+    match event.get("type").and_then(serde_json::Value::as_str) {
+        Some("voice_turn_event") => {
+            let nested = event
+                .get("event")
+                .and_then(serde_json::Value::as_object)
+                .ok_or_else(|| "voice turn event is not an object".to_owned())?;
+            if nested.get("type").and_then(serde_json::Value::as_str) == Some("turn_started")
+                && !nested.contains_key("request_id")
+            {
+                return Err("voice turn start is missing request_id".to_owned());
+            }
+        }
+        Some("voice_timing") if !event.contains_key("turn_id") => {
+            return Err("voice timing is missing turn_id".to_owned());
+        }
+        _ => {}
+    }
     Ok(())
 }
 
@@ -795,6 +1186,8 @@ enum FixtureGatewayMessage {
     CommandAccepted {
         protocol_version: u64,
         request_id: FixtureRequestId,
+        #[serde(default)]
+        turn_id: FixtureOptionalIdentifier,
     },
     CommandRejected {
         protocol_version: u64,
@@ -820,6 +1213,10 @@ enum FixtureGatewayMessage {
     RuntimeEvent {
         protocol_version: u64,
         event: FixtureRuntimeEvent,
+    },
+    VoiceEvent {
+        protocol_version: u64,
+        event: FixtureVoiceSessionEvent,
     },
     Fatal {
         protocol_version: u64,
@@ -851,6 +1248,9 @@ impl FixtureGatewayMessage {
             | Self::RuntimeEvent {
                 protocol_version, ..
             }
+            | Self::VoiceEvent {
+                protocol_version, ..
+            }
             | Self::Fatal {
                 protocol_version, ..
             } => *protocol_version,
@@ -864,6 +1264,8 @@ impl FixtureGatewayMessage {
                 Err("memory list exceeds 50 records".to_owned())
             }
             Self::MemoryInspection { inspection, .. } => inspection.validate(),
+            Self::RuntimeEvent { event, .. } => event.validate(true),
+            Self::VoiceEvent { event, .. } => event.validate(),
             _ => Ok(()),
         }
     }
@@ -881,22 +1283,141 @@ struct FixtureRuntimeStatus {
     memory_location: Option<String>,
     telemetry_enabled: bool,
     capabilities: Vec<String>,
+    components: Vec<FixtureComponentDescriptor>,
 }
 
 impl FixtureRuntimeStatus {
     fn validate(&self) -> Result<(), String> {
-        let disabled =
-            !self.memory_enabled && self.memory_location.is_none() && self.capabilities == ["text"];
-        let inspectable_local = self.memory_enabled
-            && self.memory_location.as_deref() == Some("local")
-            && self.capabilities == ["text", "memory_inspection"];
+        if self.transport != "stdio"
+            || self.privacy_mode != "local_only"
+            || self.language_location != "local"
+            || self.model_id.trim().is_empty()
+            || self.telemetry_enabled
+        {
+            return Err("runtime status enum is invalid".to_owned());
+        }
+        validate_fixture_components(&self.components)?;
+        if self
+            .components
+            .iter()
+            .any(|component| component.execution_location != FixtureExecutionLocation::Local)
+            || self
+                .components
+                .iter()
+                .filter(|component| component.kind == FixtureComponentKind::LanguageModel)
+                .count()
+                != 1
+        {
+            return Err("runtime components are invalid".to_owned());
+        }
 
-        if disabled || inspectable_local {
-            Ok(())
-        } else {
-            Err("runtime memory status is incoherent".to_owned())
+        let memory = self.capabilities == ["text", "memory_inspection"]
+            || self.capabilities == ["text", "memory_inspection", "voice_session"];
+        let voice = self.capabilities == ["text", "voice_session"]
+            || self.capabilities == ["text", "memory_inspection", "voice_session"];
+        if self.capabilities != ["text"]
+            && self.capabilities != ["text", "memory_inspection"]
+            && self.capabilities != ["text", "voice_session"]
+            && self.capabilities != ["text", "memory_inspection", "voice_session"]
+        {
+            return Err("runtime capabilities are not canonical".to_owned());
+        }
+        let memory_descriptors = self
+            .components
+            .iter()
+            .filter(|component| component.kind == FixtureComponentKind::Memory)
+            .count();
+        if memory
+            != (self.memory_enabled
+                && self.memory_location.as_deref() == Some("local")
+                && memory_descriptors == 1)
+            || (!memory
+                && (self.memory_enabled
+                    || self.memory_location.is_some()
+                    || memory_descriptors != 0))
+        {
+            return Err("runtime memory status is incoherent".to_owned());
+        }
+        if voice {
+            validate_fixture_voice_components(&self.privacy_mode, &self.components)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FixtureComponentDescriptor {
+    kind: FixtureComponentKind,
+    execution_location: FixtureExecutionLocation,
+    provider_label: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(rename_all = "snake_case")]
+enum FixtureComponentKind {
+    SpeechRecognition,
+    LanguageModel,
+    SpeechSynthesis,
+    AudioIo,
+    Tool,
+    Memory,
+    Telemetry,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum FixtureExecutionLocation {
+    Local,
+    Remote,
+}
+
+fn validate_fixture_components(components: &[FixtureComponentDescriptor]) -> Result<(), String> {
+    if components.is_empty() || components.len() > 32 {
+        return Err("component descriptor count is invalid".to_owned());
+    }
+    for pair in components.windows(2) {
+        if pair[0].kind > pair[1].kind {
+            return Err("component descriptors are not canonical".to_owned());
         }
     }
+    if components.iter().any(|component| {
+        component.provider_label.trim().is_empty()
+            || component.provider_label.len() > MAX_CLIENT_PROVIDER_LABEL_BYTES
+    }) {
+        return Err("component provider label is invalid".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_fixture_voice_components(
+    privacy_mode: &str,
+    components: &[FixtureComponentDescriptor],
+) -> Result<(), String> {
+    validate_fixture_components(components)?;
+    if privacy_mode != "local_only"
+        || components
+            .iter()
+            .any(|component| component.execution_location != FixtureExecutionLocation::Local)
+    {
+        return Err("voice privacy is not local only".to_owned());
+    }
+    for kind in [
+        FixtureComponentKind::SpeechRecognition,
+        FixtureComponentKind::LanguageModel,
+        FixtureComponentKind::SpeechSynthesis,
+        FixtureComponentKind::AudioIo,
+    ] {
+        if components
+            .iter()
+            .filter(|component| component.kind == kind)
+            .count()
+            != 1
+        {
+            return Err("voice component is missing or duplicated".to_owned());
+        }
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -927,7 +1448,12 @@ enum FixtureRuntimeErrorCode {
 #[allow(dead_code)]
 enum FixtureRuntimeEvent {
     TurnStarted {
+        request_id: FixtureNullableRequestId,
         turn_id: FixtureIdentifier,
+    },
+    TranscriptFinal {
+        turn_id: FixtureIdentifier,
+        text: String,
     },
     QualityResolved {
         decision: FixtureQualityDecision,
@@ -938,6 +1464,16 @@ enum FixtureRuntimeEvent {
     TextDelta {
         turn_id: FixtureIdentifier,
         delta: String,
+    },
+    TextCompleted {
+        turn_id: FixtureIdentifier,
+        text: String,
+    },
+    SpeechStarted {
+        turn_id: FixtureIdentifier,
+    },
+    SpeechCompleted {
+        turn_id: FixtureIdentifier,
     },
     Timing {
         turn_id: FixtureIdentifier,
@@ -954,6 +1490,203 @@ enum FixtureRuntimeEvent {
         turn_id: FixtureIdentifier,
         error: FixtureRuntimeError,
     },
+}
+
+impl FixtureRuntimeEvent {
+    fn turn_id(&self) -> u64 {
+        match self {
+            Self::TurnStarted { turn_id, .. }
+            | Self::TranscriptFinal { turn_id, .. }
+            | Self::TextDelta { turn_id, .. }
+            | Self::TextCompleted { turn_id, .. }
+            | Self::SpeechStarted { turn_id }
+            | Self::SpeechCompleted { turn_id }
+            | Self::Timing { turn_id, .. }
+            | Self::TurnCompleted { turn_id }
+            | Self::TurnCancelled { turn_id }
+            | Self::TurnFailed { turn_id, .. } => turn_id.0,
+            Self::QualityResolved { decision } => decision.turn_id.0,
+            Self::MemoryRetrieved { trace } => trace.turn_id.0,
+        }
+    }
+
+    fn validate(&self, typed: bool) -> Result<(), String> {
+        match self {
+            Self::TurnStarted { request_id, .. } if typed != request_id.is_some() => {
+                Err("turn start correlation is invalid".to_owned())
+            }
+            Self::TranscriptFinal { text, .. } | Self::TextCompleted { text, .. }
+                if text.is_empty() || text.len() > MAX_CONVERSATION_MESSAGE_BYTES =>
+            {
+                Err("final text is invalid".to_owned())
+            }
+            Self::TextDelta { delta, .. } if delta.len() > MAX_CONVERSATION_MESSAGE_BYTES => {
+                Err("text delta is oversized".to_owned())
+            }
+            Self::Timing { milestone, .. }
+                if !matches!(
+                    milestone.as_str(),
+                    "first_text_delta" | "first_synthesis_request" | "first_playable_audio"
+                ) =>
+            {
+                Err("runtime timing milestone is invalid".to_owned())
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[allow(dead_code)]
+enum FixtureVoiceSessionEvent {
+    #[serde(rename = "voice_session_started")]
+    SessionStarted {
+        session_id: FixtureIdentifier,
+        privacy: FixturePrivacySummary,
+    },
+    #[serde(rename = "voice_capture_paused")]
+    CapturePaused { session_id: FixtureIdentifier },
+    #[serde(rename = "voice_capture_resumed")]
+    CaptureResumed { session_id: FixtureIdentifier },
+    #[serde(rename = "voice_activity")]
+    Activity {
+        session_id: FixtureIdentifier,
+        activity: FixtureVoiceActivity,
+    },
+    #[serde(rename = "voice_transcript_partial")]
+    TranscriptPartial {
+        session_id: FixtureIdentifier,
+        segment_id: FixtureIdentifier,
+        text: String,
+    },
+    #[serde(rename = "voice_transcript_final")]
+    TranscriptFinal {
+        session_id: FixtureIdentifier,
+        turn_id: FixtureIdentifier,
+        text: String,
+    },
+    #[serde(rename = "voice_barge_in")]
+    BargeIn {
+        session_id: FixtureIdentifier,
+        turn_id: FixtureIdentifier,
+        generation_id: FixtureIdentifier,
+    },
+    #[serde(rename = "voice_turn_event")]
+    TurnEvent {
+        session_id: FixtureIdentifier,
+        generation_id: FixtureIdentifier,
+        event: FixtureRuntimeEvent,
+    },
+    #[serde(rename = "voice_timing")]
+    Timing {
+        session_id: FixtureIdentifier,
+        turn_id: FixtureNullableIdentifier,
+        milestone: FixtureVoiceTimingMilestone,
+        elapsed_ms: u64,
+    },
+    #[serde(rename = "voice_playback")]
+    Playback {
+        session_id: FixtureIdentifier,
+        generation_id: FixtureIdentifier,
+        state: FixturePlaybackState,
+    },
+    #[serde(rename = "voice_session_failed")]
+    SessionFailed {
+        session_id: FixtureIdentifier,
+        error: FixtureRuntimeError,
+        recovery: FixtureRecoveryDisposition,
+    },
+    #[serde(rename = "voice_session_ended")]
+    SessionEnded { session_id: FixtureIdentifier },
+}
+
+impl FixtureVoiceSessionEvent {
+    fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::SessionStarted { privacy, .. } => privacy.validate(),
+            Self::TranscriptPartial { text, .. }
+                if text.is_empty() || text.len() > MAX_CONVERSATION_MESSAGE_BYTES =>
+            {
+                Err("partial transcript is invalid".to_owned())
+            }
+            Self::TranscriptFinal { text, .. }
+                if text.is_empty() || text.len() > MAX_CONVERSATION_MESSAGE_BYTES =>
+            {
+                Err("final transcript is invalid".to_owned())
+            }
+            Self::BargeIn {
+                turn_id,
+                generation_id,
+                ..
+            } if turn_id.0 != generation_id.0 => Err("barge-in identity mismatch".to_owned()),
+            Self::TurnEvent {
+                generation_id,
+                event,
+                ..
+            } if generation_id.0 != event.turn_id() => {
+                Err("voice turn identity mismatch".to_owned())
+            }
+            Self::TurnEvent { event, .. } => event.validate(false),
+            _ => Ok(()),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FixturePrivacySummary {
+    privacy_mode: String,
+    components: Vec<FixtureComponentDescriptor>,
+}
+
+impl FixturePrivacySummary {
+    fn validate(&self) -> Result<(), String> {
+        validate_fixture_voice_components(&self.privacy_mode, &self.components)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[allow(dead_code)]
+enum FixtureVoiceActivity {
+    #[serde(rename = "speech_started")]
+    Started { at_ms: u64 },
+    #[serde(rename = "speech_continued")]
+    Continued { at_ms: u64 },
+    #[serde(rename = "speech_ended")]
+    Ended { at_ms: u64 },
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum FixtureVoiceTimingMilestone {
+    SpeechEnd,
+    TranscriptFinal,
+    FirstTextDelta,
+    FirstSynthesisRequest,
+    FirstPlayableAudio,
+    FirstSidecarAccept,
+    PlaybackRenderAcknowledged,
+    BargeInOnset,
+    BargeInThreshold,
+    PlaybackFlushAcknowledged,
+    Cleanup,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum FixturePlaybackState {
+    Accepted,
+    Rendered,
+    Flushed,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum FixtureRecoveryDisposition {
+    ContinueSession,
+    NewSession,
 }
 
 #[derive(Deserialize)]
@@ -1180,7 +1913,59 @@ impl<'de> Deserialize<'de> for FixtureRequestId {
     }
 }
 
-struct FixtureIdentifier;
+struct FixtureNullableRequestId(Option<FixtureRequestId>);
+
+impl FixtureNullableRequestId {
+    fn is_some(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+impl<'de> Deserialize<'de> for FixtureNullableRequestId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Option::<String>::deserialize(deserializer)?;
+        match value {
+            Some(value) if !value.is_empty() && value.len() <= 64 => {
+                Ok(Self(Some(FixtureRequestId)))
+            }
+            Some(_) => Err(serde::de::Error::custom("invalid request identifier")),
+            None => Ok(Self(None)),
+        }
+    }
+}
+
+struct FixtureIdentifier(u64);
+
+#[derive(Default)]
+#[allow(dead_code)]
+struct FixtureOptionalIdentifier(Option<FixtureIdentifier>);
+
+impl<'de> Deserialize<'de> for FixtureOptionalIdentifier {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        FixtureIdentifier::deserialize(deserializer).map(|identifier| Self(Some(identifier)))
+    }
+}
+
+#[allow(dead_code)]
+struct FixtureNullableIdentifier(Option<FixtureIdentifier>);
+
+impl<'de> Deserialize<'de> for FixtureNullableIdentifier {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<String>::deserialize(deserializer)?
+            .map(|value| parse_fixture_identifier::<D::Error>(&value))
+            .transpose()
+            .map(Self)
+    }
+}
 
 fn is_canonical_decimal(value: &str) -> bool {
     !value.is_empty()
@@ -1194,14 +1979,23 @@ impl<'de> Deserialize<'de> for FixtureIdentifier {
         D: Deserializer<'de>,
     {
         let value = String::deserialize(deserializer)?;
-        if value.is_empty()
-            || value == "0"
-            || value.starts_with('0')
-            || !value.bytes().all(|byte| byte.is_ascii_digit())
-            || value.parse::<u64>().is_err()
-        {
-            return Err(serde::de::Error::custom("invalid decimal identifier"));
-        }
-        Ok(Self)
+        parse_fixture_identifier::<D::Error>(&value)
     }
+}
+
+fn parse_fixture_identifier<E>(value: &str) -> Result<FixtureIdentifier, E>
+where
+    E: serde::de::Error,
+{
+    if value.is_empty()
+        || value == "0"
+        || value.starts_with('0')
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(E::custom("invalid decimal identifier"));
+    }
+    value
+        .parse()
+        .map(FixtureIdentifier)
+        .map_err(|_| E::custom("identifier exceeds u64"))
 }

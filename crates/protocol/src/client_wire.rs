@@ -4,12 +4,13 @@ use std::fmt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
-    ClientMemoryCursor, ClientMemoryInspection, ClientMemoryRecord, ClientMemoryRetention,
-    ClientMemorySummary, ConversationMode, FollowUpPolicy, MemoryId, MemoryRetrievalTrace,
-    QualityDecision, ResponseControls, RetrievalTraceId, RuntimeError, RuntimeErrorKind,
-    RuntimeEvent, RuntimeStage, RuntimeTimingMilestone, SilencePolicy, SpeechPace, TurnId,
-    MAX_CONVERSATION_MESSAGE_BYTES, MAX_MEMORY_CONTENT_BYTES, MAX_MEMORY_INSPECTION_HISTORY_ITEMS,
-    MAX_MEMORY_LIST_PAGE_ITEMS, MAX_MEMORY_PREVIEW_BYTES,
+    ClientComponentDescriptor, ClientMemoryCursor, ClientMemoryInspection, ClientMemoryRecord,
+    ClientMemoryRetention, ClientMemorySummary, ClientVoiceSessionEvent, ConversationMode,
+    FollowUpPolicy, MemoryId, MemoryRetrievalTrace, QualityDecision, ResponseControls,
+    RetrievalTraceId, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage,
+    RuntimeTimingMilestone, SilencePolicy, SpeechPace, TurnId, MAX_CONVERSATION_MESSAGE_BYTES,
+    MAX_MEMORY_CONTENT_BYTES, MAX_MEMORY_INSPECTION_HISTORY_ITEMS, MAX_MEMORY_LIST_PAGE_ITEMS,
+    MAX_MEMORY_PREVIEW_BYTES,
 };
 
 pub const CLIENT_PROTOCOL_VERSION: u64 = 3;
@@ -28,6 +29,18 @@ pub enum ClientCommand {
         request_id: String,
         turn_id: TurnId,
     },
+    StartVoiceSession {
+        request_id: String,
+    },
+    StopVoiceSession {
+        request_id: String,
+    },
+    PauseVoiceCapture {
+        request_id: String,
+    },
+    ResumeVoiceCapture {
+        request_id: String,
+    },
     MemoryList {
         request_id: String,
         before_id: Option<MemoryId>,
@@ -42,8 +55,14 @@ pub enum ClientCommand {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ClientRuntimeEvent {
     TurnStarted {
+        request_id: Option<String>,
         #[serde(serialize_with = "serialize_turn_id")]
         turn_id: TurnId,
+    },
+    TranscriptFinal {
+        #[serde(serialize_with = "serialize_turn_id")]
+        turn_id: TurnId,
+        text: String,
     },
     QualityResolved {
         decision: ClientQualityDecision,
@@ -60,6 +79,14 @@ pub enum ClientRuntimeEvent {
         #[serde(serialize_with = "serialize_turn_id")]
         turn_id: TurnId,
         text: String,
+    },
+    SpeechStarted {
+        #[serde(serialize_with = "serialize_turn_id")]
+        turn_id: TurnId,
+    },
+    SpeechCompleted {
+        #[serde(serialize_with = "serialize_turn_id")]
+        turn_id: TurnId,
     },
     Timing {
         #[serde(serialize_with = "serialize_turn_id")]
@@ -130,6 +157,7 @@ pub struct RuntimeStatus {
     pub memory_location: Option<String>,
     pub telemetry_enabled: bool,
     pub capabilities: Vec<String>,
+    pub components: Vec<ClientComponentDescriptor>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -161,6 +189,9 @@ pub enum GatewayMessage {
     RuntimeEvent {
         event: ClientRuntimeEvent,
     },
+    VoiceEvent {
+        event: ClientVoiceSessionEvent,
+    },
     Fatal {
         error: ClientRuntimeError,
     },
@@ -175,6 +206,8 @@ pub enum ClientWireError {
     InvalidIdentifier,
     InvalidRuntimeErrorCode,
     InvalidRuntimeStatus,
+    InvalidVoiceEvent,
+    MismatchedVoiceIdentity,
     InvalidMemoryResponse,
     PayloadTooLarge { actual: usize, maximum: usize },
     UnsupportedRuntimeEvent { event: &'static str },
@@ -194,6 +227,10 @@ impl fmt::Display for ClientWireError {
                 formatter.write_str("invalid client runtime error code")
             }
             Self::InvalidRuntimeStatus => formatter.write_str("invalid client runtime status"),
+            Self::InvalidVoiceEvent => formatter.write_str("invalid client voice event"),
+            Self::MismatchedVoiceIdentity => {
+                formatter.write_str("mismatched client voice identity")
+            }
             Self::InvalidMemoryResponse => formatter.write_str("invalid client memory response"),
             Self::PayloadTooLarge { actual, maximum } => {
                 write!(
@@ -286,7 +323,10 @@ impl TryFrom<RuntimeEvent> for ClientRuntimeEvent {
 
     fn try_from(event: RuntimeEvent) -> Result<Self, Self::Error> {
         match event {
-            RuntimeEvent::TurnStarted { turn_id } => Ok(Self::TurnStarted { turn_id }),
+            RuntimeEvent::TurnStarted { turn_id } => Ok(Self::TurnStarted {
+                request_id: None,
+                turn_id,
+            }),
             RuntimeEvent::QualityResolved { decision } => Ok(Self::QualityResolved {
                 decision: ClientQualityDecision::from(&decision),
             }),
@@ -316,6 +356,25 @@ impl TryFrom<RuntimeEvent> for ClientRuntimeEvent {
             RuntimeEvent::SpeechStarted { .. } => Err(unsupported_event("speech_started")),
             RuntimeEvent::SpeechCompleted { .. } => Err(unsupported_event("speech_completed")),
             RuntimeEvent::Playback { .. } => Err(unsupported_event("playback")),
+        }
+    }
+}
+
+impl ClientRuntimeEvent {
+    pub const fn turn_id(&self) -> TurnId {
+        match self {
+            Self::TurnStarted { turn_id, .. }
+            | Self::TranscriptFinal { turn_id, .. }
+            | Self::TextDelta { turn_id, .. }
+            | Self::TextCompleted { turn_id, .. }
+            | Self::SpeechStarted { turn_id }
+            | Self::SpeechCompleted { turn_id }
+            | Self::Timing { turn_id, .. }
+            | Self::TurnCompleted { turn_id }
+            | Self::TurnCancelled { turn_id }
+            | Self::TurnFailed { turn_id, .. } => *turn_id,
+            Self::QualityResolved { decision } => decision.turn_id,
+            Self::MemoryRetrieved { trace } => trace.turn_id,
         }
     }
 }
@@ -358,6 +417,38 @@ pub fn decode_client_command(payload: &[u8]) -> Result<ClientCommand, ClientWire
                 request_id,
                 turn_id: TurnId::new(turn_id.0),
             })
+        }
+        WireClientCommand::StartVoiceSession {
+            protocol_version,
+            request_id,
+        } => {
+            validate_protocol_version(protocol_version)?;
+            validate_request_id(&request_id)?;
+            Ok(ClientCommand::StartVoiceSession { request_id })
+        }
+        WireClientCommand::StopVoiceSession {
+            protocol_version,
+            request_id,
+        } => {
+            validate_protocol_version(protocol_version)?;
+            validate_request_id(&request_id)?;
+            Ok(ClientCommand::StopVoiceSession { request_id })
+        }
+        WireClientCommand::PauseVoiceCapture {
+            protocol_version,
+            request_id,
+        } => {
+            validate_protocol_version(protocol_version)?;
+            validate_request_id(&request_id)?;
+            Ok(ClientCommand::PauseVoiceCapture { request_id })
+        }
+        WireClientCommand::ResumeVoiceCapture {
+            protocol_version,
+            request_id,
+        } => {
+            validate_protocol_version(protocol_version)?;
+            validate_request_id(&request_id)?;
+            Ok(ClientCommand::ResumeVoiceCapture { request_id })
         }
         WireClientCommand::MemoryList {
             protocol_version,
@@ -414,6 +505,22 @@ enum WireClientCommand {
         protocol_version: u64,
         request_id: String,
         turn_id: DecimalIdentifier,
+    },
+    StartVoiceSession {
+        protocol_version: u64,
+        request_id: String,
+    },
+    StopVoiceSession {
+        protocol_version: u64,
+        request_id: String,
+    },
+    PauseVoiceCapture {
+        protocol_version: u64,
+        request_id: String,
+    },
+    ResumeVoiceCapture {
+        protocol_version: u64,
+        request_id: String,
     },
     MemoryList {
         protocol_version: u64,
@@ -661,6 +768,10 @@ enum GatewayMessageEnvelope<'a> {
         protocol_version: u64,
         event: &'a ClientRuntimeEvent,
     },
+    VoiceEvent {
+        protocol_version: u64,
+        event: &'a ClientVoiceSessionEvent,
+    },
     Fatal {
         protocol_version: u64,
         error: &'a ClientRuntimeError,
@@ -711,6 +822,10 @@ impl<'a> From<&'a GatewayMessage> for GatewayMessageEnvelope<'a> {
                 inspection: Box::new(WireClientMemoryInspection::from(inspection)),
             },
             GatewayMessage::RuntimeEvent { event } => Self::RuntimeEvent {
+                protocol_version: CLIENT_PROTOCOL_VERSION,
+                event,
+            },
+            GatewayMessage::VoiceEvent { event } => Self::VoiceEvent {
                 protocol_version: CLIENT_PROTOCOL_VERSION,
                 event,
             },
@@ -783,34 +898,135 @@ fn validate_gateway_message(message: &GatewayMessage) -> Result<(), ClientWireEr
             validate_client_runtime_error(error)
         }
         GatewayMessage::Fatal { error } => validate_client_runtime_error(error),
-        GatewayMessage::RuntimeEvent { event } => validate_client_runtime_event(event),
+        GatewayMessage::RuntimeEvent { event } => {
+            if matches!(
+                event,
+                ClientRuntimeEvent::TranscriptFinal { .. }
+                    | ClientRuntimeEvent::SpeechStarted { .. }
+                    | ClientRuntimeEvent::SpeechCompleted { .. }
+            ) {
+                return Err(ClientWireError::UnsupportedRuntimeEvent {
+                    event: "voice_turn_event",
+                });
+            }
+            validate_client_runtime_event(event)?;
+            if let ClientRuntimeEvent::TurnStarted { request_id, .. } = event {
+                validate_request_id(
+                    request_id
+                        .as_deref()
+                        .ok_or(ClientWireError::InvalidRequestId)?,
+                )?;
+            }
+            Ok(())
+        }
+        GatewayMessage::VoiceEvent { event } => {
+            crate::client_voice::validate_client_voice_event(event)
+        }
         GatewayMessage::Ready { status } => validate_runtime_status(status),
     }
 }
 
 fn validate_runtime_status(status: &RuntimeStatus) -> Result<(), ClientWireError> {
-    let disabled = !status.memory_enabled
-        && status.memory_location.is_none()
-        && status.capabilities == ["text"];
-    let inspectable_local = status.memory_enabled
-        && status.memory_location.as_deref() == Some("local")
-        && status.capabilities == ["text", "memory_inspection"];
-
-    if disabled || inspectable_local {
-        Ok(())
-    } else {
-        Err(ClientWireError::InvalidRuntimeStatus)
+    if status.transport != "stdio"
+        || status.privacy_mode != "local_only"
+        || status.language_location != "local"
+        || status.model_id.trim().is_empty()
+        || status.telemetry_enabled
+    {
+        return Err(ClientWireError::InvalidRuntimeStatus);
     }
+    crate::client_voice::validate_component_descriptors(&status.components)?;
+    if status
+        .components
+        .iter()
+        .any(|component| component.execution_location != "local")
+        || status
+            .components
+            .iter()
+            .filter(|component| component.kind == "language_model")
+            .count()
+            != 1
+        || status
+            .components
+            .iter()
+            .any(|component| component.kind == "telemetry")
+    {
+        return Err(ClientWireError::InvalidRuntimeStatus);
+    }
+
+    let memory = status.capabilities == ["text", "memory_inspection"]
+        || status.capabilities == ["text", "memory_inspection", "voice_session"];
+    let voice = status.capabilities == ["text", "voice_session"]
+        || status.capabilities == ["text", "memory_inspection", "voice_session"];
+    if status.capabilities != ["text"]
+        && status.capabilities != ["text", "memory_inspection"]
+        && status.capabilities != ["text", "voice_session"]
+        && status.capabilities != ["text", "memory_inspection", "voice_session"]
+    {
+        return Err(ClientWireError::InvalidRuntimeStatus);
+    }
+
+    let memory_descriptors = status
+        .components
+        .iter()
+        .filter(|component| component.kind == "memory")
+        .count();
+    if memory
+        != (status.memory_enabled
+            && status.memory_location.as_deref() == Some("local")
+            && memory_descriptors == 1)
+        || (!memory
+            && (status.memory_enabled
+                || status.memory_location.is_some()
+                || memory_descriptors != 0))
+    {
+        return Err(ClientWireError::InvalidRuntimeStatus);
+    }
+
+    if voice {
+        crate::client_voice::validate_voice_components(&status.privacy_mode, &status.components)?;
+    } else if status.components.iter().any(|component| {
+        matches!(
+            component.kind.as_str(),
+            "speech_recognition" | "speech_synthesis" | "audio_io"
+        )
+    }) {
+        return Err(ClientWireError::InvalidRuntimeStatus);
+    }
+    Ok(())
 }
 
-fn validate_client_runtime_event(event: &ClientRuntimeEvent) -> Result<(), ClientWireError> {
+pub(crate) fn validate_client_runtime_event(
+    event: &ClientRuntimeEvent,
+) -> Result<(), ClientWireError> {
     match event {
-        ClientRuntimeEvent::TurnStarted { turn_id }
-        | ClientRuntimeEvent::TextDelta { turn_id, .. }
-        | ClientRuntimeEvent::TextCompleted { turn_id, .. }
-        | ClientRuntimeEvent::Timing { turn_id, .. }
+        ClientRuntimeEvent::TurnStarted { turn_id, .. }
         | ClientRuntimeEvent::TurnCompleted { turn_id }
         | ClientRuntimeEvent::TurnCancelled { turn_id } => validate_turn_id(*turn_id),
+        ClientRuntimeEvent::TranscriptFinal { turn_id, text }
+        | ClientRuntimeEvent::TextCompleted { turn_id, text } => {
+            validate_turn_id(*turn_id)?;
+            validate_transcript(text)
+        }
+        ClientRuntimeEvent::TextDelta { turn_id, delta } => {
+            validate_turn_id(*turn_id)?;
+            validate_bounded_text(delta)
+        }
+        ClientRuntimeEvent::SpeechStarted { turn_id }
+        | ClientRuntimeEvent::SpeechCompleted { turn_id } => validate_turn_id(*turn_id),
+        ClientRuntimeEvent::Timing {
+            turn_id, milestone, ..
+        } => {
+            validate_turn_id(*turn_id)?;
+            if matches!(
+                milestone.as_str(),
+                "first_text_delta" | "first_synthesis_request" | "first_playable_audio"
+            ) {
+                Ok(())
+            } else {
+                Err(ClientWireError::InvalidVoiceEvent)
+            }
+        }
         ClientRuntimeEvent::TurnFailed { turn_id, error } => {
             validate_turn_id(*turn_id)?;
             validate_client_runtime_error(error)
@@ -823,8 +1039,10 @@ fn validate_client_runtime_event(event: &ClientRuntimeEvent) -> Result<(), Clien
     }
 }
 
-fn validate_client_runtime_error(error: &ClientRuntimeError) -> Result<(), ClientWireError> {
-    if matches!(
+pub(crate) fn validate_client_runtime_error(
+    error: &ClientRuntimeError,
+) -> Result<(), ClientWireError> {
+    if !matches!(
         error.code.as_str(),
         "adapter_failure"
             | "configuration_invalid"
@@ -833,11 +1051,25 @@ fn validate_client_runtime_error(error: &ClientRuntimeError) -> Result<(), Clien
             | "memory_turn_active"
             | "memory_not_found"
             | "memory_unavailable"
+    ) || !matches!(
+        error.kind.as_str(),
+        "adapter" | "configuration" | "invalid_state"
+    ) || !matches!(
+        error.stage.as_str(),
+        "runtime"
+            | "privacy_policy"
+            | "audio_capture"
+            | "speech_recognizer"
+            | "language_model"
+            | "speech_synthesizer"
+            | "audio_output"
+            | "voice_sidecar"
+            | "continuous_audio_output"
+            | "memory"
     ) {
-        Ok(())
-    } else {
-        Err(ClientWireError::InvalidRuntimeErrorCode)
+        return Err(ClientWireError::InvalidRuntimeErrorCode);
     }
+    Ok(())
 }
 
 fn validate_memory_list(
@@ -1008,6 +1240,14 @@ fn validate_transcript(transcript: &str) -> Result<(), ClientWireError> {
         return Err(ClientWireError::InvalidTranscript);
     }
     Ok(())
+}
+
+fn validate_bounded_text(text: &str) -> Result<(), ClientWireError> {
+    if text.len() > MAX_CONVERSATION_MESSAGE_BYTES {
+        Err(ClientWireError::InvalidTranscript)
+    } else {
+        Ok(())
+    }
 }
 
 fn is_canonical_identifier(value: &str) -> bool {

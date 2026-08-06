@@ -1,7 +1,7 @@
 # R6 Desktop Voice Session Design
 
-**Status:** Approved for implementation planning  
-**Date:** 2026-08-06  
+**Status:** Approved for implementation planning
+**Date:** 2026-08-06
 **Milestone:** R6 — Desktop Reference App and SDK Boundary
 
 ## Problem

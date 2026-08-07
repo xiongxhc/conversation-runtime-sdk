@@ -102,6 +102,35 @@ async fn sequence_overflow_returns_a_typed_error_without_reserving_a_turn() {
 }
 
 #[tokio::test]
+async fn discard_reclaims_an_interrupted_finalization() {
+    let context = ConversationContext::new(quality());
+    let turn = context
+        .begin_turn(ConversationTurnSource::Text, "interrupted finalization")
+        .await
+        .unwrap();
+    context.begin_outcome_for_test(turn.identity()).await;
+
+    let error = context
+        .complete_turn(turn.identity(), "late answer")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.message(),
+        "conversation turn outcome is already being finalized"
+    );
+
+    context.discard_turn(turn.identity(), true).await.unwrap();
+    assert_eq!(context.active_turn().await, None);
+
+    let next = context
+        .begin_turn(ConversationTurnSource::Text, "next")
+        .await
+        .unwrap();
+    assert_eq!(next.identity().turn_id(), TurnId::new(2));
+    context.discard_turn(next.identity(), false).await.unwrap();
+}
+
+#[tokio::test]
 async fn failed_completion_releases_the_context_for_a_new_turn() {
     let context = ConversationContext::new(quality());
     let first = context

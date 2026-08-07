@@ -142,7 +142,7 @@ impl ConversationContext {
         identity: ConversationTurnIdentity,
         assistant: impl Into<String>,
     ) -> Result<(), RuntimeError> {
-        self.begin_outcome(identity).await?;
+        self.begin_outcome(identity, false).await?;
         let result = {
             let mut quality = self.quality.lock().await;
             quality.complete_turn(identity.turn_id, assistant)
@@ -155,16 +155,30 @@ impl ConversationContext {
         identity: ConversationTurnIdentity,
         interrupted: bool,
     ) -> Result<(), RuntimeError> {
-        self.begin_outcome(identity).await?;
+        let reclaimed = self.begin_outcome(identity, true).await?;
         let result = {
             let mut quality = self.quality.lock().await;
-            if interrupted {
+            let result = if interrupted {
                 quality.interrupt_turn(identity.turn_id)
             } else {
                 quality.discard_turn(identity.turn_id)
+            };
+            // A reclaimed finalization may already have consumed the pending
+            // quality turn before it was interrupted; the discard still holds.
+            if reclaimed {
+                result.or(Ok(()))
+            } else {
+                result
             }
         };
         self.finish_outcome(identity, result).await
+    }
+
+    #[doc(hidden)]
+    pub async fn begin_outcome_for_test(&self, identity: ConversationTurnIdentity) {
+        self.begin_outcome(identity, false)
+            .await
+            .expect("test turn accepts an initial outcome claim");
     }
 
     #[doc(hidden)]
@@ -208,13 +222,23 @@ impl ConversationContext {
         Ok(identity)
     }
 
-    async fn begin_outcome(&self, identity: ConversationTurnIdentity) -> Result<(), RuntimeError> {
+    /// Claims the active turn for finalization. With `reclaim_interrupted`, a
+    /// turn already marked finalizing is reclaimed instead of rejected — so a
+    /// discard can recover a finalization whose task was aborted between
+    /// `begin_outcome` and `finish_outcome` — and `Ok(true)` reports the
+    /// reclaim.
+    async fn begin_outcome(
+        &self,
+        identity: ConversationTurnIdentity,
+        reclaim_interrupted: bool,
+    ) -> Result<bool, RuntimeError> {
         let mut lifecycle = self.lifecycle.lock().await;
         match lifecycle.active.as_mut() {
             Some(active) if active.identity == identity && !active.finalizing => {
                 active.finalizing = true;
-                Ok(())
+                Ok(false)
             }
+            Some(active) if active.identity == identity && reclaim_interrupted => Ok(true),
             Some(active) if active.identity == identity => Err(runtime_error(
                 "conversation turn outcome is already being finalized",
             )),

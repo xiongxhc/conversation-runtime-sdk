@@ -418,9 +418,15 @@ impl StreamingTurnRuntime {
                     .then_some(current.identity)
             })
         };
-        if let Some(identity) = identity {
-            self.context.discard_turn(identity, true).await?;
-        }
+        // The reaped task may have finalized the context before it could clear
+        // the active slot; skip the discard for that benign race, and keep
+        // deactivation and the slot clear ahead of any discard error.
+        let discard_result = match identity {
+            Some(identity) if self.context.active_turn().await == Some(identity) => {
+                self.context.discard_turn(identity, true).await
+            }
+            _ => Ok(()),
+        };
         self.generation_guard
             .deactivate(turn_id, generation_id)
             .await;
@@ -431,7 +437,7 @@ impl StreamingTurnRuntime {
         }) {
             *active = None;
         }
-        Ok(())
+        discard_result
     }
 }
 
@@ -1533,6 +1539,72 @@ mod tests {
             ResponseControls::default(),
             ConversationMode::DirectAnswer,
         ))
+    }
+
+    #[derive(Default)]
+    struct BlockingLanguage {
+        started: Arc<Notify>,
+    }
+
+    impl GenerationLanguageModel for BlockingLanguage {
+        fn stream(
+            &self,
+            _request: GenerationLanguageRequest,
+            cancellation: CancellationToken,
+        ) -> mpsc::Receiver<Result<GenerationTextDelta, AdapterError>> {
+            let (sender, receiver) = mpsc::channel(1);
+            let started = Arc::clone(&self.started);
+            tokio::spawn(async move {
+                started.notify_one();
+                cancellation.cancelled().await;
+                drop(sender);
+            });
+            receiver
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn abort_racing_a_finalized_context_still_releases_the_runtime() {
+        let context = context();
+        let language = Arc::new(BlockingLanguage::default());
+        let runtime = StreamingTurnRuntime::new(
+            context.clone(),
+            language.clone(),
+            Arc::new(MockStreamingSpeechSynthesizer::new([])),
+            Arc::new(MockContinuousAudioOutput::new()),
+        );
+        let started = runtime
+            .start_turn(ConversationTurnSource::Text, "barged in at completion")
+            .await
+            .unwrap();
+        let identity = started.identity();
+        language.started.notified().await;
+
+        // The terminal task finalizes the context before clearing the active
+        // slot; this discard reproduces an abort landing inside that window.
+        context.discard_turn(identity, true).await.unwrap();
+        let mut events = started.into_events();
+        runtime
+            .abort_turn(identity.turn_id(), identity.generation_id(), &mut events)
+            .await
+            .expect("abort racing a finalized context must succeed");
+
+        let mut second = runtime
+            .start_turn(ConversationTurnSource::Text, "next")
+            .await
+            .expect("aborted runtime must immediately accept a new turn");
+        runtime
+            .interrupt(
+                second.identity().turn_id(),
+                second.identity().generation_id(),
+            )
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), async {
+            while second.recv().await.is_some() {}
+        })
+        .await
+        .expect("second turn did not clean up");
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -832,28 +832,24 @@ impl VoiceLoop {
         let generation_id = identity.generation_id();
         let mut turn_events = started.into_events();
 
-        if !self
+        let published = self
             .publish_reliable(VoiceSessionEvent::TranscriptFinal {
                 session_id: self.session_id,
                 turn_id,
                 text: finalized.text.clone(),
             })
             .await
-        {
+            && self.publish_best_effort(VoiceSessionEvent::Timing {
+                session_id: self.session_id,
+                turn_id: Some(turn_id),
+                milestone: VoiceTimingMilestone::TranscriptFinal,
+                elapsed_ms: self.clock.now_ms(),
+            });
+        if !published {
             let _ = self
                 .turn_runtime
                 .abort_turn(turn_id, generation_id, &mut turn_events)
                 .await;
-            return Err(runtime_error(
-                "voice session event stream closed during finalization",
-            ));
-        }
-        if !self.publish_best_effort(VoiceSessionEvent::Timing {
-            session_id: self.session_id,
-            turn_id: Some(turn_id),
-            milestone: VoiceTimingMilestone::TranscriptFinal,
-            elapsed_ms: self.clock.now_ms(),
-        }) {
             return Err(runtime_error(
                 "voice session event stream closed during finalization",
             ));
@@ -1528,4 +1524,105 @@ fn closed_completion() -> oneshot::Sender<()> {
     let (completion, completed) = oneshot::channel();
     drop(completed);
     completion
+}
+
+#[cfg(test)]
+mod tests {
+    use conversation_model_adapters::{
+        GenerationLanguageRequest, GenerationTextDelta, MockContinuousAudioOutput,
+        MockStreamingSpeechSynthesizer, MockVoiceCaptureControl, RecognitionHypothesis,
+    };
+    use conversation_protocol::{
+        ComponentDescriptor, ComponentKind, ConversationMode, ExecutionLocation, PersonaProfile,
+        PrivacyMode, ResponseControls,
+    };
+    use tokio::sync::Notify;
+
+    use super::*;
+    use crate::ConversationQualityController;
+
+    #[derive(Default)]
+    struct BlockingLanguage {
+        started: Arc<Notify>,
+    }
+
+    impl GenerationLanguageModel for BlockingLanguage {
+        fn stream(
+            &self,
+            _request: GenerationLanguageRequest,
+            cancellation: CancellationToken,
+        ) -> mpsc::Receiver<Result<GenerationTextDelta, AdapterError>> {
+            let (sender, receiver) = mpsc::channel(1);
+            let started = Arc::clone(&self.started);
+            tokio::spawn(async move {
+                started.notify_one();
+                cancellation.cancelled().await;
+                drop(sender);
+            });
+            receiver
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_finalization_publish_aborts_the_started_turn() {
+        let session_id = SessionId::new(1);
+        let policy = VoiceSessionPolicy::new(
+            session_id,
+            PrivacyMode::LocalOnly,
+            200,
+            600,
+            [ComponentDescriptor::new(
+                ComponentKind::SpeechRecognition,
+                "local-recognition",
+                ExecutionLocation::Local,
+            )],
+        )
+        .unwrap();
+        let context = ConversationContext::new(ConversationQualityController::new(
+            PersonaProfile::default(),
+            ResponseControls::default(),
+            ConversationMode::DirectAnswer,
+        ));
+        let turn_runtime = StreamingTurnRuntime::new(
+            context.clone(),
+            Arc::new(BlockingLanguage::default()),
+            Arc::new(MockStreamingSpeechSynthesizer::new([])),
+            Arc::new(MockContinuousAudioOutput::new()),
+        );
+        let (_input, input_receiver) = mpsc::channel(1);
+        let (_commands, command_receiver) = mpsc::channel(1);
+        let (event_sender, event_receiver) = mpsc::channel(SESSION_EVENT_BUFFER_SIZE);
+        drop(event_receiver);
+        let mut voice_loop = VoiceLoop::new(
+            policy,
+            input_receiver,
+            Arc::new(MockVoiceCaptureControl::new()),
+            tokio::spawn(async { Ok(()) }),
+            turn_runtime,
+            command_receiver,
+            event_sender,
+            CancellationToken::new(),
+        );
+        voice_loop
+            .finalizer
+            .observe_hypothesis(RecognitionHypothesis::engine_final(1, "hello"), 0);
+        voice_loop
+            .finalizer
+            .observe_activity(VoiceActivity::SpeechEnded { at_ms: 0 });
+        tokio::time::advance(Duration::from_millis(600)).await;
+
+        let error = voice_loop.start_ready_turn().await.unwrap_err();
+
+        assert_eq!(
+            error.message(),
+            "voice session event stream closed during finalization"
+        );
+        assert!(voice_loop.turn_events.is_none());
+        assert_eq!(context.active_turn().await, None);
+        let next = context
+            .begin_turn(ConversationTurnSource::Text, "next")
+            .await
+            .expect("aborted finalization must release the shared context");
+        context.discard_turn(next.identity(), false).await.unwrap();
+    }
 }

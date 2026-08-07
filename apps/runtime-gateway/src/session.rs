@@ -7,9 +7,12 @@ use conversation_model_adapters::GenerationLanguageModel;
 use conversation_protocol::{
     decode_client_command, encode_gateway_message, ClientCommand, ClientMemoryCursor,
     ClientMemoryInspection, ClientMemorySummary, ClientRuntimeError, ClientRuntimeEvent,
-    GatewayMessage, RuntimeEvent, RuntimeStatus, TurnId,
+    ClientVoiceSessionEvent, GatewayMessage, RuntimeEvent, RuntimeStatus, SessionId, TurnId,
 };
-use conversation_runtime::{ConversationContext, TextTurnEventStream, TextTurnRuntime};
+use conversation_runtime::{
+    ConversationContext, TextTurnEventStream, TextTurnRuntime, VoiceSessionAdapters,
+    VoiceSessionEventStream, VoiceSessionRuntime,
+};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinError, JoinHandle};
@@ -43,6 +46,14 @@ struct VoiceLane {
     adapters: GatewayVoiceAdapters,
     context: ConversationContext,
     language: Arc<dyn GenerationLanguageModel>,
+}
+
+struct ActiveVoiceSession {
+    // Consumed by Task 3's stop/pause/resume command handling; this task only starts
+    // the runtime and holds it alongside the event pump task.
+    #[allow(dead_code)]
+    runtime: VoiceSessionRuntime,
+    task: JoinHandle<Result<(), GatewaySessionError>>,
 }
 
 struct WriterLanes {
@@ -138,6 +149,7 @@ impl GatewaySession {
             event_receiver,
         ));
         let mut active: Option<ActiveForwarder> = None;
+        let mut active_voice: Option<ActiveVoiceSession> = None;
 
         let exit = if let Err(error) = send_urgent(
             &urgent_sender,
@@ -155,6 +167,15 @@ impl GatewaySession {
                     tokio::select! {
                         writer = &mut writer_task => SessionInput::Writer(writer),
                         forwarding = active_task => SessionInput::Forwarder(forwarding),
+                        frame = reader.read_frame() => SessionInput::Frame(frame),
+                    }
+                } else if let Some(voice_task) = active_voice
+                    .as_mut()
+                    .map(|active_voice| &mut active_voice.task)
+                {
+                    tokio::select! {
+                        writer = &mut writer_task => SessionInput::Writer(writer),
+                        pumped = voice_task => SessionInput::VoicePump(pumped),
                         frame = reader.read_frame() => SessionInput::Frame(frame),
                     }
                 } else {
@@ -184,6 +205,15 @@ impl GatewaySession {
                             }
                         }
                     }
+                    SessionInput::VoicePump(result) => {
+                        active_voice = None;
+                        if let Err(error) = forwarder_result(result) {
+                            break SessionExit::fatal(
+                                error,
+                                "gateway voice event forwarding failed",
+                            );
+                        }
+                    }
                     SessionInput::Frame(Ok(Some(payload))) => {
                         let command = match decode_client_command(&payload) {
                             Ok(command) => command,
@@ -205,6 +235,7 @@ impl GatewaySession {
                                 &normal_sender,
                                 &event_sender,
                                 &mut active,
+                                &mut active_voice,
                             )
                             .await
                         {
@@ -254,6 +285,7 @@ impl GatewaySession {
         normal: &mpsc::Sender<GatewayMessage>,
         events: &mpsc::Sender<GatewayMessage>,
         active: &mut Option<ActiveForwarder>,
+        active_voice: &mut Option<ActiveVoiceSession>,
     ) -> Result<(), CommandFailure> {
         match command {
             ClientCommand::Status { request_id } => {
@@ -271,6 +303,14 @@ impl GatewaySession {
                 request_id,
                 transcript,
             } => {
+                if active_voice.is_some() {
+                    return send_rejection(
+                        normal,
+                        &request_id,
+                        command_error("a voice session is active"),
+                    )
+                    .map_err(CommandFailure::response);
+                }
                 if active.is_some() {
                     return send_rejection(
                         normal,
@@ -336,8 +376,73 @@ impl GatewaySession {
                     )
                 })
             }
-            ClientCommand::StartVoiceSession { request_id }
-            | ClientCommand::StopVoiceSession { request_id }
+            ClientCommand::StartVoiceSession { request_id } => {
+                let Some(lane) = self.voice.as_ref() else {
+                    return send_rejection(
+                        normal,
+                        &request_id,
+                        command_error("voice is unavailable"),
+                    )
+                    .map_err(CommandFailure::response);
+                };
+                if active.is_some() {
+                    return send_rejection(
+                        normal,
+                        &request_id,
+                        command_error("a text turn is active"),
+                    )
+                    .map_err(CommandFailure::response);
+                }
+                if active_voice.is_some() {
+                    return send_rejection(
+                        normal,
+                        &request_id,
+                        command_error("a voice session is already active"),
+                    )
+                    .map_err(CommandFailure::response);
+                }
+
+                let policy = match lane.adapters.policy.for_session(SessionId::new(1)) {
+                    Ok(policy) => policy,
+                    Err(_) => {
+                        return send_rejection(
+                            normal,
+                            &request_id,
+                            command_error("voice is unavailable"),
+                        )
+                        .map_err(CommandFailure::response);
+                    }
+                };
+                let runtime = VoiceSessionRuntime::new(
+                    lane.context.clone(),
+                    VoiceSessionAdapters::new(
+                        lane.adapters.io.clone(),
+                        lane.language.clone(),
+                        lane.adapters.speech.clone(),
+                    ),
+                );
+                let event_stream = match runtime.start(policy).await {
+                    Ok(event_stream) => event_stream,
+                    Err(_) => {
+                        return send_rejection(
+                            normal,
+                            &request_id,
+                            command_error("voice is unavailable"),
+                        )
+                        .map_err(CommandFailure::response);
+                    }
+                };
+
+                send_accepted(normal, &request_id).map_err(CommandFailure::response)?;
+                let task = tokio::spawn(pump_voice_events(
+                    event_stream,
+                    normal.clone(),
+                    events.clone(),
+                ));
+                *active_voice = Some(ActiveVoiceSession { runtime, task });
+                Ok(())
+            }
+            ClientCommand::StopVoiceSession { request_id }
             | ClientCommand::PauseVoiceCapture { request_id }
             | ClientCommand::ResumeVoiceCapture { request_id } => {
                 send_rejection(normal, &request_id, command_error("voice is unavailable"))
@@ -494,6 +599,7 @@ impl CommandFailure {
 enum SessionInput {
     Frame(Result<Option<Vec<u8>>, FrameError>),
     Forwarder(Result<Result<(), GatewaySessionError>, JoinError>),
+    VoicePump(Result<Result<(), GatewaySessionError>, JoinError>),
     Writer(Result<Result<(), GatewaySessionError>, JoinError>),
 }
 
@@ -577,6 +683,40 @@ async fn forward_events(
                     forwarding = false;
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+// Forwards a voice session's events onto the gateway's writer lanes: partials, activity,
+// timing, and every other non-terminal event go on the (bounded, best-effort) event lane;
+// the session's single reliable terminal (`VoiceSessionFailed` / `VoiceSessionEnded`) goes
+// on the normal lane so it cannot be starved behind queued partials.
+async fn pump_voice_events(
+    mut events: VoiceSessionEventStream,
+    normal: mpsc::Sender<GatewayMessage>,
+    event_writer: mpsc::Sender<GatewayMessage>,
+) -> Result<(), GatewaySessionError> {
+    let mut forwarding = true;
+    while let Some(event) = events.recv().await {
+        if !forwarding {
+            continue;
+        }
+        let terminal = event.is_session_terminal();
+        let event = match ClientVoiceSessionEvent::try_from(event) {
+            Ok(event) => event,
+            Err(_) => {
+                while events.recv().await.is_some() {}
+                return Err(GatewaySessionError::Projection);
+            }
+        };
+        let lane = if terminal { &normal } else { &event_writer };
+        if lane
+            .send(GatewayMessage::VoiceEvent { event })
+            .await
+            .is_err()
+        {
+            forwarding = false;
         }
     }
     Ok(())
@@ -883,20 +1023,23 @@ mod tests {
         SqliteMemoryStore,
     };
     use conversation_model_adapters::{
-        GenerationLanguageModel, MockStreamingSpeechSynthesizer, MockVoiceIoFactory, OllamaConfig,
-        OllamaLanguageModel,
+        AdapterError, AdapterFuture, GenerationLanguageModel, MockContinuousAudioOutput,
+        MockGenerationLanguageModel, MockStreamingSpeechSynthesizer, MockVoiceCaptureControl,
+        MockVoiceIoFactory, OllamaConfig, OllamaLanguageModel, RecognitionEvent,
+        RecognitionHypothesis, VoiceInput, VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
     };
     use conversation_protocol::{
         ClientRuntimeEvent, ComponentDescriptor, ComponentKind, ExecutionLocation, GatewayMessage,
         MemoryConfidence, MemoryDraft, MemoryKind, MemoryPatch, MemoryProvenance,
-        MemoryProvenanceKind, MemoryRetention, PrivacyMode, RuntimeStatus, TurnId,
-        UnixTimestampMillis, MAX_CLIENT_FRAME_BYTES, MAX_MEMORY_CONTENT_BYTES,
+        MemoryProvenanceKind, MemoryRetention, PrivacyMode, RuntimeStatus, SessionId, TurnId,
+        UnixTimestampMillis, VoiceActivity, MAX_CLIENT_FRAME_BYTES, MAX_MEMORY_CONTENT_BYTES,
     };
     use tempfile::TempDir;
     use tokio::io::{duplex, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::{mpsc, Notify};
     use tokio::time::timeout;
+    use tokio_util::sync::CancellationToken;
 
     use crate::voice_adapters::{GatewayVoiceAdapters, VoicePolicyTemplate};
     use crate::FrameReader;
@@ -1549,6 +1692,154 @@ mod tests {
         assert!(ready_capabilities(&ready).contains(&"voice_session".to_owned()));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn start_voice_session_accepts_and_streams_events_until_terminal() {
+        let (input, input_receiver) = mpsc::channel(8);
+        let language = Arc::new(MockGenerationLanguageModel::new(["fixture reply"]));
+        let session = session_with_interactive_voice(input_receiver, language);
+        let mut gateway = InMemoryGateway::start(session).await;
+
+        gateway
+            .write(r#"{"protocol_version":1,"type":"start_voice_session","request_id":"voice-1"}"#)
+            .await;
+        assert_accepted_message(&gateway.read_message().await, "voice-1");
+        let started = gateway.read_message().await;
+        assert!(started.contains(r#""type":"voice_event""#));
+        assert!(started.contains(r#""type":"voice_session_started""#));
+
+        send_voice_input(
+            &input,
+            VoiceInputEvent::Activity(VoiceActivity::SpeechStarted { at_ms: 0 }),
+        )
+        .await;
+        let activity = gateway.read_message().await;
+        assert!(activity.contains(r#""type":"voice_activity""#));
+
+        send_voice_input(
+            &input,
+            VoiceInputEvent::Recognition(RecognitionEvent::Hypothesis(
+                RecognitionHypothesis::engine_final(1, "hello"),
+            )),
+        )
+        .await;
+        send_voice_input(
+            &input,
+            VoiceInputEvent::Activity(VoiceActivity::SpeechEnded { at_ms: 0 }),
+        )
+        .await;
+        let speech_ended = gateway.read_message().await;
+        assert!(speech_ended.contains(r#""type":"voice_activity""#));
+
+        tokio::time::advance(Duration::from_millis(900)).await;
+
+        let messages = gateway.read_until(is_voice_terminal).await;
+        drop(input);
+
+        assert!(messages
+            .iter()
+            .any(|message| message.contains(r#""type":"voice_transcript_final""#)));
+        assert!(messages
+            .iter()
+            .any(|message| message.contains(r#""type":"voice_turn_event""#)));
+        let terminals = messages
+            .iter()
+            .filter(|message| is_voice_terminal(message))
+            .count();
+        assert_eq!(terminals, 1);
+        assert!(is_voice_terminal(messages.last().unwrap()));
+
+        gateway.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn second_start_voice_session_is_rejected_request_scoped() {
+        let (input, input_receiver) = mpsc::channel(8);
+        let language = Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new()));
+        let session = session_with_interactive_voice(input_receiver, language);
+        let mut gateway = InMemoryGateway::start(session).await;
+
+        gateway
+            .write(r#"{"protocol_version":1,"type":"start_voice_session","request_id":"voice-1"}"#)
+            .await;
+        assert_accepted_message(&gateway.read_message().await, "voice-1");
+        let started = gateway.read_message().await;
+        assert!(started.contains(r#""type":"voice_session_started""#));
+
+        gateway
+            .write(r#"{"protocol_version":1,"type":"start_voice_session","request_id":"voice-2"}"#)
+            .await;
+        let rejection = gateway.read_message().await;
+        assert_rejected_message(&rejection, "voice-2", "invalid_state");
+        assert!(rejection.contains("a voice session is already active"));
+
+        // the first session keeps streaming despite the second request's rejection
+        send_voice_input(
+            &input,
+            VoiceInputEvent::Activity(VoiceActivity::SpeechStarted { at_ms: 0 }),
+        )
+        .await;
+        let activity = gateway.read_message().await;
+        assert!(activity.contains(r#""type":"voice_activity""#));
+
+        drop(input);
+        let messages = gateway.read_until(is_voice_terminal).await;
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| is_voice_terminal(message))
+                .count(),
+            1
+        );
+        assert!(!messages
+            .iter()
+            .any(|message| message.contains(r#""request_id":"voice-2""#)));
+
+        gateway.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn start_turn_is_rejected_while_voice_session_is_active() {
+        let (input, input_receiver) = mpsc::channel(8);
+        let language = Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new()));
+        let session = session_with_interactive_voice(input_receiver, language);
+        let mut gateway = InMemoryGateway::start(session).await;
+
+        gateway
+            .write(r#"{"protocol_version":1,"type":"start_voice_session","request_id":"voice-1"}"#)
+            .await;
+        assert_accepted_message(&gateway.read_message().await, "voice-1");
+        let started = gateway.read_message().await;
+        assert!(started.contains(r#""type":"voice_session_started""#));
+
+        gateway
+            .write(
+                r#"{"protocol_version":1,"type":"start_turn","request_id":"text-1","transcript":"fixture text while voice is active"}"#,
+            )
+            .await;
+        let rejection = gateway.read_message().await;
+        assert_rejected_message(&rejection, "text-1", "invalid_state");
+        assert!(rejection.contains("a voice session is active"));
+
+        drop(input);
+        let messages = gateway.read_until(is_voice_terminal).await;
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| is_voice_terminal(message))
+                .count(),
+            1
+        );
+
+        gateway
+            .write(
+                r#"{"protocol_version":1,"type":"start_turn","request_id":"text-2","transcript":"fixture text after voice stops"}"#,
+            )
+            .await;
+        assert_accepted_message(&gateway.read_message().await, "text-2");
+
+        gateway.close().await;
+    }
+
     struct InMemoryGateway {
         input: DuplexStream,
         output: FrameReader<DuplexStream>,
@@ -1838,10 +2129,8 @@ mod tests {
         speech: Arc<MockStreamingSpeechSynthesizer>,
     }
 
-    fn test_voice_adapters() -> (GatewayVoiceAdapters, VoiceTestGuards) {
-        let io_factory = Arc::new(MockVoiceIoFactory::new(Vec::new()));
-        let speech = Arc::new(MockStreamingSpeechSynthesizer::new(Vec::new()));
-        let policy = VoicePolicyTemplate::new(
+    fn voice_policy() -> VoicePolicyTemplate {
+        VoicePolicyTemplate::new(
             PrivacyMode::LocalOnly,
             200,
             800,
@@ -1868,11 +2157,16 @@ mod tests {
                 ),
             ],
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    fn test_voice_adapters() -> (GatewayVoiceAdapters, VoiceTestGuards) {
+        let io_factory = Arc::new(MockVoiceIoFactory::new(Vec::new()));
+        let speech = Arc::new(MockStreamingSpeechSynthesizer::new(Vec::new()));
         let adapters = GatewayVoiceAdapters {
             io: io_factory.clone(),
             speech: speech.clone(),
-            policy,
+            policy: voice_policy(),
         };
         (adapters, VoiceTestGuards { io_factory, speech })
     }
@@ -1885,6 +2179,99 @@ mod tests {
             test_language(),
         );
         (session, guards)
+    }
+
+    /// A voice I/O double driven interactively by a test through `input`, unlike
+    /// `MockVoiceIoFactory`'s fixed scripted list. Tests that need to interleave voice
+    /// input events with mocked-time advancement (e.g. waiting out the finalization
+    /// silence window) drive this instead; dropping `input` ends the underlying voice
+    /// session the same way a disconnected sidecar would.
+    struct TestVoiceInput {
+        receiver: StdMutex<Option<mpsc::Receiver<Result<VoiceInputEvent, AdapterError>>>>,
+    }
+
+    impl VoiceInput for TestVoiceInput {
+        fn start<'a>(
+            &'a self,
+            _session_id: SessionId,
+            _cancellation: CancellationToken,
+        ) -> AdapterFuture<'a, mpsc::Receiver<Result<VoiceInputEvent, AdapterError>>> {
+            Box::pin(async move {
+                Ok(self
+                    .receiver
+                    .lock()
+                    .expect("test voice input receiver lock poisoned")
+                    .take()
+                    .expect("test voice input started more than once"))
+            })
+        }
+    }
+
+    struct TestVoiceIoFactory {
+        input: Arc<TestVoiceInput>,
+        output: Arc<MockContinuousAudioOutput>,
+        capture: Arc<MockVoiceCaptureControl>,
+    }
+
+    impl TestVoiceIoFactory {
+        fn new(input_receiver: mpsc::Receiver<Result<VoiceInputEvent, AdapterError>>) -> Self {
+            Self {
+                input: Arc::new(TestVoiceInput {
+                    receiver: StdMutex::new(Some(input_receiver)),
+                }),
+                output: Arc::new(MockContinuousAudioOutput::new()),
+                capture: Arc::new(MockVoiceCaptureControl::new()),
+            }
+        }
+    }
+
+    impl VoiceIoFactory for TestVoiceIoFactory {
+        fn start<'a>(
+            &'a self,
+            _session_id: SessionId,
+            cancellation: CancellationToken,
+        ) -> AdapterFuture<'a, VoiceIoSession> {
+            Box::pin(async move {
+                Ok(VoiceIoSession {
+                    input: self.input.clone(),
+                    capture: self.capture.clone(),
+                    output: self.output.clone(),
+                    completion: tokio::spawn(async move {
+                        cancellation.cancelled().await;
+                        Ok(())
+                    }),
+                })
+            })
+        }
+    }
+
+    fn session_with_interactive_voice(
+        input_receiver: mpsc::Receiver<Result<VoiceInputEvent, AdapterError>>,
+        language: Arc<dyn GenerationLanguageModel>,
+    ) -> GatewaySession {
+        let adapters = GatewayVoiceAdapters {
+            io: Arc::new(TestVoiceIoFactory::new(input_receiver)),
+            speech: Arc::new(MockStreamingSpeechSynthesizer::new(Vec::new())),
+            policy: voice_policy(),
+        };
+        GatewaySession::new(unused_runtime(), status_with_voice()).with_voice(
+            adapters,
+            test_context(),
+            language,
+        )
+    }
+
+    async fn send_voice_input(
+        input: &mpsc::Sender<Result<VoiceInputEvent, AdapterError>>,
+        event: VoiceInputEvent,
+    ) {
+        input.send(Ok(event)).await.unwrap();
+        tokio::task::yield_now().await;
+    }
+
+    fn is_voice_terminal(message: &str) -> bool {
+        message.contains(r#""type":"voice_session_ended""#)
+            || message.contains(r#""type":"voice_session_failed""#)
     }
 
     async fn first_ready_message(session: GatewaySession) -> String {

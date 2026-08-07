@@ -99,7 +99,12 @@ async fn status_reports_exact_model_and_enabled_local_memory() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn configured_voice_is_advertised_but_start_is_not_yet_hosted() {
+async fn configured_voice_session_spawns_the_sidecar_and_reports_its_failure() {
+    // The fixture sidecar executable only marks that it was spawned; it never speaks the
+    // sidecar handshake protocol. That proves `start_voice_session` now does real work
+    // (spawns the configured sidecar) instead of the earlier universal rejection, while
+    // staying within this task's mocked-adapter scope: a real handshake against a fake
+    // sidecar binary is Task 7's compiled-gateway integration surface.
     let server = FakeOllamaServer::completing(0).await;
     let mut gateway = GatewayProcess::start_with_voice(server.endpoint()).await;
 
@@ -110,18 +115,38 @@ async fn configured_voice_is_advertised_but_start_is_not_yet_hosted() {
 
     gateway
         .write_message(
-            r#"{"protocol_version":1,"type":"start_voice_session","request_id":"voice-before-host"}"#,
+            r#"{"protocol_version":1,"type":"start_voice_session","request_id":"voice-start"}"#,
         )
         .await;
-    assert_rejected(
-        &gateway.read_message().await,
-        "voice-before-host",
-        "invalid_state",
+    assert_accepted(&gateway.read_message().await, "voice-start");
+
+    let messages = gateway
+        .read_until(|message| {
+            matches!(
+                message.event_type(),
+                Some("voice_session_failed" | "voice_session_ended")
+            )
+        })
+        .await;
+    let terminals = messages
+        .iter()
+        .filter(|message| {
+            matches!(
+                message.event_type(),
+                Some("voice_session_failed" | "voice_session_ended")
+            )
+        })
+        .count();
+    assert_eq!(terminals, 1);
+    assert_eq!(
+        messages.last().unwrap().event_type(),
+        Some("voice_session_failed")
     );
-    assert!(!gateway.sidecar_spawned());
+    assert!(gateway.sidecar_spawned());
 
     let exit = gateway.close().await;
     assert!(exit.status.success());
+    exit.assert_content_free_stderr(&["voice-start"]);
 }
 
 #[tokio::test]

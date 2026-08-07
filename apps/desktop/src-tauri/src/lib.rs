@@ -3,6 +3,8 @@
 pub mod gateway_bridge;
 pub mod history_store;
 
+use std::sync::{Arc, Mutex};
+
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager, RunEvent, State};
 
@@ -15,55 +17,85 @@ struct HistoryStorageInfo {
     database_path: String,
 }
 
-fn app_history_store(app: &AppHandle) -> Result<ConversationHistoryStore, String> {
+#[derive(Default)]
+struct HistoryState(Mutex<Option<Arc<ConversationHistoryStore>>>);
+
+fn app_history_store(app: &AppHandle) -> Result<Arc<ConversationHistoryStore>, String> {
+    let state = app.state::<HistoryState>();
+    let mut slot = state
+        .0
+        .lock()
+        .map_err(|_| "conversation history store is unavailable".to_owned())?;
+    if let Some(store) = slot.as_ref() {
+        return Ok(Arc::clone(store));
+    }
     let database = app
         .path()
         .app_data_dir()
         .map_err(|_| "conversation history path could not be resolved".to_owned())?
         .join("conversations.sqlite3");
-    ConversationHistoryStore::open(&database).map_err(|error| error.to_string())
+    let store =
+        Arc::new(ConversationHistoryStore::open(&database).map_err(|error| error.to_string())?);
+    *slot = Some(Arc::clone(&store));
+    Ok(store)
 }
 
-#[tauri::command]
-fn history_storage_info(app: AppHandle) -> Result<HistoryStorageInfo, String> {
-    let store = app_history_store(&app)?;
-    Ok(HistoryStorageInfo {
-        database_path: store.database_path().to_string_lossy().into_owned(),
+async fn with_history_store<T, F>(app: AppHandle, operation: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(&ConversationHistoryStore) -> Result<T, String> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = app_history_store(&app)?;
+        operation(&store)
     })
+    .await
+    .map_err(|_| "conversation history task could not complete".to_owned())?
 }
 
 #[tauri::command]
-fn list_conversation_history(app: AppHandle) -> Result<Vec<ConversationSummary>, String> {
-    app_history_store(&app)?
-        .list()
-        .map_err(|error| error.to_string())
+async fn history_storage_info(app: AppHandle) -> Result<HistoryStorageInfo, String> {
+    with_history_store(app, |store| {
+        Ok(HistoryStorageInfo {
+            database_path: store.database_path().to_string_lossy().into_owned(),
+        })
+    })
+    .await
 }
 
 #[tauri::command]
-fn get_conversation_history(
+async fn list_conversation_history(app: AppHandle) -> Result<Vec<ConversationSummary>, String> {
+    with_history_store(app, |store| store.list().map_err(|error| error.to_string())).await
+}
+
+#[tauri::command]
+async fn get_conversation_history(
     app: AppHandle,
     id: String,
 ) -> Result<Option<ConversationHistory>, String> {
-    app_history_store(&app)?
-        .get(&id)
-        .map_err(|error| error.to_string())
+    with_history_store(app, move |store| {
+        store.get(&id).map_err(|error| error.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-fn save_conversation_history(
+async fn save_conversation_history(
     app: AppHandle,
     conversation: ConversationHistory,
 ) -> Result<(), String> {
-    app_history_store(&app)?
-        .save(&conversation)
-        .map_err(|error| error.to_string())
+    with_history_store(app, move |store| {
+        store.save(&conversation).map_err(|error| error.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-fn delete_conversation_history(app: AppHandle, id: String) -> Result<(), String> {
-    app_history_store(&app)?
-        .delete(&id)
-        .map_err(|error| error.to_string())
+async fn delete_conversation_history(app: AppHandle, id: String) -> Result<(), String> {
+    with_history_store(app, move |store| {
+        store.delete(&id).map_err(|error| error.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -97,6 +129,7 @@ async fn close_runtime(bridge: State<'_, GatewayBridge>) -> Result<(), String> {
 pub fn run() {
     tauri::Builder::default()
         .manage(GatewayBridge::default())
+        .manage(HistoryState::default())
         .invoke_handler(tauri::generate_handler![
             open_runtime,
             send_runtime,

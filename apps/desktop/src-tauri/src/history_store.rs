@@ -1,6 +1,7 @@
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -87,9 +88,10 @@ impl TurnState {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ConversationHistoryStore {
     database: PathBuf,
+    connection: Mutex<Connection>,
 }
 
 impl ConversationHistoryStore {
@@ -100,14 +102,10 @@ impl ConversationHistoryStore {
         fs::create_dir_all(parent).map_err(|_| {
             HistoryStoreError("conversation history directory could not be created")
         })?;
-        let store = Self {
-            database: database.to_path_buf(),
-        };
-        let connection = store.connection()?;
+        let connection = open_connection(database)?;
         connection
             .execute_batch(
-                "PRAGMA foreign_keys = ON;
-                 CREATE TABLE IF NOT EXISTS conversations (
+                "CREATE TABLE IF NOT EXISTS conversations (
                    id TEXT PRIMARY KEY NOT NULL,
                    title TEXT NOT NULL,
                    created_at_ms INTEGER NOT NULL,
@@ -129,7 +127,10 @@ impl ConversationHistoryStore {
             )
             .map_err(database_error)?;
         set_private_permissions(database)?;
-        Ok(store)
+        Ok(Self {
+            database: database.to_path_buf(),
+            connection: Mutex::new(connection),
+        })
     }
 
     pub fn database_path(&self) -> &Path {
@@ -282,16 +283,22 @@ impl ConversationHistoryStore {
             .map_err(database_error)
     }
 
-    fn connection(&self) -> Result<Connection, HistoryStoreError> {
-        let connection = Connection::open(&self.database).map_err(database_error)?;
-        connection
-            .busy_timeout(Duration::from_secs(2))
-            .map_err(database_error)?;
-        connection
-            .execute_batch("PRAGMA foreign_keys = ON;")
-            .map_err(database_error)?;
-        Ok(connection)
+    fn connection(&self) -> Result<MutexGuard<'_, Connection>, HistoryStoreError> {
+        self.connection
+            .lock()
+            .map_err(|_| HistoryStoreError("conversation history connection is unavailable"))
     }
+}
+
+fn open_connection(database: &Path) -> Result<Connection, HistoryStoreError> {
+    let connection = Connection::open(database).map_err(database_error)?;
+    connection
+        .busy_timeout(Duration::from_secs(2))
+        .map_err(database_error)?;
+    connection
+        .execute_batch("PRAGMA foreign_keys = ON;")
+        .map_err(database_error)?;
+    Ok(connection)
 }
 
 fn validate_conversation(value: &ConversationHistory) -> Result<(), HistoryStoreError> {

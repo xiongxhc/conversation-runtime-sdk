@@ -124,6 +124,36 @@ fn lists_every_saved_conversation() {
     assert_eq!(summaries[200].id, "conversation-0");
 }
 
+#[test]
+fn shares_one_store_across_threads() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<ConversationHistoryStore>();
+
+    let temporary = tempfile::tempdir().unwrap();
+    let store = std::sync::Arc::new(
+        ConversationHistoryStore::open(&temporary.path().join("history.sqlite3")).unwrap(),
+    );
+    let workers: Vec<_> = (0..4)
+        .map(|index| {
+            let store = std::sync::Arc::clone(&store);
+            std::thread::spawn(move || {
+                store
+                    .save(&conversation(
+                        &format!("thread-{index}"),
+                        index + 1,
+                        &format!("Thread {index}"),
+                    ))
+                    .unwrap();
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+
+    assert_eq!(store.list().unwrap().len(), 4);
+}
+
 fn conversation(id: &str, updated_at_ms: i64, title: &str) -> ConversationHistory {
     ConversationHistory {
         id: id.to_owned(),

@@ -1,0 +1,9 @@
+{"protocol_version":2,"type":"status","request_id":"req-1"}
+{"protocol_version":99,"type":"status","request_id":"req-1","extra":true}
+{"protocol_version":99,"type":"start_turn","request_id":"req-1","turn_id":1,"transcript":"hello"}
+{"protocol_version":99,"type":"start_turn","request_id":"req-1","turn_id":"01","transcript":"hello"}
+{"protocol_version":99,"type":"start_turn","request_id":"req-1","turn_id":"0","transcript":"hello"}
+{"protocol_version":99,"type":"start_turn","request_id":"","turn_id":"1","transcript":"hello"}
+{"protocol_version":99,"type":"start_turn","request_id":"req-1","turn_id":"1","transcript":""}
+{"protocol_version":99,"type":"unknown","request_id":"req-1"}
+not-json

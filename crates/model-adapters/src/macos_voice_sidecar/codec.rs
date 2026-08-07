@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{AudioFrame, PcmFormat, PcmSampleFormat, RecognitionHypothesis, MAX_PCM_FRAME_BYTES};
 
-pub(crate) const PROTOCOL_VERSION: u16 = 2;
+pub(crate) const PROTOCOL_VERSION: u16 = 1;
 pub(crate) const HEADER_BYTES: usize = 8;
 pub(crate) const AUDIO_METADATA_BYTES: usize = 48;
 pub(crate) const MAX_CONTROL_PAYLOAD_BYTES: usize = 65_536;
@@ -345,7 +345,7 @@ impl fmt::Display for SidecarCodecError {
                 write!(formatter, "unknown sidecar PCM sample format {format}")
             }
             Self::UnsupportedFailureStage => formatter
-                .write_str("runtime stage is not supported by sidecar protocol version two"),
+                .write_str("runtime stage is not supported by sidecar protocol version one"),
             Self::TrailingBytes(count) => {
                 write!(formatter, "sidecar frame has {count} trailing bytes")
             }

@@ -33,7 +33,7 @@ async fn persistent_session_reports_local_status_and_preserves_completed_history
     assert_local_status(&ready, false);
 
     gateway
-        .write_message(r#"{"protocol_version":3,"type":"status","request_id":"status-1"}"#)
+        .write_message(r#"{"protocol_version":1,"type":"status","request_id":"status-1"}"#)
         .await;
     assert_accepted(&gateway.read_message().await, "status-1");
     let status = gateway.read_message().await;
@@ -87,7 +87,7 @@ async fn status_reports_exact_model_and_enabled_local_memory() {
     assert_local_status(&ready, true);
 
     gateway
-        .write_message(r#"{"protocol_version":3,"type":"status","request_id":"status-memory"}"#)
+        .write_message(r#"{"protocol_version":1,"type":"status","request_id":"status-memory"}"#)
         .await;
     assert_accepted(&gateway.read_message().await, "status-memory");
     assert_local_status(&gateway.read_message().await, true);
@@ -110,7 +110,7 @@ async fn configured_voice_is_not_advertised_before_voice_hosting() {
 
     gateway
         .write_message(
-            r#"{"protocol_version":3,"type":"start_voice_session","request_id":"voice-before-host"}"#,
+            r#"{"protocol_version":1,"type":"start_voice_session","request_id":"voice-before-host"}"#,
         )
         .await;
     assert_rejected(
@@ -135,7 +135,7 @@ async fn compiled_gateway_lists_and_inspects_memory_with_exact_correlation() {
 
     gateway
         .write_message(
-            r#"{"protocol_version":3,"type":"memory_list","request_id":"compiled-list","cursor":null}"#,
+            r#"{"protocol_version":1,"type":"memory_list","request_id":"compiled-list","cursor":null}"#,
         )
         .await;
     assert_accepted(&gateway.read_message().await, "compiled-list");
@@ -151,7 +151,7 @@ async fn compiled_gateway_lists_and_inspects_memory_with_exact_correlation() {
 
     gateway
         .write_message(&format!(
-            r#"{{"protocol_version":3,"type":"memory_inspect","request_id":"compiled-inspect","memory_id":"{}"}}"#,
+            r#"{{"protocol_version":1,"type":"memory_inspect","request_id":"compiled-inspect","memory_id":"{}"}}"#,
             record.id().get()
         ))
         .await;
@@ -167,7 +167,7 @@ async fn compiled_gateway_lists_and_inspects_memory_with_exact_correlation() {
     assert!(inspection.raw.len() < MAX_CLIENT_FRAME_BYTES);
 
     gateway
-        .write_message(r#"{"protocol_version":3,"type":"status","request_id":"compiled-status"}"#)
+        .write_message(r#"{"protocol_version":1,"type":"status","request_id":"compiled-status"}"#)
         .await;
     assert_accepted(&gateway.read_message().await, "compiled-status");
     let status = gateway.read_message().await;
@@ -201,7 +201,7 @@ async fn compiled_gateway_rejects_active_memory_before_interrupt_and_reaps() {
 
     gateway
         .write_message(
-            r#"{"protocol_version":3,"type":"memory_list","request_id":"compiled-list-active","cursor":null}"#,
+            r#"{"protocol_version":1,"type":"memory_list","request_id":"compiled-list-active","cursor":null}"#,
         )
         .await;
     let rejection = gateway
@@ -217,7 +217,7 @@ async fn compiled_gateway_rejects_active_memory_before_interrupt_and_reaps() {
     );
     gateway
         .write_message(
-            r#"{"protocol_version":3,"type":"status","request_id":"compiled-status-after-active"}"#,
+            r#"{"protocol_version":1,"type":"status","request_id":"compiled-status-after-active"}"#,
         )
         .await;
     assert_accepted(
@@ -228,7 +228,7 @@ async fn compiled_gateway_rejects_active_memory_before_interrupt_and_reaps() {
 
     gateway
         .write_message(
-            r#"{"protocol_version":3,"type":"interrupt_turn","request_id":"compiled-interrupt-after-memory","turn_id":"1"}"#,
+            r#"{"protocol_version":1,"type":"interrupt_turn","request_id":"compiled-interrupt-after-memory","turn_id":"1"}"#,
         )
         .await;
     let before_terminal = gateway.read_until(|message| message.is_terminal()).await;
@@ -276,7 +276,7 @@ async fn interrupt_is_accepted_before_one_cancelled_terminal() {
 
     gateway
         .write_message(
-            r#"{"protocol_version":3,"type":"interrupt_turn","request_id":"interrupt-1","turn_id":"1"}"#,
+            r#"{"protocol_version":1,"type":"interrupt_turn","request_id":"interrupt-1","turn_id":"1"}"#,
         )
         .await;
     let before_ack = gateway
@@ -319,7 +319,7 @@ async fn malformed_command_is_rejected_and_the_session_survives() {
 
     gateway
         .write_message(
-            r#"{"protocol_version":3,"type":"status","request_id":"status-after-rejection"}"#,
+            r#"{"protocol_version":1,"type":"status","request_id":"status-after-rejection"}"#,
         )
         .await;
     assert_accepted(&gateway.read_message().await, "status-after-rejection");
@@ -644,7 +644,7 @@ fn stderr_task(mut stderr: ChildStderr) -> JoinHandle<Vec<u8>> {
 
 fn config_contents(endpoint: &str, memory_path: Option<&Path>) -> String {
     let mut config = format!(
-        r#"schema_version = 2
+        r#"schema_version = 1
 privacy_mode = "local-only"
 
 [language]
@@ -688,7 +688,7 @@ maximum_bytes = 4096
 
 fn start_turn(request_id: &str, transcript: &str) -> String {
     format!(
-        r#"{{"protocol_version":3,"type":"start_turn","request_id":"{request_id}","transcript":"{transcript}"}}"#
+        r#"{{"protocol_version":1,"type":"start_turn","request_id":"{request_id}","transcript":"{transcript}"}}"#
     )
 }
 

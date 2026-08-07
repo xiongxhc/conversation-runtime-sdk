@@ -3,8 +3,8 @@ import Testing
 @testable import VoiceSidecarCore
 
 @Test
-func versionTwoCaptureKindCodesArePinned() {
-    #expect(ChildProtocol.version == 2)
+func versionOneCaptureKindCodesArePinned() {
+    #expect(ChildProtocol.version == 1)
     let expected: [(ChildFrameKind, UInt16)] = [
         (.startSession, 0x0001),
         (.startCapture, 0x0002),
@@ -49,14 +49,14 @@ func captureControlsRoundTripExactSessionAndOperationIdentity() throws {
 }
 
 @Test
-func protocolV1IsRejectedExplicitly() {
+func unknownProtocolVersionIsRejectedExplicitly() {
     let data = rawFrame(
-        version: 1,
+        version: 99,
         kind: .startCapture,
         payload: Data(#"{"session_id":7,"operation_id":1}"#.utf8)
     )
 
-    #expect(throws: ChildProtocolError.unknownVersion(1)) {
+    #expect(throws: ChildProtocolError.unknownVersion(99)) {
         try ChildProtocol.decode(data)
     }
 }
@@ -119,7 +119,7 @@ func startSessionFixtureRoundTrips() throws {
     let data = try Data(contentsOf: fixture("control/start-session.bin"))
     let frame = try ChildProtocol.decode(data)
 
-    #expect(frame.version == 2)
+    #expect(frame.version == 1)
     #expect(frame.kind == .startSession)
     #expect(try ChildProtocol.encode(frame) == data)
     #expect(
@@ -258,8 +258,8 @@ func eofConvertsPartialDataToTypedTruncation() throws {
 
 @Test
 func unknownVersionAndKindFailBeforePayloadDecode() {
-    #expect(throws: ChildProtocolError.unknownVersion(1)) {
-        try ChildProtocol.decode(rawFrame(version: 1, kindCode: 0x0002, payload: Data([0xFF])))
+    #expect(throws: ChildProtocolError.unknownVersion(99)) {
+        try ChildProtocol.decode(rawFrame(version: 99, kindCode: 0x0002, payload: Data([0xFF])))
     }
     #expect(throws: ChildProtocolError.unknownKind(0x7777)) {
         try ChildProtocol.decode(rawFrame(kindCode: 0x7777, payload: Data([0xFF])))

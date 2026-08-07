@@ -28,7 +28,7 @@ test("connects, correlates status, and streams an accepted turn", async () => {
   transport.push(accepted(statusCommand.requestId));
   transport.push({
     type: "status",
-    protocol_version: 3,
+    protocol_version: 1,
     request_id: statusCommand.requestId,
     status: wireStatus(),
   });
@@ -39,7 +39,7 @@ test("connects, correlates status, and streams an accepted turn", async () => {
   assert.equal("turnId" in start, false);
   transport.push({
     type: "command_accepted",
-    protocol_version: 3,
+    protocol_version: 1,
     request_id: start.requestId,
     turn_id: "41",
   });
@@ -112,7 +112,7 @@ test("rejects every pending operation after text arrives after terminal", async 
 test("propagates malformed inbound messages and transport failures", async () => {
   const malformed = await connectedClient();
   const pendingMalformed = malformed.client.status();
-  malformed.transport.push({ type: "status", protocol_version: 3 });
+  malformed.transport.push({ type: "status", protocol_version: 1 });
   await assert.rejects(pendingMalformed, /message contains missing or unknown fields/);
   await malformed.client.close();
 
@@ -191,7 +191,7 @@ test("rejects an accepted command rejection as a correlation violation", async (
   connected.transport.push(accepted(statusCommand.requestId));
   connected.transport.push({
     type: "command_rejected",
-    protocol_version: 3,
+    protocol_version: 1,
     request_id: statusCommand.requestId,
     error: { code: "invalid_state", kind: "invalid_state", stage: "runtime", message: "rejected" },
   });
@@ -212,7 +212,7 @@ test("rejects an accepted start rejection as a correlation violation", async () 
   await starting;
   connected.transport.push({
     type: "command_rejected",
-    protocol_version: 3,
+    protocol_version: 1,
     request_id: startCommand.requestId,
     error: { code: "invalid_state", kind: "invalid_state", stage: "runtime", message: "rejected" },
   });
@@ -232,7 +232,7 @@ test("rejects oversized starts before registering pending work", async () => {
   const pending = connected.client.status();
   const statusCommand = command(connected.transport, "status");
   connected.transport.push(accepted(statusCommand.requestId));
-  connected.transport.push({ type: "status", protocol_version: 3, request_id: statusCommand.requestId, status: wireStatus() });
+  connected.transport.push({ type: "status", protocol_version: 1, request_id: statusCommand.requestId, status: wireStatus() });
   assert.deepEqual(await pending, status);
   await connected.client.close();
 });
@@ -321,7 +321,7 @@ test("preserves client health after a rejected memory request", async () => {
   const pendingStatus = connected.client.status();
   const statusCommand = command(connected.transport, "status");
   connected.transport.push(acceptedControl(statusCommand.requestId));
-  connected.transport.push({ type: "status", protocol_version: 3, request_id: statusCommand.requestId, status: wireStatusV2() });
+  connected.transport.push({ type: "status", protocol_version: 1, request_id: statusCommand.requestId, status: wireStatusV2() });
   assert.deepEqual(await pendingStatus, {
     ...status,
     memoryEnabled: true,
@@ -511,7 +511,7 @@ function latestCommand<T extends ClientCommand["type"]>(
 }
 
 function ready(): unknown {
-  return { type: "ready", protocol_version: 3, status: wireStatus() };
+  return { type: "ready", protocol_version: 1, status: wireStatus() };
 }
 
 async function acceptTurn(
@@ -527,18 +527,18 @@ async function acceptTurn(
 function accepted(requestId: string, turnId?: bigint): unknown {
   return {
     type: "command_accepted",
-    protocol_version: 3,
+    protocol_version: 1,
     request_id: requestId,
     ...(turnId === undefined ? {} : { turn_id: turnId.toString() }),
   };
 }
 
 function acceptedControl(requestId: string): unknown {
-  return { type: "command_accepted", protocol_version: 3, request_id: requestId };
+  return { type: "command_accepted", protocol_version: 1, request_id: requestId };
 }
 
 function rejected(requestId: string, error: RuntimeFailure): unknown {
-  return { type: "command_rejected", protocol_version: 3, request_id: requestId, error };
+  return { type: "command_rejected", protocol_version: 1, request_id: requestId, error };
 }
 
 function assertCommandRejectedError(error: Error, failure: RuntimeFailure): boolean {
@@ -554,7 +554,7 @@ function assertCommandRejectedError(error: Error, failure: RuntimeFailure): bool
 function memoryList(requestId: string, id: string, nextCursor: Record<string, string> | null): unknown {
   return {
     type: "memory_list",
-    protocol_version: 3,
+    protocol_version: 1,
     request_id: requestId,
     records: [{
       id,
@@ -571,7 +571,7 @@ function memoryList(requestId: string, id: string, nextCursor: Record<string, st
 function memoryInspection(requestId: string): unknown {
   return {
     type: "memory_inspection",
-    protocol_version: 3,
+    protocol_version: 1,
     request_id: requestId,
     inspection: {
       record: {
@@ -606,7 +606,7 @@ function event(type: "text_delta", turnId: bigint, delta: string): unknown;
 function event(type: "turn_started" | "turn_completed" | "turn_cancelled" | "text_delta", turnId: bigint, delta?: string): unknown {
   return {
     type: "runtime_event",
-    protocol_version: 3,
+    protocol_version: 1,
     event:
       type === "text_delta"
         ? { type, turn_id: turnId.toString(), delta }

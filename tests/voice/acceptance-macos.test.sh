@@ -27,7 +27,7 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 CONFIG="$FIXTURE_ROOT/voice-session.toml"
-printf '%s\n' 'schema_version = 2' >"$CONFIG"
+printf '%s\n' 'schema_version = 1' >"$CONFIG"
 
 /usr/bin/xcrun clang \
     -std=c11 \

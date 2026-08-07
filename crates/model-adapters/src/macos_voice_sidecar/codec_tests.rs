@@ -11,11 +11,11 @@ use conversation_protocol::{
     GenerationId, RuntimeStage, SessionId, TurnId, UtteranceId, VoiceActivity,
 };
 
-const FIXTURE_ROOT: &str = "../../tests/fixtures/voice-sidecar-v2";
+const FIXTURE_ROOT: &str = "../../tests/fixtures/voice-sidecar-v1";
 
 #[test]
-fn version_two_capture_kind_codes_are_pinned() {
-    assert_eq!(PROTOCOL_VERSION, 2);
+fn version_one_capture_kind_codes_are_pinned() {
+    assert_eq!(PROTOCOL_VERSION, 1);
     let expected = [
         (SidecarFrameKind::StartSession, 0x0001),
         (SidecarFrameKind::StartCapture, 0x0002),
@@ -78,12 +78,12 @@ fn capture_controls_round_trip_exact_session_and_operation_identity() {
 }
 
 #[test]
-fn sidecar_protocol_v1_is_rejected_explicitly() {
-    let bytes = raw_frame(1, 0x0002, br#"{"session_id":7,"operation_id":1}"#);
+fn unknown_sidecar_protocol_version_is_rejected_explicitly() {
+    let bytes = raw_frame(99, 0x0002, br#"{"session_id":7,"operation_id":1}"#);
 
     assert_eq!(
         decode_frame(&bytes),
-        Err(SidecarCodecError::UnknownVersion(1))
+        Err(SidecarCodecError::UnknownVersion(99))
     );
 }
 
@@ -168,10 +168,10 @@ fn capture_controls_reject_zero_session_identity() {
 #[test]
 fn start_session_fixture_round_trips_exactly() {
     let bytes =
-        include_bytes!("../../../../tests/fixtures/voice-sidecar-v2/control/start-session.bin");
+        include_bytes!("../../../../tests/fixtures/voice-sidecar-v1/control/start-session.bin");
     let frame = decode_frame(bytes).unwrap();
 
-    assert_eq!(frame.version(), 2);
+    assert_eq!(frame.version(), 1);
     assert_eq!(frame.kind(), SidecarFrameKind::StartSession);
     assert_eq!(encode_frame(&frame).unwrap(), bytes);
     assert_eq!(
@@ -183,7 +183,7 @@ fn start_session_fixture_round_trips_exactly() {
 #[test]
 fn transcript_partial_fixture_round_trips_exactly() {
     let bytes = include_bytes!(
-        "../../../../tests/fixtures/voice-sidecar-v2/control/transcript-partial.bin"
+        "../../../../tests/fixtures/voice-sidecar-v1/control/transcript-partial.bin"
     );
     let frame = decode_frame(bytes).unwrap();
 
@@ -236,7 +236,7 @@ fn signed_sixteen_audio_fixture_pins_metadata_and_pcm_bytes() {
     assert_eq!(encode_frame(&frame).unwrap(), bytes);
 
     let expected = [
-        0x00, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00, 0x34, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x34, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x05, 0x00, 0x00, 0x5d, 0xc0, 0x00, 0x01, 0x00, 0x01, 0x00, 0x80, 0xff, 0x7f,
@@ -320,11 +320,11 @@ fn eof_converts_partial_data_to_typed_truncation() {
 
 #[test]
 fn unknown_version_fails_before_payload_decode() {
-    let bytes = raw_frame(1, SidecarFrameKind::StartCapture.code(), &[0xff]);
+    let bytes = raw_frame(99, SidecarFrameKind::StartCapture.code(), &[0xff]);
 
     assert_eq!(
         decode_frame(&bytes),
-        Err(SidecarCodecError::UnknownVersion(1))
+        Err(SidecarCodecError::UnknownVersion(99))
     );
 }
 
@@ -689,8 +689,8 @@ fn trailing_bytes_are_not_silently_accepted() {
 }
 
 #[test]
-#[ignore = "writes the immutable version-two cross-language fixtures once"]
-fn write_version_two_fixtures() {
+#[ignore = "writes the immutable version-one cross-language fixtures once"]
+fn write_version_one_fixtures() {
     let start_session = SidecarFrame::control(SidecarControl::StartSession {
         session_id: SessionId::new(7),
         speech_start_ms: 200,

@@ -18,7 +18,7 @@ The first release is not a directory-complete platform. It is one local voice lo
 - Phrase-level language-to-speech integration, first-playable-audio timing, integrated runtime speech, and cancellation through active playback are implemented and deterministic-test covered.
 - One cold cached Apple Silicon run records first text, first synthesis, first playable audio, playback-process launch, total completion, and cleanup. It is machine-specific evidence, not a model or backend selection.
 - A later isolated Apple Silicon continuity check records one speech request, one playback launch, process-level timings, and cleanup for the corrected punctuation/formatting path. It adds no first-audible or subjective-quality claim.
-- The deterministic R3 implementation now includes schema-v2 privacy policy, a
+- The deterministic R3 implementation now includes schema-v1 privacy policy, a
   managed macOS voice-processing sidecar, local recognition integration,
   generation-safe continuous playback, explicit streaming local speech, and a
   bounded ten-minute acceptance harness that requires observed completed turns
@@ -152,7 +152,7 @@ and [the canonical architecture](docs/architecture.md).
 
 ### Source Status
 
-The deterministic code path is implemented: strict schema-v2 configuration
+The deterministic code path is implemented: strict schema-v1 configuration
 selects buffered compatibility or explicit streaming speech; the streaming
 adapter parses arbitrarily chunked concatenated WAV containers with checked
 bounds; the Rust runtime preserves turn, generation, utterance, and sequence
@@ -217,7 +217,7 @@ preserves deployment guidance, runtime guidance, ordered history, and current
 input while lowering its output-token cap to the resolved spoken-duration
 budget.
 
-Schema-v2 configuration exposes persona, response, and content-free metric
+Schema-v1 configuration exposes persona, response, and content-free metric
 controls with explicit defaults and pre-capture validation. Relationship
 guidance is derived from visible persona, supplied context, reciprocity, pacing,
 and rapport; no scripted expression, hidden unlock, or frequency quota exists.
@@ -307,7 +307,7 @@ supports setup with absolute paths, verified local-only status, streamed text
 chat, Stop, close, and reconnect. Its idle Voice Focus preview makes Soft Aurora
 (the default), Silk, Threads, Prism, Orb, Still Gradient, and None selectable;
 the transcript remains hidden by default. When an explicitly initialized local
-memory store is configured and the gateway advertises protocol-v3
+memory store is configured and the gateway advertises protocol-v1
 `memory_inspection`, the desktop uses the public browser-safe SDK to provide
 read-only list and detail inspection. History remains separately owned local
 transcript storage; the desktop neither initializes runtime memory nor
@@ -345,7 +345,7 @@ See [the R6 local-gateway evaluation](docs/r6-local-gateway-evaluation.md) and
 - macOS Tauri process bridge using explicit absolute gateway and configuration
   paths.
 - Local text-chat workspace with streamed output, Stop, close, and reconnect.
-- Protocol-v3 read-only runtime-memory list and detail inspection through the
+- Protocol-v1 read-only runtime-memory list and detail inspection through the
   public browser-safe SDK, gated on an explicitly configured local store.
 - Idle Voice Focus preview with seven selectable scenes, hidden transcript by
   default, reduced-motion fallback, and explicit visual-preview labeling.

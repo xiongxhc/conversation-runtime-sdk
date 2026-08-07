@@ -147,9 +147,9 @@ fn approval(
 }
 
 #[test]
-fn version_three_start_turns_reject_version_two_and_client_selected_identifiers() {
+fn version_one_start_turns_reject_version_two_and_client_selected_identifiers() {
     let command = decode_client_command(
-        br#"{"protocol_version":3,"type":"start_turn","request_id":"req-1","transcript":"hello"}"#,
+        br#"{"protocol_version":1,"type":"start_turn","request_id":"req-1","transcript":"hello"}"#,
     )
     .unwrap();
 
@@ -159,7 +159,7 @@ fn version_three_start_turns_reject_version_two_and_client_selected_identifiers(
     )
     .is_err());
     assert!(decode_client_command(
-        br#"{"protocol_version":3,"type":"start_turn","request_id":"req-1","turn_id":"1","transcript":"hello"}"#,
+        br#"{"protocol_version":1,"type":"start_turn","request_id":"req-1","turn_id":"1","transcript":"hello"}"#,
     )
     .is_err());
 }
@@ -172,13 +172,13 @@ fn accepted_start_turns_carry_the_gateway_allocated_identifier() {
     });
 
     assert_eq!(value["type"], "command_accepted");
-    assert_eq!(value["protocol_version"], 3);
+    assert_eq!(value["protocol_version"], 1);
     assert_eq!(value["request_id"], "req-1");
     assert_eq!(value["turn_id"], "9");
 }
 
 #[test]
-fn version_three_voice_controls_decode_without_client_selected_identifiers() {
+fn version_one_voice_controls_decode_without_client_selected_identifiers() {
     let cases = [
         ("start_voice_session", "start"),
         ("stop_voice_session", "stop"),
@@ -188,7 +188,7 @@ fn version_three_voice_controls_decode_without_client_selected_identifiers() {
 
     for (command_type, expected) in cases {
         let payload = format!(
-            r#"{{"protocol_version":3,"type":"{command_type}","request_id":"req-{expected}"}}"#
+            r#"{{"protocol_version":1,"type":"{command_type}","request_id":"req-{expected}"}}"#
         );
         let command = decode_client_command(payload.as_bytes()).unwrap();
         assert!(
@@ -219,7 +219,7 @@ fn typed_start_projection_carries_request_correlation_and_exact_final_text() {
     assert_eq!(
         gateway_value(&GatewayMessage::RuntimeEvent { event: started }),
         serde_json::json!({
-            "protocol_version": 3,
+            "protocol_version": 1,
             "type": "runtime_event",
             "event": {"type": "turn_started", "request_id": "req-1", "turn_id": "1"}
         })
@@ -227,7 +227,7 @@ fn typed_start_projection_carries_request_correlation_and_exact_final_text() {
     assert_eq!(
         gateway_value(&GatewayMessage::RuntimeEvent { event: completed }),
         serde_json::json!({
-            "protocol_version": 3,
+            "protocol_version": 1,
             "type": "runtime_event",
             "event": {"type": "text_completed", "turn_id": "1", "text": "exact answer"}
         })
@@ -318,7 +318,7 @@ fn voice_events_project_every_approved_lifecycle_variant() {
             gateway_value(&GatewayMessage::VoiceEvent { event })
         })
         .collect::<Vec<_>>();
-    let fixture_events = include_str!("../../../tests/fixtures/client-wire-v3/events.jsonl")
+    let fixture_events = include_str!("../../../tests/fixtures/client-wire-v1/events.jsonl")
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
         .filter(|value| value["type"] == "voice_event")
@@ -372,7 +372,7 @@ fn runtime_status_accepts_only_canonical_capability_and_component_combinations()
                 .clone()
         })
         .collect::<Vec<_>>();
-    let fixture_statuses = include_str!("../../../tests/fixtures/client-wire-v3/events.jsonl")
+    let fixture_statuses = include_str!("../../../tests/fixtures/client-wire-v1/events.jsonl")
         .lines()
         .take(4)
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["status"].clone())
@@ -547,7 +547,7 @@ fn production_and_fixture_provider_labels_share_exact_boundary_rules() {
             encode_gateway_message(&GatewayMessage::Ready { status: production }).is_ok();
 
         let mut fixture: serde_json::Value = serde_json::from_str(
-            include_str!("../../../tests/fixtures/client-wire-v3/events.jsonl")
+            include_str!("../../../tests/fixtures/client-wire-v1/events.jsonl")
                 .lines()
                 .next()
                 .unwrap(),
@@ -585,9 +585,9 @@ fn maximum_valid_voice_payload_stays_below_the_frame_limit() {
 }
 
 #[test]
-fn version_three_memory_commands_decode_and_older_versions_are_rejected() {
+fn version_one_memory_commands_decode_and_unsupported_versions_are_rejected() {
     let list = decode_client_command(
-        br#"{"protocol_version":3,"type":"memory_list","request_id":"req-1","cursor":null}"#,
+        br#"{"protocol_version":1,"type":"memory_list","request_id":"req-1","cursor":null}"#,
     )
     .unwrap();
     assert!(matches!(
@@ -599,7 +599,7 @@ fn version_three_memory_commands_decode_and_older_versions_are_rejected() {
     ));
 
     let inspect = decode_client_command(
-        br#"{"protocol_version":3,"type":"memory_inspect","request_id":"req-2","memory_id":"7"}"#,
+        br#"{"protocol_version":1,"type":"memory_inspect","request_id":"req-2","memory_id":"7"}"#,
     )
     .unwrap();
     assert!(matches!(
@@ -607,10 +607,14 @@ fn version_three_memory_commands_decode_and_older_versions_are_rejected() {
         ClientCommand::MemoryInspect { memory_id, .. } if memory_id.get() == 7
     ));
 
-    for line in include_str!("../../../tests/fixtures/client-wire-v1/commands.jsonl").lines() {
+    for line in
+        include_str!("../../../tests/fixtures/client-wire-unsupported/commands.jsonl").lines()
+    {
         assert!(decode_client_command(line.as_bytes()).is_err());
     }
-    for line in include_str!("../../../tests/fixtures/client-wire-v1/invalid.jsonl").lines() {
+    for line in
+        include_str!("../../../tests/fixtures/client-wire-unsupported/invalid.jsonl").lines()
+    {
         assert!(decode_client_command(line.as_bytes()).is_err());
     }
 }
@@ -618,11 +622,11 @@ fn version_three_memory_commands_decode_and_older_versions_are_rejected() {
 #[test]
 fn unknown_fields_and_versions_are_rejected() {
     assert!(decode_client_command(
-        br#"{"protocol_version":1,"type":"status","request_id":"req-1"}"#
+        br#"{"protocol_version":99,"type":"status","request_id":"req-1"}"#
     )
     .is_err());
     assert!(decode_client_command(
-        br#"{"protocol_version":3,"type":"status","request_id":"req-1","extra":true}"#
+        br#"{"protocol_version":1,"type":"status","request_id":"req-1","extra":true}"#
     )
     .is_err());
 }
@@ -631,7 +635,7 @@ fn unknown_fields_and_versions_are_rejected() {
 fn identifiers_must_be_canonical_non_zero_decimal_strings() {
     for identifier in ["0", "01", "+1", " 1", "1 ", "-1"] {
         let payload = format!(
-            r#"{{"protocol_version":3,"type":"interrupt_turn","request_id":"req-1","turn_id":"{identifier}"}}"#
+            r#"{{"protocol_version":1,"type":"interrupt_turn","request_id":"req-1","turn_id":"{identifier}"}}"#
         );
         assert!(
             decode_client_command(payload.as_bytes()).is_err(),
@@ -640,7 +644,7 @@ fn identifiers_must_be_canonical_non_zero_decimal_strings() {
     }
 
     assert!(decode_client_command(
-        br#"{"protocol_version":3,"type":"interrupt_turn","request_id":"req-1","turn_id":1}"#
+        br#"{"protocol_version":1,"type":"interrupt_turn","request_id":"req-1","turn_id":1}"#
     )
     .is_err());
 }
@@ -648,24 +652,24 @@ fn identifiers_must_be_canonical_non_zero_decimal_strings() {
 #[test]
 fn commands_reject_invalid_request_ids_and_transcripts() {
     assert!(
-        decode_client_command(br#"{"protocol_version":3,"type":"status","request_id":""}"#)
+        decode_client_command(br#"{"protocol_version":1,"type":"status","request_id":""}"#)
             .is_err()
     );
     assert!(decode_client_command(
         format!(
-            r#"{{"protocol_version":3,"type":"status","request_id":"{}"}}"#,
+            r#"{{"protocol_version":1,"type":"status","request_id":"{}"}}"#,
             "r".repeat(65)
         )
         .as_bytes()
     )
     .is_err());
     assert!(decode_client_command(
-        br#"{"protocol_version":3,"type":"start_turn","request_id":"req-1","transcript":""}"#
+        br#"{"protocol_version":1,"type":"start_turn","request_id":"req-1","transcript":""}"#
     )
     .is_err());
     assert!(decode_client_command(
         format!(
-            r#"{{"protocol_version":3,"type":"start_turn","request_id":"req-1","transcript":"{}"}}"#,
+            r#"{{"protocol_version":1,"type":"start_turn","request_id":"req-1","transcript":"{}"}}"#,
             "x".repeat(16 * 1024 + 1)
         )
         .as_bytes()
@@ -674,13 +678,13 @@ fn commands_reject_invalid_request_ids_and_transcripts() {
 }
 
 #[test]
-fn version_one_command_fixtures_are_rejected() {
-    let commands = include_str!("../../../tests/fixtures/client-wire-v1/commands.jsonl");
+fn unsupported_version_command_fixtures_are_rejected() {
+    let commands = include_str!("../../../tests/fixtures/client-wire-unsupported/commands.jsonl");
 
     for (line_number, line) in commands.lines().enumerate() {
         assert!(
             decode_client_command(line.as_bytes()).is_err(),
-            "v1 command fixture line {} must be rejected",
+            "unsupported command fixture line {} must be rejected",
             line_number + 1
         );
     }
@@ -689,9 +693,9 @@ fn version_one_command_fixtures_are_rejected() {
 #[test]
 fn event_fixtures_reject_numeric_or_malformed_nested_identifiers() {
     for payload in [
-        r#"{"protocol_version":3,"type":"runtime_event","event":{"type":"turn_started","turn_id":1}}"#,
-        r#"{"protocol_version":3,"type":"runtime_event","event":{"type":"quality_resolved","decision":{"turn_id":"0","mode":"direct_answer","controls":{"maximum_spoken_seconds":20,"directness":80,"pace":"natural","follow_up_policy":"contextual","silence_policy":"allow_without_filler"},"signals":[],"history_message_count":0,"context_sources":["saved_persona","current_turn"]}}}"#,
-        r#"{"protocol_version":3,"type":"runtime_event","event":{"type":"memory_retrieved","trace":{"trace_id":"01","turn_id":"1","selected_items":1,"used_bytes":12}}}"#,
+        r#"{"protocol_version":1,"type":"runtime_event","event":{"type":"turn_started","turn_id":1}}"#,
+        r#"{"protocol_version":1,"type":"runtime_event","event":{"type":"quality_resolved","decision":{"turn_id":"0","mode":"direct_answer","controls":{"maximum_spoken_seconds":20,"directness":80,"pace":"natural","follow_up_policy":"contextual","silence_policy":"allow_without_filler"},"signals":[],"history_message_count":0,"context_sources":["saved_persona","current_turn"]}}}"#,
+        r#"{"protocol_version":1,"type":"runtime_event","event":{"type":"memory_retrieved","trace":{"trace_id":"01","turn_id":"1","selected_items":1,"used_bytes":12}}}"#,
     ] {
         assert!(parse_event_fixture(payload).is_err(), "{payload}");
     }
@@ -822,8 +826,8 @@ fn maximum_memory_inspection_response_stays_within_frame_limit() {
 }
 
 #[test]
-fn version_three_fixtures_parse_and_invalid_cases_are_rejected() {
-    for (line_number, line) in include_str!("../../../tests/fixtures/client-wire-v3/commands.jsonl")
+fn version_one_fixtures_parse_and_invalid_cases_are_rejected() {
+    for (line_number, line) in include_str!("../../../tests/fixtures/client-wire-v1/commands.jsonl")
         .lines()
         .enumerate()
     {
@@ -831,7 +835,7 @@ fn version_three_fixtures_parse_and_invalid_cases_are_rejected() {
             .unwrap_or_else(|error| panic!("command fixture line {}: {error}", line_number + 1));
     }
 
-    for (line_number, line) in include_str!("../../../tests/fixtures/client-wire-v3/events.jsonl")
+    for (line_number, line) in include_str!("../../../tests/fixtures/client-wire-v1/events.jsonl")
         .lines()
         .enumerate()
     {
@@ -839,13 +843,13 @@ fn version_three_fixtures_parse_and_invalid_cases_are_rejected() {
             .unwrap_or_else(|error| panic!("event fixture line {}: {error}", line_number + 1));
     }
 
-    for (line_number, line) in include_str!("../../../tests/fixtures/client-wire-v3/invalid.jsonl")
+    for (line_number, line) in include_str!("../../../tests/fixtures/client-wire-v1/invalid.jsonl")
         .lines()
         .enumerate()
     {
         assert!(
             decode_client_command(line.as_bytes()).is_err() && parse_event_fixture(line).is_err(),
-            "invalid fixture line {} must be rejected by every v3 envelope",
+            "invalid fixture line {} must be rejected by every v1 envelope",
             line_number + 1
         );
     }

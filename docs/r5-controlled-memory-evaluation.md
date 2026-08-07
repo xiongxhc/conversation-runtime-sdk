@@ -23,7 +23,7 @@ subjective long-term conversation quality.
   message before the current input. The no-memory request remains unchanged.
 - `conversation-memory-probe` exposes manual initialization, lifecycle,
   approval, expiration, deletion, and retrieval commands.
-- Schema-v2 voice configuration opts in only when one local SQLite descriptor
+- Schema-v1 voice configuration opts in only when one local SQLite descriptor
   and one matching `[memory_store]` are both present with a local language model.
 
 ## Control and Privacy Guarantees

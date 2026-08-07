@@ -6,7 +6,7 @@ func fixture(_ relativePath: String) throws -> URL {
         .map { URL(fileURLWithPath: $0, isDirectory: true) }
         ?? URL(fileURLWithPath: #filePath)
         .deletingLastPathComponent()
-        .appendingPathComponent("../../../../../tests/fixtures/voice-sidecar-v2")
+        .appendingPathComponent("../../../../../tests/fixtures/voice-sidecar-v1")
         .standardizedFileURL
     return root.appendingPathComponent(relativePath)
 }

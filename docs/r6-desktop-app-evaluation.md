@@ -1,7 +1,7 @@
 # R6 Desktop App Evaluation
 
 **Date:** 2026-08-06
-**Scope:** macOS Tauri text-chat, Voice Focus preview, and protocol-v3
+**Scope:** macOS Tauri text-chat, Voice Focus preview, and protocol-v1
 read-only runtime-memory inspection
 
 ## Result
@@ -22,7 +22,7 @@ mutation, packaged release, or R3 human/acoustic acceptance claim is made.
 | Voice Focus shell | Preview entry, scene selection, hidden transcript default, explicit transcript reveal, `Escape`, reduced motion, and scene failure fallbacks are covered by tests and the production build. | Preview is intentionally idle and cannot imply microphone or playback activity. |
 | Focus scenes | Soft Aurora, Silk, Threads, Prism, Orb, Still Gradient, and None are selectable; Soft Aurora is the default. | The five animated scenes have separate lazy chunks; final human GPU visual review remains open. |
 | Local gateway bridge | Absolute-path validation, idempotent close, process reaping, and reopen ordering pass Rust tests. | The desktop validation in this report does not claim model quality, latency, or acoustic behavior. |
-| Runtime memory inspection | With enabled local memory and advertised protocol-v3 `memory_inspection`, the Memory destination lists at most 50 summaries per page and opens read-only details through the browser-safe SDK. Provenance and approval histories retain at most their latest 32 entries and visibly mark truncation. | The desktop has no SQLite access, does not initialize memory, and does not copy conversations into it. Due expiry may be applied while inspecting; persona and all memory mutation remain open. |
+| Runtime memory inspection | With enabled local memory and advertised protocol-v1 `memory_inspection`, the Memory destination lists at most 50 summaries per page and opens read-only details through the browser-safe SDK. Provenance and approval histories retain at most their latest 32 entries and visibly mark truncation. | The desktop has no SQLite access, does not initialize memory, and does not copy conversations into it. Due expiry may be applied while inspecting; persona and all memory mutation remain open. |
 
 ## Reproduce the Developer Run
 

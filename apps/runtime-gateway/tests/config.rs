@@ -10,7 +10,7 @@ use conversation_protocol::{
 };
 use conversation_runtime_gateway::{GatewayAdapters, GatewayConfig};
 
-const VALID_CONFIG: &str = r#"schema_version = 2
+const VALID_CONFIG: &str = r#"schema_version = 1
 privacy_mode = "local-only"
 
 [language]
@@ -120,7 +120,7 @@ fn rejects_an_unsupported_schema_version() {
     let fixture = tempfile::tempdir().unwrap();
     let path = write_config(
         fixture.path(),
-        &VALID_CONFIG.replacen("schema_version = 2", "schema_version = 1", 1),
+        &VALID_CONFIG.replacen("schema_version = 1", "schema_version = 2", 1),
     );
 
     assert!(GatewayConfig::load(&path).is_err());

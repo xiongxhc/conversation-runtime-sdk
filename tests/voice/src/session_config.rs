@@ -317,8 +317,8 @@ impl SessionConfig {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema_version != 2 {
-            return Err("voice session configuration schema_version must be 2".to_owned());
+        if self.schema_version != 1 {
+            return Err("voice session configuration schema_version must be 1".to_owned());
         }
         self.require_local_execution_adapters()?;
         self.validate_memory_configuration()?;

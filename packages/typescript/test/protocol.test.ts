@@ -12,7 +12,7 @@ import {
 } from "../src/protocol.js";
 
 const fixtureDirectory = new URL(
-  "../../../../tests/fixtures/client-wire-v3/",
+  "../../../../tests/fixtures/client-wire-v1/",
   import.meta.url,
 );
 
@@ -30,7 +30,7 @@ async function fixtureLines(name: string): Promise<unknown[]> {
     });
 }
 
-test("parses every shared v3 command fixture with bigint identifiers", async () => {
+test("parses every shared v1 command fixture with bigint identifiers", async () => {
   const commands = await fixtureLines("commands.jsonl");
   const parsed = commands.map(parseClientCommand);
 
@@ -49,10 +49,10 @@ test("parses every shared v3 command fixture with bigint identifiers", async () 
   assert.deepEqual(parsed[9], { type: "memory_inspect", requestId: "req-inspect-1", memoryId: 7n });
 });
 
-test("rejects v2 while correlating typed starts through v3 acceptance", () => {
+test("rejects v2 while correlating typed starts through v1 acceptance", () => {
   assert.deepEqual(
     parseClientCommand({
-      protocol_version: 3,
+      protocol_version: 1,
       type: "start_turn",
       request_id: "request-1",
       transcript: "hello",
@@ -67,7 +67,7 @@ test("rejects v2 while correlating typed starts through v3 acceptance", () => {
   }));
   assert.deepEqual(
     parseGatewayMessage({
-      protocol_version: 3,
+      protocol_version: 1,
       type: "command_accepted",
       request_id: "request-1",
       turn_id: "9",
@@ -82,7 +82,7 @@ test("rejects v2 while correlating typed starts through v3 acceptance", () => {
   }));
 });
 
-test("parses every shared v3 gateway fixture with bigint-safe memory values", async () => {
+test("parses every shared v1 gateway fixture with bigint-safe memory values", async () => {
   const messages = await fixtureLines("events.jsonl");
   const parsed = messages.map(parseGatewayMessage);
 
@@ -132,7 +132,7 @@ test("parses every shared v3 gateway fixture with bigint-safe memory values", as
   });
 });
 
-test("rejects every shared invalid v3 command and gateway fixture", async () => {
+test("rejects every shared invalid v1 command and gateway fixture", async () => {
   const values = await fixtureLines("invalid.jsonl");
 
   for (const value of values) {
@@ -160,7 +160,7 @@ test("rejects every shared invalid v3 command and gateway fixture", async () => 
 test("rejects noncanonical and numeric wire identifiers", () => {
   assert.throws(() =>
     parseClientCommand({
-      protocol_version: 3,
+      protocol_version: 1,
       type: "start_turn",
       request_id: "request-1",
       turn_id: "1",
@@ -180,7 +180,7 @@ test("rejects overlong identifiers lexically before bigint conversion", () => {
   try {
     assert.throws(() =>
       parseClientCommand({
-        protocol_version: 3,
+        protocol_version: 1,
         type: "memory_inspect",
         request_id: "request-1",
         memory_id: "9".repeat(40),
@@ -196,7 +196,7 @@ test("rejects overlong identifiers lexically before bigint conversion", () => {
 test("rejects unknown and missing inbound fields", () => {
   assert.throws(() =>
     parseGatewayMessage({
-      protocol_version: 3,
+      protocol_version: 1,
       type: "ready",
       status: {},
       extra: true,
@@ -204,7 +204,7 @@ test("rejects unknown and missing inbound fields", () => {
   );
   assert.throws(() =>
     parseGatewayMessage({
-      protocol_version: 3,
+      protocol_version: 1,
       type: "runtime_event",
       event: { type: "text_delta", turn_id: "1" },
     }),
@@ -214,7 +214,7 @@ test("rejects unknown and missing inbound fields", () => {
 test("parses an exact completed text snapshot", () => {
   assert.deepEqual(
     parseGatewayMessage({
-      protocol_version: 3,
+      protocol_version: 1,
       type: "runtime_event",
       event: { type: "text_completed", turn_id: "1", text: "complete answer" },
     }),
@@ -225,10 +225,10 @@ test("parses an exact completed text snapshot", () => {
   );
 });
 
-test("rejects explicit v1 compatibility and unsupported inbound protocol versions", () => {
+test("rejects unsupported inbound protocol versions", () => {
   assert.throws(() =>
     parseGatewayMessage({
-      protocol_version: 1,
+      protocol_version: 99,
       type: "fatal",
       error: { code: "configuration_invalid", kind: "configuration", stage: "runtime", message: "stopped" },
     }),
@@ -242,7 +242,7 @@ test("rejects voice-only runtime events outside the voice envelope", () => {
     { type: "speech_completed", turn_id: "1" },
   ]) {
     assert.throws(() => parseGatewayMessage({
-      protocol_version: 3,
+      protocol_version: 1,
       type: "runtime_event",
       event,
     }));
@@ -252,7 +252,7 @@ test("rejects voice-only runtime events outside the voice envelope", () => {
 test("rejects unsupported status and error enum values", () => {
   assert.throws(() =>
     parseGatewayMessage({
-      protocol_version: 3,
+      protocol_version: 1,
       type: "ready",
       status: {
         transport: "stdio",
@@ -268,7 +268,7 @@ test("rejects unsupported status and error enum values", () => {
   );
   assert.throws(() =>
     parseGatewayMessage({
-      protocol_version: 3,
+      protocol_version: 1,
       type: "fatal",
       error: { code: "unknown", kind: "network", stage: "runtime", message: "stopped" },
     }),
@@ -277,7 +277,7 @@ test("rejects unsupported status and error enum values", () => {
 
 test("rejects incoherent runtime memory status combinations", () => {
   assert.doesNotThrow(() => parseGatewayMessage({
-    protocol_version: 3,
+    protocol_version: 1,
     type: "ready",
     status: {
       ...wireStatus(),
@@ -310,7 +310,7 @@ test("rejects incoherent runtime memory status combinations", () => {
     },
   ]) {
     assert.throws(() => parseGatewayMessage({
-      protocol_version: 3,
+      protocol_version: 1,
       type: "ready",
       status,
     }), /memory status is incoherent/);
@@ -418,7 +418,7 @@ test("encodes bigint command identifiers as canonical decimals", () => {
   });
 
   assert.deepEqual(JSON.parse(new TextDecoder().decode(encoded)), {
-    protocol_version: 3,
+    protocol_version: 1,
     type: "interrupt_turn",
     request_id: "request-1",
     turn_id: "18446744073709551615",
@@ -429,7 +429,7 @@ test("enforces the 16 KiB UTF-8 transcript boundary for parsed and encoded comma
   const boundary = "🙂".repeat(MAX_CONVERSATION_MESSAGE_BYTES / 4);
   const oversized = `${boundary}🙂`;
   const command = {
-    protocol_version: 3,
+    protocol_version: 1,
     type: "start_turn",
     request_id: "request-1",
     transcript: boundary,
@@ -451,13 +451,13 @@ test("enforces the 16 KiB UTF-8 transcript boundary for parsed and encoded comma
   );
 });
 
-test("encodes v3 memory controls with snake-case decimal wire values", () => {
+test("encodes v1 memory controls with snake-case decimal wire values", () => {
   assert.deepEqual(JSON.parse(new TextDecoder().decode(encodeClientCommand({
     type: "memory_list",
     requestId: "request-1",
     cursor: { beforeId: MAX_U64 },
   }))), {
-    protocol_version: 3,
+    protocol_version: 1,
     type: "memory_list",
     request_id: "request-1",
     cursor: { before_id: "18446744073709551615" },
@@ -467,14 +467,14 @@ test("encodes v3 memory controls with snake-case decimal wire values", () => {
     requestId: "request-2",
     memoryId: 7n,
   }))), {
-    protocol_version: 3,
+    protocol_version: 1,
     type: "memory_inspect",
     request_id: "request-2",
     memory_id: "7",
   });
 });
 
-test("mirrors the complete v3 timing, quality, and status vocabulary", () => {
+test("mirrors the complete v1 timing, quality, and status vocabulary", () => {
   for (const milestone of ["first_text_delta", "first_synthesis_request", "first_playable_audio"]) {
     const parsed = parseGatewayMessage(runtimeEvent({
       type: "timing",
@@ -518,14 +518,14 @@ test("mirrors the complete v3 timing, quality, and status vocabulary", () => {
   assert.throws(() => parseGatewayMessage(runtimeEvent(qualityResolved({ controls: { ...qualityControls(), maximum_spoken_seconds: 65536 } }))));
   assert.throws(() => parseGatewayMessage(runtimeEvent(qualityResolved({ controls: { ...qualityControls(), directness: 101 } }))));
   assert.throws(() => parseGatewayMessage({
-      protocol_version: 3,
+      protocol_version: 1,
     type: "ready",
     status: { ...wireStatus(), capabilities: ["voice"] },
   }));
 });
 
 function runtimeEvent(event: Record<string, unknown>): Record<string, unknown> {
-  return { protocol_version: 3, type: "runtime_event", event };
+  return { protocol_version: 1, type: "runtime_event", event };
 }
 
 function qualityDecision(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -584,7 +584,7 @@ function memoryInspectionWire(): {
 } {
   return {
     type: "memory_inspection",
-    protocol_version: 3,
+    protocol_version: 1,
     request_id: "request-1",
     inspection: {
       record: {

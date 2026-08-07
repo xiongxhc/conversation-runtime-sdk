@@ -13,7 +13,7 @@ use crate::{
     MAX_MEMORY_PREVIEW_BYTES,
 };
 
-pub const CLIENT_PROTOCOL_VERSION: u64 = 3;
+pub const CLIENT_PROTOCOL_VERSION: u64 = 1;
 pub const MAX_CLIENT_FRAME_BYTES: usize = 512 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]

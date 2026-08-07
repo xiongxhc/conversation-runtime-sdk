@@ -102,7 +102,7 @@ VAD windows, flushes the active sidecar generation and cancels language
 generation, TTS, queued frames, and playback without waiting for a transcript.
 The default remains `200 ms`.
 
-Schema v2 resolves `conversation-voice-sidecar` adjacent to the running
+Schema v1 resolves `conversation-voice-sidecar` adjacent to the running
 `conversation-voice-loop` binary. `sidecar_executable` is only an optional
 absolute override; relative overrides, missing files, and files without an
 executable bit fail before capture. Resolution never searches ambient `PATH`.
@@ -198,7 +198,7 @@ or directly command relationship behavior.
 
 ## Streaming Speech Boundary
 
-Schema-v2 voice configuration selects speech mode explicitly:
+Schema-v1 voice configuration selects speech mode explicitly:
 
 ```toml
 [speech]

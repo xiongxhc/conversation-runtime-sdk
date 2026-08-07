@@ -185,7 +185,7 @@ public enum ChildProtocolError: Error, Equatable, Sendable {
 }
 
 public enum ChildProtocol {
-    public static let version: UInt16 = 2
+    public static let version: UInt16 = 1
     public static let headerBytes = 8
     public static let audioMetadataBytes = 48
     public static let maximumControlPayloadBytes = 65_536

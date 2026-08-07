@@ -29,12 +29,12 @@ const LANGUAGE_RESPONSE: &[u8] =
 const LANGUAGE_RESPONSE_END: &[u8] = b"{\"message\":{\"content\":\"\"},\"done\":true}\n";
 
 #[test]
-fn strict_schema_v2_rejects_wrong_version_unknown_fields_and_missing_execution() {
+fn strict_schema_v1_rejects_wrong_version_unknown_fields_and_missing_execution() {
     let cases = [
         (
             "wrong-version",
             Box::new(|config: String| {
-                config.replacen("schema_version = 2", "schema_version = 1", 1)
+                config.replacen("schema_version = 1", "schema_version = 2", 1)
             }) as Box<dyn Fn(String) -> String>,
         ),
         (
@@ -918,7 +918,7 @@ impl CliHarness {
 
     fn valid_config(&self, language_endpoint: &str, speech_endpoint: &str) -> String {
         format!(
-            r#"schema_version = 2
+            r#"schema_version = 1
 
 [privacy]
 mode = "local-only"

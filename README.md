@@ -30,7 +30,7 @@ The repository now contains the deterministic runtime foundation, reviewed local
 - a bounded two-stage speech pipeline that may prefetch exactly one synthesized segment while the current segment plays;
 - runtime timing events for first text delta, first synthesis request, and first playable audio;
 - an integrated voice probe that composes replaceable language, speech, and audio-output adapters behind `ConversationRuntime`;
-- schema-v2 local voice-session policy, generation-safe streaming contracts, and a managed macOS sidecar protocol;
+- schema-v1 local voice-session policy, generation-safe streaming contracts, and a managed macOS sidecar protocol;
 - a Swift macOS voice-processing sidecar with local recognition and continuous generation-tagged PCM playback;
 - explicit buffered and streaming OpenAI-compatible speech modes, with checked concatenated-RIFF parsing and no streaming-to-buffered fallback;
 - a bounded ten-minute acceptance harness plus an external acoustic measurement procedure;
@@ -44,8 +44,8 @@ The repository now contains the deterministic runtime foundation, reviewed local
   identity, and relationship records;
 - revision-checked inspection, editing, approval, pinning, expiration, deletion,
   bounded retrieval, and content-free trace contracts;
-- a local memory control probe plus optional schema-v2 voice-session wiring;
-- strict schema-v2 persona, response, quality-metric, and memory settings;
+- a local memory control probe plus optional schema-v1 voice-session wiring;
+- strict schema-v1 persona, response, quality-metric, and memory settings;
 - a persistent local-only Rust gateway using bounded framed standard I/O with no
   network listener;
 - the backend-neutral `@conversation/runtime` TypeScript client and Node stdio
@@ -108,7 +108,7 @@ combines visible persona dimensions, one explicit conversation mode, response
 defaults, bounded completed history, and temporary signals such as a shorter
 request, rejected question, hesitation, topic change, or interruption.
 
-Schema-v2 session configuration accepts these optional sections and applies
+Schema-v1 session configuration accepts these optional sections and applies
 explicit defaults when they are absent:
 
 ```toml
@@ -304,7 +304,7 @@ acceptance.
 
 Memory is an optional, explicitly initialized runtime store. When the selected
 local gateway config points to an existing initialized database and advertises
-the protocol-v3 `memory_inspection` capability, the desktop can list and inspect
+the protocol-v1 `memory_inspection` capability, the desktop can list and inspect
 it through the public browser-safe SDK only. The first Memory screen is
 read-only: it does not create a database, mutate memory, or automatically copy
 conversations into memory. History remains a separate app-owned transcript
@@ -313,10 +313,10 @@ shows at most the latest 32 provenance entries and 32 approval entries, and
 labels any older history that was truncated. Due expiry may be applied while a
 record is inspected.
 
-Protocol v3 is the current wire contract. It supersedes v2 because the gateway
-allocates typed start-turn identifiers and returns them only in the correlated
-acceptance; v2 and v3 peers reject each other rather than silently mixing wire
-shapes.
+Protocol v1 is the current wire contract. The gateway allocates typed
+start-turn identifiers and returns them only in the correlated acceptance;
+peers that disagree on the protocol version reject each other rather than
+silently mixing wire shapes.
 
 The gateway does not advertise voice capabilities. Live microphone and playback
 activation, real voice-session events, persona mutation, memory mutation,
@@ -424,7 +424,7 @@ install -m 755 "$SIDECAR" \
   target/release/conversation-voice-sidecar
 ```
 
-Copy the public schema-v2 template to a private absolute path outside the
+Copy the public schema-v1 template to a private absolute path outside the
 repository. Replace every placeholder with installed local components,
 including the absolute ASR model directory. By default the CLI resolves
 `conversation-voice-sidecar` beside its own executable and never through

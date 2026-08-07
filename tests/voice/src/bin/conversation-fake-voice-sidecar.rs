@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use serde_json::json;
 
-const PROTOCOL_VERSION: u16 = 2;
+const PROTOCOL_VERSION: u16 = 1;
 const HEADER_BYTES: usize = 8;
 const AUDIO_METADATA_BYTES: usize = 48;
 const MAX_CONTROL_PAYLOAD_BYTES: usize = 65_536;

@@ -1,4 +1,4 @@
-export const CLIENT_PROTOCOL_VERSION = 3;
+export const CLIENT_PROTOCOL_VERSION = 1;
 export const MAX_CONVERSATION_MESSAGE_BYTES = 16 * 1024;
 export const MAX_HISTORY_MESSAGE_COUNT = 16;
 export const MAX_U64 = 2n ** 64n - 1n;

@@ -89,9 +89,9 @@ impl GatewayConfig {
     }
 
     fn build_adapters(&self) -> Result<GatewayAdapters, GatewayConfigError> {
-        if self.schema_version != 2 {
+        if self.schema_version != 1 {
             return Err(config_error(
-                "gateway configuration schema_version must be 2",
+                "gateway configuration schema_version must be 1",
             ));
         }
         if !matches!(self.privacy_mode, GatewayPrivacyMode::LocalOnly) {

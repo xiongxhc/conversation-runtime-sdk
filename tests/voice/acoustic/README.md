@@ -50,7 +50,7 @@ Record these before collecting samples:
 
 - source commit and binary digest;
 - machine, operating system, input device, output device, and audio route;
-- private schema-v2 configuration digest without its path or contents;
+- private schema-v1 configuration digest without its path or contents;
 - language, speech, and ASR service versions and loaded-state procedure;
 - recorder or loopback identity, sample rate, clock relationship, placement,
   gain, and calibration procedure;

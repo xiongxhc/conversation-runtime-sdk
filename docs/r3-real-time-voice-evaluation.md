@@ -59,7 +59,7 @@ first-audible or audible-stop measurement.
   `fd6e2f12d9a4bd3d1e0869e3006d1b90ad495ff8`.
 - Observed release-sidecar SHA-256 from one build:
   `25f3db9bcb90be584f0a9a32f633712b15c7e3f3678aab09cf0f0b3b4215ad62`.
-- Private schema-v2 config digest:
+- Private schema-v1 config digest:
   `7baa3de85e9c03f363b4f2f0a0d7e1f4d69a3a22989d41686f0d3882e08d3615`.
 - Measured ASR model: local
   `openai_whisper-large-v3-v20240930_turbo_632MB`, approximately `626 MB`;
@@ -134,7 +134,7 @@ sh -n tests/voice/acceptance-macos.test.sh
 git diff --check
 ```
 
-To rebuild the schema-v2 bundled layout without starting capture, build the
+To rebuild the schema-v1 bundled layout without starting capture, build the
 Rust CLI and place the sidecar beside it. Leave
 `sidecar_executable` absent from the private config; an absolute override is
 only for development or alternate packaging:
@@ -155,7 +155,7 @@ Results:
 
 - streaming OpenAI-compatible speech: `16` focused tests passed;
 - cancellation-aware WAV decode boundary: `1` focused unit test passed;
-- schema-v2 voice CLI: `20` tests passed, including buffered compatibility,
+- schema-v1 voice CLI: `20` tests passed, including buffered compatibility,
   explicit streaming mode, and adjacent bundled-sidecar resolution;
 - complete Rust workspace: `446` tests passed with `1` intentionally ignored
   immutable-fixture writer;
@@ -250,7 +250,7 @@ malicious-process containment claim.
 
 **Status: PARTIALLY VALIDATED**
 
-- Private schema-v2 configuration: present outside the repository, mode `0600`.
+- Private schema-v1 configuration: present outside the repository, mode `0600`.
 - Private configuration digest:
   `7baa3de85e9c03f363b4f2f0a0d7e1f4d69a3a22989d41686f0d3882e08d3615`.
 - Active policy at release-CLI startup: `privacy=local-only`.

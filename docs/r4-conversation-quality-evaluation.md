@@ -92,7 +92,7 @@ git diff --check
 Focused evidence includes `4` protocol quality-contract tests, `11` controller
 scenarios, `23` Ollama adapter tests including typed message ordering and output
 cap translation, `10` streaming-turn tests including completed-history and
-one-turn interruption state, and `21` schema-v2 continuous CLI tests including
+one-turn interruption state, and `21` schema-v1 continuous CLI tests including
 configuration rejection and content-free metric output. The complete Rust
 workspace passed with its one intentionally ignored immutable-fixture writer;
 the complete Swift package passed `109` tests.

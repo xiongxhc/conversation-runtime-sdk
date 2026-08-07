@@ -84,6 +84,22 @@ describe("ConversationSession", () => {
     expect(session.state.phase).toBe("streaming");
   });
 
+  it("rejects a second send while a start is pending without failing the session", async () => {
+    const transport = connectedTransport();
+    const session = await ConversationSession.connect(transport);
+    transport.holdStartAcceptance = true;
+
+    const first = session.send("Hello");
+    await expect(session.send("Duplicate")).rejects.toThrow("already active");
+    expect(session.state.phase).toBe("ready");
+    expect(session.state.error).toBeUndefined();
+
+    transport.releaseStartAcceptance();
+    await expect(first).resolves.toBe(1n);
+    expect(session.state.phase).toBe("streaming");
+    expect(session.state.turns).toHaveLength(1);
+  });
+
   it("interrupts the active turn and returns to ready after cancellation", async () => {
     const transport = connectedTransport();
     const session = await ConversationSession.connect(transport);
@@ -209,12 +225,18 @@ class InMemoryTransport implements RuntimeTransport {
   readonly messages = new AsyncQueue<unknown>();
   readonly sent: ClientCommand[] = [];
   closeCalls = 0;
+  holdStartAcceptance = false;
+  private heldStart: ClientCommand | undefined;
   private turnCounter = 0n;
 
   constructor(private readonly status: Record<string, unknown>) {}
 
   async send(command: ClientCommand): Promise<void> {
     this.sent.push(command);
+    if (command.type === "start_turn" && this.holdStartAcceptance) {
+      this.heldStart = command;
+      return;
+    }
     this.emit(
       command.type === "start_turn"
         ? {
@@ -279,6 +301,19 @@ class InMemoryTransport implements RuntimeTransport {
   async close(): Promise<void> {
     this.closeCalls += 1;
     this.messages.finish();
+  }
+
+  releaseStartAcceptance(): void {
+    const command = this.heldStart;
+    this.heldStart = undefined;
+    if (command) {
+      this.emit({
+        protocol_version: 3,
+        type: "command_accepted",
+        request_id: command.requestId,
+        turn_id: (++this.turnCounter).toString(),
+      });
+    }
   }
 
   ready(): void {

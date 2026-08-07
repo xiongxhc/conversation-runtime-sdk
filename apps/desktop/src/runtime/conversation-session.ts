@@ -34,6 +34,7 @@ export class ConversationSession {
   private closePromise: Promise<void> | undefined;
   private error: Error | undefined;
   private phase: ConversationSessionState["phase"] = "ready";
+  private startPending = false;
 
   private constructor(
     private readonly client: RuntimeClient,
@@ -74,10 +75,13 @@ export class ConversationSession {
 
   async send(transcript: string): Promise<bigint> {
     this.ensureReady();
+    this.startPending = true;
     const turn = await this.client.startTurn(transcript).catch((error: unknown) => {
       const failure = asError(error);
       this.fail(failure);
       throw failure;
+    }).finally(() => {
+      this.startPending = false;
     });
     const state: ConversationTurnState = {
       turnId: turn.turnId,
@@ -179,7 +183,7 @@ export class ConversationSession {
     if (this.phase === "failed") {
       throw this.error ?? new Error("conversation session failed");
     }
-    if (this.activeTurn) {
+    if (this.activeTurn || this.startPending) {
       throw new Error("a conversation turn is already active");
     }
   }

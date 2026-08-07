@@ -99,13 +99,13 @@ async fn status_reports_exact_model_and_enabled_local_memory() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn configured_voice_is_not_advertised_before_voice_hosting() {
+async fn configured_voice_is_advertised_but_start_is_not_yet_hosted() {
     let server = FakeOllamaServer::completing(0).await;
     let mut gateway = GatewayProcess::start_with_voice(server.endpoint()).await;
 
     let ready = gateway.read_message().await;
     assert_eq!(ready.message_type(), "ready");
-    assert_local_status(&ready, false);
+    assert_voice_status(&ready);
     assert!(!gateway.sidecar_spawned());
 
     gateway
@@ -740,6 +740,33 @@ fn assert_local_status(message: &WireMessage, memory_enabled: bool) {
     assert!(!message.raw.contains(r#""kind":"speech_recognition""#));
     assert!(!message.raw.contains(r#""kind":"speech_synthesis""#));
     assert!(!message.raw.contains(r#""kind":"audio_io""#));
+}
+
+#[cfg(unix)]
+fn assert_voice_status(message: &WireMessage) {
+    assert!(message.raw.contains(r#""transport":"stdio""#));
+    assert!(message.raw.contains(r#""privacy_mode":"local_only""#));
+    assert!(message.raw.contains(r#""language_location":"local""#));
+    assert!(message
+        .raw
+        .contains(&format!(r#""model_id":"{FIXTURE_MODEL_ID}""#)));
+    assert!(message.raw.contains(r#""memory_enabled":false"#));
+    assert!(message.raw.contains(r#""memory_location":null"#));
+    assert!(message.raw.contains(r#""telemetry_enabled":false"#));
+    assert!(message
+        .raw
+        .contains(r#""capabilities":["text","voice_session"]"#));
+    assert!(!message.raw.contains(r#""kind":"memory""#));
+    assert!(message.raw.contains(r#""kind":"language_model""#));
+    assert!(message
+        .raw
+        .contains(r#""kind":"speech_recognition","execution_location":"local","provider_label":"fixture-speech-recognition""#));
+    assert!(message
+        .raw
+        .contains(r#""kind":"speech_synthesis","execution_location":"local","provider_label":"fixture-speech-synthesis""#));
+    assert!(message.raw.contains(
+        r#""kind":"audio_io","execution_location":"local","provider_label":"fixture-audio""#
+    ));
 }
 
 #[cfg(unix)]

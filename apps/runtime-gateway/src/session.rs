@@ -3,17 +3,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use conversation_memory::{MemoryClock, MemoryStore, MemoryStoreErrorKind};
+use conversation_model_adapters::GenerationLanguageModel;
 use conversation_protocol::{
     decode_client_command, encode_gateway_message, ClientCommand, ClientMemoryCursor,
     ClientMemoryInspection, ClientMemorySummary, ClientRuntimeError, ClientRuntimeEvent,
     GatewayMessage, RuntimeEvent, RuntimeStatus, TurnId,
 };
-use conversation_runtime::{TextTurnEventStream, TextTurnRuntime};
+use conversation_runtime::{ConversationContext, TextTurnEventStream, TextTurnRuntime};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinError, JoinHandle};
 use tokio::time::timeout;
 
+use crate::voice_adapters::GatewayVoiceAdapters;
 use crate::{FrameError, FrameReader, FrameWriter};
 
 const URGENT_WRITER_BUFFER_SIZE: usize = 2;
@@ -26,11 +28,21 @@ pub struct GatewaySession {
     runtime: TextTurnRuntime,
     status: RuntimeStatus,
     memory_inspection: Option<MemoryInspectionAdapters>,
+    voice: Option<VoiceLane>,
 }
 
 struct MemoryInspectionAdapters {
     store: Arc<dyn MemoryStore>,
     clock: Arc<dyn MemoryClock>,
+}
+
+// `VoiceLane` fields are consumed by later voice-lane tasks (start/stop/pause/resume
+// command handling); this task only wires and stores them.
+#[allow(dead_code)]
+struct VoiceLane {
+    adapters: GatewayVoiceAdapters,
+    context: ConversationContext,
+    language: Arc<dyn GenerationLanguageModel>,
 }
 
 struct WriterLanes {
@@ -64,6 +76,7 @@ impl GatewaySession {
             runtime,
             status,
             memory_inspection: None,
+            voice: None,
         }
     }
 
@@ -73,6 +86,20 @@ impl GatewaySession {
         clock: Arc<dyn MemoryClock>,
     ) -> Self {
         self.memory_inspection = Some(MemoryInspectionAdapters { store, clock });
+        self
+    }
+
+    pub fn with_voice(
+        mut self,
+        voice: GatewayVoiceAdapters,
+        context: ConversationContext,
+        language: Arc<dyn GenerationLanguageModel>,
+    ) -> Self {
+        self.voice = Some(VoiceLane {
+            adapters: voice,
+            context,
+            language,
+        });
         self
     }
 
@@ -855,10 +882,14 @@ mod tests {
         MemoryClock, MemoryStore, MemoryStoreError, MemoryStoreErrorKind, MemoryStoreResult,
         SqliteMemoryStore,
     };
-    use conversation_model_adapters::{OllamaConfig, OllamaLanguageModel};
+    use conversation_model_adapters::{
+        GenerationLanguageModel, MockStreamingSpeechSynthesizer, MockVoiceIoFactory, OllamaConfig,
+        OllamaLanguageModel,
+    };
     use conversation_protocol::{
-        ClientRuntimeEvent, GatewayMessage, MemoryConfidence, MemoryDraft, MemoryKind, MemoryPatch,
-        MemoryProvenance, MemoryProvenanceKind, MemoryRetention, RuntimeStatus, TurnId,
+        ClientRuntimeEvent, ComponentDescriptor, ComponentKind, ExecutionLocation, GatewayMessage,
+        MemoryConfidence, MemoryDraft, MemoryKind, MemoryPatch, MemoryProvenance,
+        MemoryProvenanceKind, MemoryRetention, PrivacyMode, RuntimeStatus, TurnId,
         UnixTimestampMillis, MAX_CLIENT_FRAME_BYTES, MAX_MEMORY_CONTENT_BYTES,
     };
     use tempfile::TempDir;
@@ -867,6 +898,7 @@ mod tests {
     use tokio::sync::{mpsc, Notify};
     use tokio::time::timeout;
 
+    use crate::voice_adapters::{GatewayVoiceAdapters, VoicePolicyTemplate};
     use crate::FrameReader;
 
     use super::{GatewaySession, GatewaySessionError};
@@ -1510,6 +1542,13 @@ mod tests {
         }));
     }
 
+    #[tokio::test]
+    async fn ready_advertises_voice_session_when_voice_is_wired() {
+        let (session, _guards) = session_with_voice();
+        let ready = first_ready_message(session).await;
+        assert!(ready_capabilities(&ready).contains(&"voice_session".to_owned()));
+    }
+
     struct InMemoryGateway {
         input: DuplexStream,
         output: FrameReader<DuplexStream>,
@@ -1740,6 +1779,142 @@ mod tests {
             ],
             ..status()
         }
+    }
+
+    fn status_with_voice() -> RuntimeStatus {
+        RuntimeStatus {
+            capabilities: vec!["text".to_owned(), "voice_session".to_owned()],
+            components: vec![
+                conversation_protocol::ClientComponentDescriptor {
+                    kind: "speech_recognition".to_owned(),
+                    execution_location: "local".to_owned(),
+                    provider_label: "test-voice-asr".to_owned(),
+                },
+                conversation_protocol::ClientComponentDescriptor {
+                    kind: "language_model".to_owned(),
+                    execution_location: "local".to_owned(),
+                    provider_label: "test-language".to_owned(),
+                },
+                conversation_protocol::ClientComponentDescriptor {
+                    kind: "speech_synthesis".to_owned(),
+                    execution_location: "local".to_owned(),
+                    provider_label: "test-voice-speech".to_owned(),
+                },
+                conversation_protocol::ClientComponentDescriptor {
+                    kind: "audio_io".to_owned(),
+                    execution_location: "local".to_owned(),
+                    provider_label: "test-voice-audio".to_owned(),
+                },
+            ],
+            ..status()
+        }
+    }
+
+    fn test_context() -> conversation_runtime::ConversationContext {
+        conversation_runtime::ConversationContext::new(
+            conversation_runtime::ConversationQualityController::new(
+                conversation_protocol::PersonaProfile::default(),
+                conversation_protocol::ResponseControls::default(),
+                conversation_protocol::ConversationMode::DirectAnswer,
+            ),
+        )
+    }
+
+    fn test_language() -> Arc<dyn GenerationLanguageModel> {
+        Arc::new(OllamaLanguageModel::new_direct(
+            OllamaConfig::new("test-model")
+                .unwrap()
+                .with_endpoint("http://127.0.0.1:9")
+                .unwrap(),
+        ))
+    }
+
+    /// Handles into the voice I/O and speech test doubles, kept alive alongside the
+    /// session under test. This task only checks readiness; later voice-lane tasks
+    /// extend these guards to assert on captured events, requests, and start counts.
+    #[allow(dead_code)]
+    struct VoiceTestGuards {
+        io_factory: Arc<MockVoiceIoFactory>,
+        speech: Arc<MockStreamingSpeechSynthesizer>,
+    }
+
+    fn test_voice_adapters() -> (GatewayVoiceAdapters, VoiceTestGuards) {
+        let io_factory = Arc::new(MockVoiceIoFactory::new(Vec::new()));
+        let speech = Arc::new(MockStreamingSpeechSynthesizer::new(Vec::new()));
+        let policy = VoicePolicyTemplate::new(
+            PrivacyMode::LocalOnly,
+            200,
+            800,
+            vec![
+                ComponentDescriptor::new(
+                    ComponentKind::SpeechRecognition,
+                    "test-voice-asr",
+                    ExecutionLocation::Local,
+                ),
+                ComponentDescriptor::new(
+                    ComponentKind::LanguageModel,
+                    "test-language",
+                    ExecutionLocation::Local,
+                ),
+                ComponentDescriptor::new(
+                    ComponentKind::SpeechSynthesis,
+                    "test-voice-speech",
+                    ExecutionLocation::Local,
+                ),
+                ComponentDescriptor::new(
+                    ComponentKind::AudioIo,
+                    "test-voice-audio",
+                    ExecutionLocation::Local,
+                ),
+            ],
+        )
+        .unwrap();
+        let adapters = GatewayVoiceAdapters {
+            io: io_factory.clone(),
+            speech: speech.clone(),
+            policy,
+        };
+        (adapters, VoiceTestGuards { io_factory, speech })
+    }
+
+    fn session_with_voice() -> (GatewaySession, VoiceTestGuards) {
+        let (voice_adapters, guards) = test_voice_adapters();
+        let session = GatewaySession::new(unused_runtime(), status_with_voice()).with_voice(
+            voice_adapters,
+            test_context(),
+            test_language(),
+        );
+        (session, guards)
+    }
+
+    async fn first_ready_message(session: GatewaySession) -> String {
+        let (_input, reader) = duplex(MAX_CLIENT_FRAME_BYTES * 2);
+        let (writer, output) = duplex(MAX_CLIENT_FRAME_BYTES * 2);
+        tokio::spawn(session.run(reader, writer));
+        let mut output = FrameReader::new(output);
+        let frame = timeout(TEST_TIMEOUT, output.read_frame())
+            .await
+            .expect("gateway did not produce a ready frame")
+            .unwrap()
+            .expect("gateway closed before producing a ready frame");
+        String::from_utf8(frame).unwrap()
+    }
+
+    fn ready_capabilities(message: &str) -> Vec<String> {
+        let key = "\"capabilities\":[";
+        let start = message
+            .find(key)
+            .expect("ready message is missing capabilities")
+            + key.len();
+        let end = start
+            + message[start..]
+                .find(']')
+                .expect("ready message capabilities array is not closed");
+        message[start..end]
+            .split(',')
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| entry.trim_matches('"').to_owned())
+            .collect()
     }
 
     async fn write_command(writer: &mut (impl AsyncWrite + Unpin), payload: &str) {

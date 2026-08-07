@@ -22,16 +22,23 @@ async fn run() -> Result<(), ()> {
     let adapters = GatewayConfig::load(&config_path).map_err(|_| {
         eprintln!("gateway configuration failed");
     })?;
-    let status = adapters.text_only_status();
+    let status = if adapters.voice.is_some() {
+        adapters.status.clone()
+    } else {
+        adapters.text_only_status()
+    };
     let GatewayAdapters {
         context,
         language,
-        voice: _,
+        voice,
         memory_store,
         status: _,
     } = adapters;
-    let runtime = TextTurnRuntime::new(context, language);
+    let runtime = TextTurnRuntime::new(context.clone(), language.clone());
     let mut session = GatewaySession::new(runtime, status);
+    if let Some(voice_adapters) = voice {
+        session = session.with_voice(voice_adapters, context, language);
+    }
     if let Some(store) = memory_store {
         session = session.with_memory_inspection(Arc::new(store), Arc::new(SystemMemoryClock));
     }

@@ -599,9 +599,11 @@ function createConversationId(timestamp: number): string {
 }
 
 function conversationTitle(transcript: string): string {
-  const normalized = transcript.replace(/\s+/g, " ").trim();
+  const normalized = transcript.replace(/\s+/g, " ").replace(/\p{Cc}/gu, "").trim();
   if (normalized.length <= 72) return normalized;
-  return `${normalized.slice(0, 69).trimEnd()}…`;
+  const clipped = normalized.slice(0, 69);
+  const wholeCodePoints = /[\uD800-\uDBFF]$/.test(clipped) ? clipped.slice(0, -1) : clipped;
+  return `${wholeCodePoints.trimEnd()}…`;
 }
 
 function summaryOf(conversation: ConversationHistory): ConversationSummary {

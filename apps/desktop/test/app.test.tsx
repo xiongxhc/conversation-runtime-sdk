@@ -312,6 +312,27 @@ describe("desktop app", () => {
     expect(screen.queryByLabelText("Message")).toBeNull();
   });
 
+  it("derives storable titles from control characters and split surrogate pairs", async () => {
+    const historyStore = new FakeHistoryStore();
+    const session = new FakeSession(localState());
+    render(
+      <App
+        connectSession={vi.fn(async () => session)}
+        historyStore={historyStore}
+        storage={memoryStorage()}
+      />,
+    );
+    connectWithAbsolutePaths();
+    await screen.findByLabelText("Message");
+
+    session.emit(localState({
+      turns: [conversationTurn(1n, `Fix\u0007 the \u001bbug ${"🚀".repeat(40)}`, "Done", "completed")],
+    }));
+
+    await waitFor(() => expect(historyStore.saved).toHaveLength(1));
+    expect(historyStore.saved[0].title).toBe(`Fix the bug ${"🚀".repeat(28)}…`);
+  });
+
   it("deletes a saved conversation from local history", async () => {
     const historyStore = new FakeHistoryStore([storedConversation()]);
     const session = new FakeSession(localState());

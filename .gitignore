@@ -4,6 +4,8 @@
 /apps/desktop/dist/
 /apps/desktop/src-tauri/gen/
 /.worktrees/
+/.planning/
+/platform/macos/voice-sidecar/.build/
 .DS_Store
 .env
 .env.*

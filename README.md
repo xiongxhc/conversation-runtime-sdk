@@ -1,5 +1,8 @@
 # Conversation Runtime SDK
 
+> **Tier: standalone public product.** Independent of every other repository;
+> no deployment or data coupling.
+
 > Models are replaceable components. The runtime is the product.
 
 Conversation Runtime SDK is a local-first foundation for natural, interruptible voice conversations. It owns turn lifecycle, pacing, cancellation, persona, memory, and user boundaries while keeping ASR, language, and speech models replaceable.

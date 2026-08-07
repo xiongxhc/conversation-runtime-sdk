@@ -58,6 +58,15 @@ pub struct GatewayAdapters {
     pub status: RuntimeStatus,
 }
 
+impl fmt::Debug for GatewayAdapters {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GatewayAdapters")
+            .field("status", &self.status)
+            .finish_non_exhaustive()
+    }
+}
+
 impl GatewayAdapters {
     pub fn text_only_status(&self) -> RuntimeStatus {
         let mut status = self.status.clone();
@@ -75,26 +84,8 @@ impl GatewayAdapters {
 }
 
 impl GatewayConfig {
-    pub fn load(path: &Path) -> Result<Self, GatewayConfigError> {
-        let config = load_toml(path)?;
-        config.validate()?;
-        Ok(config)
-    }
-
-    pub fn into_adapters(self) -> Result<GatewayAdapters, GatewayConfigError> {
-        self.build_adapters()
-    }
-
-    fn validate(&self) -> Result<(), GatewayConfigError> {
-        if self.schema_version != 2 {
-            return Err(config_error(
-                "gateway configuration schema_version must be 2",
-            ));
-        }
-        if !matches!(self.privacy_mode, GatewayPrivacyMode::LocalOnly) {
-            return Err(config_error("gateway privacy_mode must be local-only"));
-        }
-        self.build_adapters().map(|_| ())
+    pub fn load(path: &Path) -> Result<GatewayAdapters, GatewayConfigError> {
+        load_toml(path)?.build_adapters()
     }
 
     fn build_adapters(&self) -> Result<GatewayAdapters, GatewayConfigError> {

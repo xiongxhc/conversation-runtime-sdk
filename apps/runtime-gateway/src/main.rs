@@ -19,11 +19,8 @@ async fn run() -> Result<(), ()> {
     let config_path = parse_config_path().ok_or_else(|| {
         eprintln!("gateway arguments are invalid");
     })?;
-    let config = GatewayConfig::load(&config_path).map_err(|_| {
+    let adapters = GatewayConfig::load(&config_path).map_err(|_| {
         eprintln!("gateway configuration failed");
-    })?;
-    let adapters: GatewayAdapters = config.into_adapters().map_err(|_| {
-        eprintln!("gateway adapter initialization failed");
     })?;
     let status = adapters.text_only_status();
     let GatewayAdapters {

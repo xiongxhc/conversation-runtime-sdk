@@ -50,8 +50,7 @@ fn accepts_an_optional_deployment_system_prompt() {
         ),
     );
 
-    let config = GatewayConfig::load(&path).unwrap();
-    let _: GatewayAdapters = config.into_adapters().unwrap();
+    let _: GatewayAdapters = GatewayConfig::load(&path).unwrap();
 }
 
 #[test]
@@ -75,8 +74,7 @@ fn loads_an_explicit_valid_local_only_configuration() {
     let fixture = tempfile::tempdir().unwrap();
     let path = write_config(fixture.path(), VALID_CONFIG);
 
-    let config = GatewayConfig::load(&path).unwrap();
-    let adapters: GatewayAdapters = config.into_adapters().unwrap();
+    let adapters: GatewayAdapters = GatewayConfig::load(&path).unwrap();
     assert_eq!(adapters.status.model_id, "local-model-id");
     assert_eq!(adapters.status.capabilities, ["text"]);
     assert_eq!(adapters.status.components.len(), 1);
@@ -209,8 +207,7 @@ async fn memory_configuration_returns_shared_retrieval_and_inspection_handles() 
         ),
     );
 
-    let config = GatewayConfig::load(&path).unwrap();
-    let adapters: GatewayAdapters = config.into_adapters().unwrap();
+    let adapters: GatewayAdapters = GatewayConfig::load(&path).unwrap();
     let store = adapters.memory_store.as_ref().unwrap();
     let record = store
         .create(
@@ -258,7 +255,7 @@ fn configuration_without_memory_returns_no_memory_handles() {
     let fixture = tempfile::tempdir().unwrap();
     let path = write_config(fixture.path(), VALID_CONFIG);
 
-    let adapters = GatewayConfig::load(&path).unwrap().into_adapters().unwrap();
+    let adapters = GatewayConfig::load(&path).unwrap();
 
     assert!(adapters.memory_store.is_none());
 }
@@ -268,10 +265,7 @@ fn configuration_without_memory_returns_no_memory_handles() {
 fn valid_voice_reuses_root_configuration_without_spawning() {
     let fixture = GatewayFixture::voice(true);
 
-    let adapters = GatewayConfig::load(fixture.config())
-        .unwrap()
-        .into_adapters()
-        .unwrap();
+    let adapters = GatewayConfig::load(fixture.config()).unwrap();
 
     assert!(adapters.voice.is_some());
     assert_eq!(

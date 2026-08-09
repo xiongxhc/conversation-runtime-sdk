@@ -1,4 +1,4 @@
-export { CommandRejectedError, RuntimeClient, type RuntimeTransport, type RuntimeTurn } from "./client.js";
+export { CommandRejectedError, RuntimeClient, type RuntimeTransport, type RuntimeTurn, type VoiceSession } from "./client.js";
 export {
   CLIENT_PROTOCOL_VERSION,
   MAX_CONVERSATION_MESSAGE_BYTES,

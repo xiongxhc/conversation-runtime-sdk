@@ -12,6 +12,7 @@ import type {
   MemoryRecord,
   MemoryRetention,
   MemorySummary,
+  VoiceSession,
 } from "../src/browser.js";
 import type {
   MemoryApproval as RootMemoryApproval,
@@ -22,6 +23,7 @@ import type {
   MemoryRecord as RootMemoryRecord,
   MemoryRetention as RootMemoryRetention,
   MemorySummary as RootMemorySummary,
+  VoiceSession as RootVoiceSession,
 } from "../src/index.js";
 
 test("browser entry exports typed command rejections without the stdio transport", () => {
@@ -84,4 +86,12 @@ test("browser and root entries expose browser-safe memory DTOs", () => {
   ] = [cursor, summary, page, record, inspection, provenance, approval, retention];
 
   assert.equal(rootTypes.length, 8);
+});
+
+test("browser entry exports VoiceSession type without Node builtins", () => {
+  const browserVoiceSession: VoiceSession = null as any;
+  const rootVoiceSession: RootVoiceSession = browserVoiceSession;
+
+  assert.ok(rootVoiceSession === browserVoiceSession);
+  assert.equal("StdioGatewayTransport" in browser, false);
 });

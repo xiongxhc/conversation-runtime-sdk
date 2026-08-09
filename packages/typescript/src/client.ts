@@ -9,6 +9,7 @@ import {
   type RuntimeEvent,
   type RuntimeFailure,
   type RuntimeStatus,
+  type VoiceSessionEvent,
 } from "./protocol.js";
 
 export interface RuntimeTransport {
@@ -20,6 +21,13 @@ export interface RuntimeTransport {
 export interface RuntimeTurn {
   readonly turnId: bigint;
   readonly events: AsyncIterable<RuntimeEvent>;
+}
+
+export interface VoiceSession {
+  events(): AsyncIterable<VoiceSessionEvent>;
+  stop(): Promise<void>;
+  pauseCapture(): Promise<void>;
+  resumeCapture(): Promise<void>;
 }
 
 export class CommandRejectedError extends Error {
@@ -44,6 +52,7 @@ export class RuntimeClient {
   private readonly unexpectedFailureListeners = new Set<(error: Error) => void>();
   private readonly turns = new Map<bigint, TurnState>();
   private readonly acceptedStartRequests = new Set<string>();
+  private activeVoiceSession: AsyncQueue<VoiceSessionEvent> | undefined;
   private failure: Error | undefined;
   private closing = false;
   private closePromise: Promise<void> | undefined;
@@ -113,6 +122,34 @@ export class RuntimeClient {
       fail: (error) => result.reject(error),
     });
     this.send({ type: "start_turn", requestId, transcript });
+    return result.promise;
+  }
+
+  startVoiceSession(): Promise<VoiceSession> {
+    const requestId = this.nextRequestId();
+    const result = new Deferred<VoiceSession>();
+    this.controls.set(requestId, {
+      kind: "start_voice_session",
+      accepted: false,
+      result,
+      fail: (error) => result.reject(error),
+    });
+    this.send({ type: "start_voice_session", requestId });
+    return result.promise;
+  }
+
+  private voiceControl(
+    type: "stop_voice_session" | "pause_voice_capture" | "resume_voice_capture",
+  ): Promise<void> {
+    const requestId = this.nextRequestId();
+    const result = new Deferred<void>();
+    this.controls.set(requestId, {
+      kind: type,
+      accepted: false,
+      result,
+      fail: (error) => result.reject(error),
+    });
+    this.send({ type, requestId });
     return result.promise;
   }
 
@@ -222,7 +259,16 @@ export class RuntimeClient {
       return;
     }
     if (message.type === "voice_event") {
-      this.fail(new Error("gateway sent a voice event before voice client support was active"));
+      if (!this.activeVoiceSession) {
+        this.fail(new Error("gateway sent a voice event with no active voice session"));
+        return;
+      }
+      const queue = this.activeVoiceSession;
+      queue.push(message.event);
+      if (isVoiceSessionTerminal(message.event)) {
+        this.activeVoiceSession = undefined;
+        queue.finish();
+      }
       return;
     }
 
@@ -265,6 +311,28 @@ export class RuntimeClient {
         return;
       }
       case "interrupt_turn":
+        this.controls.delete(requestId);
+        control.result.resolve();
+        return;
+      case "start_voice_session": {
+        this.controls.delete(requestId);
+        if (this.activeVoiceSession) {
+          control.fail(new Error("gateway accepted a start voice session while one was already active"));
+          return;
+        }
+        const queue = new AsyncQueue<VoiceSessionEvent>();
+        this.activeVoiceSession = queue;
+        control.result.resolve({
+          events: () => queue,
+          stop: () => this.voiceControl("stop_voice_session"),
+          pauseCapture: () => this.voiceControl("pause_voice_capture"),
+          resumeCapture: () => this.voiceControl("resume_voice_capture"),
+        });
+        return;
+      }
+      case "stop_voice_session":
+      case "pause_voice_capture":
+      case "resume_voice_capture":
         this.controls.delete(requestId);
         control.result.resolve();
     }
@@ -313,6 +381,10 @@ export class RuntimeClient {
       state.events.fail(error);
     }
     this.turns.clear();
+    if (this.activeVoiceSession) {
+      this.activeVoiceSession.fail(error);
+      this.activeVoiceSession = undefined;
+    }
     if (closeTransport && !this.closing) {
       void this.transport.close().catch(() => undefined);
       for (const listener of this.unexpectedFailureListeners) {
@@ -340,7 +412,11 @@ type PendingControl =
   | { kind: "memory_list"; accepted: boolean; result: Deferred<MemoryPage>; fail(error: Error): void }
   | { kind: "memory_inspect"; accepted: boolean; result: Deferred<MemoryInspection>; fail(error: Error): void }
   | { kind: "start_turn"; accepted: boolean; result: Deferred<RuntimeTurn>; fail(error: Error): void }
-  | { kind: "interrupt_turn"; accepted: boolean; result: Deferred<void>; fail(error: Error): void };
+  | { kind: "interrupt_turn"; accepted: boolean; result: Deferred<void>; fail(error: Error): void }
+  | { kind: "start_voice_session"; accepted: boolean; result: Deferred<VoiceSession>; fail(error: Error): void }
+  | { kind: "stop_voice_session"; accepted: boolean; result: Deferred<void>; fail(error: Error): void }
+  | { kind: "pause_voice_capture"; accepted: boolean; result: Deferred<void>; fail(error: Error): void }
+  | { kind: "resume_voice_capture"; accepted: boolean; result: Deferred<void>; fail(error: Error): void };
 
 type TurnState = {
   events: AsyncQueue<RuntimeEvent>;
@@ -453,6 +529,13 @@ function eventTurnId(event: RuntimeEvent): bigint {
 function isTerminal(event: RuntimeEvent): boolean {
   return (
     event.type === "turn_completed" || event.type === "turn_cancelled" || event.type === "turn_failed"
+  );
+}
+
+function isVoiceSessionTerminal(event: VoiceSessionEvent): boolean {
+  return (
+    event.type === "voice_session_ended"
+    || (event.type === "voice_session_failed" && event.recovery === "new_session")
   );
 }
 

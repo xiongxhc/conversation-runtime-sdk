@@ -3,7 +3,13 @@ import test from "node:test";
 import { setImmediate } from "node:timers/promises";
 
 import { CommandRejectedError, RuntimeClient, type RuntimeTransport, type RuntimeTurn } from "../src/client.js";
-import type { ClientCommand, RuntimeEvent, RuntimeFailure, RuntimeStatus } from "../src/protocol.js";
+import type {
+  ClientCommand,
+  RuntimeComponentDescriptor,
+  RuntimeEvent,
+  RuntimeFailure,
+  RuntimeStatus,
+} from "../src/protocol.js";
 
 const status: RuntimeStatus = {
   transport: "stdio",
@@ -392,6 +398,130 @@ test("rejects out-of-range memory identifiers before sending", async () => {
   await connected.client.close();
 });
 
+test("startVoiceSession resolves on acceptance and streams events to terminal", async () => {
+  const connected = await connectedClient();
+  const starting = connected.client.startVoiceSession();
+  const start = command(connected.transport, "start_voice_session");
+  connected.transport.push(acceptedControl(start.requestId));
+  const session = await starting;
+
+  connected.transport.push(voiceEvent({
+    type: "voice_session_started",
+    session_id: "1",
+    privacy: { privacy_mode: "local_only", components: wireVoiceComponents() },
+  }));
+  const midSessionFailure: RuntimeFailure = {
+    code: "adapter_failure",
+    kind: "adapter",
+    stage: "speech_recognizer",
+    message: "recognizer hiccup",
+  };
+  connected.transport.push(voiceEvent({
+    type: "voice_session_failed",
+    session_id: "1",
+    error: midSessionFailure,
+    recovery: "continue_session",
+  }));
+  connected.transport.push(voiceEvent({ type: "voice_session_ended", session_id: "1" }));
+
+  assert.deepEqual(await collect(session.events()), [
+    { type: "voice_session_started", sessionId: 1n, privacy: { privacyMode: "local_only", components: parsedVoiceComponents() } },
+    { type: "voice_session_failed", sessionId: 1n, error: midSessionFailure, recovery: "continue_session" },
+    { type: "voice_session_ended", sessionId: 1n },
+  ]);
+  await connected.client.close();
+});
+
+test("a rejected startVoiceSession rejects only that request and leaves the client usable", async () => {
+  const connected = await connectedClient();
+  const failure: RuntimeFailure = {
+    code: "invalid_state",
+    kind: "invalid_state",
+    stage: "runtime",
+    message: "a voice session is already active",
+  };
+  const starting = connected.client.startVoiceSession();
+  const start = command(connected.transport, "start_voice_session");
+  connected.transport.push(rejected(start.requestId, failure));
+  await assert.rejects(starting, (error: Error) => assertCommandRejectedError(error, failure));
+
+  const pendingStatus = connected.client.status();
+  const statusCommand = command(connected.transport, "status");
+  connected.transport.push(acceptedControl(statusCommand.requestId));
+  connected.transport.push({ type: "status", protocol_version: 1, request_id: statusCommand.requestId, status: wireStatus() });
+  assert.deepEqual(await pendingStatus, status);
+  await connected.client.close();
+});
+
+test("voice controls resolve on acceptance and reject request-scoped", async () => {
+  const connected = await connectedClient();
+  const starting = connected.client.startVoiceSession();
+  const start = command(connected.transport, "start_voice_session");
+  connected.transport.push(acceptedControl(start.requestId));
+  const session = await starting;
+
+  const pausing = session.pauseCapture();
+  const pause = command(connected.transport, "pause_voice_capture");
+  connected.transport.push(acceptedControl(pause.requestId));
+  await pausing;
+
+  const failure: RuntimeFailure = {
+    code: "invalid_state",
+    kind: "invalid_state",
+    stage: "runtime",
+    message: "capture is not paused",
+  };
+  const resuming = session.resumeCapture();
+  const resume = command(connected.transport, "resume_voice_capture");
+  connected.transport.push(rejected(resume.requestId, failure));
+  await assert.rejects(resuming, (error: Error) => assertCommandRejectedError(error, failure));
+
+  const stopping = session.stop();
+  const stop = command(connected.transport, "stop_voice_session");
+  connected.transport.push(acceptedControl(stop.requestId));
+  await stopping;
+
+  connected.transport.push(voiceEvent({ type: "voice_session_ended", session_id: "1" }));
+  assert.deepEqual(await collect(session.events()), [{ type: "voice_session_ended", sessionId: 1n }]);
+  await connected.client.close();
+});
+
+test("a voice_event with no active session still fails the client", async () => {
+  const connected = await connectedClient();
+  const pendingStatus = connected.client.status();
+  connected.transport.push(voiceEvent({ type: "voice_session_ended", session_id: "1" }));
+  await assert.rejects(pendingStatus, /no active voice session/);
+  await connected.client.close();
+});
+
+test("client close settles the active voice session's event stream", async () => {
+  const connected = await connectedClient();
+  const starting = connected.client.startVoiceSession();
+  const start = command(connected.transport, "start_voice_session");
+  connected.transport.push(acceptedControl(start.requestId));
+  const session = await starting;
+
+  await connected.client.close();
+
+  await assert.rejects(session.events()[Symbol.asyncIterator]().next(), /runtime client closed/);
+});
+
+test("exactly one terminal settles events(); later events are a protocol violation", async () => {
+  const connected = await connectedClient();
+  const starting = connected.client.startVoiceSession();
+  const start = command(connected.transport, "start_voice_session");
+  connected.transport.push(acceptedControl(start.requestId));
+  const session = await starting;
+
+  connected.transport.push(voiceEvent({ type: "voice_session_ended", session_id: "1" }));
+  assert.deepEqual(await collect(session.events()), [{ type: "voice_session_ended", sessionId: 1n }]);
+
+  const pendingStatus = connected.client.status();
+  connected.transport.push(voiceEvent({ type: "voice_session_ended", session_id: "1" }));
+  await assert.rejects(pendingStatus, /no active voice session/);
+  await connected.client.close();
+});
+
 class InMemoryTransport implements RuntimeTransport {
   readonly inbox = new AsyncChannel<unknown>();
   readonly messages = this.inbox;
@@ -645,10 +775,32 @@ function wireStatusV2(): Record<string, unknown> {
   };
 }
 
-async function collect(events: AsyncIterable<RuntimeEvent>): Promise<RuntimeEvent[]> {
-  const values: RuntimeEvent[] = [];
+async function collect<T>(events: AsyncIterable<T>): Promise<T[]> {
+  const values: T[] = [];
   for await (const value of events) {
     values.push(value);
   }
   return values;
+}
+
+function voiceEvent(event: unknown): unknown {
+  return { type: "voice_event", protocol_version: 1, event };
+}
+
+function wireVoiceComponents(): Record<string, unknown>[] {
+  return [
+    { kind: "speech_recognition", execution_location: "local", provider_label: "Local speech recognition" },
+    { kind: "language_model", execution_location: "local", provider_label: "Local language" },
+    { kind: "speech_synthesis", execution_location: "local", provider_label: "Local speech synthesis" },
+    { kind: "audio_io", execution_location: "local", provider_label: "Local audio io" },
+  ];
+}
+
+function parsedVoiceComponents(): RuntimeComponentDescriptor[] {
+  return [
+    { kind: "speech_recognition", executionLocation: "local", providerLabel: "Local speech recognition" },
+    { kind: "language_model", executionLocation: "local", providerLabel: "Local language" },
+    { kind: "speech_synthesis", executionLocation: "local", providerLabel: "Local speech synthesis" },
+    { kind: "audio_io", executionLocation: "local", providerLabel: "Local audio io" },
+  ];
 }

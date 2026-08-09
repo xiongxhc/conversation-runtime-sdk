@@ -1,4 +1,4 @@
-export { CommandRejectedError, RuntimeClient, type RuntimeTransport, type RuntimeTurn } from "./client.js";
+export { CommandRejectedError, RuntimeClient, type RuntimeTransport, type RuntimeTurn, type VoiceSession } from "./client.js";
 export { FrameDecoder, FrameError, MAX_FRAME_BYTES, encodeFrame } from "./framing.js";
 export {
   CLIENT_PROTOCOL_VERSION,

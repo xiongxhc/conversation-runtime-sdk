@@ -433,7 +433,8 @@ impl GatewaySession {
                     }
                 };
 
-                send_accepted(normal, &request_id).map_err(CommandFailure::response)?;
+                send_urgent(urgent, accepted_message(&request_id))
+                    .map_err(CommandFailure::response)?;
                 let task = tokio::spawn(pump_voice_events(
                     event_stream,
                     normal.clone(),
@@ -1031,8 +1032,9 @@ mod tests {
     use conversation_protocol::{
         ClientRuntimeEvent, ComponentDescriptor, ComponentKind, ExecutionLocation, GatewayMessage,
         MemoryConfidence, MemoryDraft, MemoryKind, MemoryPatch, MemoryProvenance,
-        MemoryProvenanceKind, MemoryRetention, PrivacyMode, RuntimeStatus, SessionId, TurnId,
-        UnixTimestampMillis, VoiceActivity, MAX_CLIENT_FRAME_BYTES, MAX_MEMORY_CONTENT_BYTES,
+        MemoryProvenanceKind, MemoryRetention, PrivacyMode, RuntimeStage, RuntimeStatus, SessionId,
+        TurnId, UnixTimestampMillis, VoiceActivity, MAX_CLIENT_FRAME_BYTES,
+        MAX_MEMORY_CONTENT_BYTES,
     };
     use tempfile::TempDir;
     use tokio::io::{duplex, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
@@ -1456,6 +1458,65 @@ mod tests {
         assert!(accepted < started);
     }
 
+    #[tokio::test]
+    async fn voice_accept_precedes_first_voice_event_when_both_are_queued() {
+        let (_, input_receiver) = mpsc::channel(8);
+        let language = Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new()));
+        let session = session_with_interactive_voice(input_receiver, language, no_speech_frames());
+        let (mut input, reader) = duplex(4096);
+        let (writer, writer_state) = ReadyFlushBlockingWriter::new();
+        let writer_lanes = super::WriterLanes::new();
+        let urgent_monitor = writer_lanes.urgent_sender.clone();
+        let event_monitor = writer_lanes.event_sender.clone();
+        let session_task =
+            tokio::spawn(session.run_with_writer_lanes(reader, writer, writer_lanes));
+
+        timeout(TEST_TIMEOUT, writer_state.blocked.wait())
+            .await
+            .expect("gateway writer did not block while flushing ready");
+        assert_eq!(queued_messages(&urgent_monitor), 0);
+        assert_eq!(queued_messages(&event_monitor), 0);
+        write_command(
+            &mut input,
+            r#"{"protocol_version":1,"type":"start_voice_session","request_id":"voice-tie"}"#,
+        )
+        .await;
+        wait_for_queued_start_acceptance_and_turn_started(&urgent_monitor, &event_monitor).await;
+        assert!(!writer_state.released.load(Ordering::SeqCst));
+        drop(event_monitor);
+        drop(urgent_monitor);
+
+        writer_state.release();
+        timeout(
+            TEST_TIMEOUT,
+            writer_state.wait_for_bytes(r#""request_id":"voice-tie""#),
+        )
+        .await
+        .expect("voice acceptance was not written after output resumed");
+        timeout(
+            TEST_TIMEOUT,
+            writer_state.wait_for_bytes(r#""type":"voice_session_started""#),
+        )
+        .await
+        .expect("voice_session_started was not written after output resumed");
+        drop(input);
+        timeout(TEST_TIMEOUT, session_task)
+            .await
+            .expect("gateway session did not clean up after voice-order test")
+            .unwrap()
+            .unwrap();
+
+        let messages = decode_frames(&writer_state.bytes());
+        let accepted = message_index(&messages, |message| {
+            message_type(message) == "command_accepted"
+                && message.contains(r#""request_id":"voice-tie""#)
+        });
+        let started = message_index(&messages, |message| {
+            message.contains(r#""type":"voice_session_started""#)
+        });
+        assert!(accepted < started);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn fatal_framing_aborts_and_reaps_a_blocked_writer_after_the_deadline() {
         let session = GatewaySession::new(unused_runtime(), status());
@@ -1696,7 +1757,7 @@ mod tests {
     async fn start_voice_session_accepts_and_streams_events_until_terminal() {
         let (input, input_receiver) = mpsc::channel(8);
         let language = Arc::new(MockGenerationLanguageModel::new(["fixture reply"]));
-        let session = session_with_interactive_voice(input_receiver, language);
+        let session = session_with_interactive_voice(input_receiver, language, no_speech_frames());
         let mut gateway = InMemoryGateway::start(session).await;
 
         gateway
@@ -1732,15 +1793,29 @@ mod tests {
 
         tokio::time::advance(Duration::from_millis(900)).await;
 
-        let messages = gateway.read_until(is_voice_terminal).await;
-        drop(input);
-
-        assert!(messages
+        // The turn runs to completion and then fails during synthesis (the fixture speech
+        // synthesizer has no frames to play); that failure carries `ContinueSession`
+        // recovery, so it is not the session's terminal and the session keeps listening
+        // past it. Drain up to (and including) that failure before tearing the mock voice
+        // input down, so its arrival never races the session's real (`NewSession`) terminal.
+        let mid_session_messages = gateway
+            .read_until(|message| {
+                message.contains(r#""type":"voice_session_failed""#)
+                    && message.contains(r#""recovery":"continue_session""#)
+            })
+            .await;
+        assert!(mid_session_messages
             .iter()
             .any(|message| message.contains(r#""type":"voice_transcript_final""#)));
-        assert!(messages
+        assert!(mid_session_messages
             .iter()
             .any(|message| message.contains(r#""type":"voice_turn_event""#)));
+        assert!(!mid_session_messages
+            .iter()
+            .any(|message| is_voice_terminal(message)));
+
+        drop(input);
+        let messages = gateway.read_until(is_voice_terminal).await;
         let terminals = messages
             .iter()
             .filter(|message| is_voice_terminal(message))
@@ -1752,10 +1827,59 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn voice_session_survives_a_continue_session_recovery_failure() {
+        let (input, input_receiver) = mpsc::channel(8);
+        let language = Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new()));
+        let session = session_with_interactive_voice(input_receiver, language, no_speech_frames());
+        let mut gateway = InMemoryGateway::start(session).await;
+
+        gateway
+            .write(r#"{"protocol_version":1,"type":"start_voice_session","request_id":"voice-1"}"#)
+            .await;
+        assert_accepted_message(&gateway.read_message().await, "voice-1");
+        let started = gateway.read_message().await;
+        assert!(started.contains(r#""type":"voice_session_started""#));
+
+        // A recognizer hiccup is reported with `ContinueSession` recovery: it is not the
+        // session's terminal, and the session keeps listening past it.
+        input
+            .send(Err(AdapterError::new("fixture recognizer hiccup")
+                .with_stage(RuntimeStage::SpeechRecognizer)))
+            .await
+            .unwrap();
+        let failure = gateway.read_message().await;
+        assert!(failure.contains(r#""type":"voice_session_failed""#));
+        assert!(failure.contains(r#""recovery":"continue_session""#));
+        assert!(!is_voice_terminal(&failure));
+
+        // the session is still alive: further activity keeps streaming normally
+        send_voice_input(
+            &input,
+            VoiceInputEvent::Activity(VoiceActivity::SpeechStarted { at_ms: 0 }),
+        )
+        .await;
+        let activity = gateway.read_message().await;
+        assert!(activity.contains(r#""type":"voice_activity""#));
+
+        drop(input);
+        let messages = gateway.read_until(is_voice_terminal).await;
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| is_voice_terminal(message))
+                .count(),
+            1
+        );
+        assert!(is_voice_terminal(messages.last().unwrap()));
+
+        gateway.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn second_start_voice_session_is_rejected_request_scoped() {
         let (input, input_receiver) = mpsc::channel(8);
         let language = Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new()));
-        let session = session_with_interactive_voice(input_receiver, language);
+        let session = session_with_interactive_voice(input_receiver, language, no_speech_frames());
         let mut gateway = InMemoryGateway::start(session).await;
 
         gateway
@@ -1801,7 +1925,7 @@ mod tests {
     async fn start_turn_is_rejected_while_voice_session_is_active() {
         let (input, input_receiver) = mpsc::channel(8);
         let language = Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new()));
-        let session = session_with_interactive_voice(input_receiver, language);
+        let session = session_with_interactive_voice(input_receiver, language, no_speech_frames());
         let mut gateway = InMemoryGateway::start(session).await;
 
         gateway
@@ -2248,10 +2372,11 @@ mod tests {
     fn session_with_interactive_voice(
         input_receiver: mpsc::Receiver<Result<VoiceInputEvent, AdapterError>>,
         language: Arc<dyn GenerationLanguageModel>,
+        speech: Arc<MockStreamingSpeechSynthesizer>,
     ) -> GatewaySession {
         let adapters = GatewayVoiceAdapters {
             io: Arc::new(TestVoiceIoFactory::new(input_receiver)),
-            speech: Arc::new(MockStreamingSpeechSynthesizer::new(Vec::new())),
+            speech,
             policy: voice_policy(),
         };
         GatewaySession::new(unused_runtime(), status_with_voice()).with_voice(
@@ -2259,6 +2384,10 @@ mod tests {
             test_context(),
             language,
         )
+    }
+
+    fn no_speech_frames() -> Arc<MockStreamingSpeechSynthesizer> {
+        Arc::new(MockStreamingSpeechSynthesizer::new(Vec::new()))
     }
 
     async fn send_voice_input(
@@ -2271,7 +2400,8 @@ mod tests {
 
     fn is_voice_terminal(message: &str) -> bool {
         message.contains(r#""type":"voice_session_ended""#)
-            || message.contains(r#""type":"voice_session_failed""#)
+            || (message.contains(r#""type":"voice_session_failed""#)
+                && message.contains(r#""recovery":"new_session""#))
     }
 
     async fn first_ready_message(session: GatewaySession) -> String {

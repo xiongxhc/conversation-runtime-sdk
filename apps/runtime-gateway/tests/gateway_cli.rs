@@ -120,22 +120,10 @@ async fn configured_voice_session_spawns_the_sidecar_and_reports_its_failure() {
         .await;
     assert_accepted(&gateway.read_message().await, "voice-start");
 
-    let messages = gateway
-        .read_until(|message| {
-            matches!(
-                message.event_type(),
-                Some("voice_session_failed" | "voice_session_ended")
-            )
-        })
-        .await;
+    let messages = gateway.read_until(is_voice_terminal).await;
     let terminals = messages
         .iter()
-        .filter(|message| {
-            matches!(
-                message.event_type(),
-                Some("voice_session_failed" | "voice_session_ended")
-            )
-        })
+        .filter(|message| is_voice_terminal(message))
         .count();
     assert_eq!(terminals, 1);
     assert_eq!(
@@ -723,6 +711,17 @@ fn assert_accepted(message: &WireMessage, request_id: &str) {
 
 fn is_accepted(message: &WireMessage, request_id: &str) -> bool {
     message.message_type() == "command_accepted" && message.request_id() == Some(request_id)
+}
+
+/// A voice session's single reliable terminal: `voice_session_ended`, or
+/// `voice_session_failed` with `recovery: "new_session"`. A `voice_session_failed` with
+/// `recovery: "continue_session"` is not terminal — the session keeps streaming past it.
+fn is_voice_terminal(message: &WireMessage) -> bool {
+    match message.event_type() {
+        Some("voice_session_ended") => true,
+        Some("voice_session_failed") => message.raw.contains(r#""recovery":"new_session""#),
+        _ => false,
+    }
 }
 
 fn assert_rejected(message: &WireMessage, request_id: &str, code: &str) {

@@ -203,6 +203,14 @@ impl GatewaySession {
                         }
                     }
                     SessionInput::VoicePump(result) => {
+                        // The pump completing here means the *voice session's own*
+                        // lifecycle finished — its terminal (`VoiceSessionFailed` or
+                        // `VoiceSessionEnded`) has already been forwarded. That is a
+                        // healthy outcome and must not end the gateway session. Only
+                        // pump *infrastructure* failure (a panicked task, or an event
+                        // the wire protocol rejects) surfaces as `Err` here and is
+                        // treated as fatal, mirroring `forward_events`'s handling of
+                        // the text lane.
                         active_voice = None;
                         if let Err(error) = forwarder_result(result) {
                             break SessionExit::fatal(
@@ -254,6 +262,7 @@ impl GatewaySession {
         };
 
         shutdown_active(&self.runtime, &mut active).await;
+        shutdown_active_voice(&mut active_voice).await;
         if let Some(message) = exit.fatal_message() {
             let _ = send_urgent(&urgent_sender, fatal_message(message));
         }
@@ -779,6 +788,21 @@ async fn shutdown_active(runtime: &TextTurnRuntime, active: &mut Option<ActiveFo
     if let Some(task) = active_turn.task.take() {
         let _ = task.await;
     }
+}
+
+// Every session exit path (client EOF, framing failure, writer failure, a fatal
+// command) must leave no live voice runtime or pump task behind — later integration
+// tests depend on that invariant. Mirrors `shutdown_active`'s text-lane cleanup:
+// shuts the voice runtime down, then bounds and reaps the pump via
+// `shutdown_voice_pump` (its own timeout aborts a pump wedged behind a dead writer).
+// Idempotent: a no-op once `StopVoiceSession` or the pump's own completion has
+// already cleared `active_voice`.
+async fn shutdown_active_voice(active_voice: &mut Option<ActiveVoiceSession>) {
+    let Some(voice_session) = active_voice.take() else {
+        return;
+    };
+    let _ = voice_session.runtime.shutdown().await;
+    let _ = shutdown_voice_pump(voice_session.task).await;
 }
 
 async fn writer_loop<W>(
@@ -2026,6 +2050,155 @@ mod tests {
         gateway.close().await;
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn eof_aborts_active_voice_session_and_reaps() {
+        let (_input, input_receiver) = mpsc::channel(8);
+        let language = Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new()));
+        let (session, cancelled) = session_with_interactive_voice_and_cancellation(
+            input_receiver,
+            language,
+            no_speech_frames(),
+        );
+        let mut gateway = InMemoryGateway::start(session).await;
+
+        gateway
+            .write(r#"{"protocol_version":1,"type":"start_voice_session","request_id":"voice-1"}"#)
+            .await;
+        assert_accepted_message(&gateway.read_message().await, "voice-1");
+        let started = gateway.read_message().await;
+        assert!(started.contains(r#""type":"voice_session_started""#));
+
+        assert!(!cancelled.is_set());
+        let InMemoryGateway {
+            input,
+            output: _,
+            task,
+        } = gateway;
+        drop(input);
+
+        timeout(TEST_TIMEOUT, cancelled.wait())
+            .await
+            .expect("client EOF did not cancel the active voice session");
+        timeout(TEST_TIMEOUT, task)
+            .await
+            .expect("gateway session did not return after client EOF")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn voice_session_failure_leaves_text_lane_healthy() {
+        let (input, input_receiver) = mpsc::channel(8);
+        let language_server = HoldOpenLanguageServer::completing().await;
+        let text_runtime = runtime_for(language_server.endpoint());
+        let voice_language = Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new()));
+        let session = session_with_voice_and_runtime(
+            text_runtime,
+            input_receiver,
+            voice_language,
+            no_speech_frames(),
+        );
+        let mut gateway = InMemoryGateway::start(session).await;
+
+        gateway
+            .write(r#"{"protocol_version":1,"type":"start_voice_session","request_id":"voice-1"}"#)
+            .await;
+        assert_accepted_message(&gateway.read_message().await, "voice-1");
+        let started = gateway.read_message().await;
+        assert!(started.contains(r#""type":"voice_session_started""#));
+
+        // A non-recognizer io fault is the session's fatal (`NewSession`) terminal;
+        // it must end only the voice session, not the gateway session.
+        input
+            .send(Err(
+                AdapterError::new("fixture voice io fault").with_stage(RuntimeStage::VoiceSidecar)
+            ))
+            .await
+            .unwrap();
+        let messages = gateway.read_until(is_voice_terminal).await;
+        let failure = messages.last().unwrap();
+        assert!(failure.contains(r#""type":"voice_session_failed""#));
+        assert!(failure.contains(r#""recovery":"new_session""#));
+
+        // the text lane is still healthy: a turn on the same connection runs to
+        // completion after the voice session's fatal failure.
+        gateway
+            .write(
+                r#"{"protocol_version":1,"type":"start_turn","request_id":"start-after-voice-failure","transcript":"fixture question"}"#,
+            )
+            .await;
+        assert_accepted_message(&gateway.read_message().await, "start-after-voice-failure");
+        let messages = gateway.read_until(is_terminal).await;
+        assert!(messages
+            .last()
+            .unwrap()
+            .contains(r#""type":"turn_completed""#));
+
+        gateway.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blocked_writer_during_voice_stop_still_reaps() {
+        let (input, input_receiver) = mpsc::channel(8);
+        let language = Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new()));
+        let (session, cancelled) = session_with_interactive_voice_and_cancellation(
+            input_receiver,
+            language,
+            no_speech_frames(),
+        );
+        let (mut client_input, reader) = duplex(4096);
+        let (writer, writer_state) = ReadyFlushBlockingWriter::new();
+        let writer_lanes = super::WriterLanes::new();
+        let urgent_monitor = writer_lanes.urgent_sender.clone();
+        let event_monitor = writer_lanes.event_sender.clone();
+        let session_task =
+            tokio::spawn(session.run_with_writer_lanes(reader, writer, writer_lanes));
+
+        timeout(TEST_TIMEOUT, writer_state.blocked.wait())
+            .await
+            .expect("gateway writer did not block while flushing ready");
+
+        write_command(
+            &mut client_input,
+            r#"{"protocol_version":1,"type":"start_voice_session","request_id":"voice-1"}"#,
+        )
+        .await;
+        wait_for_queued_start_acceptance_and_turn_started(&urgent_monitor, &event_monitor).await;
+        drop(urgent_monitor);
+        drop(event_monitor);
+
+        // The event lane's single slot is already held by `voice_session_started`
+        // (unconsumed, since the writer is stuck flushing `ready`); this next event
+        // wedges the pump task mid-send with nowhere to drain to.
+        send_voice_input(
+            &input,
+            VoiceInputEvent::Activity(VoiceActivity::SpeechStarted { at_ms: 0 }),
+        )
+        .await;
+
+        write_command(
+            &mut client_input,
+            r#"{"protocol_version":1,"type":"stop_voice_session","request_id":"stop-1"}"#,
+        )
+        .await;
+
+        // `runtime.shutdown()` does not wait on the writer, so the underlying voice
+        // I/O is reaped even though the pump is wedged behind it.
+        timeout(TEST_TIMEOUT, cancelled.wait())
+            .await
+            .expect("blocked writer prevented the voice session from being reaped during stop");
+
+        assert!(!writer_state.released.load(Ordering::SeqCst));
+        let result = timeout(TEST_TIMEOUT, session_task)
+            .await
+            .expect("gateway session did not return while its writer stayed blocked")
+            .unwrap();
+        assert!(matches!(
+            result,
+            Err(super::GatewaySessionError::VoicePumpShutdownTimeout)
+        ));
+    }
+
     #[tokio::test]
     async fn stop_voice_session_shuts_down_and_emits_single_terminal() {
         let (input, input_receiver) = mpsc::channel(8);
@@ -2605,6 +2778,10 @@ mod tests {
         input: Arc<TestVoiceInput>,
         output: Arc<MockContinuousAudioOutput>,
         capture: Arc<dyn VoiceCaptureControl>,
+        // Set once the io session's completion task observes the runtime cancel it,
+        // so disconnect-cleanup tests can assert the underlying voice I/O was
+        // actually reaped rather than merely inferring it from the session's return.
+        cancelled: Arc<Condition>,
     }
 
     impl TestVoiceIoFactory {
@@ -2618,6 +2795,7 @@ mod tests {
                 }),
                 output: Arc::new(MockContinuousAudioOutput::new()),
                 capture,
+                cancelled: Arc::new(Condition::default()),
             }
         }
     }
@@ -2629,12 +2807,14 @@ mod tests {
             cancellation: CancellationToken,
         ) -> AdapterFuture<'a, VoiceIoSession> {
             Box::pin(async move {
+                let cancelled = self.cancelled.clone();
                 Ok(VoiceIoSession {
                     input: self.input.clone(),
                     capture: self.capture.clone(),
                     output: self.output.clone(),
                     completion: tokio::spawn(async move {
                         cancellation.cancelled().await;
+                        cancelled.set();
                         Ok(())
                     }),
                 })
@@ -2718,6 +2898,57 @@ mod tests {
             policy: voice_policy(),
         };
         GatewaySession::new(unused_runtime(), status_with_voice()).with_voice(
+            adapters,
+            test_context(),
+            language,
+        )
+    }
+
+    /// Like `session_with_interactive_voice`, but also returns a handle a test can
+    /// await to observe the underlying voice I/O session actually being cancelled —
+    /// disconnect-cleanup tests need this to prove the runtime was reaped rather than
+    /// merely left running unobserved.
+    fn session_with_interactive_voice_and_cancellation(
+        input_receiver: mpsc::Receiver<Result<VoiceInputEvent, AdapterError>>,
+        language: Arc<dyn GenerationLanguageModel>,
+        speech: Arc<MockStreamingSpeechSynthesizer>,
+    ) -> (GatewaySession, Arc<Condition>) {
+        let factory = Arc::new(TestVoiceIoFactory::with_capture(
+            input_receiver,
+            Arc::new(MockVoiceCaptureControl::new()),
+        ));
+        let cancelled = factory.cancelled.clone();
+        let adapters = GatewayVoiceAdapters {
+            io: factory,
+            speech,
+            policy: voice_policy(),
+        };
+        let session = GatewaySession::new(unused_runtime(), status_with_voice()).with_voice(
+            adapters,
+            test_context(),
+            language,
+        );
+        (session, cancelled)
+    }
+
+    /// Like `session_with_interactive_voice`, but wired to a caller-supplied text
+    /// runtime instead of the unreachable `unused_runtime()` — for tests proving a
+    /// voice session failure leaves the *text* lane able to actually run a turn.
+    fn session_with_voice_and_runtime(
+        runtime: conversation_runtime::TextTurnRuntime,
+        input_receiver: mpsc::Receiver<Result<VoiceInputEvent, AdapterError>>,
+        language: Arc<dyn GenerationLanguageModel>,
+        speech: Arc<MockStreamingSpeechSynthesizer>,
+    ) -> GatewaySession {
+        let adapters = GatewayVoiceAdapters {
+            io: Arc::new(TestVoiceIoFactory::with_capture(
+                input_receiver,
+                Arc::new(MockVoiceCaptureControl::new()),
+            )),
+            speech,
+            policy: voice_policy(),
+        };
+        GatewaySession::new(runtime, status_with_voice()).with_voice(
             adapters,
             test_context(),
             language,

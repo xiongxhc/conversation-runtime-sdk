@@ -513,8 +513,23 @@ test("exactly one terminal settles events(); later events are a protocol violati
   connected.transport.push(acceptedControl(start.requestId));
   const session = await starting;
 
-  connected.transport.push(voiceEvent({ type: "voice_session_ended", session_id: "1" }));
-  assert.deepEqual(await collect(session.events()), [{ type: "voice_session_ended", sessionId: 1n }]);
+  // voice_session_failed with recovery "new_session" is the other terminal variant (alongside
+  // voice_session_ended, covered elsewhere) and must settle the stream exactly once.
+  const terminalFailure: RuntimeFailure = {
+    code: "adapter_failure",
+    kind: "adapter",
+    stage: "speech_recognizer",
+    message: "recognizer crashed",
+  };
+  connected.transport.push(voiceEvent({
+    type: "voice_session_failed",
+    session_id: "1",
+    error: terminalFailure,
+    recovery: "new_session",
+  }));
+  assert.deepEqual(await collect(session.events()), [
+    { type: "voice_session_failed", sessionId: 1n, error: terminalFailure, recovery: "new_session" },
+  ]);
 
   const pendingStatus = connected.client.status();
   connected.transport.push(voiceEvent({ type: "voice_session_ended", session_id: "1" }));

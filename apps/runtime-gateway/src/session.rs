@@ -49,9 +49,6 @@ struct VoiceLane {
 }
 
 struct ActiveVoiceSession {
-    // Consumed by Task 3's stop/pause/resume command handling; this task only starts
-    // the runtime and holds it alongside the event pump task.
-    #[allow(dead_code)]
     runtime: VoiceSessionRuntime,
     task: JoinHandle<Result<(), GatewaySessionError>>,
 }
@@ -443,11 +440,56 @@ impl GatewaySession {
                 *active_voice = Some(ActiveVoiceSession { runtime, task });
                 Ok(())
             }
-            ClientCommand::StopVoiceSession { request_id }
-            | ClientCommand::PauseVoiceCapture { request_id }
-            | ClientCommand::ResumeVoiceCapture { request_id } => {
-                send_rejection(normal, &request_id, command_error("voice is unavailable"))
-                    .map_err(CommandFailure::response)
+            ClientCommand::StopVoiceSession { request_id } => {
+                let Some(voice_session) = active_voice.take() else {
+                    return send_rejection(
+                        normal,
+                        &request_id,
+                        command_error("no voice session is active"),
+                    )
+                    .map_err(CommandFailure::response);
+                };
+                let _ = voice_session.runtime.shutdown().await;
+                shutdown_voice_pump(voice_session.task)
+                    .await
+                    .map_err(|error| {
+                        CommandFailure::fatal(error, "gateway voice session shutdown failed")
+                    })?;
+                send_accepted(normal, &request_id).map_err(CommandFailure::response)
+            }
+            ClientCommand::PauseVoiceCapture { request_id } => {
+                let Some(voice_session) = active_voice.as_ref() else {
+                    return send_rejection(
+                        normal,
+                        &request_id,
+                        command_error("no voice session is active"),
+                    )
+                    .map_err(CommandFailure::response);
+                };
+                match voice_session.runtime.pause_capture().await {
+                    Ok(()) => send_accepted(normal, &request_id).map_err(CommandFailure::response),
+                    Err(error) => {
+                        send_rejection(normal, &request_id, ClientRuntimeError::from(error))
+                            .map_err(CommandFailure::response)
+                    }
+                }
+            }
+            ClientCommand::ResumeVoiceCapture { request_id } => {
+                let Some(voice_session) = active_voice.as_ref() else {
+                    return send_rejection(
+                        normal,
+                        &request_id,
+                        command_error("no voice session is active"),
+                    )
+                    .map_err(CommandFailure::response);
+                };
+                match voice_session.runtime.resume_capture().await {
+                    Ok(()) => send_accepted(normal, &request_id).map_err(CommandFailure::response),
+                    Err(error) => {
+                        send_rejection(normal, &request_id, ClientRuntimeError::from(error))
+                            .map_err(CommandFailure::response)
+                    }
+                }
             }
             ClientCommand::MemoryList {
                 request_id,
@@ -842,6 +884,23 @@ async fn shutdown_writer(
     }
 }
 
+// Awaits the voice event pump's completion notification after `StopVoiceSession` has
+// already shut the runtime down: the pump's terminal write races the accept response
+// on the same normal lane, so `StopVoiceSession` must not accept until the pump task
+// itself has finished draining and forwarding the session's single terminal.
+async fn shutdown_voice_pump(
+    mut task: JoinHandle<Result<(), GatewaySessionError>>,
+) -> Result<(), GatewaySessionError> {
+    match timeout(WRITER_SHUTDOWN_TIMEOUT, &mut task).await {
+        Ok(result) => forwarder_result(result),
+        Err(_) => {
+            task.abort();
+            let _ = task.await;
+            Err(GatewaySessionError::VoicePumpShutdownTimeout)
+        }
+    }
+}
+
 fn send_accepted(
     writer: &mpsc::Sender<GatewayMessage>,
     request_id: &str,
@@ -978,6 +1037,7 @@ pub enum GatewaySessionError {
     Framing(FrameError),
     Interruption,
     Projection,
+    VoicePumpShutdownTimeout,
     WriterTask,
     WriterBackpressure,
     WriterShutdownTimeout,
@@ -993,6 +1053,7 @@ impl fmt::Display for GatewaySessionError {
             Self::Framing(_) => "gateway input framing failed",
             Self::Interruption => "gateway interruption failed",
             Self::Projection => "gateway event projection failed",
+            Self::VoicePumpShutdownTimeout => "gateway voice session shutdown timed out",
             Self::WriterTask => "gateway writer task failed",
             Self::WriterBackpressure => "gateway writer backpressure limit reached",
             Self::WriterShutdownTimeout => "gateway writer shutdown timed out",
@@ -1027,7 +1088,8 @@ mod tests {
         AdapterError, AdapterFuture, GenerationLanguageModel, MockContinuousAudioOutput,
         MockGenerationLanguageModel, MockStreamingSpeechSynthesizer, MockVoiceCaptureControl,
         MockVoiceIoFactory, OllamaConfig, OllamaLanguageModel, RecognitionEvent,
-        RecognitionHypothesis, VoiceInput, VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
+        RecognitionHypothesis, VoiceCaptureControl, VoiceInput, VoiceInputEvent, VoiceIoFactory,
+        VoiceIoSession,
     };
     use conversation_protocol::{
         ClientRuntimeEvent, ComponentDescriptor, ComponentKind, ExecutionLocation, GatewayMessage,
@@ -1964,6 +2026,214 @@ mod tests {
         gateway.close().await;
     }
 
+    #[tokio::test]
+    async fn stop_voice_session_shuts_down_and_emits_single_terminal() {
+        let (input, input_receiver) = mpsc::channel(8);
+        let language = Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new()));
+        let session = session_with_interactive_voice(input_receiver, language, no_speech_frames());
+        let mut gateway = InMemoryGateway::start(session).await;
+
+        gateway
+            .write(r#"{"protocol_version":1,"type":"start_voice_session","request_id":"voice-1"}"#)
+            .await;
+        assert_accepted_message(&gateway.read_message().await, "voice-1");
+        let started = gateway.read_message().await;
+        assert!(started.contains(r#""type":"voice_session_started""#));
+
+        gateway
+            .write(r#"{"protocol_version":1,"type":"stop_voice_session","request_id":"stop-1"}"#)
+            .await;
+        let messages = gateway
+            .read_until(|message| {
+                message_type(message) == "command_accepted"
+                    && message.contains(r#""request_id":"stop-1""#)
+            })
+            .await;
+
+        let terminal_index = message_index(&messages, is_voice_terminal);
+        let accepted_index = message_index(&messages, |message| {
+            message_type(message) == "command_accepted"
+                && message.contains(r#""request_id":"stop-1""#)
+        });
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| is_voice_terminal(message))
+                .count(),
+            1
+        );
+        assert!(
+            terminal_index < accepted_index,
+            "stop must accept only after the session's terminal has been forwarded"
+        );
+
+        drop(input);
+        gateway.close().await;
+    }
+
+    #[tokio::test]
+    async fn pause_and_resume_acknowledge_after_capture_state_changes() {
+        let (input, input_receiver) = mpsc::channel(8);
+        let language = Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new()));
+        let capture = GatedVoiceCaptureControl::new();
+        let session = session_with_interactive_voice_and_capture(
+            input_receiver,
+            language,
+            no_speech_frames(),
+            capture.clone(),
+        );
+        let (mut client_input, reader) = duplex(MAX_CLIENT_FRAME_BYTES * 2);
+        let (writer, writer_state) = BlockingWriter::new(usize::MAX);
+        let session_task = tokio::spawn(session.run(reader, writer));
+
+        timeout(
+            TEST_TIMEOUT,
+            writer_state.wait_for_bytes(r#""type":"ready""#),
+        )
+        .await
+        .expect("gateway never sent ready");
+
+        write_command(
+            &mut client_input,
+            r#"{"protocol_version":1,"type":"start_voice_session","request_id":"voice-1"}"#,
+        )
+        .await;
+        timeout(
+            TEST_TIMEOUT,
+            writer_state.wait_for_bytes(r#""type":"voice_session_started""#),
+        )
+        .await
+        .expect("voice session never started");
+
+        // Pause: the capture control is gated, so nothing can have been written for
+        // "pause-1" the moment the call is observed to have started.
+        write_command(
+            &mut client_input,
+            r#"{"protocol_version":1,"type":"pause_voice_capture","request_id":"pause-1"}"#,
+        )
+        .await;
+        timeout(TEST_TIMEOUT, capture.pause_started.wait())
+            .await
+            .expect("pause was never invoked on the capture control");
+        assert!(
+            !String::from_utf8_lossy(&writer_state.bytes()).contains(r#""request_id":"pause-1""#)
+        );
+
+        capture.pause_release.set();
+        timeout(
+            TEST_TIMEOUT,
+            writer_state.wait_for_bytes(r#""request_id":"pause-1""#),
+        )
+        .await
+        .expect("pause was never accepted after the capture control released");
+
+        // Resume: same shape, proving the invariant holds for both directions.
+        write_command(
+            &mut client_input,
+            r#"{"protocol_version":1,"type":"resume_voice_capture","request_id":"resume-1"}"#,
+        )
+        .await;
+        timeout(TEST_TIMEOUT, capture.resume_started.wait())
+            .await
+            .expect("resume was never invoked on the capture control");
+        assert!(
+            !String::from_utf8_lossy(&writer_state.bytes()).contains(r#""request_id":"resume-1""#)
+        );
+
+        capture.resume_release.set();
+        timeout(
+            TEST_TIMEOUT,
+            writer_state.wait_for_bytes(r#""request_id":"resume-1""#),
+        )
+        .await
+        .expect("resume was never accepted after the capture control released");
+
+        drop(input);
+        drop(client_input);
+        timeout(TEST_TIMEOUT, session_task)
+            .await
+            .expect("gateway session did not close")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn voice_controls_without_active_session_are_rejected_request_scoped() {
+        let (session, _guards) = session_with_voice();
+        let mut gateway = InMemoryGateway::start(session).await;
+
+        for (index, command_type) in [
+            "stop_voice_session",
+            "pause_voice_capture",
+            "resume_voice_capture",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let request_id = format!("no-session-{index}");
+            gateway
+                .write(&format!(
+                    r#"{{"protocol_version":1,"type":"{command_type}","request_id":"{request_id}"}}"#
+                ))
+                .await;
+            let rejection = gateway.read_message().await;
+            assert_rejected_message(&rejection, &request_id, "invalid_state");
+            assert!(rejection.contains("no voice session is active"));
+        }
+
+        gateway.close().await;
+    }
+
+    #[tokio::test]
+    async fn repeated_stop_is_idempotent_and_bounded() {
+        let (input, input_receiver) = mpsc::channel(8);
+        let language = Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new()));
+        let session = session_with_interactive_voice(input_receiver, language, no_speech_frames());
+        let mut gateway = InMemoryGateway::start(session).await;
+
+        gateway
+            .write(r#"{"protocol_version":1,"type":"start_voice_session","request_id":"voice-1"}"#)
+            .await;
+        assert_accepted_message(&gateway.read_message().await, "voice-1");
+        let started = gateway.read_message().await;
+        assert!(started.contains(r#""type":"voice_session_started""#));
+
+        gateway
+            .write(r#"{"protocol_version":1,"type":"stop_voice_session","request_id":"stop-1"}"#)
+            .await;
+        let messages = gateway
+            .read_until(|message| {
+                message_type(message) == "command_accepted"
+                    && message.contains(r#""request_id":"stop-1""#)
+            })
+            .await;
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| is_voice_terminal(message))
+                .count(),
+            1
+        );
+
+        // Every repeat behaves identically: bounded (each read below relies on
+        // `InMemoryGateway`'s own `TEST_TIMEOUT`-bounded reads, so a hang fails the test
+        // rather than blocking forever) and request-scoped rejected, never a session
+        // failure.
+        for request_id in ["stop-2", "stop-3"] {
+            gateway
+                .write(&format!(
+                    r#"{{"protocol_version":1,"type":"stop_voice_session","request_id":"{request_id}"}}"#
+                ))
+                .await;
+            let rejection = gateway.read_message().await;
+            assert_rejected_message(&rejection, request_id, "invalid_state");
+            assert!(rejection.contains("no voice session is active"));
+        }
+
+        drop(input);
+        gateway.close().await;
+    }
+
     struct InMemoryGateway {
         input: DuplexStream,
         output: FrameReader<DuplexStream>,
@@ -2334,17 +2604,20 @@ mod tests {
     struct TestVoiceIoFactory {
         input: Arc<TestVoiceInput>,
         output: Arc<MockContinuousAudioOutput>,
-        capture: Arc<MockVoiceCaptureControl>,
+        capture: Arc<dyn VoiceCaptureControl>,
     }
 
     impl TestVoiceIoFactory {
-        fn new(input_receiver: mpsc::Receiver<Result<VoiceInputEvent, AdapterError>>) -> Self {
+        fn with_capture(
+            input_receiver: mpsc::Receiver<Result<VoiceInputEvent, AdapterError>>,
+            capture: Arc<dyn VoiceCaptureControl>,
+        ) -> Self {
             Self {
                 input: Arc::new(TestVoiceInput {
                     receiver: StdMutex::new(Some(input_receiver)),
                 }),
                 output: Arc::new(MockContinuousAudioOutput::new()),
-                capture: Arc::new(MockVoiceCaptureControl::new()),
+                capture,
             }
         }
     }
@@ -2369,13 +2642,78 @@ mod tests {
         }
     }
 
+    /// A capture control whose `pause`/`resume` block until the test releases the
+    /// matching gate, so a test can prove a command's acceptance is ordered *after* the
+    /// runtime control call actually completes rather than merely after it is invoked.
+    /// `*_started` fires the moment the call begins (proving it was actually invoked);
+    /// `*_release` is set by the test to let it complete.
+    struct GatedVoiceCaptureControl {
+        inner: MockVoiceCaptureControl,
+        pause_started: Condition,
+        pause_release: Condition,
+        resume_started: Condition,
+        resume_release: Condition,
+    }
+
+    impl GatedVoiceCaptureControl {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inner: MockVoiceCaptureControl::new(),
+                pause_started: Condition::default(),
+                pause_release: Condition::default(),
+                resume_started: Condition::default(),
+                resume_release: Condition::default(),
+            })
+        }
+    }
+
+    impl VoiceCaptureControl for GatedVoiceCaptureControl {
+        fn pause<'a>(
+            &'a self,
+            session_id: SessionId,
+            cancellation: CancellationToken,
+        ) -> AdapterFuture<'a, ()> {
+            Box::pin(async move {
+                self.pause_started.set();
+                self.pause_release.wait().await;
+                self.inner.pause(session_id, cancellation).await
+            })
+        }
+
+        fn resume<'a>(
+            &'a self,
+            session_id: SessionId,
+            cancellation: CancellationToken,
+        ) -> AdapterFuture<'a, ()> {
+            Box::pin(async move {
+                self.resume_started.set();
+                self.resume_release.wait().await;
+                self.inner.resume(session_id, cancellation).await
+            })
+        }
+    }
+
     fn session_with_interactive_voice(
         input_receiver: mpsc::Receiver<Result<VoiceInputEvent, AdapterError>>,
         language: Arc<dyn GenerationLanguageModel>,
         speech: Arc<MockStreamingSpeechSynthesizer>,
     ) -> GatewaySession {
+        session_with_interactive_voice_and_capture(
+            input_receiver,
+            language,
+            speech,
+            Arc::new(MockVoiceCaptureControl::new()),
+        )
+    }
+
+    fn session_with_interactive_voice_and_capture(
+        input_receiver: mpsc::Receiver<Result<VoiceInputEvent, AdapterError>>,
+        language: Arc<dyn GenerationLanguageModel>,
+        speech: Arc<MockStreamingSpeechSynthesizer>,
+        capture: Arc<dyn VoiceCaptureControl>,
+    ) -> GatewaySession {
         let adapters = GatewayVoiceAdapters {
-            io: Arc::new(TestVoiceIoFactory::new(input_receiver)),
+            io: Arc::new(TestVoiceIoFactory::with_capture(input_receiver, capture)),
             speech,
             policy: voice_policy(),
         };

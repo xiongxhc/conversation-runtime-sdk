@@ -799,10 +799,14 @@ struct ProcessSupervisor {
 
 impl ProcessSupervisor {
     async fn run(mut self) -> Result<(), AdapterError> {
-        let (outcome, mut child_reaped) = tokio::select! {
+        let (outcome, mut child_reaped, shutdown_requested) = tokio::select! {
             biased;
             _ = self.session_cancellation.cancelled() => {
-                (AdapterError::new("voice sidecar session cancelled"), false)
+                (
+                    AdapterError::new("voice sidecar session cancelled"),
+                    false,
+                    true,
+                )
             }
             event = self.events.recv() => {
                 let error = match event {
@@ -814,23 +818,25 @@ impl ProcessSupervisor {
                         AdapterError::new("voice sidecar lifecycle event was out of order")
                     }
                 };
-                (error, false)
+                (error, false, false)
             }
             result = self.child.wait() => {
                 match result {
                     Ok(_) => (
                         AdapterError::new("voice sidecar process exited unexpectedly"),
                         true,
+                        false,
                     ),
                     Err(_) => (
                         AdapterError::new("failed to wait for voice sidecar process"),
+                        false,
                         false,
                     ),
                 }
             }
         };
 
-        if self.session_cancellation.is_cancelled() && !child_reaped {
+        if shutdown_requested && !child_reaped {
             self.media_cancellation.cancel();
             self.tasks.close_media().await;
             child_reaped = graceful_shutdown(
@@ -854,6 +860,18 @@ impl ProcessSupervisor {
             outcome.clone(),
         )
         .await;
+        complete_supervision(cleanup, outcome, shutdown_requested)
+    }
+}
+
+fn complete_supervision(
+    cleanup: Result<(), AdapterError>,
+    outcome: AdapterError,
+    shutdown_requested: bool,
+) -> Result<(), AdapterError> {
+    if shutdown_requested {
+        cleanup
+    } else {
         cleanup.and(Err(outcome))
     }
 }
@@ -2415,6 +2433,28 @@ fn configuration_error(message: impl AsRef<str>) -> AdapterError {
 #[cfg(test)]
 mod process_tests {
     use super::*;
+
+    #[test]
+    fn requested_shutdown_reports_success_after_cleanup() {
+        let result = complete_supervision(
+            Ok(()),
+            AdapterError::new("voice sidecar session cancelled"),
+            true,
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn failure_is_preserved_when_shutdown_was_not_requested() {
+        let result = complete_supervision(
+            Ok(()),
+            AdapterError::new("voice sidecar process failed"),
+            false,
+        );
+
+        assert!(result.is_err());
+    }
 
     #[tokio::test]
     async fn writing_ack_waiters_are_released_by_cancel_flush_and_shutdown_cleanup() {

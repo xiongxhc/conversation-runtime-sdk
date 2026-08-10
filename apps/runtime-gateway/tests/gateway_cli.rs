@@ -14,6 +14,27 @@ use support::{
 use support::{assert_voice_status, is_voice_terminal};
 
 #[tokio::test]
+async fn fatal_session_errors_report_a_content_free_category() {
+    let server = FakeOllamaServer::completing(0).await;
+    let mut gateway = GatewayProcess::start(server.endpoint()).await;
+    assert_eq!(gateway.read_message().await.message_type(), "ready");
+
+    gateway
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(&0_u32.to_be_bytes())
+        .await
+        .unwrap();
+    gateway.stdin.as_mut().unwrap().flush().await.unwrap();
+
+    let exit = gateway.finish().await;
+    assert!(!exit.status.success());
+    assert_eq!(exit.stderr.trim(), "gateway session failed: framing");
+    exit.assert_content_free_stderr(&[]);
+}
+
+#[tokio::test]
 async fn persistent_session_reports_local_status_and_preserves_completed_history() {
     let server = FakeOllamaServer::completing(2).await;
     let mut gateway = GatewayProcess::start(server.endpoint()).await;

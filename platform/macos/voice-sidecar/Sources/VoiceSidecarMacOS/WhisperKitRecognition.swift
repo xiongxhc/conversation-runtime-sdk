@@ -609,7 +609,7 @@ public struct RecognitionMapper: Sendable {
             }
             changes.append(
                 RecognitionHypothesis(
-                    segmentID: UInt64(confirmedCount + offset),
+                    segmentID: UInt64(confirmedCount + offset + 1),
                     text: segment.text,
                     engineFinal: true
                 )
@@ -660,6 +660,7 @@ public struct RecognitionMapper: Sendable {
         UInt64(
             state.confirmedSegments.count
                 + max(0, state.unconfirmedSegments.count - 1)
+                + 1
         )
     }
 }

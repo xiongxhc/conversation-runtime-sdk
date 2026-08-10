@@ -45,8 +45,8 @@ async fn run() -> Result<(), ()> {
     session
         .run(tokio::io::stdin(), tokio::io::stdout())
         .await
-        .map_err(|_| {
-            eprintln!("gateway session failed");
+        .map_err(|error| {
+            eprintln!("gateway session failed: {}", error.diagnostic_code());
         })
 }
 

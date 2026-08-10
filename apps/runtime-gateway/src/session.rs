@@ -1389,6 +1389,25 @@ pub enum GatewaySessionError {
     Writing(FrameError),
 }
 
+impl GatewaySessionError {
+    pub const fn diagnostic_code(&self) -> &'static str {
+        match self {
+            Self::Encoding => "encoding",
+            Self::ForwarderTask => "forwarder_task",
+            Self::Framing(_) => "framing",
+            Self::Interruption => "interruption",
+            Self::Projection => "projection",
+            Self::VoiceControlTask => "voice_control_task",
+            Self::VoicePumpShutdownTimeout => "voice_pump_shutdown_timeout",
+            Self::WriterTask => "writer_task",
+            Self::WriterBackpressure => "writer_backpressure",
+            Self::WriterShutdownTimeout => "writer_shutdown_timeout",
+            Self::WriterUnavailable => "writer_unavailable",
+            Self::Writing(_) => "writing",
+        }
+    }
+}
+
 impl fmt::Display for GatewaySessionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {

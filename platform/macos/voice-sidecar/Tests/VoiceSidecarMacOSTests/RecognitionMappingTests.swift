@@ -27,7 +27,7 @@ func changedCurrentTextReplacesThePartialForTheSameSegment() {
         mapper.changes(from: oldState, to: newState)
             == [
                 RecognitionHypothesis(
-                    segmentID: 0,
+                    segmentID: 1,
                     text: "hello",
                     engineFinal: false
                 )
@@ -50,7 +50,7 @@ func unconfirmedSegmentsProduceOnePartialHypothesis() {
         mapper.changes(from: oldState, to: newState)
             == [
                 RecognitionHypothesis(
-                    segmentID: 1,
+                    segmentID: 2,
                     text: "hello world",
                     engineFinal: false
                 )
@@ -77,7 +77,7 @@ func newlyConfirmedSegmentsMapToEngineFinalWithoutConversationFinalization() {
         mapper.changes(from: oldState, to: newState)
             == [
                 RecognitionHypothesis(
-                    segmentID: 1,
+                    segmentID: 2,
                     text: "engine confirmed",
                     engineFinal: true
                 )
@@ -104,7 +104,7 @@ func repeatedWhisperKitSegmentIDsStillProduceNewConfirmedHypotheses() {
         mapper.changes(from: oldState, to: newState)
             == [
                 RecognitionHypothesis(
-                    segmentID: 1,
+                    segmentID: 2,
                     text: "second pass",
                     engineFinal: true
                 )

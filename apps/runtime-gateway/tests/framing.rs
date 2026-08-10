@@ -1,6 +1,13 @@
+use std::io;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+
 use conversation_protocol::{decode_client_command, MAX_CLIENT_FRAME_BYTES};
 use conversation_runtime_gateway::{FrameError, FrameReader, FrameWriter};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::watch;
 
 #[tokio::test]
 async fn reads_fragmented_headers_and_payloads() {
@@ -130,4 +137,57 @@ async fn writer_rejects_an_oversized_payload() {
         writer.write_frame(&payload).await,
         Err(FrameError::InvalidLength(length)) if length == MAX_CLIENT_FRAME_BYTES + 1
     ));
+}
+
+#[tokio::test]
+async fn acknowledges_a_complete_frame_before_a_blocked_flush() {
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let (flush_polled, mut flush_polled_receiver) = watch::channel(false);
+    let writer = FlushBlockingWriter {
+        bytes: Arc::clone(&bytes),
+        flush_polled,
+    };
+    let acknowledged = Arc::new(AtomicBool::new(false));
+    let task_acknowledged = Arc::clone(&acknowledged);
+    let task = tokio::spawn(async move {
+        FrameWriter::new(writer)
+            .write_frame_with_ack(b"abc", || {
+                task_acknowledged.store(true, Ordering::SeqCst);
+            })
+            .await
+    });
+
+    if !*flush_polled_receiver.borrow() {
+        flush_polled_receiver.changed().await.unwrap();
+    }
+    assert!(acknowledged.load(Ordering::SeqCst));
+    assert_eq!(*bytes.lock().unwrap(), [0, 0, 0, 3, b'a', b'b', b'c']);
+
+    task.abort();
+    let _ = task.await;
+}
+
+struct FlushBlockingWriter {
+    bytes: Arc<Mutex<Vec<u8>>>,
+    flush_polled: watch::Sender<bool>,
+}
+
+impl AsyncWrite for FlushBlockingWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _context: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.bytes.lock().unwrap().extend_from_slice(bytes);
+        Poll::Ready(Ok(bytes.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.flush_polled.send_replace(true);
+        Poll::Pending
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
 }

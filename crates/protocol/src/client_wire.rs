@@ -269,8 +269,27 @@ impl From<&RuntimeError> for ClientRuntimeError {
             code: runtime_error_code(error.kind()).to_owned(),
             kind: runtime_error_kind_name(error.kind()).to_owned(),
             stage: runtime_stage_name(error.stage()).to_owned(),
-            message: error.message().to_owned(),
+            message: content_free_runtime_error_message(error).to_owned(),
         }
+    }
+}
+
+fn content_free_runtime_error_message(error: &RuntimeError) -> &'static str {
+    match error.kind() {
+        RuntimeErrorKind::Adapter => match error.stage() {
+            RuntimeStage::PrivacyPolicy => "privacy policy operation failed",
+            RuntimeStage::AudioCapture => "audio capture operation failed",
+            RuntimeStage::SpeechRecognizer => "speech recognition operation failed",
+            RuntimeStage::LanguageModel => "language model operation failed",
+            RuntimeStage::SpeechSynthesizer => "speech synthesis operation failed",
+            RuntimeStage::AudioOutput => "audio output operation failed",
+            RuntimeStage::VoiceSidecar => "voice sidecar operation failed",
+            RuntimeStage::ContinuousAudioOutput => "continuous audio output operation failed",
+            RuntimeStage::Memory => "memory operation failed",
+            RuntimeStage::Runtime => "adapter operation failed",
+        },
+        RuntimeErrorKind::Configuration => "runtime configuration is invalid",
+        RuntimeErrorKind::InvalidState => "runtime state rejected the operation",
     }
 }
 

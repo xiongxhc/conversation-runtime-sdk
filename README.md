@@ -64,7 +64,7 @@ The repository now contains the deterministic runtime foundation, reviewed local
   Threads, Prism, Orb, Still Gradient, and None.
 
 The complete Rust workspace, strict Clippy and formatting gates, acceptance
-harness suite, and `109` Swift sidecar tests pass. R5 is complete for the
+harness suite, and `116` Swift sidecar tests pass. R5 is complete for the
 deterministic local control surface; it does not add automatic transcript
 capture or a desktop UI. A private local-only configuration and local ASR model
 pass R3 preflight, and the current macOS source passes an opt-in full-duplex

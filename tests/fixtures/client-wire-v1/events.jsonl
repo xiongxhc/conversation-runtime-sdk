@@ -20,6 +20,6 @@
 {"protocol_version":1,"type":"voice_event","event":{"type":"voice_turn_event","session_id":"1","generation_id":"1","event":{"type":"text_completed","turn_id":"1","text":"exact answer"}}}
 {"protocol_version":1,"type":"voice_event","event":{"type":"voice_timing","session_id":"1","turn_id":"1","milestone":"first_playable_audio","elapsed_ms":42}}
 {"protocol_version":1,"type":"voice_event","event":{"type":"voice_playback","session_id":"1","generation_id":"1","state":"rendered"}}
-{"protocol_version":1,"type":"voice_event","event":{"type":"voice_session_failed","session_id":"1","error":{"code":"adapter_failure","kind":"adapter","stage":"speech_recognizer","message":"recognition unavailable"},"recovery":"continue_session"}}
+{"protocol_version":1,"type":"voice_event","event":{"type":"voice_session_failed","session_id":"1","error":{"code":"adapter_failure","kind":"adapter","stage":"speech_recognizer","message":"speech recognition operation failed"},"recovery":"continue_session"}}
 {"protocol_version":1,"type":"voice_event","event":{"type":"voice_session_ended","session_id":"1"}}
 {"protocol_version":1,"type":"fatal","error":{"code":"configuration_invalid","kind":"configuration","stage":"runtime","message":"stdout is unavailable"}}

@@ -328,6 +328,19 @@ fn voice_events_project_every_approved_lifecycle_variant() {
 }
 
 #[test]
+fn public_runtime_errors_do_not_expose_adapter_details() {
+    let private_detail = "private provider response body";
+    let error = ClientRuntimeError::from(RuntimeError::new(
+        RuntimeErrorKind::Adapter,
+        RuntimeStage::LanguageModel,
+        private_detail,
+    ));
+
+    assert_eq!(error.message, "language model operation failed");
+    assert!(!error.message.contains(private_detail));
+}
+
+#[test]
 fn runtime_status_accepts_only_canonical_capability_and_component_combinations() {
     let memory_component = client_component("memory", "Local memory");
     let valid_statuses = [
@@ -974,17 +987,16 @@ fn encoded_messages_never_use_numeric_u64_ids_and_are_frame_bounded() {
         .contains("\"18446744073709551615\""));
     assert_eq!(MAX_CLIENT_FRAME_BYTES, 512 * 1024);
 
-    let error = RuntimeError::new(
-        RuntimeErrorKind::Adapter,
-        RuntimeStage::LanguageModel,
-        "x".repeat(MAX_CLIENT_FRAME_BYTES),
-    );
     let oversized = GatewayMessage::RuntimeEvent {
-        event: ClientRuntimeEvent::try_from(RuntimeEvent::TurnFailed {
+        event: ClientRuntimeEvent::TurnFailed {
             turn_id: TurnId::new(1),
-            error,
-        })
-        .unwrap(),
+            error: ClientRuntimeError {
+                code: "adapter_failure".to_owned(),
+                kind: "adapter".to_owned(),
+                stage: "language_model".to_owned(),
+                message: "x".repeat(MAX_CLIENT_FRAME_BYTES),
+            },
+        },
     };
     assert!(encode_gateway_message(&oversized).is_err());
 }

@@ -52,7 +52,7 @@ export class RuntimeClient {
   private readonly unexpectedFailureListeners = new Set<(error: Error) => void>();
   private readonly turns = new Map<bigint, TurnState>();
   private readonly acceptedStartRequests = new Set<string>();
-  private activeVoiceSession: AsyncQueue<VoiceSessionEvent> | undefined;
+  private activeVoiceSession: VoiceSessionState | undefined;
   private failure: Error | undefined;
   private closing = false;
   private closePromise: Promise<void> | undefined;
@@ -140,7 +140,14 @@ export class RuntimeClient {
 
   private voiceControl(
     type: "stop_voice_session" | "pause_voice_capture" | "resume_voice_capture",
+    session: VoiceSessionState,
   ): Promise<void> {
+    if (this.failure) {
+      return Promise.reject(this.failure);
+    }
+    if (this.activeVoiceSession !== session) {
+      return Promise.reject(new Error("voice session is no longer active"));
+    }
     const requestId = this.nextRequestId();
     const result = new Deferred<void>();
     this.controls.set(requestId, {
@@ -263,11 +270,17 @@ export class RuntimeClient {
         this.fail(new Error("gateway sent a voice event with no active voice session"));
         return;
       }
-      const queue = this.activeVoiceSession;
-      queue.push(message.event);
+      const session = this.activeVoiceSession;
+      if (session.sessionId === undefined) {
+        session.sessionId = message.event.sessionId;
+      } else if (message.event.sessionId !== session.sessionId) {
+        this.fail(new Error("voice event changed session identifier"));
+        return;
+      }
+      session.events.push(message.event);
       if (isVoiceSessionTerminal(message.event)) {
         this.activeVoiceSession = undefined;
-        queue.finish();
+        session.events.finish();
       }
       return;
     }
@@ -320,13 +333,13 @@ export class RuntimeClient {
           control.fail(new Error("gateway accepted a start voice session while one was already active"));
           return;
         }
-        const queue = new AsyncQueue<VoiceSessionEvent>();
-        this.activeVoiceSession = queue;
+        const session: VoiceSessionState = { events: new AsyncQueue<VoiceSessionEvent>() };
+        this.activeVoiceSession = session;
         control.result.resolve({
-          events: () => queue,
-          stop: () => this.voiceControl("stop_voice_session"),
-          pauseCapture: () => this.voiceControl("pause_voice_capture"),
-          resumeCapture: () => this.voiceControl("resume_voice_capture"),
+          events: () => session.events,
+          stop: () => this.voiceControl("stop_voice_session", session),
+          pauseCapture: () => this.voiceControl("pause_voice_capture", session),
+          resumeCapture: () => this.voiceControl("resume_voice_capture", session),
         });
         return;
       }
@@ -382,7 +395,7 @@ export class RuntimeClient {
     }
     this.turns.clear();
     if (this.activeVoiceSession) {
-      this.activeVoiceSession.fail(error);
+      this.activeVoiceSession.events.fail(error);
       this.activeVoiceSession = undefined;
     }
     if (closeTransport && !this.closing) {
@@ -421,6 +434,11 @@ type PendingControl =
 type TurnState = {
   events: AsyncQueue<RuntimeEvent>;
   startRequestId: string;
+};
+
+type VoiceSessionState = {
+  events: AsyncQueue<VoiceSessionEvent>;
+  sessionId?: bigint;
 };
 
 class Deferred<T> {

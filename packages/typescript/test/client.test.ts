@@ -481,8 +481,128 @@ test("voice controls resolve on acceptance and reject request-scoped", async () 
   connected.transport.push(acceptedControl(stop.requestId));
   await stopping;
 
+  connected.transport.push(voiceEvent({
+    type: "voice_session_started",
+    session_id: "1",
+    privacy: { privacy_mode: "local_only", components: wireVoiceComponents() },
+  }));
   connected.transport.push(voiceEvent({ type: "voice_session_ended", session_id: "1" }));
-  assert.deepEqual(await collect(session.events()), [{ type: "voice_session_ended", sessionId: 1n }]);
+  assert.deepEqual(await collect(session.events()), [
+    { type: "voice_session_started", sessionId: 1n, privacy: { privacyMode: "local_only", components: parsedVoiceComponents() } },
+    { type: "voice_session_ended", sessionId: 1n },
+  ]);
+  await connected.client.close();
+});
+
+test("a stale voice session handle cannot control its replacement", async () => {
+  const connected = await connectedClient();
+  const firstStarting = connected.client.startVoiceSession();
+  const firstStart = command(connected.transport, "start_voice_session");
+  connected.transport.push(acceptedControl(firstStart.requestId));
+  const first = await firstStarting;
+  connected.transport.push(voiceEvent({
+    type: "voice_session_started",
+    session_id: "1",
+    privacy: { privacy_mode: "local_only", components: wireVoiceComponents() },
+  }));
+  connected.transport.push(voiceEvent({ type: "voice_session_ended", session_id: "1" }));
+  await collect(first.events());
+
+  const replacementStarting = connected.client.startVoiceSession();
+  const replacementStart = latestCommand(connected.transport, "start_voice_session");
+  connected.transport.push(acceptedControl(replacementStart.requestId));
+  const replacement = await replacementStarting;
+  connected.transport.push(voiceEvent({
+    type: "voice_session_started",
+    session_id: "2",
+    privacy: { privacy_mode: "local_only", components: wireVoiceComponents() },
+  }));
+
+  const staleControls = [
+    ["stop_voice_session", () => first.stop()],
+    ["pause_voice_capture", () => first.pauseCapture()],
+    ["resume_voice_capture", () => first.resumeCapture()],
+  ] as const;
+  for (const [type, control] of staleControls) {
+    const sentBefore = connected.transport.sent.length;
+    const pending = control();
+    const sent = connected.transport.sent.at(-1);
+    if (connected.transport.sent.length > sentBefore && sent?.type === type) {
+      connected.transport.push(acceptedControl(sent.requestId));
+    }
+    await assert.rejects(pending, /voice session is no longer active/);
+    assert.equal(connected.transport.sent.length, sentBefore);
+  }
+
+  connected.transport.push(voiceEvent({ type: "voice_session_ended", session_id: "2" }));
+  assert.deepEqual(await collect(replacement.events()), [
+    { type: "voice_session_started", sessionId: 2n, privacy: { privacyMode: "local_only", components: parsedVoiceComponents() } },
+    { type: "voice_session_ended", sessionId: 2n },
+  ]);
+  await connected.client.close();
+});
+
+test("a terminal first voice event settles an accepted session", async () => {
+  const ended = await connectedClient();
+  const endingStart = ended.client.startVoiceSession();
+  const endingCommand = command(ended.transport, "start_voice_session");
+  ended.transport.push(acceptedControl(endingCommand.requestId));
+  const endingSession = await endingStart;
+  ended.transport.push(voiceEvent({ type: "voice_session_ended", session_id: "1" }));
+  assert.deepEqual(await collect(endingSession.events()), [
+    { type: "voice_session_ended", sessionId: 1n },
+  ]);
+  await ended.client.close();
+
+  const failed = await connectedClient();
+  const failingStart = failed.client.startVoiceSession();
+  const failingCommand = command(failed.transport, "start_voice_session");
+  failed.transport.push(acceptedControl(failingCommand.requestId));
+  const failingSession = await failingStart;
+  const failure: RuntimeFailure = {
+    code: "adapter_failure",
+    kind: "adapter",
+    stage: "audio_capture",
+    message: "audio capture operation failed",
+  };
+  failed.transport.push(voiceEvent({
+    type: "voice_session_failed",
+    session_id: "2",
+    error: failure,
+    recovery: "new_session",
+  }));
+  assert.deepEqual(await collect(failingSession.events()), [
+    { type: "voice_session_failed", sessionId: 2n, error: failure, recovery: "new_session" },
+  ]);
+  await failed.client.close();
+});
+
+test("fails the client when a voice event changes sessionId", async () => {
+  const connected = await connectedClient();
+  const starting = connected.client.startVoiceSession();
+  const start = command(connected.transport, "start_voice_session");
+  connected.transport.push(acceptedControl(start.requestId));
+  const session = await starting;
+  const events = session.events()[Symbol.asyncIterator]();
+  connected.transport.push(voiceEvent({
+    type: "voice_session_started",
+    session_id: "1",
+    privacy: { privacy_mode: "local_only", components: wireVoiceComponents() },
+  }));
+  assert.deepEqual(await events.next(), {
+    value: { type: "voice_session_started", sessionId: 1n, privacy: { privacyMode: "local_only", components: parsedVoiceComponents() } },
+    done: false,
+  });
+  const pendingStatus = connected.client.status();
+  const statusCommand = command(connected.transport, "status");
+
+  connected.transport.push(voiceEvent({ type: "voice_session_ended", session_id: "2" }));
+  await setImmediate();
+  connected.transport.push(acceptedControl(statusCommand.requestId));
+  connected.transport.push({ type: "status", protocol_version: 1, request_id: statusCommand.requestId, status: wireStatus() });
+
+  await assert.rejects(pendingStatus, /voice event changed session identifier/);
+  await assert.rejects(events.next(), /voice event changed session identifier/);
   await connected.client.close();
 });
 
@@ -522,12 +642,18 @@ test("exactly one terminal settles events(); later events are a protocol violati
     message: "recognizer crashed",
   };
   connected.transport.push(voiceEvent({
+    type: "voice_session_started",
+    session_id: "1",
+    privacy: { privacy_mode: "local_only", components: wireVoiceComponents() },
+  }));
+  connected.transport.push(voiceEvent({
     type: "voice_session_failed",
     session_id: "1",
     error: terminalFailure,
     recovery: "new_session",
   }));
   assert.deepEqual(await collect(session.events()), [
+    { type: "voice_session_started", sessionId: 1n, privacy: { privacyMode: "local_only", components: parsedVoiceComponents() } },
     { type: "voice_session_failed", sessionId: 1n, error: terminalFailure, recovery: "new_session" },
   ]);
 

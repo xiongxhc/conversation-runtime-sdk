@@ -7,14 +7,15 @@ use conversation_model_adapters::GenerationLanguageModel;
 use conversation_protocol::{
     decode_client_command, encode_gateway_message, ClientCommand, ClientMemoryCursor,
     ClientMemoryInspection, ClientMemorySummary, ClientRuntimeError, ClientRuntimeEvent,
-    ClientVoiceSessionEvent, GatewayMessage, RuntimeEvent, RuntimeStatus, SessionId, TurnId,
+    ClientVoiceSessionEvent, GatewayMessage, RuntimeError, RuntimeEvent, RuntimeStatus, SessionId,
+    TurnId, VoiceSessionEvent,
 };
 use conversation_runtime::{
     ConversationContext, TextTurnEventStream, TextTurnRuntime, VoiceSessionAdapters,
     VoiceSessionEventStream, VoiceSessionRuntime,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{JoinError, JoinHandle};
 use tokio::time::timeout;
 
@@ -39,9 +40,6 @@ struct MemoryInspectionAdapters {
     clock: Arc<dyn MemoryClock>,
 }
 
-// `VoiceLane` fields are consumed by later voice-lane tasks (start/stop/pause/resume
-// command handling); this task only wires and stores them.
-#[allow(dead_code)]
 struct VoiceLane {
     adapters: GatewayVoiceAdapters,
     context: ConversationContext,
@@ -51,6 +49,33 @@ struct VoiceLane {
 struct ActiveVoiceSession {
     runtime: VoiceSessionRuntime,
     task: JoinHandle<Result<(), GatewaySessionError>>,
+    control: Option<ActiveVoiceControl>,
+    control_events: mpsc::Sender<VoiceCaptureControlKind>,
+    control_pending: watch::Sender<bool>,
+}
+
+struct ActiveVoiceControl {
+    request_id: String,
+    kind: VoiceCaptureControlKind,
+    task: JoinHandle<Result<(), RuntimeError>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VoiceCaptureControlKind {
+    Pause,
+    Resume,
+}
+
+struct VoiceSessionState {
+    active: Option<ActiveVoiceSession>,
+    terminals_enqueued: u64,
+    terminals_written: u64,
+}
+
+impl VoiceSessionState {
+    const fn terminal_pending(&self) -> bool {
+        self.terminals_enqueued > self.terminals_written
+    }
 }
 
 struct WriterLanes {
@@ -139,14 +164,20 @@ impl GatewaySession {
             event_sender,
             event_receiver,
         } = writer_lanes;
+        let (terminal_written, mut terminal_written_receiver) = mpsc::unbounded_channel();
         let mut writer_task = tokio::spawn(writer_loop(
             writer,
             urgent_receiver,
             normal_receiver,
             event_receiver,
+            terminal_written,
         ));
         let mut active: Option<ActiveForwarder> = None;
-        let mut active_voice: Option<ActiveVoiceSession> = None;
+        let mut voice = VoiceSessionState {
+            active: None,
+            terminals_enqueued: 0,
+            terminals_written: 0,
+        };
 
         let exit = if let Err(error) = send_urgent(
             &urgent_sender,
@@ -162,21 +193,36 @@ impl GatewaySession {
                     .and_then(|active_turn| active_turn.task.as_mut())
                 {
                     tokio::select! {
+                        biased;
+                        terminal = terminal_written_receiver.recv(), if !terminal_written_receiver.is_closed() => SessionInput::VoiceTerminalWritten(terminal),
                         writer = &mut writer_task => SessionInput::Writer(writer),
                         forwarding = active_task => SessionInput::Forwarder(forwarding),
                         frame = reader.read_frame() => SessionInput::Frame(frame),
                     }
-                } else if let Some(voice_task) = active_voice
-                    .as_mut()
-                    .map(|active_voice| &mut active_voice.task)
-                {
-                    tokio::select! {
-                        writer = &mut writer_task => SessionInput::Writer(writer),
-                        pumped = voice_task => SessionInput::VoicePump(pumped),
-                        frame = reader.read_frame() => SessionInput::Frame(frame),
+                } else if let Some(voice_session) = voice.active.as_mut() {
+                    let voice_task = &mut voice_session.task;
+                    if let Some(control) = voice_session.control.as_mut() {
+                        tokio::select! {
+                            biased;
+                            terminal = terminal_written_receiver.recv(), if !terminal_written_receiver.is_closed() => SessionInput::VoiceTerminalWritten(terminal),
+                            writer = &mut writer_task => SessionInput::Writer(writer),
+                            pumped = voice_task => SessionInput::VoicePump(pumped),
+                            controlled = &mut control.task => SessionInput::VoiceControl(controlled),
+                            frame = reader.read_frame() => SessionInput::Frame(frame),
+                        }
+                    } else {
+                        tokio::select! {
+                            biased;
+                            terminal = terminal_written_receiver.recv(), if !terminal_written_receiver.is_closed() => SessionInput::VoiceTerminalWritten(terminal),
+                            writer = &mut writer_task => SessionInput::Writer(writer),
+                            pumped = voice_task => SessionInput::VoicePump(pumped),
+                            frame = reader.read_frame() => SessionInput::Frame(frame),
+                        }
                     }
                 } else {
                     tokio::select! {
+                        biased;
+                        terminal = terminal_written_receiver.recv(), if !terminal_written_receiver.is_closed() => SessionInput::VoiceTerminalWritten(terminal),
                         writer = &mut writer_task => SessionInput::Writer(writer),
                         frame = reader.read_frame() => SessionInput::Frame(frame),
                     }
@@ -189,6 +235,10 @@ impl GatewaySession {
                             .unwrap_or(GatewaySessionError::WriterUnavailable);
                         break SessionExit::Writer(error);
                     }
+                    SessionInput::VoiceTerminalWritten(Some(())) => {
+                        voice.terminals_written = voice.terminals_written.saturating_add(1);
+                    }
+                    SessionInput::VoiceTerminalWritten(None) => {}
                     SessionInput::Forwarder(result) => {
                         let active_turn = active
                             .as_mut()
@@ -211,7 +261,21 @@ impl GatewaySession {
                         // the wire protocol rejects) surfaces as `Err` here and is
                         // treated as fatal, mirroring `forward_events`'s handling of
                         // the text lane.
-                        active_voice = None;
+                        let mut voice_session = voice
+                            .active
+                            .take()
+                            .expect("a completed voice pump has an active session");
+                        if let Err(error) = cancel_voice_control(
+                            &mut voice_session.control,
+                            Some(&urgent_sender),
+                            None,
+                            &voice_session.control_pending,
+                        )
+                        .await
+                        {
+                            break SessionExit::failure(error);
+                        }
+                        voice.terminals_enqueued = voice.terminals_enqueued.saturating_add(1);
                         if let Err(error) = forwarder_result(result) {
                             break SessionExit::fatal(
                                 error,
@@ -219,7 +283,39 @@ impl GatewaySession {
                             );
                         }
                     }
+                    SessionInput::VoiceControl(result) => {
+                        let voice_session = voice
+                            .active
+                            .as_mut()
+                            .expect("a completed voice control has an active session");
+                        let control = voice_session
+                            .control
+                            .take()
+                            .expect("a completed voice control remains active");
+                        let result = match voice_control_result(result) {
+                            Ok(result) => result,
+                            Err(error) => {
+                                break SessionExit::fatal(
+                                    error,
+                                    "gateway voice capture control failed",
+                                );
+                            }
+                        };
+                        let release = result.is_ok().then_some(control.kind);
+                        let response =
+                            send_voice_control_result(&urgent_sender, &control.request_id, result);
+                        let release = release.map_or(Ok(()), |kind| {
+                            release_capture_control(&voice_session.control_events, kind)
+                        });
+                        voice_session.control_pending.send_replace(false);
+                        if let Err(error) = response.and(release) {
+                            break SessionExit::failure(error);
+                        }
+                    }
                     SessionInput::Frame(Ok(Some(payload))) => {
+                        while terminal_written_receiver.try_recv().is_ok() {
+                            voice.terminals_written = voice.terminals_written.saturating_add(1);
+                        }
                         let command = match decode_client_command(&payload) {
                             Ok(command) => command,
                             Err(_) => {
@@ -240,7 +336,7 @@ impl GatewaySession {
                                 &normal_sender,
                                 &event_sender,
                                 &mut active,
-                                &mut active_voice,
+                                &mut voice,
                             )
                             .await
                         {
@@ -262,7 +358,7 @@ impl GatewaySession {
         };
 
         shutdown_active(&self.runtime, &mut active).await;
-        shutdown_active_voice(&mut active_voice).await;
+        shutdown_active_voice(&mut voice.active).await;
         if let Some(message) = exit.fatal_message() {
             let _ = send_urgent(&urgent_sender, fatal_message(message));
         }
@@ -291,7 +387,7 @@ impl GatewaySession {
         normal: &mpsc::Sender<GatewayMessage>,
         events: &mpsc::Sender<GatewayMessage>,
         active: &mut Option<ActiveForwarder>,
-        active_voice: &mut Option<ActiveVoiceSession>,
+        voice: &mut VoiceSessionState,
     ) -> Result<(), CommandFailure> {
         match command {
             ClientCommand::Status { request_id } => {
@@ -309,7 +405,15 @@ impl GatewaySession {
                 request_id,
                 transcript,
             } => {
-                if active_voice.is_some() {
+                if voice.terminal_pending() {
+                    return send_rejection(
+                        normal,
+                        &request_id,
+                        command_error("the previous voice session is still finishing"),
+                    )
+                    .map_err(CommandFailure::response);
+                }
+                if voice.active.is_some() {
                     return send_rejection(
                         normal,
                         &request_id,
@@ -399,11 +503,19 @@ impl GatewaySession {
                     )
                     .map_err(CommandFailure::response);
                 }
-                if active_voice.is_some() {
+                if voice.active.is_some() {
                     return send_rejection(
                         normal,
                         &request_id,
                         command_error("a voice session is already active"),
+                    )
+                    .map_err(CommandFailure::response);
+                }
+                if voice.terminal_pending() {
+                    return send_rejection(
+                        normal,
+                        &request_id,
+                        command_error("the previous voice session is still finishing"),
                     )
                     .map_err(CommandFailure::response);
                 }
@@ -441,33 +553,62 @@ impl GatewaySession {
 
                 send_urgent(urgent, accepted_message(&request_id))
                     .map_err(CommandFailure::response)?;
+                let (control_events, control_event_receiver) = mpsc::channel(1);
+                let (control_pending, control_pending_receiver) = watch::channel(false);
                 let task = tokio::spawn(pump_voice_events(
                     event_stream,
                     normal.clone(),
                     events.clone(),
+                    control_event_receiver,
+                    control_pending_receiver,
                 ));
-                *active_voice = Some(ActiveVoiceSession { runtime, task });
+                voice.active = Some(ActiveVoiceSession {
+                    runtime,
+                    task,
+                    control: None,
+                    control_events,
+                    control_pending,
+                });
                 Ok(())
             }
             ClientCommand::StopVoiceSession { request_id } => {
-                let Some(voice_session) = active_voice.take() else {
+                if voice.active.is_none() {
                     return send_rejection(
                         normal,
                         &request_id,
                         command_error("no voice session is active"),
                     )
                     .map_err(CommandFailure::response);
-                };
-                let _ = voice_session.runtime.shutdown().await;
+                }
+                {
+                    let voice_session = voice
+                        .active
+                        .as_mut()
+                        .expect("validated active voice session remains available");
+                    let _ = voice_session.runtime.shutdown().await;
+                    cancel_voice_control(
+                        &mut voice_session.control,
+                        Some(urgent),
+                        Some(&voice_session.control_events),
+                        &voice_session.control_pending,
+                    )
+                    .await
+                    .map_err(CommandFailure::response)?;
+                }
+                let voice_session = voice
+                    .active
+                    .take()
+                    .expect("validated active voice session remains available");
                 shutdown_voice_pump(voice_session.task)
                     .await
                     .map_err(|error| {
                         CommandFailure::fatal(error, "gateway voice session shutdown failed")
                     })?;
+                voice.terminals_enqueued = voice.terminals_enqueued.saturating_add(1);
                 send_accepted(normal, &request_id).map_err(CommandFailure::response)
             }
             ClientCommand::PauseVoiceCapture { request_id } => {
-                let Some(voice_session) = active_voice.as_ref() else {
+                let Some(voice_session) = voice.active.as_mut() else {
                     return send_rejection(
                         normal,
                         &request_id,
@@ -475,16 +616,25 @@ impl GatewaySession {
                     )
                     .map_err(CommandFailure::response);
                 };
-                match voice_session.runtime.pause_capture().await {
-                    Ok(()) => send_accepted(normal, &request_id).map_err(CommandFailure::response),
-                    Err(error) => {
-                        send_rejection(normal, &request_id, ClientRuntimeError::from(error))
-                            .map_err(CommandFailure::response)
-                    }
+                if voice_session.control.is_some() {
+                    return send_rejection(
+                        normal,
+                        &request_id,
+                        command_error("a voice capture control is already pending"),
+                    )
+                    .map_err(CommandFailure::response);
                 }
+                let runtime = voice_session.runtime.clone();
+                voice_session.control_pending.send_replace(true);
+                voice_session.control = Some(ActiveVoiceControl {
+                    request_id,
+                    kind: VoiceCaptureControlKind::Pause,
+                    task: tokio::spawn(async move { runtime.pause_capture().await }),
+                });
+                Ok(())
             }
             ClientCommand::ResumeVoiceCapture { request_id } => {
-                let Some(voice_session) = active_voice.as_ref() else {
+                let Some(voice_session) = voice.active.as_mut() else {
                     return send_rejection(
                         normal,
                         &request_id,
@@ -492,13 +642,22 @@ impl GatewaySession {
                     )
                     .map_err(CommandFailure::response);
                 };
-                match voice_session.runtime.resume_capture().await {
-                    Ok(()) => send_accepted(normal, &request_id).map_err(CommandFailure::response),
-                    Err(error) => {
-                        send_rejection(normal, &request_id, ClientRuntimeError::from(error))
-                            .map_err(CommandFailure::response)
-                    }
+                if voice_session.control.is_some() {
+                    return send_rejection(
+                        normal,
+                        &request_id,
+                        command_error("a voice capture control is already pending"),
+                    )
+                    .map_err(CommandFailure::response);
                 }
+                let runtime = voice_session.runtime.clone();
+                voice_session.control_pending.send_replace(true);
+                voice_session.control = Some(ActiveVoiceControl {
+                    request_id,
+                    kind: VoiceCaptureControlKind::Resume,
+                    task: tokio::spawn(async move { runtime.resume_capture().await }),
+                });
+                Ok(())
             }
             ClientCommand::MemoryList {
                 request_id,
@@ -508,7 +667,7 @@ impl GatewaySession {
                     return send_rejection(normal, &request_id, memory_turn_active_error())
                         .map_err(CommandFailure::response);
                 }
-                if active_voice.is_some() {
+                if voice.active.is_some() {
                     return send_rejection(normal, &request_id, memory_voice_active_error())
                         .map_err(CommandFailure::response);
                 }
@@ -559,7 +718,7 @@ impl GatewaySession {
                     return send_rejection(normal, &request_id, memory_turn_active_error())
                         .map_err(CommandFailure::response);
                 }
-                if active_voice.is_some() {
+                if voice.active.is_some() {
                     return send_rejection(normal, &request_id, memory_voice_active_error())
                         .map_err(CommandFailure::response);
                 }
@@ -660,6 +819,8 @@ enum SessionInput {
     Frame(Result<Option<Vec<u8>>, FrameError>),
     Forwarder(Result<Result<(), GatewaySessionError>, JoinError>),
     VoicePump(Result<Result<(), GatewaySessionError>, JoinError>),
+    VoiceControl(Result<Result<(), RuntimeError>, JoinError>),
+    VoiceTerminalWritten(Option<()>),
     Writer(Result<Result<(), GatewaySessionError>, JoinError>),
 }
 
@@ -760,6 +921,8 @@ async fn pump_voice_events(
     mut events: VoiceSessionEventStream,
     normal: mpsc::Sender<GatewayMessage>,
     event_writer: mpsc::Sender<GatewayMessage>,
+    mut control_events: mpsc::Receiver<VoiceCaptureControlKind>,
+    mut control_pending: watch::Receiver<bool>,
 ) -> Result<(), GatewaySessionError> {
     let mut forwarding = true;
     while let Some(event) = events.recv().await {
@@ -767,6 +930,25 @@ async fn pump_voice_events(
             continue;
         }
         let terminal = event.is_session_terminal();
+        if terminal {
+            while *control_pending.borrow_and_update() {
+                if control_pending.changed().await.is_err() {
+                    while events.recv().await.is_some() {}
+                    return Err(GatewaySessionError::Projection);
+                }
+            }
+        }
+        let expected_control = match &event {
+            VoiceSessionEvent::CapturePaused { .. } => Some(VoiceCaptureControlKind::Pause),
+            VoiceSessionEvent::CaptureResumed { .. } => Some(VoiceCaptureControlKind::Resume),
+            _ => None,
+        };
+        if let Some(expected_control) = expected_control {
+            if control_events.recv().await != Some(expected_control) {
+                while events.recv().await.is_some() {}
+                return Err(GatewaySessionError::Projection);
+            }
+        }
         let event = match ClientVoiceSessionEvent::try_from(event) {
             Ok(event) => event,
             Err(_) => {
@@ -810,10 +992,17 @@ async fn shutdown_active(runtime: &TextTurnRuntime, active: &mut Option<ActiveFo
 // Idempotent: a no-op once `StopVoiceSession` or the pump's own completion has
 // already cleared `active_voice`.
 async fn shutdown_active_voice(active_voice: &mut Option<ActiveVoiceSession>) {
-    let Some(voice_session) = active_voice.take() else {
+    let Some(mut voice_session) = active_voice.take() else {
         return;
     };
     let _ = voice_session.runtime.shutdown().await;
+    let _ = cancel_voice_control(
+        &mut voice_session.control,
+        None,
+        Some(&voice_session.control_events),
+        &voice_session.control_pending,
+    )
+    .await;
     let _ = shutdown_voice_pump(voice_session.task).await;
 }
 
@@ -822,6 +1011,7 @@ async fn writer_loop<W>(
     mut urgent: mpsc::Receiver<GatewayMessage>,
     mut normal: mpsc::Receiver<GatewayMessage>,
     mut events: mpsc::Receiver<GatewayMessage>,
+    terminal_written: mpsc::UnboundedSender<()>,
 ) -> Result<(), GatewaySessionError>
 where
     W: AsyncWrite + Unpin,
@@ -887,12 +1077,24 @@ where
         };
         if drain_events_first {
             while let Ok(queued) = events.try_recv() {
-                write_gateway_message(&mut writer, queued).await?;
+                write_gateway_message(&mut writer, queued, &terminal_written).await?;
             }
         }
-        write_gateway_message(&mut writer, message).await?;
+        write_gateway_message(&mut writer, message, &terminal_written).await?;
     }
     Ok(())
+}
+
+fn is_terminal_voice_message(message: &GatewayMessage) -> bool {
+    match message {
+        GatewayMessage::VoiceEvent {
+            event: ClientVoiceSessionEvent::VoiceSessionEnded { .. },
+        } => true,
+        GatewayMessage::VoiceEvent {
+            event: ClientVoiceSessionEvent::VoiceSessionFailed { recovery, .. },
+        } => recovery == "new_session",
+        _ => false,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -910,15 +1112,23 @@ enum WriterInput {
 async fn write_gateway_message<W>(
     writer: &mut FrameWriter<W>,
     message: GatewayMessage,
+    terminal_written: &mpsc::UnboundedSender<()>,
 ) -> Result<(), GatewaySessionError>
 where
     W: AsyncWrite + Unpin,
 {
+    let terminal = is_terminal_voice_message(&message);
     let payload = encode_gateway_message(&message).map_err(|_| GatewaySessionError::Encoding)?;
-    writer
-        .write_frame(&payload)
-        .await
-        .map_err(GatewaySessionError::Writing)
+    if terminal {
+        writer
+            .write_frame_with_ack(&payload, || {
+                let _ = terminal_written.send(());
+            })
+            .await
+    } else {
+        writer.write_frame(&payload).await
+    }
+    .map_err(GatewaySessionError::Writing)
 }
 
 async fn shutdown_writer(
@@ -949,6 +1159,78 @@ async fn shutdown_voice_pump(
             Err(GatewaySessionError::VoicePumpShutdownTimeout)
         }
     }
+}
+
+fn send_voice_control_result(
+    writer: &mpsc::Sender<GatewayMessage>,
+    request_id: &str,
+    result: Result<(), RuntimeError>,
+) -> Result<(), GatewaySessionError> {
+    match result {
+        Ok(()) => send_accepted(writer, request_id),
+        Err(error) => send_rejection(writer, request_id, ClientRuntimeError::from(error)),
+    }
+}
+
+fn voice_control_result(
+    result: Result<Result<(), RuntimeError>, JoinError>,
+) -> Result<Result<(), RuntimeError>, GatewaySessionError> {
+    result.map_err(|_| GatewaySessionError::VoiceControlTask)
+}
+
+async fn cancel_voice_control(
+    active: &mut Option<ActiveVoiceControl>,
+    writer: Option<&mpsc::Sender<GatewayMessage>>,
+    control_events: Option<&mpsc::Sender<VoiceCaptureControlKind>>,
+    control_pending: &watch::Sender<bool>,
+) -> Result<(), GatewaySessionError> {
+    let Some(mut control) = active.take() else {
+        return Ok(());
+    };
+    let completed = match timeout(WRITER_SHUTDOWN_TIMEOUT, &mut control.task).await {
+        Ok(result) => Some(voice_control_result(result)?),
+        Err(_) => {
+            control.task.abort();
+            let _ = control.task.await;
+            None
+        }
+    };
+    let result = match completed {
+        Some(result) => {
+            let release = result.is_ok().then_some(control.kind);
+            let response = writer.map_or(Ok(()), |writer| {
+                send_voice_control_result(writer, &control.request_id, result)
+            });
+            let release = release.map_or(Ok(()), |kind| {
+                control_events.map_or(Ok(()), |events| release_capture_control(events, kind))
+            });
+            response.and(release)
+        }
+        None => {
+            let response = writer.map_or(Ok(()), |writer| {
+                send_rejection(
+                    writer,
+                    &control.request_id,
+                    command_error("voice capture control was cancelled"),
+                )
+            });
+            let release = control_events.map_or(Ok(()), |events| {
+                release_capture_control(events, control.kind)
+            });
+            response.and(release)
+        }
+    };
+    control_pending.send_replace(false);
+    result
+}
+
+fn release_capture_control(
+    events: &mpsc::Sender<VoiceCaptureControlKind>,
+    kind: VoiceCaptureControlKind,
+) -> Result<(), GatewaySessionError> {
+    events
+        .try_send(kind)
+        .map_err(|_| GatewaySessionError::VoiceControlTask)
 }
 
 fn send_accepted(
@@ -1098,6 +1380,7 @@ pub enum GatewaySessionError {
     Framing(FrameError),
     Interruption,
     Projection,
+    VoiceControlTask,
     VoicePumpShutdownTimeout,
     WriterTask,
     WriterBackpressure,
@@ -1114,6 +1397,7 @@ impl fmt::Display for GatewaySessionError {
             Self::Framing(_) => "gateway input framing failed",
             Self::Interruption => "gateway interruption failed",
             Self::Projection => "gateway event projection failed",
+            Self::VoiceControlTask => "gateway voice capture control task failed",
             Self::VoicePumpShutdownTimeout => "gateway voice session shutdown timed out",
             Self::WriterTask => "gateway writer task failed",
             Self::WriterBackpressure => "gateway writer backpressure limit reached",
@@ -1804,9 +2088,16 @@ mod tests {
         drop(event_sender);
 
         let (writer, writer_state) = BlockingWriter::new(usize::MAX);
-        super::writer_loop(writer, urgent_receiver, normal_receiver, event_receiver)
-            .await
-            .unwrap();
+        let (terminal_written, _terminal_written_receiver) = mpsc::unbounded_channel();
+        super::writer_loop(
+            writer,
+            urgent_receiver,
+            normal_receiver,
+            event_receiver,
+            terminal_written,
+        )
+        .await
+        .unwrap();
         normal_producer.await.unwrap();
 
         let messages = decode_frames(&writer_state.bytes());
@@ -1973,6 +2264,8 @@ mod tests {
         let failure = gateway.read_message().await;
         assert!(failure.contains(r#""type":"voice_session_failed""#));
         assert!(failure.contains(r#""recovery":"continue_session""#));
+        assert!(failure.contains(r#""message":"speech recognition operation failed""#));
+        assert!(!failure.contains("fixture recognizer hiccup"));
         assert!(!is_voice_terminal(&failure));
 
         // the session is still alive: further activity keeps streaming normally
@@ -2156,6 +2449,8 @@ mod tests {
         let failure = messages.last().unwrap();
         assert!(failure.contains(r#""type":"voice_session_failed""#));
         assert!(failure.contains(r#""recovery":"new_session""#));
+        assert!(failure.contains(r#""message":"voice sidecar operation failed""#));
+        assert!(!failure.contains("fixture voice io fault"));
 
         // the text lane is still healthy: a turn on the same connection runs to
         // completion after the voice session's fatal failure.
@@ -2316,6 +2611,146 @@ mod tests {
             terminal < stop_accepted,
             "stop must accept only after the session's terminal has been forwarded"
         );
+    }
+
+    #[tokio::test]
+    async fn replacement_voice_start_waits_for_the_previous_terminal_to_drain() {
+        let (input, input_receiver) = mpsc::channel(8);
+        let language = Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new()));
+        let session = session_with_interactive_voice(input_receiver, language, no_speech_frames());
+        let (mut client_input, reader) = duplex(4096);
+        let (writer, writer_state) = ReadyFlushBlockingWriter::new();
+        let writer_lanes = super::WriterLanes::new();
+        let urgent_monitor = writer_lanes.urgent_sender.clone();
+        let normal_monitor = writer_lanes.normal_sender.clone();
+        let event_monitor = writer_lanes.event_sender.clone();
+        let session_task =
+            tokio::spawn(session.run_with_writer_lanes(reader, writer, writer_lanes));
+
+        timeout(TEST_TIMEOUT, writer_state.blocked.wait())
+            .await
+            .expect("gateway writer did not block while flushing ready");
+        write_command(
+            &mut client_input,
+            r#"{"protocol_version":1,"type":"start_voice_session","request_id":"voice-1"}"#,
+        )
+        .await;
+        wait_for_queued_start_acceptance_and_turn_started(&urgent_monitor, &event_monitor).await;
+        write_command(
+            &mut client_input,
+            r#"{"protocol_version":1,"type":"stop_voice_session","request_id":"stop-1"}"#,
+        )
+        .await;
+        timeout(TEST_TIMEOUT, async {
+            while queued_messages(&normal_monitor) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("voice terminal and stop acceptance were not queued");
+
+        write_command(
+            &mut client_input,
+            r#"{"protocol_version":1,"type":"start_voice_session","request_id":"voice-2"}"#,
+        )
+        .await;
+        timeout(TEST_TIMEOUT, async {
+            while queued_messages(&urgent_monitor) < 2 && queued_messages(&normal_monitor) < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replacement voice start did not receive a response");
+
+        drop(urgent_monitor);
+        drop(normal_monitor);
+        drop(event_monitor);
+        writer_state.release();
+        drop(input);
+        drop(client_input);
+        timeout(TEST_TIMEOUT, session_task)
+            .await
+            .expect("gateway session did not close after replacement ordering test")
+            .unwrap()
+            .unwrap();
+
+        let messages = decode_frames(&writer_state.bytes());
+        let terminal = message_index(&messages, is_voice_terminal);
+        let replacement_response = message_index(&messages, |message| {
+            message.contains(r#""request_id":"voice-2""#)
+        });
+        assert!(terminal < replacement_response);
+        assert!(messages[replacement_response].contains(r#""type":"command_rejected""#));
+    }
+
+    #[tokio::test]
+    async fn text_start_waits_for_the_previous_voice_terminal_to_drain() {
+        let (input, input_receiver) = mpsc::channel(8);
+        let language = Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new()));
+        let session = session_with_interactive_voice(input_receiver, language, no_speech_frames());
+        let (mut client_input, reader) = duplex(4096);
+        let (writer, writer_state) = ReadyFlushBlockingWriter::new();
+        let writer_lanes = super::WriterLanes::new();
+        let urgent_monitor = writer_lanes.urgent_sender.clone();
+        let normal_monitor = writer_lanes.normal_sender.clone();
+        let event_monitor = writer_lanes.event_sender.clone();
+        let session_task =
+            tokio::spawn(session.run_with_writer_lanes(reader, writer, writer_lanes));
+
+        timeout(TEST_TIMEOUT, writer_state.blocked.wait())
+            .await
+            .expect("gateway writer did not block while flushing ready");
+        write_command(
+            &mut client_input,
+            r#"{"protocol_version":1,"type":"start_voice_session","request_id":"voice-1"}"#,
+        )
+        .await;
+        wait_for_queued_start_acceptance_and_turn_started(&urgent_monitor, &event_monitor).await;
+        write_command(
+            &mut client_input,
+            r#"{"protocol_version":1,"type":"stop_voice_session","request_id":"stop-1"}"#,
+        )
+        .await;
+        timeout(TEST_TIMEOUT, async {
+            while queued_messages(&normal_monitor) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("voice terminal and stop acceptance were not queued");
+
+        write_command(
+            &mut client_input,
+            r#"{"protocol_version":1,"type":"start_turn","request_id":"text-1","transcript":"hello"}"#,
+        )
+        .await;
+        timeout(TEST_TIMEOUT, async {
+            while queued_messages(&urgent_monitor) < 2 && queued_messages(&normal_monitor) < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("text start did not receive a response");
+
+        drop(urgent_monitor);
+        drop(normal_monitor);
+        drop(event_monitor);
+        writer_state.release();
+        drop(input);
+        drop(client_input);
+        timeout(TEST_TIMEOUT, session_task)
+            .await
+            .expect("gateway session did not close after text ordering test")
+            .unwrap()
+            .unwrap();
+
+        let messages = decode_frames(&writer_state.bytes());
+        let terminal = message_index(&messages, is_voice_terminal);
+        let text_response = message_index(&messages, |message| {
+            message.contains(r#""request_id":"text-1""#)
+        });
+        assert!(terminal < text_response);
+        assert!(messages[text_response].contains(r#""type":"command_rejected""#));
     }
 
     #[tokio::test]
@@ -2491,6 +2926,134 @@ mod tests {
             .expect("gateway session did not close")
             .unwrap()
             .unwrap();
+
+        let messages = decode_frames(&writer_state.bytes());
+        let pause_accepted = message_index(&messages, |message| {
+            message.contains(r#""type":"command_accepted""#)
+                && message.contains(r#""request_id":"pause-1""#)
+        });
+        let paused = message_index(&messages, |message| {
+            message.contains(r#""type":"voice_capture_paused""#)
+        });
+        let resume_accepted = message_index(&messages, |message| {
+            message.contains(r#""type":"command_accepted""#)
+                && message.contains(r#""request_id":"resume-1""#)
+        });
+        let resumed = message_index(&messages, |message| {
+            message.contains(r#""type":"voice_capture_resumed""#)
+        });
+        assert!(pause_accepted < paused);
+        assert!(resume_accepted < resumed);
+    }
+
+    #[tokio::test]
+    async fn client_eof_cancels_a_pending_capture_control() {
+        let (_input, input_receiver) = mpsc::channel(8);
+        let language = Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new()));
+        let capture = GatedVoiceCaptureControl::new();
+        let session = session_with_interactive_voice_and_capture(
+            input_receiver,
+            language,
+            no_speech_frames(),
+            capture.clone(),
+        );
+        let (mut client_input, reader) = duplex(MAX_CLIENT_FRAME_BYTES * 2);
+        let (writer, writer_state) = BlockingWriter::new(usize::MAX);
+        let session_task = tokio::spawn(session.run(reader, writer));
+
+        timeout(
+            TEST_TIMEOUT,
+            writer_state.wait_for_bytes(r#""type":"ready""#),
+        )
+        .await
+        .expect("gateway never sent ready");
+        write_command(
+            &mut client_input,
+            r#"{"protocol_version":1,"type":"start_voice_session","request_id":"voice-1"}"#,
+        )
+        .await;
+        timeout(
+            TEST_TIMEOUT,
+            writer_state.wait_for_bytes(r#""type":"voice_session_started""#),
+        )
+        .await
+        .expect("voice session never started");
+
+        write_command(
+            &mut client_input,
+            r#"{"protocol_version":1,"type":"pause_voice_capture","request_id":"pause-1"}"#,
+        )
+        .await;
+        timeout(TEST_TIMEOUT, capture.pause_started.wait())
+            .await
+            .expect("pause was never invoked on the capture control");
+
+        drop(client_input);
+        timeout(TEST_TIMEOUT, session_task)
+            .await
+            .expect("client EOF did not cancel the pending capture control")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_rejects_a_pending_capture_control_before_terminal_and_acceptance() {
+        let (_input, input_receiver) = mpsc::channel(8);
+        let language = Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new()));
+        let capture = GatedVoiceCaptureControl::new();
+        let session = session_with_interactive_voice_and_capture(
+            input_receiver,
+            language,
+            no_speech_frames(),
+            capture.clone(),
+        );
+        let mut gateway = InMemoryGateway::start(session).await;
+
+        gateway
+            .write(r#"{"protocol_version":1,"type":"start_voice_session","request_id":"voice-1"}"#)
+            .await;
+        assert_accepted_message(&gateway.read_message().await, "voice-1");
+        assert!(gateway
+            .read_message()
+            .await
+            .contains(r#""type":"voice_session_started""#));
+
+        gateway
+            .write(r#"{"protocol_version":1,"type":"pause_voice_capture","request_id":"pause-1"}"#)
+            .await;
+        timeout(TEST_TIMEOUT, capture.pause_started.wait())
+            .await
+            .expect("pause was never invoked on the capture control");
+        gateway
+            .write(r#"{"protocol_version":1,"type":"stop_voice_session","request_id":"stop-1"}"#)
+            .await;
+
+        let messages = gateway
+            .read_until(|message| {
+                message_type(message) == "command_accepted"
+                    && message.contains(r#""request_id":"stop-1""#)
+            })
+            .await;
+        let rejection_index = message_index(&messages, |message| {
+            message_type(message) == "command_rejected"
+                && message.contains(r#""request_id":"pause-1""#)
+        });
+        let terminal_index = message_index(&messages, is_voice_terminal);
+        let stop_index = message_index(&messages, |message| {
+            message_type(message) == "command_accepted"
+                && message.contains(r#""request_id":"stop-1""#)
+        });
+        assert!(rejection_index < terminal_index);
+        assert!(terminal_index < stop_index);
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| is_voice_terminal(message))
+                .count(),
+            1
+        );
+
+        gateway.close().await;
     }
 
     #[tokio::test]
@@ -3018,8 +3581,14 @@ mod tests {
         ) -> AdapterFuture<'a, ()> {
             Box::pin(async move {
                 self.pause_started.set();
-                self.pause_release.wait().await;
-                self.inner.pause(session_id, cancellation).await
+                tokio::select! {
+                    _ = self.pause_release.wait() => {
+                        self.inner.pause(session_id, cancellation).await
+                    }
+                    _ = cancellation.cancelled() => {
+                        Err(AdapterError::new("capture pause cancelled"))
+                    }
+                }
             })
         }
 
@@ -3030,8 +3599,14 @@ mod tests {
         ) -> AdapterFuture<'a, ()> {
             Box::pin(async move {
                 self.resume_started.set();
-                self.resume_release.wait().await;
-                self.inner.resume(session_id, cancellation).await
+                tokio::select! {
+                    _ = self.resume_release.wait() => {
+                        self.inner.resume(session_id, cancellation).await
+                    }
+                    _ = cancellation.cancelled() => {
+                        Err(AdapterError::new("capture resume cancelled"))
+                    }
+                }
             })
         }
     }

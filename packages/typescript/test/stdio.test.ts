@@ -59,32 +59,42 @@ test("rejects client work when the gateway exits", async () => {
   );
 });
 
-test("discards buffered ready and responses when the process fails", async () => {
-  await withGateway(
-    "emit({ type: 'ready', protocol_version: 1, status }); setTimeout(() => { writeFileSync(`${process.argv[3]}.exit`, ''); process.exit(1); }, 10);",
-    async ({ gatewayPath, configPath }) => {
-      const transport = await StdioGatewayTransport.start({ gatewayPath, configPath });
-      await waitForFile(`${configPath}.exit`);
-      await setTimeout(10);
-      await assert.rejects(RuntimeClient.connect(transport), /gateway (stdout ended|process exited)/);
-    },
-  );
+test("discards a buffered ready message when the process exits", async () => {
+  const child = new FakeChild();
+  const transport = startWithChild(child);
+  child.stdout.emit("data", framedReady());
+  child.exitCode = 1;
+  child.emit("exit");
+
+  await assert.rejects(RuntimeClient.connect(transport), /gateway process exited/);
+  await transport.close();
 });
 
 test("discards buffered status responses when exit follows", async () => {
-  await withGateway(
-    "emit({ type: 'ready', protocol_version: 1, status }); process.stdin.once('data', () => { emit({ type: 'command_accepted', protocol_version: 1, request_id: 'request-1' }); emit({ type: 'status', protocol_version: 1, request_id: 'request-1', status }); writeFileSync(`${process.argv[3]}.exit`, ''); process.exit(1); });",
-    async ({ gatewayPath, configPath }) => {
-      const transport = await StdioGatewayTransport.start({ gatewayPath, configPath });
-      const iterator = transport.messages[Symbol.asyncIterator]();
-      await iterator.next();
-      await transport.send({ type: "status", requestId: "request-1" });
-      await waitForFile(`${configPath}.exit`);
-      await setTimeout(10);
+  const child = new FakeChild();
+  const transport = startWithChild(child);
+  const iterator = transport.messages[Symbol.asyncIterator]();
+  child.stdout.emit("data", framedReady());
+  await iterator.next();
+  await transport.send({ type: "status", requestId: "request-1" });
+  child.stdout.emit("data", Buffer.concat([
+    framedMessage({
+      type: "command_accepted",
+      protocol_version: 1,
+      request_id: "request-1",
+    }),
+    framedMessage({
+      type: "status",
+      protocol_version: 1,
+      request_id: "request-1",
+      status: wireStatus(),
+    }),
+  ]));
+  child.exitCode = 1;
+  child.emit("exit");
 
-      await assert.rejects(iterator.next(), /gateway (stdout ended|process exited)/);
-    },
-  );
+  await assert.rejects(iterator.next(), /gateway process exited/);
+  await transport.close();
 });
 
 test("closes an EOF-ignoring child with bounded termination and reaping", { timeout: 2_000 }, async () => {
@@ -172,18 +182,6 @@ ${body}
   }
 }
 
-async function waitForFile(path: string): Promise<void> {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    try {
-      await access(path);
-      return;
-    } catch {
-      await setTimeout(10);
-    }
-  }
-  throw new Error("child did not write its exit marker");
-}
-
 function startWithChild(child: FakeChild): StdioGatewayTransport {
   const testable = StdioGatewayTransport as unknown as {
     startWithChildForTest(child: unknown): StdioGatewayTransport;
@@ -192,7 +190,11 @@ function startWithChild(child: FakeChild): StdioGatewayTransport {
 }
 
 function framedReady(): Buffer {
-  const payload = Buffer.from(JSON.stringify({ type: "ready", protocol_version: 1, status: {
+  return framedMessage({ type: "ready", protocol_version: 1, status: wireStatus() });
+}
+
+function wireStatus(): object {
+  return {
     transport: "stdio",
     privacy_mode: "local_only",
     language_location: "local",
@@ -204,7 +206,11 @@ function framedReady(): Buffer {
     components: [
       { kind: "language_model", execution_location: "local", provider_label: "Local language" },
     ],
-  } }));
+  };
+}
+
+function framedMessage(message: object): Buffer {
+  const payload = Buffer.from(JSON.stringify(message));
   const header = Buffer.alloc(4);
   header.writeUInt32BE(payload.length);
   return Buffer.concat([header, payload]);

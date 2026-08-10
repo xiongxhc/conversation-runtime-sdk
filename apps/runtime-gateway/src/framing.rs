@@ -74,6 +74,17 @@ where
     }
 
     pub async fn write_frame(&mut self, payload: &[u8]) -> Result<(), FrameError> {
+        self.write_frame_with_ack(payload, || {}).await
+    }
+
+    pub async fn write_frame_with_ack<F>(
+        &mut self,
+        payload: &[u8],
+        on_written: F,
+    ) -> Result<(), FrameError>
+    where
+        F: FnOnce(),
+    {
         validate_length(payload.len())?;
         let length = u32::try_from(payload.len()).expect("frame length is capped at 512 KiB");
         self.writer
@@ -84,6 +95,7 @@ where
             .write_all(payload)
             .await
             .map_err(FrameError::Io)?;
+        on_written();
         self.writer.flush().await.map_err(FrameError::Io)
     }
 }

@@ -835,10 +835,6 @@ impl FakeTtsServer {
     pub fn endpoint(&self) -> &str {
         &self.endpoint
     }
-
-    pub fn request_count(&self) -> usize {
-        self.requests.load(Ordering::SeqCst)
-    }
 }
 
 #[cfg(unix)]
@@ -1001,8 +997,9 @@ pub fn assert_content_free_stderr(stderr: &str, private_values: &[&str]) {
     }
 }
 
-/// Polls until `path` exists, matching the blocking `wait_for_path` idiom in
-/// `tests/voice/tests/continuous_cli.rs` but async for this harness's tokio tests.
+/// Polls until `path` exists, matching the `wait_for_marker`/`wait_until` idiom in
+/// `tests/voice/tests/sidecar_process.rs` (already async, unlike the blocking `wait_for_path`
+/// in `tests/voice/tests/continuous_cli.rs`).
 #[cfg(unix)]
 pub async fn wait_for_path(path: &Path) {
     timeout(PROCESS_TIMEOUT, async {
@@ -1017,9 +1014,11 @@ pub async fn wait_for_path(path: &Path) {
     .unwrap_or_else(|_| panic!("fixture path was not created: {}", path.display()));
 }
 
-/// Asserts an OS process is reaped (no longer signalable) within `PROCESS_TIMEOUT`. Matches
-/// `tests/voice/tests/continuous_cli.rs`'s `process_exists` idiom: this workspace forbids
-/// `unsafe_code`, so liveness is checked via `kill -0` rather than a raw `libc::kill` call.
+/// Asserts an OS process is reaped (no longer signalable) within `PROCESS_TIMEOUT`. Matches the
+/// `assert_process_gone`/`process_exists` idiom in `tests/voice/tests/sidecar_process.rs` (the
+/// brief's named reaping-assertion source; `tests/voice/tests/continuous_cli.rs` has the same
+/// idiom under `assert_sidecar_reaped`): this workspace forbids `unsafe_code`, so liveness is
+/// checked via `kill -0` rather than a raw `libc::kill` call.
 #[cfg(unix)]
 pub async fn assert_process_reaped(pid: u32) {
     timeout(PROCESS_TIMEOUT, async {

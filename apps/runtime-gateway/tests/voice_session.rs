@@ -40,11 +40,26 @@ async fn voice_session_runs_accept_to_terminal_through_compiled_gateway() {
         .await;
     assert_accepted(&gateway.read_message().await, "v-1");
 
-    // The voice turn's `turn_completed` (via `StreamingTurnRuntime`'s speech-completion path)
-    // is only forwarded once TTS playback has rendered, so it arrives after the playback
-    // events, not before — read through it rather than stopping at the first playback event.
+    // `turn_completed` (via `StreamingTurnRuntime`'s speech-completion path) only requires
+    // `PlaybackState::Accepted`, while `voice_playback: rendered` is forwarded by an
+    // independent task (the sidecar stdout reader's `handle_rendered_playback`,
+    // crates/runtime/src/voice_session.rs:717-720) racing into the same event channel. Their
+    // relative arrival order on the wire is therefore NOT structurally guaranteed — wait for
+    // both to have been observed rather than asserting either one precedes the other.
+    let seen_turn_completed = std::cell::Cell::new(false);
+    let seen_playback_rendered = std::cell::Cell::new(false);
     let events = gateway
-        .read_until(|message| message.raw.contains(r#""type":"turn_completed""#))
+        .read_until(|message| {
+            if message.raw.contains(r#""type":"turn_completed""#) {
+                seen_turn_completed.set(true);
+            }
+            if message.event_type() == Some("voice_playback")
+                && message.raw.contains(r#""state":"rendered""#)
+            {
+                seen_playback_rendered.set(true);
+            }
+            seen_turn_completed.get() && seen_playback_rendered.get()
+        })
         .await;
     let event_types = events
         .iter()
@@ -65,9 +80,6 @@ async fn voice_session_runs_accept_to_terminal_through_compiled_gateway() {
     assert!(events
         .iter()
         .any(|message| message.raw.contains(r#""state":"accepted""#)));
-    assert!(events
-        .iter()
-        .any(|message| message.raw.contains(r#""state":"rendered""#)));
 
     gateway
         .write_message(

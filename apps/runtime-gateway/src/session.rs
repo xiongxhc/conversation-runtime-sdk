@@ -743,7 +743,11 @@ async fn forward_events(
 // Forwards a voice session's events onto the gateway's writer lanes: partials, activity,
 // timing, and every other non-terminal event go on the (bounded, best-effort) event lane;
 // the session's single reliable terminal (`VoiceSessionFailed` / `VoiceSessionEnded`) goes
-// on the normal lane so it cannot be starved behind queued partials.
+// on the normal lane so it cannot be starved behind queued partials, and so it stays
+// ahead of the `StopVoiceSession` acceptance that follows it on that same lane. Because
+// every non-terminal is handed to the event lane before the terminal is handed to the
+// normal lane, `writer_loop` can restore the session's order by draining the event lane
+// before it writes a normal-lane voice message.
 async fn pump_voice_events(
     mut events: VoiceSessionEventStream,
     normal: mpsc::Sender<GatewayMessage>,
@@ -838,32 +842,46 @@ where
                 }
             }
         };
-        let message = match input {
-            WriterInput::Urgent(Some(message)) => Some(message),
+        let (message, drain_events_first) = match input {
+            WriterInput::Urgent(Some(message)) => (Some(message), false),
             WriterInput::Urgent(None) => {
                 urgent_open = false;
-                None
+                (None, false)
             }
             WriterInput::Normal(Some(message)) => {
                 next_regular = RegularLane::Event;
-                Some(message)
+                // The voice pump publishes a session's non-terminal events on the event
+                // lane and its single terminal on the normal lane. Fair alternation
+                // between the two lanes would otherwise let that terminal overtake an
+                // event the pump already handed over, putting a voice event *after* the
+                // terminal on the wire — which clients read as an event with no live
+                // session. The pump only sends the terminal once every preceding event
+                // is in the event lane, so flushing what that lane already holds
+                // restores the session's own order.
+                let drain = matches!(message, GatewayMessage::VoiceEvent { .. });
+                (Some(message), drain)
             }
             WriterInput::Normal(None) => {
                 normal_open = false;
-                None
+                (None, false)
             }
             WriterInput::Event(Some(message)) => {
                 next_regular = RegularLane::Normal;
-                Some(message)
+                (Some(message), false)
             }
             WriterInput::Event(None) => {
                 events_open = false;
-                None
+                (None, false)
             }
         };
         let Some(message) = message else {
             continue;
         };
+        if drain_events_first {
+            while let Ok(queued) = events.try_recv() {
+                write_gateway_message(&mut writer, queued).await?;
+            }
+        }
         write_gateway_message(&mut writer, message).await?;
     }
     Ok(())
@@ -2197,6 +2215,88 @@ mod tests {
             result,
             Err(super::GatewaySessionError::VoicePumpShutdownTimeout)
         ));
+    }
+
+    /// A stalled writer leaves a non-terminal voice event queued on the event lane while
+    /// the terminal and the stop acceptance queue on the normal lane. Fair alternation
+    /// alone would emit the terminal first and strand the event behind it, which clients
+    /// read as a voice event arriving with no live session.
+    #[tokio::test]
+    async fn queued_voice_events_precede_the_terminal_when_output_resumes() {
+        let (input, input_receiver) = mpsc::channel(8);
+        let language = Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new()));
+        let session = session_with_interactive_voice(input_receiver, language, no_speech_frames());
+        let (mut client_input, reader) = duplex(4096);
+        let (writer, writer_state) = ReadyFlushBlockingWriter::new();
+        let writer_lanes = super::WriterLanes::new();
+        let urgent_monitor = writer_lanes.urgent_sender.clone();
+        let normal_monitor = writer_lanes.normal_sender.clone();
+        let event_monitor = writer_lanes.event_sender.clone();
+        let session_task =
+            tokio::spawn(session.run_with_writer_lanes(reader, writer, writer_lanes));
+
+        timeout(TEST_TIMEOUT, writer_state.blocked.wait())
+            .await
+            .expect("gateway writer did not block while flushing ready");
+
+        write_command(
+            &mut client_input,
+            r#"{"protocol_version":1,"type":"start_voice_session","request_id":"voice-1"}"#,
+        )
+        .await;
+        wait_for_queued_start_acceptance_and_turn_started(&urgent_monitor, &event_monitor).await;
+
+        // `voice_session_started` is stuck on the event lane; stopping now puts the
+        // session's terminal and the stop acceptance on the normal lane behind it.
+        write_command(
+            &mut client_input,
+            r#"{"protocol_version":1,"type":"stop_voice_session","request_id":"stop-1"}"#,
+        )
+        .await;
+        timeout(TEST_TIMEOUT, async {
+            while queued_messages(&normal_monitor) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the voice terminal and the stop acceptance were not both queued");
+        assert_eq!(queued_messages(&event_monitor), 1);
+        assert!(!writer_state.released.load(Ordering::SeqCst));
+        drop(urgent_monitor);
+        drop(normal_monitor);
+        drop(event_monitor);
+
+        writer_state.release();
+        drop(input);
+        drop(client_input);
+        timeout(TEST_TIMEOUT, session_task)
+            .await
+            .expect("gateway session did not close after output resumed")
+            .unwrap()
+            .unwrap();
+
+        let messages = decode_frames(&writer_state.bytes());
+        let started = message_index(&messages, |message| {
+            message.contains(r#""type":"voice_session_started""#)
+        });
+        let terminal = message_index(&messages, is_voice_terminal);
+        let stop_accepted = message_index(&messages, |message| {
+            message_type(message) == "command_accepted"
+                && message.contains(r#""request_id":"stop-1""#)
+        });
+        let last_voice_message = messages
+            .iter()
+            .rposition(|message| message_type(message) == "voice_event")
+            .expect("no voice messages reached the wire");
+        assert!(started < terminal);
+        assert_eq!(
+            last_voice_message, terminal,
+            "the terminal must be the last voice-session message on the wire"
+        );
+        assert!(
+            terminal < stop_accepted,
+            "stop must accept only after the session's terminal has been forwarded"
+        );
     }
 
     #[tokio::test]

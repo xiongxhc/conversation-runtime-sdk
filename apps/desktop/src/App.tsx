@@ -31,10 +31,14 @@ import {
 export interface DesktopSession {
   readonly state: ConversationSessionState;
   subscribe(listener: (state: ConversationSessionState) => void): () => void;
-  send(transcript: string): bigint | Promise<bigint>;
+  send(transcript: string): Promise<bigint>;
   listMemories(cursor?: MemoryCursor | null): Promise<MemoryPage>;
   inspectMemory(memoryId: bigint): Promise<MemoryInspection>;
   interrupt(): Promise<void>;
+  startVoice(): Promise<void>;
+  stopVoice(): Promise<void>;
+  pauseVoiceCapture(): Promise<void>;
+  resumeVoiceCapture(): Promise<void>;
   close(): Promise<void>;
 }
 

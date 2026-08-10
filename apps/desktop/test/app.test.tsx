@@ -312,6 +312,56 @@ describe("desktop app", () => {
     expect(screen.queryByLabelText("Message")).toBeNull();
   });
 
+  it("keeps partial voice transcripts transient and persists finalized spoken turns", async () => {
+    const historyStore = new FakeHistoryStore();
+    const session = new FakeSession(localState());
+    render(
+      <App
+        connectSession={vi.fn(async () => session)}
+        historyStore={historyStore}
+        storage={memoryStorage()}
+      />,
+    );
+    connectWithAbsolutePaths();
+    await screen.findByLabelText("Message");
+
+    session.emit(localState({
+      voice: {
+        availability: "configured",
+        session: "active",
+        capture: "listening",
+        visual: "listening",
+        sessionId: 1n,
+        partialTranscript: "unfinished spoken words",
+      },
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(historyStore.saved).toHaveLength(0);
+
+    session.emit(localState({
+      voice: {
+        availability: "configured",
+        session: "active",
+        capture: "listening",
+        visual: "listening",
+        sessionId: 1n,
+        partialTranscript: "",
+      },
+      turns: [conversationTurn(1n, "Final spoken question", "Final spoken answer", "completed")],
+    }));
+
+    await waitFor(() => expect(historyStore.saved).toHaveLength(1));
+    expect(historyStore.saved[0].turns[0]).toEqual({
+      turnId: "1",
+      transcript: "Final spoken question",
+      response: "Final spoken answer",
+      state: "completed",
+      failureMessage: undefined,
+    });
+    expect(Object.keys(historyStore.saved[0].turns[0])).not.toContain("partialTranscript");
+    expect(Object.keys(historyStore.saved[0].turns[0])).not.toContain("audio");
+  });
+
   it("derives storable titles from control characters and split surrogate pairs", async () => {
     const historyStore = new FakeHistoryStore();
     const session = new FakeSession(localState());
@@ -577,7 +627,11 @@ class FakeSession implements DesktopSession {
   readonly interrupt = vi.fn(async () => undefined);
   readonly inspectMemory = vi.fn<(memoryId: bigint) => Promise<MemoryInspection>>();
   readonly listMemories = vi.fn<(cursor?: MemoryCursor | null) => Promise<MemoryPage>>();
-  readonly send = vi.fn(() => 1n);
+  readonly pauseVoiceCapture = vi.fn(async () => undefined);
+  readonly resumeVoiceCapture = vi.fn(async () => undefined);
+  readonly send = vi.fn(async () => 1n);
+  readonly startVoice = vi.fn(async () => undefined);
+  readonly stopVoice = vi.fn(async () => undefined);
   private readonly listeners = new Set<(state: ConversationSessionState) => void>();
 
   constructor(state: ConversationSessionState) {
@@ -648,6 +702,13 @@ function localState(
     },
     turns: [],
     activeTurn: undefined,
+    voice: {
+      availability: "unavailable",
+      session: "idle",
+      capture: "stopped",
+      visual: "idle",
+      partialTranscript: "",
+    },
     error: undefined,
     ...overrides,
   };

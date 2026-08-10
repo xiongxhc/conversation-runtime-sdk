@@ -253,7 +253,11 @@ class FakeSession implements DesktopSession {
   readonly inspectMemory = vi.fn<DesktopSession["inspectMemory"]>();
   readonly interrupt = vi.fn(async () => undefined);
   readonly listMemories = vi.fn<DesktopSession["listMemories"]>();
-  readonly send = vi.fn(() => 1n);
+  readonly pauseVoiceCapture = vi.fn(async () => undefined);
+  readonly resumeVoiceCapture = vi.fn(async () => undefined);
+  readonly send = vi.fn(async () => 1n);
+  readonly startVoice = vi.fn(async () => undefined);
+  readonly stopVoice = vi.fn(async () => undefined);
   private readonly listeners = new Set<(state: ConversationSessionState) => void>();
 
   subscribe(listener: (state: ConversationSessionState) => void) {
@@ -332,6 +336,13 @@ function localState(
     },
     turns: [],
     activeTurn: undefined,
+    voice: {
+      availability: "unavailable",
+      session: "idle",
+      capture: "stopped",
+      visual: "idle",
+      partialTranscript: "",
+    },
     error: undefined,
     ...overrides,
   };

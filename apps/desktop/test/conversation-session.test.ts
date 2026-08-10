@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type {
   ClientCommand,
@@ -21,6 +21,17 @@ const localStatus = {
   capabilities: ["text"],
   components: [
     { kind: "language_model", execution_location: "local", provider_label: "Local language" },
+  ],
+};
+
+const localVoiceStatus = {
+  ...localStatus,
+  capabilities: ["text", "voice_session"],
+  components: [
+    { kind: "speech_recognition", execution_location: "local", provider_label: "Local speech recognition" },
+    { kind: "language_model", execution_location: "local", provider_label: "Local language" },
+    { kind: "speech_synthesis", execution_location: "local", provider_label: "Local speech synthesis" },
+    { kind: "audio_io", execution_location: "local", provider_label: "System audio" },
   ],
 };
 
@@ -121,9 +132,236 @@ describe("ConversationSession", () => {
     transport.turnEvent({ type: "text_delta", turn_id: "1", delta: "Done" });
     transport.turnEvent({ type: "turn_completed", turn_id: "1" });
 
-    await eventually(() => expect(session.state.phase).toBe("ready"));
+    await eventually(() => expect(session.state.turns[0]?.state).toBe("completed"));
+    expect(session.state.phase).toBe("ready");
     expect(session.state.activeTurn).toBeUndefined();
     expect(session.state.turns[0]).toMatchObject({ response: "Done", state: "completed" });
+  });
+
+  it("models spoken and typed turns in one finalized history", async () => {
+    const transport = connectedVoiceTransport();
+    const session = await ConversationSession.connect(transport);
+
+    expect(session.state.voice).toMatchObject({ availability: "configured", session: "idle" });
+    await session.startVoice();
+    expect(session.state.voice).toMatchObject({ session: "starting", capture: "starting" });
+
+    transport.voiceEvent({
+      type: "voice_session_started",
+      session_id: "1",
+      privacy: { privacy_mode: "local_only", components: localVoiceStatus.components },
+    });
+    transport.voiceEvent({
+      type: "voice_transcript_partial",
+      session_id: "1",
+      segment_id: "1",
+      text: "spoken ques",
+    });
+    await eventually(() => expect(session.state.voice.partialTranscript).toBe("spoken ques"));
+    expect(session.state.turns).toHaveLength(0);
+
+    transport.voiceEvent({
+      type: "voice_transcript_final",
+      session_id: "1",
+      turn_id: "1",
+      text: "spoken question",
+    });
+    transport.voiceTurnEvent(1n, { type: "text_delta", turn_id: "1", delta: "partial" });
+    transport.voiceTurnEvent(1n, { type: "text_completed", turn_id: "1", text: "spoken answer" });
+    transport.voiceTurnEvent(1n, { type: "turn_completed", turn_id: "1" });
+
+    await eventually(() => expect(session.state.turns[0]?.state).toBe("completed"));
+    expect(session.state.phase).toBe("ready");
+    expect(session.state.voice.partialTranscript).toBe("");
+    expect(session.state.turns[0]).toMatchObject({
+      turnId: 1n,
+      transcript: "spoken question",
+      response: "spoken answer",
+      state: "completed",
+    });
+
+    await session.send("typed follow-up");
+    transport.turnEvent({ type: "text_completed", turn_id: "2", text: "typed answer" });
+    transport.turnEvent({ type: "turn_completed", turn_id: "2" });
+
+    await eventually(() => expect(session.state.phase).toBe("ready"));
+    expect(session.state.turns.map((turn) => turn.transcript)).toEqual([
+      "spoken question",
+      "typed follow-up",
+    ]);
+  });
+
+  it("controls capture and keeps typed conversation usable after recoverable voice failure", async () => {
+    const transport = connectedVoiceTransport();
+    const session = await ConversationSession.connect(transport);
+    await session.startVoice();
+    transport.voiceEvent({
+      type: "voice_session_started",
+      session_id: "1",
+      privacy: { privacy_mode: "local_only", components: localVoiceStatus.components },
+    });
+    await eventually(() => expect(session.state.voice.capture).toBe("listening"));
+
+    await session.pauseVoiceCapture();
+    expect(session.state.voice.capture).toBe("pausing");
+    transport.voiceEvent({ type: "voice_capture_paused", session_id: "1" });
+    await eventually(() => expect(session.state.voice.capture).toBe("paused"));
+
+    await session.resumeVoiceCapture();
+    expect(session.state.voice.capture).toBe("resuming");
+    transport.voiceEvent({ type: "voice_capture_resumed", session_id: "1" });
+    await eventually(() => expect(session.state.voice.capture).toBe("listening"));
+
+    transport.voiceEvent({
+      type: "voice_session_failed",
+      session_id: "1",
+      error: {
+        code: "adapter_failure",
+        kind: "adapter",
+        stage: "speech_recognizer",
+        message: "recognizer hiccup",
+      },
+      recovery: "continue_session",
+    });
+    await eventually(() => expect(session.state.voice.error?.message).toBe("recognizer hiccup"));
+    expect(session.state.voice.session).toBe("active");
+    expect(session.state.phase).toBe("ready");
+    await expect(session.send("typed after voice failure")).resolves.toBe(1n);
+  });
+
+  it("rejects voice start while a typed turn is active", async () => {
+    const transport = connectedVoiceTransport();
+    const session = await ConversationSession.connect(transport);
+    await session.send("typed question");
+
+    await expect(session.startVoice()).rejects.toThrow("already active");
+    expect(transport.sent.some((command) => command.type === "start_voice_session")).toBe(false);
+  });
+
+  it("honors stop requested while voice start acceptance is pending", async () => {
+    const transport = connectedVoiceTransport();
+    const session = await ConversationSession.connect(transport);
+    transport.holdVoiceStartAcceptance = true;
+
+    const starting = session.startVoice();
+    const stopping = session.stopVoice();
+    expect(session.state.voice.session).toBe("stopping");
+    transport.releaseVoiceStartAcceptance();
+    await starting;
+    await eventually(() => expect(transport.sent.at(-1)?.type).toBe("stop_voice_session"));
+
+    transport.voiceEvent({
+      type: "voice_session_started",
+      session_id: "1",
+      privacy: { privacy_mode: "local_only", components: localVoiceStatus.components },
+    });
+    transport.voiceEvent({ type: "voice_session_ended", session_id: "1" });
+    await stopping;
+    expect(session.state.voice.session).toBe("idle");
+  });
+
+  it("does not restart voice from the terminal notification before stop settles", async () => {
+    const transport = connectedVoiceTransport();
+    const session = await ConversationSession.connect(transport);
+    await session.startVoice();
+    transport.voiceEvent({
+      type: "voice_session_started",
+      session_id: "1",
+      privacy: { privacy_mode: "local_only", components: localVoiceStatus.components },
+    });
+    await eventually(() => expect(session.state.voice.session).toBe("active"));
+
+    let immediateRetry: Promise<void> | undefined;
+    const unsubscribe = session.subscribe((state) => {
+      if (state.voice.session === "idle" && immediateRetry === undefined) {
+        immediateRetry = session.startVoice();
+        void immediateRetry.catch(() => undefined);
+      }
+    });
+    const stopping = session.stopVoice();
+    transport.voiceEvent({ type: "voice_session_ended", session_id: "1" });
+    await eventually(() => expect(immediateRetry).toBeDefined());
+
+    await expect(immediateRetry).rejects.toThrow("already active");
+    await stopping;
+    await expect(session.startVoice()).resolves.toBeUndefined();
+    unsubscribe();
+  });
+
+  it("allows retry after a request-scoped or terminal voice failure", async () => {
+    const transport = connectedVoiceTransport();
+    const session = await ConversationSession.connect(transport);
+    transport.rejectNextVoiceStart = true;
+
+    await expect(session.startVoice()).rejects.toThrow("microphone unavailable");
+    await expect(session.startVoice()).resolves.toBeUndefined();
+    transport.voiceEvent({
+      type: "voice_session_failed",
+      session_id: "1",
+      error: {
+        code: "adapter_failure",
+        kind: "adapter",
+        stage: "audio_capture",
+        message: "device disconnected",
+      },
+      recovery: "new_session",
+    });
+    await eventually(() => expect(session.state.voice.error?.message).toBe("device disconnected"));
+
+    await expect(session.startVoice()).resolves.toBeUndefined();
+    expect(transport.sent.filter((command) => command.type === "start_voice_session")).toHaveLength(3);
+  });
+
+  it("stops and joins active voice cleanup before closing the transport", async () => {
+    const transport = connectedVoiceTransport();
+    const session = await ConversationSession.connect(transport);
+    await session.startVoice();
+    transport.voiceEvent({
+      type: "voice_session_started",
+      session_id: "1",
+      privacy: { privacy_mode: "local_only", components: localVoiceStatus.components },
+    });
+    await eventually(() => expect(session.state.voice.session).toBe("active"));
+
+    let closed = false;
+    const closing = session.close().then(() => {
+      closed = true;
+    });
+    await eventually(() => expect(transport.sent.at(-1)?.type).toBe("stop_voice_session"));
+    expect(closed).toBe(false);
+    expect(transport.closeCalls).toBe(0);
+
+    transport.voiceEvent({ type: "voice_session_ended", session_id: "1" });
+    await closing;
+    expect(session.state.phase).toBe("closed");
+    expect(transport.closeCalls).toBe(1);
+  });
+
+  it("bounds voice cleanup before forcing transport close", async () => {
+    const transport = connectedVoiceTransport();
+    const session = await ConversationSession.connect(transport);
+    await session.startVoice();
+    transport.voiceEvent({
+      type: "voice_session_started",
+      session_id: "1",
+      privacy: { privacy_mode: "local_only", components: localVoiceStatus.components },
+    });
+    await eventually(() => expect(session.state.voice.session).toBe("active"));
+
+    vi.useFakeTimers();
+    try {
+      const closing = session.close();
+      await flushMicrotasks();
+      expect(transport.sent.at(-1)?.type).toBe("stop_voice_session");
+      expect(transport.closeCalls).toBe(0);
+      await vi.advanceTimersByTimeAsync(2_000);
+      await closing;
+
+      expect(session.state.phase).toBe("closed");
+      expect(transport.closeCalls).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("forwards memory list and inspection requests only while ready", async () => {
@@ -221,12 +459,21 @@ function connectedTransport(): InMemoryTransport {
   return transport;
 }
 
+function connectedVoiceTransport(): InMemoryTransport {
+  const transport = new InMemoryTransport(localVoiceStatus);
+  transport.ready();
+  return transport;
+}
+
 class InMemoryTransport implements RuntimeTransport {
   readonly messages = new AsyncQueue<unknown>();
   readonly sent: ClientCommand[] = [];
   closeCalls = 0;
   holdStartAcceptance = false;
+  holdVoiceStartAcceptance = false;
+  rejectNextVoiceStart = false;
   private heldStart: ClientCommand | undefined;
+  private heldVoiceStart: ClientCommand | undefined;
   private turnCounter = 0n;
 
   constructor(private readonly status: Record<string, unknown>) {}
@@ -235,6 +482,25 @@ class InMemoryTransport implements RuntimeTransport {
     this.sent.push(command);
     if (command.type === "start_turn" && this.holdStartAcceptance) {
       this.heldStart = command;
+      return;
+    }
+    if (command.type === "start_voice_session" && this.holdVoiceStartAcceptance) {
+      this.heldVoiceStart = command;
+      return;
+    }
+    if (command.type === "start_voice_session" && this.rejectNextVoiceStart) {
+      this.rejectNextVoiceStart = false;
+      this.emit({
+        protocol_version: 1,
+        type: "command_rejected",
+        request_id: command.requestId,
+        error: {
+          code: "adapter_failure",
+          kind: "adapter",
+          stage: "audio_capture",
+          message: "microphone unavailable",
+        },
+      });
       return;
     }
     this.emit(
@@ -316,12 +582,43 @@ class InMemoryTransport implements RuntimeTransport {
     }
   }
 
+  releaseVoiceStartAcceptance(): void {
+    const command = this.heldVoiceStart;
+    this.heldVoiceStart = undefined;
+    if (command) {
+      this.emit({
+        protocol_version: 1,
+        type: "command_accepted",
+        request_id: command.requestId,
+      });
+    }
+  }
+
   ready(): void {
-    this.emit({ protocol_version: 1, type: "ready", status: localStatus });
+    this.emit({ protocol_version: 1, type: "ready", status: this.status });
   }
 
   turnEvent(event: Record<string, unknown>): void {
     this.emit({ protocol_version: 1, type: "runtime_event", event });
+  }
+
+  voiceEvent(event: Record<string, unknown>): void {
+    if (event.type === "voice_transcript_final") {
+      const turnId = BigInt(String(event.turn_id));
+      if (turnId > this.turnCounter) {
+        this.turnCounter = turnId;
+      }
+    }
+    this.emit({ protocol_version: 1, type: "voice_event", event });
+  }
+
+  voiceTurnEvent(generationId: bigint, event: Record<string, unknown>): void {
+    this.voiceEvent({
+      type: "voice_turn_event",
+      session_id: "1",
+      generation_id: generationId.toString(),
+      event,
+    });
   }
 
   emit(message: unknown): void {
@@ -341,4 +638,10 @@ async function eventually(assertion: () => void): Promise<void> {
     }
   }
   throw lastError;
+}
+
+async function flushMicrotasks(): Promise<void> {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    await Promise.resolve();
+  }
 }

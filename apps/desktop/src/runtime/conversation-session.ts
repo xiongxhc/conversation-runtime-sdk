@@ -7,6 +7,8 @@ import {
   type RuntimeFailure,
   type RuntimeStatus,
   type RuntimeTransport,
+  type VoiceSession as RuntimeVoiceSession,
+  type VoiceSessionEvent,
 } from "@conversation/runtime/browser";
 
 export type ConversationTurnState = {
@@ -22,10 +24,31 @@ export type ConversationSessionState = {
   status: RuntimeStatus;
   turns: readonly ConversationTurnState[];
   activeTurn: ConversationTurnState | undefined;
+  voice: VoiceSessionState;
   error: Error | undefined;
 };
 
+export type VoiceSessionState = {
+  availability: "unavailable" | "configured";
+  session: "idle" | "starting" | "active" | "stopping" | "error";
+  capture: "stopped" | "starting" | "listening" | "pausing" | "paused" | "resuming";
+  visual:
+    | "idle"
+    | "requesting_permission"
+    | "listening"
+    | "thinking"
+    | "speaking"
+    | "interrupted"
+    | "paused"
+    | "error";
+  sessionId?: bigint;
+  partialTranscript: string;
+  error?: RuntimeFailure;
+};
+
 type SessionListener = (state: ConversationSessionState) => void;
+
+const voiceCleanupTimeoutMs = 2_000;
 
 export class ConversationSession {
   private readonly listeners = new Set<SessionListener>();
@@ -35,11 +58,17 @@ export class ConversationSession {
   private error: Error | undefined;
   private phase: ConversationSessionState["phase"] = "ready";
   private startPending = false;
+  private voice: VoiceSessionState;
+  private voiceSession: RuntimeVoiceSession | undefined;
+  private voiceStartPromise: Promise<void> | undefined;
+  private voiceEventsPromise: Promise<void> | undefined;
+  private voiceStopPromise: Promise<void> | undefined;
 
   private constructor(
     private readonly client: RuntimeClient,
     private readonly status: RuntimeStatus,
   ) {
+    this.voice = initialVoiceState(status);
     this.unsubscribeUnexpectedFailure = client.onUnexpectedFailure((error) => this.fail(error));
   }
 
@@ -63,6 +92,7 @@ export class ConversationSession {
       status: this.status,
       turns: this.turns.map(copyTurn),
       activeTurn: this.activeTurn ? copyTurn(this.activeTurn) : undefined,
+      voice: { ...this.voice },
       error: this.error,
     };
   }
@@ -116,16 +146,131 @@ export class ConversationSession {
     await this.client.interrupt(activeTurn.turnId);
   }
 
+  startVoice(): Promise<void> {
+    try {
+      this.ensureReady();
+    } catch (error) {
+      return Promise.reject(asError(error));
+    }
+    if (this.voice.availability === "unavailable") {
+      return Promise.reject(new Error("voice is not configured for this runtime"));
+    }
+    if (this.voiceSession || this.voiceStartPromise || this.voiceStopPromise) {
+      return Promise.reject(new Error("a voice session is already active"));
+    }
+    this.voice = {
+      ...this.voice,
+      session: "starting",
+      capture: "starting",
+      visual: "requesting_permission",
+      partialTranscript: "",
+      error: undefined,
+    };
+    this.publish();
+    const pending = this.openVoiceSession();
+    const tracked = pending.finally(() => {
+      if (this.voiceStartPromise === tracked) {
+        this.voiceStartPromise = undefined;
+      }
+    });
+    this.voiceStartPromise = tracked;
+    return tracked;
+  }
+
+  private async openVoiceSession(): Promise<void> {
+    try {
+      const voiceSession = await this.client.startVoiceSession();
+      this.voiceSession = voiceSession;
+      this.voiceEventsPromise = this.consumeVoice(voiceSession);
+    } catch (error) {
+      if (!this.closePromise) {
+        this.voice = {
+          ...this.voice,
+          session: "error",
+          capture: "stopped",
+          visual: "error",
+        };
+        this.publish();
+      }
+      throw asError(error);
+    }
+  }
+
+  stopVoice(): Promise<void> {
+    if (this.voiceStopPromise) {
+      return this.voiceStopPromise;
+    }
+    const pendingStart = this.voiceStartPromise;
+    if (!this.voiceSession && !pendingStart) {
+      return Promise.resolve();
+    }
+    this.voice = { ...this.voice, session: "stopping", partialTranscript: "" };
+    this.publish();
+    this.voiceStopPromise = (async () => {
+      await pendingStart?.catch(() => undefined);
+      const voiceSession = this.voiceSession;
+      if (!voiceSession) {
+        return;
+      }
+      await voiceSession.stop();
+      await this.voiceEventsPromise;
+    })().finally(() => {
+      this.voiceStopPromise = undefined;
+    });
+    return this.voiceStopPromise;
+  }
+
+  async pauseVoiceCapture(): Promise<void> {
+    const voiceSession = this.requireVoiceSession();
+    const previous = this.voice.capture;
+    this.voice = { ...this.voice, capture: "pausing" };
+    this.publish();
+    try {
+      await voiceSession.pauseCapture();
+    } catch (error) {
+      this.voice = { ...this.voice, capture: previous };
+      this.publish();
+      throw asError(error);
+    }
+  }
+
+  async resumeVoiceCapture(): Promise<void> {
+    const voiceSession = this.requireVoiceSession();
+    const previous = this.voice.capture;
+    this.voice = { ...this.voice, capture: "resuming" };
+    this.publish();
+    try {
+      await voiceSession.resumeCapture();
+    } catch (error) {
+      this.voice = { ...this.voice, capture: previous };
+      this.publish();
+      throw asError(error);
+    }
+  }
+
   close(): Promise<void> {
     if (this.closePromise) {
       return this.closePromise;
     }
+    this.closePromise = this.closeSession();
+    return this.closePromise;
+  }
+
+  private async closeSession(): Promise<void> {
+    await withTimeout(this.stopVoice(), voiceCleanupTimeoutMs);
     this.phase = "closed";
     this.activeTurn = undefined;
+    this.voice = {
+      ...this.voice,
+      session: "idle",
+      capture: "stopped",
+      visual: "idle",
+      sessionId: undefined,
+      partialTranscript: "",
+    };
     this.unsubscribeUnexpectedFailure();
     this.publish();
-    this.closePromise = this.client.close();
-    return this.closePromise;
+    await this.client.close();
   }
 
   private async consumeTurn(
@@ -149,6 +294,14 @@ export class ConversationSession {
       case "text_delta":
         state.response += event.delta;
         break;
+      case "text_completed":
+        state.response = event.text;
+        break;
+      case "speech_started":
+        if (this.voiceSession) {
+          this.voice = { ...this.voice, visual: "speaking" };
+        }
+        break;
       case "turn_completed":
         state.state = "completed";
         this.finishTurn(state);
@@ -168,6 +321,125 @@ export class ConversationSession {
     this.publish();
   }
 
+  private async consumeVoice(voiceSession: RuntimeVoiceSession): Promise<void> {
+    try {
+      for await (const event of voiceSession.events()) {
+        this.applyVoiceEvent(event);
+      }
+    } catch (error) {
+      if (!this.closePromise) {
+        this.fail(asError(error));
+      }
+    } finally {
+      if (this.voiceSession === voiceSession) {
+        this.voiceSession = undefined;
+      }
+    }
+  }
+
+  private applyVoiceEvent(event: VoiceSessionEvent): void {
+    if (this.phase === "closed") {
+      return;
+    }
+    switch (event.type) {
+      case "voice_session_started":
+        this.voice = {
+          ...this.voice,
+          session: this.voiceStopPromise ? "stopping" : "active",
+          capture: "listening",
+          visual: "listening",
+          sessionId: event.sessionId,
+          error: undefined,
+        };
+        break;
+      case "voice_capture_paused":
+        this.voice = { ...this.voice, capture: "paused", visual: "paused" };
+        break;
+      case "voice_capture_resumed":
+        this.voice = { ...this.voice, capture: "listening", visual: "listening" };
+        break;
+      case "voice_activity":
+        if (event.activity.type === "speech_started" || event.activity.type === "speech_continued") {
+          this.voice = { ...this.voice, visual: "listening" };
+        } else {
+          this.voice = { ...this.voice, visual: "thinking" };
+        }
+        break;
+      case "voice_transcript_partial":
+        this.voice = { ...this.voice, partialTranscript: event.text };
+        break;
+      case "voice_transcript_final":
+        this.voice = { ...this.voice, partialTranscript: "", visual: "thinking" };
+        this.beginTurn(event.turnId, event.text);
+        break;
+      case "voice_barge_in":
+        this.voice = { ...this.voice, visual: "interrupted" };
+        break;
+      case "voice_turn_event": {
+        const state = this.activeTurn;
+        if (!state || state.turnId !== event.generationId) {
+          this.fail(new Error("voice runtime event did not match the active turn"));
+          return;
+        }
+        this.applyEvent(state, event.event);
+        return;
+      }
+      case "voice_playback":
+        if (event.state === "rendered") {
+          this.voice = { ...this.voice, visual: "speaking" };
+        } else if (event.state === "flushed") {
+          this.voice = { ...this.voice, visual: "listening" };
+        }
+        break;
+      case "voice_session_failed":
+        this.voice = {
+          ...this.voice,
+          session: event.recovery === "new_session" ? "error" : "active",
+          capture: event.recovery === "new_session" ? "stopped" : this.voice.capture,
+          visual: "error",
+          partialTranscript: "",
+          error: event.error,
+        };
+        if (event.recovery === "new_session") {
+          this.voiceSession = undefined;
+          this.voice = { ...this.voice, sessionId: undefined };
+        }
+        break;
+      case "voice_session_ended":
+        this.voiceSession = undefined;
+        this.voice = {
+          ...this.voice,
+          session: "idle",
+          capture: "stopped",
+          visual: "idle",
+          sessionId: undefined,
+          partialTranscript: "",
+          error: undefined,
+        };
+        break;
+      case "voice_timing":
+        return;
+    }
+    this.publish();
+  }
+
+  private beginTurn(turnId: bigint, transcript: string): void {
+    if (this.activeTurn || this.startPending) {
+      this.fail(new Error("voice transcript arrived while another turn was active"));
+      return;
+    }
+    const state: ConversationTurnState = {
+      turnId,
+      transcript,
+      response: "",
+      state: "streaming",
+      failure: undefined,
+    };
+    this.turns.push(state);
+    this.activeTurn = state;
+    this.phase = "streaming";
+  }
+
   private finishTurn(state: ConversationTurnState): void {
     if (this.activeTurn !== state) {
       return;
@@ -177,15 +449,27 @@ export class ConversationSession {
   }
 
   private ensureReady(): void {
-    if (this.phase === "closed") {
+    this.ensureOpen();
+    if (this.activeTurn || this.startPending) {
+      throw new Error("a conversation turn is already active");
+    }
+  }
+
+  private ensureOpen(): void {
+    if (this.phase === "closed" || this.closePromise) {
       throw new Error("conversation session is closed");
     }
     if (this.phase === "failed") {
       throw this.error ?? new Error("conversation session failed");
     }
-    if (this.activeTurn || this.startPending) {
-      throw new Error("a conversation turn is already active");
+  }
+
+  private requireVoiceSession(): RuntimeVoiceSession {
+    this.ensureOpen();
+    if (!this.voiceSession) {
+      throw new Error("no active voice session");
     }
+    return this.voiceSession;
   }
 
   private ensureMemoryReady(): void {
@@ -210,6 +494,13 @@ export class ConversationSession {
     this.activeTurn = undefined;
     this.error = error;
     this.phase = "failed";
+    this.voice = {
+      ...this.voice,
+      session: "error",
+      capture: "stopped",
+      visual: "error",
+      partialTranscript: "",
+    };
     this.publish();
   }
 
@@ -248,6 +539,31 @@ function copyTurn(turn: ConversationTurnState): ConversationTurnState {
   return { ...turn };
 }
 
+function initialVoiceState(status: RuntimeStatus): VoiceSessionState {
+  return {
+    availability: status.capabilities.some((capability) => capability === "voice_session")
+      ? "configured"
+      : "unavailable",
+    session: "idle",
+    capture: "stopped",
+    visual: "idle",
+    partialTranscript: "",
+  };
+}
+
 function asError(value: unknown): Error {
   return value instanceof Error ? value : new Error("runtime session failed");
+}
+
+async function withTimeout(promise: Promise<void>, timeoutMs: number): Promise<void> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    promise.catch(() => undefined),
+    new Promise<void>((resolve) => {
+      timeout = setTimeout(resolve, timeoutMs);
+    }),
+  ]);
+  if (timeout !== undefined) {
+    clearTimeout(timeout);
+  }
 }

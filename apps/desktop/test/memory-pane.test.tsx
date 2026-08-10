@@ -360,13 +360,24 @@ class MemorySession implements DesktopSession {
     status: localMemoryStatus,
     turns: [],
     activeTurn: undefined,
+    voice: {
+      availability: "unavailable",
+      session: "idle",
+      capture: "stopped",
+      visual: "idle",
+      partialTranscript: "",
+    },
     error: undefined,
   };
   readonly close = vi.fn(async () => undefined);
   readonly inspectMemory = vi.fn<(memoryId: bigint) => Promise<MemoryInspection>>();
   readonly interrupt = vi.fn(async () => undefined);
   readonly listMemories = vi.fn<(cursor?: MemoryCursor | null) => Promise<MemoryPage>>();
-  readonly send = vi.fn(() => 1n);
+  readonly pauseVoiceCapture = vi.fn(async () => undefined);
+  readonly resumeVoiceCapture = vi.fn(async () => undefined);
+  readonly send = vi.fn(async () => 1n);
+  readonly startVoice = vi.fn(async () => undefined);
+  readonly stopVoice = vi.fn(async () => undefined);
 
   subscribe(listener: (state: ConversationSessionState) => void) {
     listener(this.state);

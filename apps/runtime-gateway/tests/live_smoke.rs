@@ -1,8 +1,10 @@
 //! Opt-in live smoke: drives one real voice session through the *compiled* gateway against a
 //! real sidecar and a private local `[voice]` configuration. This is the gateway-level analogue
 //! of `tests/voice`'s manual, real-hardware acceptance harness
-//! (`tests/voice/acceptance-macos.sh`) — it is not part of `cargo test --workspace` or the merge
-//! gate. `apps/runtime-gateway/tests/voice_session.rs` already proves the lane deterministically
+//! (`tests/voice/acceptance-macos.sh`). This test runs like any other under `cargo test
+//! --workspace`, but its live PASS path is env-gated off by default, so only the skip path ever
+//! executes there or in CI — the live path itself is not part of the merge gate.
+//! `apps/runtime-gateway/tests/voice_session.rs` already proves the lane deterministically
 //! against the fake sidecar and fixture STT/LLM/TTS; this file only exercises the same
 //! start → activity → stop flow against real hardware, for a human operator to run by hand.
 //!
@@ -28,7 +30,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use conversation_runtime_gateway::{FrameReader, FrameWriter};
-use support::{assert_accepted, gateway_command, is_accepted, is_voice_terminal, WireMessage};
+use support::{gateway_command, is_accepted, is_voice_terminal, WireMessage};
 use tokio::process::{ChildStdin, ChildStdout};
 use tokio::time::timeout;
 
@@ -46,11 +48,16 @@ async fn live_voice_session_smoke() {
         );
         return;
     }
-    let config_path = std::env::var("GATEWAY_VOICE_LIVE_CONFIG").expect(
-        "GATEWAY_VOICE_LIVE_SMOKE=1 requires GATEWAY_VOICE_LIVE_CONFIG=<abs path to a private \
-         local voice config>",
-    );
-    let config_path = PathBuf::from(config_path);
+    // `var_os` + a static panic message (rather than `var(..).expect(..)`) so a malformed value
+    // can never surface through `VarError`'s `Debug` output — the failure message stays a fixed
+    // string regardless of what was actually set.
+    let config_path = match std::env::var_os("GATEWAY_VOICE_LIVE_CONFIG") {
+        Some(value) => PathBuf::from(value),
+        None => panic!(
+            "GATEWAY_VOICE_LIVE_SMOKE=1 requires GATEWAY_VOICE_LIVE_CONFIG=<abs path to a \
+             private local voice config>"
+        ),
+    };
     assert!(
         config_path.is_absolute(),
         "GATEWAY_VOICE_LIVE_CONFIG must be an absolute path"
@@ -76,7 +83,7 @@ async fn live_voice_session_smoke() {
         r#"{"protocol_version":1,"type":"start_voice_session","request_id":"live-start"}"#,
     )
     .await;
-    assert_accepted(&read_message(&mut reader).await, "live-start");
+    assert_accepted_content_free(&read_message(&mut reader).await, "live-start");
     milestone("start_accepted", started);
 
     loop {
@@ -137,6 +144,21 @@ async fn read_message(reader: &mut FrameReader<ChildStdout>) -> WireMessage {
         .expect("frame read failed")
         .expect("gateway stdout closed before the expected frame");
     WireMessage::from_payload(payload)
+}
+
+/// Unlike `support::assert_accepted`, which dumps the full raw wire message on failure (fine for
+/// the fixture-driven tests, where every message is one of a handful of hardcoded fixture
+/// strings), this smoke talks to a real backend where a failure message is not guaranteed
+/// content-free. Report only the message type and the client-supplied request id correlation on
+/// failure, never the raw payload.
+fn assert_accepted_content_free(message: &WireMessage, request_id: &str) {
+    assert!(
+        is_accepted(message, request_id),
+        "expected command_accepted for request_id={request_id:?}, got message_type={:?} \
+         request_id={:?}",
+        message.message_type(),
+        message.request_id()
+    );
 }
 
 async fn write_message(writer: &mut FrameWriter<ChildStdin>, message: &str) {

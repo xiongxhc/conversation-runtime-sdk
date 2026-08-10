@@ -43,8 +43,14 @@ The first release is not a directory-complete platform. It is one local voice lo
   client, minimal Node chat example, macOS Tauri bridge, text workspace, and
   seven-scene Voice Focus preview are implemented. A native launch smoke passes,
   but a live local-model desktop turn and native GPU scene acceptance have not
-  been recorded. The real
-  gateway remains text-only, so live microphone/playback activation, persona
+  been recorded. The gateway voice lane is also complete under the same gates:
+  when `[voice]` is configured, the compiled gateway advertises and hosts
+  `voice_session` — start, stop, pause, and resume with typed voice events —
+  proven by deterministic compiled-gateway and SDK integration tests, plus an
+  opt-in live smoke against real hardware that is not part of the merge gate.
+  Without `[voice]` configured, gateway behavior is unchanged (text-only). The
+  desktop app does not yet activate live microphone/playback capture or wire
+  real voice-session events into its own UI, and persona
   and memory mutation, packaging/signing, model setup, and the separate R3
   human and acoustic acceptance gates remain open.
 - First-audible timing, audible-stop p95, representative warm measurements,
@@ -321,9 +327,14 @@ acceptance, text streaming, completion, and a separate cancellation run. It is
 interoperability evidence only; it does not select a model, measure latency or
 quality, or close any R3 human, device, or acoustic acceptance gate.
 
-R6 remains open overall. The current gateway does not report voice
-capabilities, so production Voice Focus cannot activate microphone capture,
-recognition, playback, or barge-in. Persona inspection and mutation backed by
+R6 remains open overall. When `[voice]` is configured, the compiled gateway
+now advertises and hosts `voice_session` — start, stop, pause, and resume
+with typed voice events — proven by deterministic compiled-gateway and SDK
+integration tests, plus an opt-in live smoke against real hardware that is
+not part of the merge gate; without `[voice]` configured, gateway behavior is
+unchanged (text-only). Production Voice Focus in the desktop app does not yet
+activate microphone capture, recognition, playback, or barge-in against that
+lane. Persona inspection and mutation backed by
 runtime state, runtime-memory mutation and management work, model setup and
 benchmark UI, packaging, signing, and installation flows also remain open. The
 first desktop memory slice completes read-only runtime inspection; persona
@@ -342,6 +353,10 @@ See [the R6 local-gateway evaluation](docs/r6-local-gateway-evaluation.md) and
   desktop entry.
 - Minimal persistent Node chat client using public SDK exports only.
 - Real Rust-binary-to-Node completion and cancellation smoke coverage.
+- Gateway-hosted `voice_session` start, stop, pause, and resume with typed
+  voice events when `[voice]` is configured, proven by deterministic
+  compiled-gateway and SDK mixed-mode integration tests, plus an opt-in live
+  smoke against real hardware outside the merge gate.
 - macOS Tauri process bridge using explicit absolute gateway and configuration
   paths.
 - Local text-chat workspace with streamed output, Stop, close, and reconnect.

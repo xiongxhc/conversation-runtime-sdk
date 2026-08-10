@@ -48,6 +48,11 @@ The repository now contains the deterministic runtime foundation, reviewed local
 - strict schema-v1 persona, response, quality-metric, and memory settings;
 - a persistent local-only Rust gateway using bounded framed standard I/O with no
   network listener;
+- gateway-hosted `voice_session` start, stop, pause, and resume with typed
+  voice events when `[voice]` is configured, proven by deterministic
+  compiled-gateway and SDK mixed-mode integration tests, plus an opt-in live
+  smoke against real hardware that is not part of the merge gate; gateway
+  behavior is unchanged (text-only) without `[voice]` configured;
 - the backend-neutral `@conversation/runtime` TypeScript client and Node stdio
   transport;
 - a minimal Node chat example with streamed UTF-8 text, persistent multi-turn
@@ -318,10 +323,14 @@ start-turn identifiers and returns them only in the correlated acceptance;
 peers that disagree on the protocol version reject each other rather than
 silently mixing wire shapes.
 
-The gateway does not advertise voice capabilities. Live microphone and playback
-activation, real voice-session events, persona mutation, memory mutation,
-packaging and signing, and R3 human, ten-minute, and acoustic acceptance remain
-open. See [the desktop README](apps/desktop/README.md) and
+When `[voice]` is configured, the compiled gateway advertises and hosts
+`voice_session` — start, stop, pause, and resume with typed voice events —
+proven by deterministic compiled-gateway and SDK integration tests; without
+`[voice]` configured, gateway behavior is unchanged (text-only). The desktop
+app does not yet activate live microphone or playback capture or wire real
+voice-session events into its own UI. Persona mutation, memory mutation,
+packaging and signing, and R3 human, ten-minute, and acoustic acceptance
+remain open. See [the desktop README](apps/desktop/README.md) and
 [the desktop evaluation](docs/r6-desktop-app-evaluation.md).
 
 ## Test Local Inference

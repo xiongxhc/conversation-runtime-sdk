@@ -494,6 +494,7 @@ dependencies = [
  "libc",
  "reqwest",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-util",

@@ -187,6 +187,7 @@ async fn recognizer_final_arriving_after_elapsed_silence_starts_the_turn() {
     assert!(harness.language.requests().is_empty());
 
     harness.engine_final(4, "late final").await;
+    tokio::time::advance(Duration::from_millis(600)).await;
     harness.wait_for_request_count(1).await;
 
     let observed = drain_until_turn_terminal(&mut events).await;
@@ -260,7 +261,7 @@ async fn newer_same_segment_hypothesis_replaces_text_without_moving_deadline() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn replacement_segment_disarms_the_previous_segments_deadline() {
+async fn pending_replacement_segment_defers_finalization_then_joins_the_turn() {
     let harness = VoiceSessionHarness::new();
     let mut events = harness.start().await;
     assert_session_started(events.recv().await);
@@ -270,17 +271,60 @@ async fn replacement_segment_disarms_the_previous_segments_deadline() {
     assert_voice_activity(events.recv().await, VoiceActivity::SpeechEnded { at_ms: 0 });
     assert_speech_end_timing(events.recv().await);
     tokio::time::advance(Duration::from_millis(300)).await;
-    harness.partial(8, "new").await;
-    assert_partial(events.recv().await, 8, "new");
+    harness.partial(8, " new").await;
+    assert_partial(events.recv().await, 8, " new");
     tokio::time::advance(Duration::from_millis(300)).await;
     tokio::task::yield_now().await;
     assert!(harness.language.requests().is_empty());
 
-    harness.engine_final(8, "new segment").await;
+    harness.engine_final(8, " new segment").await;
     harness.speech_ended(600).await;
     tokio::time::advance(Duration::from_millis(600)).await;
     let observed = drain_until_turn_terminal(&mut events).await;
-    assert_final_and_completed(&observed, TurnId::new(1), "new segment");
+    assert_final_and_completed(&observed, TurnId::new(1), "old segment new segment");
+    harness.shutdown(&mut events).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn multi_segment_utterance_finalizes_as_one_turn() {
+    let harness = VoiceSessionHarness::new();
+    let mut events = harness.start().await;
+    assert_session_started(events.recv().await);
+
+    harness.engine_final(1, "first half").await;
+    harness.engine_final(2, " second half").await;
+    harness.speech_ended(0).await;
+    tokio::time::advance(Duration::from_millis(600)).await;
+
+    let observed = drain_until_turn_terminal(&mut events).await;
+    assert_final_and_completed(&observed, TurnId::new(1), "first half second half");
+    assert_eq!(harness.language.requests().len(), 1);
+    harness.shutdown(&mut events).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn late_final_segment_after_silence_joins_the_same_turn() {
+    let harness = VoiceSessionHarness::new();
+    let mut events = harness.start().await;
+    assert_session_started(events.recv().await);
+
+    harness.engine_final(1, "early").await;
+    harness.speech_ended(0).await;
+    assert_voice_activity(events.recv().await, VoiceActivity::SpeechEnded { at_ms: 0 });
+    assert_speech_end_timing(events.recv().await);
+    tokio::time::advance(Duration::from_millis(300)).await;
+    harness.partial(2, " la").await;
+    assert_partial(events.recv().await, 2, " la");
+    tokio::time::advance(Duration::from_millis(300)).await;
+    tokio::task::yield_now().await;
+    assert!(harness.language.requests().is_empty());
+
+    harness.engine_final(2, " late").await;
+    tokio::time::advance(Duration::from_millis(600)).await;
+
+    let observed = drain_until_turn_terminal(&mut events).await;
+    assert_final_and_completed(&observed, TurnId::new(1), "early late");
+    assert_eq!(harness.language.requests().len(), 1);
     harness.shutdown(&mut events).await;
 }
 

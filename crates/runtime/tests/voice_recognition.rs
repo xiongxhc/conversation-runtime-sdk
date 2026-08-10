@@ -75,23 +75,23 @@ fn speech_resume_cancels_the_silence_deadline() {
 }
 
 #[test]
-fn a_new_segment_replaces_all_candidates_from_the_previous_segment() {
+fn a_new_segment_keeps_prior_engine_final_text_in_the_same_turn() {
     let mut finalizer = TurnFinalizer::new(600).unwrap();
     finalizer.observe_hypothesis(RecognitionHypothesis::engine_final(10, "old"), 10);
     finalizer.observe_activity(VoiceActivity::SpeechEnded { at_ms: 20 });
-    finalizer.observe_hypothesis(RecognitionHypothesis::partial(11, "new"), 30);
+    finalizer.observe_hypothesis(RecognitionHypothesis::partial(11, " new"), 30);
 
-    assert_eq!(finalizer.display_text(), Some("new"));
+    assert_eq!(finalizer.display_text(), Some(" new"));
     assert_eq!(finalizer.finalize_ready(620), None);
 
-    finalizer.observe_hypothesis(RecognitionHypothesis::engine_final(11, "new text"), 700);
+    finalizer.observe_hypothesis(RecognitionHypothesis::engine_final(11, " new text"), 700);
     finalizer.observe_activity(VoiceActivity::SpeechEnded { at_ms: 720 });
     let finalized = finalizer
         .finalize_ready(1_320)
         .expect("new segment should finalize");
 
     assert_eq!(finalized.segment_id, 11);
-    assert_eq!(finalized.text, "new text");
+    assert_eq!(finalized.text, "old new text");
 }
 
 #[test]

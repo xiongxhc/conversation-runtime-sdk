@@ -11,6 +11,7 @@ pub struct FinalizedTranscript {
 pub struct TurnFinalizer {
     final_silence_ms: u64,
     segment_id: Option<u64>,
+    committed: Vec<String>,
     display_candidate: Option<String>,
     engine_final_candidate: Option<String>,
     speech_ended_at_ms: Option<u64>,
@@ -30,6 +31,7 @@ impl TurnFinalizer {
         Ok(Self {
             final_silence_ms,
             segment_id: None,
+            committed: Vec::new(),
             display_candidate: None,
             engine_final_candidate: None,
             speech_ended_at_ms: None,
@@ -46,12 +48,14 @@ impl TurnFinalizer {
         let text = value.text().to_owned();
 
         if self.segment_id != Some(segment_id) {
-            if self.segment_id.is_some() {
-                self.speech_ended_at_ms = None;
+            if self.finalized {
+                self.committed.clear();
+                self.finalized = false;
+            } else if let Some(committed) = self.engine_final_candidate.take() {
+                self.committed.push(committed);
             }
             self.segment_id = Some(segment_id);
             self.engine_final_candidate = None;
-            self.finalized = false;
         }
 
         self.display_candidate = Some(text.clone());
@@ -87,15 +91,84 @@ impl TurnFinalizer {
             return None;
         }
 
-        let text = self.engine_final_candidate.as_ref()?;
+        let candidate = self.engine_final_candidate.as_ref()?;
+        let mut text: String = self.committed.concat();
+        text.push_str(candidate);
         if text.trim().is_empty() {
             return None;
         }
 
         self.finalized = true;
-        Some(FinalizedTranscript {
-            segment_id,
-            text: text.clone(),
-        })
+        Some(FinalizedTranscript { segment_id, text })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn finalizer() -> TurnFinalizer {
+        TurnFinalizer::new(600).unwrap()
+    }
+
+    fn ended(finalizer: &mut TurnFinalizer, at_ms: u64) {
+        finalizer.observe_activity(VoiceActivity::SpeechEnded { at_ms });
+    }
+
+    #[test]
+    fn accumulates_engine_final_segments_across_segment_ids() {
+        let mut finalizer = finalizer();
+        finalizer.observe_hypothesis(RecognitionHypothesis::engine_final(1, " first half"), 0);
+        finalizer.observe_hypothesis(RecognitionHypothesis::engine_final(2, " second half."), 100);
+        ended(&mut finalizer, 100);
+
+        let finalized = finalizer.finalize_ready(700).expect("utterance finalizes");
+        assert_eq!(finalized.text, " first half second half.");
+        assert_eq!(finalized.segment_id, 2);
+    }
+
+    #[test]
+    fn late_segment_does_not_clear_the_silence_gate() {
+        let mut finalizer = finalizer();
+        finalizer.observe_hypothesis(RecognitionHypothesis::engine_final(1, " early"), 0);
+        ended(&mut finalizer, 0);
+        finalizer.observe_hypothesis(RecognitionHypothesis::engine_final(2, " late"), 500);
+
+        let finalized = finalizer
+            .finalize_ready(1_100)
+            .expect("late segment must not stall finalization");
+        assert_eq!(finalized.text, " early late");
+    }
+
+    #[test]
+    fn pending_partial_segment_defers_finalization_until_engine_final() {
+        let mut finalizer = finalizer();
+        finalizer.observe_hypothesis(RecognitionHypothesis::engine_final(1, " early"), 0);
+        ended(&mut finalizer, 0);
+        finalizer.observe_hypothesis(RecognitionHypothesis::partial(2, " la"), 500);
+
+        assert!(finalizer.finalize_ready(1_100).is_none());
+
+        finalizer.observe_hypothesis(RecognitionHypothesis::engine_final(2, " late"), 900);
+        let finalized = finalizer
+            .finalize_ready(1_200)
+            .expect("utterance finalizes");
+        assert_eq!(finalized.text, " early late");
+    }
+
+    #[test]
+    fn next_utterance_starts_without_previous_segments() {
+        let mut finalizer = finalizer();
+        finalizer.observe_hypothesis(RecognitionHypothesis::engine_final(1, " first"), 0);
+        finalizer.observe_hypothesis(RecognitionHypothesis::engine_final(2, " utterance"), 100);
+        ended(&mut finalizer, 100);
+        assert!(finalizer.finalize_ready(700).is_some());
+
+        finalizer.observe_hypothesis(RecognitionHypothesis::engine_final(3, " next"), 2_000);
+        ended(&mut finalizer, 2_000);
+        let finalized = finalizer
+            .finalize_ready(2_600)
+            .expect("next utterance finalizes");
+        assert_eq!(finalized.text, " next");
     }
 }

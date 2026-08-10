@@ -14,14 +14,14 @@ describe("preferences", () => {
   });
 
   it("falls back to Soft Aurora for unknown stored scenes", () => {
-    const preferences = loadPreferences(storageWith({ version: 2, focusScene: "unknown" }));
+    const preferences = loadPreferences(storageWith({ version: 3, focusScene: "unknown" }));
 
     expect(preferences.focusScene).toBe("soft-aurora");
   });
 
   it("rejects malformed and unsupported stored preferences", () => {
     expect(loadPreferences(storageWith("not json"))).toEqual(defaultPreferences);
-    expect(loadPreferences(storageWith({ version: 3, focusScene: "orb" }))).toEqual(defaultPreferences);
+    expect(loadPreferences(storageWith({ version: 4, focusScene: "orb" }))).toEqual(defaultPreferences);
   });
 
   it("migrates version 1 with transcript visibility forgotten by default", () => {
@@ -35,10 +35,10 @@ describe("preferences", () => {
     }));
 
     expect(preferences).toEqual({
-      version: 2,
+      version: 3,
       focusScene: "orb",
       focusIntensity: 0.8,
-      focusEntry: "automatic",
+      focusEntry: "manual",
       rememberTranscriptVisibility: false,
       transcriptVisible: false,
       reducedMotion: "system",
@@ -48,7 +48,7 @@ describe("preferences", () => {
   it("normalizes invalid UI values without reading conversation memory", () => {
     const preferences = loadPreferences(
       storageWith({
-        version: 2,
+        version: 3,
         focusScene: "orb",
         focusIntensity: 1.5,
         focusEntry: "sometimes",
@@ -64,7 +64,7 @@ describe("preferences", () => {
     const storage = storageWith();
 
     savePreferences(storage, {
-      version: 2,
+      version: 3,
       focusScene: "still-gradient",
       focusIntensity: 0.8,
       focusEntry: "manual",
@@ -74,7 +74,7 @@ describe("preferences", () => {
     });
 
     expect(JSON.parse(storage.getItem(preferencesStorageKey) ?? "")).toEqual({
-      version: 2,
+      version: 3,
       focusScene: "still-gradient",
       focusIntensity: 0.8,
       focusEntry: "manual",
@@ -84,15 +84,26 @@ describe("preferences", () => {
     });
   });
 
-  it("round-trips an explicitly remembered automatic Focus entry", () => {
-    const storage = storageWith();
-
-    savePreferences(storage, {
-      ...defaultPreferences,
+  it("migrates version 2 automatic Focus entry to manual", () => {
+    const preferences = loadPreferences(storageWith({
+      version: 2,
+      focusScene: "threads",
+      focusIntensity: 0.7,
       focusEntry: "automatic",
-    });
+      rememberTranscriptVisibility: true,
+      transcriptVisible: true,
+      reducedMotion: "system",
+    }));
 
-    expect(loadPreferences(storage).focusEntry).toBe("automatic");
+    expect(preferences).toEqual({
+      version: 3,
+      focusScene: "threads",
+      focusIntensity: 0.7,
+      focusEntry: "manual",
+      rememberTranscriptVisibility: true,
+      transcriptVisible: true,
+      reducedMotion: "system",
+    });
   });
 });
 

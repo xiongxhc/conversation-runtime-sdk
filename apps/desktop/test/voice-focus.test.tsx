@@ -11,7 +11,6 @@ import {
 } from "../src/focus-scenes/registry.js";
 import { preferencesStorageKey } from "../src/preferences/preferences.js";
 import type { ConversationSessionState } from "../src/runtime/conversation-session.js";
-import type { VoiceCapabilitySnapshot } from "../src/components/Workspace.js";
 
 beforeEach(() => {
   registerSceneRenderer("soft-aurora", ({ state }) => (
@@ -44,10 +43,332 @@ describe("Voice Focus", () => {
     expect(screen.getByText("TTS unavailable")).toBeTruthy();
   });
 
-  it("enters manually, exits with Escape, and restores focus to the entry control", async () => {
-    renderConnectedApp({ voiceCapability: voiceCapability() });
+  it("enters configured Voice Focus without capture and starts only on explicit action", async () => {
+    const session = new FakeSession(configuredVoiceState());
+    renderConnectedApp({ session });
 
-    const entry = await screen.findByRole("button", { name: "Enter Voice Focus" });
+    const entry = await screen.findByRole("button", { name: "Voice Focus" });
+    fireEvent.click(entry);
+
+    expect(await screen.findByRole("dialog", { name: "Voice Focus" })).toBeTruthy();
+    expect(session.startVoice).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Start voice" }));
+    expect(session.startVoice).toHaveBeenCalledOnce();
+  });
+
+  it("keeps active voice visible outside Focus after an explicit exit choice", async () => {
+    const session = new FakeSession(configuredVoiceState({
+      voice: {
+        availability: "configured",
+        session: "active",
+        capture: "listening",
+        visual: "listening",
+        sessionId: 1n,
+        partialTranscript: "",
+      },
+    }));
+    renderConnectedApp({ session });
+    fireEvent.click(await screen.findByRole("button", { name: "Voice Focus" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Exit Focus" }));
+
+    expect(await screen.findByRole("dialog", { name: "Leave Voice Focus?" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Keep voice active" }));
+
+    expect(await screen.findByText("Microphone listening locally")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Return to Voice Focus" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Stop voice" }));
+    expect(session.stopVoice).toHaveBeenCalledOnce();
+  });
+
+  it("opens the active exit choice on Escape and supports cancel or stop", async () => {
+    const session = new FakeSession(configuredVoiceState({
+      voice: activeVoice(),
+    }));
+    renderConnectedApp({ session });
+    fireEvent.click(await screen.findByRole("button", { name: "Voice Focus" }));
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(await screen.findByRole("dialog", { name: "Leave Voice Focus?" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Leave Voice Focus?" })).toBeNull());
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Exit Focus" }));
+
+    fireEvent.click(screen.getByRole("button", { name: "Exit Focus" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Stop voice and exit" }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Voice Focus" })).toBeNull());
+    expect(session.stopVoice).toHaveBeenCalledOnce();
+  });
+
+  it("closes a stale exit dialog instead of stopping a replacement session", async () => {
+    const session = new FakeSession(configuredVoiceState({ voice: activeVoice() }));
+    renderConnectedApp({ session });
+    fireEvent.click(await screen.findByRole("button", { name: "Voice Focus" }));
+    fireEvent.click(screen.getByRole("button", { name: "Exit Focus" }));
+    expect(await screen.findByRole("dialog", { name: "Leave Voice Focus?" })).toBeTruthy();
+
+    act(() => session.emit(configuredVoiceState({
+      voice: { ...activeVoice(), sessionId: 2n },
+    })));
+
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Leave Voice Focus?" })).toBeNull());
+    expect(session.stopVoice).not.toHaveBeenCalled();
+  });
+
+  it("keeps stop failure visible in the exit dialog and traps Tab", async () => {
+    const session = new FakeSession(configuredVoiceState({ voice: activeVoice() }));
+    session.stopVoice.mockRejectedValueOnce(new Error("stop failed"));
+    renderConnectedApp({ session });
+    fireEvent.click(await screen.findByRole("button", { name: "Voice Focus" }));
+    fireEvent.click(screen.getByRole("button", { name: "Exit Focus" }));
+
+    const cancel = await screen.findByRole("button", { name: "Cancel" });
+    expect(document.activeElement).toBe(cancel);
+    fireEvent.keyDown(document, { key: "Tab" });
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Stop voice and exit" }));
+    fireEvent.click(screen.getByRole("button", { name: "Stop voice and exit" }));
+
+    expect((await screen.findByRole("alert")).textContent).toContain("Voice could not stop cleanly");
+    expect(screen.getByRole("dialog", { name: "Leave Voice Focus?" })).toBeTruthy();
+  });
+
+  it("does not cancel the exit dialog while Stop is pending", async () => {
+    const session = new FakeSession(configuredVoiceState({ voice: activeVoice() }));
+    const stopping = deferred<undefined>();
+    session.stopVoice.mockReturnValueOnce(stopping.promise);
+    renderConnectedApp({ session });
+    fireEvent.click(await screen.findByRole("button", { name: "Voice Focus" }));
+    fireEvent.click(screen.getByRole("button", { name: "Exit Focus" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Stop voice and exit" }));
+    fireEvent.keyDown(document, { key: "Escape" });
+
+    expect(screen.getByRole("dialog", { name: "Leave Voice Focus?" })).toBeTruthy();
+    expect(document.activeElement).toBe(screen.getByRole("dialog", { name: "Leave Voice Focus?" }));
+    stopping.resolve(undefined);
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Voice Focus" })).toBeNull());
+  });
+
+  it("pauses active capture before typed send and resumes after the typed turn", async () => {
+    const session = new FakeSession(configuredVoiceState({
+      voice: {
+        availability: "configured",
+        session: "active",
+        capture: "listening",
+        visual: "listening",
+        sessionId: 1n,
+        partialTranscript: "",
+      },
+    }));
+    renderConnectedApp({ session });
+    const composer = await screen.findByLabelText("Message");
+
+    fireEvent.focus(composer);
+    expect(session.pauseVoiceCapture).toHaveBeenCalledOnce();
+    fireEvent.change(composer, { target: { value: "Typed while voice is active" } });
+    expect(screen.getByRole("button", { name: "Send" }).hasAttribute("disabled")).toBe(true);
+
+    act(() => session.emit(configuredVoiceState({
+      voice: {
+        availability: "configured",
+        session: "active",
+        capture: "paused",
+        visual: "paused",
+        sessionId: 1n,
+        partialTranscript: "",
+      },
+    })));
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    expect(session.send).toHaveBeenCalledWith("Typed while voice is active");
+
+    act(() => session.emit(configuredVoiceState({
+      turns: [{
+        turnId: 2n,
+        transcript: "Typed while voice is active",
+        response: "Done",
+        state: "completed",
+        failure: undefined,
+      }],
+      voice: {
+        availability: "configured",
+        session: "active",
+        capture: "paused",
+        visual: "paused",
+        sessionId: 1n,
+        partialTranscript: "",
+      },
+    })));
+    await waitFor(() => expect(session.resumeVoiceCapture).toHaveBeenCalledOnce());
+  });
+
+  it("resumes paused capture after an empty composer loses focus", async () => {
+    const session = new FakeSession(configuredVoiceState({ voice: activeVoice() }));
+    renderConnectedApp({ session });
+    const composer = await screen.findByLabelText("Message");
+
+    fireEvent.focus(composer);
+    fireEvent.blur(composer);
+    act(() => session.emit(configuredVoiceState({
+      voice: { ...activeVoice(), capture: "paused", visual: "paused" },
+    })));
+
+    await waitFor(() => expect(session.resumeVoiceCapture).toHaveBeenCalledOnce());
+  });
+
+  it("does not resume a replacement voice session after a typed turn", async () => {
+    const session = new FakeSession(configuredVoiceState({ voice: activeVoice() }));
+    renderConnectedApp({ session });
+    const composer = await screen.findByLabelText("Message");
+    fireEvent.focus(composer);
+    act(() => session.emit(configuredVoiceState({
+      voice: { ...activeVoice(), capture: "paused", visual: "paused" },
+    })));
+    fireEvent.change(composer, { target: { value: "Typed turn" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    act(() => session.emit(configuredVoiceState({
+      turns: [{
+        turnId: 2n,
+        transcript: "Typed turn",
+        response: "Done",
+        state: "completed",
+        failure: undefined,
+      }],
+      voice: { ...activeVoice(), capture: "paused", visual: "paused", sessionId: 2n },
+    })));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(session.resumeVoiceCapture).not.toHaveBeenCalled();
+  });
+
+  it("does not resume capture after Stop begins during a typed turn", async () => {
+    const session = new FakeSession(configuredVoiceState({ voice: activeVoice() }));
+    renderConnectedApp({ session });
+    const composer = await screen.findByLabelText("Message");
+    fireEvent.focus(composer);
+    act(() => session.emit(configuredVoiceState({
+      voice: { ...activeVoice(), capture: "paused", visual: "paused" },
+    })));
+    fireEvent.change(composer, { target: { value: "Typed turn" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    act(() => session.emit(configuredVoiceState({
+      turns: [{ turnId: 2n, transcript: "Typed turn", response: "Done", state: "completed", failure: undefined }],
+      voice: { ...activeVoice(), session: "stopping", capture: "paused", visual: "paused" },
+    })));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(session.resumeVoiceCapture).not.toHaveBeenCalled();
+  });
+
+  it("pauses after capture finishes starting or resuming while the composer is focused", async () => {
+    const session = new FakeSession(configuredVoiceState({
+      voice: { ...activeVoice(), capture: "resuming" },
+    }));
+    renderConnectedApp({ session });
+    fireEvent.focus(await screen.findByLabelText("Message"));
+    expect(session.pauseVoiceCapture).not.toHaveBeenCalled();
+
+    act(() => session.emit(configuredVoiceState({ voice: activeVoice() })));
+    await waitFor(() => expect(session.pauseVoiceCapture).toHaveBeenCalledOnce());
+  });
+
+  it("offers retry and stop when a capture control fails", async () => {
+    const session = new FakeSession(configuredVoiceState({ voice: activeVoice() }));
+    session.pauseVoiceCapture.mockRejectedValueOnce(new Error("pause failed"));
+    renderConnectedApp({ session });
+
+    fireEvent.focus(await screen.findByLabelText("Message"));
+    expect((await screen.findByRole("alert")).textContent).toContain("Microphone pause failed");
+    fireEvent.click(screen.getByRole("button", { name: "Retry voice control" }));
+    await waitFor(() => expect(session.pauseVoiceCapture).toHaveBeenCalledTimes(2));
+    fireEvent.click(screen.getByRole("button", { name: "Stop voice" }));
+    expect(session.stopVoice).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the newest control failure when an older operation settles", async () => {
+    const session = new FakeSession(configuredVoiceState({ voice: activeVoice() }));
+    const pause = deferred<undefined>();
+    session.pauseVoiceCapture.mockReturnValueOnce(pause.promise);
+    session.stopVoice.mockRejectedValueOnce(new Error("stop failed"));
+    renderConnectedApp({ session });
+    fireEvent.focus(await screen.findByLabelText("Message"));
+    fireEvent.click(screen.getByRole("button", { name: "Stop voice" }));
+    expect((await screen.findByRole("alert")).textContent).toContain("Voice could not stop cleanly");
+
+    pause.resolve(undefined);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(screen.getByRole("alert").textContent).toContain("Voice could not stop cleanly");
+  });
+
+  it("surfaces runtime voice failures and truthful paused capture in and outside Focus", async () => {
+    const session = new FakeSession(configuredVoiceState({
+      voice: {
+        ...activeVoice(),
+        capture: "paused",
+        visual: "error",
+        error: {
+          code: "adapter_failure",
+          kind: "adapter",
+          stage: "speech_recognizer",
+          message: "recognizer needs attention",
+        },
+      },
+    }));
+    renderConnectedApp({ session });
+
+    expect(await screen.findByText("Voice needs attention locally")).toBeTruthy();
+    expect(screen.getByText("recognizer needs attention")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Voice Focus" }));
+    expect(await screen.findByText("Microphone needs attention")).toBeTruthy();
+    expect(screen.getByText("recognizer needs attention")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Retry voice" }));
+    await waitFor(() => expect(session.stopVoice).toHaveBeenCalledOnce());
+    expect(session.startVoice).toHaveBeenCalledOnce();
+  });
+
+  it("serializes repeated runtime voice retries", async () => {
+    const session = new FakeSession(configuredVoiceState({
+      voice: {
+        ...activeVoice(),
+        visual: "error",
+        error: {
+          code: "adapter_failure",
+          kind: "adapter",
+          stage: "speech_recognizer",
+          message: "recognizer needs attention",
+        },
+      },
+    }));
+    const stopping = deferred<undefined>();
+    session.stopVoice.mockReturnValue(stopping.promise);
+    renderConnectedApp({ session });
+    fireEvent.click(await screen.findByRole("button", { name: "Voice Focus" }));
+
+    const retry = screen.getByRole("button", { name: "Retry voice" });
+    fireEvent.click(retry);
+    expect(retry.hasAttribute("disabled")).toBe(true);
+    fireEvent.click(retry);
+    expect(session.stopVoice).toHaveBeenCalledOnce();
+
+    stopping.resolve(undefined);
+    await waitFor(() => expect(session.startVoice).toHaveBeenCalledOnce());
+  });
+
+  it("shows persistent Focus Stop failure with retry", async () => {
+    const session = new FakeSession(configuredVoiceState({ voice: activeVoice() }));
+    session.stopVoice.mockRejectedValueOnce(new Error("stop failed"));
+    renderConnectedApp({ session });
+    fireEvent.click(await screen.findByRole("button", { name: "Voice Focus" }));
+    fireEvent.click(screen.getByRole("button", { name: "Stop voice" }));
+
+    expect((await screen.findByRole("alert")).textContent).toContain("Voice could not stop cleanly");
+    fireEvent.click(screen.getByRole("button", { name: "Retry voice control" }));
+    await waitFor(() => expect(session.stopVoice).toHaveBeenCalledTimes(2));
+  });
+
+  it("enters manually, exits with Escape, and restores focus to the entry control", async () => {
+    renderConnectedApp({ session: new FakeSession(configuredVoiceState()) });
+
+    const entry = await screen.findByRole("button", { name: "Voice Focus" });
     expect(screen.queryByRole("dialog", { name: "Voice Focus" })).toBeNull();
     fireEvent.click(entry);
 
@@ -56,59 +377,62 @@ describe("Voice Focus", () => {
 
     await waitFor(() => expect(screen.queryByRole("dialog", { name: "Voice Focus" })).toBeNull());
     expect(document.activeElement).toBe(
-      screen.getByRole("button", { name: "Enter Voice Focus" }),
+      screen.getByRole("button", { name: "Voice Focus" }),
     );
   });
 
-  it("does not advertise live Focus for a voice capability without an active session", async () => {
-    renderConnectedApp({
-      voiceCapability: voiceCapability({ sessionStatus: "inactive" }),
-    });
+  it("advertises configured Focus while keeping an idle microphone off", async () => {
+    const session = new FakeSession(configuredVoiceState());
+    renderConnectedApp({ session });
 
-    await screen.findByRole("button", { name: "Preview Voice Focus" });
-    expect(screen.queryByRole("button", { name: "Enter Voice Focus" })).toBeNull();
-    expect(screen.getByText("Start a voice session before entering Voice Focus.")).toBeTruthy();
+    expect(await screen.findByRole("button", { name: "Voice Focus" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Preview Voice Focus" })).toBeNull();
+    expect(screen.getByText(/start the local microphone when you are ready/i)).toBeTruthy();
     expect(screen.queryByRole("dialog", { name: "Voice Focus" })).toBeNull();
+    expect(session.startVoice).not.toHaveBeenCalled();
   });
 
-  it("never renders an inactive live snapshot through Focus before effect cleanup", async () => {
+  it("never renders an unavailable live snapshot through Focus before effect cleanup", async () => {
     const renderedStates: string[] = [];
     registerSceneRenderer("soft-aurora", ({ state }) => {
       renderedStates.push(state);
       return <div data-focus-scene="soft-aurora" data-state={state} />;
     });
-    const session = new FakeSession();
+    const session = new FakeSession(configuredVoiceState({
+      voice: {
+        availability: "configured",
+        session: "active",
+        capture: "listening",
+        visual: "speaking",
+        sessionId: 1n,
+        partialTranscript: "",
+      },
+    }));
     const storage = memoryStorage();
     const connectSession = vi.fn(async () => session);
     const view = render(
       <App
         connectSession={connectSession}
         storage={storage}
-        voiceCapability={voiceCapability({ state: "speaking" })}
       />,
     );
     connectWithAbsolutePaths();
-    fireEvent.click(await screen.findByRole("button", { name: "Enter Voice Focus" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Voice Focus" }));
     expect(await screen.findByRole("dialog", { name: "Voice Focus" })).toBeTruthy();
     renderedStates.length = 0;
 
-    view.rerender(
-      <App
-        connectSession={connectSession}
-        storage={storage}
-        voiceCapability={voiceCapability({ sessionStatus: "inactive" })}
-      />,
-    );
+    act(() => session.emit(localState()));
 
     expect(renderedStates).toEqual([]);
     expect(screen.queryByRole("dialog", { name: "Voice Focus" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Enter Voice Focus" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Voice Focus" })).toBeNull();
+    view.unmount();
   });
 
   it("renders disconnected recovery immediately when the runtime fails in live Focus", async () => {
-    const session = new FakeSession();
-    renderConnectedApp({ session, voiceCapability: voiceCapability({ state: "listening" }) });
-    fireEvent.click(await screen.findByRole("button", { name: "Enter Voice Focus" }));
+    const session = new FakeSession(configuredVoiceState());
+    renderConnectedApp({ session });
+    fireEvent.click(await screen.findByRole("button", { name: "Voice Focus" }));
     expect(await screen.findByRole("dialog", { name: "Voice Focus" })).toBeTruthy();
 
     act(() => session.emit(localState({
@@ -122,7 +446,7 @@ describe("Voice Focus", () => {
     expect(screen.getByRole("button", { name: "Reconnect runtime" })).toBeTruthy();
   });
 
-  it("honors a remembered auto-entry preference only for an active voice fixture", async () => {
+  it("migrates remembered automatic entry to manual Focus", async () => {
     const storage = memoryStorage({
       version: 2,
       focusScene: "soft-aurora",
@@ -132,20 +456,24 @@ describe("Voice Focus", () => {
       transcriptVisible: false,
       reducedMotion: "system",
     });
-    renderConnectedApp({ storage, voiceCapability: voiceCapability() });
+    renderConnectedApp({ storage, session: new FakeSession(configuredVoiceState()) });
 
-    expect(await screen.findByRole("dialog", { name: "Voice Focus" })).toBeTruthy();
-    expect(screen.getByLabelText("Enter Focus automatically when voice starts")).toBeTruthy();
+    expect(await screen.findByRole("button", { name: "Voice Focus" })).toBeTruthy();
+    expect(screen.queryByRole("dialog", { name: "Voice Focus" })).toBeNull();
   });
 
   it("keeps transcript hidden by default and announces text plus locality", async () => {
-    renderConnectedApp({
-      voiceCapability: voiceCapability({
-        state: "speaking",
-        transcript: "A fixture transcript",
-      }),
-    });
-    fireEvent.click(await screen.findByRole("button", { name: "Enter Voice Focus" }));
+    renderConnectedApp({ session: new FakeSession(configuredVoiceState({
+      voice: {
+        availability: "configured",
+        session: "active",
+        capture: "listening",
+        visual: "speaking",
+        sessionId: 1n,
+        partialTranscript: "A fixture transcript",
+      },
+    })) });
+    fireEvent.click(await screen.findByRole("button", { name: "Voice Focus" }));
 
     expect(await screen.findByText("Speaking")).toBeTruthy();
     expect(screen.getByText("Speaking").getAttribute("aria-live")).toBe("polite");
@@ -158,33 +486,22 @@ describe("Voice Focus", () => {
     expect(await screen.findByText("A fixture transcript")).toBeTruthy();
   });
 
-  it("shows non-local and unknown component status without implying privacy", async () => {
-    renderConnectedApp({
-      voiceCapability: voiceCapability({
-        components: {
-          stt: { status: "ready", location: "remote" },
-          llm: { status: "ready", location: "local" },
-          tts: { status: "unknown", location: null },
-        },
-      }),
-    });
-    fireEvent.click(await screen.findByRole("button", { name: "Enter Voice Focus" }));
-
-    expect(await screen.findByText("STT remote")).toBeTruthy();
-    expect(screen.getByText("LLM local")).toBeTruthy();
-    expect(screen.getByText("TTS unknown")).toBeTruthy();
-  });
-
   it("forgets transcript visibility between Focus sessions by default", async () => {
-    renderConnectedApp({
-      voiceCapability: voiceCapability({ transcript: "Session-only transcript" }),
-    });
-    fireEvent.click(await screen.findByRole("button", { name: "Enter Voice Focus" }));
+    renderConnectedApp({ session: new FakeSession(configuredVoiceState({
+      voice: {
+        availability: "configured",
+        session: "idle",
+        capture: "stopped",
+        visual: "idle",
+        partialTranscript: "Session-only transcript",
+      },
+    })) });
+    fireEvent.click(await screen.findByRole("button", { name: "Voice Focus" }));
     fireEvent.click(screen.getByRole("button", { name: "Show transcript" }));
     expect(screen.getByText("Session-only transcript")).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "Exit Focus" }));
-    fireEvent.click(screen.getByRole("button", { name: "Enter Voice Focus" }));
+    fireEvent.click(screen.getByRole("button", { name: "Voice Focus" }));
     expect(screen.queryByText("Session-only transcript")).toBeNull();
   });
 
@@ -192,14 +509,22 @@ describe("Voice Focus", () => {
     const storage = memoryStorage();
     renderConnectedApp({
       storage,
-      voiceCapability: voiceCapability({ transcript: "Remembered transcript" }),
+      session: new FakeSession(configuredVoiceState({
+        voice: {
+          availability: "configured",
+          session: "idle",
+          capture: "stopped",
+          visual: "idle",
+          partialTranscript: "Remembered transcript",
+        },
+      })),
     });
-    fireEvent.click(await screen.findByRole("button", { name: "Enter Voice Focus" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Voice Focus" }));
     fireEvent.click(screen.getByLabelText("Remember transcript visibility"));
     fireEvent.click(screen.getByRole("button", { name: "Show transcript" }));
 
     fireEvent.click(screen.getByRole("button", { name: "Exit Focus" }));
-    fireEvent.click(screen.getByRole("button", { name: "Enter Voice Focus" }));
+    fireEvent.click(screen.getByRole("button", { name: "Voice Focus" }));
     expect(screen.getByText("Remembered transcript")).toBeTruthy();
     expect(JSON.parse(storage.getItem(preferencesStorageKey) ?? "")).toMatchObject({
       rememberTranscriptVisibility: true,
@@ -245,10 +570,24 @@ describe("Voice Focus", () => {
     expect(focus.querySelector("[data-secondary-controls]")?.getAttribute("data-visible"))
       .toBe("true");
   });
+
+  it("does not steal control focus when live voice state updates", async () => {
+    const session = new FakeSession(configuredVoiceState({ voice: activeVoice() }));
+    renderConnectedApp({ session });
+    fireEvent.click(await screen.findByRole("button", { name: "Voice Focus" }));
+    const transcriptButton = await screen.findByRole("button", { name: "Show transcript" });
+    transcriptButton.focus();
+
+    act(() => session.emit(configuredVoiceState({
+      voice: { ...activeVoice(), visual: "thinking" },
+    })));
+
+    expect(document.activeElement).toBe(transcriptButton);
+  });
 });
 
 class FakeSession implements DesktopSession {
-  state = localState();
+  state: ConversationSessionState;
   readonly close = vi.fn(async () => undefined);
   readonly inspectMemory = vi.fn<DesktopSession["inspectMemory"]>();
   readonly interrupt = vi.fn(async () => undefined);
@@ -259,6 +598,10 @@ class FakeSession implements DesktopSession {
   readonly startVoice = vi.fn(async () => undefined);
   readonly stopVoice = vi.fn(async () => undefined);
   private readonly listeners = new Set<(state: ConversationSessionState) => void>();
+
+  constructor(state: ConversationSessionState = localState()) {
+    this.state = state;
+  }
 
   subscribe(listener: (state: ConversationSessionState) => void) {
     this.listeners.add(listener);
@@ -275,13 +618,11 @@ class FakeSession implements DesktopSession {
 function renderConnectedApp(options: {
   session?: FakeSession;
   storage?: Storage;
-  voiceCapability?: VoiceCapabilitySnapshot;
 } = {}) {
   render(
     <App
       connectSession={vi.fn(async () => options.session ?? new FakeSession())}
       storage={options.storage ?? memoryStorage()}
-      voiceCapability={options.voiceCapability}
     />,
   );
   connectWithAbsolutePaths();
@@ -295,27 +636,6 @@ function connectWithAbsolutePaths() {
     target: { value: "/Users/tester/runtime.toml" },
   });
   fireEvent.click(screen.getByRole("button", { name: "Connect local runtime" }));
-}
-
-function voiceCapability(options: {
-  sessionStatus?: "active" | "inactive";
-  state?: VoiceCapabilitySnapshot["session"]["state"];
-  transcript?: string;
-  components?: VoiceCapabilitySnapshot["components"];
-} = {}): VoiceCapabilitySnapshot {
-  return {
-    capability: "voice",
-    session: {
-      status: options.sessionStatus ?? "active",
-      state: options.state ?? "idle",
-      transcript: options.transcript ?? "",
-    },
-    components: options.components ?? {
-      stt: { status: "ready", location: "local" },
-      llm: { status: "ready", location: "local" },
-      tts: { status: "ready", location: "local" },
-    },
-  };
 }
 
 function localState(
@@ -346,6 +666,58 @@ function localState(
     error: undefined,
     ...overrides,
   };
+}
+
+function configuredVoiceState(
+  overrides: Partial<ConversationSessionState> = {},
+): ConversationSessionState {
+  return localState({
+    status: {
+      transport: "stdio",
+      privacyMode: "local_only",
+      languageLocation: "local",
+      modelId: "local-model",
+      memoryEnabled: false,
+      memoryLocation: null,
+      telemetryEnabled: false,
+      capabilities: ["text", "voice_session"],
+      components: [
+        { kind: "speech_recognition", executionLocation: "local", providerLabel: "Local speech recognition" },
+        { kind: "language_model", executionLocation: "local", providerLabel: "Local language" },
+        { kind: "speech_synthesis", executionLocation: "local", providerLabel: "Local speech synthesis" },
+        { kind: "audio_io", executionLocation: "local", providerLabel: "System audio" },
+      ],
+    },
+    voice: {
+      availability: "configured",
+      session: "idle",
+      capture: "stopped",
+      visual: "idle",
+      partialTranscript: "",
+    },
+    ...overrides,
+  });
+}
+
+function activeVoice(): ConversationSessionState["voice"] {
+  return {
+    availability: "configured",
+    session: "active",
+    capture: "listening",
+    visual: "listening",
+    sessionId: 1n,
+    partialTranscript: "",
+  };
+}
+
+function deferred<T>() {
+  let resolvePromise!: (value: T | PromiseLike<T>) => void;
+  let rejectPromise!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolve, reject) => {
+    resolvePromise = resolve;
+    rejectPromise = reject;
+  });
+  return { promise, reject: rejectPromise, resolve: resolvePromise };
 }
 
 function memoryStorage(value?: unknown): Storage {

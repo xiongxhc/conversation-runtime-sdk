@@ -12,10 +12,12 @@ export interface FocusSceneMetadata {
 
 export type VoiceVisualState =
   | "idle"
+  | "requesting_permission"
   | "listening"
   | "thinking"
   | "speaking"
   | "interrupted"
+  | "paused"
   | "error";
 
 export interface FocusSceneProps {

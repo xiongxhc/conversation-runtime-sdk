@@ -20,7 +20,7 @@ describe("local setup preferences", () => {
       configPath: "/runtime.toml",
     }))).toEqual(defaultSetupPaths);
     expect(loadSetupPaths(storageWith({
-      version: 2,
+      version: 3,
       gatewayPath: "/runtime-gateway",
       configPath: "/runtime.toml",
     }))).toEqual(defaultSetupPaths);

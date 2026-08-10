@@ -616,14 +616,82 @@ textarea {
 
 .voice-unavailable button {
   border: 1px solid rgba(40, 42, 43, 0.2);
-  opacity: 0.58;
+  opacity: 1;
   width: 100%;
+}
+
+.voice-unavailable .preview-focus-action {
+  opacity: 0.58;
 }
 
 .voice-unavailable p {
   color: #747773;
   font-size: 0.76rem;
   line-height: 1.5;
+}
+
+.conversation-voice-status {
+  align-items: center;
+  background: rgba(142, 214, 208, 0.1);
+  border: 1px solid rgba(74, 143, 137, 0.24);
+  border-radius: 14px;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: auto minmax(0, 1fr);
+  padding: 13px;
+}
+
+.conversation-voice-status p,
+.conversation-voice-status span {
+  margin: 0;
+}
+
+.conversation-voice-status p {
+  font-size: 0.8rem;
+  font-weight: 680;
+}
+
+.conversation-voice-status span {
+  color: #686d69;
+  display: block;
+  font-size: 0.7rem;
+  line-height: 1.45;
+}
+
+.conversation-voice-status .voice-control-error {
+  color: #8a4039;
+  margin-top: 6px;
+}
+
+.microphone-pulse {
+  background: #4a8f89;
+  border: 5px solid rgba(142, 214, 208, 0.32);
+  border-radius: 50%;
+  height: 10px;
+  width: 10px;
+}
+
+.microphone-pulse[data-capture="paused"] {
+  background: #777b82;
+  border-color: rgba(119, 123, 130, 0.22);
+}
+
+.conversation-voice-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  grid-column: 1 / -1;
+}
+
+.conversation-voice-actions button {
+  background: transparent;
+  border: 0;
+  color: inherit;
+  cursor: pointer;
+  font-size: 0.7rem;
+  padding: 2px 0;
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
 
 .privacy-status {
@@ -685,6 +753,35 @@ textarea {
   padding: 9px 12px;
 }
 
+.focus-microphone-indicator {
+  align-items: center;
+  background: rgba(23, 27, 36, 0.72);
+  border: 1px solid rgba(142, 214, 208, 0.34);
+  border-radius: 999px;
+  display: flex;
+  font-size: 0.7rem;
+  gap: 7px;
+  padding: 9px 12px;
+}
+
+.focus-microphone-indicator::before {
+  background: #8ed6d0;
+  border-radius: 50%;
+  content: "";
+  height: 7px;
+  width: 7px;
+}
+
+.focus-microphone-indicator[data-capture="paused"],
+.focus-microphone-indicator[data-capture="error"] {
+  border-color: rgba(183, 181, 174, 0.3);
+}
+
+.focus-microphone-indicator[data-capture="paused"]::before,
+.focus-microphone-indicator[data-capture="error"]::before {
+  background: #777b82;
+}
+
 .voice-presence-area {
   align-items: center;
   display: flex;
@@ -723,6 +820,10 @@ textarea {
   --focus-state-color: rgba(246, 243, 236, 0.62);
 }
 
+.voice-focus[data-state="requesting_permission"] {
+  --focus-state-color: #b8a3de;
+}
+
 .voice-focus[data-state="listening"] {
   --focus-state-color: #8ed6d0;
 }
@@ -736,8 +837,76 @@ textarea {
 }
 
 .voice-focus[data-state="interrupted"],
+.voice-focus[data-state="paused"],
 .voice-focus[data-state="error"] {
   --focus-state-color: rgba(246, 243, 236, 0.48);
+}
+
+.focus-start-voice,
+.focus-stop-voice {
+  background: rgba(23, 27, 36, 0.72);
+  border: 1px solid rgba(246, 243, 236, 0.28);
+  border-radius: 999px;
+  color: #f6f3ec;
+  cursor: pointer;
+  margin-top: 22px;
+  padding: 10px 18px;
+}
+
+.focus-stop-voice:disabled {
+  cursor: wait;
+  opacity: 0.56;
+}
+
+.voice-exit-dialog {
+  align-items: center;
+  backdrop-filter: blur(18px);
+  background: rgba(10, 13, 18, 0.58);
+  display: flex;
+  inset: 0;
+  justify-content: center;
+  padding: 24px;
+  position: fixed;
+  z-index: 20;
+}
+
+.voice-exit-card {
+  background: #f0eee8;
+  border: 1px solid rgba(246, 243, 236, 0.3);
+  border-radius: 18px;
+  box-shadow: 0 26px 80px rgba(5, 8, 12, 0.42);
+  color: #292c2d;
+  max-width: 440px;
+  padding: 26px;
+}
+
+.voice-exit-card h2 {
+  font-family: ui-rounded, "SF Pro Rounded", -apple-system, system-ui, sans-serif;
+  margin: 8px 0 10px;
+}
+
+.voice-exit-card > p:not(.utility-label) {
+  color: #666a68;
+  line-height: 1.55;
+}
+
+.voice-exit-card .voice-exit-error {
+  color: #8a4039;
+  font-size: 0.82rem;
+}
+
+.voice-exit-actions {
+  display: grid;
+  gap: 8px;
+  margin-top: 22px;
+}
+
+.voice-exit-actions button {
+  border: 1px solid rgba(40, 42, 43, 0.18);
+  border-radius: 10px;
+  cursor: pointer;
+  padding: 11px 13px;
+  text-align: left;
 }
 
 .voice-state-label {
@@ -815,6 +984,10 @@ textarea {
 @media (prefers-reduced-motion: no-preference) {
   .voice-focus[data-state="idle"] .voice-presence-orb {
     animation: focus-breathe 6s ease-in-out infinite;
+  }
+
+  .voice-focus[data-state="requesting_permission"] .voice-presence-orb {
+    animation: focus-think 3.2s ease-in-out infinite;
   }
 
   .voice-focus[data-state="listening"] .voice-presence-orb {
@@ -919,6 +1092,8 @@ textarea {
   }
 
   .focus-persistent-controls {
+    align-items: flex-start;
+    flex-wrap: wrap;
     gap: 12px;
     padding: 16px;
   }
@@ -926,6 +1101,10 @@ textarea {
   .focus-privacy {
     justify-content: flex-end;
     max-width: 70vw;
+  }
+
+  .focus-microphone-indicator {
+    order: 3;
   }
 
   .focus-secondary-controls {
@@ -967,6 +1146,30 @@ textarea {
   .voice-unavailable,
   .runtime-details div {
     border-color: rgba(255, 255, 255, 0.12);
+  }
+
+  .conversation-voice-status {
+    background: rgba(142, 214, 208, 0.08);
+    border-color: rgba(142, 214, 208, 0.2);
+  }
+
+  .conversation-voice-status span {
+    color: #b9bfbb;
+  }
+
+  .voice-exit-card {
+    background: #262a31;
+    color: #f1eee7;
+  }
+
+  .voice-exit-card > p:not(.utility-label) {
+    color: #c4c1ba;
+  }
+
+  .voice-exit-actions button {
+    background: rgba(255, 255, 255, 0.06);
+    border-color: rgba(255, 255, 255, 0.16);
+    color: #f1eee7;
   }
 
   .memory-list,

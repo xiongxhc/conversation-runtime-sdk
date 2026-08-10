@@ -23,10 +23,12 @@ export interface SceneResourceTracker {
 
 export const voiceStateColors: Record<VoiceVisualState, string> = {
   idle: "#b8a3de",
+  requesting_permission: "#b8a3de",
   listening: "#8ed6d0",
   thinking: "#b8a3de",
   speaking: "#eaa58d",
   interrupted: "#f6f3ec",
+  paused: "#777b82",
   error: "#777b82",
 };
 

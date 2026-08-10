@@ -40,6 +40,22 @@ export function textOnlyComponentStatus(
   };
 }
 
+export function voiceComponentStatus(
+  status: ConversationSessionState["status"],
+): ComponentStatusSnapshot {
+  const location = (kind: "speech_recognition" | "language_model" | "speech_synthesis") => {
+    const component = status.components.find((candidate) => candidate.kind === kind);
+    return component
+      ? { status: "ready" as const, location: component.executionLocation }
+      : { status: "unavailable" as const, location: null };
+  };
+  return {
+    stt: location("speech_recognition"),
+    llm: location("language_model"),
+    tts: location("speech_synthesis"),
+  };
+}
+
 export const disconnectedComponentStatus: ComponentStatusSnapshot = {
   stt: { status: "unavailable", location: null },
   llm: { status: "unavailable", location: null },

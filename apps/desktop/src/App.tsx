@@ -7,7 +7,7 @@ import type {
 } from "@conversation/runtime/browser";
 
 import { SetupView } from "./components/SetupView.js";
-import { Workspace, type VoiceCapabilitySnapshot } from "./components/Workspace.js";
+import { Workspace } from "./components/Workspace.js";
 import {
   conversationHistoryStore,
   type ConversationHistoryStore,
@@ -46,7 +46,6 @@ export interface AppProps {
   connectSession?: (paths: RuntimePaths) => Promise<DesktopSession>;
   historyStore?: ConversationHistoryStore;
   storage?: StorageLike;
-  voiceCapability?: VoiceCapabilitySnapshot;
 }
 
 const defaultConnectSession = async (paths: RuntimePaths): Promise<DesktopSession> => {
@@ -58,7 +57,6 @@ export function App({
   connectSession = defaultConnectSession,
   historyStore = conversationHistoryStore,
   storage = window.localStorage,
-  voiceCapability,
 }: AppProps) {
   const [session, setSession] = useState<DesktopSession>();
   const [setupError, setSetupError] = useState<string>();
@@ -117,7 +115,6 @@ export function App({
       }}
       session={session}
       storage={storage}
-      voiceCapability={voiceCapability}
     />
   );
 }

@@ -7,10 +7,10 @@ export interface StorageLike {
 }
 
 export interface Preferences {
-  version: 2;
+  version: 3;
   focusScene: FocusSceneId;
   focusIntensity: number;
-  focusEntry: "manual" | "automatic";
+  focusEntry: "manual";
   rememberTranscriptVisibility: boolean;
   transcriptVisible: boolean;
   reducedMotion: "system";
@@ -19,7 +19,7 @@ export interface Preferences {
 export const preferencesStorageKey = "conversation-desktop.preferences";
 
 export const defaultPreferences: Preferences = {
-  version: 2,
+  version: 3,
   focusScene: "soft-aurora",
   focusIntensity: 0.55,
   focusEntry: "manual",
@@ -66,7 +66,7 @@ function validatePreferences(value: unknown): Preferences {
     return normalizePreferences(value, false, false);
   }
 
-  if (value.version !== 2) {
+  if (value.version !== 2 && value.version !== 3) {
     return { ...defaultPreferences };
   }
 
@@ -84,13 +84,10 @@ function normalizePreferences(
   transcriptVisible: boolean,
 ): Preferences {
   return {
-    version: 2,
+    version: 3,
     focusScene: isFocusSceneId(value.focusScene) ? value.focusScene : defaultPreferences.focusScene,
     focusIntensity: isIntensity(value.focusIntensity) ? value.focusIntensity : defaultPreferences.focusIntensity,
-    focusEntry:
-      value.focusEntry === "manual" || value.focusEntry === "automatic"
-        ? value.focusEntry
-        : defaultPreferences.focusEntry,
+    focusEntry: "manual",
     rememberTranscriptVisibility,
     transcriptVisible,
     reducedMotion: value.reducedMotion === "system" ? value.reducedMotion : defaultPreferences.reducedMotion,

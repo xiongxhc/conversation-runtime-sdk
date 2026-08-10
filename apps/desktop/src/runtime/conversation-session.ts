@@ -201,6 +201,7 @@ export class ConversationSession {
       return this.voiceStopPromise;
     }
     const pendingStart = this.voiceStartPromise;
+    const previousSession = this.voice.session;
     if (!this.voiceSession && !pendingStart) {
       return Promise.resolve();
     }
@@ -212,7 +213,22 @@ export class ConversationSession {
       if (!voiceSession) {
         return;
       }
-      await voiceSession.stop();
+      try {
+        await voiceSession.stop();
+      } catch (error) {
+        if (
+          !this.closePromise &&
+          this.voiceSession === voiceSession &&
+          this.voice.session === "stopping"
+        ) {
+          this.voice = {
+            ...this.voice,
+            session: this.voice.sessionId === undefined ? previousSession : "active",
+          };
+          this.publish();
+        }
+        throw asError(error);
+      }
       await this.voiceEventsPromise;
     })().finally(() => {
       this.voiceStopPromise = undefined;

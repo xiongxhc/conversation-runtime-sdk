@@ -7,45 +7,35 @@ import type {
   ConversationSummary,
 } from "../history/conversation-history.js";
 import { savePreferences, type Preferences, type StorageLike } from "../preferences/preferences.js";
-import type { VoiceVisualState } from "../focus-scenes/types.js";
 import type { ConversationSessionState } from "../runtime/conversation-session.js";
 import {
   disconnectedComponentStatus,
   PrivacyStatus,
   textOnlyComponentStatus,
-  type ComponentStatusSnapshot,
+  voiceComponentStatus,
 } from "./PrivacyStatus.js";
+import { ConversationVoiceStatus } from "./ConversationVoiceStatus.js";
 import { MemoryPane } from "./MemoryPane.js";
+import { VoiceExitDialog, type VoiceExitChoice } from "./VoiceExitDialog.js";
 import { VoiceFocus } from "./VoiceFocus.js";
-
-export interface VoiceCapabilitySnapshot {
-  capability: "voice";
-  session: {
-    status: "active" | "inactive";
-    state: VoiceVisualState;
-    transcript: string;
-  };
-  components: ComponentStatusSnapshot;
-}
 
 export interface WorkspaceProps {
   session: DesktopSession;
   historyStore: ConversationHistoryStore;
   initialPreferences: Preferences;
   storage: StorageLike;
-  voiceCapability?: VoiceCapabilitySnapshot;
   onClosed(setupError?: string): void;
 }
 
 type FocusMode = "live" | "preview";
 type WorkspaceView = "conversation" | "history" | "memory";
+type VoiceControlFailure = { message: string; retry: () => Promise<void> };
 
 export function Workspace({
   session,
   historyStore,
   initialPreferences,
   storage,
-  voiceCapability,
   onClosed,
 }: WorkspaceProps) {
   const [sessionState, setSessionState] = useState<ConversationSessionState>(session.state);
@@ -58,21 +48,36 @@ export function Workspace({
   const [historyPath, setHistoryPath] = useState<string>();
   const [historyError, setHistoryError] = useState<string>();
   const [operationError, setOperationError] = useState<string>();
+  const [voiceControlFailure, setVoiceControlFailure] = useState<VoiceControlFailure>();
+  const [exitVoiceSessionId, setExitVoiceSessionId] = useState<bigint | null>();
+  const [exitDialogError, setExitDialogError] = useState<string>();
+  const [exitBusy, setExitBusy] = useState(false);
+  const [voiceRestartBusy, setVoiceRestartBusy] = useState(false);
   const currentConversation = useRef<ConversationHistory | undefined>(undefined);
   const historyTurnOffset = useRef(0);
   const lastPersistedState = useRef("");
   const historyWrite = useRef(Promise.resolve());
   const focusReturn = useRef<HTMLButtonElement>(null);
   const restoreFocusOnWorkspace = useRef(false);
+  const voiceControlOperation = useRef(0);
+  const voiceRestartPending = useRef(false);
+  const typedResume = useRef<{ sessionId: bigint; turnCount: number } | undefined>(undefined);
+  const pausedForComposerSession = useRef<bigint | undefined>(undefined);
+  const composerFocused = useRef(false);
   const runtimeHealthy = sessionState.phase === "ready" || sessionState.phase === "streaming";
   const memoryAvailable =
     sessionState.status.memoryEnabled &&
     sessionState.status.memoryLocation === "local" &&
     sessionState.status.capabilities[1] === "memory_inspection";
-  const canRenderLiveFocus =
-    focusMode === "live" &&
-    runtimeHealthy &&
-    voiceCapability?.session.status === "active";
+  const voiceConfigured = sessionState.voice.availability === "configured";
+  const voiceRunning = sessionState.voice.session !== "idle" && (
+    sessionState.voice.session !== "error" || sessionState.voice.sessionId !== undefined
+  );
+  const exitChoiceVisible = exitVoiceSessionId !== undefined;
+  const canRenderLiveFocus = focusMode === "live" && runtimeHealthy && voiceConfigured;
+  const components = voiceConfigured
+    ? voiceComponentStatus(sessionState.status)
+    : textOnlyComponentStatus(sessionState.status);
 
   useEffect(() => session.subscribe((state) => {
     setSessionState(state);
@@ -95,15 +100,6 @@ export function Workspace({
     };
   }, [historyStore]);
   useEffect(() => {
-    if (
-      preferences.focusEntry === "automatic" &&
-      runtimeHealthy &&
-      voiceCapability?.session.status === "active"
-    ) {
-      setFocusMode("live");
-    }
-  }, [preferences.focusEntry, runtimeHealthy, voiceCapability?.session.status]);
-  useEffect(() => {
     if (!focusMode && restoreFocusOnWorkspace.current) {
       restoreFocusOnWorkspace.current = false;
       focusReturn.current?.focus();
@@ -114,6 +110,73 @@ export function Workspace({
       setWorkspaceView("conversation");
     }
   }, [sessionState.phase, workspaceView]);
+  useEffect(() => {
+    const pending = typedResume.current;
+    if (sessionState.voice.session !== "active") {
+      typedResume.current = undefined;
+    }
+    if (pending && sessionState.voice.sessionId !== pending.sessionId) {
+      typedResume.current = undefined;
+      return;
+    }
+    if (
+      pending &&
+      sessionState.phase === "ready" &&
+      sessionState.turns.length > pending.turnCount &&
+      sessionState.voice.session === "active" &&
+      sessionState.voice.sessionId === pending.sessionId &&
+      sessionState.voice.capture === "paused" &&
+      pausedForComposerSession.current === pending.sessionId
+    ) {
+      typedResume.current = undefined;
+      pausedForComposerSession.current = undefined;
+      runVoiceControl(
+        () => session.resumeVoiceCapture(),
+        "Microphone resume failed. Retry or stop voice before continuing.",
+      );
+    }
+  }, [sessionState.phase, sessionState.turns.length, sessionState.voice.capture, sessionState.voice.session, sessionState.voice.sessionId]);
+  useEffect(() => {
+    if (
+      !composerFocused.current &&
+      message.trim() === "" &&
+      sessionState.phase === "ready" &&
+      sessionState.voice.session === "active" &&
+      sessionState.voice.capture === "paused" &&
+      sessionState.voice.sessionId !== undefined &&
+      pausedForComposerSession.current === sessionState.voice.sessionId &&
+      typedResume.current === undefined
+    ) {
+      pausedForComposerSession.current = undefined;
+      runVoiceControl(
+        () => session.resumeVoiceCapture(),
+        "Microphone resume failed. Retry or stop voice before continuing.",
+      );
+    }
+  }, [message, sessionState.phase, sessionState.voice.capture, sessionState.voice.session, sessionState.voice.sessionId]);
+  useEffect(() => {
+    const ownedSessionId = pausedForComposerSession.current;
+    if (ownedSessionId !== undefined && sessionState.voice.sessionId !== ownedSessionId) {
+      pausedForComposerSession.current = undefined;
+    }
+    if (
+      composerFocused.current &&
+      sessionState.voice.session === "active" &&
+      sessionState.voice.capture === "listening" &&
+      sessionState.voice.sessionId !== undefined &&
+      pausedForComposerSession.current !== sessionState.voice.sessionId
+    ) {
+      requestComposerPause();
+    }
+  }, [sessionState.voice.capture, sessionState.voice.session, sessionState.voice.sessionId]);
+  useEffect(() => {
+    if (exitVoiceSessionId === undefined) return;
+    const currentSessionId = sessionState.voice.sessionId ?? null;
+    if (!voiceRunning || currentSessionId !== exitVoiceSessionId) {
+      setExitVoiceSessionId(undefined);
+      setExitDialogError(undefined);
+    }
+  }, [exitVoiceSessionId, sessionState.voice.sessionId, voiceRunning]);
 
   const updatePreferences = (nextPreferences: Preferences) => {
     setPreferences(nextPreferences);
@@ -203,25 +266,160 @@ export function Workspace({
 
   const exitFocus = () => {
     restoreFocusOnWorkspace.current = true;
+    setExitVoiceSessionId(undefined);
+    setExitDialogError(undefined);
     setFocusMode(undefined);
   };
 
-  useEffect(() => {
-    if (
-      focusMode &&
-      (!runtimeHealthy || (focusMode === "live" && voiceCapability?.session.status !== "active"))
-    ) {
+  const runVoiceControl = (
+    control: () => Promise<void>,
+    errorMessage: string,
+  ) => {
+    const operation = ++voiceControlOperation.current;
+    setVoiceControlFailure(undefined);
+    void control().then(
+      () => {
+        if (voiceControlOperation.current === operation) {
+          setVoiceControlFailure(undefined);
+        }
+      },
+      () => {
+        if (voiceControlOperation.current === operation) {
+          setVoiceControlFailure({ message: errorMessage, retry: control });
+        }
+      },
+    );
+  };
+
+  const startVoice = () => runVoiceControl(
+    () => session.startVoice(),
+    "Voice could not start. Retry or review the local microphone configuration.",
+  );
+
+  const stopVoice = () => {
+    typedResume.current = undefined;
+    pausedForComposerSession.current = undefined;
+    runVoiceControl(
+      () => session.stopVoice(),
+      "Voice could not stop cleanly. Retry before closing the runtime.",
+    );
+  };
+
+  const restartVoiceControl = async () => {
+    if (voiceRestartPending.current) return;
+    voiceRestartPending.current = true;
+    setVoiceRestartBusy(true);
+    try {
+      await session.stopVoice();
+      await session.startVoice();
+    } finally {
+      voiceRestartPending.current = false;
+      setVoiceRestartBusy(false);
+    }
+  };
+
+  const restartVoice = () => {
+    typedResume.current = undefined;
+    pausedForComposerSession.current = undefined;
+    runVoiceControl(
+      restartVoiceControl,
+      "Voice could not restart. Retry or review the local microphone configuration.",
+    );
+  };
+
+  const requestComposerPause = () => {
+    const sessionId = sessionState.voice.sessionId;
+    if (sessionId === undefined) return;
+    pausedForComposerSession.current = sessionId;
+    runVoiceControl(
+      () => session.pauseVoiceCapture(),
+      "Microphone pause failed. Retry or stop voice before typing.",
+    );
+  };
+
+  const requestExitFocus = () => {
+    if (voiceRunning) {
+      setExitVoiceSessionId(sessionState.voice.sessionId ?? null);
+      setExitDialogError(undefined);
+    } else {
       exitFocus();
     }
-  }, [focusMode, runtimeHealthy, voiceCapability?.session.status]);
+  };
+
+  const chooseVoiceExit = async (choice: VoiceExitChoice) => {
+    if (choice === "cancel") {
+      setExitVoiceSessionId(undefined);
+      setExitDialogError(undefined);
+      return;
+    }
+    if (choice === "keep") {
+      exitFocus();
+      return;
+    }
+    const currentSessionId = sessionState.voice.sessionId ?? null;
+    if (!voiceRunning || currentSessionId !== exitVoiceSessionId) {
+      setExitVoiceSessionId(undefined);
+      setExitDialogError(undefined);
+      return;
+    }
+    typedResume.current = undefined;
+    pausedForComposerSession.current = undefined;
+    setExitBusy(true);
+    try {
+      await session.stopVoice();
+      exitFocus();
+    } catch {
+      setExitDialogError("Voice could not stop cleanly. Retry or keep voice active.");
+    } finally {
+      setExitBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    if (focusMode && (!runtimeHealthy || (focusMode === "live" && !voiceConfigured))) {
+      exitFocus();
+    }
+  }, [focusMode, runtimeHealthy, voiceConfigured]);
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
     const transcript = message.trim();
-    if (!transcript || sessionState.phase !== "ready") return;
+    const voiceNeedsPause = voiceRunning && sessionState.voice.capture !== "paused";
+    if (!transcript || sessionState.phase !== "ready" || voiceNeedsPause) return;
     setOperationError(undefined);
+    if (sessionState.voice.sessionId !== undefined && sessionState.voice.capture === "paused") {
+      typedResume.current = {
+        sessionId: sessionState.voice.sessionId,
+        turnCount: sessionState.turns.length,
+      };
+    }
     void Promise.resolve(session.send(transcript)).catch(() => undefined);
     setMessage("");
+  };
+
+  const focusComposer = () => {
+    composerFocused.current = true;
+    if (sessionState.voice.capture === "listening") {
+      requestComposerPause();
+    }
+  };
+
+  const blurComposer = () => {
+    composerFocused.current = false;
+    if (
+      message.trim() === "" &&
+      sessionState.phase === "ready" &&
+      sessionState.voice.session === "active" &&
+      sessionState.voice.capture === "paused" &&
+      pausedForComposerSession.current === sessionState.voice.sessionId &&
+      typedResume.current === undefined
+    ) {
+      pausedForComposerSession.current = undefined;
+      runVoiceControl(
+        () => session.resumeVoiceCapture(),
+        "Microphone resume failed. Retry or stop voice before continuing.",
+      );
+    }
   };
 
   const close = async () => {
@@ -261,33 +459,62 @@ export function Workspace({
     );
   };
 
-  if (canRenderLiveFocus && voiceCapability) {
+  if (canRenderLiveFocus) {
     return (
-      <VoiceFocus
-        components={voiceCapability.components}
-        mode="live"
-        onExit={exitFocus}
-        onPreferencesChange={updatePreferences}
-        preferences={preferences}
-        reducedMotion={prefersReducedMotion()}
-        state={voiceCapability.session.state}
-        transcript={voiceCapability.session.transcript}
-      />
+      <>
+        <VoiceFocus
+          capture={sessionState.voice.capture}
+          components={components}
+          controlError={voiceControlFailure?.message}
+          mode="live"
+          onExit={requestExitFocus}
+          onPreferencesChange={updatePreferences}
+          onRetryControl={voiceControlFailure
+            ? () => runVoiceControl(
+              voiceControlFailure.retry,
+              voiceControlFailure.message,
+            )
+            : undefined}
+          onRetryVoice={restartVoice}
+          onStart={startVoice}
+          onStop={stopVoice}
+          preferences={preferences}
+          reducedMotion={prefersReducedMotion()}
+          retryVoiceBusy={voiceRestartBusy}
+          runtimeError={sessionState.voice.error?.message}
+          session={sessionState.voice.session}
+          state={sessionState.voice.visual}
+          suspended={exitChoiceVisible}
+          transcript={sessionState.voice.partialTranscript || sessionState.activeTurn?.transcript || ""}
+        />
+        {exitChoiceVisible ? (
+          <VoiceExitDialog
+            busy={exitBusy}
+            error={exitDialogError}
+            onChoose={(choice) => void chooseVoiceExit(choice)}
+          />
+        ) : null}
+      </>
     );
   }
 
   if (focusMode === "preview" && runtimeHealthy) {
     return (
-      <VoiceFocus
-        components={textOnlyComponentStatus(sessionState.status)}
-        mode="preview"
-        onExit={exitFocus}
-        onPreferencesChange={updatePreferences}
-        preferences={preferences}
-        reducedMotion={prefersReducedMotion()}
-        state="idle"
-        transcript=""
-      />
+        <VoiceFocus
+          capture="stopped"
+          components={textOnlyComponentStatus(sessionState.status)}
+          mode="preview"
+          onExit={exitFocus}
+          onPreferencesChange={updatePreferences}
+          onStart={() => undefined}
+          onStop={() => undefined}
+          preferences={preferences}
+          reducedMotion={prefersReducedMotion()}
+          session="idle"
+          state="idle"
+          suspended={false}
+          transcript=""
+        />
     );
   }
 
@@ -391,7 +618,9 @@ export function Workspace({
           <textarea
             id="message"
             disabled={sessionState.phase === "failed" || sessionState.phase === "closed"}
+            onBlur={blurComposer}
             onChange={(event) => setMessage(event.target.value)}
+            onFocus={focusComposer}
             placeholder="Write a message"
             rows={2}
             value={message}
@@ -401,7 +630,14 @@ export function Workspace({
               Stop
             </button>
           ) : (
-            <button className="send-action" disabled={!message.trim()} type="submit">
+            <button
+              className="send-action"
+              disabled={
+                !message.trim() ||
+                (voiceRunning && sessionState.voice.capture !== "paused")
+              }
+              type="submit"
+            >
               Send
             </button>
           )}
@@ -440,40 +676,58 @@ export function Workspace({
             <div><dt>Memory</dt><dd>{sessionState.status.memoryEnabled ? "Local" : "Memory off"}</dd></div>
           </dl>
         </div>
+        {voiceRunning && focusMode !== "live" ? (
+          <ConversationVoiceStatus
+            error={voiceControlFailure?.message ?? sessionState.voice.error?.message}
+            onRetry={voiceControlFailure
+              ? () => runVoiceControl(
+                voiceControlFailure.retry,
+                voiceControlFailure.message,
+              )
+              : sessionState.voice.error
+                ? restartVoice
+                : undefined}
+            onReturn={() => setFocusMode("live")}
+            onStop={stopVoice}
+            retryLabel={voiceControlFailure ? "Retry voice control" : "Retry voice"}
+            retryBusy={voiceRestartBusy}
+            voice={sessionState.voice}
+          />
+        ) : null}
         <div className="voice-unavailable">
-          {voiceCapability?.session.status === "active" ? (
+          {voiceConfigured ? (
             <button
               disabled={!runtimeHealthy}
               onClick={() => setFocusMode("live")}
               ref={focusReturn}
               type="button"
             >
-              Enter Voice Focus
+              Voice Focus
             </button>
           ) : null}
           {!runtimeHealthy ? (
             <p>Reconnect the runtime before entering Voice Focus.</p>
-          ) : voiceCapability?.session.status === "active" ? (
-            <p>Voice-capable fixture connected. Focus opens only from reported voice state.</p>
-          ) : voiceCapability ? (
-            <p>Start a voice session before entering Voice Focus.</p>
+          ) : voiceConfigured ? (
+            <p>Open Voice Focus, then start the local microphone when you are ready.</p>
           ) : (
             <p>Microphone and speech playback are not connected in this desktop build. The scene below is a visual preview only.</p>
           )}
-          <button
-            className="preview-focus-action"
-            onClick={() => setFocusMode("preview")}
-            ref={!voiceCapability ? focusReturn : undefined}
-            type="button"
-          >
-            Preview Voice Focus
-          </button>
+          {!voiceConfigured ? (
+            <button
+              className="preview-focus-action"
+              onClick={() => setFocusMode("preview")}
+              ref={focusReturn}
+              type="button"
+            >
+              Preview Voice Focus
+            </button>
+          ) : null}
         </div>
         <PrivacyStatus
           components={
             sessionState.phase === "failed" || sessionState.phase === "closed"
               ? disconnectedComponentStatus
-              : voiceCapability?.components ?? textOnlyComponentStatus(sessionState.status)
+              : components
           }
         />
         {sessionState.phase === "failed" || sessionState.phase === "closed" ? (

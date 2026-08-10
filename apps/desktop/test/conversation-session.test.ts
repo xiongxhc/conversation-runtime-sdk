@@ -337,6 +337,22 @@ describe("ConversationSession", () => {
     expect(transport.closeCalls).toBe(1);
   });
 
+  it("restores active voice state when Stop is request-scoped rejected", async () => {
+    const transport = connectedVoiceTransport();
+    const session = await ConversationSession.connect(transport);
+    await session.startVoice();
+    transport.voiceEvent({
+      type: "voice_session_started",
+      session_id: "1",
+      privacy: { privacy_mode: "local_only", components: localVoiceStatus.components },
+    });
+    await eventually(() => expect(session.state.voice.session).toBe("active"));
+    transport.rejectNextVoiceStop = true;
+
+    await expect(session.stopVoice()).rejects.toThrow("voice stop rejected");
+    expect(session.state.voice).toMatchObject({ session: "active", capture: "listening" });
+  });
+
   it("bounds voice cleanup before forcing transport close", async () => {
     const transport = connectedVoiceTransport();
     const session = await ConversationSession.connect(transport);
@@ -472,6 +488,7 @@ class InMemoryTransport implements RuntimeTransport {
   holdStartAcceptance = false;
   holdVoiceStartAcceptance = false;
   rejectNextVoiceStart = false;
+  rejectNextVoiceStop = false;
   private heldStart: ClientCommand | undefined;
   private heldVoiceStart: ClientCommand | undefined;
   private turnCounter = 0n;
@@ -499,6 +516,21 @@ class InMemoryTransport implements RuntimeTransport {
           kind: "adapter",
           stage: "audio_capture",
           message: "microphone unavailable",
+        },
+      });
+      return;
+    }
+    if (command.type === "stop_voice_session" && this.rejectNextVoiceStop) {
+      this.rejectNextVoiceStop = false;
+      this.emit({
+        protocol_version: 1,
+        type: "command_rejected",
+        request_id: command.requestId,
+        error: {
+          code: "invalid_state",
+          kind: "invalid_state",
+          stage: "runtime",
+          message: "voice stop rejected",
         },
       });
       return;

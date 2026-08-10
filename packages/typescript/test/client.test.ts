@@ -577,6 +577,27 @@ test("a terminal first voice event settles an accepted session", async () => {
   await failed.client.close();
 });
 
+test("rejects nonterminal voice events before the session-start privacy envelope", async () => {
+  const connected = await connectedClient();
+  const starting = connected.client.startVoiceSession();
+  const start = command(connected.transport, "start_voice_session");
+  connected.transport.push(acceptedControl(start.requestId));
+  const session = await starting;
+
+  connected.transport.push(voiceEvent({
+    type: "voice_transcript_partial",
+    session_id: "1",
+    segment_id: "1",
+    text: "premature",
+  }));
+
+  await assert.rejects(
+    session.events()[Symbol.asyncIterator]().next(),
+    /before voice session started/,
+  );
+  await connected.client.close();
+});
+
 test("fails the client when a voice event changes sessionId", async () => {
   const connected = await connectedClient();
   const starting = connected.client.startVoiceSession();

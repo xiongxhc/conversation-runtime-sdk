@@ -1,10 +1,15 @@
 # Desktop Reference App
 
 This macOS Tauri reference app exercises the public browser-safe runtime SDK
-against the compiled local gateway. The desktop app supports local text chat,
-locally persisted transcript history, optional read-only runtime-memory
-inspection, and an idle Voice Focus preview. It does not activate a microphone
-or play audio.
+against the compiled local gateway. It supports local text chat, explicit local
+voice sessions, shared typed/spoken conversation state, app-owned transcript
+history, optional read-only runtime-memory inspection, and Voice Focus scenes.
+
+The desktop is a reference application, not the SDK boundary. It owns UI state,
+setup paths, Focus preferences, and transcript-history presentation. The public
+SDK owns protocol validation and lifecycle handles; the Rust runtime owns turn
+identifiers, context, persona/quality decisions, optional memory, and
+cancellation; the gateway owns private configuration and child cleanup.
 
 ## Run from a Clean Checkout
 
@@ -18,8 +23,8 @@ cargo build --locked -p conversation-runtime-gateway
 ```
 
 Copy the example gateway configuration to a private absolute path, then edit
-the loopback endpoint and model placeholder for a local service already running
-on this Mac:
+the loopback endpoint and generic model placeholder for a local service already
+running on this Mac:
 
 ```bash
 PRIVATE_GATEWAY_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/conversation-runtime/gateway.toml"
@@ -28,7 +33,27 @@ cp configs/gateway.example.toml "$PRIVATE_GATEWAY_CONFIG"
 ${EDITOR:-vi} "$PRIVATE_GATEWAY_CONFIG"
 ```
 
-Launch the native development app with the documented root command:
+For text-only use, leave the optional `[voice.*]` blocks commented. For voice:
+
+1. Build the managed macOS sidecar.
+2. Set `[voice.asr].model_path` to an existing local ASR model directory.
+3. Set `[voice.audio].sidecar_executable` to the printed absolute path.
+4. Set the speech endpoint, model, and voice to an explicitly selected local
+   service; public placeholders are not deployment defaults.
+5. Uncomment the complete voice subtree together.
+
+```bash
+swift build -c release --package-path platform/macos/voice-sidecar
+printf '%s/conversation-voice-sidecar\n' "$(swift build -c release \
+  --package-path platform/macos/voice-sidecar --show-bin-path)"
+```
+
+Configuration loading validates voice paths and policy but does not access the
+microphone, spawn the sidecar, or contact providers. The app requests capture
+only after explicit `Start voice`. Local-only status is enforced and there is
+no silent fallback to a remote provider.
+
+Launch the native development app:
 
 ```bash
 npm run desktop:dev
@@ -41,7 +66,7 @@ In setup, enter these two absolute paths:
 <value printed by: printf '%s\n' "$PRIVATE_GATEWAY_CONFIG">
 ```
 
-For copyable values, run this from the same shell:
+For copyable values:
 
 ```bash
 printf 'Gateway: %s\nConfig: %s\n' \
@@ -49,70 +74,70 @@ printf 'Gateway: %s\nConfig: %s\n' \
   "$PRIVATE_GATEWAY_CONFIG"
 ```
 
-The app requires the configured loopback model service to be running before
-`Connect local runtime` can succeed. It never falls back to a remote service.
+The gateway can connect before the configured loopback language service is
+running, but the service must be available before the first text or spoken turn.
 
-## Developer Checks
+## Voice Behavior
 
-- Send local text turns, observe streamed assistant text, stop an active turn,
-  close the runtime, and reconnect through setup.
-- Open `History`, reopen a prior transcript read-only, verify the displayed
-  SQLite storage path, and delete a saved conversation.
-- When the connected local gateway explicitly advertises memory inspection,
-  open `Memory`, page through at most 50 summaries at a time, and open a
-  record's read-only detail. The detail shows at most the latest 32 provenance
-  entries and 32 approval entries, with an explicit notice when older entries
-  are truncated.
-- Open `Preview Voice Focus` and switch among Soft Aurora, Silk, Threads,
-  Prism, Orb, Still Gradient, and None. Soft Aurora is the default.
-- Verify the Focus transcript is hidden by default, reveal it explicitly, and
-  leave Focus with `Escape` or `Exit Focus`.
-- Verify reduced-motion selects the static fallback for animated scenes.
+- Entering `Voice Focus` never starts the microphone. Select `Start voice` to
+  request permission and wait for the sidecar's capture acknowledgement.
+- Typed and finalized spoken turns appear in one transcript and use one bounded
+  runtime context. Partial ASR text is display-only and is not persisted.
+- Focusing the composer pauses capture before typed send. Send remains disabled
+  until pause is acknowledged. Capture resumes only after that typed turn is
+  terminal, the draft is empty, and the same voice session still owns the pause.
+- `Exit Focus` offers Stop, Keep, and Cancel. Keep returns to Conversation with
+  a visible microphone status; Stop waits for voice cleanup; Cancel remains in
+  Focus.
+- Speaking during playback produces barge-in lifecycle state and cancels old
+  generation, synthesis, queued audio, and active playback in the runtime.
+- Recoverable voice failures leave typed chat usable and expose retry. Fatal
+  gateway failures return to setup.
+- App close uses bounded voice and gateway cleanup rather than silently leaving
+  the sidecar running.
 
-`Preview Voice Focus` is intentionally idle. The production gateway does not
-advertise voice capabilities, so live Focus cannot imply listening,
-recognition, speech playback, or barge-in.
+When voice is not configured, `Preview Voice Focus` remains available without
+capture. Soft Aurora is the default; Silk, Threads, Prism, Orb, Still Gradient,
+and None are also selectable. Transcript visibility is hidden by default and
+can be remembered explicitly. Reduced-motion uses static fallbacks.
+
+## History and Memory
 
 Conversation transcripts are stored by the native app in
-`conversations.sqlite3` under the operating system's private app-data
-directory. The exact resolved path is shown at the bottom of `History`.
-Transcript history is separate from the runtime's optional semantic memory,
-and opening a past transcript does not restore it to the model's active
-context.
-
-## Optional Runtime Memory
+`conversations.sqlite3` under the operating system's private app-data directory.
+The exact resolved path is shown at the bottom of `History`. History is separate
+from runtime semantic memory, and opening a saved transcript does not restore it
+to the model's active context.
 
 Runtime memory is opt-in. Initialize a chosen SQLite database explicitly with
-`conversation-memory-probe`, then configure its absolute path in the gateway;
-the desktop neither creates the database nor captures conversations into it.
-History remains app-owned transcript storage, while runtime memory remains
-runtime-owned semantic storage with its own provenance, approval, retention,
-and retrieval rules.
+`conversation-memory-probe`, then configure its absolute path in the gateway.
+The desktop neither creates that database nor automatically captures
+conversations into it. `Memory` appears only when the gateway reports enabled
+local memory and protocol-v1 `memory_inspection`. The desktop reads summaries
+and records through the public SDK only; it has no runtime SQLite access and no
+memory mutation controls.
 
-The Memory destination appears only when the connected local gateway reports
-enabled local memory and the protocol-v1 `memory_inspection` capability. The
-desktop reads summaries and individual records only through the public
-browser-safe SDK and local framed-stdio protocol. It has no SQLite access and
-offers no create, edit, approval, pin, expiry, deletion, or retrieval control.
-Inspection can apply due expiry before returning a record, so a due item may no
-longer be active when displayed.
-
-## Open Work
-
-- Live microphone and playback activation through typed voice-session events.
-- Persona inspection and mutation, plus runtime-memory mutation controls.
-- Packaging, signing, notarization, installation, and upgrade validation.
-- R3 human-spoken, ten-minute, first-audible, audible-stop, and acoustic
-  acceptance.
-
-## Focused Validation
+## Developer Checks
 
 ```bash
 npm test --workspace conversation-desktop
 cargo test -p conversation-desktop
 npm run build --workspace conversation-desktop
-npm run desktop:dev -- --help
 ```
 
-See [the desktop evaluation](../../docs/r6-desktop-app-evaluation.md) for the
-validated evidence and remaining R6 and R3 gates.
+For hardware-dependent observations, use
+[the native macOS checklist](../../docs/r6-desktop-voice-session-native-check.md).
+Automated gates do not prove microphone selection, audible playback, subjective
+voice quality, first-audible latency, audible-stop latency, or ten-minute device
+continuity.
+
+## Open Work
+
+- Persona inspection/mutation and runtime-memory mutation controls.
+- Model setup and benchmark UI.
+- Packaging, signing, notarization, installation, and upgrade validation.
+- Native microphone, playback, GPU-scene, ten-minute, first-audible,
+  audible-stop, and 30-sample acoustic acceptance.
+
+See [the desktop evaluation](../../docs/r6-desktop-app-evaluation.md) for current
+automated evidence and remaining R6/R3 boundaries.

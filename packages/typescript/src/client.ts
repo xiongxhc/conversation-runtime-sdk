@@ -271,6 +271,18 @@ export class RuntimeClient {
         return;
       }
       const session = this.activeVoiceSession;
+      const terminal = isVoiceSessionTerminal(message.event);
+      if (!session.started) {
+        if (message.event.type === "voice_session_started") {
+          session.started = true;
+        } else if (!terminal) {
+          this.fail(new Error("gateway sent a nonterminal voice event before voice session started"));
+          return;
+        }
+      } else if (message.event.type === "voice_session_started") {
+        this.fail(new Error("gateway sent duplicate voice session started"));
+        return;
+      }
       if (session.sessionId === undefined) {
         session.sessionId = message.event.sessionId;
       } else if (message.event.sessionId !== session.sessionId) {
@@ -278,7 +290,7 @@ export class RuntimeClient {
         return;
       }
       session.events.push(message.event);
-      if (isVoiceSessionTerminal(message.event)) {
+      if (terminal) {
         this.activeVoiceSession = undefined;
         session.events.finish();
       }
@@ -333,7 +345,7 @@ export class RuntimeClient {
           control.fail(new Error("gateway accepted a start voice session while one was already active"));
           return;
         }
-        const session: VoiceSessionState = { events: new AsyncQueue<VoiceSessionEvent>() };
+        const session: VoiceSessionState = { events: new AsyncQueue<VoiceSessionEvent>(), started: false };
         this.activeVoiceSession = session;
         control.result.resolve({
           events: () => session.events,
@@ -439,6 +451,7 @@ type TurnState = {
 type VoiceSessionState = {
   events: AsyncQueue<VoiceSessionEvent>;
   sessionId?: bigint;
+  started: boolean;
 };
 
 class Deferred<T> {

@@ -2,12 +2,14 @@ import type { ConversationSessionState } from "../runtime/conversation-session.j
 
 export type ComponentExecutionStatus =
   | { status: "ready"; location: "local" | "remote" }
-  | { status: "unavailable" | "unknown"; location: null };
+  | { status: "disabled" | "unavailable" | "unknown"; location: null };
 
 export interface ComponentStatusSnapshot {
   stt: ComponentExecutionStatus;
   llm: ComponentExecutionStatus;
   tts: ComponentExecutionStatus;
+  audio: ComponentExecutionStatus;
+  telemetry: ComponentExecutionStatus;
 }
 
 export interface PrivacyStatusProps {
@@ -26,6 +28,10 @@ export function PrivacyStatus({
       <span>LLM {componentLabel(components.llm)}</span>
       <span aria-hidden="true">·</span>
       <span>TTS {componentLabel(components.tts)}</span>
+      <span aria-hidden="true">·</span>
+      <span>Audio {componentLabel(components.audio)}</span>
+      <span aria-hidden="true">·</span>
+      <span>Telemetry {componentLabel(components.telemetry)}</span>
     </div>
   );
 }
@@ -37,13 +43,15 @@ export function textOnlyComponentStatus(
     stt: { status: "unavailable", location: null },
     llm: { status: "ready", location: status.languageLocation },
     tts: { status: "unavailable", location: null },
+    audio: { status: "unavailable", location: null },
+    telemetry: { status: "disabled", location: null },
   };
 }
 
 export function voiceComponentStatus(
   status: ConversationSessionState["status"],
 ): ComponentStatusSnapshot {
-  const location = (kind: "speech_recognition" | "language_model" | "speech_synthesis") => {
+  const location = (kind: "speech_recognition" | "language_model" | "speech_synthesis" | "audio_io") => {
     const component = status.components.find((candidate) => candidate.kind === kind);
     return component
       ? { status: "ready" as const, location: component.executionLocation }
@@ -53,6 +61,8 @@ export function voiceComponentStatus(
     stt: location("speech_recognition"),
     llm: location("language_model"),
     tts: location("speech_synthesis"),
+    audio: location("audio_io"),
+    telemetry: { status: "disabled", location: null },
   };
 }
 
@@ -60,6 +70,8 @@ export const disconnectedComponentStatus: ComponentStatusSnapshot = {
   stt: { status: "unavailable", location: null },
   llm: { status: "unavailable", location: null },
   tts: { status: "unavailable", location: null },
+  audio: { status: "unavailable", location: null },
+  telemetry: { status: "unavailable", location: null },
 };
 
 function componentLabel(component: ComponentExecutionStatus): string {

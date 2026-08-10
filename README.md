@@ -59,9 +59,11 @@ The repository now contains the deterministic runtime foundation, reviewed local
   process reuse, and two-stage interruption and shutdown behavior;
 - a browser-safe SDK entry and macOS Tauri bridge for the same bounded local
   gateway protocol; and
-- a desktop text-chat workspace with streamed output, Stop and reconnect
-  behavior, plus an idle Voice Focus preview containing Soft Aurora, Silk,
-  Threads, Prism, Orb, Still Gradient, and None.
+- a desktop shared conversation workspace where typed and spoken turns use one
+  runtime context, with explicit voice start, acknowledged capture pause/resume,
+  barge-in-aware lifecycle events, background microphone status, local history,
+  and Voice Focus scenes containing Soft Aurora, Silk, Threads, Prism, Orb,
+  Still Gradient, and None.
 
 The complete Rust workspace, strict Clippy and formatting gates, acceptance
 harness suite, and `116` Swift sidecar tests pass. R5 is complete for the
@@ -77,6 +79,30 @@ claimed. See [the R3 evaluation](docs/r3-real-time-voice-evaluation.md),
 [the R6 local-gateway evaluation](docs/r6-local-gateway-evaluation.md),
 [the R6 desktop-app evaluation](docs/r6-desktop-app-evaluation.md), and
 [ROADMAP.md](ROADMAP.md).
+
+## R6 Reference Stack
+
+```mermaid
+flowchart LR
+    App["Tauri reference app"] <-->|"browser-safe API"| SDK["@conversation/runtime SDK"]
+    SDK <-->|"bounded protocol v1 frames"| Gateway["Local gateway reference host"]
+    Gateway --> Context["Shared ConversationContext"]
+    Context --> LLM["Replaceable local LLM"]
+    Context --> Voice["Voice session runtime"]
+    Voice <-->|"acknowledged local controls and PCM"| Sidecar["Managed macOS voice sidecar"]
+    Sidecar --> Devices["System-default microphone and speaker"]
+    Context -.-> Memory["Optional local memory provider"]
+```
+
+The SDK owns transport-neutral commands, events, validation, and lifecycle
+handles. The runtime owns turn identifiers, arbitration, completed context,
+persona/quality decisions, optional memory, and cancellation across typed and
+spoken turns. The gateway is the local reference host: it loads private
+configuration, composes adapters, and owns child-process cleanup. The desktop
+is a reference application: it owns presentation, explicit microphone intent,
+Focus preferences, and its separate app transcript history. Entering Voice
+Focus never starts capture; only `Start voice` does. No layer silently falls
+back to a remote provider.
 
 ## R3 Target Architecture
 
@@ -285,6 +311,24 @@ cp configs/gateway.example.toml "$PRIVATE_GATEWAY_CONFIG"
 ${EDITOR:-vi} "$PRIVATE_GATEWAY_CONFIG"
 ```
 
+For text-only use, leave the optional `[voice.*]` blocks commented. For local
+voice, build the managed sidecar, set `[voice.asr].model_path` to an existing
+local model directory, and set `[voice.audio].sidecar_executable` to the
+absolute path printed below:
+
+```bash
+swift build -c release --package-path platform/macos/voice-sidecar
+printf '%s/conversation-voice-sidecar\n' "$(swift build -c release \
+  --package-path platform/macos/voice-sidecar --show-bin-path)"
+```
+
+Uncomment the complete `[voice.capture]`, `[voice.turn]`, `[voice.asr]`,
+`[voice.speech]`, and `[voice.audio]` subtree together. Public examples contain
+generic provider, model, and voice identifiers; choose exact local values only
+in the private configuration. Configuration loading validates the subtree but
+does not access the microphone. The app requests capture only after the user
+selects `Start voice`.
+
 Launch the Tauri development app from the repository root:
 
 ```bash
@@ -300,15 +344,18 @@ printf 'Gateway: %s\nConfig: %s\n' \
 ```
 
 With the configured loopback model service running, the app exposes local text
-chat, streamed assistant output, Stop, close, and reconnect for developer
-testing. `Preview Voice Focus` exposes all seven scenes for manual review: Soft
-Aurora (the default), Silk, Threads, Prism, Orb, Still Gradient, and None. The
-preview is deliberately idle and its transcript is hidden by default. This
-evaluation does not record a live local-model desktop turn or native GPU scene
-acceptance.
+chat, streamed assistant output, Stop, close, reconnect, local transcript
+history, and read-only runtime-memory inspection when configured. If the
+optional `[voice]` subtree remains commented out, `Preview Voice Focus` exposes
+all seven scenes without opening the microphone. If `[voice]` is configured,
+`Voice Focus` becomes live-capable but still waits for explicit `Start voice`.
+Typed and spoken turns then share the same runtime context and transcript;
+focusing the composer pauses capture before typed send and resumes it after the
+typed turn reaches a terminal state. Leaving Focus offers Stop, Keep, and
+Cancel, and a kept voice session remains visibly active in Conversation.
 
 Memory is an optional, explicitly initialized runtime store. When the selected
-local gateway config points to an existing initialized database and advertises
+  local gateway config points to an existing initialized database and advertises
 the protocol-v1 `memory_inspection` capability, the desktop can list and inspect
 it through the public browser-safe SDK only. The first Memory screen is
 read-only: it does not create a database, mutate memory, or automatically copy
@@ -318,19 +365,24 @@ shows at most the latest 32 provenance entries and 32 approval entries, and
 labels any older history that was truncated. Due expiry may be applied while a
 record is inspected.
 
-Protocol v1 is the current wire contract. The gateway allocates typed
-start-turn identifiers and returns them only in the correlated acceptance;
-peers that disagree on the protocol version reject each other rather than
-silently mixing wire shapes.
+Protocol v1 is the current public gateway wire contract. It now includes typed
+text, memory-inspection, and voice-session commands/events. The gateway/runtime
+allocate monotonic turn and generation identifiers across typed and spoken
+input and return request-scoped acceptances before lifecycle streams. Peers
+that disagree on the protocol version reject each other rather than silently
+mixing wire shapes. The gateway configuration schema and private managed-sidecar
+protocol have their own versioning and must not be inferred from this number.
 
 When `[voice]` is configured, the compiled gateway advertises and hosts
 `voice_session` — start, stop, pause, and resume with typed voice events —
 proven by deterministic compiled-gateway and SDK integration tests; without
 `[voice]` configured, gateway behavior is unchanged (text-only). The desktop
-app does not yet activate live microphone or playback capture or wire real
-voice-session events into its own UI. Persona mutation, memory mutation,
-packaging and signing, and R3 human, ten-minute, and acoustic acceptance
-remain open. See [the desktop README](apps/desktop/README.md) and
+consumes those events for explicit start, capture pause/resume, Stop, shared
+typed/spoken history, recoverable failure, background status, and Voice Focus.
+Persona mutation, memory mutation, packaging and signing, and R3 human,
+ten-minute, first-audible, audible-stop, and acoustic acceptance remain open.
+See [the desktop README](apps/desktop/README.md),
+[the native acceptance checklist](docs/r6-desktop-voice-session-native-check.md), and
 [the desktop evaluation](docs/r6-desktop-app-evaluation.md).
 
 ## Test Local Inference
@@ -521,6 +573,7 @@ docs/                  Architecture, design, and benchmark guidance
 examples/node-chat/    Minimal persistent TypeScript chat client
 models/                Registry schema and local model instructions
 packages/typescript/   Public @conversation/runtime TypeScript SDK
+platform/macos/        Managed macOS voice sidecar package
 tests/latency/         Runnable mock latency probe and metric definitions
 tests/memory/          Explicit local memory control probe
 tests/ollama/          Runnable local Ollama text probe

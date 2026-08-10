@@ -129,6 +129,8 @@ describe("Voice Focus", () => {
 
     expect((await screen.findByRole("alert")).textContent).toContain("Voice could not stop cleanly");
     expect(screen.getByRole("dialog", { name: "Leave Voice Focus?" })).toBeTruthy();
+    fireEvent.keyDown(document, { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Cancel" }));
   });
 
   it("does not cancel the exit dialog while Stop is pending", async () => {
@@ -481,6 +483,8 @@ describe("Voice Focus", () => {
     expect(screen.getByText("STT local")).toBeTruthy();
     expect(screen.getByText("LLM local")).toBeTruthy();
     expect(screen.getByText("TTS local")).toBeTruthy();
+    expect(screen.getByText("Audio local")).toBeTruthy();
+    expect(screen.getByText("Telemetry disabled")).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "Show transcript" }));
     expect(await screen.findByText("A fixture transcript")).toBeTruthy();

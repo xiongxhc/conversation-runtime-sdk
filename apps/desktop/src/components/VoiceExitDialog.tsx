@@ -39,7 +39,10 @@ export function VoiceExitDialog({ busy, error, onChoose }: VoiceExitDialogProps)
       if (buttons.length === 0) return;
       const first = buttons[0]!;
       const last = buttons.at(-1)!;
-      if (!event.shiftKey && document.activeElement === last) {
+      if (!buttons.includes(document.activeElement as HTMLButtonElement)) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
         event.preventDefault();
         first.focus();
       } else if (event.shiftKey && document.activeElement === first) {

@@ -17,41 +17,77 @@ on runtime orchestration or model-specific payloads.
 
 `runtime` owns turn state, adapter coordination, event ordering, and cancellation. Clients should not depend on adapter implementation details.
 
-## R6 Local Gateway Slice
+## R6 SDK, Reference Host, and Desktop App
 
-The first R6 slice adds a process boundary without adding a network service:
+R6 keeps the public SDK, runtime, local reference host, and product UI as
+separate ownership boundaries:
 
 ```mermaid
 flowchart LR
-    Client["Node client / later Tauri host"] <-->|"bounded framed stdio"| Gateway["Local-only Rust gateway"]
-    Gateway <-->|"typed commands and lifecycle events"| Runtime["Text runtime"]
-    Runtime <-->|"streaming generation and cancellation"| Adapter["Local language adapter"]
-    Adapter <-->|"loopback HTTP"| Provider["Operator-selected local provider"]
-    NoListener["Gateway opens no TCP, HTTP, WebSocket, Unix, or LAN listener"] -.-> Gateway
+    Desktop["Tauri reference app"] <-->|"browser-safe RuntimeClient"| SDK["@conversation/runtime"]
+    Node["Node example"] <-->|"Node stdio transport"| SDK
+    SDK <-->|"bounded public protocol v1"| Gateway["conversation-runtime-gateway"]
+    Gateway --> Context["Shared ConversationContext"]
+    Context --> Text["TextTurnRuntime"]
+    Context --> Voice["VoiceSessionRuntime"]
+    Context -.-> Memory["Optional local memory provider"]
+    Text --> LLM["Replaceable language adapter"]
+    Voice --> LLM
+    Voice --> TTS["Replaceable speech adapter"]
+    Voice <-->|"private acknowledged sidecar protocol"| Sidecar["Managed macOS voice sidecar"]
+    Sidecar --> Devices["System-default microphone and speaker"]
+    NoListener["Gateway opens no listener"] -.-> Gateway
 ```
 
-The client spawns exactly one `conversation-runtime-gateway` process with an
-explicit absolute configuration path. Four-byte big-endian length prefixes
-frame bounded versioned JSON over child stdin and stdout. Standard error carries
-only bounded content-free diagnostics; transcripts, generated text, provider
-payloads, model identifiers, and memory contents do not become diagnostics.
+### Ownership
 
-The gateway owns one `TextTurnRuntime`, accepts at most one active turn, and
-acknowledges an accepted start before forwarding that turn's events. The same
-process remains reusable after completion or cancellation. EOF closes the
-session and cancels owned work. The gateway itself never binds a listener; the
-configured local provider is a separate loopback service and is not exposed by
-the public protocol.
+- **Public SDK:** validates public protocol-v1 commands, acceptances, status,
+  typed and voice lifecycle events, frame bounds, request correlation, and
+  reusable lifecycle handles. It contains no provider or desktop policy.
+- **Runtime:** owns monotonic turn/generation identifiers, one-active-turn
+  arbitration, completed bounded context, persona and quality decisions,
+  optional memory retrieval, cancellation, backpressure, and exactly one
+  terminal lifecycle event across typed and spoken input.
+- **Gateway reference host:** loads one explicit private configuration, composes
+  local adapters, owns the shared runtime/context, exposes bounded framed stdio,
+  and reaps gateway/provider/sidecar work on Stop, EOF, failure, or close. It
+  opens no TCP, HTTP, WebSocket, Unix-domain, or LAN listener.
+- **Desktop reference app:** owns setup presentation, explicit microphone
+  intent, Voice Focus preferences, accessibility behavior, and app transcript
+  history. It consumes only the browser-safe SDK and does not import runtime,
+  provider, sidecar, or SQLite internals.
 
-`@conversation/runtime` contains validated protocol unions, incremental frame
-handling, a transport-neutral `RuntimeClient`, and the Node
-`StdioGatewayTransport`. The Node chat example consumes only those public
-exports. A later Tauri host can implement the same transport boundary without
-moving provider-specific types into the SDK.
+Four-byte big-endian length prefixes frame bounded versioned JSON over child
+stdin and stdout. Standard error carries only bounded content-free diagnostics;
+transcripts, generated text, provider payloads, model identifiers, private
+paths, and memory contents do not become diagnostics. The same gateway process
+remains reusable after typed or spoken completion, cancellation, and a clean
+voice-session restart.
 
-This slice does not implement the Tauri or React UI, microphone or playback
-controls, persona or memory mutation commands, model installation, packaging,
-signing, LAN access, or pairing. Those remain later R6 or R7 work.
+Public protocol v1 is independent from gateway configuration schema v1 and the
+private managed-sidecar protocol version. Version disagreement fails explicitly;
+there is no compatibility guess or silent fallback.
+
+### Shared Conversation and Voice Activation
+
+Typed and finalized spoken input enter the same `ConversationContext`, use the
+same language adapter, quality controller, optional memory provider, and bounded
+completed history, and receive monotonic runtime-owned identifiers. Partial ASR
+hypotheses are transient UI data and never enter model context or persisted
+desktop history. A recoverable voice failure can leave typed chat available;
+fatal gateway failure returns the app to setup.
+
+Loading a valid optional `[voice]` subtree advertises the capability but performs
+no microphone access, sidecar spawn, or provider request. Entering Voice Focus
+also performs no capture. Only explicit `Start voice` sends the start command;
+the UI shows requesting permission until the managed sidecar acknowledges active
+capture. Composer focus requests and awaits capture pause before typed send,
+then resumes only after that typed turn is terminal and the same voice session
+still owns the pause. Stop and app close await bounded voice cleanup.
+
+The optional remote-provider boundary remains backend-neutral. `LocalOnly`
+rejects remote or undeclared STT, LLM, TTS, tools, memory, and telemetry before
+microphone access, and no component silently falls back to an API.
 
 ## R3 Target: Real-Time Voice Loop
 
@@ -372,11 +408,11 @@ cloud/provider memory export remain deferred boundaries. The deterministic
 macOS and SQLite reference paths do not imply those platform or deployment
 capabilities.
 
-## Why the Desktop Shell Is Deferred
+## Desktop and Future Client Boundary
 
-The first R6 gateway slice now proves that a non-desktop client can use the
-public TypeScript SDK for persistent turns and cancellation over a local
-process boundary. Tauri and React remain deferred so desktop UI requirements do
-not redefine the validated protocol prematurely. The later desktop slice must
-reuse this public boundary while adding visible controls, packaging, and
-application policy rather than importing Rust or provider internals.
+The Tauri/React desktop is now the first reference application over the public
+SDK. It proves that a product UI can add visible microphone intent, shared
+typed/spoken presentation, transcript history, and Focus scenes without moving
+application state into protocol or provider internals. Persona and memory
+mutation, packaging/signing, authenticated LAN transport, iPhone pairing, and
+Linux/Windows media implementations remain later application boundaries.

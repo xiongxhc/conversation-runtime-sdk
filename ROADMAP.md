@@ -37,22 +37,17 @@ The first release is not a directory-complete platform. It is one local voice lo
 - R5 controlled local memory is complete for its deterministic SDK and probe
   surface, including explicit initialization, revision-bound mutation,
   confirmation-backed promotion, bounded retrieval, and content-free traces.
-- The first R6 local-gateway and desktop implementation slices are complete
-  under deterministic and automated gates: a persistent
-  local-only Rust gateway, bounded framed stdio protocol, public TypeScript
-  client, minimal Node chat example, macOS Tauri bridge, text workspace, and
-  seven-scene Voice Focus preview are implemented. A native launch smoke passes,
-  but a live local-model desktop turn and native GPU scene acceptance have not
-  been recorded. The gateway voice lane is also complete under the same gates:
-  when `[voice]` is configured, the compiled gateway advertises and hosts
-  `voice_session` — start, stop, pause, and resume with typed voice events —
-  proven by deterministic compiled-gateway and SDK integration tests; an
-  opt-in live smoke against real hardware exists outside the merge gate.
-  Without `[voice]` configured, gateway behavior is unchanged (text-only). The
-  desktop app does not yet activate live microphone/playback capture or wire
-  real voice-session events into its own UI, and persona
-  and memory mutation, packaging/signing, model setup, and the separate R3
-  human and acoustic acceptance gates remain open.
+- R6 now includes the persistent local gateway, public TypeScript SDK, Node
+  example, Tauri bridge, shared typed/spoken `ConversationContext`, optional
+  gateway voice subtree, and live-capable desktop Voice Focus. Entering Focus is
+  microphone-idle; explicit Start, acknowledged pause/resume, Stop/Keep/Cancel,
+  background microphone status, typed/spoken shared history, recoverable retry,
+  and bounded close cleanup are deterministic-test covered. The compiled public
+  SDK test proves typed→spoken→typed context reuse through a disposable gateway,
+  fake sidecar, and loopback providers. Without `[voice]`, the same app remains
+  text-only with a visual Focus preview. Native microphone, playback, device,
+  GPU, ten-minute, first-audible, audible-stop, and acoustic observations remain
+  separately open, as do persona/memory mutation, model setup, and distribution.
 - First-audible timing, audible-stop p95, representative warm measurements,
   subjective English and Chinese quality, and the 1.2-second
   time-to-useful-audio goal remain unvalidated.
@@ -173,8 +168,8 @@ multilingual fixtures transcribe without control tokens. A complete spoken
 microphone-to-audible-response turn is not yet observed after the latest
 finalization fix, so process/device acceptance remains incomplete. Acoustic
 evidence is `NOT VALIDATED` because no external recording set exists. The latest
-deterministic gate recorded `446` passing Rust tests plus one intentionally
-ignored fixture writer and `109` passing Swift tests. No ten-minute continuity,
+current complete mechanical gate passes the Rust workspace with one intentionally
+ignored fixture writer and `116` Swift tests. No ten-minute continuity,
 first-audible, audible-stop p95, or R3 completion claim is made. See
 [the R3 evaluation](docs/r3-real-time-voice-evaluation.md).
 
@@ -227,7 +222,7 @@ Schema-v1 configuration exposes persona, response, and content-free metric
 controls with explicit defaults and pre-capture validation. Relationship
 guidance is derived from visible persona, supplied context, reciprocity, pacing,
 and rapport; no scripted expression, hidden unlock, or frequency quota exists.
-The deterministic R4 gate passes the complete Rust workspace and `109` Swift
+The deterministic R4 gate passes the complete Rust workspace and `116` Swift
 tests. Subjective model quality remains deployment-specific; SQLite persistence
 remains R5 and application controls remain R6.
 
@@ -299,9 +294,9 @@ adapter, probe, and voice-CLI tests. See
 
 ### Source Status
 
-The first local-gateway and macOS desktop implementation slices are complete
-under deterministic and automated gates.
-`conversation-runtime-gateway` owns one local-only text runtime and exchanges
+The local-gateway and macOS desktop shared voice slices are complete under
+deterministic and automated gates. `conversation-runtime-gateway` owns one
+local-only shared conversation context and exchanges
 bounded versioned frames over its child-process stdin and stdout without
 opening a network listener. `@conversation/runtime` exposes the validated
 protocol, transport-neutral client, browser-safe entry, and Node stdio
@@ -310,10 +305,15 @@ transport. The Node example and desktop app both consume the public boundary.
 The Tauri bridge starts only the selected absolute gateway executable and
 forwards the bounded protocol without adding a network listener. The React app
 supports setup with absolute paths, verified local-only status, streamed text
-chat, Stop, close, and reconnect. Its idle Voice Focus preview makes Soft Aurora
-(the default), Silk, Threads, Prism, Orb, Still Gradient, and None selectable;
-the transcript remains hidden by default. When an explicitly initialized local
-memory store is configured and the gateway advertises protocol-v1
+chat, Stop, close, reconnect, local history, and live-capable Voice Focus. Focus
+entry is microphone-idle; explicit Start drives permission/capture state. The
+same desktop conversation contains typed and finalized spoken turns, while
+partial hypotheses remain transient. Capture pause is acknowledged before typed
+send and resumes after the typed terminal. Stop, Keep, and Cancel preserve
+session intent when leaving Focus, and a kept session remains visible in the
+conversation view. Soft Aurora (the default), Silk, Threads, Prism, Orb, Still
+Gradient, and None remain selectable with hidden transcript by default. When an
+explicitly initialized local memory store is configured and the gateway advertises protocol-v1
 `memory_inspection`, the desktop uses the public browser-safe SDK to provide
 read-only list and detail inspection. History remains separately owned local
 transcript storage; the desktop neither initializes runtime memory nor
@@ -328,19 +328,14 @@ interoperability evidence only; it does not select a model, measure latency or
 quality, or close any R3 human, device, or acoustic acceptance gate.
 
 R6 remains open overall. When `[voice]` is configured, the compiled gateway
-now advertises and hosts `voice_session` — start, stop, pause, and resume
-with typed voice events — proven by deterministic compiled-gateway and SDK
-integration tests; an opt-in live smoke against real hardware exists outside
-the merge gate; without `[voice]` configured, gateway behavior is
-unchanged (text-only). Production Voice Focus in the desktop app does not yet
-activate microphone capture, recognition, playback, or barge-in against that
-lane. Persona inspection and mutation backed by
-runtime state, runtime-memory mutation and management work, model setup and
-benchmark UI, packaging, signing, and installation flows also remain open. The
-first desktop memory slice completes read-only runtime inspection; persona
-mutation and all memory mutation remain open. R3 human-spoken, ten-minute, and
-acoustic acceptance remains a separate blocked milestone and is not advanced by
-desktop scene rendering.
+advertises and hosts `voice_session` start, stop, capture pause/resume, transcript,
+turn, playback, timing, barge-in, failure, and terminal events. The desktop now
+consumes that lane; without `[voice]`, gateway behavior remains text-only and
+Focus remains a visual preview. Persona inspection/mutation backed by runtime
+state, runtime-memory mutation and management, model setup/benchmark UI,
+packaging, signing, and installation remain open. R3 human-spoken, ten-minute,
+first-audible, audible-stop, and acoustic acceptance remains a separate blocked
+milestone and is not advanced by deterministic desktop integration.
 
 See [the R6 local-gateway evaluation](docs/r6-local-gateway-evaluation.md) and
 [the R6 desktop-app evaluation](docs/r6-desktop-app-evaluation.md).
@@ -362,19 +357,25 @@ See [the R6 local-gateway evaluation](docs/r6-local-gateway-evaluation.md) and
 - Local text-chat workspace with streamed output, Stop, close, and reconnect.
 - Protocol-v1 read-only runtime-memory list and detail inspection through the
   public browser-safe SDK, gated on an explicitly configured local store.
-- Idle Voice Focus preview with seven selectable scenes, hidden transcript by
-  default, reduced-motion fallback, and explicit visual-preview labeling.
+- Shared typed/spoken runtime context with monotonic gateway-owned turn and
+  generation identifiers and completed-only bounded history.
+- Explicit live Voice Focus start, truthful requesting/listening/paused/thinking/
+  speaking/error states, Stop/Keep/Cancel exit, background microphone status,
+  recoverable retry, and no microphone access on Focus entry.
+- Composer pause-before-type and same-session resume-after-terminal behavior.
+- Seven selectable Focus scenes, hidden transcript by default, reduced-motion
+  fallback, and explicit visual-preview labeling when voice is unavailable.
 
 ### Remaining Deliverables
 
-- Typed voice-session events and production microphone, recognition, playback,
-  and barge-in activation in the desktop app.
 - Persona inspection and mutation controls, plus runtime-memory mutation
   controls backed by actual runtime state.
 - Local model setup and benchmark reporting.
 - Packaging, signing, installation, and private configuration workflows that
   contain no model weights.
 - Human-spoken, ten-minute, and 30-sample acoustic evidence required by R3.
+- Native desktop observation of permission, one spoken turn, playback, audible
+  barge-in, exit choices, device selection, and child cleanup.
 - Later application-owned transport work required before any opt-in LAN binding
   and pairing in R7.
 

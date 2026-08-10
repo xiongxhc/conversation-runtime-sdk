@@ -1,121 +1,137 @@
 # R6 Desktop App Evaluation
 
-**Date:** 2026-08-06
-**Scope:** macOS Tauri text-chat, Voice Focus preview, and protocol-v1
-read-only runtime-memory inspection
+**Date:** 2026-08-10
+**Scope:** Public SDK, compiled local gateway voice lane, shared typed/spoken
+desktop session model, live-capable Voice Focus, and native-acceptance boundary
 
 ## Result
 
-The R6 desktop surface is developer-runnable with bounded automated checks.
-Memory inspection is optional and explicit: the desktop uses the public local
-runtime protocol only after an existing initialized local memory store is
-configured. R6 is not complete: the production gateway reports text and, when
-enabled, memory-inspection capabilities only; no live voice, persona or memory
-mutation, packaged release, or R3 human/acoustic acceptance claim is made.
+The R6 desktop voice-session slice passes the complete mechanical gate. The
+desktop now consumes the public voice-session surface rather than presenting an
+idle-only shell: explicit Start, acknowledged capture pause/resume, Stop,
+shared typed/spoken history, recoverable failure, background microphone status,
+and Voice Focus exit choices are implemented and independently reviewed.
+
+This is deterministic and compiled integration evidence, not native acoustic
+evidence. No current-branch human observation is recorded for microphone
+permission, physical input/output devices, audible playback, audible barge-in,
+GPU scene quality, first-audible latency, audible-stop latency, or ten-minute
+continuity. R3 therefore remains `ACCEPTANCE BLOCKED`.
+
+## Ownership and Protocol Boundary
+
+| Layer | Current responsibility |
+| --- | --- |
+| Public `@conversation/runtime` SDK | Protocol-v1 validation, bounded framing, request correlation, typed/voice lifecycle streams, transport-neutral client, Node stdio transport, browser-safe entry. |
+| Rust runtime | Monotonic typed/spoken identifiers, one-active-turn arbitration, shared completed context, persona/quality decisions, optional memory, cancellation, backpressure, terminals. |
+| Local gateway reference host | Private config loading, local adapter composition, shared runtime/context ownership, framed stdio, gateway and sidecar cleanup; no network listener. |
+| Tauri desktop reference app | Explicit microphone intent, shared conversation presentation, app transcript history, Focus preferences/scenes, accessibility, visible privacy and background voice status. |
+
+Public gateway protocol v1 now carries text, memory-inspection, and voice-session
+commands/events. Gateway configuration schema v1 and the private sidecar
+protocol are separate version domains. Unsupported versions fail explicitly.
 
 ## Testable Surface
 
 | Surface | Current evidence | Boundary |
 | --- | --- | --- |
-| Desktop launch | The root `desktop:dev` command starts Vite and the native Tauri binary. | The launch smoke was stopped after startup; it was not a human visual acceptance run. |
-| Text chat | Setup, verified local-only status, send, streamed deltas, Stop, close, failure recovery, and reconnect are covered by desktop tests. | A person still needs a running configured loopback model service for an interactive turn. |
-| Voice Focus shell | Preview entry, scene selection, hidden transcript default, explicit transcript reveal, `Escape`, reduced motion, and scene failure fallbacks are covered by tests and the production build. | Preview is intentionally idle and cannot imply microphone or playback activity. |
-| Focus scenes | Soft Aurora, Silk, Threads, Prism, Orb, Still Gradient, and None are selectable; Soft Aurora is the default. | The five animated scenes have separate lazy chunks; final human GPU visual review remains open. |
-| Local gateway bridge | Absolute-path validation, idempotent close, process reaping, and reopen ordering pass Rust tests. | The desktop validation in this report does not claim model quality, latency, or acoustic behavior. |
-| Runtime memory inspection | With enabled local memory and advertised protocol-v1 `memory_inspection`, the Memory destination lists at most 50 summaries per page and opens read-only details through the browser-safe SDK. Provenance and approval histories retain at most their latest 32 entries and visibly mark truncation. | The desktop has no SQLite access, does not initialize memory, and does not copy conversations into it. Due expiry may be applied while inspecting; persona and all memory mutation remain open. |
+| Shared conversation | Runtime and compiled SDK tests prove typed→spoken→typed turns preserve completed history and monotonic identities through one context. | Deterministic fixture content does not establish model usefulness or quality. |
+| Voice start/stop | Desktop tests prove Focus entry is idle, Start is explicit, pending start can be stopped, failure can retry, and Stop rejection restores usable state. | Physical permission and device behavior still require the native checklist. |
+| Composer coexistence | Desktop and runtime tests prove pause acknowledgement precedes typed send and same-session resume follows typed terminal. | Human interaction timing and OS focus behavior remain a native observation. |
+| Voice Focus exit | Stop, Keep, Cancel, session replacement, pending-stop focus trap, persistent failure, and retry are test-covered. | Audible stop and child observation require native/acoustic checks. |
+| Barge-in and cleanup | Rust tests cover generation/synthesis/queue/playback cancellation, blocked output, EOF, repeated Stop, failure, and child reaping. | No external recording proves audible-stop p95. |
+| Partial/final text | Partial hypotheses remain transient; final transcript and exact completed assistant text are retained under backpressure. | No private transcript or ASR-quality claim is recorded. |
+| History and memory | App history is local SQLite and separate from optional read-only runtime memory inspection. | Persona mutation and all runtime-memory mutation remain open. |
+| Focus scenes | Seven scenes, lazy chunks, hidden transcript default, preference migration, and reduced-motion fallback pass automated checks. | Native GPU appearance has not received a recorded human pass. |
 
-## Reproduce the Developer Run
+## Complete Mechanical Gate
 
-Run these commands from the repository root on macOS:
+Observed on 2026-08-10:
+
+```text
+cargo fmt --all -- --check
+passed
+
+cargo clippy --workspace --all-targets --locked -- -D warnings
+passed
+
+cargo test --workspace --locked --no-fail-fast
+passed; one immutable version-one fixture writer remains intentionally ignored
+
+swift test --package-path platform/macos/voice-sidecar
+116 passed
+
+npm test --workspaces
+@conversation/runtime: 74 passed
+conversation-node-chat: 14 passed
+conversation-desktop: 10 files, 136 passed
+
+npm run build --workspaces
+TypeScript, desktop type checks, Vite production build, and scene-chunk checks passed
+
+git diff --check
+passed
+```
+
+The SDK workspace test builds the actual Rust gateway and fake managed sidecar,
+creates a disposable gateway configuration and ASR directory, binds temporary
+loopback language and speech fixtures, and proves one typed→spoken→typed flow
+through the public client. It validates shared completed history and removes its
+temporary directory and providers. Rust compiled-gateway tests separately cover
+voice accept-to-terminal, request-scoped rejection, EOF child reaping, capture
+pause/resume acknowledgement, blocked output, and terminal ordering. Runtime
+tests separately cover barge-in cleanup; it is not claimed as compiled-gateway
+integration or audible evidence.
+
+## Developer Run
+
+Use a private configuration outside the repository. Leave `[voice.*]` commented
+for text-only mode, or configure all local voice components explicitly as
+described in [the desktop README](../apps/desktop/README.md). Then run:
 
 ```bash
 npm ci
 npm run build --workspace @conversation/runtime
 cargo build --locked -p conversation-runtime-gateway
-
-PRIVATE_GATEWAY_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/conversation-runtime/gateway.toml"
-mkdir -p "$(dirname "$PRIVATE_GATEWAY_CONFIG")"
-cp configs/gateway.example.toml "$PRIVATE_GATEWAY_CONFIG"
-${EDITOR:-vi} "$PRIVATE_GATEWAY_CONFIG"
-
-printf 'Gateway: %s\nConfig: %s\n' \
-  "$PWD/target/debug/conversation-runtime-gateway" \
-  "$PRIVATE_GATEWAY_CONFIG"
-
 npm run desktop:dev
 ```
 
-Before connecting, start the loopback model service configured in the private
-file and replace `local-model-id` with one exact installed model identifier.
-Enter the two printed absolute paths in the setup screen. The gateway rejects
-remote endpoints and the app does not silently fall back to cloud execution.
+Entering Voice Focus does not start the microphone. Select `Start voice` only
+after verifying the displayed component locality. The app never silently falls
+back to a remote provider.
 
-After connecting:
+## Native Acceptance Status
 
-1. Send a text turn and observe streamed assistant text.
-2. Use `Stop` during an active turn, then send another turn.
-3. Open `Preview Voice Focus` and select Soft Aurora, Silk, Threads, Prism,
-   Orb, Still Gradient, and None.
-4. Confirm the transcript starts hidden, reveal it explicitly, and leave Focus
-   with `Escape`.
-5. Close the runtime and reconnect through setup.
-
-To use the optional Memory destination, first initialize a disposable or
-operator-chosen database explicitly with `conversation-memory-probe`, then add
-its absolute path under `[memory]` in the selected gateway configuration. The
-desktop shows Memory only when gateway status reports enabled local memory and
-the `memory_inspection` capability. Open the list and a detail to verify
-read-only navigation and any truncation notice. History is a separate
-app-owned transcript store and does not become runtime memory automatically.
-
-## Focused Validation Evidence
-
-Observed on 2026-08-06 with Node `v24.14.0`, npm `9.6.7`, and Rust `1.97.1`:
+The current branch has no new human native run. The following remain `skipped`,
+not passed:
 
 ```text
-$ cargo fmt --all -- --check
-$ cargo clippy --workspace --all-targets --locked -- -D warnings
-$ cargo test --workspace --locked --no-fail-fast
-all workspace, integration, and doc-test targets passed
-
-$ npm test --workspaces
-@conversation/runtime: 58 passed
-conversation-node-chat: 11 passed
-conversation-desktop: 10 files and 108 passed
-
-$ npm run build --workspaces
-TypeScript, desktop type checks, Vite production build, and scene-chunk checks passed
-
-$ node --input-type=module ...
-compiled TypeScript client: status returned ["text", "memory_inspection"]
-compiled gateway: listed and inspected the one disposable memory record
-
-$ npm run desktop:dev
-Vite served the local development app and started target/debug/conversation-desktop
-The process was closed cleanly. The Mac was locked, so this run did not make a
-human visual claim about the Memory list, detail, or truncation presentation.
+Native window observed: skipped
+Microphone permission observed: skipped
+Shared typed/spoken transcript: skipped
+Audible playback observed: skipped
+Audible barge-in observed: skipped
+Exit choices observed: skipped
+Composer pause/resume observed: skipped
+Child cleanup observed by a human: skipped
 ```
 
-## Open Work and Acceptance Boundaries
+Use [the native macOS checklist](r6-desktop-voice-session-native-check.md) and
+keep device names, private paths, transcripts, and exact model/voice selections
+in an untracked local record.
 
-- **Live voice activation:** typed desktop voice-session events and production
-  microphone capture, recognition, playback, and barge-in are not connected.
-- **Persona and memory mutation:** the app does not inspect or mutate persona;
-  runtime memory is inspectable only, with no create, edit, approval, pin,
-  expiry, deletion, or retrieval control.
-- **Distribution:** packaging, model-free bundle review, signing,
-  notarization, installation, and upgrade flows are not validated.
-- **Human visual review:** final scene appearance and GPU behavior in the Tauri
-  window have not received a recorded human acceptance pass; the current native
-  launch could not be visually inspected while the Mac was locked.
-- **Interactive model run:** this evaluation does not record a live local-model
-  text turn or make latency, usefulness, or model-quality claims.
-- **R3 acceptance:** a post-fix human-spoken turn, ten-minute device run,
-  first-audible measurement, audible-stop p95, and the 30-sample external
-  acoustic procedure remain open. Desktop shell work does not satisfy them.
+## Open Work
+
+- Persona inspection/mutation and runtime-memory mutation controls.
+- Local model setup and benchmark UI.
+- Packaging, signing, notarization, installation, and upgrade validation.
+- Native microphone, playback, device, GPU scene, and child-process observation.
+- R3 post-fix spoken turn, ten-minute run, first-audible measurement,
+  audible-stop p95, and 30-sample external acoustic procedure.
 
 ## Status
 
-The first R6 desktop slice is testable and documented. R6 remains open for the
-work above, and R3 remains `ACCEPTANCE BLOCKED` pending its separately defined
-human and acoustic evidence.
+The R6 shared desktop voice-session implementation is mechanically validated
+and developer-runnable. R6 remains open for the product and distribution work
+above. R3 remains `ACCEPTANCE BLOCKED` until its separately defined human,
+device, latency, continuity, and acoustic evidence is recorded.

@@ -50,9 +50,9 @@ The repository now contains the deterministic runtime foundation, reviewed local
   network listener;
 - gateway-hosted `voice_session` start, stop, pause, and resume with typed
   voice events when `[voice]` is configured, proven by deterministic
-  compiled-gateway and SDK mixed-mode integration tests, plus an opt-in live
-  smoke against real hardware that is not part of the merge gate; gateway
-  behavior is unchanged (text-only) without `[voice]` configured;
+  compiled-gateway and SDK mixed-mode integration tests; an opt-in live smoke
+  against real hardware exists outside the merge gate; gateway behavior is
+  unchanged (text-only) without `[voice]` configured;
 - the backend-neutral `@conversation/runtime` TypeScript client and Node stdio
   transport;
 - a minimal Node chat example with streamed UTF-8 text, persistent multi-turn

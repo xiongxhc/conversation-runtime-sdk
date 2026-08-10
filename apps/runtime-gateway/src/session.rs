@@ -410,11 +410,11 @@ impl GatewaySession {
 
                 let policy = match lane.adapters.policy.for_session(SessionId::new(1)) {
                     Ok(policy) => policy,
-                    Err(_) => {
+                    Err(error) => {
                         return send_rejection(
                             normal,
                             &request_id,
-                            command_error("voice is unavailable"),
+                            ClientRuntimeError::from(error),
                         )
                         .map_err(CommandFailure::response);
                     }
@@ -429,11 +429,11 @@ impl GatewaySession {
                 );
                 let event_stream = match runtime.start(policy).await {
                     Ok(event_stream) => event_stream,
-                    Err(_) => {
+                    Err(error) => {
                         return send_rejection(
                             normal,
                             &request_id,
-                            command_error("voice is unavailable"),
+                            ClientRuntimeError::from(error),
                         )
                         .map_err(CommandFailure::response);
                     }
@@ -508,6 +508,10 @@ impl GatewaySession {
                     return send_rejection(normal, &request_id, memory_turn_active_error())
                         .map_err(CommandFailure::response);
                 }
+                if active_voice.is_some() {
+                    return send_rejection(normal, &request_id, memory_voice_active_error())
+                        .map_err(CommandFailure::response);
+                }
                 let Some(inspection) = self.memory_inspection.as_ref() else {
                     return send_rejection(normal, &request_id, memory_disabled_error())
                         .map_err(CommandFailure::response);
@@ -553,6 +557,10 @@ impl GatewaySession {
             } => {
                 if active.is_some() {
                     return send_rejection(normal, &request_id, memory_turn_active_error())
+                        .map_err(CommandFailure::response);
+                }
+                if active_voice.is_some() {
+                    return send_rejection(normal, &request_id, memory_voice_active_error())
                         .map_err(CommandFailure::response);
                 }
                 let Some(inspection) = self.memory_inspection.as_ref() else {
@@ -1026,6 +1034,17 @@ fn memory_turn_active_error() -> ClientRuntimeError {
     memory_command_error(
         "memory_turn_active",
         "memory inspection is unavailable while a turn is active",
+    )
+}
+
+// A voice session occupies the conversation exactly as a text turn does, so memory
+// inspection is refused for the same reason. It reuses `memory_turn_active` rather than
+// minting a wire code: the protocol's error-code set is closed and mirrored by clients,
+// and every client that already handles "something is running, retry later" handles this.
+fn memory_voice_active_error() -> ClientRuntimeError {
+    memory_command_error(
+        "memory_turn_active",
+        "memory inspection is unavailable while a voice session is active",
     )
 }
 
@@ -2297,6 +2316,50 @@ mod tests {
             terminal < stop_accepted,
             "stop must accept only after the session's terminal has been forwarded"
         );
+    }
+
+    #[tokio::test]
+    async fn memory_inspection_is_rejected_while_a_voice_session_is_active() {
+        let (_temporary, store) = initialized_store();
+        let record = create_semantic(&store, "gateway voice guard fixture");
+        let (input, input_receiver) = mpsc::channel(8);
+        let language = Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new()));
+        let session = session_with_interactive_voice(input_receiver, language, no_speech_frames())
+            .with_memory_inspection(Arc::new(store), Arc::new(FixedClock(timestamp(10_000))));
+        let mut gateway = InMemoryGateway::start(session).await;
+
+        gateway
+            .write(r#"{"protocol_version":1,"type":"start_voice_session","request_id":"voice-1"}"#)
+            .await;
+        assert_accepted_message(&gateway.read_message().await, "voice-1");
+        assert!(gateway
+            .read_message()
+            .await
+            .contains(r#""type":"voice_session_started""#));
+
+        gateway
+            .write(r#"{"protocol_version":1,"type":"memory_list","request_id":"list-1","cursor":null}"#)
+            .await;
+        let rejection = gateway.read_message().await;
+        assert_rejected_message(&rejection, "list-1", "memory_turn_active");
+        assert!(
+            rejection.contains("memory inspection is unavailable while a voice session is active")
+        );
+
+        gateway
+            .write(&format!(
+                r#"{{"protocol_version":1,"type":"memory_inspect","request_id":"inspect-1","memory_id":"{}"}}"#,
+                record.id().get()
+            ))
+            .await;
+        let rejection = gateway.read_message().await;
+        assert_rejected_message(&rejection, "inspect-1", "memory_turn_active");
+        assert!(
+            rejection.contains("memory inspection is unavailable while a voice session is active")
+        );
+
+        drop(input);
+        gateway.close().await;
     }
 
     #[tokio::test]

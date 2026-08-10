@@ -91,15 +91,15 @@ test("browser and root entries expose browser-safe memory DTOs", () => {
 });
 
 test("browser entry exports complete voice surface without Node builtins", () => {
-  // Verify VoiceSession type is available from browser entry
+  // Verify the browser entry's voice types are the root entry's voice types
   const browserVoiceSession: VoiceSession = null as any;
-  const rootVoiceSession: RootVoiceSession = browserVoiceSession;
-  assert.ok(rootVoiceSession === browserVoiceSession);
-
-  // Verify VoiceSessionEvent type is available from browser entry
   const browserEvent: VoiceSessionEvent = null as any;
-  const rootEvent: RootVoiceSessionEvent = browserEvent;
-  assert.ok(rootEvent === browserEvent);
+  const rootTypes: [RootVoiceSession, RootVoiceSessionEvent] = [
+    browserVoiceSession,
+    browserEvent,
+  ];
+
+  assert.equal(rootTypes.length, 2);
 
   // Verify RuntimeClient.startVoiceSession method is accessible and has correct signature
   const startVoiceSessionMethod = browser.RuntimeClient.prototype.startVoiceSession;

@@ -46,8 +46,8 @@ The first release is not a directory-complete platform. It is one local voice lo
   been recorded. The gateway voice lane is also complete under the same gates:
   when `[voice]` is configured, the compiled gateway advertises and hosts
   `voice_session` — start, stop, pause, and resume with typed voice events —
-  proven by deterministic compiled-gateway and SDK integration tests, plus an
-  opt-in live smoke against real hardware that is not part of the merge gate.
+  proven by deterministic compiled-gateway and SDK integration tests; an
+  opt-in live smoke against real hardware exists outside the merge gate.
   Without `[voice]` configured, gateway behavior is unchanged (text-only). The
   desktop app does not yet activate live microphone/playback capture or wire
   real voice-session events into its own UI, and persona
@@ -330,8 +330,8 @@ quality, or close any R3 human, device, or acoustic acceptance gate.
 R6 remains open overall. When `[voice]` is configured, the compiled gateway
 now advertises and hosts `voice_session` — start, stop, pause, and resume
 with typed voice events — proven by deterministic compiled-gateway and SDK
-integration tests, plus an opt-in live smoke against real hardware that is
-not part of the merge gate; without `[voice]` configured, gateway behavior is
+integration tests; an opt-in live smoke against real hardware exists outside
+the merge gate; without `[voice]` configured, gateway behavior is
 unchanged (text-only). Production Voice Focus in the desktop app does not yet
 activate microphone capture, recognition, playback, or barge-in against that
 lane. Persona inspection and mutation backed by
@@ -355,8 +355,8 @@ See [the R6 local-gateway evaluation](docs/r6-local-gateway-evaluation.md) and
 - Real Rust-binary-to-Node completion and cancellation smoke coverage.
 - Gateway-hosted `voice_session` start, stop, pause, and resume with typed
   voice events when `[voice]` is configured, proven by deterministic
-  compiled-gateway and SDK mixed-mode integration tests, plus an opt-in live
-  smoke against real hardware outside the merge gate.
+  compiled-gateway and SDK mixed-mode integration tests; an opt-in live smoke
+  against real hardware exists outside the merge gate.
 - macOS Tauri process bridge using explicit absolute gateway and configuration
   paths.
 - Local text-chat workspace with streamed output, Stop, close, and reconnect.

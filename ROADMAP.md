@@ -185,7 +185,10 @@ first-audible, audible-stop p95, or R3 completion claim is made. See
   protocol.
 - Local VAD and WhisperKit ASR adapter.
 - Display-only partial transcripts and finalization after approximately `600 ms`
-  of silence.
+  of silence. If the engine-final transcript arrives after that gate has already
+  elapsed, the runtime uses a private `120 ms` adjacent-segment debounce instead
+  of charging a second full silence interval; this does not change public
+  configuration.
 - Generation-tagged playback cancellation after approximately `200 ms` of
   sustained user speech.
 - Barge-in that stops generation, synthesis, queued audio, and active playback.

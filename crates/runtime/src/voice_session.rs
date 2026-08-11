@@ -29,6 +29,7 @@ const RELIABLE_EVENT_RESERVE: usize = 4;
 const MAX_PENDING_RELIABLE_EVENTS: usize = SESSION_EVENT_BUFFER_SIZE;
 const MAX_PENDING_PARTIAL_SEGMENTS: usize = SESSION_EVENT_BUFFER_SIZE;
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+const LATE_RECOGNITION_SETTLE_MS: u64 = 120;
 
 #[derive(Clone)]
 pub struct VoiceSessionAdapters {
@@ -692,10 +693,8 @@ impl VoiceLoop {
                 let is_engine_final = hypothesis.is_engine_final();
                 let segment_id = hypothesis.segment_id();
                 let text = hypothesis.text().to_owned();
-                if !self
-                    .finalizer
-                    .observe_hypothesis(hypothesis, self.clock.now_ms())
-                {
+                let now_ms = self.clock.now_ms();
+                if !self.finalizer.observe_hypothesis(hypothesis, now_ms) {
                     return None;
                 }
                 self.active_segment_id = Some(segment_id);
@@ -703,9 +702,14 @@ impl VoiceLoop {
                     return Some(LoopExit::ConsumerDropped);
                 }
                 if is_engine_final && self.state == VoiceLoopState::Listening {
-                    // Settle window: later engine-final segments of the same
-                    // utterance must land in this turn, not start their own.
-                    self.deadline.arm_after(self.final_silence);
+                    if let Some(remaining_ms) = self.finalizer.remaining_silence_ms(now_ms) {
+                        let delay_ms = if remaining_ms == 0 {
+                            LATE_RECOGNITION_SETTLE_MS
+                        } else {
+                            remaining_ms
+                        };
+                        self.deadline.arm_after(Duration::from_millis(delay_ms));
+                    }
                 }
                 None
             }

@@ -88,6 +88,18 @@ impl TurnFinalizer {
         self.display_candidate.as_deref()
     }
 
+    pub(crate) fn remaining_silence_ms(&self, now_ms: u64) -> Option<u64> {
+        if self.finalized {
+            return None;
+        }
+
+        self.speech_ended_at_ms.map(|ended_at_ms| {
+            ended_at_ms
+                .saturating_add(self.final_silence_ms)
+                .saturating_sub(now_ms)
+        })
+    }
+
     pub fn finalize_ready(&mut self, now_ms: u64) -> Option<FinalizedTranscript> {
         if self.finalized {
             return None;
@@ -146,6 +158,25 @@ mod tests {
             .finalize_ready(1_100)
             .expect("late segment must not stall finalization");
         assert_eq!(finalized.text, " early late");
+    }
+
+    #[test]
+    fn remaining_silence_tracks_the_runtime_clock_and_speech_resume() {
+        let mut finalizer = finalizer();
+
+        assert_eq!(finalizer.remaining_silence_ms(100), None);
+
+        ended(&mut finalizer, 100);
+        assert_eq!(finalizer.remaining_silence_ms(100), Some(600));
+        assert_eq!(finalizer.remaining_silence_ms(699), Some(1));
+        assert_eq!(finalizer.remaining_silence_ms(700), Some(0));
+
+        finalizer.observe_activity(VoiceActivity::SpeechStarted { at_ms: 800 });
+        assert_eq!(finalizer.remaining_silence_ms(800), None);
+
+        ended(&mut finalizer, u64::MAX - 100);
+        assert_eq!(finalizer.remaining_silence_ms(u64::MAX - 1), Some(1));
+        assert_eq!(finalizer.remaining_silence_ms(u64::MAX), Some(0));
     }
 
     #[test]

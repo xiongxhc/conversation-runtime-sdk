@@ -241,11 +241,58 @@ async fn recognizer_final_arriving_after_elapsed_silence_starts_the_turn() {
     assert!(harness.language.requests().is_empty());
 
     harness.engine_final(4, "late final").await;
-    tokio::time::advance(Duration::from_millis(600)).await;
+    tokio::time::advance(Duration::from_millis(119)).await;
+    tokio::task::yield_now().await;
+    assert!(harness.language.requests().is_empty());
+    tokio::time::advance(Duration::from_millis(1)).await;
     harness.wait_for_request_count(1).await;
 
     let observed = drain_until_turn_terminal(&mut events).await;
     assert_final_and_completed(&observed, TurnId::new(1), "late final");
+    harness.shutdown(&mut events).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn adjacent_late_engine_finals_restart_the_short_debounce() {
+    let harness = VoiceSessionHarness::new();
+    let mut events = harness.start().await;
+    assert_session_started(events.recv().await);
+
+    harness.speech_ended(0).await;
+    tokio::time::advance(Duration::from_millis(600)).await;
+    tokio::task::yield_now().await;
+
+    harness.engine_final(1, "first").await;
+    tokio::time::advance(Duration::from_millis(100)).await;
+    harness.engine_final(2, " second").await;
+    tokio::time::advance(Duration::from_millis(119)).await;
+    tokio::task::yield_now().await;
+    assert!(harness.language.requests().is_empty());
+    tokio::time::advance(Duration::from_millis(1)).await;
+    harness.wait_for_request_count(1).await;
+
+    let observed = drain_until_turn_terminal(&mut events).await;
+    assert_final_and_completed(&observed, TurnId::new(1), "first second");
+    harness.shutdown(&mut events).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn resumed_speech_disarms_the_short_late_recognition_debounce() {
+    let harness = VoiceSessionHarness::new();
+    let mut events = harness.start().await;
+    assert_session_started(events.recv().await);
+
+    harness.speech_ended(0).await;
+    tokio::time::advance(Duration::from_millis(600)).await;
+    tokio::task::yield_now().await;
+    harness.engine_final(1, "not final yet").await;
+
+    tokio::time::advance(Duration::from_millis(119)).await;
+    harness.speech_started(719).await;
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+
+    assert!(harness.language.requests().is_empty());
     harness.shutdown(&mut events).await;
 }
 

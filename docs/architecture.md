@@ -145,11 +145,17 @@ partial-start failures clean up in reverse activation order.
 Rust remains authoritative for privacy and adapter validation, session and turn
 state, the `600 ms` final-silence rule, generation identifiers, provider
 coordination, cancellation, and lifecycle events. Partial transcripts are
-observable but never reach the language model. During playback, approximately
-the configured `speech_start_ms` of sustained local speech, measured in `100 ms`
-VAD windows, flushes the active sidecar generation and cancels language
-generation, TTS, queued frames, and playback without waiting for a transcript.
-The default remains `200 ms`.
+observable but never reach the language model. An engine-final transcript that
+arrives before the silence gate retains only the gate's remaining duration. If
+it arrives after the gate, Rust applies a private `120 ms` debounce so adjacent
+engine-final segments can join the same turn without repeating the full silence
+wait. Another late engine-final restarts that short debounce, while resumed
+speech disarms it. This scheduler detail does not change the schema or the
+configured final-silence contract. During playback, approximately the configured
+`speech_start_ms` of sustained local speech, measured in `100 ms` VAD windows,
+flushes the active sidecar generation and cancels language generation, TTS,
+queued frames, and playback without waiting for a transcript. The default
+remains `200 ms`.
 
 Schema v1 resolves `conversation-voice-sidecar` adjacent to the running
 `conversation-voice-loop` binary. `sidecar_executable` is only an optional

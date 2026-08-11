@@ -37,6 +37,21 @@ latency, and externally measured audible-stop latency remain unvalidated. The
 process/device status remains `PARTIALLY VALIDATED` and acoustic status remains
 `NOT VALIDATED`.
 
+## Late Recognition Endpointing Update — 2026-08-11
+
+Rust still requires the configured final-silence interval before a voice turn
+can start. When recognition becomes engine-final only after that interval has
+already elapsed, the session now uses a private `120 ms` adjacent-segment
+debounce instead of reapplying the complete configured interval. Additional
+late engine-final segments restart the short debounce and join the same turn;
+new speech disarms it, and partial transcripts remain display-only.
+
+Paused-clock tests establish the scheduler boundary at `119 ms` and `120 ms`,
+the adjacent-segment restart, remaining-silence arithmetic, and the unchanged
+normal finalization path. This is deterministic orchestration evidence only. It
+does not measure speech-end-to-first-audible latency, recognizer quality, or
+subjective voice continuity, and it introduces no public configuration change.
+
 ## Acceptance Closure Update — 2026-08-02
 
 Source commit `55d29b4` closes the remaining deterministic acceptance-tooling

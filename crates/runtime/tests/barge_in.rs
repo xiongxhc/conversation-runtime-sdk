@@ -769,6 +769,12 @@ impl VoiceSessionHarness {
 
     async fn finalize_utterance(&self, segment_id: u64, text: &str, at_ms: u64) {
         self.input
+            .send(Ok(VoiceInputEvent::Activity(
+                VoiceActivity::SpeechStarted { at_ms },
+            )))
+            .await
+            .unwrap();
+        self.input
             .send(Ok(VoiceInputEvent::Recognition(
                 RecognitionEvent::Hypothesis(RecognitionHypothesis::engine_final(segment_id, text)),
             )))

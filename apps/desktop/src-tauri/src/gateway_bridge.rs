@@ -83,12 +83,17 @@ impl GatewayBridge {
             return Err(GatewayBridgeError("runtime is already open"));
         }
 
+        let stderr = paths
+            .config
+            .parent()
+            .and_then(open_gateway_log)
+            .map_or_else(Stdio::null, Stdio::from);
         let mut child = Command::new(&paths.gateway)
             .arg("--config")
             .arg(&paths.config)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(stderr)
             .spawn()
             .map_err(|_| GatewayBridgeError("runtime could not start"))?;
 
@@ -156,6 +161,31 @@ impl GatewayBridge {
         *lifecycle = GatewayLifecycle::Idle;
         child_result.and(forwarder_result)
     }
+}
+
+#[cfg(unix)]
+fn open_gateway_log(directory: &Path) -> Option<std::fs::File> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(directory.join("gateway.log"))
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    file.set_len(0).ok()?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .ok()?;
+    Some(file)
+}
+
+#[cfg(not(unix))]
+fn open_gateway_log(_directory: &Path) -> Option<std::fs::File> {
+    None
 }
 
 pub async fn close_for_app_exit(bridge: &GatewayBridge) -> Result<(), GatewayBridgeError> {

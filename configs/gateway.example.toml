@@ -48,6 +48,10 @@ follow_up_frequency = 25
 # provider = "local-speech-recognition"
 # model_path = "/absolute/path/to/local-asr-model"
 # download = false
+# Optional: pin recognition to one lowercase Whisper language code (for
+# example "zh" or "en"). When unset, the engine detects the language per
+# window, which can drift on mixed-language or noisy audio.
+# language = "zh"
 #
 # [voice.speech]
 # backend = "openai-compatible"

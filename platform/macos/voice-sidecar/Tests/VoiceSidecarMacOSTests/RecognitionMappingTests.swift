@@ -7,12 +7,23 @@ import Testing
 
 @Test
 func streamingRecognitionTranscribesDetectedLanguageWithoutControlTokens() {
-    let options = WhisperKitRecognition.transcriptionDecodingOptions()
+    let options = WhisperKitRecognition.transcriptionDecodingOptions(language: nil)
 
     #expect(options.task == .transcribe)
     #expect(options.language == nil)
     #expect(options.usePrefillPrompt)
     #expect(options.detectLanguage)
+    #expect(options.skipSpecialTokens)
+    #expect(options.withoutTimestamps)
+}
+
+@Test
+func pinnedRecognitionLanguageDisablesDetection() {
+    let options = WhisperKitRecognition.transcriptionDecodingOptions(language: "zh")
+
+    #expect(options.task == .transcribe)
+    #expect(options.language == "zh")
+    #expect(!options.detectLanguage)
     #expect(options.skipSpecialTokens)
     #expect(options.withoutTimestamps)
 }
@@ -123,6 +134,35 @@ func unchangedAndWhitespaceRecognitionStateEmitsNothing() {
     )
 
     #expect(mapper.changes(from: state, to: state).isEmpty)
+}
+
+@Test
+func punctuationOnlyRecognitionEmitsNothingButMultilingualTextRemains() {
+    let mapper = RecognitionMapper()
+    let empty = RecognitionStateSnapshot()
+    let punctuation = RecognitionStateSnapshot(
+        currentText: "...",
+        confirmedSegments: [
+            RecognitionSegmentSnapshot(id: 1, text: "。，！")
+        ]
+    )
+
+    #expect(mapper.changes(from: empty, to: punctuation).isEmpty)
+    for text in ["你好", "مرحبا", "नमस्ते", "Привет", "café"] {
+        #expect(
+            mapper.changes(
+                from: empty,
+                to: RecognitionStateSnapshot(currentText: text)
+            )
+                == [
+                    RecognitionHypothesis(
+                        segmentID: 1,
+                        text: text,
+                        engineFinal: false
+                    )
+                ]
+        )
+    }
 }
 
 @Test
@@ -504,6 +544,18 @@ func unexpectedRecognitionWorkerCompletionCannotSelfAwait() async {
                 )
             )
     )
+}
+
+@Test
+func intentionalRecognitionWorkerRestartIsNotReportedAsFailure() async {
+    let stopState = RecognitionWorkerStopState()
+    #expect(stopState.beginRestart())
+
+    let completion = await runRecognitionWorker(stopState: stopState) {}
+
+    #expect(completion == .stopped)
+    stopState.finishRestart()
+    #expect(!stopState.isWorkerExitExpected)
 }
 
 @Test

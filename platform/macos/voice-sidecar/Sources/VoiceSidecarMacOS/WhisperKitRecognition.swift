@@ -436,16 +436,44 @@ public final class OrderedRecognitionBatchPipeline: @unchecked Sendable {
 }
 
 final class RecognitionWorkerStopState: @unchecked Sendable {
+    private enum State {
+        case running
+        case restarting
+        case stopping
+    }
+
     private let lock = NSLock()
-    private var stopping = false
+    private var state = State.running
 
     var isStopping: Bool {
-        lock.withLock { stopping }
+        lock.withLock { state == .stopping }
+    }
+
+    var isWorkerExitExpected: Bool {
+        lock.withLock { state != .running }
+    }
+
+    func beginRestart() -> Bool {
+        lock.withLock {
+            guard state == .running else {
+                return false
+            }
+            state = .restarting
+            return true
+        }
+    }
+
+    func finishRestart() {
+        lock.withLock {
+            if state == .restarting {
+                state = .running
+            }
+        }
     }
 
     func beginStopping() {
         lock.withLock {
-            stopping = true
+            state = .stopping
         }
     }
 }
@@ -457,7 +485,7 @@ func runRecognitionWorker(
     do {
         try await operation()
     } catch {
-        if stopState.isStopping || Task.isCancelled {
+        if stopState.isWorkerExitExpected || Task.isCancelled {
             return .stopped
         }
         return .failed(
@@ -467,7 +495,7 @@ func runRecognitionWorker(
             )
         )
     }
-    if stopState.isStopping || Task.isCancelled {
+    if stopState.isWorkerExitExpected || Task.isCancelled {
         return .stopped
     }
     return .failed(
@@ -603,7 +631,8 @@ public struct RecognitionMapper: Sendable {
             guard
                 !segment.text.trimmingCharacters(
                     in: .whitespacesAndNewlines
-                ).isEmpty
+                ).isEmpty,
+                containsRecognizableContent(segment.text)
             else {
                 continue
             }
@@ -638,7 +667,10 @@ public struct RecognitionMapper: Sendable {
     ) -> String? {
         let currentText = state.currentText
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        if !currentText.isEmpty, currentText != "Waiting for speech..." {
+        if !currentText.isEmpty,
+            currentText != "Waiting for speech...",
+            containsRecognizableContent(currentText)
+        {
             return state.currentText
         }
         let unconfirmed = state.unconfirmedSegments
@@ -647,7 +679,8 @@ public struct RecognitionMapper: Sendable {
         guard
             !unconfirmed.trimmingCharacters(
                 in: .whitespacesAndNewlines
-            ).isEmpty
+            ).isEmpty,
+            containsRecognizableContent(unconfirmed)
         else {
             return nil
         }
@@ -663,6 +696,10 @@ public struct RecognitionMapper: Sendable {
                 + 1
         )
     }
+}
+
+private func containsRecognizableContent(_ text: String) -> Bool {
+    text.unicodeScalars.contains { CharacterSet.alphanumerics.contains($0) }
 }
 
 public enum WhisperKitRecognitionEvent: Sendable {
@@ -889,6 +926,7 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
 
     private let modelPath: String
     private let audioProcessor: VoiceProcessingAudioProcessor
+    private let language: String?
     private let mapper = RecognitionMapper()
     private let vad = EnergyVAD(
         sampleRate: 16_000,
@@ -896,10 +934,21 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
     )
     private let eventRelay = RecognitionEventRelay()
 
+    private struct TranscriberComponents {
+        let audioEncoder: any AudioEncoding
+        let featureExtractor: any FeatureExtracting
+        let segmentSeeker: any SegmentSeeking
+        let textDecoder: any TextDecoding
+        let tokenizer: any WhisperTokenizer
+    }
+
     private var preparedConfiguration: SidecarConfiguration?
+    private var transcriberComponents: TranscriberComponents?
     private var transcriber: AudioStreamTranscriber?
     private var hypothesisPipeline: OrderedRecognitionBatchPipeline?
     private var transcriptionTask: Task<RecognitionWorkerCompletion, Never>?
+    private var transcriptionMonitorTask: Task<Void, Never>?
+    private var recognitionResetTask: Task<Void, Never>?
     private var voiceWindowTask: Task<RecognitionWorkerCompletion, Never>?
     private var voiceMailbox: RecognitionVoiceMailbox?
     private var monitorTasks: [Task<Void, Never>] = []
@@ -911,10 +960,12 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
 
     public init(
         modelPath: String,
-        audioProcessor: VoiceProcessingAudioProcessor
+        audioProcessor: VoiceProcessingAudioProcessor,
+        language: String? = nil
     ) {
         self.modelPath = modelPath
         self.audioProcessor = audioProcessor
+        self.language = language
     }
 
     public func setEventHandler(_ handler: EventHandler?) async {
@@ -925,12 +976,12 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
         await eventRelay.setFailureHandler(handler)
     }
 
-    static func transcriptionDecodingOptions() -> DecodingOptions {
+    static func transcriptionDecodingOptions(language: String?) -> DecodingOptions {
         DecodingOptions(
             task: .transcribe,
-            language: nil,
+            language: language,
             usePrefillPrompt: true,
-            detectLanguage: true,
+            detectLanguage: language == nil,
             skipSpecialTokens: true,
             withoutTimestamps: true
         )
@@ -943,6 +994,12 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
             throw SidecarServiceFailure(
                 stage: .speechRecognizer,
                 code: .invalidState
+            )
+        }
+        if let language, !Constants.languages.values.contains(language) {
+            throw SidecarServiceFailure(
+                stage: .speechRecognizer,
+                code: .recognitionFailed
             )
         }
         let modelURL = URL(fileURLWithPath: modelPath, isDirectory: true)
@@ -986,29 +1043,23 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
                 code: .recognitionFailed
             )
         }
-        let mapper = mapper
         let pipeline = OrderedRecognitionBatchPipeline(capacity: 8)
-        let transcriber = AudioStreamTranscriber(
+        let components = TranscriberComponents(
             audioEncoder: whisperKit.audioEncoder,
             featureExtractor: whisperKit.featureExtractor,
             segmentSeeker: whisperKit.segmentSeeker,
             textDecoder: whisperKit.textDecoder,
-            tokenizer: tokenizer,
+            tokenizer: tokenizer
+        )
+        let transcriber = Self.makeTranscriber(
+            components: components,
             audioProcessor: audioProcessor,
-            decodingOptions: Self.transcriptionDecodingOptions(),
-            requiredSegmentsForConfirmation: 0,
-            stateChangeCallback: { oldState, newState in
-                let hypotheses = mapper.changes(
-                    from: Self.snapshot(oldState),
-                    to: Self.snapshot(newState)
-                )
-                guard !hypotheses.isEmpty else {
-                    return
-                }
-                pipeline.enqueue(hypotheses)
-            }
+            language: language,
+            mapper: mapper,
+            pipeline: pipeline
         )
         preparedConfiguration = configuration
+        transcriberComponents = components
         hypothesisPipeline = pipeline
         self.transcriber = transcriber
     }
@@ -1081,25 +1132,18 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
             }
         )
 
-        let transcriptionWorker = Task {
-            await runRecognitionWorker(stopState: stopState) {
-                try await transcriber.startStreamTranscription()
-            }
-        }
-        transcriptionTask = transcriptionWorker
-        monitorTasks.append(
-            monitorRecognitionWorker(transcriptionWorker) { failure in
-                await eventRelay.reportFailure(
-                    sessionID: sessionID,
-                    failure: failure
-                )
-            }
+        startTranscriptionWorker(
+            transcriber: transcriber,
+            stopState: stopState,
+            sessionID: sessionID
         )
         await audioProcessor.waitUntilRecordingStarted()
     }
 
     public func stop() async {
         workerStopState.beginStopping()
+        recognitionResetTask?.cancel()
+        recognitionResetTask = nil
         audioProcessor.setVoiceWindowHandler(nil)
         audioProcessor.setDiscontinuityHandler(nil)
         voiceMailbox?.finish()
@@ -1120,7 +1164,13 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
             _ = await transcriptionTask.value
         }
         self.transcriptionTask = nil
+        transcriptionMonitorTask?.cancel()
+        if let transcriptionMonitorTask {
+            _ = await transcriptionMonitorTask.value
+        }
+        self.transcriptionMonitorTask = nil
         self.transcriber = nil
+        transcriberComponents = nil
         audioProcessor.stopRecording()
         preparedConfiguration = nil
 
@@ -1146,6 +1196,124 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
         )
     }
 
+    private static func makeTranscriber(
+        components: TranscriberComponents,
+        audioProcessor: VoiceProcessingAudioProcessor,
+        language: String?,
+        mapper: RecognitionMapper,
+        pipeline: OrderedRecognitionBatchPipeline
+    ) -> AudioStreamTranscriber {
+        AudioStreamTranscriber(
+            audioEncoder: components.audioEncoder,
+            featureExtractor: components.featureExtractor,
+            segmentSeeker: components.segmentSeeker,
+            textDecoder: components.textDecoder,
+            tokenizer: components.tokenizer,
+            audioProcessor: audioProcessor,
+            decodingOptions: transcriptionDecodingOptions(language: language),
+            requiredSegmentsForConfirmation: 0,
+            stateChangeCallback: { oldState, newState in
+                let hypotheses = mapper.changes(
+                    from: snapshot(oldState),
+                    to: snapshot(newState)
+                )
+                guard !hypotheses.isEmpty else {
+                    return
+                }
+                pipeline.enqueue(hypotheses)
+            }
+        )
+    }
+
+    private func startTranscriptionWorker(
+        transcriber: AudioStreamTranscriber,
+        stopState: RecognitionWorkerStopState,
+        sessionID: UInt64
+    ) {
+        let eventRelay = eventRelay
+        let worker = Task {
+            await runRecognitionWorker(stopState: stopState) {
+                try await transcriber.startStreamTranscription()
+            }
+        }
+        transcriptionTask = worker
+        transcriptionMonitorTask = monitorRecognitionWorker(worker) { failure in
+            await eventRelay.reportFailure(
+                sessionID: sessionID,
+                failure: failure
+            )
+        }
+    }
+
+    private func scheduleRecognitionReset() {
+        guard let configuration = preparedConfiguration else {
+            return
+        }
+        recognitionResetTask?.cancel()
+        recognitionResetTask = Task { [weak self] in
+            do {
+                try await Task.sleep(
+                    nanoseconds: configuration.finalSilenceMilliseconds
+                        * 1_000_000
+                )
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else {
+                return
+            }
+            await self?.resetRecognitionAfterFinalSilence(
+                configuration: configuration
+            )
+        }
+    }
+
+    private func resetRecognitionAfterFinalSilence(
+        configuration: SidecarConfiguration
+    ) async {
+        guard preparedConfiguration == configuration,
+            !speechGate.isSpeaking,
+            !workerStopState.isStopping,
+            let components = transcriberComponents,
+            let pipeline = hypothesisPipeline,
+            let transcriber,
+            let transcriptionTask,
+            workerStopState.beginRestart()
+        else {
+            return
+        }
+        recognitionResetTask = nil
+        audioProcessor.prepareForCaptureRestart()
+        await transcriber.stopStreamTranscription()
+        _ = await transcriptionTask.value
+        self.transcriptionTask = nil
+        transcriptionMonitorTask?.cancel()
+        if let transcriptionMonitorTask {
+            _ = await transcriptionMonitorTask.value
+        }
+        self.transcriptionMonitorTask = nil
+        guard preparedConfiguration == configuration,
+            !workerStopState.isStopping
+        else {
+            workerStopState.finishRestart()
+            return
+        }
+        let replacement = Self.makeTranscriber(
+            components: components,
+            audioProcessor: audioProcessor,
+            language: language,
+            mapper: mapper,
+            pipeline: pipeline
+        )
+        self.transcriber = replacement
+        startTranscriptionWorker(
+            transcriber: replacement,
+            stopState: workerStopState,
+            sessionID: configuration.sessionID
+        )
+        workerStopState.finishRestart()
+    }
+
     private func processVoiceInput(
         _ input: RecognitionVoiceInput
     ) async throws {
@@ -1164,6 +1332,10 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
 
     private func processVoiceWindow(_ window: [Float]) async throws {
         let isSpeech = vad.voiceActivity(in: window).last == true
+        if isSpeech {
+            recognitionResetTask?.cancel()
+            recognitionResetTask = nil
+        }
         let atMilliseconds = elapsedMilliseconds()
         _ = try await eventRelay.emit(
             .voiceWindow(
@@ -1200,6 +1372,7 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
                     )
                 )
             )
+            scheduleRecognitionReset()
         }
     }
 

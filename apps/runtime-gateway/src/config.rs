@@ -290,7 +290,7 @@ impl VoiceConfig {
         )
         .map_err(runtime_error)?;
 
-        let sidecar = MacOsVoiceSidecarConfig::new(
+        let mut sidecar = MacOsVoiceSidecarConfig::new(
             &self.audio.sidecar_executable,
             &self.asr.model_path,
             SystemDevice::SystemDefault,
@@ -301,6 +301,9 @@ impl VoiceConfig {
         .map_err(adapter_error)?
         .with_max_stderr_bytes(self.audio.max_error_bytes)
         .map_err(adapter_error)?;
+        if let Some(language) = &self.asr.language {
+            sidecar = sidecar.with_language(language).map_err(adapter_error)?;
+        }
 
         Ok(GatewayVoiceAdapters {
             io: Arc::new(MacOsVoiceSidecar::new(sidecar)),
@@ -616,6 +619,7 @@ struct VoiceAsrConfig {
     provider: String,
     model_path: PathBuf,
     download: bool,
+    language: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]

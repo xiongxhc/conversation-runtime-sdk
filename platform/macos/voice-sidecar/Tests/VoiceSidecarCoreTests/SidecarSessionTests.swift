@@ -308,16 +308,65 @@ func suspendedEnqueueCannotResurrectFlushedGenerationOrEmitLateAccepted() async 
             ]
     )
 
-    do {
-        try await session.handleMedia(
-            ChildFrame(audioSessionID: 7, frame: frame)
+    try await session.handleMedia(
+        ChildFrame(audioSessionID: 7, frame: frame)
+    )
+    #expect(
+        await events.frames
+            == [
+                ChildFrame(control: .ready(sessionID: 7)),
+                ChildFrame(control: .captureStarted(sessionID: 7, operationID: 1)),
+                ChildFrame(
+                    control: .playbackFlushed(
+                        sessionID: 7,
+                        generationID: 3,
+                        operationID: 9
+                    )
+                ),
+            ]
+    )
+}
+
+@Test
+func frameArrivingAfterItsGenerationWasFlushedIsDroppedWithoutFailure() async throws {
+    let playback = ControllablePlaybackService()
+    let events = RecordingEventSink()
+    let session = SidecarSession(
+        audioService: RecordingAudioService(),
+        recognitionService: RecordingRecognitionService(),
+        playbackService: playback,
+        eventSink: events
+    )
+    try await startAndCapture(session)
+    try await session.handleControl(
+        ChildFrame(
+            control: .flushGeneration(
+                sessionID: 7,
+                generationID: 3,
+                operationID: 9
+            )
         )
-        Issue.record("expected flushed generation to remain stale")
-    } catch let error as PlaybackBufferError {
-        #expect(error == .staleGeneration)
-    } catch {
-        Issue.record("unexpected error \(error)")
-    }
+    )
+
+    try await session.handleMedia(
+        ChildFrame(audioSessionID: 7, frame: pcmFrame(generationID: 3))
+    )
+
+    #expect(await playback.frames.isEmpty)
+    #expect(
+        await events.frames
+            == [
+                ChildFrame(control: .ready(sessionID: 7)),
+                ChildFrame(control: .captureStarted(sessionID: 7, operationID: 1)),
+                ChildFrame(
+                    control: .playbackFlushed(
+                        sessionID: 7,
+                        generationID: 3,
+                        operationID: 9
+                    )
+                ),
+            ]
+    )
 }
 
 @Test

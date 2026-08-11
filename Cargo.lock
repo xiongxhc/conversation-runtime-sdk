@@ -398,6 +398,7 @@ version = "0.1.0"
 dependencies = [
  "conversation-protocol",
  "conversation-runtime-gateway",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

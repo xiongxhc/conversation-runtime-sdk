@@ -690,17 +690,18 @@ impl VoiceLoop {
             Some(Ok(VoiceInputEvent::Activity(activity))) => self.handle_activity(activity).await,
             Some(Ok(VoiceInputEvent::Recognition(RecognitionEvent::Hypothesis(hypothesis)))) => {
                 let is_engine_final = hypothesis.is_engine_final();
-                if !hypothesis.text().trim().is_empty() {
-                    self.active_segment_id = Some(hypothesis.segment_id());
-                    if !hypothesis.is_engine_final()
-                        && !self
-                            .publish_partial(hypothesis.segment_id(), hypothesis.text().to_owned())
-                    {
-                        return Some(LoopExit::ConsumerDropped);
-                    }
+                let segment_id = hypothesis.segment_id();
+                let text = hypothesis.text().to_owned();
+                if !self
+                    .finalizer
+                    .observe_hypothesis(hypothesis, self.clock.now_ms())
+                {
+                    return None;
                 }
-                self.finalizer
-                    .observe_hypothesis(hypothesis, self.clock.now_ms());
+                self.active_segment_id = Some(segment_id);
+                if !is_engine_final && !self.publish_partial(segment_id, text) {
+                    return Some(LoopExit::ConsumerDropped);
+                }
                 if is_engine_final && self.state == VoiceLoopState::Listening {
                     // Settle window: later engine-final segments of the same
                     // utterance must land in this turn, not start their own.

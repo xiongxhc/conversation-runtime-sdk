@@ -377,6 +377,45 @@ func captureDiscontinuityPreventsVoiceWindowBridging() throws {
     #expect(recorder.count == 1)
 }
 
+@Test
+func recognitionHandlersSurviveCaptureRestart() throws {
+    let engine = VoiceProcessingEngine(
+        permissionProvider: AuthorizedPermissionProvider()
+    )
+    let processor = VoiceProcessingAudioProcessor(engine: engine)
+    let recorder = VoiceWindowRecorder()
+    processor.setVoiceWindowHandler { window in
+        recorder.record(window)
+    }
+    let format = try #require(
+        AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: 16_000,
+            channels: 1,
+            interleaved: false
+        )
+    )
+
+    try processor.startRecordingLive(inputDeviceID: nil, callback: nil)
+    processor.consumeCaptureEvent(
+        .buffer(try floatBuffer(format: format, count: 1_600))
+    )
+    #expect(processor.audioSamples.count == 1_600)
+    processor.prepareForCaptureRestart()
+    processor.stopRecording()
+    try processor.startRecordingLive(inputDeviceID: nil, callback: nil)
+    defer {
+        processor.stopRecording()
+        processor.setVoiceWindowHandler(nil)
+    }
+    processor.consumeCaptureEvent(
+        .buffer(try floatBuffer(format: format, count: 1_600))
+    )
+
+    #expect(recorder.count == 2)
+    #expect(processor.audioSamples.count == 1_600)
+}
+
 @Test(
     arguments: [
         StreamingRecognizerCase(

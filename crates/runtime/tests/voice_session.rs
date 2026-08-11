@@ -138,6 +138,14 @@ async fn finalizes_each_utterance_from_the_silence_timer_with_increasing_identit
         GenerationId::new(1)
     );
 
+    harness.speech_started(600).await;
+    assert!(matches!(
+        events.recv().await,
+        Some(VoiceSessionEvent::VoiceActivity {
+            activity: VoiceActivity::SpeechStarted { .. },
+            ..
+        })
+    ));
     harness.partial(2, "again").await;
     assert_partial(events.recv().await, 2, "again");
     harness.engine_final(2, "again").await;
@@ -151,6 +159,52 @@ async fn finalizes_each_utterance_from_the_silence_timer_with_increasing_identit
     assert_eq!(
         harness.language.requests()[1].generation_id(),
         GenerationId::new(2)
+    );
+
+    harness.shutdown(&mut events).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn late_recognition_waits_for_the_next_speech_window() {
+    let harness = VoiceSessionHarness::new();
+    let mut events = harness.start().await;
+    assert_session_started(events.recv().await);
+
+    harness.engine_final(1, "first").await;
+    harness.speech_ended(0).await;
+    tokio::time::advance(Duration::from_millis(600)).await;
+    assert_final_and_completed(
+        &drain_until_turn_terminal(&mut events).await,
+        TurnId::new(1),
+        "first",
+    );
+
+    harness.partial(2, "stale partial").await;
+    harness.engine_final(2, "stale final").await;
+    tokio::time::advance(Duration::from_millis(600)).await;
+    tokio::task::yield_now().await;
+
+    assert_eq!(harness.language.requests().len(), 1);
+    tokio::select! {
+        event = events.recv() => panic!("late recognition was published: {event:?}"),
+        _ = tokio::time::sleep(Duration::from_millis(1)) => {}
+    }
+
+    harness.speech_started(1_200).await;
+    assert!(matches!(
+        events.recv().await,
+        Some(VoiceSessionEvent::VoiceActivity {
+            activity: VoiceActivity::SpeechStarted { .. },
+            ..
+        })
+    ));
+    harness.engine_final(3, "second").await;
+    harness.speech_ended(1_200).await;
+    tokio::time::advance(Duration::from_millis(600)).await;
+    assert_final_and_completed(
+        &drain_until_turn_terminal(&mut events).await,
+        TurnId::new(2),
+        "second",
     );
 
     harness.shutdown(&mut events).await;
@@ -755,6 +809,7 @@ async fn stalled_consumer_backpressures_sustained_multi_turn_reliable_events() {
     assert_session_started(events.recv().await);
 
     for segment_id in 1..=4 {
+        harness.speech_started((segment_id - 1) * 600).await;
         harness
             .partial(segment_id, &format!("partial-{segment_id}"))
             .await;

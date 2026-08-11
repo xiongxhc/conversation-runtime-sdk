@@ -201,7 +201,7 @@ async fn handshake_enqueue_flush_and_input_events_use_protocol_acknowledgements(
     );
 
     cancellation.cancel();
-    assert!(await_completion(session.completion).await.is_err());
+    assert!(await_completion(session.completion).await.is_ok());
     harness.assert_process_gone().await;
     assert!(harness.shutdown_marker().exists());
 }
@@ -248,7 +248,7 @@ async fn voice_input_receives_activity_and_partial_final_hypotheses() {
     assert!(saw_final && saw_ended);
 
     cancellation.cancel();
-    assert!(await_completion(session.completion).await.is_err());
+    assert!(await_completion(session.completion).await.is_ok());
     harness.assert_process_gone().await;
 }
 
@@ -282,7 +282,7 @@ async fn capture_start_and_pause_resolve_only_after_exact_acknowledgements() {
         .await
         .unwrap();
     cancellation.cancel();
-    assert!(await_completion(session.completion).await.is_err());
+    assert!(await_completion(session.completion).await.is_ok());
     harness.assert_process_gone().await;
 }
 
@@ -328,7 +328,7 @@ async fn capture_control_cancellation_releases_its_waiter_and_reaps() {
 
     assert!(pausing.await.is_err());
     cancellation.cancel();
-    assert!(await_completion(session.completion).await.is_err());
+    assert!(await_completion(session.completion).await.is_ok());
     harness.assert_process_gone().await;
 }
 
@@ -348,7 +348,7 @@ async fn capture_start_cancellation_cancels_the_session_and_reaps() {
     start_cancellation.cancel();
 
     assert!(starting.await.is_err());
-    assert!(await_completion(session.completion).await.is_err());
+    assert!(await_completion(session.completion).await.is_ok());
     harness.assert_process_gone().await;
 }
 
@@ -437,7 +437,7 @@ async fn recognition_failure_keeps_real_factory_completion_alive() {
     );
 
     cancellation.cancel();
-    assert!(await_completion(session.completion).await.is_err());
+    assert!(await_completion(session.completion).await.is_ok());
     harness.assert_process_gone().await;
 }
 
@@ -590,7 +590,7 @@ async fn cancellation_kills_reaps_and_finishes_stderr_reader() {
     let session = harness.start(cancellation.clone()).await.unwrap();
 
     cancellation.cancel();
-    assert!(await_completion(session.completion).await.is_err());
+    assert!(await_completion(session.completion).await.is_ok());
     harness.assert_process_gone().await;
     assert!(!harness.shutdown_marker().exists());
     harness.terminate_descendant().await;
@@ -604,7 +604,7 @@ async fn slow_stdin_forces_kill_after_grace_period() {
     let started = Instant::now();
 
     cancellation.cancel();
-    assert!(await_completion(session.completion).await.is_err());
+    assert!(await_completion(session.completion).await.is_ok());
     assert!(started.elapsed() >= GRACEFUL_TIMEOUT);
     assert!(!harness.shutdown_marker().exists());
     harness.assert_process_gone().await;
@@ -617,7 +617,7 @@ async fn graceful_shutdown_marker_precedes_reap() {
     let session = harness.start(cancellation.clone()).await.unwrap();
 
     cancellation.cancel();
-    assert!(await_completion(session.completion).await.is_err());
+    assert!(await_completion(session.completion).await.is_ok());
     assert!(harness.shutdown_marker().exists());
     harness.assert_process_gone().await;
 }
@@ -666,7 +666,7 @@ async fn blocked_media_does_not_block_flush_and_cancellation_drains_full_queue()
     harness.wait_for_marker(harness.flush_marker()).await;
 
     cancellation.cancel();
-    assert!(await_completion(session.completion).await.is_err());
+    assert!(await_completion(session.completion).await.is_ok());
     for enqueue in enqueues {
         assert!(tokio::time::timeout(Duration::from_secs(1), enqueue)
             .await
@@ -717,7 +717,7 @@ async fn concurrent_same_generation_enqueues_resolve_the_exact_reversed_acknowle
         enqueue.await.unwrap();
     }
     cancellation.cancel();
-    assert!(await_completion(session.completion).await.is_err());
+    assert!(await_completion(session.completion).await.is_ok());
     harness.assert_process_gone().await;
 }
 
@@ -769,7 +769,7 @@ async fn dropped_enqueue_retains_its_two_second_reservation_until_exact_ack() {
     assert_eq!(retried.state(), PlaybackState::Accepted);
 
     cancellation.cancel();
-    assert!(await_completion(session.completion).await.is_err());
+    assert!(await_completion(session.completion).await.is_ok());
     harness.assert_process_gone().await;
 }
 
@@ -818,7 +818,7 @@ async fn same_exact_identity_retry_waits_until_late_old_ack_is_consumed() {
     assert_eq!(safe_retry.state(), PlaybackState::Accepted);
 
     cancellation.cancel();
-    assert!(await_completion(session.completion).await.is_err());
+    assert!(await_completion(session.completion).await.is_ok());
     harness.assert_process_gone().await;
 }
 
@@ -854,7 +854,7 @@ async fn cancelled_enqueue_removes_only_its_operation_and_allows_retry() {
     assert_eq!(retried.state(), PlaybackState::Accepted);
 
     cancellation.cancel();
-    assert!(await_completion(session.completion).await.is_err());
+    assert!(await_completion(session.completion).await.is_ok());
     harness.assert_process_gone().await;
 }
 
@@ -895,7 +895,7 @@ async fn repeated_cancelled_written_media_remains_bounded_by_existing_limits() {
 
     cancellation.cancel();
     assert!(blocked.await.unwrap().is_err());
-    assert!(await_completion(session.completion).await.is_err());
+    assert!(await_completion(session.completion).await.is_ok());
     harness.assert_process_gone().await;
 
     assert_eq!(held_line_count, 100);
@@ -927,7 +927,7 @@ async fn dropped_flush_removes_its_exact_operation_and_allows_retry() {
     assert_eq!(retried.state(), PlaybackState::Flushed);
 
     cancellation.cancel();
-    assert!(await_completion(session.completion).await.is_err());
+    assert!(await_completion(session.completion).await.is_ok());
     harness.assert_process_gone().await;
 }
 
@@ -983,7 +983,7 @@ async fn cancellation_closes_media_before_flush_and_shutdown_controls() {
         .unwrap();
 
     cancellation.cancel();
-    assert!(await_completion(session.completion).await.is_err());
+    assert!(await_completion(session.completion).await.is_ok());
     harness.assert_process_gone().await;
     assert_eq!(
         std::fs::read_to_string(harness.order_marker()).unwrap(),
@@ -1044,7 +1044,7 @@ async fn full_input_consumer_does_not_block_playback_flush_or_shutdown_acknowled
     assert!(saw_started && saw_final && saw_ended);
 
     cancellation.cancel();
-    assert!(await_completion(session.completion).await.is_err());
+    assert!(await_completion(session.completion).await.is_ok());
     harness.assert_process_gone().await;
 }
 
@@ -1073,7 +1073,7 @@ async fn flush_accepts_a_new_generation_before_its_first_media_frame() {
     assert_eq!(repeated.state(), PlaybackState::Flushed);
 
     cancellation.cancel();
-    assert!(await_completion(session.completion).await.is_err());
+    assert!(await_completion(session.completion).await.is_ok());
     harness.assert_process_gone().await;
 }
 
@@ -1115,7 +1115,7 @@ async fn handles_reject_mismatched_sessions_and_stale_generations() {
         .is_err());
 
     cancellation.cancel();
-    assert!(await_completion(session.completion).await.is_err());
+    assert!(await_completion(session.completion).await.is_ok());
     harness.assert_process_gone().await;
 }
 

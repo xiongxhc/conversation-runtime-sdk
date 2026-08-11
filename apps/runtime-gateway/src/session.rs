@@ -7,8 +7,8 @@ use conversation_model_adapters::GenerationLanguageModel;
 use conversation_protocol::{
     decode_client_command, encode_gateway_message, ClientCommand, ClientMemoryCursor,
     ClientMemoryInspection, ClientMemorySummary, ClientRuntimeError, ClientRuntimeEvent,
-    ClientVoiceSessionEvent, GatewayMessage, RuntimeError, RuntimeEvent, RuntimeStatus, SessionId,
-    TurnId, VoiceSessionEvent,
+    ClientVoiceSessionEvent, GatewayMessage, RecoveryDisposition, RuntimeError, RuntimeErrorKind,
+    RuntimeEvent, RuntimeStatus, SessionId, TurnId, VoiceSessionEvent,
 };
 use conversation_runtime::{
     ConversationContext, TextTurnEventStream, TextTurnRuntime, VoiceSessionAdapters,
@@ -929,6 +929,12 @@ async fn pump_voice_events(
         if !forwarding {
             continue;
         }
+        if let VoiceSessionEvent::SessionFailed {
+            error, recovery, ..
+        } = &event
+        {
+            eprintln!("{}", voice_failure_diagnostic(error, *recovery));
+        }
         let terminal = event.is_session_terminal();
         if terminal {
             while *control_pending.borrow_and_update() {
@@ -966,6 +972,24 @@ async fn pump_voice_events(
         }
     }
     Ok(())
+}
+
+fn voice_failure_diagnostic(error: &RuntimeError, recovery: RecoveryDisposition) -> String {
+    let recovery = match recovery {
+        RecoveryDisposition::ContinueSession => "continue_session",
+        RecoveryDisposition::NewSession => "new_session",
+        _ => "unknown",
+    };
+    let kind = match error.kind() {
+        RuntimeErrorKind::Adapter => "adapter",
+        RuntimeErrorKind::Configuration => "configuration",
+        RuntimeErrorKind::InvalidState => "invalid_state",
+        _ => "unknown",
+    };
+    format!(
+        "voice session failure recovery={recovery} stage={} kind={kind}",
+        error.stage().as_str(),
+    )
 }
 
 async fn shutdown_active(runtime: &TextTurnRuntime, active: &mut Option<ActiveForwarder>) {
@@ -1458,9 +1482,9 @@ mod tests {
     use conversation_protocol::{
         ClientRuntimeEvent, ComponentDescriptor, ComponentKind, ExecutionLocation, GatewayMessage,
         MemoryConfidence, MemoryDraft, MemoryKind, MemoryPatch, MemoryProvenance,
-        MemoryProvenanceKind, MemoryRetention, PrivacyMode, RuntimeStage, RuntimeStatus, SessionId,
-        TurnId, UnixTimestampMillis, VoiceActivity, MAX_CLIENT_FRAME_BYTES,
-        MAX_MEMORY_CONTENT_BYTES,
+        MemoryProvenanceKind, MemoryRetention, PrivacyMode, RecoveryDisposition, RuntimeError,
+        RuntimeErrorKind, RuntimeStage, RuntimeStatus, SessionId, TurnId, UnixTimestampMillis,
+        VoiceActivity, MAX_CLIENT_FRAME_BYTES, MAX_MEMORY_CONTENT_BYTES,
     };
     use tempfile::TempDir;
     use tokio::io::{duplex, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
@@ -1472,9 +1496,23 @@ mod tests {
     use crate::voice_adapters::{GatewayVoiceAdapters, VoicePolicyTemplate};
     use crate::FrameReader;
 
-    use super::{GatewaySession, GatewaySessionError};
+    use super::{voice_failure_diagnostic, GatewaySession, GatewaySessionError};
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn voice_failure_diagnostic_omits_internal_error_message() {
+        let error = RuntimeError::new(
+            RuntimeErrorKind::Adapter,
+            RuntimeStage::SpeechRecognizer,
+            "private transcript or provider detail",
+        );
+
+        assert_eq!(
+            voice_failure_diagnostic(&error, RecoveryDisposition::NewSession),
+            "voice session failure recovery=new_session stage=speech_recognizer kind=adapter",
+        );
+    }
 
     #[tokio::test]
     async fn memory_list_is_accepted_before_its_correlated_response() {

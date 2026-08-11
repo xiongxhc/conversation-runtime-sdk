@@ -39,19 +39,16 @@ impl TurnFinalizer {
         })
     }
 
-    pub fn observe_hypothesis(&mut self, value: RecognitionHypothesis, _at_ms: u64) {
-        if value.text().trim().is_empty() {
-            return;
+    pub fn observe_hypothesis(&mut self, value: RecognitionHypothesis, _at_ms: u64) -> bool {
+        if self.finalized || value.text().trim().is_empty() {
+            return false;
         }
 
         let segment_id = value.segment_id();
         let text = value.text().to_owned();
 
         if self.segment_id != Some(segment_id) {
-            if self.finalized {
-                self.committed.clear();
-                self.finalized = false;
-            } else if let Some(committed) = self.engine_final_candidate.take() {
+            if let Some(committed) = self.engine_final_candidate.take() {
                 self.committed.push(committed);
             }
             self.segment_id = Some(segment_id);
@@ -62,11 +59,22 @@ impl TurnFinalizer {
         if value.is_engine_final() {
             self.engine_final_candidate = Some(text);
         }
+        true
     }
 
     pub fn observe_activity(&mut self, value: VoiceActivity) {
         match value {
-            VoiceActivity::SpeechStarted { .. } | VoiceActivity::SpeechContinued { .. } => {
+            VoiceActivity::SpeechStarted { .. } => {
+                if self.finalized {
+                    self.segment_id = None;
+                    self.committed.clear();
+                    self.display_candidate = None;
+                    self.engine_final_candidate = None;
+                    self.finalized = false;
+                }
+                self.speech_ended_at_ms = None;
+            }
+            VoiceActivity::SpeechContinued { .. } => {
                 self.speech_ended_at_ms = None;
             }
             VoiceActivity::SpeechEnded { at_ms } => {
@@ -164,11 +172,33 @@ mod tests {
         ended(&mut finalizer, 100);
         assert!(finalizer.finalize_ready(700).is_some());
 
+        finalizer.observe_activity(VoiceActivity::SpeechStarted { at_ms: 2_000 });
         finalizer.observe_hypothesis(RecognitionHypothesis::engine_final(3, " next"), 2_000);
         ended(&mut finalizer, 2_000);
         let finalized = finalizer
             .finalize_ready(2_600)
             .expect("next utterance finalizes");
+        assert_eq!(finalized.text, " next");
+    }
+
+    #[test]
+    fn late_hypothesis_waits_for_the_next_speech_start() {
+        let mut finalizer = finalizer();
+        finalizer.observe_hypothesis(RecognitionHypothesis::engine_final(1, " first"), 0);
+        ended(&mut finalizer, 0);
+        assert!(finalizer.finalize_ready(600).is_some());
+
+        assert!(
+            !finalizer.observe_hypothesis(RecognitionHypothesis::engine_final(2, " stale"), 700)
+        );
+        assert!(finalizer.finalize_ready(1_300).is_none());
+
+        finalizer.observe_activity(VoiceActivity::SpeechStarted { at_ms: 2_000 });
+        finalizer.observe_hypothesis(RecognitionHypothesis::engine_final(3, " next"), 2_100);
+        ended(&mut finalizer, 2_100);
+        let finalized = finalizer
+            .finalize_ready(2_700)
+            .expect("new speech starts the next utterance");
         assert_eq!(finalized.text, " next");
     }
 }

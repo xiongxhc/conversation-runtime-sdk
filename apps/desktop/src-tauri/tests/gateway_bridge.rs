@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 use std::fs;
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -82,6 +83,83 @@ async fn app_exit_cleanup_waits_for_gateway_reaping() {
 }
 
 #[tokio::test]
+async fn gateway_diagnostics_replace_old_content_with_private_permissions() {
+    let fixture = gateway_fixture();
+    let log = fixture.config.parent().unwrap().join("gateway.log");
+    fs::write(&log, "stale diagnostic\n").expect("stale diagnostic");
+    let mut permissions = fs::metadata(&log).unwrap().permissions();
+    permissions.set_mode(0o644);
+    fs::set_permissions(&log, permissions).unwrap();
+    let bridge = GatewayBridge::default();
+
+    bridge
+        .open(paths_for(&fixture), channel())
+        .await
+        .expect("open gateway");
+    wait_for_path(&fixture.started).await;
+    bridge.close().await.expect("close gateway");
+
+    assert_eq!(fs::read_to_string(&log).unwrap(), "fixture diagnostic\n");
+    assert_eq!(
+        fs::metadata(&log).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[tokio::test]
+async fn gateway_diagnostics_never_follow_a_leaf_symlink() {
+    let fixture = gateway_fixture();
+    let log = fixture.config.parent().unwrap().join("gateway.log");
+    let target = fixture.config.parent().unwrap().join("diagnostic-target");
+    fs::write(&target, "preserve me\n").unwrap();
+    std::os::unix::fs::symlink(&target, &log).unwrap();
+    let bridge = GatewayBridge::default();
+
+    bridge
+        .open(paths_for(&fixture), channel())
+        .await
+        .expect("open gateway without unsafe diagnostic sink");
+    wait_for_path(&fixture.started).await;
+    bridge.close().await.expect("close gateway");
+
+    assert_eq!(fs::read_to_string(&target).unwrap(), "preserve me\n");
+}
+
+#[tokio::test]
+async fn gateway_diagnostics_reject_a_named_pipe() {
+    let fixture = gateway_fixture();
+    let log = fixture.config.parent().unwrap().join("gateway.log");
+    assert!(std::process::Command::new("mkfifo")
+        .arg(&log)
+        .status()
+        .unwrap()
+        .success());
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let worker_fixture = fixture.clone();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let bridge = GatewayBridge::default();
+            let result = bridge.open(paths_for(&worker_fixture), channel()).await;
+            if result.is_ok() {
+                wait_for_path(&worker_fixture.started).await;
+                bridge.close().await.unwrap();
+            }
+            sender.send(result).unwrap();
+        });
+    });
+
+    receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("gateway startup must not block on a named pipe")
+        .expect("open gateway without unsafe diagnostic sink");
+    assert!(fs::metadata(&log).unwrap().file_type().is_fifo());
+}
+
+#[tokio::test]
 async fn unexpected_gateway_exit_is_forwarded_to_the_desktop() {
     let temporary = tempfile::tempdir().expect("temporary directory");
     let gateway = temporary.path().join("gateway.sh");
@@ -146,7 +224,7 @@ fn gateway_fixture() -> GatewayFixture {
     let marker = temporary.path().join("gateway");
     fs::write(
         &gateway,
-        "#!/bin/sh\nset -eu\nmarker=$(/bin/cat \"$2\")\n: > \"${marker}.started\"\nread -r _ || true\n: > \"${marker}.closing\"\n/bin/sleep 0.2\n: > \"${marker}.finished\"\n",
+        "#!/bin/sh\nset -eu\nmarker=$(/bin/cat \"$2\")\nprintf 'fixture diagnostic\\n' >&2\n: > \"${marker}.started\"\nread -r _ || true\n: > \"${marker}.closing\"\n/bin/sleep 0.2\n: > \"${marker}.finished\"\n",
     )
     .expect("gateway fixture");
     let mut permissions = fs::metadata(&gateway)

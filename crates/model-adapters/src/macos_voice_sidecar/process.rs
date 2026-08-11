@@ -51,6 +51,7 @@ pub struct MacOsVoiceSidecarConfig {
     executable: PathBuf,
     model_path: PathBuf,
     device: SystemDevice,
+    language: Option<String>,
     speech_start_ms: u64,
     final_silence_ms: u64,
     max_payload_bytes: usize,
@@ -96,11 +97,30 @@ impl MacOsVoiceSidecarConfig {
             executable: executable.to_path_buf(),
             model_path: model_path.to_path_buf(),
             device,
+            language: None,
             speech_start_ms,
             final_silence_ms,
             max_payload_bytes: MAX_CONTROL_PAYLOAD_BYTES,
             max_stderr_bytes: DEFAULT_MAX_STDERR_BYTES,
         })
+    }
+
+    pub fn with_language(mut self, language: impl AsRef<str>) -> Result<Self, AdapterError> {
+        let language = language.as_ref();
+        let valid = !language.is_empty()
+            && language.len() <= 8
+            && language.bytes().all(|byte| byte.is_ascii_lowercase());
+        if !valid {
+            return Err(configuration_error(
+                "ASR language must be a lowercase ISO language code",
+            ));
+        }
+        self.language = Some(language.to_owned());
+        Ok(self)
+    }
+
+    pub fn language(&self) -> Option<&str> {
+        self.language.as_deref()
     }
 
     pub fn with_max_payload_bytes(
@@ -377,14 +397,8 @@ async fn spawn_process(config: &MacOsVoiceSidecarConfig) -> Result<SpawnedProces
     let media = UnixStream::from_std(parent_media)
         .map_err(|_| AdapterError::new("failed to open voice sidecar media output"))?;
 
-    let mut command = Command::new(config.executable());
+    let mut command = sidecar_command(config);
     command
-        .arg("--model-path")
-        .arg(config.model_path())
-        .arg("--device")
-        .arg("system-default")
-        .arg("--download")
-        .arg("false")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -425,6 +439,21 @@ async fn spawn_process(config: &MacOsVoiceSidecarConfig) -> Result<SpawnedProces
         stderr,
         media,
     })
+}
+
+fn sidecar_command(config: &MacOsVoiceSidecarConfig) -> Command {
+    let mut command = Command::new(config.executable());
+    command
+        .arg("--model-path")
+        .arg(config.model_path())
+        .arg("--device")
+        .arg("system-default")
+        .arg("--download")
+        .arg("false");
+    if let Some(language) = config.language() {
+        command.arg("--language").arg(language);
+    }
+    command
 }
 
 async fn reap_failed_setup(child: &mut Child) {
@@ -797,55 +826,75 @@ struct ProcessSupervisor {
     io_cancellation: CancellationToken,
 }
 
+async fn wait_for_supervision_outcome(
+    child: &mut Child,
+    events: &mut mpsc::UnboundedReceiver<SupervisorEvent>,
+    session_cancellation: &CancellationToken,
+) -> (AdapterError, bool, bool) {
+    tokio::select! {
+        biased;
+        event = events.recv() => {
+            let error = match event {
+                Some(SupervisorEvent::Fatal(error)) => error,
+                Some(SupervisorEvent::Eof) | None => {
+                    AdapterError::new("voice sidecar event stream ended unexpectedly")
+                }
+                Some(SupervisorEvent::Ready) | Some(SupervisorEvent::ShutdownComplete) => {
+                    AdapterError::new("voice sidecar lifecycle event was out of order")
+                }
+            };
+            (error, false, false)
+        }
+        result = child.wait() => {
+            match result {
+                Ok(_) => (
+                    AdapterError::new("voice sidecar process exited unexpectedly"),
+                    true,
+                    false,
+                ),
+                Err(_) => (
+                    AdapterError::new("failed to wait for voice sidecar process"),
+                    false,
+                    false,
+                ),
+            }
+        }
+        _ = session_cancellation.cancelled() => {
+            (
+                AdapterError::new("voice sidecar session cancelled"),
+                false,
+                true,
+            )
+        }
+    }
+}
+
 impl ProcessSupervisor {
     async fn run(mut self) -> Result<(), AdapterError> {
-        let (outcome, mut child_reaped, shutdown_requested) = tokio::select! {
-            biased;
-            _ = self.session_cancellation.cancelled() => {
-                (
-                    AdapterError::new("voice sidecar session cancelled"),
-                    false,
-                    true,
-                )
-            }
-            event = self.events.recv() => {
-                let error = match event {
-                    Some(SupervisorEvent::Fatal(error)) => error,
-                    Some(SupervisorEvent::Eof) | None => {
-                        AdapterError::new("voice sidecar event stream ended unexpectedly")
-                    }
-                    Some(SupervisorEvent::Ready) | Some(SupervisorEvent::ShutdownComplete) => {
-                        AdapterError::new("voice sidecar lifecycle event was out of order")
-                    }
-                };
-                (error, false, false)
-            }
-            result = self.child.wait() => {
-                match result {
-                    Ok(_) => (
-                        AdapterError::new("voice sidecar process exited unexpectedly"),
-                        true,
-                        false,
-                    ),
-                    Err(_) => (
-                        AdapterError::new("failed to wait for voice sidecar process"),
-                        false,
-                        false,
-                    ),
-                }
-            }
-        };
+        let (mut outcome, mut child_reaped, mut shutdown_requested) = wait_for_supervision_outcome(
+            &mut self.child,
+            &mut self.events,
+            &self.session_cancellation,
+        )
+        .await;
 
         if shutdown_requested && !child_reaped {
             self.media_cancellation.cancel();
             self.tasks.close_media().await;
-            child_reaped = graceful_shutdown(
+            match graceful_shutdown(
                 &mut self.child,
                 &mut self.events,
                 &self.control_sender,
                 &self.shared,
             )
-            .await;
+            .await
+            {
+                Ok(reaped) => child_reaped = reaped,
+                Err(error) => {
+                    outcome = error;
+                    shutdown_requested = false;
+                }
+            }
         } else {
             self.input_publisher.publish_reliable(Err(outcome.clone()));
         }
@@ -872,7 +921,8 @@ fn complete_supervision(
     if shutdown_requested {
         cleanup
     } else {
-        cleanup.and(Err(outcome))
+        let _ = cleanup;
+        Err(outcome)
     }
 }
 
@@ -881,7 +931,7 @@ async fn graceful_shutdown(
     supervisor_receiver: &mut mpsc::UnboundedReceiver<SupervisorEvent>,
     control_sender: &mpsc::Sender<SidecarFrame>,
     shared: &Arc<SessionShared>,
-) -> bool {
+) -> Result<bool, AdapterError> {
     let graceful = tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, async {
         let mut _flush_operation = None;
         let mut _flush_completion = None;
@@ -896,7 +946,7 @@ async fn graceful_shutdown(
                         operation_id,
                     }))
                     .await
-                    .map_err(|_| ())?;
+                    .map_err(|_| AdapterError::new("failed to request voice sidecar flush"))?;
             }
         }
         control_sender
@@ -904,28 +954,44 @@ async fn graceful_shutdown(
                 session_id: shared.session_id,
             }))
             .await
-            .map_err(|_| ())?;
+            .map_err(|_| AdapterError::new("failed to request voice sidecar shutdown"))?;
 
         let mut shutdown_complete = false;
         loop {
             tokio::select! {
                 biased;
-                status = child.wait() => return status.map(|_| true).map_err(|_| ()),
+                status = child.wait() => return match status {
+                    Ok(status) if status.success() => Ok(true),
+                    Ok(_) => Err(AdapterError::new(
+                        "voice sidecar process exited unsuccessfully during shutdown",
+                    )),
+                    Err(_) => Err(AdapterError::new(
+                        "failed to wait for voice sidecar process during shutdown",
+                    )),
+                },
                 event = supervisor_receiver.recv() => match event {
                     Some(SupervisorEvent::ShutdownComplete) => shutdown_complete = true,
-                    Some(SupervisorEvent::Ready) => return Err(()),
-                    Some(SupervisorEvent::Fatal(_)) | Some(SupervisorEvent::Eof) | None => {
+                    Some(SupervisorEvent::Ready) => return Err(AdapterError::new(
+                        "voice sidecar lifecycle event was out of order during shutdown",
+                    )),
+                    Some(SupervisorEvent::Fatal(error)) => return Err(error),
+                    Some(SupervisorEvent::Eof) | None => {
                         if shutdown_complete {
                             continue;
                         }
-                        return Err(());
+                        return Err(AdapterError::new(
+                            "voice sidecar event stream ended during shutdown",
+                        ));
                     }
                 }
             }
         }
     })
     .await;
-    matches!(graceful, Ok(Ok(true)))
+    match graceful {
+        Ok(result) => result,
+        Err(_) => Ok(false),
+    }
 }
 
 async fn cleanup_process(
@@ -2434,6 +2500,67 @@ fn configuration_error(message: impl AsRef<str>) -> AdapterError {
 mod process_tests {
     use super::*;
 
+    fn sidecar_config_fixture() -> (tempfile::TempDir, MacOsVoiceSidecarConfig) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("sidecar");
+        std::fs::write(&executable, b"#!/bin/sh\n").unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        let model = dir.path().join("model");
+        std::fs::create_dir(&model).unwrap();
+        let config = MacOsVoiceSidecarConfig::new(
+            &executable,
+            &model,
+            SystemDevice::SystemDefault,
+            false,
+            400,
+            1_000,
+        )
+        .unwrap();
+        (dir, config)
+    }
+
+    #[test]
+    fn pinned_language_is_stored_for_spawn() {
+        let (_dir, config) = sidecar_config_fixture();
+        let config = config.with_language("zh").unwrap();
+        assert_eq!(config.language(), Some("zh"));
+        let command = sidecar_command(&config);
+        let arguments = command
+            .as_std()
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(arguments
+            .windows(2)
+            .any(|pair| pair == ["--language", "zh"]));
+    }
+
+    #[test]
+    fn language_defaults_to_engine_detection() {
+        let (_dir, config) = sidecar_config_fixture();
+        assert_eq!(config.language(), None);
+        let command = sidecar_command(&config);
+        assert!(!command
+            .as_std()
+            .get_args()
+            .any(|argument| argument == "--language"));
+    }
+
+    #[test]
+    fn invalid_language_codes_are_rejected() {
+        for invalid in ["", " zh", "ZH", "zh-TW", "中文", "abcdefghi"] {
+            let (_dir, config) = sidecar_config_fixture();
+            assert!(
+                config.with_language(invalid).is_err(),
+                "accepted {invalid:?}"
+            );
+        }
+    }
+
     #[test]
     fn requested_shutdown_reports_success_after_cleanup() {
         let result = complete_supervision(
@@ -2454,6 +2581,88 @@ mod process_tests {
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn first_failure_is_preserved_when_cleanup_also_fails() {
+        let result = complete_supervision(
+            Err(AdapterError::new("cleanup failed")),
+            AdapterError::new("first fatal failure"),
+            false,
+        );
+
+        assert_eq!(result.unwrap_err().message(), "first fatal failure");
+    }
+
+    #[tokio::test]
+    async fn fatal_event_wins_a_simultaneous_cancellation() {
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 60")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        sender
+            .send(SupervisorEvent::Fatal(AdapterError::new(
+                "deterministic fatal failure",
+            )))
+            .unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let (outcome, child_reaped, shutdown_requested) =
+            wait_for_supervision_outcome(&mut child, &mut receiver, &cancellation).await;
+
+        assert_eq!(outcome.message(), "deterministic fatal failure");
+        assert!(!child_reaped);
+        assert!(!shutdown_requested);
+        child.kill().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_preserves_a_fatal_event() {
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 60")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
+        event_sender
+            .send(SupervisorEvent::Fatal(AdapterError::new(
+                "fatal during shutdown",
+            )))
+            .unwrap();
+        let (control_sender, _control_receiver) = mpsc::channel(1);
+        let shared = Arc::new(SessionShared::new(SessionId::new(1)));
+
+        let result =
+            graceful_shutdown(&mut child, &mut event_receiver, &control_sender, &shared).await;
+
+        assert_eq!(result.unwrap_err().message(), "fatal during shutdown");
+        child.kill().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_rejects_a_nonzero_process_exit() {
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 7")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let (_event_sender, mut event_receiver) = mpsc::unbounded_channel();
+        let (control_sender, _control_receiver) = mpsc::channel(1);
+        let shared = Arc::new(SessionShared::new(SessionId::new(1)));
+
+        let result =
+            graceful_shutdown(&mut child, &mut event_receiver, &control_sender, &shared).await;
+
+        assert_eq!(
+            result.unwrap_err().message(),
+            "voice sidecar process exited unsuccessfully during shutdown"
+        );
     }
 
     #[tokio::test]

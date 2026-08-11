@@ -155,6 +155,12 @@ public actor SidecarSession {
             guard audio.sessionID == configuration.sessionID else {
                 throw SidecarSessionError.sessionMismatch
             }
+            // Frames travel on the media channel and flushes on the control
+            // channel, so a frame for an already-flushed generation is an
+            // expected race, not a protocol violation.
+            if playbackBuffer.isExplicitlyStale(audio.frame.identity) {
+                return
+            }
 
             var nextBuffer = playbackBuffer
             try nextBuffer.enqueue(audio.frame)

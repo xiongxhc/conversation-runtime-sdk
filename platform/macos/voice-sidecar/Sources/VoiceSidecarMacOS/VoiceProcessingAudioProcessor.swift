@@ -23,6 +23,7 @@ public final class VoiceProcessingAudioProcessor:
         var conversionFailureHandler: ConversionFailureHandler?
         var windowSamples: [Float] = []
         var paused = true
+        var preserveHandlersOnNextStop = false
         var recordingStartWaiters: [CheckedContinuation<Void, Never>] = []
     }
 
@@ -233,13 +234,23 @@ public final class VoiceProcessingAudioProcessor:
         }
     }
 
+    func prepareForCaptureRestart() {
+        stateLock.withLock {
+            state.preserveHandlersOnNextStop = true
+        }
+    }
+
     public func stopRecording() {
         stateLock.withLock {
             state.paused = true
             state.callback = nil
-            state.voiceWindowHandler = nil
-            state.discontinuityHandler = nil
-            state.conversionFailureHandler = nil
+            if state.preserveHandlersOnNextStop {
+                state.preserveHandlersOnNextStop = false
+            } else {
+                state.voiceWindowHandler = nil
+                state.discontinuityHandler = nil
+                state.conversionFailureHandler = nil
+            }
             state.windowSamples = []
         }
         engine.setCaptureHandler(nil)

@@ -15,12 +15,14 @@ use crate::{
 
 const FRAME_CHANNEL_CAPACITY: usize = 1;
 const RIFF_HEADER_BYTES: usize = 12;
+const DEFAULT_RESPONSE_START_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_STALL_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub struct OpenAiCompatibleStreamingSpeechConfig {
     speech: OpenAiCompatibleSpeechConfig,
     streaming_interval: f32,
+    response_start_timeout: Duration,
     stall_timeout: Duration,
 }
 
@@ -43,8 +45,22 @@ impl OpenAiCompatibleStreamingSpeechConfig {
         Ok(Self {
             speech,
             streaming_interval,
+            response_start_timeout: DEFAULT_RESPONSE_START_TIMEOUT,
             stall_timeout: DEFAULT_STALL_TIMEOUT,
         })
+    }
+
+    pub fn with_response_start_timeout(
+        mut self,
+        response_start_timeout: Duration,
+    ) -> Result<Self, AdapterError> {
+        if response_start_timeout.is_zero() {
+            return Err(AdapterError::new(
+                "invalid OpenAI-compatible streaming speech configuration: response start timeout must be non-zero",
+            ));
+        }
+        self.response_start_timeout = response_start_timeout;
+        Ok(self)
     }
 
     pub fn with_stall_timeout(mut self, stall_timeout: Duration) -> Result<Self, AdapterError> {
@@ -119,7 +135,7 @@ async fn stream_response(
             .post(speech_endpoint(config.speech.endpoint()))
             .json(&payload)
             .send(),
-        config.stall_timeout,
+        config.response_start_timeout,
         cancellation,
         sender,
     )

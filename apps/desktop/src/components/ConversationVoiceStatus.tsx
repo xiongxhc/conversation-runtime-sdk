@@ -39,7 +39,11 @@ export function ConversationVoiceStatus({
 }
 
 function voiceStatusLabel(voice: VoiceSessionState): string {
-  if (voice.error) return "Voice needs attention locally";
+  if (voice.error) {
+    return voice.session === "active"
+      ? "Voice remains active locally"
+      : "Voice needs attention locally";
+  }
   switch (voice.capture) {
     case "starting":
       return "Microphone permission requested locally";

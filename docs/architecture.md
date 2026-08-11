@@ -278,6 +278,13 @@ backpressure, while cancellation can stop request reads and blocked frame sends.
 Turn, generation, utterance, and continuous sequence identities remain
 unchanged across concatenated containers.
 
+Response startup and body progress use separate bounded waits. The adapter
+allows up to `30 s` by default for response headers so a cold local model can
+load without being mistaken for a stalled stream. After headers arrive, every
+body read retains the `5 s` inactivity limit. Cancellation and receiver closure
+preempt both waits; neither timeout triggers buffered fallback or a remote
+provider.
+
 ## Runtime Text-to-Audio Flow
 
 1. A client starts one turn with a completed transcript.

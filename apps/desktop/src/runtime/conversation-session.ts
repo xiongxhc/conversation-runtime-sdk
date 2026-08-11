@@ -375,17 +375,29 @@ export class ConversationSession {
         this.voice = { ...this.voice, capture: "listening", visual: "listening" };
         break;
       case "voice_activity":
-        if (event.activity.type === "speech_started" || event.activity.type === "speech_continued") {
-          this.voice = { ...this.voice, visual: "listening" };
-        } else {
-          this.voice = { ...this.voice, visual: "thinking" };
+        if (!this.voice.error) {
+          if (event.activity.type === "speech_started" || event.activity.type === "speech_continued") {
+            this.voice = { ...this.voice, visual: "listening" };
+          } else {
+            this.voice = { ...this.voice, visual: "thinking" };
+          }
         }
         break;
       case "voice_transcript_partial":
-        this.voice = { ...this.voice, partialTranscript: event.text };
+        this.voice = {
+          ...this.voice,
+          partialTranscript: event.text,
+          visual: "listening",
+          error: undefined,
+        };
         break;
       case "voice_transcript_final":
-        this.voice = { ...this.voice, partialTranscript: "", visual: "thinking" };
+        this.voice = {
+          ...this.voice,
+          partialTranscript: "",
+          visual: "thinking",
+          error: undefined,
+        };
         this.beginTurn(event.turnId, event.text);
         break;
       case "voice_barge_in":

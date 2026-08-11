@@ -233,6 +233,53 @@ async fn stalled_response_body_fails_without_buffered_fallback() {
 }
 
 #[tokio::test]
+async fn slow_response_start_can_outlive_the_body_stall_timeout() {
+    let server = StreamingSpeechServer::delayed_headers(
+        Duration::from_millis(50),
+        pcm16_wav(8_000, 1, 160, 1),
+    )
+    .await;
+
+    let frames = drain(
+        configured_streaming_adapter_with_timeouts(
+            server.endpoint(),
+            0.32,
+            1024 * 1024,
+            Duration::from_secs(2),
+            Duration::from_millis(10),
+        )
+        .stream(request(), CancellationToken::new()),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(frames.len(), 1);
+}
+
+#[tokio::test]
+async fn response_start_timeout_remains_bounded() {
+    let server = StreamingSpeechServer::stall_before_headers().await;
+
+    let error = timeout(
+        Duration::from_secs(1),
+        next_error(
+            configured_streaming_adapter_with_timeouts(
+                server.endpoint(),
+                0.32,
+                1024 * 1024,
+                Duration::from_millis(25),
+                Duration::from_secs(1),
+            )
+            .stream(request(), CancellationToken::new()),
+        ),
+    )
+    .await
+    .expect("streaming speech response start did not remain bounded");
+
+    assert_eq!(error.message(), "speech synthesis response stalled");
+}
+
+#[tokio::test]
 async fn cancellation_stops_a_backpressured_frame_send() {
     let first = pcm16_wav(8_000, 1, 160, 1);
     let mut body = first.clone();
@@ -342,6 +389,16 @@ fn streaming_interval_requires_finite_inclusive_reference_bounds() {
     assert!(OpenAiCompatibleStreamingSpeechConfig::new(base(), f32::NAN).is_err());
 }
 
+#[test]
+fn response_start_timeout_must_be_non_zero() {
+    let speech = OpenAiCompatibleSpeechConfig::new("local-speech-model").unwrap();
+    let streaming = OpenAiCompatibleStreamingSpeechConfig::new(speech, 0.32).unwrap();
+
+    assert!(streaming
+        .with_response_start_timeout(Duration::ZERO)
+        .is_err());
+}
+
 fn configured_streaming_adapter(
     endpoint: &str,
     streaming_interval: f32,
@@ -359,6 +416,22 @@ fn configured_streaming_adapter_with_stall(
     endpoint: &str,
     streaming_interval: f32,
     max_audio_bytes: usize,
+    stall_timeout: Duration,
+) -> OpenAiCompatibleStreamingSpeechSynthesizer {
+    configured_streaming_adapter_with_timeouts(
+        endpoint,
+        streaming_interval,
+        max_audio_bytes,
+        Duration::from_secs(30),
+        stall_timeout,
+    )
+}
+
+fn configured_streaming_adapter_with_timeouts(
+    endpoint: &str,
+    streaming_interval: f32,
+    max_audio_bytes: usize,
+    response_start_timeout: Duration,
     stall_timeout: Duration,
 ) -> OpenAiCompatibleStreamingSpeechSynthesizer {
     let speech = OpenAiCompatibleSpeechConfig::new("local-speech-model")
@@ -382,6 +455,8 @@ fn configured_streaming_adapter_with_stall(
         .with_max_audio_bytes(max_audio_bytes)
         .unwrap();
     let streaming = OpenAiCompatibleStreamingSpeechConfig::new(speech, streaming_interval)
+        .unwrap()
+        .with_response_start_timeout(response_start_timeout)
         .unwrap()
         .with_stall_timeout(stall_timeout)
         .unwrap();
@@ -487,6 +562,14 @@ impl StreamingSpeechServer {
     async fn failure(status: u16, body: impl Into<Vec<u8>>) -> Self {
         Self::start(Response::Failure {
             status,
+            body: body.into(),
+        })
+        .await
+    }
+
+    async fn delayed_headers(delay: Duration, body: impl Into<Vec<u8>>) -> Self {
+        Self::start(Response::DelayedHeaders {
+            delay,
             body: body.into(),
         })
         .await
@@ -610,6 +693,7 @@ enum Response {
     StallAfter(Vec<u8>),
     DeclaredLength(usize),
     Failure { status: u16, body: Vec<u8> },
+    DelayedHeaders { delay: Duration, body: Vec<u8> },
     Redirect(String),
     ObserveDisconnectBeforeHeaders,
     ObserveDisconnectAfterIncompleteBody,
@@ -683,6 +767,17 @@ async fn write_response(
                         body.len()
                     )
                     .as_bytes(),
+                )
+                .await
+                .unwrap();
+            stream.write_all(&body).await.unwrap();
+            false
+        }
+        Response::DelayedHeaders { delay, body } => {
+            tokio::time::sleep(delay).await;
+            stream
+                .write_all(
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).as_bytes(),
                 )
                 .await
                 .unwrap();

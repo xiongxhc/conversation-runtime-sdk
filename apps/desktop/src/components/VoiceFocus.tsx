@@ -13,7 +13,6 @@ export interface VoiceFocusProps {
   components: ComponentStatusSnapshot;
   preferences: Preferences;
   reducedMotion: boolean;
-  retryVoiceBusy?: boolean;
   runtimeError?: string;
   session: VoiceSessionState["session"];
   state: VoiceVisualState;
@@ -22,7 +21,6 @@ export interface VoiceFocusProps {
   onExit(): void;
   onPreferencesChange(preferences: Preferences): void;
   onRetryControl?(): void;
-  onRetryVoice?(): void;
   onStart(): void;
   onStop(): void;
 }
@@ -36,7 +34,6 @@ export function VoiceFocus({
   components,
   preferences,
   reducedMotion,
-  retryVoiceBusy = false,
   runtimeError,
   session,
   state,
@@ -45,7 +42,6 @@ export function VoiceFocus({
   onExit,
   onPreferencesChange,
   onRetryControl,
-  onRetryVoice,
   onStart,
   onStop,
 }: VoiceFocusProps) {
@@ -158,13 +154,12 @@ export function VoiceFocus({
         ) : null}
         {visualState === "error" ? (
           <p className="focus-state-guidance">
-            Voice session needs attention. Retry locally or exit Focus and review setup.
+            {session === "active"
+              ? "Temporary voice issue. The session is still active; speak again or stop voice."
+              : "Voice session needs attention. Retry locally or exit Focus and review setup."}
           </p>
         ) : null}
         {runtimeError ? <p className="voice-control-error" role="alert">{runtimeError}</p> : null}
-        {runtimeError && onRetryVoice && session !== "idle" && session !== "error" ? (
-          <button disabled={retryVoiceBusy} onClick={onRetryVoice} type="button">Retry voice</button>
-        ) : null}
         {controlError ? <p className="voice-control-error" role="alert">{controlError}</p> : null}
         {controlError && onRetryControl ? (
           <button onClick={onRetryControl} type="button">Retry voice control</button>
@@ -235,7 +230,9 @@ function microphoneLabel(
   session: VoiceSessionState["session"],
   state: VoiceVisualState,
 ): string {
-  if (state === "error") return "Microphone needs attention";
+  if (state === "error" && session !== "active") {
+    return "Microphone needs attention";
+  }
   if (session === "stopping") return "Microphone stopping";
   switch (capture) {
     case "starting":

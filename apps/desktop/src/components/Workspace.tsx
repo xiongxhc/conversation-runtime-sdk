@@ -52,7 +52,6 @@ export function Workspace({
   const [exitVoiceSessionId, setExitVoiceSessionId] = useState<bigint | null>();
   const [exitDialogError, setExitDialogError] = useState<string>();
   const [exitBusy, setExitBusy] = useState(false);
-  const [voiceRestartBusy, setVoiceRestartBusy] = useState(false);
   const currentConversation = useRef<ConversationHistory | undefined>(undefined);
   const historyTurnOffset = useRef(0);
   const lastPersistedState = useRef("");
@@ -60,7 +59,6 @@ export function Workspace({
   const focusReturn = useRef<HTMLButtonElement>(null);
   const restoreFocusOnWorkspace = useRef(false);
   const voiceControlOperation = useRef(0);
-  const voiceRestartPending = useRef(false);
   const typedResume = useRef<{ sessionId: bigint; turnCount: number } | undefined>(undefined);
   const pausedForComposerSession = useRef<bigint | undefined>(undefined);
   const composerFocused = useRef(false);
@@ -305,28 +303,6 @@ export function Workspace({
     );
   };
 
-  const restartVoiceControl = async () => {
-    if (voiceRestartPending.current) return;
-    voiceRestartPending.current = true;
-    setVoiceRestartBusy(true);
-    try {
-      await session.stopVoice();
-      await session.startVoice();
-    } finally {
-      voiceRestartPending.current = false;
-      setVoiceRestartBusy(false);
-    }
-  };
-
-  const restartVoice = () => {
-    typedResume.current = undefined;
-    pausedForComposerSession.current = undefined;
-    runVoiceControl(
-      restartVoiceControl,
-      "Voice could not restart. Retry or review the local microphone configuration.",
-    );
-  };
-
   const requestComposerPause = () => {
     const sessionId = sessionState.voice.sessionId;
     if (sessionId === undefined) return;
@@ -475,12 +451,10 @@ export function Workspace({
               voiceControlFailure.message,
             )
             : undefined}
-          onRetryVoice={restartVoice}
           onStart={startVoice}
           onStop={stopVoice}
           preferences={preferences}
           reducedMotion={prefersReducedMotion()}
-          retryVoiceBusy={voiceRestartBusy}
           runtimeError={sessionState.voice.error?.message}
           session={sessionState.voice.session}
           state={sessionState.voice.visual}
@@ -684,13 +658,10 @@ export function Workspace({
                 voiceControlFailure.retry,
                 voiceControlFailure.message,
               )
-              : sessionState.voice.error
-                ? restartVoice
-                : undefined}
+              : undefined}
             onReturn={() => setFocusMode("live")}
             onStop={stopVoice}
             retryLabel={voiceControlFailure ? "Retry voice control" : "Retry voice"}
-            retryBusy={voiceRestartBusy}
             voice={sessionState.voice}
           />
         ) : null}

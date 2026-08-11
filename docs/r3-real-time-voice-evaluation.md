@@ -232,7 +232,8 @@ The repository contract evidence covers:
 - checked aggregate limits before buffering and checked `riff_size + 8` before
   container extraction;
 - incomplete EOF, oversized declarations/content length, redirect, HTTP
-  failure, response stall, malformed WAV, and cross-container format change;
+  failure, bounded slow response start, body stall, malformed WAV, and
+  cross-container format change;
 - content-free request failures that do not echo synthesized text or response
   bodies;
 - capacity-one backpressure, cancellation of request reads and blocked frame

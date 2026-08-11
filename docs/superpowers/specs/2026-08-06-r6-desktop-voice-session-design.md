@@ -310,7 +310,9 @@ Voice failures never silently switch providers or locations.
   recoverable synthesis failure stops or pauses voice as directed by the Rust
   recovery disposition and leaves typed chat available.
 - A recoverable voice error shows a content-free stage-specific explanation
-  and an explicit Retry action.
+  while the Rust session continues automatically. The explanation remains
+  visible until the next transcript proves the input path is healthy; the user
+  can stop voice, but the desktop does not restart an already-active session.
 - A terminal voice-session error requires a new explicit Start voice action but
   does not discard completed conversation context.
 - A gateway framing, process, or invariant failure closes the client session

@@ -512,6 +512,9 @@ streaming_interval = 0.32
 Use `mode = "buffered"` only as an explicit compatibility choice and omit
 `streaming_interval` in that mode. An unsupported streaming backend fails at
 the speech adapter; the runtime never falls back to buffered synthesis.
+Streaming synthesis allows up to `30 s` for a configured endpoint to start its
+response so a cold local model can load, then enforces a `5 s` inactivity limit
+between response chunks. Cancellation remains immediate during either wait.
 
 After privately configuring installed local services, run:
 

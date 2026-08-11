@@ -229,6 +229,54 @@ describe("ConversationSession", () => {
     await expect(session.send("typed after voice failure")).resolves.toBe(1n);
   });
 
+  it("clears a recoverable voice error when the next transcript arrives", async () => {
+    const transport = connectedVoiceTransport();
+    const session = await ConversationSession.connect(transport);
+    await session.startVoice();
+    transport.voiceEvent({
+      type: "voice_session_started",
+      session_id: "1",
+      privacy: { privacy_mode: "local_only", components: localVoiceStatus.components },
+    });
+    transport.voiceEvent({
+      type: "voice_session_failed",
+      session_id: "1",
+      error: {
+        code: "adapter_failure",
+        kind: "adapter",
+        stage: "speech_synthesizer",
+        message: "temporary synthesis failure",
+      },
+      recovery: "continue_session",
+    });
+    await eventually(() => expect(session.state.voice.error?.message).toBe("temporary synthesis failure"));
+
+    transport.voiceEvent({
+      type: "voice_activity",
+      session_id: "1",
+      activity: { type: "speech_started", at_ms: 10 },
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(session.state.voice.error?.message).toBe("temporary synthesis failure");
+    expect(session.state.voice.visual).toBe("error");
+
+    transport.voiceEvent({
+      type: "voice_transcript_partial",
+      session_id: "1",
+      segment_id: "2",
+      text: "new turn",
+    });
+
+    await eventually(() => expect(session.state.voice.error).toBeUndefined());
+    expect(session.state.voice).toMatchObject({
+      session: "active",
+      capture: "listening",
+      visual: "listening",
+      partialTranscript: "new turn",
+    });
+  });
+
   it("rejects voice start while a typed turn is active", async () => {
     const transport = connectedVoiceTransport();
     const session = await ConversationSession.connect(transport);

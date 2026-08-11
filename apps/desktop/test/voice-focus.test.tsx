@@ -301,7 +301,7 @@ describe("Voice Focus", () => {
     expect(screen.getByRole("alert").textContent).toContain("Voice could not stop cleanly");
   });
 
-  it("surfaces runtime voice failures and truthful paused capture in and outside Focus", async () => {
+  it("keeps recoverable runtime voice failures active in and outside Focus", async () => {
     const session = new FakeSession(configuredVoiceState({
       voice: {
         ...activeVoice(),
@@ -317,42 +317,40 @@ describe("Voice Focus", () => {
     }));
     renderConnectedApp({ session });
 
-    expect(await screen.findByText("Voice needs attention locally")).toBeTruthy();
+    expect(await screen.findByText("Voice remains active locally")).toBeTruthy();
     expect(screen.getByText("recognizer needs attention")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Retry voice" })).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Voice Focus" }));
-    expect(await screen.findByText("Microphone needs attention")).toBeTruthy();
+    expect(await screen.findByText("Microphone paused")).toBeTruthy();
     expect(screen.getByText("recognizer needs attention")).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "Retry voice" }));
-    await waitFor(() => expect(session.stopVoice).toHaveBeenCalledOnce());
-    expect(session.startVoice).toHaveBeenCalledOnce();
+    expect(screen.getByText("Temporary voice issue. The session is still active; speak again or stop voice.")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Retry voice" })).toBeNull();
+    expect(session.stopVoice).not.toHaveBeenCalled();
+    expect(session.startVoice).not.toHaveBeenCalled();
   });
 
-  it("serializes repeated runtime voice retries", async () => {
+  it("offers a direct retry after a terminal runtime voice failure", async () => {
     const session = new FakeSession(configuredVoiceState({
       voice: {
-        ...activeVoice(),
+        availability: "configured",
+        session: "error",
+        capture: "stopped",
         visual: "error",
+        partialTranscript: "",
         error: {
           code: "adapter_failure",
           kind: "adapter",
-          stage: "speech_recognizer",
-          message: "recognizer needs attention",
+          stage: "audio_capture",
+          message: "microphone disconnected",
         },
       },
     }));
-    const stopping = deferred<undefined>();
-    session.stopVoice.mockReturnValue(stopping.promise);
     renderConnectedApp({ session });
     fireEvent.click(await screen.findByRole("button", { name: "Voice Focus" }));
 
-    const retry = screen.getByRole("button", { name: "Retry voice" });
-    fireEvent.click(retry);
-    expect(retry.hasAttribute("disabled")).toBe(true);
-    fireEvent.click(retry);
-    expect(session.stopVoice).toHaveBeenCalledOnce();
-
-    stopping.resolve(undefined);
-    await waitFor(() => expect(session.startVoice).toHaveBeenCalledOnce());
+    fireEvent.click(screen.getByRole("button", { name: "Retry voice" }));
+    expect(session.startVoice).toHaveBeenCalledOnce();
+    expect(session.stopVoice).not.toHaveBeenCalled();
   });
 
   it("shows persistent Focus Stop failure with retry", async () => {

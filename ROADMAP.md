@@ -158,7 +158,10 @@ selects buffered compatibility or explicit streaming speech; the streaming
 adapter parses arbitrarily chunked concatenated WAV containers with checked
 bounds; the Rust runtime preserves turn, generation, utterance, and sequence
 identity through cancellation and backpressure; and the managed macOS sidecar
-owns capture and playback in one Apple voice-processing engine.
+owns capture and playback in one Apple voice-processing engine. The Apple
+capture graph now remains active for the full session while WhisperKit rotates
+bounded logical turn buffers with `300 ms` of pre-roll and a bounded transition
+accumulator, avoiding microphone restart gaps during slow in-flight decoding.
 
 The public acceptance harness and acoustic procedure are present. Process/device
 evidence is `PARTIALLY VALIDATED`: a private local-only configuration and local
@@ -169,7 +172,7 @@ microphone-to-audible-response turn is not yet observed after the latest
 finalization fix, so process/device acceptance remains incomplete. Acoustic
 evidence is `NOT VALIDATED` because no external recording set exists. The latest
 current complete mechanical gate passes the Rust workspace with one intentionally
-ignored fixture writer and `116` Swift tests. No ten-minute continuity,
+ignored fixture writer and `127` Swift tests. No ten-minute continuity,
 first-audible, audible-stop p95, or R3 completion claim is made. See
 [the R3 evaluation](docs/r3-real-time-voice-evaluation.md).
 
@@ -222,7 +225,7 @@ Schema-v1 configuration exposes persona, response, and content-free metric
 controls with explicit defaults and pre-capture validation. Relationship
 guidance is derived from visible persona, supplied context, reciprocity, pacing,
 and rapport; no scripted expression, hidden unlock, or frequency quota exists.
-The deterministic R4 gate passes the complete Rust workspace and `116` Swift
+The deterministic R4 gate passes the complete Rust workspace and `127` Swift
 tests. Subjective model quality remains deployment-specific; SQLite persistence
 remains R5 and application controls remain R6.
 

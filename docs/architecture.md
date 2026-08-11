@@ -99,6 +99,8 @@ flowchart LR
     User["User"]
     Sidecar["Managed macOS voice sidecar"]
     Audio["Apple voice-processing engine"]
+    Capture["Session-scoped capture and VAD"]
+    TurnBuffer["Turn-scoped ASR buffer with 300 ms pre-roll"]
     ASR["Local WhisperKit"]
     Runtime["Rust runtime"]
     Policy["Privacy policy"]
@@ -106,7 +108,10 @@ flowchart LR
     TTS["Replaceable streaming TTS"]
 
     User -->|"speech"| Audio
-    Audio -->|"echo-cancelled frames"| ASR
+    Audio -->|"echo-cancelled frames"| Capture
+    Capture -->|"bounded current-turn PCM"| TurnBuffer
+    TurnBuffer --> ASR
+    Capture -->|"voice activity"| Sidecar
     ASR -->|"VAD and hypotheses"| Sidecar
     Sidecar <-->|"bounded framed stdio"| Runtime
     Policy -->|"validated before microphone access"| Runtime
@@ -121,8 +126,16 @@ flowchart LR
 
 The sidecar owns capture and playback in the same Apple audio engine so built-in
 echo cancellation can distinguish user speech from speaker output. It also owns
-the first local WhisperKit adapter and the continuous PCM buffer. It binds no
-network port.
+the first local WhisperKit adapter. The Apple capture graph and VAD remain active
+for the full voice session; a device-free logical processor gives WhisperKit a
+fresh turn-scoped buffer after final silence while retaining only the most recent
+`300 ms` (`4,800` samples at `16 kHz`) as bounded pre-roll. During replacement,
+a bounded `30 s` transition accumulator preserves speech that arrives while an
+in-flight decode finishes. A logical turn is capped at `10 min`; exceeding either
+cap fails recognition instead of silently dropping audio. Source diagnostic
+sample and energy histories are bounded independently. Rotating a recognition
+turn therefore does not detach the microphone callback or restart the audio
+engine. The sidecar binds no network port.
 
 Before microphone permission or audio-engine startup, the sidecar validates the
 absolute local model directory and tokenizer and loads WhisperKit with downloads

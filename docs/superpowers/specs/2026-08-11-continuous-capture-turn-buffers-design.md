@@ -65,9 +65,12 @@ independently testable boundary.
   pre-roll and begins forwarding append notifications to WhisperKit.
 - On `stopRecording`, stops active accumulation while continuous capture remains
   active.
-- Clears active samples between turns, so recognition memory is bounded by one
-  utterance plus pre-roll.
-- Maintains only bounded recent energy values required for WhisperKit VAD.
+- Before replacement, opens a bounded `30 s` transition accumulator initialized
+  from pre-roll so a slow in-flight decode cannot clip new speech.
+- Clears active samples between turns and caps one logical turn at `10 min`.
+  Either capacity breach fails recognition rather than dropping audio.
+- Retains active energy for the complete pending turn so WhisperKit VAD remains
+  aligned with pending PCM; the turn cap bounds that state.
 
 ### `WhisperKitRecognition`
 
@@ -96,9 +99,10 @@ At a final-silence boundary:
 
 ```text
 continuous capture remains active
+  -> bounded transition accumulation begins
   -> old logical transcriber stops
   -> active turn buffer closes
-  -> replacement transcriber starts from bounded pre-roll
+  -> replacement transcriber starts from the complete transition buffer
   -> continuous capture keeps forwarding samples
 ```
 
@@ -106,8 +110,10 @@ continuous capture remains active
 
 - A logical transcriber restart must never change microphone permission or audio
   graph state.
-- New speech during a restart must be available through pre-roll when the
-  replacement starts.
+- New speech during a restart must be available through the transition buffer
+  when the replacement starts, including when old inference exceeds pre-roll.
+- Transition or turn capacity exhaustion must fail through the existing typed
+  recognition path without silently truncating audio.
 - A full recognition-service stop must stop both logical recognition and hardware
   capture exactly once.
 - Conversion, worker, and publication failures retain their existing typed fatal
@@ -121,7 +127,10 @@ Deterministic Swift tests must prove:
 - inactive pre-roll is capped at `4,800` samples;
 - starting recognition includes the bounded pre-roll;
 - stopping and restarting logical recognition does not stop the source processor;
-- speech appended during logical restart is present after restart;
+- speech exceeding pre-roll but appended during logical restart is present after
+  restart;
+- active VAD energy covers all pending turn audio;
+- turn-cap exhaustion fails once without exceeding the sample limit;
 - active turn samples do not accumulate across turns;
 - full recognition shutdown still releases handlers and capture;
 - existing multilingual, VAD, interruption, protocol, and lifecycle tests remain

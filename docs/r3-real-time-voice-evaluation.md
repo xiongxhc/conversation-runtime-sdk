@@ -11,6 +11,32 @@ from process/device and acoustic evidence.
 Process/device evidence is `PARTIALLY VALIDATED`. Acoustic evidence is
 `NOT VALIDATED`.
 
+## Continuous Capture Update — 2026-08-11
+
+The macOS recognition path now separates session-scoped hardware capture from
+turn-scoped WhisperKit input. The Apple voice-processing graph remains attached
+across final-silence recognition resets, while a device-free logical processor
+rotates the current ASR buffer and retains at most `300 ms` (`4,800` samples at
+`16 kHz`) of pre-roll. A `30 s` transition accumulator preserves input while an
+in-flight decode finishes, and a logical turn is capped at `10 min`; either cap
+fails closed rather than truncating audio. Source histories and logical state
+are bounded and reset with their owning lifecycle.
+
+Processor-level tests cover inactive pre-roll truncation, speech accumulated
+while the logical transcriber is closed, turn-cap failure, aligned active energy,
+continued source VAD delivery, and source-history bounds. Existing lifecycle
+tests separately cover intentional recognition-worker replacement, multilingual
+transcription, cancellation, and complete shutdown. The complete Swift sidecar
+package passes `127` tests after this change; a real delayed-decode microphone
+transition is not claimed by these deterministic tests.
+
+This update removes a known software-level microphone callback gap, but it is
+not acoustic evidence. A human-spoken repeated-turn session, ten-minute device
+run, English/Chinese code-switching, accents, background noise, first-audible
+latency, and externally measured audible-stop latency remain unvalidated. The
+process/device status remains `PARTIALLY VALIDATED` and acoustic status remains
+`NOT VALIDATED`.
+
 ## Acceptance Closure Update — 2026-08-02
 
 Source commit `55d29b4` closes the remaining deterministic acceptance-tooling

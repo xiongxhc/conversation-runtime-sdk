@@ -23,11 +23,12 @@ public final class VoiceProcessingAudioProcessor:
         var conversionFailureHandler: ConversionFailureHandler?
         var windowSamples: [Float] = []
         var paused = true
-        var preserveHandlersOnNextStop = false
         var recordingStartWaiters: [CheckedContinuation<Void, Never>] = []
     }
 
     private static let voiceWindowSamples = 1_600
+    private static let sampleHistoryLimit = 4_800
+    private static let energyHistoryLimit = 200
 
     private let engine: VoiceProcessingEngine
     private let recognizerConverter = StreamingPCMRecognizerConverter()
@@ -234,23 +235,13 @@ public final class VoiceProcessingAudioProcessor:
         }
     }
 
-    func prepareForCaptureRestart() {
-        stateLock.withLock {
-            state.preserveHandlersOnNextStop = true
-        }
-    }
-
     public func stopRecording() {
         stateLock.withLock {
             state.paused = true
             state.callback = nil
-            if state.preserveHandlersOnNextStop {
-                state.preserveHandlersOnNextStop = false
-            } else {
-                state.voiceWindowHandler = nil
-                state.discontinuityHandler = nil
-                state.conversionFailureHandler = nil
-            }
+            state.voiceWindowHandler = nil
+            state.discontinuityHandler = nil
+            state.conversionFailureHandler = nil
             state.windowSamples = []
         }
         engine.setCaptureHandler(nil)
@@ -300,6 +291,11 @@ public final class VoiceProcessingAudioProcessor:
                 )
             }
             state.audioSamples.append(contentsOf: samples)
+            if state.audioSamples.count > Self.sampleHistoryLimit {
+                state.audioSamples.removeFirst(
+                    state.audioSamples.count - Self.sampleHistoryLimit
+                )
+            }
             let energy = AudioProcessor.calculateEnergy(of: samples)
             let baseline = state.energy
                 .suffix(state.relativeEnergyWindow)
@@ -312,6 +308,11 @@ public final class VoiceProcessingAudioProcessor:
             state.energy.append(
                 (relative: relative, average: energy.avg)
             )
+            if state.energy.count > Self.energyHistoryLimit {
+                state.energy.removeFirst(
+                    state.energy.count - Self.energyHistoryLimit
+                )
+            }
             state.windowSamples.append(contentsOf: samples)
             var windows: [[Float]] = []
             while state.windowSamples.count >= Self.voiceWindowSamples {

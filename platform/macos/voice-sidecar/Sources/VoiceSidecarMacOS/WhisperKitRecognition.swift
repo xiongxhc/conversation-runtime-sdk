@@ -926,6 +926,7 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
 
     private let modelPath: String
     private let audioProcessor: VoiceProcessingAudioProcessor
+    private let turnAudioProcessor: TurnAudioProcessor
     private let language: String?
     private let mapper = RecognitionMapper()
     private let vad = EnergyVAD(
@@ -934,7 +935,7 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
     )
     private let eventRelay = RecognitionEventRelay()
 
-    private struct TranscriberComponents {
+    private struct TranscriberComponents: @unchecked Sendable {
         let audioEncoder: any AudioEncoding
         let featureExtractor: any FeatureExtracting
         let segmentSeeker: any SegmentSeeking
@@ -965,6 +966,7 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
     ) {
         self.modelPath = modelPath
         self.audioProcessor = audioProcessor
+        turnAudioProcessor = TurnAudioProcessor()
         self.language = language
     }
 
@@ -1030,7 +1032,7 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
             )
             whisperKit = try await WhisperKit(
                 modelFolder: modelURL.path,
-                audioProcessor: audioProcessor,
+                audioProcessor: turnAudioProcessor,
                 verbose: false,
                 load: false,
                 download: false
@@ -1044,6 +1046,15 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
             )
         }
         let pipeline = OrderedRecognitionBatchPipeline(capacity: 8)
+        turnAudioProcessor.reset()
+        turnAudioProcessor.setFailureHandler {
+            pipeline.fail(
+                SidecarServiceFailure(
+                    stage: .speechRecognizer,
+                    code: .recognitionFailed
+                )
+            )
+        }
         let components = TranscriberComponents(
             audioEncoder: whisperKit.audioEncoder,
             featureExtractor: whisperKit.featureExtractor,
@@ -1053,7 +1064,7 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
         )
         let transcriber = Self.makeTranscriber(
             components: components,
-            audioProcessor: audioProcessor,
+            audioProcessor: turnAudioProcessor,
             language: language,
             mapper: mapper,
             pipeline: pipeline
@@ -1132,6 +1143,11 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
             }
         )
 
+        try audioProcessor.startRecordingLive(
+            inputDeviceID: nil
+        ) { [turnAudioProcessor] samples in
+            turnAudioProcessor.append(samples)
+        }
         startTranscriptionWorker(
             transcriber: transcriber,
             stopState: stopState,
@@ -1144,6 +1160,7 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
         workerStopState.beginStopping()
         recognitionResetTask?.cancel()
         recognitionResetTask = nil
+        turnAudioProcessor.cancelTransition()
         audioProcessor.setVoiceWindowHandler(nil)
         audioProcessor.setDiscontinuityHandler(nil)
         voiceMailbox?.finish()
@@ -1172,6 +1189,8 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
         self.transcriber = nil
         transcriberComponents = nil
         audioProcessor.stopRecording()
+        turnAudioProcessor.setFailureHandler(nil)
+        turnAudioProcessor.reset()
         preparedConfiguration = nil
 
         for task in monitorTasks {
@@ -1198,7 +1217,7 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
 
     private static func makeTranscriber(
         components: TranscriberComponents,
-        audioProcessor: VoiceProcessingAudioProcessor,
+        audioProcessor: TurnAudioProcessor,
         language: String?,
         mapper: RecognitionMapper,
         pipeline: OrderedRecognitionBatchPipeline
@@ -1283,7 +1302,7 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
             return
         }
         recognitionResetTask = nil
-        audioProcessor.prepareForCaptureRestart()
+        turnAudioProcessor.beginTransition()
         await transcriber.stopStreamTranscription()
         _ = await transcriptionTask.value
         self.transcriptionTask = nil
@@ -1295,12 +1314,13 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
         guard preparedConfiguration == configuration,
             !workerStopState.isStopping
         else {
+            turnAudioProcessor.cancelTransition()
             workerStopState.finishRestart()
             return
         }
         let replacement = Self.makeTranscriber(
             components: components,
-            audioProcessor: audioProcessor,
+            audioProcessor: turnAudioProcessor,
             language: language,
             mapper: mapper,
             pipeline: pipeline

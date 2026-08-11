@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Keep macOS microphone capture active across voice turns while resetting only bounded WhisperKit recognition buffers.
+**Goal:** Keep macOS microphone capture active across voice turns while resetting only bounded WhisperKit recognition buffers and preserving speech during delayed replacement.
 
 **Architecture:** Add a device-free `TurnAudioProcessor` implementing WhisperKit's `AudioProcessing` contract. `VoiceProcessingAudioProcessor` remains the session-long hardware owner and forwards converted samples into the logical processor; transcriber replacement rotates the logical processor while the Apple capture graph remains active.
 
@@ -14,6 +14,8 @@
 - Keep all public examples backend-neutral and model-neutral.
 - Keep microphone permission and hardware capture session-scoped.
 - Retain `300 ms` (`4,800` samples at 16 kHz) of bounded pre-roll.
+- Preserve up to `30 s` across replacement and fail closed beyond it.
+- Cap a logical turn at `10 min` without silent truncation.
 - Do not add network access, remote fallback, or sensitive diagnostics.
 - Do not claim acoustic improvement without a real recorded hardware run.
 
@@ -27,7 +29,7 @@
 
 **Interfaces:**
 - Consumes: WhisperKit `AudioProcessing`, converted 16 kHz mono `[Float]` batches.
-- Produces: `TurnAudioProcessor.append(_:)`, bounded `audioSamples`, bounded `relativeEnergy`, and logical start/stop behavior.
+- Produces: `TurnAudioProcessor.append(_:)`, turn/transition capacity enforcement, pending-turn energy, and logical start/stop behavior.
 
 - [ ] **Step 1: Write the failing pre-roll test**
 
@@ -63,7 +65,7 @@ WhisperKit `AudioProcessor`. Protect mutable state with `NSLock`. Always update 
 bounded pre-roll in `append(_:)`; update active samples and invoke the callback
 only while logically recording.
 
-- [ ] **Step 4: Add restart and bounded-energy tests**
+- [ ] **Step 4: Add restart, transition, energy, and capacity tests**
 
 ```swift
 @Test
@@ -80,8 +82,8 @@ func turnAudioProcessorRestartDropsTheClosedTurnButKeepsRestartSpeech() throws {
 }
 ```
 
-Also assert that repeated inactive and active appends keep pre-roll and energy
-state within their configured limits.
+Also assert that active energy covers pending turn audio, restart speech can
+exceed pre-roll within the transition cap, and capacity exhaustion fails closed.
 
 - [ ] **Step 5: Run all macOS processor tests and verify GREEN**
 

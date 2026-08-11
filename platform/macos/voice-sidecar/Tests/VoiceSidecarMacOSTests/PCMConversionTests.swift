@@ -7,6 +7,85 @@ import Testing
 @testable import VoiceSidecarMacOS
 
 @Test
+func turnAudioProcessorCapsInactivePreRollAndStartsFromItsTail() throws {
+    let processor = TurnAudioProcessor(preRollSamples: 4)
+    processor.append([1, 2, 3])
+    processor.append([4, 5, 6])
+
+    try processor.startRecordingLive(inputDeviceID: nil, callback: nil)
+
+    #expect(Array(processor.audioSamples) == [3, 4, 5, 6])
+}
+
+@Test
+func turnAudioProcessorRestartDropsClosedTurnButKeepsRestartSpeech() throws {
+    let processor = TurnAudioProcessor(preRollSamples: 4)
+    try processor.startRecordingLive(inputDeviceID: nil, callback: nil)
+    processor.append([1, 2, 3, 4])
+    processor.stopRecording()
+    processor.append([5, 6])
+
+    try processor.startRecordingLive(inputDeviceID: nil, callback: nil)
+
+    #expect(Array(processor.audioSamples) == [3, 4, 5, 6])
+}
+
+@Test
+func turnAudioProcessorBoundsPreRollButRetainsActiveEnergyHistory() throws {
+    let processor = TurnAudioProcessor(
+        preRollSamples: 4
+    )
+    for value in 0..<10 {
+        processor.append([Float(value)])
+    }
+
+    try processor.startRecordingLive(inputDeviceID: nil, callback: nil)
+
+    #expect(Array(processor.audioSamples) == [6, 7, 8, 9])
+    #expect(processor.relativeEnergy.count == 1)
+
+    for value in 10..<20 {
+        processor.append([Float(value)])
+    }
+
+    #expect(processor.relativeEnergy.count == 11)
+}
+
+@Test
+func turnAudioProcessorTransitionRetainsMoreThanPreRoll() throws {
+    let processor = TurnAudioProcessor(
+        preRollSamples: 2,
+        maxTransitionSamples: 6
+    )
+    processor.append([1, 2])
+    try processor.startRecordingLive(inputDeviceID: nil, callback: nil)
+    processor.beginTransition()
+    processor.stopRecording()
+    processor.append([3, 4])
+    processor.append([5, 6])
+
+    try processor.startRecordingLive(inputDeviceID: nil, callback: nil)
+
+    #expect(Array(processor.audioSamples) == [1, 2, 3, 4, 5, 6])
+}
+
+@Test
+func turnAudioProcessorFailsClosedAtTheTurnLimit() throws {
+    let processor = TurnAudioProcessor(maxTurnSamples: 4)
+    let recorder = VoiceWindowRecorder()
+    processor.setFailureHandler {
+        recorder.record([])
+    }
+    try processor.startRecordingLive(inputDeviceID: nil, callback: nil)
+    processor.append([1, 2, 3, 4])
+
+    processor.append([5])
+
+    #expect(recorder.count == 1)
+    #expect(processor.audioSamples.count == 4)
+}
+
+@Test
 func signed16MonoPlaybackConversionPreservesSamples() throws {
     let samples: [Int16] = [.min, -1, 0, 1, .max]
     let frame = try PCMFrame(
@@ -378,13 +457,14 @@ func captureDiscontinuityPreventsVoiceWindowBridging() throws {
 }
 
 @Test
-func recognitionHandlersSurviveCaptureRestart() throws {
+func continuousCaptureSurvivesLogicalTurnRotation() throws {
     let engine = VoiceProcessingEngine(
         permissionProvider: AuthorizedPermissionProvider()
     )
-    let processor = VoiceProcessingAudioProcessor(engine: engine)
+    let source = VoiceProcessingAudioProcessor(engine: engine)
+    let turn = TurnAudioProcessor()
     let recorder = VoiceWindowRecorder()
-    processor.setVoiceWindowHandler { window in
+    source.setVoiceWindowHandler { window in
         recorder.record(window)
     }
     let format = try #require(
@@ -396,24 +476,55 @@ func recognitionHandlersSurviveCaptureRestart() throws {
         )
     )
 
-    try processor.startRecordingLive(inputDeviceID: nil, callback: nil)
-    processor.consumeCaptureEvent(
+    try source.startRecordingLive(inputDeviceID: nil) { samples in
+        turn.append(samples)
+    }
+    defer {
+        source.stopRecording()
+    }
+    try turn.startRecordingLive(inputDeviceID: nil, callback: nil)
+    source.consumeCaptureEvent(
         .buffer(try floatBuffer(format: format, count: 1_600))
     )
-    #expect(processor.audioSamples.count == 1_600)
-    processor.prepareForCaptureRestart()
-    processor.stopRecording()
-    try processor.startRecordingLive(inputDeviceID: nil, callback: nil)
-    defer {
-        processor.stopRecording()
-        processor.setVoiceWindowHandler(nil)
-    }
-    processor.consumeCaptureEvent(
+    turn.stopRecording()
+    source.consumeCaptureEvent(
+        .buffer(try floatBuffer(format: format, count: 1_600))
+    )
+    try turn.startRecordingLive(inputDeviceID: nil, callback: nil)
+    source.consumeCaptureEvent(
         .buffer(try floatBuffer(format: format, count: 1_600))
     )
 
-    #expect(recorder.count == 2)
-    #expect(processor.audioSamples.count == 1_600)
+    #expect(recorder.count == 3)
+    #expect(turn.audioSamples.count == 4_800)
+}
+
+@Test
+func voiceProcessingAudioProcessorBoundsSessionHistory() throws {
+    let engine = VoiceProcessingEngine(
+        permissionProvider: AuthorizedPermissionProvider()
+    )
+    let processor = VoiceProcessingAudioProcessor(engine: engine)
+    let format = try #require(
+        AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: 16_000,
+            channels: 1,
+            interleaved: false
+        )
+    )
+
+    try processor.startRecordingLive(inputDeviceID: nil, callback: nil)
+    defer {
+        processor.stopRecording()
+    }
+    for _ in 0..<4 {
+        processor.consumeCaptureEvent(
+            .buffer(try floatBuffer(format: format, count: 1_600))
+        )
+    }
+
+    #expect(processor.audioSamples.count == 4_800)
 }
 
 @Test(

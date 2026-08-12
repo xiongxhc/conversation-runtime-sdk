@@ -73,18 +73,12 @@ public actor ContinuousPCMPlayback: SidecarPlaybackService {
         guard scheduledEpoch == epoch else {
             return
         }
-        do {
-            try playbackBuffer.markRendered(identity)
-        } catch {
-            epoch &+= 1
-            await failureHandler?(
-                SidecarServiceFailure(
-                    stage: .audioOutput,
-                    code: .playbackFailed
-                )
-            )
-            return
+        // Completion callbacks hop through independent Tasks, so they can
+        // arrive out of order or repeat after their frame already left the
+        // queue. Playback itself is strictly ordered, so resolve the whole
+        // prefix through the completed frame and report each in order.
+        for rendered in playbackBuffer.markRenderedThrough(identity) {
+            await renderedHandler?(rendered)
         }
-        await renderedHandler?(identity)
     }
 }

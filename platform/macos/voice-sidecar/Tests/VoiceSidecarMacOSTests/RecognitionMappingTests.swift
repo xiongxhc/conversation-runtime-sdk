@@ -1063,7 +1063,7 @@ func captureCanPauseWhileRecognitionRecoveryIsPreparing() async throws {
 }
 
 @Test
-func outOfOrderRenderedCallbackUsesTypedFatalPath() async throws {
+func outOfOrderRenderedCallbackResolvesTheOrderedPrefix() async throws {
     let scheduler = RecordingPlaybackScheduler()
     let rendered = RenderedRecorder()
     let failures = PlaybackFailureRecorder()
@@ -1074,24 +1074,26 @@ func outOfOrderRenderedCallbackUsesTypedFatalPath() async throws {
     await playback.setFailureHandler { failure in
         await failures.record(failure)
     }
-    try await playback.enqueue(
-        pcmFrame(generationID: 9, sequence: 0)
-    )
-    try await playback.enqueue(
-        pcmFrame(generationID: 9, sequence: 1)
-    )
+    let first = try pcmFrame(generationID: 9, sequence: 0)
+    let second = try pcmFrame(generationID: 9, sequence: 1)
+    try await playback.enqueue(first)
+    try await playback.enqueue(second)
 
+    // Completion Tasks are unordered: the second buffer's callback can run
+    // first. Playback itself is strictly ordered, so the late completion
+    // proves the first frame also rendered.
     scheduler.completeScheduledBuffer(at: 1)
-    await failures.waitForFailure()
+    await rendered.waitForIdentities(2)
 
-    #expect(await rendered.identities.isEmpty)
-    #expect(
-        await failures.failure
-            == SidecarServiceFailure(
-                stage: .audioOutput,
-                code: .playbackFailed
-            )
-    )
+    #expect(await rendered.identities == [first.identity, second.identity])
+    #expect(await failures.failure == nil)
+
+    // The first buffer's own late callback is a duplicate by now and must
+    // stay benign.
+    scheduler.completeScheduledBuffer(at: 0)
+    await Task.yield()
+    #expect(await rendered.identities.count == 2)
+    #expect(await failures.failure == nil)
 }
 
 private actor PermissionRequestCounter {
@@ -1220,9 +1222,24 @@ private final class RecordingPlaybackScheduler: PCMPlaybackScheduling, @unchecke
 
 private actor RenderedRecorder {
     private(set) var identities: [PlaybackFrameIdentity] = []
+    private var waiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
 
     func append(_ identity: PlaybackFrameIdentity) {
         identities.append(identity)
+        let ready = waiters.filter { identities.count >= $0.count }
+        waiters.removeAll { identities.count >= $0.count }
+        for waiter in ready {
+            waiter.continuation.resume()
+        }
+    }
+
+    func waitForIdentities(_ count: Int) async {
+        guard identities.count < count else {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            waiters.append((count, continuation))
+        }
     }
 }
 

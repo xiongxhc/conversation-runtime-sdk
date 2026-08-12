@@ -99,6 +99,8 @@ public actor SidecarSession {
     private let playbackService: any SidecarPlaybackService
     private let eventSink: any SidecarEventSink
 
+    private static let deferredMediaLimit = 32
+
     private var configuration: SidecarConfiguration?
     private var phase = Phase.awaitingSession
     private var audioState = ServiceState.notAttempted
@@ -108,6 +110,7 @@ public actor SidecarSession {
     private var playbackBuffer = PlaybackBuffer()
     private var bargeInGate: BargeInGate?
     private var voiceActivityActive = false
+    private var deferredMedia: [ChildFrame] = []
 
     public var isTerminated: Bool {
         phase == .terminated
@@ -152,6 +155,23 @@ public actor SidecarSession {
             audio.sessionID == configuration.sessionID,
             playbackBuffer.isExplicitlyStale(audio.frame.identity)
         {
+            return
+        }
+        // A frame for a live generation can race the flush of an older one
+        // (the next turn's audio starts before the flush acknowledgement
+        // finishes). Park it until the flush restores a stable phase.
+        if case .flushing = phase,
+            let audio = frame.audio,
+            let configuration,
+            audio.sessionID == configuration.sessionID
+        {
+            guard deferredMedia.count < Self.deferredMediaLimit else {
+                try await fail(
+                    SidecarSessionError.invalidState,
+                    fallbackSessionID: configuration.sessionID
+                )
+            }
+            deferredMedia.append(frame)
             return
         }
         try requireAvailableOperation()
@@ -436,7 +456,21 @@ public actor SidecarSession {
             sessionID: configuration.sessionID
         )
         restoreAfterFlush(resumePhase)
+        try await drainDeferredMedia()
         return true
+    }
+
+    private func drainDeferredMedia() async throws {
+        while !deferredMedia.isEmpty {
+            // A flush that starts mid-drain owns the remaining frames: its
+            // completion drains again. Processing them here would just park
+            // them again in a loop that never suspends.
+            if case .flushing = phase {
+                return
+            }
+            let frame = deferredMedia.removeFirst()
+            try await handleMedia(frame)
+        }
     }
 
     private func process(_ control: ChildControl) async throws {
@@ -564,6 +598,7 @@ public actor SidecarSession {
             if let resumePhase {
                 restoreAfterFlush(resumePhase)
             }
+            try await drainDeferredMedia()
 
         case let .shutdown(sessionID):
             let configuration = try requireConfigured(sessionID: sessionID)
@@ -731,6 +766,7 @@ public actor SidecarSession {
             return
         }
         cleanupStarted = true
+        deferredMedia.removeAll()
 
         if recognitionState == .startAttempted || recognitionState == .started {
             recognitionState = .stopped

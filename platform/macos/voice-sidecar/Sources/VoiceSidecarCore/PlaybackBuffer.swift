@@ -185,6 +185,31 @@ public struct PlaybackBuffer: Sendable {
         return flushed
     }
 
+    // Playback renders frames strictly in queue order, so a completion for
+    // any queued frame proves every earlier frame also finished. Completion
+    // callbacks can be delivered out of order (and can repeat after the
+    // frame already left the queue), so this resolves the whole prefix and
+    // treats an absent identity as already handled.
+    @discardableResult
+    public mutating func markRenderedThrough(
+        _ identity: PlaybackFrameIdentity
+    ) -> [PlaybackFrameIdentity] {
+        guard
+            let index = frames.firstIndex(where: {
+                $0.frame.identity == identity
+            })
+        else {
+            return []
+        }
+        var rendered: [PlaybackFrameIdentity] = []
+        for queued in frames[...index] {
+            rendered.append(queued.frame.identity)
+            queuedDurationNanoseconds -= queued.durationNanoseconds
+        }
+        frames.removeFirst(index + 1)
+        return rendered
+    }
+
     public mutating func markRendered(_ identity: PlaybackFrameIdentity) throws {
         guard let first = frames.first, first.frame.identity == identity else {
             throw PlaybackBufferError.renderOrderMismatch

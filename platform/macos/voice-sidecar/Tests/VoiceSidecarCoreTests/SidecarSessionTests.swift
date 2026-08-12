@@ -431,6 +431,69 @@ func mediaFrameArrivingDuringSuspendedFlushIsDroppedWithoutFailure() async throw
 }
 
 @Test
+func newerGenerationFrameArrivingDuringSuspendedFlushIsEnqueuedAfterward() async throws {
+    let playback = ControllablePlaybackService()
+    await playback.setSuspendFlush(true)
+    let events = RecordingEventSink()
+    let session = SidecarSession(
+        audioService: RecordingAudioService(),
+        recognitionService: RecordingRecognitionService(),
+        playbackService: playback,
+        eventSink: events
+    )
+    try await startAndCapture(session)
+    try await session.handleMedia(
+        ChildFrame(audioSessionID: 7, frame: pcmFrame(generationID: 3))
+    )
+
+    let flush = Task {
+        try await session.handleControl(
+            ChildFrame(
+                control: .flushGeneration(
+                    sessionID: 7,
+                    generationID: 3,
+                    operationID: 2
+                )
+            )
+        )
+    }
+    await playback.waitUntilFlushStarted()
+
+    // The next turn's audio can start streaming before the previous
+    // generation's flush acknowledgement completes; the frame belongs to
+    // a live generation and must survive the transient flush phase.
+    try await session.handleMedia(
+        ChildFrame(audioSessionID: 7, frame: pcmFrame(generationID: 4))
+    )
+
+    await playback.releaseFlushes()
+    try await flush.value
+
+    #expect(await playback.frames.map(\.generationID) == [3, 4])
+    #expect(
+        await events.frames.suffix(2)
+            == [
+                ChildFrame(
+                    control: .playbackFlushed(
+                        sessionID: 7,
+                        generationID: 3,
+                        operationID: 2
+                    )
+                ),
+                ChildFrame(
+                    control: .playbackAccepted(
+                        sessionID: 7,
+                        turnID: 4,
+                        generationID: 4,
+                        utteranceID: 1,
+                        sequence: 0
+                    )
+                ),
+            ]
+    )
+}
+
+@Test
 func staleParentFlushAfterLocalBargeInIsAcknowledgedWithoutFailure() async throws {
     let playback = RecordingPlaybackService()
     let events = RecordingEventSink()

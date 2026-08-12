@@ -142,6 +142,36 @@ func renderedFramesMustLeaveInQueueOrder() throws {
 }
 
 @Test
+func outOfOrderCompletionMarksEveryFrameThroughTheIdentity() throws {
+    var buffer = PlaybackBuffer()
+    let first = try pcmFrame(sequence: 0)
+    let second = try pcmFrame(sequence: 1)
+    let third = try pcmFrame(sequence: 2)
+    try buffer.enqueue(first)
+    try buffer.enqueue(second)
+    try buffer.enqueue(third)
+
+    #expect(
+        buffer.markRenderedThrough(second.identity)
+            == [first.identity, second.identity]
+    )
+    #expect(buffer.frameCount == 1)
+    #expect(buffer.markRenderedThrough(third.identity) == [third.identity])
+    #expect(buffer.isPlaybackActive == false)
+}
+
+@Test
+func completionForAnAbsentFrameMarksNothing() throws {
+    var buffer = PlaybackBuffer()
+    let first = try pcmFrame(sequence: 0)
+    try buffer.enqueue(first)
+    _ = buffer.markRenderedThrough(first.identity)
+
+    #expect(buffer.markRenderedThrough(first.identity).isEmpty)
+    #expect(buffer.frameCount == 0)
+}
+
+@Test
 func flushMayAdvanceBeforeTheFirstMediaFrame() throws {
     var buffer = PlaybackBuffer()
 

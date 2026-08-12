@@ -212,6 +212,12 @@ native message format; it does not own conversation policy. Quality events
 expose the decision but never the transcript, prompt, response, provider
 payload, or model identifier.
 
+The reference Ollama adapter bounds response startup through the first body
+chunk to `30 s` and inactivity between later response chunks to `5 s`.
+Cancellation preempts either wait. A timeout fails only the current turn at the
+language-model stage, allowing the voice session and later turns to continue
+without silently selecting another model.
+
 ## R5 Controlled Memory Layer
 
 R5 inserts optional bounded retrieval after the quality decision and before

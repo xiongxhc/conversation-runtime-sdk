@@ -104,9 +104,15 @@ func pauseStopsCaptureBeforeAcknowledgementAndResumeRestartsIt() async throws {
         ChildFrame(control: .resumeCapture(sessionID: 7, operationID: 3))
     )
     #expect(await audio.resumeCaptureCount == 1)
+    #expect(await recognition.preparedConfigurations.count == 2)
     #expect(
         await callLog.entries
-            == ["audio.resume", "recognition.start", "event.captureResumed"]
+            == [
+                "recognition.prepare",
+                "audio.resume",
+                "recognition.start",
+                "event.captureResumed",
+            ]
     )
     #expect(
         await events.frames.suffix(3)

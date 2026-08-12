@@ -295,6 +295,19 @@ final class TurnAudioProcessor: AudioProcessing, @unchecked Sendable {
         }
     }
 
+    func beginDiscontinuityTransition() {
+        stateLock.withLock {
+            guard !state.hasFailed else {
+                return
+            }
+            state.preRoll = []
+            state.transitionSamples = []
+            state.audioSamples = []
+            state.energy = []
+            state.isTransitioning = true
+        }
+    }
+
     func cancelTransition() {
         stateLock.withLock {
             state.transitionSamples = []

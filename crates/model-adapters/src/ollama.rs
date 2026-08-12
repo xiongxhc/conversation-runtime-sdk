@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -15,6 +16,8 @@ const GENERATION_STREAM_BUFFER_SIZE: usize = 32;
 const MAX_NDJSON_RECORD_BYTES: usize = 64 * 1024;
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_MAX_ASSISTANT_CONTENT_BYTES: usize = 64 * 1024;
+const DEFAULT_RESPONSE_START_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_RESPONSE_CHUNK_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_ERROR_BODY_PREFIX_BYTES: usize = 4 * 1024;
 const MAX_GENERATION_TOKENS_PER_SPOKEN_SECOND: usize = 4;
 const MEMORY_CONTEXT_LABEL: &str =
@@ -48,6 +51,8 @@ pub struct OllamaConfig {
     num_predict: Option<usize>,
     num_ctx: Option<usize>,
     max_assistant_content_bytes: usize,
+    response_start_timeout: Duration,
+    response_chunk_timeout: Duration,
 }
 
 impl OllamaConfig {
@@ -76,6 +81,8 @@ impl OllamaConfig {
             num_predict: None,
             num_ctx: None,
             max_assistant_content_bytes: DEFAULT_MAX_ASSISTANT_CONTENT_BYTES,
+            response_start_timeout: DEFAULT_RESPONSE_START_TIMEOUT,
+            response_chunk_timeout: DEFAULT_RESPONSE_CHUNK_TIMEOUT,
         })
     }
 
@@ -153,6 +160,32 @@ impl OllamaConfig {
         }
 
         self.max_assistant_content_bytes = max_assistant_content_bytes;
+        Ok(self)
+    }
+
+    pub fn with_response_start_timeout(
+        mut self,
+        response_start_timeout: Duration,
+    ) -> Result<Self, AdapterError> {
+        if response_start_timeout.is_zero() {
+            return Err(AdapterError::new(
+                "Ollama response start timeout must be non-zero",
+            ));
+        }
+        self.response_start_timeout = response_start_timeout;
+        Ok(self)
+    }
+
+    pub fn with_response_chunk_timeout(
+        mut self,
+        response_chunk_timeout: Duration,
+    ) -> Result<Self, AdapterError> {
+        if response_chunk_timeout.is_zero() {
+            return Err(AdapterError::new(
+                "Ollama response chunk timeout must be non-zero",
+            ));
+        }
+        self.response_chunk_timeout = response_chunk_timeout;
         Ok(self)
     }
 }
@@ -347,17 +380,24 @@ async fn run_chat(
 ) -> Result<ChatOutcome, AdapterError> {
     let chat_url = chat_url(&config.endpoint);
     let chat_request = ChatRequest::new(&config, request.input())?;
+    let response_start_deadline = tokio::time::Instant::now() + config.response_start_timeout;
     let mut response = tokio::select! {
         biased;
         _ = cancellation.cancelled() => return Ok(ChatOutcome::Cancelled),
-        result = client.post(chat_url).json(&chat_request).send() => {
-            result.map_err(|error| AdapterError::new(format!("Ollama request failed: {error}")))?
+        result = tokio::time::timeout_at(
+            response_start_deadline,
+            client.post(chat_url).json(&chat_request).send(),
+        ) => {
+            result
+                .map_err(|_| AdapterError::new("Ollama response did not start before the timeout"))?
+                .map_err(|error| AdapterError::new(format!("Ollama request failed: {error}")))?
         }
     };
 
     if !response.status().is_success() {
         let status = response.status();
-        let (body, truncated) = read_error_body(&mut response, &cancellation).await?;
+        let (body, truncated) =
+            read_error_body(&mut response, &cancellation, config.response_chunk_timeout).await?;
         return Err(AdapterError::new(format!(
             "Ollama request failed with status {status}: {body}{}",
             if truncated { " [truncated]" } else { "" }
@@ -367,18 +407,32 @@ async fn run_chat(
     let mut parser = NdjsonResponseParser::new();
     let mut assistant_content_bytes = 0;
     let mut response_bytes = 0_usize;
+    let mut received_chunk = false;
     loop {
         let chunk = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Ok(ChatOutcome::Cancelled),
-            result = response.chunk() => {
-                result.map_err(|error| AdapterError::new(format!("Ollama response could not be read: {error}")))?
+            result = async {
+                if received_chunk {
+                    tokio::time::timeout(config.response_chunk_timeout, response.chunk()).await
+                } else {
+                    tokio::time::timeout_at(response_start_deadline, response.chunk()).await
+                }
+            } => {
+                result
+                    .map_err(|_| AdapterError::new(if received_chunk {
+                        "Ollama response stalled between chunks"
+                    } else {
+                        "Ollama response did not start before the timeout"
+                    }))?
+                    .map_err(|error| AdapterError::new(format!("Ollama response could not be read: {error}")))?
             }
         };
         let Some(chunk) = chunk else {
             parser.finish()?;
             return Err(AdapterError::new("Ollama response ended before done: true"));
         };
+        received_chunk = true;
         if chunk.len() > MAX_RESPONSE_BYTES.saturating_sub(response_bytes) {
             return Err(AdapterError::new(format!(
                 "Ollama response exceeds the maximum size of {MAX_RESPONSE_BYTES} bytes"
@@ -481,6 +535,7 @@ fn chat_url(endpoint: &reqwest::Url) -> reqwest::Url {
 async fn read_error_body(
     response: &mut reqwest::Response,
     cancellation: &CancellationToken,
+    response_chunk_timeout: Duration,
 ) -> Result<(String, bool), AdapterError> {
     let mut prefix = ErrorBodyPrefix::new();
 
@@ -488,8 +543,10 @@ async fn read_error_body(
         let chunk = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Ok((String::new(), false)),
-            result = response.chunk() => {
-                result.map_err(|error| AdapterError::new(format!("Ollama error response could not be read: {error}")))?
+            result = tokio::time::timeout(response_chunk_timeout, response.chunk()) => {
+                result
+                    .map_err(|_| AdapterError::new("Ollama error response stalled between chunks"))?
+                    .map_err(|error| AdapterError::new(format!("Ollama error response could not be read: {error}")))?
             }
         };
         let Some(chunk) = chunk else {

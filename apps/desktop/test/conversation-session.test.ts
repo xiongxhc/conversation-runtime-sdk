@@ -111,6 +111,28 @@ describe("ConversationSession", () => {
     expect(session.state.turns).toHaveLength(1);
   });
 
+  it("keeps a request-scoped text rejection recoverable", async () => {
+    const transport = connectedVoiceTransport();
+    const session = await ConversationSession.connect(transport);
+    await session.startVoice();
+    transport.voiceEvent({
+      type: "voice_session_started",
+      session_id: "1",
+      privacy: { privacy_mode: "local_only", components: localVoiceStatus.components },
+    });
+    await eventually(() => expect(session.state.voice.session).toBe("active"));
+    transport.rejectNextStart = true;
+
+    await expect(session.send("typed during a capture race")).rejects.toThrow(
+      "voice capture is not paused",
+    );
+
+    expect(session.state.phase).toBe("ready");
+    expect(session.state.voice.session).toBe("active");
+    expect(session.state.turns).toHaveLength(0);
+    expect(session.state.error?.message).toBe("voice capture is not paused");
+  });
+
   it("interrupts the active turn and returns to ready after cancellation", async () => {
     const transport = connectedTransport();
     const session = await ConversationSession.connect(transport);
@@ -275,6 +297,78 @@ describe("ConversationSession", () => {
       visual: "listening",
       partialTranscript: "new turn",
     });
+  });
+
+  it("releases an active turn when voice requires a new session", async () => {
+    const transport = connectedVoiceTransport();
+    const session = await ConversationSession.connect(transport);
+    await session.startVoice();
+    transport.voiceEvent({
+      type: "voice_session_started",
+      session_id: "1",
+      privacy: { privacy_mode: "local_only", components: localVoiceStatus.components },
+    });
+    transport.voiceEvent({
+      type: "voice_transcript_final",
+      session_id: "1",
+      turn_id: "1",
+      text: "spoken before device failure",
+    });
+    await eventually(() => expect(session.state.phase).toBe("streaming"));
+
+    transport.voiceEvent({
+      type: "voice_session_failed",
+      session_id: "1",
+      error: {
+        code: "adapter_failure",
+        kind: "adapter",
+        stage: "audio_output",
+        message: "audio device unavailable",
+      },
+      recovery: "new_session",
+    });
+
+    await eventually(() => expect(session.state.phase).toBe("ready"));
+    expect(session.state.activeTurn).toBeUndefined();
+    expect(session.state.turns[0]).toMatchObject({
+      transcript: "spoken before device failure",
+      state: "failed",
+      failure: { message: "audio device unavailable" },
+    });
+    await expect(session.send("typed recovery")).resolves.toBe(2n);
+  });
+
+  it("does not fail a paused-capture typed turn when voice requires a new session", async () => {
+    const transport = connectedVoiceTransport();
+    const session = await ConversationSession.connect(transport);
+    await session.startVoice();
+    transport.voiceEvent({
+      type: "voice_session_started",
+      session_id: "1",
+      privacy: { privacy_mode: "local_only", components: localVoiceStatus.components },
+    });
+    await session.send("typed while capture is paused");
+
+    transport.voiceEvent({
+      type: "voice_session_failed",
+      session_id: "1",
+      error: {
+        code: "adapter_failure",
+        kind: "adapter",
+        stage: "voice_sidecar",
+        message: "sidecar closed",
+      },
+      recovery: "new_session",
+    });
+
+    await eventually(() => expect(session.state.voice.session).toBe("error"));
+    expect(session.state.phase).toBe("streaming");
+    expect(session.state.activeTurn).toMatchObject({
+      transcript: "typed while capture is paused",
+      state: "streaming",
+    });
+    transport.turnEvent({ type: "turn_completed", turn_id: "1" });
+    await eventually(() => expect(session.state.phase).toBe("ready"));
   });
 
   it("rejects voice start while a typed turn is active", async () => {
@@ -537,6 +631,7 @@ class InMemoryTransport implements RuntimeTransport {
   holdVoiceStartAcceptance = false;
   rejectNextVoiceStart = false;
   rejectNextVoiceStop = false;
+  rejectNextStart = false;
   private heldStart: ClientCommand | undefined;
   private heldVoiceStart: ClientCommand | undefined;
   private turnCounter = 0n;
@@ -564,6 +659,21 @@ class InMemoryTransport implements RuntimeTransport {
           kind: "adapter",
           stage: "audio_capture",
           message: "microphone unavailable",
+        },
+      });
+      return;
+    }
+    if (command.type === "start_turn" && this.rejectNextStart) {
+      this.rejectNextStart = false;
+      this.emit({
+        protocol_version: 1,
+        type: "command_rejected",
+        request_id: command.requestId,
+        error: {
+          code: "invalid_state",
+          kind: "invalid_state",
+          stage: "runtime",
+          message: "voice capture is not paused",
         },
       });
       return;

@@ -31,6 +31,7 @@ pub enum ClientVoiceActivity {
     SpeechStarted { at_ms: u64 },
     SpeechContinued { at_ms: u64 },
     SpeechEnded { at_ms: u64 },
+    CaptureDiscontinuity { at_ms: u64 },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -249,6 +250,7 @@ impl From<VoiceActivity> for ClientVoiceActivity {
             VoiceActivity::SpeechStarted { at_ms } => Self::SpeechStarted { at_ms },
             VoiceActivity::SpeechContinued { at_ms } => Self::SpeechContinued { at_ms },
             VoiceActivity::SpeechEnded { at_ms } => Self::SpeechEnded { at_ms },
+            VoiceActivity::CaptureDiscontinuity { at_ms } => Self::CaptureDiscontinuity { at_ms },
         }
     }
 }

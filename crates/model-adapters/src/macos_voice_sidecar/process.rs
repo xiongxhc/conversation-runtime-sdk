@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use command_fds::{CommandFdExt, FdMapping};
 use conversation_protocol::{
-    GenerationId, PlaybackState, RuntimeStage, SessionId, TurnId, UtteranceId,
+    GenerationId, PlaybackState, RuntimeStage, SessionId, TurnId, UtteranceId, VoiceActivity,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -21,7 +21,7 @@ use super::codec::{
     SidecarFrame, MAX_CONTROL_PAYLOAD_BYTES, PROTOCOL_VERSION,
 };
 use crate::{
-    AdapterError, AdapterFuture, AudioFrame, ContinuousAudioOutput, PlaybackReceipt,
+    AdapterError, AdapterFuture, AudioFrame, CaptureEvent, ContinuousAudioOutput, PlaybackReceipt,
     RecognitionEvent, VoiceCaptureControl, VoiceInput, VoiceInputEvent, VoiceIoFactory,
     VoiceIoSession,
 };
@@ -1274,6 +1274,13 @@ async fn run_stdout_reader(
         }
 
         let input_event = match control {
+            SidecarControl::VoiceActivity {
+                activity: VoiceActivity::CaptureDiscontinuity { at_ms },
+                ..
+            } => Some((
+                VoiceInputEvent::Capture(CaptureEvent::Discontinuity { at_ms }),
+                true,
+            )),
             SidecarControl::VoiceActivity { activity, .. } => {
                 Some((VoiceInputEvent::Activity(activity), true))
             }

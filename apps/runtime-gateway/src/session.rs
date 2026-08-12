@@ -52,6 +52,7 @@ struct ActiveVoiceSession {
     control: Option<ActiveVoiceControl>,
     control_events: mpsc::Sender<VoiceCaptureControlKind>,
     control_pending: watch::Sender<bool>,
+    capture: VoiceCaptureState,
 }
 
 struct ActiveVoiceControl {
@@ -64,6 +65,12 @@ struct ActiveVoiceControl {
 enum VoiceCaptureControlKind {
     Pause,
     Resume,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VoiceCaptureState {
+    Active,
+    Paused,
 }
 
 struct VoiceSessionState {
@@ -301,6 +308,12 @@ impl GatewaySession {
                                 );
                             }
                         };
+                        if result.is_ok() {
+                            voice_session.capture = match control.kind {
+                                VoiceCaptureControlKind::Pause => VoiceCaptureState::Paused,
+                                VoiceCaptureControlKind::Resume => VoiceCaptureState::Active,
+                            };
+                        }
                         let release = result.is_ok().then_some(control.kind);
                         let response =
                             send_voice_control_result(&urgent_sender, &control.request_id, result);
@@ -413,7 +426,10 @@ impl GatewaySession {
                     )
                     .map_err(CommandFailure::response);
                 }
-                if voice.active.is_some() {
+                if voice.active.as_ref().is_some_and(|voice_session| {
+                    voice_session.capture != VoiceCaptureState::Paused
+                        || voice_session.control.is_some()
+                }) {
                     return send_rejection(
                         normal,
                         &request_id,
@@ -568,6 +584,7 @@ impl GatewaySession {
                     control: None,
                     control_events,
                     control_pending,
+                    capture: VoiceCaptureState::Active,
                 });
                 Ok(())
             }
@@ -634,6 +651,14 @@ impl GatewaySession {
                 Ok(())
             }
             ClientCommand::ResumeVoiceCapture { request_id } => {
+                if active.is_some() {
+                    return send_rejection(
+                        normal,
+                        &request_id,
+                        command_error("a conversation turn is active"),
+                    )
+                    .map_err(CommandFailure::response);
+                }
                 let Some(voice_session) = voice.active.as_mut() else {
                     return send_rejection(
                         normal,
@@ -2395,7 +2420,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn start_turn_is_rejected_while_voice_session_is_active() {
+    async fn start_turn_requires_active_voice_capture_to_be_paused() {
         let (input, input_receiver) = mpsc::channel(8);
         let language = Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new()));
         let session = session_with_interactive_voice(input_receiver, language, no_speech_frames());
@@ -2416,6 +2441,55 @@ mod tests {
         let rejection = gateway.read_message().await;
         assert_rejected_message(&rejection, "text-1", "invalid_state");
         assert!(rejection.contains("a voice session is active"));
+
+        gateway
+            .write(r#"{"protocol_version":1,"type":"pause_voice_capture","request_id":"pause-1"}"#)
+            .await;
+        let pause_messages = [gateway.read_message().await, gateway.read_message().await];
+        assert!(pause_messages.iter().any(|message| {
+            message.contains(r#""type":"command_accepted""#)
+                && message.contains(r#""request_id":"pause-1""#)
+        }));
+        assert!(pause_messages
+            .iter()
+            .any(|message| message.contains(r#""type":"voice_capture_paused""#)));
+
+        gateway
+            .write(
+                r#"{"protocol_version":1,"type":"start_turn","request_id":"text-paused","transcript":"fixture text while voice is paused"}"#,
+            )
+            .await;
+        assert_accepted_message(&gateway.read_message().await, "text-paused");
+        gateway
+            .write(r#"{"protocol_version":1,"type":"resume_voice_capture","request_id":"resume-during-text"}"#)
+            .await;
+        let resume_messages = gateway
+            .read_until(|message| message.contains(r#""request_id":"resume-during-text""#))
+            .await;
+        assert_rejected_message(
+            resume_messages.last().expect("resume response"),
+            "resume-during-text",
+            "invalid_state",
+        );
+        let is_text_terminal = |message: &str| {
+            message.contains(r#""type":"turn_completed""#)
+                || message.contains(r#""type":"turn_cancelled""#)
+                || message.contains(r#""type":"turn_failed""#)
+        };
+        let mut text_messages = resume_messages;
+        if !text_messages
+            .iter()
+            .any(|message| is_text_terminal(message))
+        {
+            text_messages.extend(gateway.read_until(is_text_terminal).await);
+        }
+        assert_eq!(
+            text_messages
+                .iter()
+                .filter(|message| is_text_terminal(message))
+                .count(),
+            1
+        );
 
         drop(input);
         let messages = gateway.read_until(is_voice_terminal).await;
@@ -3313,8 +3387,14 @@ mod tests {
     }
 
     fn assert_accepted_message(message: &str, request_id: &str) {
-        assert!(message.contains(r#""type":"command_accepted""#));
-        assert!(message.contains(&format!(r#""request_id":"{request_id}""#)));
+        assert!(
+            message.contains(r#""type":"command_accepted""#),
+            "expected command acceptance, received {message}"
+        );
+        assert!(
+            message.contains(&format!(r#""request_id":"{request_id}""#)),
+            "expected request {request_id}, received {message}"
+        );
     }
 
     fn assert_rejected_message(message: &str, request_id: &str, code: &str) {

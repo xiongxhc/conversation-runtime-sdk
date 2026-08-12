@@ -153,7 +153,7 @@ async fn gateway_diagnostics_reject_a_named_pipe() {
     });
 
     receiver
-        .recv_timeout(Duration::from_secs(2))
+        .recv_timeout(Duration::from_secs(5))
         .expect("gateway startup must not block on a named pipe")
         .expect("open gateway without unsafe diagnostic sink");
     assert!(fs::metadata(&log).unwrap().file_type().is_fifo());

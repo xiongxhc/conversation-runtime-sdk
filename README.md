@@ -18,7 +18,7 @@ The repository now contains the deterministic runtime foundation, reviewed local
 - deterministic mock adapters that require no downloaded models;
 - single-active-turn orchestration with exactly one terminal event;
 - integration tests for completion, interruption races, adapter failures, synthesis cancellation, and runtime reuse;
-- a streaming Ollama adapter with bounded NDJSON framing, cancellation, and configurable thinking;
+- a streaming Ollama adapter with bounded NDJSON framing, cancellation, bounded response-start and chunk-inactivity waits, and configurable thinking;
 - a runnable local text probe that selects an installed Ollama model by exact identifier, subject to that model supporting the fixed probe policy;
 - reproducible feasibility results for three local checkpoints under one bounded 8K-context profile;
 - typed synthesized audio, cleanup-aware speech cancellation, and a bounded macOS system-speech reference adapter;
@@ -321,6 +321,12 @@ swift build -c release --package-path platform/macos/voice-sidecar
 printf '%s/conversation-voice-sidecar\n' "$(swift build -c release \
   --package-path platform/macos/voice-sidecar --show-bin-path)"
 ```
+
+If the selected speech adapter uses a local HTTP provider, start that provider
+on its configured loopback endpoint before connecting the desktop app. The
+gateway validates and uses replaceable providers but does not yet launch an
+external model host. Backend-neutral provider supervision with explicit
+executable, argument, readiness, and cleanup contracts remains R6 work.
 
 Uncomment the complete `[voice.capture]`, `[voice.turn]`, `[voice.asr]`,
 `[voice.speech]`, and `[voice.audio]` subtree together. Public examples contain

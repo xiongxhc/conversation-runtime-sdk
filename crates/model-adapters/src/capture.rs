@@ -8,6 +8,7 @@ use crate::{AdapterError, AdapterFuture, AudioFrame};
 #[non_exhaustive]
 pub enum CaptureEvent {
     Frame(AudioFrame),
+    Discontinuity { at_ms: u64 },
 }
 
 /// Streams capture events for one voice session.

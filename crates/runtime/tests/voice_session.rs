@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -7,10 +8,12 @@ use conversation_memory::{
     SqliteMemoryContextProvider, SqliteMemoryStore,
 };
 use conversation_model_adapters::{
-    AdapterError, AdapterFuture, AudioFrame, ContinuousAudioOutput, MockContinuousAudioOutput,
-    MockGenerationLanguageModel, MockStreamingSpeechSynthesizer, MockVoiceCaptureControl,
-    PcmFormat, PcmSampleFormat, PlaybackReceipt, VoiceCaptureControl, VoiceInput, VoiceInputEvent,
-    VoiceIoFactory, VoiceIoSession,
+    AdapterError, AdapterFuture, AudioFrame, CaptureEvent, ContinuousAudioOutput,
+    GenerationLanguageModel, GenerationLanguageRequest, GenerationTextDelta,
+    MockContinuousAudioOutput, MockGenerationLanguageModel, MockStreamingSpeechSynthesizer,
+    MockVoiceCaptureControl, PcmFormat, PcmSampleFormat, PlaybackReceipt, StreamingSpeechRequest,
+    StreamingSpeechSynthesizer, VoiceCaptureControl, VoiceInput, VoiceInputEvent, VoiceIoFactory,
+    VoiceIoSession,
 };
 use conversation_protocol::{
     ComponentDescriptor, ComponentKind, ExecutionLocation, GenerationId, MemoryConfidence,
@@ -165,6 +168,105 @@ async fn finalizes_each_utterance_from_the_silence_timer_with_increasing_identit
 }
 
 #[tokio::test(start_paused = true)]
+async fn five_turn_session_recovers_after_one_language_failure() {
+    let (input, input_receiver) = mpsc::channel(32);
+    let output = Arc::new(MockContinuousAudioOutput::new());
+    let factory = Arc::new(TestVoiceIoFactory::new(input_receiver, output));
+    let language = Arc::new(MultiTurnLanguage::new([
+        LanguageOutcome::Text("answer one."),
+        LanguageOutcome::Failure("temporary local model failure"),
+        LanguageOutcome::Text("answer three."),
+        LanguageOutcome::Text("answer four."),
+        LanguageOutcome::Text("answer five."),
+    ]));
+    let runtime = VoiceSessionRuntime::new(
+        conversation_context(),
+        VoiceSessionAdapters::new(factory.clone(), language.clone(), Arc::new(PerTurnSpeech)),
+    );
+    let mut events = runtime.start(policy()).await.unwrap();
+    timeout(Duration::from_secs(1), factory.wait_for_input_start())
+        .await
+        .expect("voice input did not start");
+    assert_session_started(events.recv().await);
+
+    for turn_number in 1..=5_u64 {
+        let at_ms = (turn_number - 1) * 600;
+        input
+            .send(Ok(VoiceInputEvent::Activity(
+                VoiceActivity::SpeechStarted { at_ms },
+            )))
+            .await
+            .unwrap();
+        input
+            .send(Ok(VoiceInputEvent::Recognition(
+                conversation_model_adapters::RecognitionEvent::Hypothesis(
+                    conversation_model_adapters::RecognitionHypothesis::engine_final(
+                        turn_number,
+                        format!("question {turn_number}"),
+                    ),
+                ),
+            )))
+            .await
+            .unwrap();
+        input
+            .send(Ok(VoiceInputEvent::Activity(VoiceActivity::SpeechEnded {
+                at_ms,
+            })))
+            .await
+            .unwrap();
+        tokio::time::advance(Duration::from_millis(600)).await;
+
+        let observed = drain_until_turn_terminal(&mut events).await;
+        let expected_turn = TurnId::new(turn_number);
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| matches!(event, VoiceSessionEvent::Turn { event, .. } if event.is_terminal()))
+                .count(),
+            1
+        );
+        if turn_number == 2 {
+            assert!(observed.iter().any(|event| matches!(
+                event,
+                VoiceSessionEvent::Turn {
+                    event: RuntimeEvent::TurnFailed { turn_id, error },
+                    ..
+                } if *turn_id == expected_turn && error.stage() == RuntimeStage::LanguageModel
+            )));
+            assert!(matches!(
+                events.recv().await,
+                Some(VoiceSessionEvent::SessionFailed {
+                    recovery: RecoveryDisposition::ContinueSession,
+                    ..
+                })
+            ));
+        } else {
+            assert!(
+                observed.iter().any(|event| matches!(
+                    event,
+                    VoiceSessionEvent::Turn {
+                        event: RuntimeEvent::TurnCompleted { turn_id },
+                        ..
+                    } if *turn_id == expected_turn
+                )),
+                "turn {turn_number} did not complete: {observed:?}"
+            );
+        }
+    }
+
+    assert_eq!(
+        language
+            .requests()
+            .iter()
+            .map(GenerationLanguageRequest::turn_id)
+            .collect::<Vec<_>>(),
+        (1..=5).map(TurnId::new).collect::<Vec<_>>()
+    );
+    runtime.shutdown().await.unwrap();
+    let _ = drain_until_session_terminal(&mut events).await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn late_recognition_waits_for_the_next_speech_window() {
     let harness = VoiceSessionHarness::new();
     let mut events = harness.start().await;
@@ -309,6 +411,63 @@ async fn sidecar_timestamp_skew_does_not_move_the_session_deadline() {
 
     let observed = drain_until_turn_terminal(&mut events).await;
     assert_final_and_completed(&observed, TurnId::new(1), "clock domain");
+    harness.shutdown(&mut events).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn runtime_clock_separates_new_speech_from_an_expired_partial() {
+    let harness = VoiceSessionHarness::new();
+    let mut events = harness.start().await;
+    assert_session_started(events.recv().await);
+
+    harness.engine_final(1, "old").await;
+    harness.speech_ended(9_000_000).await;
+    assert_voice_activity(
+        events.recv().await,
+        VoiceActivity::SpeechEnded { at_ms: 9_000_000 },
+    );
+    assert_speech_end_timing(events.recv().await);
+    harness.partial(2, " tail").await;
+    assert_partial(events.recv().await, 2, " tail");
+    tokio::time::advance(Duration::from_millis(600)).await;
+    tokio::task::yield_now().await;
+    assert!(harness.language.requests().is_empty());
+
+    harness.speech_started(0).await;
+    assert_voice_activity(
+        events.recv().await,
+        VoiceActivity::SpeechStarted { at_ms: 0 },
+    );
+    harness.engine_final(1, "new").await;
+    harness.speech_ended(0).await;
+    tokio::time::advance(Duration::from_millis(600)).await;
+
+    let observed = drain_until_turn_terminal(&mut events).await;
+    assert_final_and_completed(&observed, TurnId::new(1), "new");
+    harness.shutdown(&mut events).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn capture_discontinuity_isolates_the_next_recognition_result() {
+    let harness = VoiceSessionHarness::new();
+    let mut events = harness.start().await;
+    assert_session_started(events.recv().await);
+
+    harness.engine_final(1, "old").await;
+    harness.partial(2, " tail").await;
+    assert_partial(events.recv().await, 2, " tail");
+    harness.discontinuity(100).await;
+    harness.speech_started(101).await;
+    assert_voice_activity(
+        events.recv().await,
+        VoiceActivity::SpeechStarted { at_ms: 101 },
+    );
+    harness.engine_final(1, "new").await;
+    harness.speech_ended(200).await;
+    tokio::time::advance(Duration::from_millis(600)).await;
+
+    let observed = drain_until_turn_terminal(&mut events).await;
+    assert_final_and_completed(&observed, TurnId::new(1), "new");
     harness.shutdown(&mut events).await;
 }
 
@@ -1041,6 +1200,89 @@ async fn matching_playback_lifecycle_is_reliable_under_saturated_output() {
     harness.shutdown(&mut events).await;
 }
 
+enum LanguageOutcome {
+    Text(&'static str),
+    Failure(&'static str),
+}
+
+struct PerTurnSpeech;
+
+impl StreamingSpeechSynthesizer for PerTurnSpeech {
+    fn stream(
+        &self,
+        request: StreamingSpeechRequest,
+        _cancellation: CancellationToken,
+    ) -> mpsc::Receiver<Result<AudioFrame, AdapterError>> {
+        let frame = AudioFrame::new(
+            request.turn_id(),
+            request.generation_id(),
+            request.utterance_id(),
+            0,
+            PcmFormat::new(24_000, 1, PcmSampleFormat::Signed16LittleEndian).unwrap(),
+            vec![0; 960],
+        )
+        .unwrap();
+        let (sender, receiver) = mpsc::channel(1);
+        sender
+            .try_send(Ok(frame))
+            .expect("per-turn speech result receiver remains open");
+        receiver
+    }
+}
+
+struct MultiTurnLanguage {
+    outcomes: Mutex<VecDeque<LanguageOutcome>>,
+    requests: Mutex<Vec<GenerationLanguageRequest>>,
+}
+
+impl MultiTurnLanguage {
+    fn new(outcomes: impl IntoIterator<Item = LanguageOutcome>) -> Self {
+        Self {
+            outcomes: Mutex::new(outcomes.into_iter().collect()),
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn requests(&self) -> Vec<GenerationLanguageRequest> {
+        self.requests
+            .lock()
+            .expect("multi-turn language requests lock poisoned")
+            .clone()
+    }
+}
+
+impl GenerationLanguageModel for MultiTurnLanguage {
+    fn stream(
+        &self,
+        request: GenerationLanguageRequest,
+        _cancellation: CancellationToken,
+    ) -> mpsc::Receiver<Result<GenerationTextDelta, AdapterError>> {
+        self.requests
+            .lock()
+            .expect("multi-turn language requests lock poisoned")
+            .push(request.clone());
+        let outcome = self
+            .outcomes
+            .lock()
+            .expect("multi-turn language outcomes lock poisoned")
+            .pop_front()
+            .expect("multi-turn language outcome missing");
+        let (sender, receiver) = mpsc::channel(1);
+        let result = match outcome {
+            LanguageOutcome::Text(text) => Ok(GenerationTextDelta::new(
+                request.turn_id(),
+                request.generation_id(),
+                text,
+            )),
+            LanguageOutcome::Failure(message) => Err(AdapterError::new(message)),
+        };
+        sender
+            .try_send(result)
+            .expect("multi-turn language result receiver remains open");
+        receiver
+    }
+}
+
 struct VoiceSessionHarness {
     runtime: VoiceSessionRuntime,
     factory: Arc<TestVoiceIoFactory>,
@@ -1228,6 +1470,13 @@ impl VoiceSessionHarness {
 
     async fn speech_ended(&self, at_ms: u64) {
         self.send(VoiceInputEvent::Activity(VoiceActivity::SpeechEnded {
+            at_ms,
+        }))
+        .await;
+    }
+
+    async fn discontinuity(&self, at_ms: u64) {
+        self.send(VoiceInputEvent::Capture(CaptureEvent::Discontinuity {
             at_ms,
         }))
         .await;

@@ -221,6 +221,47 @@ public actor SidecarSession {
         )
     }
 
+    public func recoverFromRecognitionFailure(
+        _ failure: SidecarServiceFailure,
+        fallbackSessionID: UInt64
+    ) async throws {
+        guard failure.stage == .speechRecognizer,
+              failure.code == .recognitionFailed,
+              phase == .capturing,
+              let configuration
+        else {
+            throw SidecarSessionError.invalidState
+        }
+        recognitionState = .stopped
+        await recognitionService.stop()
+        guard phase == .capturing else {
+            return
+        }
+        recognitionState = .prepareAttempted
+        try await recognitionService.prepare(configuration: configuration)
+        guard phase == .capturing else {
+            return
+        }
+        recognitionState = .prepared
+        recognitionState = .startAttempted
+        try await recognitionService.start(configuration: configuration)
+        guard phase == .capturing else {
+            await recognitionService.stop()
+            return
+        }
+        recognitionState = .started
+        let sessionID = self.configuration?.sessionID ?? fallbackSessionID
+        try await eventSink.send(
+            ChildFrame(
+                control: .failure(
+                    sessionID: sessionID,
+                    stage: failure.stage,
+                    code: failure.code
+                )
+            )
+        )
+    }
+
     public func publishVoiceActivity(_ activity: VoiceActivity) async throws {
         try requireAvailableOperation()
         do {
@@ -297,6 +338,9 @@ public actor SidecarSession {
                 .speechEnded(atMilliseconds: atMilliseconds)
             )
         }
+        try await sendVoiceActivity(
+            .captureDiscontinuity(atMilliseconds: atMilliseconds)
+        )
         bargeInGate?.reset()
     }
 
@@ -328,6 +372,8 @@ public actor SidecarSession {
             voiceActivityActive = true
         case .speechEnded:
             voiceActivityActive = false
+        case .captureDiscontinuity:
+            return
         }
     }
 
@@ -457,6 +503,9 @@ public actor SidecarSession {
                 throw SidecarSessionError.invalidState
             }
             phase = .resuming
+            recognitionState = .prepareAttempted
+            try await recognitionService.prepare(configuration: configuration)
+            recognitionState = .prepared
             try await audioService.resumeCapture()
             recognitionState = .startAttempted
             try await recognitionService.start(configuration: configuration)

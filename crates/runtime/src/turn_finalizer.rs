@@ -64,8 +64,12 @@ impl TurnFinalizer {
 
     pub fn observe_activity(&mut self, value: VoiceActivity) {
         match value {
-            VoiceActivity::SpeechStarted { .. } => {
-                if self.finalized {
+            VoiceActivity::SpeechStarted { at_ms } => {
+                let previous_utterance_expired =
+                    self.speech_ended_at_ms.is_some_and(|ended_at_ms| {
+                        at_ms >= ended_at_ms.saturating_add(self.final_silence_ms)
+                    });
+                if self.finalized || previous_utterance_expired {
                     self.segment_id = None;
                     self.committed.clear();
                     self.display_candidate = None;
@@ -82,6 +86,15 @@ impl TurnFinalizer {
             }
             _ => {}
         }
+    }
+
+    pub fn observe_discontinuity(&mut self) {
+        self.segment_id = None;
+        self.committed.clear();
+        self.display_candidate = None;
+        self.engine_final_candidate = None;
+        self.speech_ended_at_ms = None;
+        self.finalized = false;
     }
 
     pub fn display_text(&self) -> Option<&str> {
@@ -231,5 +244,41 @@ mod tests {
             .finalize_ready(2_700)
             .expect("new speech starts the next utterance");
         assert_eq!(finalized.text, " next");
+    }
+
+    #[test]
+    fn new_speech_after_elapsed_silence_discards_an_unresolved_partial() {
+        let mut finalizer = finalizer();
+        finalizer.observe_hypothesis(RecognitionHypothesis::engine_final(1, "old"), 0);
+        ended(&mut finalizer, 0);
+        finalizer.observe_hypothesis(RecognitionHypothesis::partial(2, " tail"), 500);
+        assert!(finalizer.finalize_ready(600).is_none());
+
+        finalizer.observe_activity(VoiceActivity::SpeechStarted { at_ms: 1_200 });
+        finalizer.observe_hypothesis(RecognitionHypothesis::engine_final(1, "new"), 1_200);
+        ended(&mut finalizer, 1_200);
+
+        let finalized = finalizer
+            .finalize_ready(1_800)
+            .expect("new utterance finalizes without stale text");
+        assert_eq!(finalized.text, "new");
+    }
+
+    #[test]
+    fn capture_discontinuity_discards_unfinalized_transcript_state() {
+        let mut finalizer = finalizer();
+        finalizer.observe_hypothesis(RecognitionHypothesis::engine_final(1, "old"), 0);
+        ended(&mut finalizer, 0);
+        finalizer.observe_hypothesis(RecognitionHypothesis::partial(2, " tail"), 100);
+
+        finalizer.observe_discontinuity();
+        finalizer.observe_activity(VoiceActivity::SpeechStarted { at_ms: 200 });
+        finalizer.observe_hypothesis(RecognitionHypothesis::engine_final(1, "new"), 200);
+        ended(&mut finalizer, 200);
+
+        let finalized = finalizer
+            .finalize_ready(800)
+            .expect("post-discontinuity utterance finalizes");
+        assert_eq!(finalized.text, "new");
     }
 }

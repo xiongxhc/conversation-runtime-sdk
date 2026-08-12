@@ -225,6 +225,28 @@ test("parses an exact completed text snapshot", () => {
   );
 });
 
+test("parses a capture discontinuity without transcript state", () => {
+  assert.deepEqual(
+    parseGatewayMessage({
+      protocol_version: 1,
+      type: "voice_event",
+      event: {
+        type: "voice_activity",
+        session_id: "7",
+        activity: { type: "capture_discontinuity", at_ms: 42 },
+      },
+    }),
+    {
+      type: "voice_event",
+      event: {
+        type: "voice_activity",
+        sessionId: 7n,
+        activity: { type: "capture_discontinuity", atMs: 42 },
+      },
+    },
+  );
+});
+
 test("rejects unsupported inbound protocol versions", () => {
   assert.throws(() =>
     parseGatewayMessage({

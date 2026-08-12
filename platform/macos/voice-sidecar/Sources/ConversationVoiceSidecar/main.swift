@@ -107,10 +107,12 @@ await recognition.setEventHandler { event in
     try await recognitionPublisher.publish(event)
 }
 await recognition.setFailureHandler { sessionID, failure in
-    await failureController.terminate(
-        with: failure,
-        fallbackSessionID: sessionID
-    )
+    Task {
+        await failureController.reportRecoverableRecognitionFailure(
+            failure,
+            fallbackSessionID: sessionID
+        )
+    }
 }
 engine.setFailureHandler { sessionID, failure in
     await failureController.terminate(

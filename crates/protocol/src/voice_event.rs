@@ -6,6 +6,7 @@ pub enum VoiceActivity {
     SpeechStarted { at_ms: u64 },
     SpeechContinued { at_ms: u64 },
     SpeechEnded { at_ms: u64 },
+    CaptureDiscontinuity { at_ms: u64 },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -439,6 +439,12 @@ public enum ChildProtocol {
                     {"session_id":\(sessionID),"activity":"speech_ended","at_ms":\(atMilliseconds)}
                     """.utf8
                 )
+            case let .captureDiscontinuity(atMilliseconds):
+                return Data(
+                    """
+                    {"session_id":\(sessionID),"activity":"capture_discontinuity","at_ms":\(atMilliseconds)}
+                    """.utf8
+                )
             }
         case let .transcriptHypothesis(sessionID, hypothesis):
             return try encodeTranscriptHypothesis(
@@ -706,6 +712,10 @@ public enum ChildProtocol {
                     activity = .speechContinued(atMilliseconds: value.atMilliseconds)
                 case .ended:
                     activity = .speechEnded(atMilliseconds: value.atMilliseconds)
+                case .discontinuity:
+                    activity = .captureDiscontinuity(
+                        atMilliseconds: value.atMilliseconds
+                    )
                 }
                 return .voiceActivity(sessionID: value.sessionID, activity: activity)
             case .transcriptHypothesis:
@@ -1052,6 +1062,7 @@ private enum VoiceActivityKindDTO: String, Decodable {
     case started = "speech_started"
     case continued = "speech_continued"
     case ended = "speech_ended"
+    case discontinuity = "capture_discontinuity"
 }
 
 private struct VoiceActivityDTO: Decodable {

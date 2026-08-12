@@ -559,6 +559,27 @@ func intentionalRecognitionWorkerRestartIsNotReportedAsFailure() async {
 }
 
 @Test
+func replacementRecognitionWorkerFailureIsReportedAfterRestart() async {
+    let stopState = RecognitionWorkerStopState()
+    #expect(stopState.beginRestart())
+    let oldCompletion = await runRecognitionWorker(stopState: stopState) {}
+    #expect(oldCompletion == .stopped)
+
+    stopState.finishRestart()
+    let replacementCompletion = await runRecognitionWorker(stopState: stopState) {}
+
+    #expect(
+        replacementCompletion
+            == .failed(
+                SidecarServiceFailure(
+                    stage: .speechRecognizer,
+                    code: .recognitionFailed
+                )
+            )
+    )
+}
+
+@Test
 func realSessionPublicationFailureCleansUpAfterRecognitionWorkerExit() async throws {
     let audio = FatalRecordingAudioService()
     let recognition = SessionOwnedRecognitionWorker()
@@ -681,6 +702,7 @@ func speakingGapPublishesEndedBeforeResetAndLaterSilenceDoesNotDuplicate() async
             == [
                 .speechStarted(atMilliseconds: 200),
                 .speechEnded(atMilliseconds: 300),
+                .captureDiscontinuity(atMilliseconds: 300),
             ]
     )
 }
@@ -779,6 +801,7 @@ func sustainedSpeechPublishesOneLifecycleAcrossGateWindows(
             == [
                 .speechStarted(atMilliseconds: firstStart),
                 .speechEnded(atMilliseconds: 500),
+                .captureDiscontinuity(atMilliseconds: 500),
                 .speechStarted(atMilliseconds: secondStart),
                 .speechEnded(atMilliseconds: 1_100),
             ]
@@ -933,6 +956,113 @@ func asynchronousOutputFailureUsesTheSameFatalPath() async throws {
 }
 
 @Test
+func recoverableRecognitionFailureKeepsTheSidecarSessionActive() async throws {
+    let audio = FatalRecordingAudioService()
+    let recognition = RestartableRecognitionService()
+    let playback = FatalRecordingPlaybackService()
+    let events = FailOnceEventSink()
+    let session = SidecarSession(
+        audioService: audio,
+        recognitionService: recognition,
+        playbackService: playback,
+        eventSink: events
+    )
+    try await startFatalSession(session)
+    let exitCounter = LockedCounter()
+    let controller = SidecarFailureController(
+        session: session,
+        exitHandler: {
+            exitCounter.increment()
+        }
+    )
+    let failure = SidecarServiceFailure(
+        stage: .speechRecognizer,
+        code: .recognitionFailed
+    )
+
+    await controller.reportRecoverableRecognitionFailure(
+        failure,
+        fallbackSessionID: 7
+    )
+    try await session.publishRecognitionHypothesis(
+        RecognitionHypothesis(
+            segmentID: 2,
+            text: "recovered",
+            engineFinal: true
+        )
+    )
+
+    #expect(await audio.stopCount == 0)
+    #expect(await recognition.prepareCount == 2)
+    #expect(await recognition.startCount == 2)
+    #expect(await recognition.stopCount == 1)
+    #expect(await playback.stopCount == 0)
+    #expect(exitCounter.value == 0)
+    #expect(
+        await events.frames.suffix(2)
+            == [
+                ChildFrame(
+                    control: .failure(
+                        sessionID: 7,
+                        stage: .speechRecognizer,
+                        code: .recognitionFailed
+                    )
+                ),
+                ChildFrame(
+                    control: .transcriptHypothesis(
+                        sessionID: 7,
+                        hypothesis: RecognitionHypothesis(
+                            segmentID: 2,
+                            text: "recovered",
+                            engineFinal: true
+                        )
+                    )
+                ),
+            ]
+    )
+}
+
+@Test
+func captureCanPauseWhileRecognitionRecoveryIsPreparing() async throws {
+    let gate = AsyncGate()
+    let audio = FatalRecordingAudioService()
+    let recognition = GatedRestartRecognitionService(gate: gate)
+    let events = FailOnceEventSink()
+    let session = SidecarSession(
+        audioService: audio,
+        recognitionService: recognition,
+        playbackService: FatalRecordingPlaybackService(),
+        eventSink: events
+    )
+    try await startFatalSession(session)
+    let recovery = Task {
+        try await session.recoverFromRecognitionFailure(
+            SidecarServiceFailure(
+                stage: .speechRecognizer,
+                code: .recognitionFailed
+            ),
+            fallbackSessionID: 7
+        )
+    }
+    await gate.waitUntilWaiting()
+
+    try await session.handleControl(
+        ChildFrame(control: .pauseCapture(sessionID: 7, operationID: 2))
+    )
+    await gate.open()
+    try await recovery.value
+
+    #expect(await audio.pauseCaptureCount == 1)
+    #expect(await recognition.startCount == 1)
+    #expect(
+        await events.frames.last
+            == ChildFrame(
+                control: .capturePaused(sessionID: 7, operationID: 2)
+            )
+    )
+}
+
+@Test
 func outOfOrderRenderedCallbackUsesTypedFatalPath() async throws {
     let scheduler = RecordingPlaybackScheduler()
     let rendered = RenderedRecorder()
@@ -1046,7 +1176,7 @@ private func speechLifecycle(in frames: [ChildFrame]) -> [VoiceActivity] {
             return nil
         }
         switch activity {
-        case .speechStarted, .speechEnded:
+        case .speechStarted, .speechEnded, .captureDiscontinuity:
             return activity
         case .speechContinued:
             return nil
@@ -1238,10 +1368,13 @@ private actor FailOnceEventSink: SidecarEventSink {
 
 private actor FatalRecordingAudioService: SidecarAudioService {
     private(set) var stopCount = 0
+    private(set) var pauseCaptureCount = 0
 
     func start(configuration _: SidecarConfiguration) {}
 
-    func pauseCapture() {}
+    func pauseCapture() {
+        pauseCaptureCount += 1
+    }
 
     func resumeCapture() {}
 
@@ -1260,6 +1393,47 @@ private actor FatalRecordingRecognitionService: SidecarRecognitionService {
     func stop() {
         stopCount += 1
     }
+}
+
+private actor RestartableRecognitionService: SidecarRecognitionService {
+    private(set) var prepareCount = 0
+    private(set) var startCount = 0
+    private(set) var stopCount = 0
+
+    func prepare(configuration _: SidecarConfiguration) {
+        prepareCount += 1
+    }
+
+    func start(configuration _: SidecarConfiguration) {
+        startCount += 1
+    }
+
+    func stop() {
+        stopCount += 1
+    }
+}
+
+private actor GatedRestartRecognitionService: SidecarRecognitionService {
+    private let gate: AsyncGate
+    private(set) var prepareCount = 0
+    private(set) var startCount = 0
+
+    init(gate: AsyncGate) {
+        self.gate = gate
+    }
+
+    func prepare(configuration _: SidecarConfiguration) async {
+        prepareCount += 1
+        if prepareCount == 2 {
+            await gate.wait()
+        }
+    }
+
+    func start(configuration _: SidecarConfiguration) {
+        startCount += 1
+    }
+
+    func stop() {}
 }
 
 private actor FatalRecordingPlaybackService: SidecarPlaybackService {

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use conversation_model_adapters::{
-    AdapterError, GenerationLanguageModel, PlaybackReceipt, RecognitionEvent,
+    AdapterError, CaptureEvent, GenerationLanguageModel, PlaybackReceipt, RecognitionEvent,
     StreamingSpeechSynthesizer, VoiceCaptureControl, VoiceInputEvent, VoiceIoFactory,
     VoiceIoSession,
 };
@@ -722,6 +722,13 @@ impl VoiceLoop {
                 RuntimeStage::VoiceSidecar,
                 "voice input playback state is unsupported",
             ))),
+            Some(Ok(VoiceInputEvent::Capture(CaptureEvent::Discontinuity { .. }))) => {
+                self.deadline.disarm();
+                self.finalization_due = false;
+                self.active_segment_id = None;
+                self.finalizer.observe_discontinuity();
+                None
+            }
             Some(Ok(VoiceInputEvent::Capture(_))) => None,
             Some(Ok(_)) => Some(LoopExit::Fatal(adapter_message(
                 RuntimeStage::VoiceSidecar,
@@ -757,10 +764,13 @@ impl VoiceLoop {
     }
 
     async fn handle_activity(&mut self, activity: VoiceActivity) -> Option<LoopExit> {
+        let now_ms = self.clock.now_ms();
         let finalizer_activity = match activity {
-            VoiceActivity::SpeechEnded { .. } => VoiceActivity::SpeechEnded {
-                at_ms: self.clock.now_ms(),
-            },
+            VoiceActivity::SpeechStarted { .. } => VoiceActivity::SpeechStarted { at_ms: now_ms },
+            VoiceActivity::SpeechContinued { .. } => {
+                VoiceActivity::SpeechContinued { at_ms: now_ms }
+            }
+            VoiceActivity::SpeechEnded { .. } => VoiceActivity::SpeechEnded { at_ms: now_ms },
             _ => activity,
         };
         self.finalizer.observe_activity(finalizer_activity);

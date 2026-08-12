@@ -617,6 +617,10 @@ func everyControlKindRoundTripsWithExactIdentity() throws {
             sessionID: 1,
             activity: .speechEnded(atMilliseconds: 30)
         ),
+        .voiceActivity(
+            sessionID: 1,
+            activity: .captureDiscontinuity(atMilliseconds: 40)
+        ),
         .transcriptHypothesis(
             sessionID: 1,
             hypothesis: RecognitionHypothesis(segmentID: 2, text: "hello", engineFinal: true)

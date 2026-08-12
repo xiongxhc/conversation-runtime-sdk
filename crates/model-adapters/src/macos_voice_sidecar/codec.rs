@@ -644,6 +644,9 @@ fn encode_control(control: &SidecarControl) -> Result<Vec<u8>, SidecarCodecError
                     (VoiceActivityKindDto::Continued, *at_ms)
                 }
                 VoiceActivity::SpeechEnded { at_ms } => (VoiceActivityKindDto::Ended, *at_ms),
+                VoiceActivity::CaptureDiscontinuity { at_ms } => {
+                    (VoiceActivityKindDto::Discontinuity, *at_ms)
+                }
                 _ => return Err(SidecarCodecError::InvalidControlJson),
             };
             serialize(&VoiceActivityDto {
@@ -790,6 +793,9 @@ fn decode_control(
                     VoiceActivity::SpeechContinued { at_ms: value.at_ms }
                 }
                 VoiceActivityKindDto::Ended => VoiceActivity::SpeechEnded { at_ms: value.at_ms },
+                VoiceActivityKindDto::Discontinuity => {
+                    VoiceActivity::CaptureDiscontinuity { at_ms: value.at_ms }
+                }
             };
             Ok(SidecarControl::VoiceActivity {
                 session_id: SessionId::new(value.session_id),
@@ -912,6 +918,8 @@ enum VoiceActivityKindDto {
     Continued,
     #[serde(rename = "speech_ended")]
     Ended,
+    #[serde(rename = "capture_discontinuity")]
+    Discontinuity,
 }
 
 #[derive(Deserialize, Serialize)]

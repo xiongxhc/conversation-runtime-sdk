@@ -54,6 +54,7 @@ export class ConversationSession {
   private readonly listeners = new Set<SessionListener>();
   private readonly turns: ConversationTurnState[] = [];
   private activeTurn: ConversationTurnState | undefined;
+  private activeTurnSource: "typed" | "voice" | undefined;
   private closePromise: Promise<void> | undefined;
   private error: Error | undefined;
   private phase: ConversationSessionState["phase"] = "ready";
@@ -108,7 +109,8 @@ export class ConversationSession {
     this.startPending = true;
     const turn = await this.client.startTurn(transcript).catch((error: unknown) => {
       const failure = asError(error);
-      this.fail(failure);
+      this.error = failure;
+      this.publish();
       throw failure;
     }).finally(() => {
       this.startPending = false;
@@ -122,6 +124,7 @@ export class ConversationSession {
     };
     this.turns.push(state);
     this.activeTurn = state;
+    this.activeTurnSource = "typed";
     this.phase = "streaming";
     this.publish();
     void this.consumeTurn(state, turn.events);
@@ -276,6 +279,7 @@ export class ConversationSession {
     await withTimeout(this.stopVoice(), voiceCleanupTimeoutMs);
     this.phase = "closed";
     this.activeTurn = undefined;
+    this.activeTurnSource = undefined;
     this.voice = {
       ...this.voice,
       session: "idle",
@@ -376,7 +380,11 @@ export class ConversationSession {
         break;
       case "voice_activity":
         if (!this.voice.error) {
-          if (event.activity.type === "speech_started" || event.activity.type === "speech_continued") {
+          if (
+            event.activity.type === "speech_started"
+            || event.activity.type === "speech_continued"
+            || event.activity.type === "capture_discontinuity"
+          ) {
             this.voice = { ...this.voice, visual: "listening" };
           } else {
             this.voice = { ...this.voice, visual: "thinking" };
@@ -429,6 +437,12 @@ export class ConversationSession {
           error: event.error,
         };
         if (event.recovery === "new_session") {
+          if (this.activeTurn && this.activeTurnSource === "voice") {
+            const activeTurn = this.activeTurn;
+            activeTurn.state = "failed";
+            activeTurn.failure = event.error;
+            this.finishTurn(activeTurn);
+          }
           this.voiceSession = undefined;
           this.voice = { ...this.voice, sessionId: undefined };
         }
@@ -465,6 +479,7 @@ export class ConversationSession {
     };
     this.turns.push(state);
     this.activeTurn = state;
+    this.activeTurnSource = "voice";
     this.phase = "streaming";
   }
 
@@ -473,6 +488,7 @@ export class ConversationSession {
       return;
     }
     this.activeTurn = undefined;
+    this.activeTurnSource = undefined;
     this.phase = "ready";
   }
 

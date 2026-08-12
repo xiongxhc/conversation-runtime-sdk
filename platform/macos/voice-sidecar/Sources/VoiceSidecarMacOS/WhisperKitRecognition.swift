@@ -524,6 +524,7 @@ public actor SidecarFailureController {
     private let session: SidecarSession
     private let exitHandler: @Sendable () -> Void
     private var terminating = false
+    private var recoveringRecognition = false
 
     public init(
         session: SidecarSession,
@@ -583,6 +584,30 @@ public actor SidecarFailureController {
             )
         } catch {}
         exitHandler()
+    }
+
+    public func reportRecoverableRecognitionFailure(
+        _ failure: SidecarServiceFailure,
+        fallbackSessionID: UInt64
+    ) async {
+        guard !terminating, !recoveringRecognition else {
+            return
+        }
+        recoveringRecognition = true
+        defer {
+            recoveringRecognition = false
+        }
+        do {
+            try await session.recoverFromRecognitionFailure(
+                failure,
+                fallbackSessionID: fallbackSessionID
+            )
+        } catch {
+            await terminate(
+                with: error,
+                fallbackSessionID: fallbackSessionID
+            )
+        }
     }
 }
 
@@ -1197,8 +1222,6 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
             task.cancel()
         }
         monitorTasks = []
-        await eventRelay.setHandler(nil)
-        await eventRelay.setFailureHandler(nil)
     }
 
     private static func snapshot(
@@ -1281,14 +1304,16 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
             guard !Task.isCancelled else {
                 return
             }
-            await self?.resetRecognitionAfterFinalSilence(
-                configuration: configuration
+            await self?.resetRecognition(
+                configuration: configuration,
+                discardingBufferedAudio: false
             )
         }
     }
 
-    private func resetRecognitionAfterFinalSilence(
-        configuration: SidecarConfiguration
+    private func resetRecognition(
+        configuration: SidecarConfiguration,
+        discardingBufferedAudio: Bool
     ) async {
         guard preparedConfiguration == configuration,
             !speechGate.isSpeaking,
@@ -1302,7 +1327,11 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
             return
         }
         recognitionResetTask = nil
-        turnAudioProcessor.beginTransition()
+        if discardingBufferedAudio {
+            turnAudioProcessor.beginDiscontinuityTransition()
+        } else {
+            turnAudioProcessor.beginTransition()
+        }
         await transcriber.stopStreamTranscription()
         _ = await transcriptionTask.value
         self.transcriptionTask = nil
@@ -1326,12 +1355,12 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
             pipeline: pipeline
         )
         self.transcriber = replacement
+        workerStopState.finishRestart()
         startTranscriptionWorker(
             transcriber: replacement,
             stopState: workerStopState,
             sessionID: configuration.sessionID
         )
-        workerStopState.finishRestart()
     }
 
     private func processVoiceInput(
@@ -1339,12 +1368,20 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
     ) async throws {
         switch input {
         case .discontinuity:
+            recognitionResetTask?.cancel()
+            recognitionResetTask = nil
             _ = try await eventRelay.emit(
                 .captureDiscontinuity(
                     atMilliseconds: elapsedMilliseconds()
                 )
             )
             speechGate.resetForDiscontinuity()
+            if let configuration = preparedConfiguration {
+                await resetRecognition(
+                    configuration: configuration,
+                    discardingBufferedAudio: true
+                )
+            }
         case .window(let window):
             try await processVoiceWindow(window)
         }

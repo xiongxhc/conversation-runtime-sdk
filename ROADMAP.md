@@ -48,6 +48,11 @@ The first release is not a directory-complete platform. It is one local voice lo
   text-only with a visual Focus preview. Native microphone, playback, device,
   GPU, ten-minute, first-audible, audible-stop, and acoustic observations remain
   separately open, as do persona/memory mutation, model setup, and distribution.
+- The deterministic continuity gate now covers five spoken turns with a
+  turn-scoped local language failure in the second turn, followed by three
+  successful turns in the same session. Post-start recognition failure restarts
+  the recognizer without exiting the sidecar, pause/resume re-prepares the local
+  recognizer, and paused voice capture can share the gateway with one typed turn.
 - First-audible timing, audible-stop p95, representative warm measurements,
   subjective English and Chinese quality, and the 1.2-second
   time-to-useful-audio goal remain unvalidated.
@@ -172,7 +177,7 @@ microphone-to-audible-response turn is not yet observed after the latest
 finalization fix, so process/device acceptance remains incomplete. Acoustic
 evidence is `NOT VALIDATED` because no external recording set exists. The latest
 current complete mechanical gate passes the Rust workspace with one intentionally
-ignored fixture writer and `127` Swift tests. No ten-minute continuity,
+ignored fixture writer and `131` Swift tests. No ten-minute continuity,
 first-audible, audible-stop p95, or R3 completion claim is made. See
 [the R3 evaluation](docs/r3-real-time-voice-evaluation.md).
 
@@ -379,6 +384,9 @@ See [the R6 local-gateway evaluation](docs/r6-local-gateway-evaluation.md) and
 - Local model setup and benchmark reporting.
 - Packaging, signing, installation, and private configuration workflows that
   contain no model weights.
+- Backend-neutral local provider supervision with explicit executable,
+  argument, readiness, ownership, and cleanup contracts; never a shell command
+  or silent remote fallback.
 - Human-spoken, ten-minute, and 30-sample acoustic evidence required by R3.
 - Native desktop observation of permission, one spoken turn, playback, audible
   barge-in, exit choices, device selection, and child cleanup.

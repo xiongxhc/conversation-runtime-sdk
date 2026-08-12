@@ -857,6 +857,103 @@ async fn cancellation_closes_the_stream_before_a_delayed_second_chunk() {
 }
 
 #[tokio::test]
+async fn stalled_response_body_becomes_a_bounded_adapter_error() {
+    let server = FakeOllamaServer::delayed_streaming(
+        [
+            r#"{"message":{"role":"assistant","content":"hello"},"done":false}"#,
+            r#"{"message":{"role":"assistant","content":" world"},"done":true}"#,
+        ],
+        Duration::from_millis(100),
+    )
+    .await;
+    let model = OllamaLanguageModel::new(
+        OllamaConfig::new("test-model")
+            .unwrap()
+            .with_endpoint(server.endpoint())
+            .unwrap()
+            .with_response_chunk_timeout(Duration::from_millis(20))
+            .unwrap(),
+    );
+    let mut output = model.stream(
+        LanguageModelRequest::new(TurnId::new(1), "hi"),
+        CancellationToken::new(),
+    );
+
+    assert_eq!(output.recv().await.unwrap().unwrap(), "hello");
+    let error = timeout(Duration::from_millis(100), output.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+
+    assert!(error.message().contains("stalled"));
+    assert!(output.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn stalled_response_start_becomes_a_bounded_adapter_error() {
+    let server = FakeOllamaServer::delayed_start(
+        [r#"{"message":{"role":"assistant","content":"late"},"done":true}"#],
+        Duration::from_millis(100),
+    )
+    .await;
+    let model = OllamaLanguageModel::new(
+        OllamaConfig::new("test-model")
+            .unwrap()
+            .with_endpoint(server.endpoint())
+            .unwrap()
+            .with_response_start_timeout(Duration::from_millis(20))
+            .unwrap(),
+    );
+    let mut output = model.stream(
+        LanguageModelRequest::new(TurnId::new(1), "hi"),
+        CancellationToken::new(),
+    );
+
+    let error = timeout(Duration::from_millis(100), output.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+
+    assert!(error.message().contains("did not start"));
+    assert!(output.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn first_body_chunk_uses_the_response_start_timeout() {
+    let server = FakeOllamaServer::delayed_first_chunk(
+        [r#"{"message":{"role":"assistant","content":"ready"},"done":true}"#],
+        Duration::from_millis(40),
+    )
+    .await;
+    let model = OllamaLanguageModel::new(
+        OllamaConfig::new("test-model")
+            .unwrap()
+            .with_endpoint(server.endpoint())
+            .unwrap()
+            .with_response_start_timeout(Duration::from_millis(100))
+            .unwrap()
+            .with_response_chunk_timeout(Duration::from_millis(10))
+            .unwrap(),
+    );
+    let mut output = model.stream(
+        LanguageModelRequest::new(TurnId::new(1), "hi"),
+        CancellationToken::new(),
+    );
+
+    assert_eq!(
+        timeout(Duration::from_millis(150), output.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        "ready"
+    );
+    assert!(output.recv().await.is_none());
+}
+
+#[tokio::test]
 async fn cancelling_a_backpressured_chat_stream_never_returns_metrics() {
     let server = FakeOllamaServer::streaming((0..32).map(|index| {
         format!(
@@ -935,6 +1032,8 @@ impl FakeOllamaServer {
                 .map(|line: String| format!("{line}\n").into_bytes())
                 .collect(),
             delay: Duration::ZERO,
+            header_delay: Duration::ZERO,
+            first_chunk_delay: Duration::ZERO,
         })
         .await
     }
@@ -951,6 +1050,44 @@ impl FakeOllamaServer {
                 .map(|line: String| format!("{line}\n").into_bytes())
                 .collect(),
             delay,
+            header_delay: Duration::ZERO,
+            first_chunk_delay: Duration::ZERO,
+        })
+        .await
+    }
+
+    async fn delayed_start<I, S>(lines: I, header_delay: Duration) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self::start(Response::Streaming {
+            chunks: lines
+                .into_iter()
+                .map(Into::into)
+                .map(|line: String| format!("{line}\n").into_bytes())
+                .collect(),
+            delay: Duration::ZERO,
+            header_delay,
+            first_chunk_delay: Duration::ZERO,
+        })
+        .await
+    }
+
+    async fn delayed_first_chunk<I, S>(lines: I, first_chunk_delay: Duration) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self::start(Response::Streaming {
+            chunks: lines
+                .into_iter()
+                .map(Into::into)
+                .map(|line: String| format!("{line}\n").into_bytes())
+                .collect(),
+            delay: Duration::ZERO,
+            header_delay: Duration::ZERO,
+            first_chunk_delay,
         })
         .await
     }
@@ -967,6 +1104,8 @@ impl FakeOllamaServer {
                 .map(String::into_bytes)
                 .collect(),
             delay: Duration::ZERO,
+            header_delay: Duration::ZERO,
+            first_chunk_delay: Duration::ZERO,
         })
         .await
     }
@@ -1067,6 +1206,8 @@ enum Response {
     Streaming {
         chunks: Vec<Vec<u8>>,
         delay: Duration,
+        header_delay: Duration,
+        first_chunk_delay: Duration,
     },
     Failure {
         status: u16,
@@ -1123,11 +1264,35 @@ async fn read_request_json(
         .to_owned();
 
     match response {
-        Response::Streaming { chunks, delay } => {
+        Response::Streaming {
+            chunks,
+            delay,
+            header_delay,
+            first_chunk_delay,
+        } => {
+            if !header_delay.is_zero() {
+                tokio::select! {
+                    _ = sleep(header_delay) => {}
+                    _ = wait_for_connection_close(&mut stream) => {
+                        connection_reaped.observe();
+                        return (request_json, request_target);
+                    }
+                }
+            }
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\n\r\n")
                 .await
                 .unwrap();
+
+            if !first_chunk_delay.is_zero() {
+                tokio::select! {
+                    _ = sleep(first_chunk_delay) => {}
+                    _ = wait_for_connection_close(&mut stream) => {
+                        connection_reaped.observe();
+                        return (request_json, request_target);
+                    }
+                }
+            }
 
             for (index, chunk) in chunks.iter().enumerate() {
                 if index > 0 && !delay.is_zero() {

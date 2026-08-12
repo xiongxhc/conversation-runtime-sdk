@@ -113,6 +113,7 @@ public enum VoiceActivity: Equatable, Sendable {
     case speechStarted(atMilliseconds: UInt64)
     case speechContinued(atMilliseconds: UInt64)
     case speechEnded(atMilliseconds: UInt64)
+    case captureDiscontinuity(atMilliseconds: UInt64)
 }
 
 public struct RecognitionHypothesis: Equatable, Sendable {

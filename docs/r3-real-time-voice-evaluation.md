@@ -1,4 +1,4 @@
-# R3 Real-Time Voice Evaluation — Through 2026-08-02
+# R3 Real-Time Voice Evaluation — Through 2026-08-12
 
 ## Scope and Status
 
@@ -10,6 +10,40 @@ from process/device and acoustic evidence.
 **R3 status: INCOMPLETE.** Repository code and documentation gates pass.
 Process/device evidence is `PARTIALLY VALIDATED`. Acoustic evidence is
 `NOT VALIDATED`.
+
+## Conversation Continuity Update — 2026-08-12
+
+The deterministic continuity gate now completes five spoken turns in one voice
+session. Turn two receives a turn-scoped local language-model failure, and turns
+three through five still complete with monotonic turn identity and exactly one
+terminal event per turn. The reference Ollama adapter also bounds response
+startup and chunk inactivity so a stalled local provider fails the active turn
+instead of hanging the session indefinitely.
+
+The macOS sidecar now treats post-start recognition failure as recoverable when
+the capture session remains valid: it stops, prepares, and restarts recognition
+without stopping audio capture, playback, or the process. Pause/resume performs
+the same required recognition preparation. Capture discontinuity resets the
+speech gate and rotates the logical ASR buffer without retaining
+pre-discontinuity PCM. Replacement recognition workers become
+failure-reporting before they start, so immediate replacement failure cannot be
+hidden as an expected old-worker exit. The complete Swift package passes `131`
+tests.
+
+The public TypeScript SDK and compiled gateway pass a mixed typed-to-spoken-to-
+typed context test. The complete JavaScript workspace passes `75` SDK tests,
+`14` Node-client tests, and `141` desktop tests with the project-compatible Node
+runtime. Strict Rust formatting and Clippy pass with warnings denied; the full
+Rust workspace test gate also passes with one intentionally ignored fixture
+writer.
+
+A private local-only configuration passed two consecutive live text turns
+against its configured loopback language provider and retained the first turn
+in context. Its configured loopback speech provider produced a non-empty mono
+`24 kHz`, signed-16 WAV. The desktop reference app launched against the compiled
+gateway and release sidecar. These are provider and launch observations, not a
+human microphone-to-speaker turn or acoustic evidence. R3 remains incomplete
+until the human, ten-minute, latency, and interruption gates below pass.
 
 ## Continuous Capture Update — 2026-08-11
 
@@ -294,7 +328,7 @@ malicious-process containment claim.
 
 - Private schema-v1 configuration: present outside the repository, mode `0600`.
 - Private configuration digest:
-  `7baa3de85e9c03f363b4f2f0a0d7e1f4d69a3a22989d41686f0d3882e08d3615`.
+  `06492ce7f9710fdc273081abd625afcd3b4b380360c43f3992e244482373af54`.
 - Active policy at release-CLI startup: `privacy=local-only`.
 - Local language endpoint preflight: passed on loopback.
 - Local streaming speech endpoint preflight: passed on loopback with a valid

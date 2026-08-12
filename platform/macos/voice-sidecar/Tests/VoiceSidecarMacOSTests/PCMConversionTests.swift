@@ -70,6 +70,24 @@ func turnAudioProcessorTransitionRetainsMoreThanPreRoll() throws {
 }
 
 @Test
+func turnAudioProcessorDiscontinuityDropsEarlierAudio() throws {
+    let processor = TurnAudioProcessor(
+        preRollSamples: 4,
+        maxTransitionSamples: 6
+    )
+    processor.append([1, 2])
+    try processor.startRecordingLive(inputDeviceID: nil, callback: nil)
+    processor.append([3, 4])
+
+    processor.beginDiscontinuityTransition()
+    processor.stopRecording()
+    processor.append([5, 6])
+    try processor.startRecordingLive(inputDeviceID: nil, callback: nil)
+
+    #expect(Array(processor.audioSamples) == [5, 6])
+}
+
+@Test
 func turnAudioProcessorFailsClosedAtTheTurnLimit() throws {
     let processor = TurnAudioProcessor(maxTurnSamples: 4)
     let recorder = VoiceWindowRecorder()

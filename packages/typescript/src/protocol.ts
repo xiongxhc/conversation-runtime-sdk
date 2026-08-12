@@ -189,7 +189,8 @@ export type RuntimeEvent =
 export type VoiceActivity =
   | { type: "speech_started"; atMs: number }
   | { type: "speech_continued"; atMs: number }
-  | { type: "speech_ended"; atMs: number };
+  | { type: "speech_ended"; atMs: number }
+  | { type: "capture_discontinuity"; atMs: number };
 
 export type VoiceSessionEvent =
   | {
@@ -732,7 +733,12 @@ function parseVoiceSessionEvent(value: unknown): VoiceSessionEvent {
           type: requireOneOf(
             activity,
             "type",
-            ["speech_started", "speech_continued", "speech_ended"] as const,
+            [
+              "speech_started",
+              "speech_continued",
+              "speech_ended",
+              "capture_discontinuity",
+            ] as const,
           ),
           atMs: requireNonNegativeInteger(activity, "at_ms"),
         },

@@ -142,6 +142,18 @@ public actor SidecarSession {
     }
 
     public func handleMedia(_ frame: ChildFrame) async throws {
+        // The media channel is independent of the control channel, so a
+        // frame of an already-flushed generation can land while a flush or
+        // barge-in still holds the session in a transient phase. Such a
+        // frame is dead on arrival in every phase — drop it before phase
+        // validation can escalate it into a session failure.
+        if let audio = frame.audio,
+            let configuration,
+            audio.sessionID == configuration.sessionID,
+            playbackBuffer.isExplicitlyStale(audio.frame.identity)
+        {
+            return
+        }
         try requireAvailableOperation()
         guard let audio = frame.audio else {
             try await fail(
@@ -522,13 +534,24 @@ public actor SidecarSession {
 
         case let .flushGeneration(sessionID, generationID, operationID):
             let configuration = try requireConfigured(sessionID: sessionID)
-            let resumePhase = try reserveFlush(
-                throughGenerationID: generationID
-            )
-            try await playbackService.flush(
-                throughGenerationID: generationID
-            )
-            bargeInGate?.reset()
+            // A parent flush can lose the race against a local barge-in flush
+            // that already advanced the buffer to a newer generation. The
+            // requested generation is gone either way, so acknowledge without
+            // touching the newer generation's playback.
+            let resumePhase: StablePhase?
+            do {
+                resumePhase = try reserveFlush(
+                    throughGenerationID: generationID
+                )
+            } catch PlaybackBufferError.staleGeneration {
+                resumePhase = nil
+            }
+            if resumePhase != nil {
+                try await playbackService.flush(
+                    throughGenerationID: generationID
+                )
+                bargeInGate?.reset()
+            }
             try await eventSink.send(
                 ChildFrame(
                     control: .playbackFlushed(
@@ -538,7 +561,9 @@ public actor SidecarSession {
                     )
                 )
             )
-            restoreAfterFlush(resumePhase)
+            if let resumePhase {
+                restoreAfterFlush(resumePhase)
+            }
 
         case let .shutdown(sessionID):
             let configuration = try requireConfigured(sessionID: sessionID)

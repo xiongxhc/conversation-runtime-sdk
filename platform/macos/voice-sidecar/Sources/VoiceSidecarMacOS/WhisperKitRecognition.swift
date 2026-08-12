@@ -954,9 +954,15 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
     private let turnAudioProcessor: TurnAudioProcessor
     private let language: String?
     private let mapper = RecognitionMapper()
+    // Calibrated against capture with the voice-processing AGC disabled
+    // (VoiceProcessingEngine): quiet-room RMS measures 0.004-0.028 and
+    // near-mic speech peaks 0.05-0.13, so 0.04 rejects the noise floor
+    // while keeping speech onsets detectable. WhisperKit's default (0.02)
+    // sits inside the noise band and fires on ambient sound.
     private let vad = EnergyVAD(
         sampleRate: 16_000,
-        frameLength: 0.1
+        frameLength: 0.1,
+        energyThreshold: 0.04
     )
     private let eventRelay = RecognitionEventRelay()
 
@@ -1377,18 +1383,49 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
             )
             speechGate.resetForDiscontinuity()
             if let configuration = preparedConfiguration {
-                await resetRecognition(
-                    configuration: configuration,
-                    discardingBufferedAudio: true
-                )
+                // Discard the stitched pre-gap audio immediately, but run the
+                // transcriber restart off this worker: stopping a transcriber
+                // mid-pass can take as long as its current pass, and awaiting
+                // it here stalls every voice window behind the mailbox,
+                // leaving the session deaf until the restart completes.
+                turnAudioProcessor.beginDiscontinuityTransition()
+                recognitionResetTask = Task { [weak self] in
+                    await self?.resetRecognition(
+                        configuration: configuration,
+                        discardingBufferedAudio: true
+                    )
+                }
             }
         case .window(let window):
             try await processVoiceWindow(window)
         }
     }
 
+    // Temporary diagnostic: dump per-window capture energy so VAD and
+    // barge-in thresholds can be calibrated against measured ambient,
+    // speech, and playback-echo levels. Active only when
+    // VOICE_VAD_DIAG_PATH points at an existing file.
+    private static let vadDiagnosticPath =
+        ProcessInfo.processInfo.environment["VOICE_VAD_DIAG_PATH"]
+
+    private func logVadDiagnostic(window: [Float], isSpeech: Bool) {
+        guard let path = Self.vadDiagnosticPath,
+            let handle = FileHandle(forWritingAtPath: path)
+        else {
+            return
+        }
+        let energy = AudioProcessor.calculateEnergy(of: window)
+        let line = "\(elapsedMilliseconds()),\(energy.avg),\(energy.max),\(isSpeech)\n"
+        if let data = line.data(using: .utf8) {
+            handle.seekToEndOfFile()
+            handle.write(data)
+        }
+        try? handle.close()
+    }
+
     private func processVoiceWindow(_ window: [Float]) async throws {
         let isSpeech = vad.voiceActivity(in: window).last == true
+        logVadDiagnostic(window: window, isSpeech: isSpeech)
         if isSpeech {
             recognitionResetTask?.cancel()
             recognitionResetTask = nil

@@ -376,6 +376,114 @@ func frameArrivingAfterItsGenerationWasFlushedIsDroppedWithoutFailure() async th
 }
 
 @Test
+func mediaFrameArrivingDuringSuspendedFlushIsDroppedWithoutFailure() async throws {
+    let playback = ControllablePlaybackService()
+    await playback.setSuspendFlush(true)
+    let events = RecordingEventSink()
+    let session = SidecarSession(
+        audioService: RecordingAudioService(),
+        recognitionService: RecordingRecognitionService(),
+        playbackService: playback,
+        eventSink: events
+    )
+    try await startAndCapture(session)
+    try await session.handleMedia(
+        ChildFrame(audioSessionID: 7, frame: pcmFrame(generationID: 3))
+    )
+
+    let flush = Task {
+        try await session.handleControl(
+            ChildFrame(
+                control: .flushGeneration(
+                    sessionID: 7,
+                    generationID: 3,
+                    operationID: 2
+                )
+            )
+        )
+    }
+    await playback.waitUntilFlushStarted()
+
+    // The media channel is independent of the control channel, so a frame
+    // of the generation being flushed can land while the flush is still
+    // awaiting the playback service.
+    try await session.handleMedia(
+        ChildFrame(
+            audioSessionID: 7,
+            frame: pcmFrame(generationID: 3, sequence: 1)
+        )
+    )
+
+    await playback.releaseFlushes()
+    try await flush.value
+
+    #expect(await playback.frames.count == 1)
+    #expect(
+        await events.frames.last
+            == ChildFrame(
+                control: .playbackFlushed(
+                    sessionID: 7,
+                    generationID: 3,
+                    operationID: 2
+                )
+            )
+    )
+}
+
+@Test
+func staleParentFlushAfterLocalBargeInIsAcknowledgedWithoutFailure() async throws {
+    let playback = RecordingPlaybackService()
+    let events = RecordingEventSink()
+    let session = SidecarSession(
+        audioService: RecordingAudioService(),
+        recognitionService: RecordingRecognitionService(),
+        playbackService: playback,
+        eventSink: events
+    )
+    try await startAndCapture(session)
+    try await session.handleMedia(
+        ChildFrame(audioSessionID: 7, frame: pcmFrame(generationID: 5))
+    )
+    _ = try await session.observeBargeIn(
+        isSpeech: true,
+        frameMilliseconds: 100,
+        atMilliseconds: 10
+    )
+    #expect(
+        try await session.observeBargeIn(
+            isSpeech: true,
+            frameMilliseconds: 100,
+            atMilliseconds: 110
+        ) == true
+    )
+    try await session.handleMedia(
+        ChildFrame(audioSessionID: 7, frame: pcmFrame(generationID: 6))
+    )
+
+    try await session.handleControl(
+        ChildFrame(
+            control: .flushGeneration(
+                sessionID: 7,
+                generationID: 5,
+                operationID: 11
+            )
+        )
+    )
+
+    #expect(await playback.flushedGenerations == [5])
+    #expect(
+        await events.frames.last
+            == ChildFrame(
+                control: .playbackFlushed(
+                    sessionID: 7,
+                    generationID: 5,
+                    operationID: 11
+                )
+            )
+    )
+}
+
+@Test
 func mismatchedSessionFailsWithoutCallingPlayback() async throws {
     let playback = RecordingPlaybackService()
     let events = RecordingEventSink()

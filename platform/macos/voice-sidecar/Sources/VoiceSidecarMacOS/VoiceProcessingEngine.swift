@@ -1,3 +1,4 @@
+import AudioToolbox
 @preconcurrency import AVFoundation
 import Darwin
 @preconcurrency import Dispatch
@@ -510,6 +511,21 @@ public final class VoiceProcessingEngine:
 
         do {
             try inputNode.setVoiceProcessingEnabled(true)
+            // The voice-processing unit's AGC boosts the quiet-room noise
+            // floor into the same energy range as speech, which makes every
+            // fixed VAD threshold downstream meaningless. Echo cancellation
+            // stays on; only the gain stage is disabled.
+            if let audioUnit = inputNode.audioUnit {
+                var agcEnabled: UInt32 = 0
+                AudioUnitSetProperty(
+                    audioUnit,
+                    kAUVoiceIOProperty_VoiceProcessingEnableAGC,
+                    kAudioUnitScope_Global,
+                    0,
+                    &agcEnabled,
+                    UInt32(MemoryLayout<UInt32>.size)
+                )
+            }
             let playbackFormat = try Self.configurePlaybackGraph(
                 engine: engine,
                 player: player,

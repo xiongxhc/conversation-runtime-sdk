@@ -125,9 +125,14 @@ flowchart LR
 ```
 
 The sidecar owns capture and playback in the same Apple audio engine so built-in
-echo cancellation can distinguish user speech from speaker output. It also owns
+echo cancellation can distinguish user speech from speaker output. Automatic
+gain control is disabled on that engine because it lifts the quiet-room noise
+floor into the same energy range as speech; the `100 ms` energy-VAD windows use
+a fixed `0.04` RMS threshold calibrated against AGC-free capture. It also owns
 the first local WhisperKit adapter. The Apple capture graph and VAD remain active
-for the full voice session; a device-free logical processor gives WhisperKit a
+for the full voice session; a capture discontinuity schedules the transcriber
+replacement without blocking voice-window delivery, so listening continues while
+an in-flight decode is stopped; a device-free logical processor gives WhisperKit a
 fresh turn-scoped buffer after final silence while retaining only the most recent
 `300 ms` (`4,800` samples at `16 kHz`) as bounded pre-roll. During replacement,
 a bounded `30 s` transition accumulator preserves speech that arrives while an
@@ -155,7 +160,13 @@ configured final-silence contract. During playback, approximately the configured
 `speech_start_ms` of sustained local speech, measured in `100 ms` VAD windows,
 flushes the active sidecar generation and cancels language generation, TTS,
 queued frames, and playback without waiting for a transcript. The default
-remains `200 ms`.
+remains `200 ms`. The media channel is independent of the control channel, so
+the sidecar drops frames of a flushed generation in every session phase,
+defers live-generation frames that race a flush until the flush settles, and
+acknowledges a repeated flush for an already-advanced generation without
+touching newer playback. Playback completion callbacks resolve in queue order
+as an ordered prefix, so out-of-order or duplicate callback delivery never
+fails the session.
 
 Schema v1 resolves `conversation-voice-sidecar` adjacent to the running
 `conversation-voice-loop` binary. `sidecar_executable` is only an optional

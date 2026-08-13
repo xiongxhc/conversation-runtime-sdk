@@ -282,6 +282,11 @@ The repository contract evidence covers:
 - local tokenizer/model validation and loading before capture activation, with
   downloads disabled and reverse-order cleanup;
 - configured `speech_start_ms` barge-in thresholds using `100 ms` VAD windows;
+- deferred delivery of live-generation media frames that race a flush, with
+  the drain yielding to a newer flush, stale-frame drops in every session
+  phase, and idempotent acknowledgement of stale flush requests;
+- ordered-prefix resolution of playback completion callbacks that tolerates
+  out-of-order and duplicate delivery without failing the session;
 - optional absolute sidecar override or bundled resolution beside the running
   voice-loop executable without ambient `PATH`;
 - explicit buffered compatibility with no streaming-to-buffered fallback;

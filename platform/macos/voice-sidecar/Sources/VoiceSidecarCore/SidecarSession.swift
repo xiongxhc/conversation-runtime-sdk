@@ -1,3 +1,5 @@
+import Foundation
+
 public struct SidecarConfiguration: Equatable, Sendable {
     public let sessionID: UInt64
     public let speechStartMilliseconds: UInt64
@@ -111,6 +113,7 @@ public actor SidecarSession {
     private var bargeInGate: BargeInGate?
     private var voiceActivityActive = false
     private var deferredMedia: [ChildFrame] = []
+    private var stablePhaseWaiters: [CheckedContinuation<Void, Never>] = []
 
     public var isTerminated: Bool {
         phase == .terminated
@@ -129,6 +132,7 @@ public actor SidecarSession {
     }
 
     public func handleControl(_ frame: ChildFrame) async throws {
+        await awaitStablePhase()
         try requireAvailableOperation()
         guard let control = frame.control else {
             try await fail(
@@ -224,20 +228,27 @@ public actor SidecarSession {
             return
         }
         do {
-            try requireAvailableOperation()
+            await awaitStablePhase()
+        try requireAvailableOperation()
             let (configuration, _) = try requirePlaybackAvailable()
-            try playbackBuffer.markRendered(identity)
-            try await eventSink.send(
-                ChildFrame(
-                    control: .playbackRendered(
-                        sessionID: configuration.sessionID,
-                        turnID: identity.turnID,
-                        generationID: identity.generationID,
-                        utteranceID: identity.utteranceID,
-                        sequence: identity.sequence
+            // Rendered acknowledgements cross several actors on their way
+            // from the playback engine, so they can arrive out of order or
+            // repeat after their frame already left the buffer. Playback is
+            // strictly ordered, so resolve the prefix through the completed
+            // frame and report each acknowledgement in order.
+            for rendered in playbackBuffer.markRenderedThrough(identity) {
+                try await eventSink.send(
+                    ChildFrame(
+                        control: .playbackRendered(
+                            sessionID: configuration.sessionID,
+                            turnID: rendered.turnID,
+                            generationID: rendered.generationID,
+                            utteranceID: rendered.utteranceID,
+                            sequence: rendered.sequence
+                        )
                     )
                 )
-            )
+            }
         } catch {
             try await fail(error, fallbackSessionID: configuration?.sessionID ?? 0)
         }
@@ -295,6 +306,7 @@ public actor SidecarSession {
     }
 
     public func publishVoiceActivity(_ activity: VoiceActivity) async throws {
+        await awaitStablePhase()
         try requireAvailableOperation()
         do {
             try await sendVoiceActivity(activity)
@@ -306,6 +318,7 @@ public actor SidecarSession {
     public func publishVoiceActivityFromRecognitionWorker(
         _ activity: VoiceActivity
     ) async throws {
+        await awaitStablePhase()
         try requireAvailableOperation()
         try await sendVoiceActivity(activity)
     }
@@ -313,6 +326,7 @@ public actor SidecarSession {
     public func publishRecognitionHypothesis(
         _ hypothesis: RecognitionHypothesis
     ) async throws {
+        await awaitStablePhase()
         try requireAvailableOperation()
         do {
             try await sendRecognitionHypothesis(hypothesis)
@@ -324,6 +338,7 @@ public actor SidecarSession {
     public func publishRecognitionHypothesisFromWorker(
         _ hypothesis: RecognitionHypothesis
     ) async throws {
+        await awaitStablePhase()
         try requireAvailableOperation()
         try await sendRecognitionHypothesis(hypothesis)
     }
@@ -334,6 +349,7 @@ public actor SidecarSession {
         frameMilliseconds: UInt64,
         atMilliseconds: UInt64
     ) async throws -> Bool {
+        await awaitStablePhase()
         try requireAvailableOperation()
         do {
             return try await processBargeIn(
@@ -352,6 +368,7 @@ public actor SidecarSession {
         frameMilliseconds: UInt64,
         atMilliseconds: UInt64
     ) async throws -> Bool {
+        await awaitStablePhase()
         try requireAvailableOperation()
         return try await processBargeIn(
             isSpeech: isSpeech,
@@ -363,6 +380,7 @@ public actor SidecarSession {
     public func observeCaptureDiscontinuityFromRecognitionWorker(
         atMilliseconds: UInt64
     ) async throws {
+        await awaitStablePhase()
         try requireAvailableOperation()
         _ = try requireCapturing()
         if voiceActivityActive {
@@ -447,14 +465,20 @@ public actor SidecarSession {
         let resumePhase = try reserveFlush(
             throughGenerationID: generationID
         )
-        try await playbackService.flush(
-            throughGenerationID: generationID
-        )
-        bargeInGate?.reset()
-        try await sendVoiceActivity(
-            .speechStarted(atMilliseconds: atMilliseconds),
-            sessionID: configuration.sessionID
-        )
+        do {
+            try await playbackService.flush(
+                throughGenerationID: generationID
+            )
+            bargeInGate?.reset()
+            try await sendVoiceActivity(
+                .speechStarted(atMilliseconds: atMilliseconds),
+                sessionID: configuration.sessionID
+            )
+        } catch {
+            // The transient flush phase must settle before the error leaves
+            // this actor, or inputs waiting on a stable phase hang forever.
+            try await fail(error, fallbackSessionID: configuration.sessionID)
+        }
         restoreAfterFlush(resumePhase)
         try await drainDeferredMedia()
         return true
@@ -660,6 +684,27 @@ public actor SidecarSession {
         case .paused:
             phase = .paused
         }
+        resumeStablePhaseWaiters()
+    }
+
+    // A flush holds the session in a transient phase across suspension
+    // points, and asynchronous inputs — controls, rendered acknowledgements,
+    // recognition events — regularly race it. They wait the flush out here
+    // instead of tripping phase validation into a session failure.
+    private func awaitStablePhase() async {
+        while case .flushing = phase {
+            await withCheckedContinuation { continuation in
+                stablePhaseWaiters.append(continuation)
+            }
+        }
+    }
+
+    private func resumeStablePhaseWaiters() {
+        let waiters = stablePhaseWaiters
+        stablePhaseWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
+        }
     }
 
     private func requireConfigured(
@@ -746,8 +791,23 @@ public actor SidecarSession {
         } else {
             failure = SidecarServiceFailure(stage: .voiceSidecar, code: .internal)
         }
+        // Temporary diagnostic for failure triage; active only when
+        // VOICE_SIDECAR_DIAG_PATH points at an existing file. The underlying
+        // error never leaves the process through the protocol, which reports
+        // only the typed stage and code.
+        if let path = ProcessInfo.processInfo.environment["VOICE_SIDECAR_DIAG_PATH"],
+            let handle = FileHandle(forWritingAtPath: path)
+        {
+            let line = "fail phase=\(phase) stage=\(failure.stage) code=\(failure.code) error=\(error)\n"
+            if let data = line.data(using: .utf8) {
+                handle.seekToEndOfFile()
+                handle.write(data)
+            }
+            try? handle.close()
+        }
 
         phase = .failing
+        resumeStablePhaseWaiters()
         await cleanupServices()
         try await eventSink.send(
             ChildFrame(

@@ -226,7 +226,7 @@ func flushedRenderedCallbackIsTheOnlyIgnoredOutputCallback() async throws {
 }
 
 @Test
-func nonStaleRenderedOrderFailureIsFatal() async throws {
+func outOfOrderRenderedAcknowledgementResolvesTheOrderedPrefix() async throws {
     let audio = RecordingAudioService()
     let recognition = RecordingRecognitionService()
     let playback = RecordingPlaybackService()
@@ -247,22 +247,37 @@ func nonStaleRenderedOrderFailureIsFatal() async throws {
         ChildFrame(audioSessionID: 7, frame: second)
     )
 
-    await #expect(throws: PlaybackBufferError.renderOrderMismatch) {
-        try await session.playbackRendered(second.identity)
-    }
+    // Rendered acknowledgements cross several actors between the playback
+    // engine and this session, so a later frame's acknowledgement can land
+    // first. Playback renders strictly in order, so it proves the earlier
+    // frame also finished.
+    try await session.playbackRendered(second.identity)
+    // The earlier frame's own acknowledgement is a duplicate by now.
+    try await session.playbackRendered(first.identity)
 
-    #expect(await audio.stopCount == 1)
-    #expect(await recognition.stopCount == 1)
-    #expect(await playback.stopCount == 1)
+    #expect(await audio.stopCount == 0)
     #expect(
-        await events.frames.last
-            == ChildFrame(
-                control: .failure(
-                    sessionID: 7,
-                    stage: .voiceSidecar,
-                    code: .malformedFrame
-                )
-            )
+        await events.frames.suffix(2)
+            == [
+                ChildFrame(
+                    control: .playbackRendered(
+                        sessionID: 7,
+                        turnID: 5,
+                        generationID: 5,
+                        utteranceID: 1,
+                        sequence: 0
+                    )
+                ),
+                ChildFrame(
+                    control: .playbackRendered(
+                        sessionID: 7,
+                        turnID: 5,
+                        generationID: 5,
+                        utteranceID: 1,
+                        sequence: 1
+                    )
+                ),
+            ]
     )
 }
 
@@ -724,7 +739,7 @@ func parentFlushCompletesLocallyBeforeAcknowledgement() async throws {
 }
 
 @Test
-func suspendedFlushAndShutdownCannotInterleaveDuplicateLifecycle() async throws {
+func controlArrivingDuringSuspendedFlushWaitsForTheFlushToSettle() async throws {
     let playback = ControllablePlaybackService()
     await playback.setSuspendFlush(true)
     let events = RecordingEventSink()
@@ -749,6 +764,9 @@ func suspendedFlushAndShutdownCannotInterleaveDuplicateLifecycle() async throws 
     }
     await playback.waitUntilFlushStarted()
 
+    // A runtime interrupt flush regularly races a local barge-in flush, so
+    // a control landing mid-flush is normal operation, not a violation. It
+    // must wait for the flush to settle instead of failing the session.
     let secondDone = CompletionFlag()
     let secondFlush = Task { () -> SidecarSessionError? in
         do {
@@ -772,48 +790,37 @@ func suspendedFlushAndShutdownCannotInterleaveDuplicateLifecycle() async throws 
             return nil
         }
     }
-    let shutdownDone = CompletionFlag()
-    let concurrentShutdown = Task { () -> SidecarSessionError? in
-        do {
-            try await session.handleControl(
-                ChildFrame(control: .shutdown(sessionID: 7))
-            )
-            await shutdownDone.complete()
-            return nil
-        } catch let error as SidecarSessionError {
-            await shutdownDone.complete()
-            return error
-        } catch {
-            await shutdownDone.complete()
-            Issue.record("unexpected error \(error)")
-            return nil
-        }
-    }
 
-    #expect(
-        await waitUntil {
-            let shutdownComplete = await shutdownDone.isComplete
-            let flushCount = await playback.flushedGenerations.count
-            return shutdownComplete || flushCount == 2
-        }
-    )
+    // Give the racing control ample scheduler turns to enter handleControl
+    // while the first flush still holds the transient phase.
+    for _ in 0..<100 {
+        await Task.yield()
+    }
     await playback.releaseFlushes()
     try await firstFlush.value
 
-    #expect(await secondFlush.value == .invalidState)
-    #expect(await concurrentShutdown.value == .invalidState)
+    #expect(await secondFlush.value == nil)
     #expect(await secondDone.isComplete)
-    #expect(await playback.flushedGenerations == [3])
     #expect(
-        await events.frames
+        await waitUntil {
+            await playback.flushedGenerations == [3, 4]
+        }
+    )
+    #expect(
+        await events.frames.suffix(2)
             == [
-                ChildFrame(control: .ready(sessionID: 7)),
-                ChildFrame(control: .captureStarted(sessionID: 7, operationID: 1)),
                 ChildFrame(
                     control: .playbackFlushed(
                         sessionID: 7,
                         generationID: 3,
                         operationID: 1
+                    )
+                ),
+                ChildFrame(
+                    control: .playbackFlushed(
+                        sessionID: 7,
+                        generationID: 4,
+                        operationID: 2
                     )
                 ),
             ]

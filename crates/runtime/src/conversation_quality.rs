@@ -11,6 +11,7 @@ const MAX_HISTORY_BYTES: usize = 16 * 1024;
 const SHORT_PROMPT_CHARACTERS: usize = 24;
 const SHORT_PROMPT_WORDS: usize = 6;
 const SHORT_RESPONSE_SECONDS: u16 = 8;
+const EXPANSIVE_VERBOSITY_THRESHOLD: u8 = 60;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedConversationQuality {
@@ -211,19 +212,33 @@ impl ConversationQualityController {
         signals: &[ConversationSignal],
     ) -> Result<ResponseControls, RuntimeError> {
         let mut maximum_spoken_seconds = self.default_controls.maximum_spoken_seconds();
+        // An expansive persona has explicitly chosen long-form speech, so a
+        // terse prompt or an incidental interruption reduces the budget
+        // proportionally instead of forcing the absolute short cap. An
+        // explicit request for brevity always wins.
+        let expansive =
+            self.saved_persona.verbosity().get() >= EXPANSIVE_VERBOSITY_THRESHOLD;
+        let reduced_budget = if expansive {
+            (self.default_controls.maximum_spoken_seconds() / 2).max(SHORT_RESPONSE_SECONDS)
+        } else {
+            SHORT_RESPONSE_SECONDS
+        };
         if is_short_prompt(transcript) {
-            maximum_spoken_seconds = maximum_spoken_seconds.min(SHORT_RESPONSE_SECONDS);
+            maximum_spoken_seconds = maximum_spoken_seconds.min(reduced_budget);
         }
-        if signals.iter().any(|signal| {
+        let explicit_brevity = signals.iter().any(|signal| {
             matches!(
                 signal,
-                ConversationSignal::Interrupted
-                    | ConversationSignal::ShorterRequested
-                    | ConversationSignal::StopExplaining
+                ConversationSignal::ShorterRequested | ConversationSignal::StopExplaining
             )
-        }) {
+        });
+        if explicit_brevity {
             maximum_spoken_seconds = maximum_spoken_seconds
                 .min(SHORT_RESPONSE_SECONDS)
+                .min((self.default_controls.maximum_spoken_seconds() / 2).max(1));
+        } else if signals.contains(&ConversationSignal::Interrupted) {
+            maximum_spoken_seconds = maximum_spoken_seconds
+                .min(reduced_budget)
                 .min((self.default_controls.maximum_spoken_seconds() / 2).max(1));
         }
 

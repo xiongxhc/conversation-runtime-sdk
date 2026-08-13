@@ -218,8 +218,11 @@ impl GatewayConfig {
             persona_level(self.persona.verbosity)?,
             persona_level(self.persona.follow_up_frequency)?,
         );
+        // Verbosity buys the spoken budget up front (10s floor, 80s ceiling);
+        // the quality controller still reduces it per turn.
+        let maximum_spoken_seconds = 10 + u16::from(self.persona.verbosity) * 7 / 10;
         let controls = ResponseControls::new(
-            20,
+            maximum_spoken_seconds,
             persona.directness(),
             SpeechPace::Natural,
             FollowUpPolicy::Contextual,

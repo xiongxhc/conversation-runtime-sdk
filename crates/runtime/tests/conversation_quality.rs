@@ -1,8 +1,74 @@
 use conversation_protocol::{
     ContextSource, ConversationMode, ConversationRole, ConversationSignal, FollowUpPolicy,
-    PersonaLevel, PersonaProfile, ResponseControls, SpeechPace, TurnId,
+    PersonaLevel, PersonaProfile, ResponseControls, SilencePolicy, SpeechPace, TurnId,
 };
 use conversation_runtime::ConversationQualityController;
+
+fn expansive_controller() -> ConversationQualityController {
+    ConversationQualityController::new(
+        PersonaProfile::new(
+            level(95),
+            level(50),
+            level(30),
+            level(40),
+            level(25),
+            level(95),
+            level(85),
+            level(40),
+        ),
+        ResponseControls::new(
+            60,
+            level(25),
+            SpeechPace::Natural,
+            FollowUpPolicy::Contextual,
+            SilencePolicy::AllowWithoutFiller,
+        )
+        .unwrap(),
+        ConversationMode::Companionship,
+    )
+}
+
+#[test]
+fn expansive_verbosity_keeps_short_prompts_at_half_the_default_budget() {
+    let mut controller = expansive_controller();
+    let resolved = controller
+        .resolve_turn(TurnId::new(1), "Hello", None)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(resolved.decision().controls().maximum_spoken_seconds(), 30);
+}
+
+#[test]
+fn expansive_verbosity_keeps_interrupted_turns_proportional() {
+    let mut controller = expansive_controller();
+    let _ = controller
+        .resolve_turn(TurnId::new(1), "Hello", None)
+        .unwrap()
+        .unwrap();
+    controller.interrupt_turn(TurnId::new(1)).unwrap();
+    let resolved = controller
+        .resolve_turn(TurnId::new(2), "Hello", None)
+        .unwrap()
+        .unwrap();
+
+    assert!(resolved
+        .decision()
+        .signals()
+        .contains(&ConversationSignal::Interrupted));
+    assert_eq!(resolved.decision().controls().maximum_spoken_seconds(), 30);
+}
+
+#[test]
+fn explicit_brevity_requests_stay_short_for_expansive_personas() {
+    let mut controller = expansive_controller();
+    let resolved = controller
+        .resolve_turn(TurnId::new(1), "shorter", None)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(resolved.decision().controls().maximum_spoken_seconds(), 8);
+}
 
 #[test]
 fn short_prompts_resolve_to_short_spoken_controls_in_every_mode() {

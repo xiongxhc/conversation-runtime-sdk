@@ -7,8 +7,8 @@ use conversation_model_adapters::{
     AdapterError, BufferedStreamingSpeechSynthesizer, MacOsVoiceSidecar, MacOsVoiceSidecarConfig,
     OllamaConfig, OllamaLanguageModel, OpenAiCompatibleSpeechConfig,
     OpenAiCompatibleSpeechSynthesizer, OpenAiCompatibleStreamingSpeechConfig,
-    OpenAiCompatibleStreamingSpeechSynthesizer, SpeechSynthesizer, StreamingSpeechSynthesizer,
-    SystemDevice,
+    OpenAiCompatibleStreamingSpeechSynthesizer, SidecarAsrBackend, SpeechSynthesizer,
+    StreamingSpeechSynthesizer, SystemDevice,
 };
 use conversation_protocol::{
     ComponentDescriptor, ComponentKind, ConversationMode, ExecutionLocation, FollowUpPolicy,
@@ -183,6 +183,7 @@ struct AsrConfig {
 #[serde(rename_all = "kebab-case")]
 enum AsrBackend {
     Whisperkit,
+    Sensevoice,
 }
 
 #[derive(Debug, Deserialize)]
@@ -364,7 +365,7 @@ impl SessionConfig {
         ) {
             (
                 CaptureDevice::SystemDefault,
-                AsrBackend::Whisperkit,
+                AsrBackend::Whisperkit | AsrBackend::Sensevoice,
                 LanguageBackend::Ollama,
                 SpeechBackend::OpenaiCompatible,
                 SpeechMode::Buffered | SpeechMode::Streaming,
@@ -596,7 +597,7 @@ impl SessionConfig {
 
     fn voice_io(&self) -> Result<MacOsVoiceSidecar, String> {
         let sidecar_executable = self.sidecar_executable()?;
-        let config = MacOsVoiceSidecarConfig::new(
+        let mut config = MacOsVoiceSidecarConfig::new(
             sidecar_executable,
             &self.asr.model_path,
             match self.capture.device {
@@ -609,6 +610,9 @@ impl SessionConfig {
         .map_err(adapter_message)?
         .with_max_stderr_bytes(self.audio.max_error_bytes)
         .map_err(adapter_message)?;
+        if matches!(self.asr.backend, AsrBackend::Sensevoice) {
+            config = config.with_asr_backend(SidecarAsrBackend::Sensevoice);
+        }
         Ok(MacOsVoiceSidecar::new(config))
     }
 

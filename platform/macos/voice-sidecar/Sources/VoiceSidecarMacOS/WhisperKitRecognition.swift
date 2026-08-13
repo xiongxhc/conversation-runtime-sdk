@@ -723,7 +723,7 @@ public struct RecognitionMapper: Sendable {
     }
 }
 
-private func containsRecognizableContent(_ text: String) -> Bool {
+func containsRecognizableContent(_ text: String) -> Bool {
     text.unicodeScalars.contains { CharacterSet.alphanumerics.contains($0) }
 }
 
@@ -873,12 +873,12 @@ actor RecognitionEventRelay {
     }
 }
 
-private enum RecognitionVoiceInput: Sendable {
+enum RecognitionVoiceInput: Sendable {
     case window([Float])
     case discontinuity
 }
 
-private final class RecognitionVoiceMailbox: @unchecked Sendable {
+final class RecognitionVoiceMailbox: @unchecked Sendable {
     private let capacity: Int
     private let lock = NSLock()
     private let notifications: AsyncStream<Void>

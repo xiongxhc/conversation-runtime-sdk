@@ -3,15 +3,22 @@ import Foundation
 import VoiceSidecarCore
 import VoiceSidecarMacOS
 
+private enum AsrBackend: String {
+    case whisperkit
+    case sensevoice
+}
+
 private struct LaunchConfiguration {
     let modelPath: String
     let language: String?
+    let asrBackend: AsrBackend
 
     init(arguments: [String]) throws {
         var modelPath: String?
         var device: String?
         var download: String?
         var language: String?
+        var asrBackend: String?
         var index = 0
         while index < arguments.count {
             guard index + 1 < arguments.count else {
@@ -26,6 +33,8 @@ private struct LaunchConfiguration {
                 download = arguments[index + 1]
             case "--language":
                 language = arguments[index + 1]
+            case "--asr-backend":
+                asrBackend = arguments[index + 1]
             default:
                 throw LaunchConfigurationError.invalidArguments
             }
@@ -41,12 +50,16 @@ private struct LaunchConfiguration {
             modelIsDirectory.boolValue,
             device == "system-default",
             download == "false",
-            language.map({ !$0.isEmpty }) ?? true
+            language.map({ !$0.isEmpty }) ?? true,
+            let asrBackend = AsrBackend(
+                rawValue: asrBackend ?? AsrBackend.whisperkit.rawValue
+            )
         else {
             throw LaunchConfigurationError.invalidArguments
         }
         self.modelPath = modelPath
         self.language = language
+        self.asrBackend = asrBackend
     }
 }
 
@@ -71,11 +84,21 @@ let eventWriter = SerializedFrameWriter(
 )
 let engine = VoiceProcessingEngine()
 let audioProcessor = VoiceProcessingAudioProcessor(engine: engine)
-let recognition = WhisperKitRecognition(
-    modelPath: launchConfiguration.modelPath,
-    audioProcessor: audioProcessor,
-    language: launchConfiguration.language
-)
+let recognition: any SidecarRecognitionEventSource =
+    switch launchConfiguration.asrBackend {
+    case .whisperkit:
+        WhisperKitRecognition(
+            modelPath: launchConfiguration.modelPath,
+            audioProcessor: audioProcessor,
+            language: launchConfiguration.language
+        )
+    case .sensevoice:
+        SenseVoiceRecognition(
+            modelPath: launchConfiguration.modelPath,
+            audioProcessor: audioProcessor,
+            language: launchConfiguration.language
+        )
+    }
 let playback = ContinuousPCMPlayback(scheduler: engine)
 let session = SidecarSession(
     audioService: engine,

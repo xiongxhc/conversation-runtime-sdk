@@ -44,7 +44,8 @@ pub use macos_afplay::{MacOsAfplayAudioOutput, MacOsAfplayConfig};
 pub use macos_system_speech::{MacOsSystemSpeechConfig, MacOsSystemSpeechSynthesizer};
 #[cfg(unix)]
 pub use macos_voice_sidecar::{
-    MacOsVoiceSidecar, MacOsVoiceSidecarConfig, MacOsVoiceSidecarSession, SystemDevice,
+    MacOsVoiceSidecar, MacOsVoiceSidecarConfig, MacOsVoiceSidecarSession, SidecarAsrBackend,
+    SystemDevice,
 };
 pub use mock::{MockAudioOutput, MockLanguageModel, MockSpeechSynthesizer};
 pub use ollama::{

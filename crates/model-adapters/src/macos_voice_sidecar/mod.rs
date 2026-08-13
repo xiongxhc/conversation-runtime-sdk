@@ -4,7 +4,8 @@ mod process;
 
 #[cfg(unix)]
 pub use process::{
-    MacOsVoiceSidecar, MacOsVoiceSidecarConfig, MacOsVoiceSidecarSession, SystemDevice,
+    MacOsVoiceSidecar, MacOsVoiceSidecarConfig, MacOsVoiceSidecarSession, SidecarAsrBackend,
+    SystemDevice,
 };
 
 #[cfg(test)]

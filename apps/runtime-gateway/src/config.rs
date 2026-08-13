@@ -10,8 +10,8 @@ use conversation_model_adapters::{
     BufferedStreamingSpeechSynthesizer, GenerationLanguageModel, MacOsVoiceSidecar,
     MacOsVoiceSidecarConfig, OllamaConfig, OllamaLanguageModel, OpenAiCompatibleSpeechConfig,
     OpenAiCompatibleSpeechSynthesizer, OpenAiCompatibleStreamingSpeechConfig,
-    OpenAiCompatibleStreamingSpeechSynthesizer, SpeechSynthesizer, StreamingSpeechSynthesizer,
-    SystemDevice,
+    OpenAiCompatibleStreamingSpeechSynthesizer, SidecarAsrBackend, SpeechSynthesizer,
+    StreamingSpeechSynthesizer, SystemDevice,
 };
 use conversation_protocol::{
     ClientComponentDescriptor, ComponentDescriptor, ComponentKind, ConversationMode,
@@ -248,7 +248,7 @@ impl VoiceConfig {
         ) {
             (
                 VoiceCaptureDevice::SystemDefault,
-                VoiceAsrBackend::Whisperkit,
+                VoiceAsrBackend::Whisperkit | VoiceAsrBackend::Sensevoice,
                 VoiceSpeechBackend::OpenaiCompatible,
                 VoiceAudioBackend::ManagedSidecar,
             ) => {}
@@ -303,6 +303,9 @@ impl VoiceConfig {
         .map_err(adapter_error)?;
         if let Some(language) = &self.asr.language {
             sidecar = sidecar.with_language(language).map_err(adapter_error)?;
+        }
+        if matches!(self.asr.backend, VoiceAsrBackend::Sensevoice) {
+            sidecar = sidecar.with_asr_backend(SidecarAsrBackend::Sensevoice);
         }
 
         Ok(GatewayVoiceAdapters {
@@ -626,6 +629,7 @@ struct VoiceAsrConfig {
 #[serde(rename_all = "kebab-case")]
 enum VoiceAsrBackend {
     Whisperkit,
+    Sensevoice,
 }
 
 #[derive(Debug, Deserialize)]

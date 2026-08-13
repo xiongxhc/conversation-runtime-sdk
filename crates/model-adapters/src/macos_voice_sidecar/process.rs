@@ -46,11 +46,20 @@ pub enum SystemDevice {
     Named(String),
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum SidecarAsrBackend {
+    #[default]
+    Whisperkit,
+    Sensevoice,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MacOsVoiceSidecarConfig {
     executable: PathBuf,
     model_path: PathBuf,
     device: SystemDevice,
+    asr_backend: SidecarAsrBackend,
     language: Option<String>,
     speech_start_ms: u64,
     final_silence_ms: u64,
@@ -97,12 +106,22 @@ impl MacOsVoiceSidecarConfig {
             executable: executable.to_path_buf(),
             model_path: model_path.to_path_buf(),
             device,
+            asr_backend: SidecarAsrBackend::default(),
             language: None,
             speech_start_ms,
             final_silence_ms,
             max_payload_bytes: MAX_CONTROL_PAYLOAD_BYTES,
             max_stderr_bytes: DEFAULT_MAX_STDERR_BYTES,
         })
+    }
+
+    pub const fn with_asr_backend(mut self, asr_backend: SidecarAsrBackend) -> Self {
+        self.asr_backend = asr_backend;
+        self
+    }
+
+    pub const fn asr_backend(&self) -> SidecarAsrBackend {
+        self.asr_backend
     }
 
     pub fn with_language(mut self, language: impl AsRef<str>) -> Result<Self, AdapterError> {
@@ -450,6 +469,9 @@ fn sidecar_command(config: &MacOsVoiceSidecarConfig) -> Command {
         .arg("system-default")
         .arg("--download")
         .arg("false");
+    if config.asr_backend() == SidecarAsrBackend::Sensevoice {
+        command.arg("--asr-backend").arg("sensevoice");
+    }
     if let Some(language) = config.language() {
         command.arg("--language").arg(language);
     }
@@ -2555,6 +2577,33 @@ mod process_tests {
             .as_std()
             .get_args()
             .any(|argument| argument == "--language"));
+    }
+
+    #[test]
+    fn default_asr_backend_omits_backend_argument() {
+        let (_dir, config) = sidecar_config_fixture();
+        assert_eq!(config.asr_backend(), SidecarAsrBackend::Whisperkit);
+        let command = sidecar_command(&config);
+        assert!(!command
+            .as_std()
+            .get_args()
+            .any(|argument| argument == "--asr-backend"));
+    }
+
+    #[test]
+    fn sensevoice_asr_backend_is_passed_to_spawn() {
+        let (_dir, config) = sidecar_config_fixture();
+        let config = config.with_asr_backend(SidecarAsrBackend::Sensevoice);
+        assert_eq!(config.asr_backend(), SidecarAsrBackend::Sensevoice);
+        let command = sidecar_command(&config);
+        let arguments = command
+            .as_std()
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(arguments
+            .windows(2)
+            .any(|pair| pair == ["--asr-backend", "sensevoice"]));
     }
 
     #[test]

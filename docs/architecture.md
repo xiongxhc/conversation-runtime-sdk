@@ -147,6 +147,16 @@ absolute local model directory and tokenizer and loads WhisperKit with downloads
 disabled. Capture activation follows that recognition preflight; shutdown and
 partial-start failures clean up in reverse activation order.
 
+An opt-in `sensevoice` ASR backend (`[voice.asr] backend`) replaces WhisperKit
+with a local SenseVoice model via sherpa-onnx behind the same sidecar protocol,
+capture graph, VAD, and turn buffering. SenseVoice decodes offline: roughly
+every second of active speech the accumulated unfinalized turn audio is decoded
+into a partial hypothesis, and each speech end decodes it once more into the
+engine-final segment. Language defaults to built-in `auto` detection with
+in-sentence Chinese/English code-switching; `language` may pin `zh`, `en`,
+`ja`, `ko`, or `yue`. The same preflight applies to its model directory
+(`model.int8.onnx` plus `tokens.txt`), and downloads remain disabled.
+
 Rust remains authoritative for privacy and adapter validation, session and turn
 state, the `600 ms` final-silence rule, generation identifiers, provider
 coordination, cancellation, and lifecycle events. Partial transcripts are

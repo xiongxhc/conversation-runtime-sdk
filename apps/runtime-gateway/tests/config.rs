@@ -319,6 +319,36 @@ fn valid_voice_reuses_root_configuration_without_spawning() {
 
 #[cfg(unix)]
 #[test]
+fn accepts_sensevoice_asr_backend_without_spawning() {
+    let fixture = GatewayFixture::voice(false);
+    let config =
+        fixture
+            .contents()
+            .replacen("backend = \"whisperkit\"", "backend = \"sensevoice\"", 1);
+    let path = write_config(fixture.directory(), &config);
+
+    let adapters = GatewayConfig::load(&path).unwrap();
+
+    assert!(adapters.voice.is_some());
+    assert!(!fixture.sidecar_spawned());
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_unknown_asr_backends() {
+    let fixture = GatewayFixture::voice(false);
+    let config =
+        fixture
+            .contents()
+            .replacen("backend = \"whisperkit\"", "backend = \"another-asr\"", 1);
+    let path = write_config(fixture.directory(), &config);
+
+    assert!(GatewayConfig::load(&path).is_err());
+    assert!(!fixture.sidecar_spawned());
+}
+
+#[cfg(unix)]
+#[test]
 fn rejects_non_voice_configuration_inside_voice() {
     for section in [
         "language",

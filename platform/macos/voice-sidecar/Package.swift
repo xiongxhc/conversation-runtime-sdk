@@ -14,7 +14,11 @@ let package = Package(
         .package(
             url: "https://github.com/argmaxinc/argmax-oss-swift.git",
             exact: "1.0.0"
-        )
+        ),
+        .package(
+            url: "https://github.com/k2-fsa/sherpa-onnx",
+            exact: "1.13.5"
+        ),
     ],
     targets: [
         .target(name: "VoiceSidecarCore"),
@@ -23,6 +27,7 @@ let package = Package(
             dependencies: [
                 "VoiceSidecarCore",
                 .product(name: "WhisperKit", package: "argmax-oss-swift"),
+                .product(name: "sherpa-onnx", package: "sherpa-onnx"),
             ]
         ),
         .executableTarget(

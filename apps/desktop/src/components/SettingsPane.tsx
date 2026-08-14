@@ -51,6 +51,12 @@ export function SettingsPane({ session, preferences, onPreferencesChange, onBack
   const generation = useRef(0);
   const backRef = useRef<HTMLButtonElement>(null);
   const restoreFocusAfterDelete = useRef(false);
+  // Async success handlers (activatePreset) resolve after arbitrary delay, during which
+  // other controls (Delete, Save as preset) can commit their own preferences updates.
+  // Reading this ref instead of the closed-over `preferences` prop keeps those handlers
+  // from clobbering intervening edits with a stale full-object snapshot.
+  const preferencesRef = useRef(preferences);
+  preferencesRef.current = preferences;
 
   const load = async () => {
     const currentGeneration = ++generation.current;
@@ -106,23 +112,24 @@ export function SettingsPane({ session, preferences, onPreferencesChange, onBack
       return;
     }
     setPresetError(undefined);
+    const current = preferencesRef.current;
     const personaPresets = [
-      ...preferences.personaPresets.filter((preset) => preset.name !== name),
+      ...current.personaPresets.filter((preset) => preset.name !== name),
       { name, persona: draft },
     ];
-    onPreferencesChange({ ...preferences, personaPresets });
+    onPreferencesChange({ ...current, personaPresets });
     setPresetName("");
   };
 
   const activatePreset = async (name: string) => {
-    const preset = preferences.personaPresets.find((candidate) => candidate.name === name);
+    const preset = preferencesRef.current.personaPresets.find((candidate) => candidate.name === name);
     if (!preset) return;
     setApplyBusy(true);
     setApplyError(undefined);
     try {
       const applied = await session.updatePersona(preset.persona);
       setDraft(applied);
-      onPreferencesChange({ ...preferences, activePresetName: name });
+      onPreferencesChange({ ...preferencesRef.current, activePresetName: name });
     } catch {
       setApplyError("Persona could not be applied.");
     } finally {
@@ -132,10 +139,11 @@ export function SettingsPane({ session, preferences, onPreferencesChange, onBack
 
   const deletePreset = (name: string) => {
     restoreFocusAfterDelete.current = true;
+    const current = preferencesRef.current;
     onPreferencesChange({
-      ...preferences,
-      personaPresets: preferences.personaPresets.filter((preset) => preset.name !== name),
-      activePresetName: preferences.activePresetName === name ? null : preferences.activePresetName,
+      ...current,
+      personaPresets: current.personaPresets.filter((preset) => preset.name !== name),
+      activePresetName: current.activePresetName === name ? null : current.activePresetName,
     });
   };
 

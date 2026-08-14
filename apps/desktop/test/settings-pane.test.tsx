@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type {
@@ -127,6 +127,56 @@ describe("SettingsPane", () => {
       personaPresets: [preset],
       activePresetName: "Focused",
     });
+  });
+
+  it("does not clobber an interleaved delete when an in-flight activate resolves later", async () => {
+    const onPreferencesChange = vi.fn();
+    const session = new PersonaSession();
+    session.getPersona.mockResolvedValueOnce(personaState());
+    const presetA: PersonaPreset = { name: "A", persona: personaState({ mode: "direct_answer", warmth: 10 }) };
+    const presetB: PersonaPreset = { name: "B", persona: personaState({ mode: "reflective", warmth: 90 }) };
+    const pendingActivate = deferred<PersonaState>();
+    session.updatePersona.mockReturnValueOnce(pendingActivate.promise);
+
+    const initialPreferences: Preferences = {
+      ...defaultPreferences,
+      personaPresets: [presetA, presetB],
+      activePresetName: null,
+    };
+    const { rerender } = renderPane(session, {
+      preferences: initialPreferences,
+      onPreferencesChange,
+    });
+    await screen.findByLabelText("Warmth");
+
+    // Start activating A; its updatePersona call is still pending.
+    fireEvent.click(screen.getByRole("button", { name: "Activate A" }));
+    expect(session.updatePersona).toHaveBeenCalledWith(presetA.persona);
+
+    // While that's in flight, delete B — Delete is not disabled during an activate.
+    // Simulate the parent (Workspace) round-tripping onPreferencesChange back down as
+    // an updated `preferences` prop, the same way savePreferences + setPreferences would.
+    fireEvent.click(screen.getByRole("button", { name: "Delete B" }));
+    const afterDelete: Preferences = { ...initialPreferences, personaPresets: [presetA] };
+    expect(onPreferencesChange).toHaveBeenLastCalledWith(afterDelete);
+    rerender(
+      <SettingsPane
+        onBack={vi.fn()}
+        onPreferencesChange={onPreferencesChange}
+        preferences={afterDelete}
+        session={session}
+      />,
+    );
+
+    // Now the activate resolves. It must apply on top of the post-delete state, not the
+    // stale pre-delete snapshot captured when Activate was first clicked.
+    pendingActivate.resolve(presetA.persona);
+
+    await waitFor(() => expect(onPreferencesChange).toHaveBeenLastCalledWith({
+      ...afterDelete,
+      activePresetName: "A",
+    }));
+    expect(screen.queryByRole("button", { name: "Activate B" })).toBeNull();
   });
 
   it("deletes a stored preset, clears the active preset name when it was active, and restores focus to Back", async () => {

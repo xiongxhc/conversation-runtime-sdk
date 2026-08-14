@@ -265,6 +265,13 @@ impl TextTurnRuntime {
         })
     }
 
+    /// The shared conversation context backing this runtime's turns. Callers
+    /// outside the turn lifecycle (persona controls) use this to read or
+    /// mutate persona state without going through a text or voice session.
+    pub fn context(&self) -> ConversationContext {
+        self.context.clone()
+    }
+
     pub async fn interrupt(&self, turn_id: TurnId) -> Result<(), RuntimeError> {
         let state = self.state.lock().await;
         match state.active.as_ref() {

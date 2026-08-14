@@ -6,9 +6,10 @@ use conversation_memory::{MemoryClock, MemoryStore, MemoryStoreErrorKind};
 use conversation_model_adapters::GenerationLanguageModel;
 use conversation_protocol::{
     decode_client_command, encode_gateway_message, ClientCommand, ClientMemoryCursor,
-    ClientMemoryInspection, ClientMemorySummary, ClientRuntimeError, ClientRuntimeEvent,
-    ClientVoiceSessionEvent, GatewayMessage, RecoveryDisposition, RuntimeError, RuntimeErrorKind,
-    RuntimeEvent, RuntimeStatus, SessionId, TurnId, VoiceSessionEvent,
+    ClientMemoryInspection, ClientMemorySummary, ClientPersonaState, ClientRuntimeError,
+    ClientRuntimeEvent, ClientVoiceSessionEvent, GatewayMessage, MemoryApproval,
+    RecoveryDisposition, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStatus, SessionId,
+    TurnId, VoiceSessionEvent,
 };
 use conversation_runtime::{
     ConversationContext, TextTurnEventStream, TextTurnRuntime, VoiceSessionAdapters,
@@ -784,6 +785,169 @@ impl GatewaySession {
                 )
                 .map_err(CommandFailure::response)
             }
+            ClientCommand::PersonaGet { request_id } => {
+                if active.is_some() {
+                    return send_rejection(normal, &request_id, persona_turn_active_error())
+                        .map_err(CommandFailure::response);
+                }
+                if voice.active.is_some() {
+                    return send_rejection(normal, &request_id, persona_voice_active_error())
+                        .map_err(CommandFailure::response);
+                }
+                let (profile, mode) = self.runtime.context().persona_snapshot().await;
+                send_accepted(normal, &request_id).map_err(CommandFailure::response)?;
+                send_normal(
+                    normal,
+                    GatewayMessage::PersonaState {
+                        request_id,
+                        persona: ClientPersonaState::from_profile(&profile, mode),
+                    },
+                )
+                .map_err(CommandFailure::response)
+            }
+            ClientCommand::PersonaUpdate {
+                request_id,
+                persona,
+            } => {
+                if active.is_some() {
+                    return send_rejection(normal, &request_id, persona_turn_active_error())
+                        .map_err(CommandFailure::response);
+                }
+                if voice.active.is_some() {
+                    return send_rejection(normal, &request_id, persona_voice_active_error())
+                        .map_err(CommandFailure::response);
+                }
+                let (profile, mode) = match persona.to_profile() {
+                    Ok(profile_and_mode) => profile_and_mode,
+                    Err(_) => {
+                        return send_rejection(normal, &request_id, persona_invalid_error())
+                            .map_err(CommandFailure::response);
+                    }
+                };
+                let context = self.runtime.context();
+                if context.apply_persona(profile, mode).await.is_err() {
+                    return send_rejection(normal, &request_id, persona_turn_active_error())
+                        .map_err(CommandFailure::response);
+                }
+                let (profile, mode) = context.persona_snapshot().await;
+                send_accepted(normal, &request_id).map_err(CommandFailure::response)?;
+                send_normal(
+                    normal,
+                    GatewayMessage::PersonaState {
+                        request_id,
+                        persona: ClientPersonaState::from_profile(&profile, mode),
+                    },
+                )
+                .map_err(CommandFailure::response)
+            }
+            ClientCommand::MemoryApprove {
+                request_id,
+                memory_id,
+                expected_revision,
+            } => {
+                if active.is_some() {
+                    return send_rejection(normal, &request_id, memory_turn_active_error())
+                        .map_err(CommandFailure::response);
+                }
+                if voice.active.is_some() {
+                    return send_rejection(normal, &request_id, memory_voice_active_error())
+                        .map_err(CommandFailure::response);
+                }
+                let Some(inspection) = self.memory_inspection.as_ref() else {
+                    return send_rejection(normal, &request_id, memory_disabled_error())
+                        .map_err(CommandFailure::response);
+                };
+                let store = Arc::clone(&inspection.store);
+                let clock = Arc::clone(&inspection.clock);
+                let confirmation_id = request_id.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    let now = clock.now().map_err(|_| MemoryOperationError::Clock)?;
+                    // Defensive only: the wire layer already rejects the inputs that
+                    // could make this fail (a zero or oversized revision, an empty
+                    // request id), so this treats any failure as a revision conflict
+                    // rather than adding an unreachable error path.
+                    let approval =
+                        MemoryApproval::new(confirmation_id, "local-user", now, expected_revision)
+                            .map_err(|_| {
+                                MemoryOperationError::Store(MemoryStoreErrorKind::Conflict)
+                            })?;
+                    store
+                        .approve(memory_id, approval)
+                        .map_err(|error| MemoryOperationError::Store(error.kind()))?;
+                    store
+                        .inspect_bounded(memory_id, now, 32)
+                        .map_err(|error| MemoryOperationError::Store(error.kind()))
+                })
+                .await;
+                let bounded = match result {
+                    Ok(Ok(inspection)) => inspection,
+                    Ok(Err(MemoryOperationError::Store(kind))) => {
+                        return send_rejection(normal, &request_id, memory_store_error(kind))
+                            .map_err(CommandFailure::response);
+                    }
+                    Ok(Err(MemoryOperationError::Clock)) | Err(_) => {
+                        return send_rejection(normal, &request_id, memory_unavailable_error())
+                            .map_err(CommandFailure::response);
+                    }
+                };
+                let mut inspection = ClientMemoryInspection::from(bounded.inspection());
+                inspection.sources_truncated = bounded.sources_truncated();
+                inspection.approvals_truncated = bounded.approvals_truncated();
+                send_accepted(normal, &request_id).map_err(CommandFailure::response)?;
+                send_normal(
+                    normal,
+                    GatewayMessage::MemoryInspection {
+                        request_id,
+                        inspection,
+                    },
+                )
+                .map_err(CommandFailure::response)
+            }
+            ClientCommand::MemoryDelete {
+                request_id,
+                memory_id,
+                expected_revision,
+            } => {
+                if active.is_some() {
+                    return send_rejection(normal, &request_id, memory_turn_active_error())
+                        .map_err(CommandFailure::response);
+                }
+                if voice.active.is_some() {
+                    return send_rejection(normal, &request_id, memory_voice_active_error())
+                        .map_err(CommandFailure::response);
+                }
+                let Some(inspection) = self.memory_inspection.as_ref() else {
+                    return send_rejection(normal, &request_id, memory_disabled_error())
+                        .map_err(CommandFailure::response);
+                };
+                let store = Arc::clone(&inspection.store);
+                let result = tokio::task::spawn_blocking(move || {
+                    store
+                        .delete(memory_id, expected_revision)
+                        .map_err(|error| MemoryOperationError::Store(error.kind()))
+                })
+                .await;
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(MemoryOperationError::Store(kind))) => {
+                        return send_rejection(normal, &request_id, memory_store_error(kind))
+                            .map_err(CommandFailure::response);
+                    }
+                    Ok(Err(MemoryOperationError::Clock)) | Err(_) => {
+                        return send_rejection(normal, &request_id, memory_unavailable_error())
+                            .map_err(CommandFailure::response);
+                    }
+                }
+                send_accepted(normal, &request_id).map_err(CommandFailure::response)?;
+                send_normal(
+                    normal,
+                    GatewayMessage::MemoryDeleted {
+                        request_id,
+                        memory_id,
+                    },
+                )
+                .map_err(CommandFailure::response)
+            }
         }
     }
 }
@@ -1384,10 +1548,39 @@ fn memory_disabled_error() -> ClientRuntimeError {
 }
 
 fn memory_store_error(kind: MemoryStoreErrorKind) -> ClientRuntimeError {
-    if kind == MemoryStoreErrorKind::NotFound {
-        memory_command_error("memory_not_found", "memory record was not found")
-    } else {
-        memory_unavailable_error()
+    match kind {
+        MemoryStoreErrorKind::NotFound => {
+            memory_command_error("memory_not_found", "memory record was not found")
+        }
+        MemoryStoreErrorKind::Conflict => memory_conflict_error(),
+        _ => memory_unavailable_error(),
+    }
+}
+
+fn memory_conflict_error() -> ClientRuntimeError {
+    memory_command_error(
+        "memory_conflict",
+        "memory revision does not match the current record",
+    )
+}
+
+// Persona guards reuse `command_error`'s existing `invalid_state` code rather than
+// minting new wire codes: the protocol's error-code set is closed and mirrored by
+// clients, and "something is running, retry later" already covers this case.
+fn persona_turn_active_error() -> ClientRuntimeError {
+    command_error("persona controls are unavailable while a turn is active")
+}
+
+fn persona_voice_active_error() -> ClientRuntimeError {
+    command_error("persona controls are unavailable while a voice session is active")
+}
+
+fn persona_invalid_error() -> ClientRuntimeError {
+    ClientRuntimeError {
+        code: "persona_invalid".to_owned(),
+        kind: "invalid_state".to_owned(),
+        stage: "runtime".to_owned(),
+        message: "persona payload is invalid".to_owned(),
     }
 }
 
@@ -2929,6 +3122,454 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persona_get_returns_the_default_persona() {
+        let mut gateway =
+            InMemoryGateway::start(GatewaySession::new(unused_runtime(), status())).await;
+
+        gateway
+            .write(r#"{"protocol_version":1,"type":"persona_get","request_id":"persona-get-1"}"#)
+            .await;
+
+        assert_accepted_message(&gateway.read_message().await, "persona-get-1");
+        let response = gateway.read_message().await;
+        assert!(response.contains(r#""type":"persona_state""#));
+        assert!(response.contains(r#""request_id":"persona-get-1""#));
+        assert!(response.contains(r#""mode":"direct_answer""#));
+        gateway.close().await;
+    }
+
+    #[tokio::test]
+    async fn persona_update_is_accepted_before_its_response_and_visible_via_persona_get() {
+        let mut gateway =
+            InMemoryGateway::start(GatewaySession::new(unused_runtime(), status())).await;
+
+        gateway
+            .write(
+                r#"{"protocol_version":1,"type":"persona_update","request_id":"persona-update-1",
+                "persona":{"mode":"companionship","warmth":80,"humor":50,"teasing":30,
+                "initiative":60,"directness":40,"intimacy":70,"verbosity":55,
+                "follow_up_frequency":45}}"#,
+            )
+            .await;
+
+        assert_accepted_message(&gateway.read_message().await, "persona-update-1");
+        let response = gateway.read_message().await;
+        assert!(response.contains(r#""type":"persona_state""#));
+        assert!(response.contains(r#""request_id":"persona-update-1""#));
+        assert!(response.contains(r#""mode":"companionship""#));
+        assert!(response.contains(r#""warmth":80"#));
+
+        gateway
+            .write(r#"{"protocol_version":1,"type":"persona_get","request_id":"persona-get-after-update"}"#)
+            .await;
+        assert_accepted_message(&gateway.read_message().await, "persona-get-after-update");
+        let response = gateway.read_message().await;
+        assert!(response.contains(r#""mode":"companionship""#));
+        assert!(response.contains(r#""warmth":80"#));
+        gateway.close().await;
+    }
+
+    #[tokio::test]
+    async fn persona_commands_are_rejected_while_a_turn_is_active() {
+        let language = HoldOpenLanguageServer::start().await;
+        let session = GatewaySession::new(runtime_for(language.endpoint()), status());
+        let mut gateway = InMemoryGateway::start(session).await;
+
+        gateway
+            .write(
+                r#"{"protocol_version":1,"type":"start_turn","request_id":"start-persona-active","transcript":"fixture active persona rejection"}"#,
+            )
+            .await;
+        assert_accepted_message(&gateway.read_message().await, "start-persona-active");
+        gateway
+            .read_until(|message| message.contains(r#""type":"text_delta""#))
+            .await;
+
+        gateway
+            .write(
+                r#"{"protocol_version":1,"type":"persona_get","request_id":"persona-get-active"}"#,
+            )
+            .await;
+        let rejection = gateway
+            .read_until(|message| {
+                message.contains(r#""type":"command_rejected""#)
+                    && message.contains(r#""request_id":"persona-get-active""#)
+            })
+            .await;
+        let rejection = rejection.last().unwrap();
+        assert_rejected_message(rejection, "persona-get-active", "invalid_state");
+        assert!(rejection.contains("persona controls are unavailable while a turn is active"));
+
+        gateway
+            .write(
+                r#"{"protocol_version":1,"type":"persona_update","request_id":"persona-update-active",
+                "persona":{"mode":"companionship","warmth":80,"humor":50,"teasing":30,
+                "initiative":60,"directness":40,"intimacy":70,"verbosity":55,
+                "follow_up_frequency":45}}"#,
+            )
+            .await;
+        let rejection = gateway
+            .read_until(|message| {
+                message.contains(r#""type":"command_rejected""#)
+                    && message.contains(r#""request_id":"persona-update-active""#)
+            })
+            .await;
+        assert_rejected_message(
+            rejection.last().unwrap(),
+            "persona-update-active",
+            "invalid_state",
+        );
+
+        gateway
+            .write(r#"{"protocol_version":1,"type":"status","request_id":"status-after-persona-active"}"#)
+            .await;
+        assert_accepted_message(&gateway.read_message().await, "status-after-persona-active");
+        assert!(gateway.read_message().await.contains(r#""type":"status""#));
+
+        gateway
+            .write(
+                r#"{"protocol_version":1,"type":"interrupt_turn","request_id":"interrupt-after-persona","turn_id":"1"}"#,
+            )
+            .await;
+        gateway
+            .read_until(|message| message.contains(r#""type":"turn_cancelled""#))
+            .await;
+        timeout(TEST_TIMEOUT, language.connection_reaped.wait())
+            .await
+            .expect("persona rejection delayed language request cleanup");
+        gateway.close().await;
+    }
+
+    #[tokio::test]
+    async fn persona_commands_are_rejected_while_a_voice_session_is_active() {
+        let (input, input_receiver) = mpsc::channel(8);
+        let language = Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new()));
+        let session = session_with_interactive_voice(input_receiver, language, no_speech_frames());
+        let mut gateway = InMemoryGateway::start(session).await;
+
+        gateway
+            .write(r#"{"protocol_version":1,"type":"start_voice_session","request_id":"voice-1"}"#)
+            .await;
+        assert_accepted_message(&gateway.read_message().await, "voice-1");
+        assert!(gateway
+            .read_message()
+            .await
+            .contains(r#""type":"voice_session_started""#));
+
+        gateway
+            .write(r#"{"protocol_version":1,"type":"persona_get","request_id":"persona-get-1"}"#)
+            .await;
+        let rejection = gateway.read_message().await;
+        assert_rejected_message(&rejection, "persona-get-1", "invalid_state");
+        assert!(
+            rejection.contains("persona controls are unavailable while a voice session is active")
+        );
+
+        gateway
+            .write(
+                r#"{"protocol_version":1,"type":"persona_update","request_id":"persona-update-1",
+                "persona":{"mode":"companionship","warmth":80,"humor":50,"teasing":30,
+                "initiative":60,"directness":40,"intimacy":70,"verbosity":55,
+                "follow_up_frequency":45}}"#,
+            )
+            .await;
+        let rejection = gateway.read_message().await;
+        assert_rejected_message(&rejection, "persona-update-1", "invalid_state");
+        assert!(
+            rejection.contains("persona controls are unavailable while a voice session is active")
+        );
+
+        drop(input);
+        gateway.close().await;
+    }
+
+    #[tokio::test]
+    async fn memory_approve_flips_a_candidate_identity_record_to_active() {
+        let (_temporary, store) = initialized_store();
+        let record = create_identity_candidate(&store, "gateway approve fixture");
+        let mut gateway = InMemoryGateway::start(inspection_session(store)).await;
+
+        gateway
+            .write(&format!(
+                r#"{{"protocol_version":1,"type":"memory_approve","request_id":"approve-1","memory_id":"{}","expected_revision":"{}"}}"#,
+                record.id().get(),
+                record.revision()
+            ))
+            .await;
+
+        assert_accepted_message(&gateway.read_message().await, "approve-1");
+        let response = gateway.read_message().await;
+        assert!(response.contains(r#""type":"memory_inspection""#));
+        assert!(response.contains(r#""request_id":"approve-1""#));
+        assert!(response.contains(r#""state":"active""#));
+        gateway.close().await;
+    }
+
+    #[tokio::test]
+    async fn memory_approve_with_a_stale_revision_is_a_conflict() {
+        let (_temporary, store) = initialized_store();
+        let record = create_identity_candidate(&store, "gateway stale approve fixture");
+        let mut gateway = InMemoryGateway::start(inspection_session(store)).await;
+
+        gateway
+            .write(&format!(
+                r#"{{"protocol_version":1,"type":"memory_approve","request_id":"approve-stale","memory_id":"{}","expected_revision":"{}"}}"#,
+                record.id().get(),
+                record.revision() + 1
+            ))
+            .await;
+
+        assert_rejection_then_status(
+            &mut gateway,
+            "approve-stale",
+            "memory_conflict",
+            "status-after-approve-stale",
+        )
+        .await;
+        gateway.close().await;
+    }
+
+    #[tokio::test]
+    async fn memory_delete_removes_the_record() {
+        let (_temporary, store) = initialized_store();
+        let record = create_semantic(&store, "gateway delete fixture");
+        let mut gateway = InMemoryGateway::start(inspection_session(store)).await;
+
+        gateway
+            .write(&format!(
+                r#"{{"protocol_version":1,"type":"memory_delete","request_id":"delete-1","memory_id":"{}","expected_revision":"{}"}}"#,
+                record.id().get(),
+                record.revision()
+            ))
+            .await;
+
+        assert_accepted_message(&gateway.read_message().await, "delete-1");
+        let response = gateway.read_message().await;
+        assert!(response.contains(r#""type":"memory_deleted""#));
+        assert!(response.contains(r#""request_id":"delete-1""#));
+        assert!(response.contains(&format!(r#""memory_id":"{}""#, record.id().get())));
+
+        gateway
+            .write(&format!(
+                r#"{{"protocol_version":1,"type":"memory_inspect","request_id":"inspect-after-delete","memory_id":"{}"}}"#,
+                record.id().get()
+            ))
+            .await;
+        assert_rejection_then_status(
+            &mut gateway,
+            "inspect-after-delete",
+            "memory_not_found",
+            "status-after-delete",
+        )
+        .await;
+        gateway.close().await;
+    }
+
+    #[tokio::test]
+    async fn memory_delete_with_a_missing_id_is_not_found() {
+        let (_temporary, store) = initialized_store();
+        let mut gateway = InMemoryGateway::start(inspection_session(store)).await;
+
+        gateway
+            .write(
+                r#"{"protocol_version":1,"type":"memory_delete","request_id":"delete-missing","memory_id":"999","expected_revision":"1"}"#,
+            )
+            .await;
+
+        assert_rejection_then_status(
+            &mut gateway,
+            "delete-missing",
+            "memory_not_found",
+            "status-after-delete-missing",
+        )
+        .await;
+        gateway.close().await;
+    }
+
+    #[tokio::test]
+    async fn memory_delete_with_a_stale_revision_is_a_conflict() {
+        let (_temporary, store) = initialized_store();
+        let record = create_semantic(&store, "gateway stale delete fixture");
+        let mut gateway = InMemoryGateway::start(inspection_session(store)).await;
+
+        gateway
+            .write(&format!(
+                r#"{{"protocol_version":1,"type":"memory_delete","request_id":"delete-stale","memory_id":"{}","expected_revision":"{}"}}"#,
+                record.id().get(),
+                record.revision() + 1
+            ))
+            .await;
+
+        assert_rejection_then_status(
+            &mut gateway,
+            "delete-stale",
+            "memory_conflict",
+            "status-after-delete-stale",
+        )
+        .await;
+        gateway.close().await;
+    }
+
+    #[tokio::test]
+    async fn memory_approve_and_delete_are_disabled_without_a_memory_store() {
+        let mut gateway =
+            InMemoryGateway::start(GatewaySession::new(unused_runtime(), status())).await;
+
+        gateway
+            .write(
+                r#"{"protocol_version":1,"type":"memory_approve","request_id":"approve-disabled","memory_id":"1","expected_revision":"1"}"#,
+            )
+            .await;
+        assert_rejection_then_status(
+            &mut gateway,
+            "approve-disabled",
+            "memory_disabled",
+            "status-after-approve-disabled",
+        )
+        .await;
+
+        gateway
+            .write(
+                r#"{"protocol_version":1,"type":"memory_delete","request_id":"delete-disabled","memory_id":"1","expected_revision":"1"}"#,
+            )
+            .await;
+        assert_rejection_then_status(
+            &mut gateway,
+            "delete-disabled",
+            "memory_disabled",
+            "status-after-delete-disabled",
+        )
+        .await;
+        gateway.close().await;
+    }
+
+    #[tokio::test]
+    async fn memory_approve_and_delete_are_rejected_while_a_turn_is_active() {
+        let language = HoldOpenLanguageServer::start().await;
+        let (_temporary, store) = initialized_store();
+        let record = create_identity_candidate(&store, "gateway active-turn approve fixture");
+        let session = GatewaySession::new(runtime_for(language.endpoint()), memory_status())
+            .with_memory_inspection(Arc::new(store), Arc::new(FixedClock(timestamp(10_000))));
+        let mut gateway = InMemoryGateway::start(session).await;
+
+        gateway
+            .write(
+                r#"{"protocol_version":1,"type":"start_turn","request_id":"start-memory-mutation-active","transcript":"fixture active memory mutation rejection"}"#,
+            )
+            .await;
+        assert_accepted_message(
+            &gateway.read_message().await,
+            "start-memory-mutation-active",
+        );
+        gateway
+            .read_until(|message| message.contains(r#""type":"text_delta""#))
+            .await;
+
+        gateway
+            .write(&format!(
+                r#"{{"protocol_version":1,"type":"memory_approve","request_id":"approve-active","memory_id":"{}","expected_revision":"{}"}}"#,
+                record.id().get(),
+                record.revision()
+            ))
+            .await;
+        let rejection = gateway
+            .read_until(|message| {
+                message.contains(r#""type":"command_rejected""#)
+                    && message.contains(r#""request_id":"approve-active""#)
+            })
+            .await;
+        assert_rejected_message(
+            rejection.last().unwrap(),
+            "approve-active",
+            "memory_turn_active",
+        );
+
+        gateway
+            .write(&format!(
+                r#"{{"protocol_version":1,"type":"memory_delete","request_id":"delete-active","memory_id":"{}","expected_revision":"{}"}}"#,
+                record.id().get(),
+                record.revision()
+            ))
+            .await;
+        let rejection = gateway
+            .read_until(|message| {
+                message.contains(r#""type":"command_rejected""#)
+                    && message.contains(r#""request_id":"delete-active""#)
+            })
+            .await;
+        assert_rejected_message(
+            rejection.last().unwrap(),
+            "delete-active",
+            "memory_turn_active",
+        );
+
+        gateway
+            .write(r#"{"protocol_version":1,"type":"status","request_id":"status-after-memory-mutation-active"}"#)
+            .await;
+        assert_accepted_message(
+            &gateway.read_message().await,
+            "status-after-memory-mutation-active",
+        );
+        assert!(gateway.read_message().await.contains(r#""type":"status""#));
+
+        gateway
+            .write(
+                r#"{"protocol_version":1,"type":"interrupt_turn","request_id":"interrupt-after-memory-mutation","turn_id":"1"}"#,
+            )
+            .await;
+        gateway
+            .read_until(|message| message.contains(r#""type":"turn_cancelled""#))
+            .await;
+        timeout(TEST_TIMEOUT, language.connection_reaped.wait())
+            .await
+            .expect("memory mutation rejection delayed language request cleanup");
+        gateway.close().await;
+    }
+
+    #[tokio::test]
+    async fn memory_approve_and_delete_are_rejected_while_a_voice_session_is_active() {
+        let (_temporary, store) = initialized_store();
+        let record = create_identity_candidate(&store, "gateway active-voice approve fixture");
+        let (input, input_receiver) = mpsc::channel(8);
+        let language = Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new()));
+        let session = session_with_interactive_voice(input_receiver, language, no_speech_frames())
+            .with_memory_inspection(Arc::new(store), Arc::new(FixedClock(timestamp(10_000))));
+        let mut gateway = InMemoryGateway::start(session).await;
+
+        gateway
+            .write(r#"{"protocol_version":1,"type":"start_voice_session","request_id":"voice-1"}"#)
+            .await;
+        assert_accepted_message(&gateway.read_message().await, "voice-1");
+        assert!(gateway
+            .read_message()
+            .await
+            .contains(r#""type":"voice_session_started""#));
+
+        gateway
+            .write(&format!(
+                r#"{{"protocol_version":1,"type":"memory_approve","request_id":"approve-voice-active","memory_id":"{}","expected_revision":"{}"}}"#,
+                record.id().get(),
+                record.revision()
+            ))
+            .await;
+        let rejection = gateway.read_message().await;
+        assert_rejected_message(&rejection, "approve-voice-active", "memory_turn_active");
+
+        gateway
+            .write(&format!(
+                r#"{{"protocol_version":1,"type":"memory_delete","request_id":"delete-voice-active","memory_id":"{}","expected_revision":"{}"}}"#,
+                record.id().get(),
+                record.revision()
+            ))
+            .await;
+        let rejection = gateway.read_message().await;
+        assert_rejected_message(&rejection, "delete-voice-active", "memory_turn_active");
+
+        drop(input);
+        gateway.close().await;
+    }
+
+    #[tokio::test]
     async fn stop_voice_session_shuts_down_and_emits_single_terminal() {
         let (input, input_receiver) = mpsc::channel(8);
         let language = Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new()));
@@ -3363,6 +4004,32 @@ mod tests {
             .create(
                 MemoryDraft::new(
                     MemoryKind::Semantic,
+                    content,
+                    MemoryProvenance::new(
+                        MemoryProvenanceKind::UserProvided,
+                        "gateway-session-test",
+                        timestamp(1_000),
+                        "local-user",
+                        None,
+                    )
+                    .unwrap(),
+                    MemoryConfidence::new(900).unwrap(),
+                    timestamp(1_000),
+                    MemoryRetention::UntilDeleted,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+    }
+
+    fn create_identity_candidate(
+        store: &SqliteMemoryStore,
+        content: &str,
+    ) -> conversation_protocol::MemoryRecord {
+        store
+            .create(
+                MemoryDraft::new(
+                    MemoryKind::Identity,
                     content,
                     MemoryProvenance::new(
                         MemoryProvenanceKind::UserProvided,

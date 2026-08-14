@@ -1225,6 +1225,8 @@ pub(crate) fn validate_client_runtime_error(
             | "memory_turn_active"
             | "memory_not_found"
             | "memory_unavailable"
+            | "memory_conflict"
+            | "persona_invalid"
     ) || !matches!(
         error.kind.as_str(),
         "adapter" | "configuration" | "invalid_state"

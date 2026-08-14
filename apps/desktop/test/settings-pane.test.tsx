@@ -268,6 +268,9 @@ class PersonaSession implements DesktopSession {
   };
   readonly close = vi.fn(async () => undefined);
   readonly inspectMemory = vi.fn<(memoryId: bigint) => Promise<MemoryInspection>>();
+  readonly approveMemory = vi.fn<DesktopSession["approveMemory"]>();
+  readonly deleteMemory = vi.fn<DesktopSession["deleteMemory"]>();
+  readonly onMemoryExtracted = vi.fn<DesktopSession["onMemoryExtracted"]>(() => () => undefined);
   readonly interrupt = vi.fn(async () => undefined);
   readonly listMemories = vi.fn<(cursor?: MemoryCursor | null) => Promise<MemoryPage>>();
   readonly getPersona = vi.fn<() => Promise<PersonaState>>();

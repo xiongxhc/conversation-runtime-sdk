@@ -331,16 +331,142 @@ describe("MemoryPane", () => {
     expect(session.inspectMemory).toHaveBeenCalledTimes(2);
   });
 
-  it("exposes no memory mutation or retrieval controls", async () => {
+  it("exposes delete but no other mutation or retrieval controls for an active memory", async () => {
     const session = sessionForInspection(inspection());
 
     renderPane(session);
     fireEvent.click(await screen.findByRole("button", { name: /Prefers concise explanations/ }));
     await screen.findByLabelText("Memory detail");
 
-    for (const name of ["Create", "Edit", "Approve", "Pin", "Retrieve", "Delete"]) {
+    for (const name of ["Create", "Edit", "Approve", "Pin", "Retrieve"]) {
       expect(screen.queryByRole("button", { name })).toBeNull();
     }
+    expect(screen.getByRole("button", { name: "Delete" })).toBeTruthy();
+  });
+
+  it("shows Approve only for a candidate memory, not for an active one", async () => {
+    const activeSession = sessionForInspection(inspection());
+    renderPane(activeSession);
+    fireEvent.click(await screen.findByRole("button", { name: /Prefers concise explanations/ }));
+    await screen.findByLabelText("Memory detail");
+    expect(screen.queryByRole("button", { name: "Approve" })).toBeNull();
+    cleanup();
+
+    const candidateBase = inspection();
+    const candidateSession = sessionForInspection({
+      ...candidateBase,
+      record: { ...candidateBase.record, state: "candidate" },
+    });
+    renderPane(candidateSession);
+    fireEvent.click(await screen.findByRole("button", { name: /Prefers concise explanations/ }));
+    await screen.findByLabelText("Memory detail");
+    expect(screen.getByRole("button", { name: "Approve" })).toBeTruthy();
+  });
+
+  it("approves a candidate memory, replacing the inspection and showing a notice", async () => {
+    const base = inspection();
+    const session = sessionForInspection({
+      ...base,
+      record: { ...base.record, state: "candidate" },
+    });
+    session.approveMemory.mockResolvedValueOnce({
+      ...base,
+      record: { ...base.record, state: "active", revision: 4n },
+    });
+
+    renderPane(session);
+    fireEvent.click(await screen.findByRole("button", { name: /Prefers concise explanations/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Approve" }));
+
+    expect(await screen.findByRole("status")).toHaveProperty("textContent", "Memory approved");
+    const detail = screen.getByLabelText("Memory detail");
+    expect(within(detail).getByText("Active")).toBeTruthy();
+    expect(within(detail).getByText("4")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Approve" })).toBeNull();
+    expect(session.approveMemory).toHaveBeenCalledWith(7n, 3n);
+  });
+
+  it("deletes a memory, returning to a refreshed list with a notice", async () => {
+    const session = sessionForInspection(inspection());
+    session.deleteMemory.mockResolvedValueOnce(4n);
+    session.listMemories.mockResolvedValueOnce({ records: [], nextCursor: null });
+
+    renderPane(session);
+    fireEvent.click(await screen.findByRole("button", { name: /Prefers concise explanations/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+
+    expect(await screen.findByRole("heading", { name: "Runtime memory" })).toBeTruthy();
+    expect((await screen.findByRole("status")).textContent).toBe("Memory deleted");
+    expect(screen.getByText("No memories to inspect.")).toBeTruthy();
+    expect(session.deleteMemory).toHaveBeenCalledWith(7n, 3n);
+    expect(session.listMemories).toHaveBeenCalledTimes(2);
+  });
+
+  it("shows a retry-copy notice and re-inspects on a memory_conflict rejection from approve", async () => {
+    const base = inspection();
+    const session = sessionForInspection({
+      ...base,
+      record: { ...base.record, state: "candidate" },
+    });
+    session.approveMemory.mockRejectedValueOnce(commandError("memory_conflict"));
+    session.inspectMemory.mockResolvedValueOnce({
+      ...base,
+      record: { ...base.record, state: "candidate", revision: 5n },
+    });
+
+    renderPane(session);
+    fireEvent.click(await screen.findByRole("button", { name: /Prefers concise explanations/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Approve" }));
+
+    expect(await screen.findByRole("status")).toHaveProperty(
+      "textContent",
+      "This memory changed elsewhere — refreshed; try again.",
+    );
+    await waitFor(() => expect(session.inspectMemory).toHaveBeenCalledTimes(2));
+    const detail = screen.getByLabelText("Memory detail");
+    expect(within(detail).getByText("5")).toBeTruthy();
+  });
+
+  it("shows a retry-copy notice and re-inspects on a memory_conflict rejection from delete", async () => {
+    const session = sessionForInspection(inspection());
+    session.deleteMemory.mockRejectedValueOnce(commandError("memory_conflict"));
+    session.inspectMemory.mockResolvedValueOnce({
+      ...inspection(),
+      record: { ...inspection().record, revision: 9n },
+    });
+
+    renderPane(session);
+    fireEvent.click(await screen.findByRole("button", { name: /Prefers concise explanations/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+
+    expect(await screen.findByRole("status")).toHaveProperty(
+      "textContent",
+      "This memory changed elsewhere — refreshed; try again.",
+    );
+    await waitFor(() => expect(session.inspectMemory).toHaveBeenCalledTimes(2));
+    expect(screen.getByLabelText("Memory detail")).toBeTruthy();
+    const detail = screen.getByLabelText("Memory detail");
+    expect(within(detail).getByText("9")).toBeTruthy();
+  });
+
+  it("refreshes the list when refreshSignal changes, but not on initial mount", async () => {
+    const session = new MemorySession();
+    session.listMemories
+      .mockResolvedValueOnce({ records: [summary(7n, "Original memory")], nextCursor: null })
+      .mockResolvedValueOnce({ records: [summary(9n, "Newly extracted memory")], nextCursor: null });
+
+    const rendered = render(
+      <MemoryPane onBack={vi.fn()} refreshSignal={0} session={session} status={localMemoryStatus} />,
+    );
+    await screen.findByRole("button", { name: /Original memory/ });
+    expect(session.listMemories).toHaveBeenCalledTimes(1);
+
+    rendered.rerender(
+      <MemoryPane onBack={vi.fn()} refreshSignal={1} session={session} status={localMemoryStatus} />,
+    );
+
+    expect(await screen.findByRole("button", { name: /Newly extracted memory/ })).toBeTruthy();
+    expect(session.listMemories).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -371,6 +497,9 @@ class MemorySession implements DesktopSession {
   };
   readonly close = vi.fn(async () => undefined);
   readonly inspectMemory = vi.fn<(memoryId: bigint) => Promise<MemoryInspection>>();
+  readonly approveMemory = vi.fn<DesktopSession["approveMemory"]>();
+  readonly deleteMemory = vi.fn<DesktopSession["deleteMemory"]>();
+  readonly onMemoryExtracted = vi.fn<DesktopSession["onMemoryExtracted"]>(() => () => undefined);
   readonly interrupt = vi.fn(async () => undefined);
   readonly listMemories = vi.fn<(cursor?: MemoryCursor | null) => Promise<MemoryPage>>();
   readonly getPersona = vi.fn<DesktopSession["getPersona"]>();
@@ -457,14 +586,17 @@ function inspection(): MemoryInspection {
   };
 }
 
-function commandError(code: "memory_not_found" | "memory_unavailable") {
+function commandError(code: "memory_not_found" | "memory_unavailable" | "memory_conflict") {
+  const messages = {
+    memory_not_found: "memory record was not found",
+    memory_unavailable: "memory inspection is unavailable",
+    memory_conflict: "memory record changed since it was last inspected",
+  } as const;
   return new CommandRejectedError({
     code,
     kind: "invalid_state",
     stage: "memory",
-    message: code === "memory_not_found"
-      ? "memory record was not found"
-      : "memory inspection is unavailable",
+    message: messages[code],
   });
 }
 

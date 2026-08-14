@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { App, type DesktopSession } from "../src/App.js";
 import type {
   MemoryCursor,
+  MemoryExtractedSummary,
   MemoryInspection,
   MemoryPage,
   PersonaState,
@@ -24,11 +25,19 @@ type IsRequired<T, Key extends keyof T> = object extends Pick<T, Key> ? false : 
 type DesktopMemoryMethodsAreRequired = Assert<
   IsRequired<DesktopSession, "listMemories"> & IsRequired<DesktopSession, "inspectMemory">
 >;
+type DesktopMemoryMutationMethodsAreRequired = Assert<
+  IsRequired<DesktopSession, "approveMemory">
+  & IsRequired<DesktopSession, "deleteMemory">
+  & IsRequired<DesktopSession, "onMemoryExtracted">
+>;
 type DesktopPersonaMethodsAreRequired = Assert<
   IsRequired<DesktopSession, "getPersona"> & IsRequired<DesktopSession, "updatePersona">
 >;
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.useRealTimers();
+});
 
 describe("desktop app", () => {
   it("rejects relative setup paths inline without connecting", async () => {
@@ -238,6 +247,79 @@ describe("desktop app", () => {
     expect(memory.getAttribute("aria-current")).toBe("page");
     expect(screen.queryByRole("button", { name: "Persona" })).toBeNull();
     expect(screen.getByRole("button", { name: "Settings" })).toBeTruthy();
+  });
+
+  it("shows a transient extraction notice with an awaiting-approval count, then auto-dismisses", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const session = new FakeSession(memoryState());
+    render(
+      <App
+        connectSession={vi.fn(async () => session)}
+        historyStore={new FakeHistoryStore()}
+        storage={memoryStorage()}
+      />,
+    );
+
+    connectWithAbsolutePaths();
+    await screen.findByLabelText("Message");
+
+    act(() => session.emitMemoryExtracted({ created: 3, activated: 2, pendingApproval: 1 }));
+
+    expect(await screen.findByText("3 memories saved · 1 awaiting approval")).toBeTruthy();
+
+    act(() => vi.advanceTimersByTime(30_000));
+
+    await waitFor(() => expect(
+      screen.queryByText("3 memories saved · 1 awaiting approval"),
+    ).toBeNull());
+  });
+
+  it("omits the awaiting-approval suffix when nothing is pending approval", async () => {
+    const session = new FakeSession(memoryState());
+    render(
+      <App
+        connectSession={vi.fn(async () => session)}
+        historyStore={new FakeHistoryStore()}
+        storage={memoryStorage()}
+      />,
+    );
+
+    connectWithAbsolutePaths();
+    await screen.findByLabelText("Message");
+
+    act(() => session.emitMemoryExtracted({ created: 2, activated: 2, pendingApproval: 0 }));
+
+    expect(await screen.findByText("2 memories saved")).toBeTruthy();
+  });
+
+  it("refreshes the open memory list when an extraction event arrives", async () => {
+    const session = new FakeSession(memoryState());
+    session.listMemories
+      .mockResolvedValueOnce({ records: [], nextCursor: null })
+      .mockResolvedValueOnce({ records: [{
+        id: 9n,
+        contentPreview: "Newly extracted memory",
+        kind: "semantic",
+        state: "candidate",
+        pinned: false,
+        updatedAtMs: 1_750_000_000_000n,
+      }], nextCursor: null });
+    render(
+      <App
+        connectSession={vi.fn(async () => session)}
+        historyStore={new FakeHistoryStore()}
+        storage={memoryStorage()}
+      />,
+    );
+
+    connectWithAbsolutePaths();
+    fireEvent.click(await screen.findByRole("button", { name: "Memory" }));
+    await screen.findByText("No memories to inspect.");
+
+    act(() => session.emitMemoryExtracted({ created: 1, activated: 0, pendingApproval: 1 }));
+
+    expect(await screen.findByRole("button", { name: /Newly extracted memory/ })).toBeTruthy();
+    expect(session.listMemories).toHaveBeenCalledTimes(2);
   });
 
   it("opens Settings from the rail and shows the persona controls", async () => {
@@ -720,6 +802,12 @@ class FakeSession implements DesktopSession {
   readonly close = vi.fn(async () => undefined);
   readonly interrupt = vi.fn(async () => undefined);
   readonly inspectMemory = vi.fn<(memoryId: bigint) => Promise<MemoryInspection>>();
+  readonly approveMemory = vi.fn<DesktopSession["approveMemory"]>();
+  readonly deleteMemory = vi.fn<DesktopSession["deleteMemory"]>();
+  readonly onMemoryExtracted = vi.fn((listener: (summary: MemoryExtractedSummary) => void) => {
+    this.memoryExtractedListeners.add(listener);
+    return () => this.memoryExtractedListeners.delete(listener);
+  });
   readonly listMemories = vi.fn<(cursor?: MemoryCursor | null) => Promise<MemoryPage>>();
   readonly getPersona = vi.fn<() => Promise<PersonaState>>();
   readonly updatePersona = vi.fn<(persona: PersonaState) => Promise<PersonaState>>();
@@ -729,6 +817,7 @@ class FakeSession implements DesktopSession {
   readonly startVoice = vi.fn(async () => undefined);
   readonly stopVoice = vi.fn(async () => undefined);
   private readonly listeners = new Set<(state: ConversationSessionState) => void>();
+  private readonly memoryExtractedListeners = new Set<(summary: MemoryExtractedSummary) => void>();
 
   constructor(state: ConversationSessionState) {
     this.state = state;
@@ -743,6 +832,10 @@ class FakeSession implements DesktopSession {
   emit(state: ConversationSessionState) {
     this.state = state;
     for (const listener of this.listeners) listener(state);
+  }
+
+  emitMemoryExtracted(summary: MemoryExtractedSummary) {
+    for (const listener of this.memoryExtractedListeners) listener(summary);
   }
 }
 

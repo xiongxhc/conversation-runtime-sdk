@@ -592,6 +592,9 @@ class FakeSession implements DesktopSession {
   state: ConversationSessionState;
   readonly close = vi.fn(async () => undefined);
   readonly inspectMemory = vi.fn<DesktopSession["inspectMemory"]>();
+  readonly approveMemory = vi.fn<DesktopSession["approveMemory"]>();
+  readonly deleteMemory = vi.fn<DesktopSession["deleteMemory"]>();
+  readonly onMemoryExtracted = vi.fn<DesktopSession["onMemoryExtracted"]>(() => () => undefined);
   readonly getPersona = vi.fn<DesktopSession["getPersona"]>();
   readonly updatePersona = vi.fn<DesktopSession["updatePersona"]>();
   readonly interrupt = vi.fn(async () => undefined);

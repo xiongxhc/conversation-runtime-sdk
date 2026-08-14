@@ -405,6 +405,12 @@ textarea {
   margin: 0 0 6px;
 }
 
+.memory-detail-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 20px;
+}
+
 .settings-pane {
   display: flex;
   flex-direction: column;
@@ -539,12 +545,17 @@ textarea {
   gap: 8px;
 }
 
-.workspace-notice {
+.workspace-notice,
+.memory-extracted-notice {
   border-left: 2px solid rgba(75, 119, 117, 0.6);
   color: #686d69;
   font-size: 0.8rem;
   line-height: 1.5;
   padding-left: 12px;
+}
+
+.memory-extracted-notice {
+  margin: 4px 0 18px;
 }
 
 .history-header {
@@ -1410,7 +1421,8 @@ textarea {
     color: #ffb4ab;
   }
 
-  .workspace-notice {
+  .workspace-notice,
+  .memory-extracted-notice {
     color: #b9bfbb;
   }
 

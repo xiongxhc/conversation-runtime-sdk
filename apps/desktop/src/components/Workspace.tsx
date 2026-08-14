@@ -32,6 +32,8 @@ type FocusMode = "live" | "preview";
 type WorkspaceView = "conversation" | "history" | "memory" | "settings";
 type VoiceControlFailure = { message: string; retry: () => Promise<void> };
 
+const memoryExtractedNoticeTimeoutMs = 6_000;
+
 export function Workspace({
   session,
   historyStore,
@@ -50,6 +52,9 @@ export function Workspace({
   const [historyError, setHistoryError] = useState<string>();
   const [operationError, setOperationError] = useState<string>();
   const [personaReplayNotice, setPersonaReplayNotice] = useState<string>();
+  const [memoryExtractedNotice, setMemoryExtractedNotice] = useState<string>();
+  const [memoryRefreshSignal, setMemoryRefreshSignal] = useState(0);
+  const memoryExtractedNoticeTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const [voiceControlFailure, setVoiceControlFailure] = useState<VoiceControlFailure>();
   const [exitVoiceSessionId, setExitVoiceSessionId] = useState<bigint | null>();
   const [exitDialogError, setExitDialogError] = useState<string>();
@@ -83,6 +88,28 @@ export function Workspace({
     setSessionState(state);
     persistConversation(state);
   }), [session, historyStore]);
+  useEffect(() => {
+    const unsubscribe = session.onMemoryExtracted((summary) => {
+      const message = `${summary.created} memories saved${
+        summary.pendingApproval > 0 ? ` · ${summary.pendingApproval} awaiting approval` : ""
+      }`;
+      setMemoryExtractedNotice(message);
+      if (memoryExtractedNoticeTimer.current !== undefined) {
+        clearTimeout(memoryExtractedNoticeTimer.current);
+      }
+      memoryExtractedNoticeTimer.current = setTimeout(
+        () => setMemoryExtractedNotice(undefined),
+        memoryExtractedNoticeTimeoutMs,
+      );
+      setMemoryRefreshSignal((value) => value + 1);
+    });
+    return () => {
+      unsubscribe();
+      if (memoryExtractedNoticeTimer.current !== undefined) {
+        clearTimeout(memoryExtractedNoticeTimer.current);
+      }
+    };
+  }, [session]);
   useEffect(() => {
     let cancelled = false;
     void Promise.all([historyStore.storagePath(), historyStore.list()]).then(
@@ -579,6 +606,7 @@ export function Workspace({
       ) : workspaceView === "memory" ? (
         <MemoryPane
           onBack={() => setWorkspaceView("conversation")}
+          refreshSignal={memoryRefreshSignal}
           session={session}
           status={sessionState.status}
         />
@@ -600,6 +628,10 @@ export function Workspace({
             {phaseLabel(sessionState.phase)}
           </p>
         </header>
+
+        {memoryExtractedNotice ? (
+          <p className="memory-extracted-notice" role="status">{memoryExtractedNotice}</p>
+        ) : null}
 
         <div
           aria-atomic="false"

@@ -16,6 +16,7 @@ export interface MemoryPaneProps {
   session: DesktopSession;
   status: RuntimeStatus;
   onBack(): void;
+  refreshSignal?: number;
 }
 
 type MemoryError =
@@ -31,13 +32,14 @@ type MemoryError =
     scope: "detail";
   };
 
-export function MemoryPane({ session, status, onBack }: MemoryPaneProps) {
+export function MemoryPane({ session, status, onBack, refreshSignal = 0 }: MemoryPaneProps) {
   const [records, setRecords] = useState<MemorySummary[]>([]);
   const [nextCursor, setNextCursor] = useState<MemoryCursor | null>();
   const [selectedId, setSelectedId] = useState<bigint>();
   const [inspection, setInspection] = useState<MemoryInspection>();
   const [loadingList, setLoadingList] = useState(true);
   const [loadingDetail, setLoadingDetail] = useState(false);
+  const [actionPending, setActionPending] = useState(false);
   const [error, setError] = useState<MemoryError>();
   const [notice, setNotice] = useState<string>();
   const listGeneration = useRef(0);
@@ -87,6 +89,14 @@ export function MemoryPane({ session, status, onBack }: MemoryPaneProps) {
       selectionGeneration.current += 1;
     };
   }, [session]);
+  const skipInitialRefresh = useRef(true);
+  useEffect(() => {
+    if (skipInitialRefresh.current) {
+      skipInitialRefresh.current = false;
+      return;
+    }
+    void loadPage(null, true);
+  }, [refreshSignal]);
   useEffect(() => {
     if (selectedId !== undefined) {
       detailBackRef.current?.focus();
@@ -155,10 +165,68 @@ export function MemoryPane({ session, status, onBack }: MemoryPaneProps) {
     }
   };
 
+  const refreshAfterConflict = async (memoryId: bigint) => {
+    const generation = ++selectionGeneration.current;
+    setLoadingDetail(true);
+    try {
+      const detail = await session.inspectMemory(memoryId);
+      if (generation === selectionGeneration.current) setInspection(detail);
+    } catch {
+      // Best-effort refresh; keep the prior inspection visible if it fails.
+    } finally {
+      if (generation === selectionGeneration.current) setLoadingDetail(false);
+    }
+  };
+
+  const handleMutationError = async (mutationError: unknown, memoryId: bigint) => {
+    if (mutationError instanceof CommandRejectedError && mutationError.code === "memory_conflict") {
+      setNotice("This memory changed elsewhere — refreshed; try again.");
+      await refreshAfterConflict(memoryId);
+    } else {
+      setError({ message: memoryErrorMessage(mutationError), scope: "detail" });
+    }
+  };
+
+  const approve = async () => {
+    if (!inspection || inspection.record.state !== "candidate") return;
+    const { id, revision } = inspection.record;
+    setActionPending(true);
+    setError(undefined);
+    try {
+      const updated = await session.approveMemory(id, revision);
+      setInspection(updated);
+      setNotice("Memory approved");
+    } catch (approveError) {
+      await handleMutationError(approveError, id);
+    } finally {
+      setActionPending(false);
+    }
+  };
+
+  const deleteRecord = async () => {
+    if (!inspection) return;
+    const { id, revision } = inspection.record;
+    setActionPending(true);
+    setError(undefined);
+    try {
+      await session.deleteMemory(id, revision);
+      selectionGeneration.current += 1;
+      restoreListFocus.current = true;
+      setSelectedId(undefined);
+      setInspection(undefined);
+      setLoadingDetail(false);
+      await loadPage(null, true, "Memory deleted");
+    } catch (deleteError) {
+      await handleMutationError(deleteError, id);
+    } finally {
+      setActionPending(false);
+    }
+  };
+
   if (selectedId !== undefined) {
     return (
       <section
-        aria-busy={loadingDetail}
+        aria-busy={loadingDetail || actionPending}
         aria-label="Memory detail"
         className="memory-pane"
       >
@@ -169,9 +237,34 @@ export function MemoryPane({ session, status, onBack }: MemoryPaneProps) {
           onAction={showList}
           title="Memory detail"
         />
+        {notice ? <p className="memory-notice" role="status">{notice}</p> : null}
         {error ? <MemoryErrorState error={error.message} onRetry={retry} /> : null}
         {loadingDetail ? <p className="memory-loading">Loading memory…</p> : null}
-        {inspection ? <MemoryDetail inspection={inspection} /> : null}
+        {inspection ? (
+          <>
+            <MemoryDetail inspection={inspection} />
+            <div className="memory-detail-actions">
+              {inspection.record.state === "candidate" ? (
+                <button
+                  className="quiet-action"
+                  disabled={actionPending}
+                  onClick={() => void approve()}
+                  type="button"
+                >
+                  Approve
+                </button>
+              ) : null}
+              <button
+                className="delete-history-action"
+                disabled={actionPending}
+                onClick={() => void deleteRecord()}
+                type="button"
+              >
+                Delete
+              </button>
+            </div>
+          </>
+        ) : null}
       </section>
     );
   }

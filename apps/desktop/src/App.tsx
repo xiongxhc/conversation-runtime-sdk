@@ -2,6 +2,7 @@ import { useRef, useState } from "react";
 
 import type {
   MemoryCursor,
+  MemoryExtractedSummary,
   MemoryInspection,
   MemoryPage,
   PersonaState,
@@ -35,6 +36,9 @@ export interface DesktopSession {
   send(transcript: string): Promise<bigint>;
   listMemories(cursor?: MemoryCursor | null): Promise<MemoryPage>;
   inspectMemory(memoryId: bigint): Promise<MemoryInspection>;
+  approveMemory(memoryId: bigint, expectedRevision: bigint): Promise<MemoryInspection>;
+  deleteMemory(memoryId: bigint, expectedRevision: bigint): Promise<bigint>;
+  onMemoryExtracted(listener: (summary: MemoryExtractedSummary) => void): () => void;
   getPersona(): Promise<PersonaState>;
   updatePersona(persona: PersonaState): Promise<PersonaState>;
   interrupt(): Promise<void>;

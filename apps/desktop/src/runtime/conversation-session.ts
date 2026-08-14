@@ -1,6 +1,7 @@
 import {
   RuntimeClient,
   type MemoryCursor,
+  type MemoryExtractedSummary,
   type MemoryInspection,
   type MemoryPage,
   type PersonaState,
@@ -140,6 +141,20 @@ export class ConversationSession {
   async inspectMemory(memoryId: bigint): Promise<MemoryInspection> {
     this.ensureMemoryReady();
     return this.client.inspectMemory(memoryId);
+  }
+
+  async approveMemory(memoryId: bigint, expectedRevision: bigint): Promise<MemoryInspection> {
+    this.ensureMemoryReady();
+    return this.client.approveMemory(memoryId, expectedRevision);
+  }
+
+  async deleteMemory(memoryId: bigint, expectedRevision: bigint): Promise<bigint> {
+    this.ensureMemoryReady();
+    return this.client.deleteMemory(memoryId, expectedRevision);
+  }
+
+  onMemoryExtracted(listener: (summary: MemoryExtractedSummary) => void): () => void {
+    return this.client.onMemoryExtracted(listener);
   }
 
   async getPersona(): Promise<PersonaState> {

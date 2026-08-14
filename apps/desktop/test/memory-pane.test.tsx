@@ -449,6 +449,77 @@ describe("MemoryPane", () => {
     expect(within(detail).getByText("9")).toBeTruthy();
   });
 
+  it("shows action-specific copy, not inspection copy, on a memory_unavailable rejection from approve", async () => {
+    const base = inspection();
+    const session = sessionForInspection({
+      ...base,
+      record: { ...base.record, state: "candidate" },
+    });
+    session.approveMemory.mockRejectedValueOnce(commandError("memory_unavailable"));
+
+    renderPane(session);
+    fireEvent.click(await screen.findByRole("button", { name: /Prefers concise explanations/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Approve" }));
+
+    expect((await screen.findByRole("alert")).textContent).toContain(
+      "This memory could not be approved because memory is temporarily unavailable.",
+    );
+    expect(screen.queryByText("Memory inspection could not be loaded.")).toBeNull();
+  });
+
+  it("shows action-specific copy, not inspection copy, on a generic rejection from delete", async () => {
+    const session = sessionForInspection(inspection());
+    session.deleteMemory.mockRejectedValueOnce(new Error("boom"));
+
+    renderPane(session);
+    fireEvent.click(await screen.findByRole("button", { name: /Prefers concise explanations/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+
+    expect((await screen.findByRole("alert")).textContent).toContain(
+      "This memory could not be deleted.",
+    );
+    expect(screen.queryByText("Memory inspection could not be loaded.")).toBeNull();
+    expect(screen.getByLabelText("Memory detail")).toBeTruthy();
+  });
+
+  it("returns to a refreshed list with a not-found notice on a memory_not_found rejection from approve", async () => {
+    const base = inspection();
+    const session = sessionForInspection({
+      ...base,
+      record: { ...base.record, state: "candidate" },
+    });
+    session.approveMemory.mockRejectedValueOnce(commandError("memory_not_found"));
+    session.listMemories.mockResolvedValueOnce({ records: [], nextCursor: null });
+
+    renderPane(session);
+    fireEvent.click(await screen.findByRole("button", { name: /Prefers concise explanations/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Approve" }));
+
+    expect(await screen.findByRole("heading", { name: "Runtime memory" })).toBeTruthy();
+    expect((await screen.findByRole("status")).textContent).toContain(
+      "That memory no longer exists. The list has been refreshed.",
+    );
+    expect(screen.getByText("No memories to inspect.")).toBeTruthy();
+    expect(session.listMemories).toHaveBeenCalledTimes(2);
+  });
+
+  it("returns to a refreshed list with a not-found notice on a memory_not_found rejection from delete", async () => {
+    const session = sessionForInspection(inspection());
+    session.deleteMemory.mockRejectedValueOnce(commandError("memory_not_found"));
+    session.listMemories.mockResolvedValueOnce({ records: [], nextCursor: null });
+
+    renderPane(session);
+    fireEvent.click(await screen.findByRole("button", { name: /Prefers concise explanations/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+
+    expect(await screen.findByRole("heading", { name: "Runtime memory" })).toBeTruthy();
+    expect((await screen.findByRole("status")).textContent).toContain(
+      "That memory no longer exists. The list has been refreshed.",
+    );
+    expect(screen.getByText("No memories to inspect.")).toBeTruthy();
+    expect(session.listMemories).toHaveBeenCalledTimes(2);
+  });
+
   it("refreshes the list when refreshSignal changes, but not on initial mount", async () => {
     const session = new MemorySession();
     session.listMemories

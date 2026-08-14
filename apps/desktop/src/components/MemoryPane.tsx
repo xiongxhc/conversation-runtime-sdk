@@ -109,6 +109,18 @@ export function MemoryPane({ session, status, onBack, refreshSignal = 0 }: Memor
     (target ?? listBackRef.current)?.focus();
   }, [loadingList, records, selectedId]);
 
+  const returnToListAfterNotFound = async () => {
+    restoreListFocus.current = true;
+    setSelectedId(undefined);
+    setInspection(undefined);
+    setNotice("That memory no longer exists.");
+    await loadPage(
+      null,
+      true,
+      "That memory no longer exists. The list has been refreshed.",
+    );
+  };
+
   const openMemory = async (memoryId: bigint) => {
     const generation = ++selectionGeneration.current;
     originMemoryId.current = memoryId;
@@ -126,15 +138,7 @@ export function MemoryPane({ session, status, onBack, refreshSignal = 0 }: Memor
         inspectionError instanceof CommandRejectedError
         && inspectionError.code === "memory_not_found"
       ) {
-        restoreListFocus.current = true;
-        setSelectedId(undefined);
-        setInspection(undefined);
-        setNotice("That memory no longer exists.");
-        await loadPage(
-          null,
-          true,
-          "That memory no longer exists. The list has been refreshed.",
-        );
+        await returnToListAfterNotFound();
       } else {
         setError({
           message: memoryErrorMessage(inspectionError),
@@ -178,12 +182,21 @@ export function MemoryPane({ session, status, onBack, refreshSignal = 0 }: Memor
     }
   };
 
-  const handleMutationError = async (mutationError: unknown, memoryId: bigint) => {
+  const handleMutationError = async (
+    mutationError: unknown,
+    memoryId: bigint,
+    action: "approved" | "deleted",
+  ) => {
     if (mutationError instanceof CommandRejectedError && mutationError.code === "memory_conflict") {
       setNotice("This memory changed elsewhere — refreshed; try again.");
       await refreshAfterConflict(memoryId);
+    } else if (
+      mutationError instanceof CommandRejectedError
+      && mutationError.code === "memory_not_found"
+    ) {
+      await returnToListAfterNotFound();
     } else {
-      setError({ message: memoryErrorMessage(mutationError), scope: "detail" });
+      setError({ message: mutationErrorMessage(mutationError, action), scope: "detail" });
     }
   };
 
@@ -197,7 +210,7 @@ export function MemoryPane({ session, status, onBack, refreshSignal = 0 }: Memor
       setInspection(updated);
       setNotice("Memory approved");
     } catch (approveError) {
-      await handleMutationError(approveError, id);
+      await handleMutationError(approveError, id, "approved");
     } finally {
       setActionPending(false);
     }
@@ -217,7 +230,7 @@ export function MemoryPane({ session, status, onBack, refreshSignal = 0 }: Memor
       setLoadingDetail(false);
       await loadPage(null, true, "Memory deleted");
     } catch (deleteError) {
-      await handleMutationError(deleteError, id);
+      await handleMutationError(deleteError, id, "deleted");
     } finally {
       setActionPending(false);
     }
@@ -479,6 +492,13 @@ function memoryErrorMessage(error: unknown): string {
     return "Memory inspection is temporarily unavailable.";
   }
   return "Memory inspection could not be loaded.";
+}
+
+function mutationErrorMessage(error: unknown, action: "approved" | "deleted"): string {
+  if (error instanceof CommandRejectedError && error.code === "memory_unavailable") {
+    return `This memory could not be ${action} because memory is temporarily unavailable.`;
+  }
+  return `This memory could not be ${action}.`;
 }
 
 function formatRetention(retention: MemoryRetention): string {

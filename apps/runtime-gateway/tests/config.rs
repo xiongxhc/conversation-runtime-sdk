@@ -8,7 +8,7 @@ use conversation_protocol::{
     MemoryProvenance, MemoryProvenanceKind, MemoryRetention, MemoryRetrievalRequest, SessionId,
     TurnId, UnixTimestampMillis,
 };
-use conversation_runtime_gateway::{GatewayAdapters, GatewayConfig};
+use conversation_runtime_gateway::{GatewayAdapters, GatewayConfig, MemoryExtractionSettings};
 
 const VALID_CONFIG: &str = r#"schema_version = 1
 privacy_mode = "local-only"
@@ -258,6 +258,93 @@ fn configuration_without_memory_returns_no_memory_handles() {
     let adapters = GatewayConfig::load(&path).unwrap();
 
     assert!(adapters.memory_store.is_none());
+    assert!(adapters.memory_extraction.is_none());
+}
+
+#[test]
+fn memory_without_extraction_leaves_extraction_disabled() {
+    let fixture = tempfile::tempdir().unwrap();
+    let database = fixture.path().join("runtime.sqlite3");
+    SqliteMemoryStore::initialize(&database).unwrap();
+    let path = write_config(fixture.path(), &memory_config(&database));
+
+    let adapters = GatewayConfig::load(&path).unwrap();
+
+    assert!(adapters.memory_store.is_some());
+    assert!(adapters.memory_extraction.is_none());
+}
+
+#[test]
+fn an_empty_extraction_table_applies_the_documented_defaults() {
+    let fixture = tempfile::tempdir().unwrap();
+    let database = fixture.path().join("runtime.sqlite3");
+    SqliteMemoryStore::initialize(&database).unwrap();
+    let path = write_config(
+        fixture.path(),
+        &format!("{}\n[memory.extraction]\n", memory_config(&database)),
+    );
+
+    let adapters = GatewayConfig::load(&path).unwrap();
+
+    assert_eq!(
+        adapters.memory_extraction,
+        Some(MemoryExtractionSettings::new(3, 90))
+    );
+}
+
+#[test]
+fn extraction_settings_are_read_from_the_memory_extraction_table() {
+    let fixture = tempfile::tempdir().unwrap();
+    let database = fixture.path().join("runtime.sqlite3");
+    SqliteMemoryStore::initialize(&database).unwrap();
+    let path = write_config(
+        fixture.path(),
+        &format!(
+            "{}\n[memory.extraction]\nmax_memories_per_turn = 5\nepisodic_retention_days = 1\n",
+            memory_config(&database)
+        ),
+    );
+
+    let adapters = GatewayConfig::load(&path).unwrap();
+
+    assert_eq!(
+        adapters.memory_extraction,
+        Some(MemoryExtractionSettings::new(5, 1))
+    );
+}
+
+#[test]
+fn rejects_extraction_settings_outside_their_bounds() {
+    for setting in [
+        "max_memories_per_turn = 0",
+        "max_memories_per_turn = 6",
+        "episodic_retention_days = 0",
+        "unknown_extraction_setting = 1",
+    ] {
+        let fixture = tempfile::tempdir().unwrap();
+        let database = fixture.path().join("runtime.sqlite3");
+        SqliteMemoryStore::initialize(&database).unwrap();
+        let path = write_config(
+            fixture.path(),
+            &format!(
+                "{}\n[memory.extraction]\n{setting}\n",
+                memory_config(&database)
+            ),
+        );
+
+        assert!(GatewayConfig::load(&path).is_err(), "accepted {setting}");
+    }
+}
+
+#[test]
+fn rejects_extraction_without_a_memory_table() {
+    let fixture = tempfile::tempdir().unwrap();
+    let path = write_config(
+        fixture.path(),
+        &format!("{VALID_CONFIG}\n[memory.extraction]\nmax_memories_per_turn = 3\n"),
+    );
+
+    assert!(GatewayConfig::load(&path).is_err());
 }
 
 #[cfg(unix)]

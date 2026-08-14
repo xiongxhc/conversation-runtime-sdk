@@ -22,6 +22,7 @@ use conversation_protocol::{
 use conversation_runtime::{ConversationContext, ConversationQualityController};
 use serde::Deserialize;
 
+use crate::memory_extraction::MemoryExtractionSettings;
 use crate::voice_adapters::{GatewayVoiceAdapters, VoicePolicyTemplate};
 
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
@@ -55,6 +56,7 @@ pub struct GatewayAdapters {
     pub language: Arc<dyn GenerationLanguageModel>,
     pub voice: Option<GatewayVoiceAdapters>,
     pub memory_store: Option<SqliteMemoryStore>,
+    pub memory_extraction: Option<MemoryExtractionSettings>,
     pub status: RuntimeStatus,
 }
 
@@ -112,6 +114,12 @@ impl GatewayConfig {
             Some((provider, store)) => (Some(provider), Some(store)),
             None => (None, None),
         };
+        let memory_extraction = self
+            .memory
+            .as_ref()
+            .and_then(|memory| memory.extraction.as_ref())
+            .map(MemoryExtractionConfig::settings)
+            .transpose()?;
         let mut context = ConversationContext::new(quality);
         if let Some(provider) = memory_provider {
             context = context
@@ -169,6 +177,7 @@ impl GatewayConfig {
             language,
             voice,
             memory_store,
+            memory_extraction,
             status,
         })
     }
@@ -583,6 +592,47 @@ struct MemoryConfig {
     database: PathBuf,
     maximum_items: usize,
     maximum_bytes: usize,
+    // Nesting extraction under `[memory]` is what makes `[memory.extraction]` alone
+    // invalid: without the rest of `[memory]` there is no store to write into.
+    extraction: Option<MemoryExtractionConfig>,
+}
+
+const MAXIMUM_MEMORIES_PER_TURN: usize = 5;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryExtractionConfig {
+    #[serde(default = "default_max_memories_per_turn")]
+    max_memories_per_turn: usize,
+    #[serde(default = "default_episodic_retention_days")]
+    episodic_retention_days: u16,
+}
+
+impl MemoryExtractionConfig {
+    fn settings(&self) -> Result<MemoryExtractionSettings, GatewayConfigError> {
+        if !(1..=MAXIMUM_MEMORIES_PER_TURN).contains(&self.max_memories_per_turn) {
+            return Err(config_error(
+                "memory extraction max_memories_per_turn must be 1 through 5",
+            ));
+        }
+        if self.episodic_retention_days == 0 {
+            return Err(config_error(
+                "memory extraction episodic_retention_days must be at least 1",
+            ));
+        }
+        Ok(MemoryExtractionSettings::new(
+            self.max_memories_per_turn,
+            self.episodic_retention_days,
+        ))
+    }
+}
+
+const fn default_max_memories_per_turn() -> usize {
+    3
+}
+
+const fn default_episodic_retention_days() -> u16 {
+    90
 }
 
 #[derive(Debug, Deserialize)]

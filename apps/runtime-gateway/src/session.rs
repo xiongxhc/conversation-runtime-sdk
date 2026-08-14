@@ -20,6 +20,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{JoinError, JoinHandle};
 use tokio::time::timeout;
 
+use crate::memory_extraction::{MemoryExtractedCounts, MemoryExtractionSettings, MemoryExtractor};
 use crate::voice_adapters::GatewayVoiceAdapters;
 use crate::{FrameError, FrameReader, FrameWriter};
 
@@ -33,6 +34,8 @@ pub struct GatewaySession {
     runtime: TextTurnRuntime,
     status: RuntimeStatus,
     memory_inspection: Option<MemoryInspectionAdapters>,
+    memory_extraction: Option<Arc<MemoryExtractor>>,
+    extracted_counts: Option<mpsc::UnboundedReceiver<MemoryExtractedCounts>>,
     voice: Option<VoiceLane>,
 }
 
@@ -117,6 +120,8 @@ impl GatewaySession {
             runtime,
             status,
             memory_inspection: None,
+            memory_extraction: None,
+            extracted_counts: None,
             voice: None,
         }
     }
@@ -127,6 +132,30 @@ impl GatewaySession {
         clock: Arc<dyn MemoryClock>,
     ) -> Self {
         self.memory_inspection = Some(MemoryInspectionAdapters { store, clock });
+        self
+    }
+
+    /// Enables extraction of durable memories from completed exchanges. The
+    /// extractor reports what it wrote through a channel the session forwards as
+    /// `MemoryExtracted` on the event lane; nothing it does can delay a turn.
+    pub fn with_memory_extraction(
+        mut self,
+        store: Arc<dyn MemoryStore>,
+        language: Arc<dyn GenerationLanguageModel>,
+        clock: Arc<dyn MemoryClock>,
+        settings: MemoryExtractionSettings,
+    ) -> Self {
+        let (counts, counts_receiver) = mpsc::unbounded_channel();
+        self.memory_extraction = Some(Arc::new(MemoryExtractor::new(
+            store,
+            language,
+            settings,
+            clock,
+            Arc::new(move |extracted| {
+                let _ = counts.send(extracted);
+            }),
+        )));
+        self.extracted_counts = Some(counts_receiver);
         self
     }
 
@@ -154,7 +183,7 @@ impl GatewaySession {
     }
 
     async fn run_with_writer_lanes<R, W>(
-        self,
+        mut self,
         reader: R,
         writer: W,
         writer_lanes: WriterLanes,
@@ -172,6 +201,10 @@ impl GatewaySession {
             event_sender,
             event_receiver,
         } = writer_lanes;
+        let extracted_forwarder = self
+            .extracted_counts
+            .take()
+            .map(|counts| tokio::spawn(forward_extracted_counts(counts, event_sender.clone())));
         let (terminal_written, mut terminal_written_receiver) = mpsc::unbounded_channel();
         let mut writer_task = tokio::spawn(writer_loop(
             writer,
@@ -376,6 +409,12 @@ impl GatewaySession {
         if let Some(message) = exit.fatal_message() {
             let _ = send_urgent(&urgent_sender, fatal_message(message));
         }
+        // Reaped before the event lane is dropped: the forwarder holds its own sender
+        // clone, and `writer_loop` only closes the lane once every clone is gone.
+        if let Some(forwarder) = extracted_forwarder {
+            forwarder.abort();
+            let _ = forwarder.await;
+        }
         drop(event_sender);
         drop(normal_sender);
         drop(urgent_sender);
@@ -447,6 +486,7 @@ impl GatewaySession {
                     .map_err(CommandFailure::response);
                 }
 
+                let exchange_transcript = transcript.clone();
                 let started = match self.runtime.start_turn(transcript).await {
                     Ok(started) => started,
                     Err(error) => {
@@ -470,7 +510,11 @@ impl GatewaySession {
                 active
                     .as_mut()
                     .expect("accepted text turn remains active")
-                    .start(events.clone());
+                    .start(
+                        events.clone(),
+                        exchange_transcript,
+                        self.memory_extraction.clone(),
+                    );
                 Ok(())
             }
             ClientCommand::InterruptTurn {
@@ -574,6 +618,7 @@ impl GatewaySession {
                 let (control_pending, control_pending_receiver) = watch::channel(false);
                 let task = tokio::spawn(pump_voice_events(
                     event_stream,
+                    self.memory_extraction.clone(),
                     normal.clone(),
                     events.clone(),
                     control_event_receiver,
@@ -1032,7 +1077,12 @@ impl ActiveForwarder {
         }
     }
 
-    fn start(&mut self, writer: mpsc::Sender<GatewayMessage>) {
+    fn start(
+        &mut self,
+        writer: mpsc::Sender<GatewayMessage>,
+        transcript: String,
+        extractor: Option<Arc<MemoryExtractor>>,
+    ) {
         let request_id = self.request_id.clone();
         let event_stream = self
             .event_stream
@@ -1042,6 +1092,8 @@ impl ActiveForwarder {
         self.shutdown = Some(shutdown);
         self.task = Some(tokio::spawn(forward_events(
             request_id,
+            transcript,
+            extractor,
             event_stream,
             writer,
             shutdown_receiver,
@@ -1051,6 +1103,8 @@ impl ActiveForwarder {
 
 async fn forward_events(
     request_id: String,
+    transcript: String,
+    extractor: Option<Arc<MemoryExtractor>>,
     mut events: TextTurnEventStream,
     writer: mpsc::Sender<GatewayMessage>,
     mut shutdown: oneshot::Receiver<()>,
@@ -1070,6 +1124,13 @@ async fn forward_events(
     } {
         if !forwarding {
             continue;
+        }
+        // The text lane's completed exchange: the runtime only emits `TextCompleted`
+        // once the turn reached its completed terminal and the context recorded it.
+        if let (Some(extractor), RuntimeEvent::TextCompleted { turn_id, text }) =
+            (extractor.as_ref(), &event)
+        {
+            extractor.observe_exchange(*turn_id, &transcript, text);
         }
         let event = match event {
             RuntimeEvent::TurnStarted { turn_id } => ClientRuntimeEvent::TurnStarted {
@@ -1108,15 +1169,41 @@ async fn forward_events(
 // before it writes a normal-lane voice message.
 async fn pump_voice_events(
     mut events: VoiceSessionEventStream,
+    extractor: Option<Arc<MemoryExtractor>>,
     normal: mpsc::Sender<GatewayMessage>,
     event_writer: mpsc::Sender<GatewayMessage>,
     mut control_events: mpsc::Receiver<VoiceCaptureControlKind>,
     mut control_pending: watch::Receiver<bool>,
 ) -> Result<(), GatewaySessionError> {
     let mut forwarding = true;
+    // The voice lane splits one exchange across two events: the recognized utterance
+    // arrives as `TranscriptFinal`, the completed reply as `TextCompleted`.
+    let mut spoken: Option<(TurnId, String)> = None;
     while let Some(event) = events.recv().await {
         if !forwarding {
             continue;
+        }
+        if let Some(extractor) = extractor.as_ref() {
+            match &event {
+                VoiceSessionEvent::Turn {
+                    event: RuntimeEvent::TranscriptFinal { turn_id, text },
+                    ..
+                }
+                | VoiceSessionEvent::TranscriptFinal { turn_id, text, .. } => {
+                    spoken = Some((*turn_id, text.clone()));
+                }
+                VoiceSessionEvent::Turn {
+                    event: RuntimeEvent::TextCompleted { turn_id, text },
+                    ..
+                } => {
+                    if let Some((spoken_turn, spoken_text)) = spoken.take() {
+                        if spoken_turn == *turn_id {
+                            extractor.observe_exchange(*turn_id, &spoken_text, text);
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
         if let VoiceSessionEvent::SessionFailed {
             error, recovery, ..
@@ -1161,6 +1248,25 @@ async fn pump_voice_events(
         }
     }
     Ok(())
+}
+
+// Publishes what each extraction wrote on the event lane. It runs as its own task so
+// the awaited send can never push back on the session loop or on a live turn, and it
+// carries counts only — extracted content never reaches the wire.
+async fn forward_extracted_counts(
+    mut extracted: mpsc::UnboundedReceiver<MemoryExtractedCounts>,
+    events: mpsc::Sender<GatewayMessage>,
+) {
+    while let Some(counts) = extracted.recv().await {
+        let message = GatewayMessage::MemoryExtracted {
+            created: counts.created,
+            activated: counts.activated,
+            pending_approval: counts.pending_approval,
+        };
+        if events.send(message).await.is_err() {
+            return;
+        }
+    }
 }
 
 fn voice_failure_diagnostic(error: &RuntimeError, recovery: RecoveryDisposition) -> String {
@@ -3566,6 +3672,68 @@ mod tests {
         assert_rejected_message(&rejection, "delete-voice-active", "memory_turn_active");
 
         drop(input);
+        gateway.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_completed_text_turn_reports_extracted_memories_when_extraction_is_configured() {
+        let (_temporary, store) = initialized_store();
+        let language = HoldOpenLanguageServer::completing().await;
+        let extraction = MockGenerationLanguageModel::new([concat!(
+            r#"[{"kind":"semantic","content":"the user wants short answers",""#,
+            r#"explicit":true,"confidence":800}]"#
+        )]);
+        let session = GatewaySession::new(runtime_for(language.endpoint()), memory_status())
+            .with_memory_extraction(
+                Arc::new(store.clone()),
+                Arc::new(extraction),
+                Arc::new(FixedClock(timestamp(10_000))),
+                crate::MemoryExtractionSettings::new(3, 90),
+            );
+        let mut gateway = InMemoryGateway::start(session).await;
+
+        gateway
+            .write(
+                r#"{"protocol_version":1,"type":"start_turn","request_id":"start-extract","transcript":"keep answers short"}"#,
+            )
+            .await;
+        let messages = gateway
+            .read_until(|message| message_type(message) == "memory_extracted")
+            .await;
+
+        assert!(messages.iter().any(|message| is_terminal(message)));
+        let extracted = messages.last().unwrap();
+        assert!(extracted.contains(r#""created":1"#), "{extracted}");
+        assert!(extracted.contains(r#""activated":1"#), "{extracted}");
+        assert!(extracted.contains(r#""pending_approval":0"#), "{extracted}");
+        assert_eq!(store.list(timestamp(10_000)).unwrap().len(), 1);
+        gateway.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_completed_text_turn_reports_nothing_without_extraction() {
+        let language = HoldOpenLanguageServer::completing().await;
+        let session = GatewaySession::new(runtime_for(language.endpoint()), status());
+        let mut gateway = InMemoryGateway::start(session).await;
+
+        gateway
+            .write(
+                r#"{"protocol_version":1,"type":"start_turn","request_id":"start-plain","transcript":"keep answers short"}"#,
+            )
+            .await;
+        let mut messages = gateway.read_until(is_terminal).await;
+        gateway
+            .write(r#"{"protocol_version":1,"type":"status","request_id":"status-after-turn"}"#)
+            .await;
+        messages.extend(
+            gateway
+                .read_until(|message| message_type(message) == "status")
+                .await,
+        );
+
+        assert!(!messages
+            .iter()
+            .any(|message| message_type(message) == "memory_extracted"));
         gateway.close().await;
     }
 

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use conversation_memory::SystemMemoryClock;
+use conversation_memory::{MemoryClock, MemoryStore, SystemMemoryClock};
 use conversation_runtime::TextTurnRuntime;
 use conversation_runtime_gateway::{GatewayAdapters, GatewayConfig, GatewaySession};
 
@@ -32,15 +32,21 @@ async fn run() -> Result<(), ()> {
         language,
         voice,
         memory_store,
+        memory_extraction,
         status: _,
     } = adapters;
     let runtime = TextTurnRuntime::new(context.clone(), language.clone());
     let mut session = GatewaySession::new(runtime, status);
     if let Some(voice_adapters) = voice {
-        session = session.with_voice(voice_adapters, context, language);
+        session = session.with_voice(voice_adapters, context, language.clone());
     }
     if let Some(store) = memory_store {
-        session = session.with_memory_inspection(Arc::new(store), Arc::new(SystemMemoryClock));
+        let store: Arc<dyn MemoryStore> = Arc::new(store);
+        let clock: Arc<dyn MemoryClock> = Arc::new(SystemMemoryClock);
+        session = session.with_memory_inspection(store.clone(), clock.clone());
+        if let Some(settings) = memory_extraction {
+            session = session.with_memory_extraction(store, language, clock, settings);
+        }
     }
     session
         .run(tokio::io::stdin(), tokio::io::stdout())

@@ -8,14 +8,19 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use conversation_memory::{MemoryClock, MemoryStore};
-use conversation_model_adapters::{GenerationLanguageModel, GenerationLanguageRequest};
+use conversation_model_adapters::{
+    AdapterError, GenerationLanguageModel, GenerationLanguageRequest, GenerationTextDelta,
+};
 use conversation_protocol::{
     GenerationId, MemoryConfidence, MemoryDraft, MemoryKind, MemoryProvenance,
     MemoryProvenanceKind, MemoryRetention, MemoryState, TurnId, UnixTimestampMillis,
     MAX_MEMORY_CONTENT_BYTES,
 };
+use tokio::sync::mpsc;
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 /// The extraction instruction. The exchange is framed as data so that a user or an
@@ -38,6 +43,11 @@ const EXTRACTION_INSTRUCTION: &str = concat!(
 
 const EXTRACTION_ACTOR: &str = "memory-extraction";
 const EXTRACTION_GENERATION_ID: GenerationId = GenerationId::new(1);
+/// Wall-clock bound on one extraction's generation call. Generous, because the local
+/// model is also serving live turns, but finite: without it a model that stalls would
+/// hold the single-flight slot for the rest of the session and silently disable the
+/// feature with no recovery short of restarting the gateway.
+const EXTRACTION_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_CONFIDENCE: u64 = 500;
 const MILLIS_PER_DAY: i64 = 24 * 60 * 60 * 1_000;
 const MAX_EXCHANGE_SIDE_BYTES: usize = 2 * 1024;
@@ -79,6 +89,7 @@ pub struct MemoryExtractor {
     settings: MemoryExtractionSettings,
     on_extracted: MemoryExtractionSink,
     extracting: AtomicBool,
+    cancellation: CancellationToken,
 }
 
 impl MemoryExtractor {
@@ -96,7 +107,15 @@ impl MemoryExtractor {
             settings,
             on_extracted,
             extracting: AtomicBool::new(false),
+            cancellation: CancellationToken::new(),
         }
+    }
+
+    /// Winds down extraction for good. The session calls this on its way out so an
+    /// in-flight attempt stops instead of running on detached: the generation request
+    /// is torn down through its child token and the task ends without writing.
+    pub fn cancel(&self) {
+        self.cancellation.cancel();
     }
 
     /// Starts extraction for one completed exchange and returns immediately.
@@ -126,9 +145,13 @@ impl MemoryExtractor {
         let assistant_text = truncated(assistant_text, MAX_EXCHANGE_SIDE_BYTES).to_owned();
         tokio::spawn(async move {
             let _slot = ExtractionSlot(Arc::clone(&extractor));
-            extractor
-                .extract(turn_id, &user_text, &assistant_text)
-                .await;
+            let cancelled = extractor.cancellation.clone();
+            tokio::select! {
+                () = cancelled.cancelled() => {
+                    eprintln!("memory extraction dropped: the session is shutting down");
+                }
+                () = extractor.extract(turn_id, &user_text, &assistant_text) => {}
+            }
         });
     }
 
@@ -169,22 +192,38 @@ impl MemoryExtractor {
     }
 
     async fn generate(&self, turn_id: TurnId, prompt: String) -> Option<String> {
+        // A child of the extractor's own token: cancelling either the session or this
+        // one request tears the generation down inside the adapter.
+        let cancellation = self.cancellation.child_token();
         let request = GenerationLanguageRequest::new(turn_id, EXTRACTION_GENERATION_ID, prompt);
-        let mut deltas = self.language.stream(request, CancellationToken::new());
-        let mut response = String::new();
-        while let Some(delta) = deltas.recv().await {
-            let Ok(delta) = delta else {
-                eprintln!("memory extraction dropped: the language model failed");
-                return None;
-            };
-            if response.len().saturating_add(delta.delta().len()) > MAX_RESPONSE_BYTES {
-                eprintln!("memory extraction dropped: the model reply exceeded its byte budget");
-                return None;
+        let deltas = self.language.stream(request, cancellation.clone());
+        match timeout(EXTRACTION_TIMEOUT, collect_response(deltas)).await {
+            Ok(response) => response,
+            Err(_) => {
+                cancellation.cancel();
+                eprintln!("memory extraction dropped: the model did not reply in time");
+                None
             }
-            response.push_str(delta.delta());
         }
-        Some(response)
     }
+}
+
+async fn collect_response(
+    mut deltas: mpsc::Receiver<Result<GenerationTextDelta, AdapterError>>,
+) -> Option<String> {
+    let mut response = String::new();
+    while let Some(delta) = deltas.recv().await {
+        let Ok(delta) = delta else {
+            eprintln!("memory extraction dropped: the language model failed");
+            return None;
+        };
+        if response.len().saturating_add(delta.delta().len()) > MAX_RESPONSE_BYTES {
+            eprintln!("memory extraction dropped: the model reply exceeded its byte budget");
+            return None;
+        }
+        response.push_str(delta.delta());
+    }
+    Some(response)
 }
 
 /// Releases the single-flight slot even when the extraction task unwinds.
@@ -358,14 +397,12 @@ fn truncated(text: &str, maximum_bytes: usize) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::sync::Mutex as StdMutex;
 
     use conversation_memory::{MemoryStoreResult, SqliteMemoryStore};
     use conversation_model_adapters::MockGenerationLanguageModel;
     use conversation_protocol::MemoryRecord;
     use tempfile::TempDir;
-    use tokio::sync::mpsc;
-    use tokio::time::timeout;
 
     use super::*;
 
@@ -509,6 +546,108 @@ mod tests {
         wait_for_idle(&extractor).await;
         assert_eq!(probe.requests().len(), 1);
         assert_eq!(store.list(timestamp(NOW)).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_stalled_model_releases_the_single_flight_slot_after_the_timeout() {
+        let (_temporary, store) = initialized_store();
+        let model = StallingLanguageModel::new([
+            r#"[{"kind":"semantic","content":"the user ships rust","explicit":false,"confidence":700}]"#,
+        ]);
+        let tokens = Arc::clone(&model.tokens);
+        let (extractor, mut counts) = extractor_for(&store, Arc::new(model), settings(3, 90));
+
+        tokio::time::pause();
+        extractor.observe_exchange(TurnId::new(1), "the stalled exchange", "noted");
+        tokio::task::yield_now().await;
+        tokio::time::advance(EXTRACTION_TIMEOUT + Duration::from_secs(1)).await;
+        tokio::time::resume();
+        wait_for_idle(&extractor).await;
+
+        assert!(
+            tokens.lock().unwrap()[0].is_cancelled(),
+            "the timed-out generation request was not torn down"
+        );
+
+        extractor.observe_exchange(TurnId::new(2), "the next exchange", "noted");
+
+        assert_eq!(next_counts(&mut counts).await.created, 1);
+        assert_eq!(store.list(timestamp(NOW)).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_extractor_ends_an_in_flight_extraction() {
+        let (_temporary, store) = initialized_store();
+        let model = StallingLanguageModel::new(Vec::<String>::new());
+        let tokens = Arc::clone(&model.tokens);
+        let (extractor, mut counts) = extractor_for(&store, Arc::new(model), settings(3, 90));
+
+        extractor.observe_exchange(TurnId::new(1), "the stalled exchange", "noted");
+        wait_for_generation(&tokens).await;
+        extractor.cancel();
+
+        wait_for_idle(&extractor).await;
+        assert!(tokens.lock().unwrap()[0].is_cancelled());
+        assert!(store.list(timestamp(NOW)).unwrap().is_empty());
+        assert!(counts.try_recv().is_err());
+    }
+
+    /// Stalls its first request forever — the sender is parked, never resolved — and
+    /// answers every later one from the canned deltas.
+    struct StallingLanguageModel {
+        deltas: Vec<String>,
+        tokens: Arc<StdMutex<Vec<CancellationToken>>>,
+        stalled: StdMutex<Vec<mpsc::Sender<Result<GenerationTextDelta, AdapterError>>>>,
+    }
+
+    impl StallingLanguageModel {
+        fn new<I, S>(deltas: I) -> Self
+        where
+            I: IntoIterator<Item = S>,
+            S: Into<String>,
+        {
+            Self {
+                deltas: deltas.into_iter().map(Into::into).collect(),
+                tokens: Arc::new(StdMutex::new(Vec::new())),
+                stalled: StdMutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl GenerationLanguageModel for StallingLanguageModel {
+        fn stream(
+            &self,
+            request: GenerationLanguageRequest,
+            cancellation: CancellationToken,
+        ) -> mpsc::Receiver<Result<GenerationTextDelta, AdapterError>> {
+            let mut tokens = self.tokens.lock().unwrap();
+            let first = tokens.is_empty();
+            tokens.push(cancellation);
+            drop(tokens);
+            let (sender, receiver) = mpsc::channel(8);
+            if first {
+                self.stalled.lock().unwrap().push(sender);
+                return receiver;
+            }
+            for delta in &self.deltas {
+                let _ = sender.try_send(Ok(GenerationTextDelta::new(
+                    request.turn_id(),
+                    request.generation_id(),
+                    delta,
+                )));
+            }
+            receiver
+        }
+    }
+
+    async fn wait_for_generation(tokens: &Arc<StdMutex<Vec<CancellationToken>>>) {
+        timeout(TEST_TIMEOUT, async {
+            while tokens.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("extraction never reached the language model");
     }
 
     fn settings(

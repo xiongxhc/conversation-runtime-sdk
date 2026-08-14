@@ -409,6 +409,11 @@ impl GatewaySession {
         if let Some(message) = exit.fatal_message() {
             let _ = send_urgent(&urgent_sender, fatal_message(message));
         }
+        // Cancelled before the lanes close so an in-flight extraction stops instead of
+        // running on detached past the session that started it.
+        if let Some(extractor) = self.memory_extraction.as_ref() {
+            extractor.cancel();
+        }
         // Reaped before the event lane is dropped: the forwarder holds its own sender
         // clone, and `writer_loop` only closes the lane once every clone is gone.
         if let Some(forwarder) = extracted_forwarder {
@@ -1797,11 +1802,11 @@ mod tests {
         SqliteMemoryStore,
     };
     use conversation_model_adapters::{
-        AdapterError, AdapterFuture, GenerationLanguageModel, MockContinuousAudioOutput,
-        MockGenerationLanguageModel, MockStreamingSpeechSynthesizer, MockVoiceCaptureControl,
-        MockVoiceIoFactory, OllamaConfig, OllamaLanguageModel, RecognitionEvent,
-        RecognitionHypothesis, VoiceCaptureControl, VoiceInput, VoiceInputEvent, VoiceIoFactory,
-        VoiceIoSession,
+        AdapterError, AdapterFuture, GenerationLanguageModel, GenerationLanguageRequest,
+        GenerationTextDelta, MockContinuousAudioOutput, MockGenerationLanguageModel,
+        MockStreamingSpeechSynthesizer, MockVoiceCaptureControl, MockVoiceIoFactory, OllamaConfig,
+        OllamaLanguageModel, RecognitionEvent, RecognitionHypothesis, VoiceCaptureControl,
+        VoiceInput, VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
     };
     use conversation_protocol::{
         ClientRuntimeEvent, ComponentDescriptor, ComponentKind, ExecutionLocation, GatewayMessage,
@@ -3708,6 +3713,66 @@ mod tests {
         assert!(extracted.contains(r#""pending_approval":0"#), "{extracted}");
         assert_eq!(store.list(timestamp(10_000)).unwrap().len(), 1);
         gateway.close().await;
+    }
+
+    #[tokio::test]
+    async fn session_shutdown_cancels_an_in_flight_extraction() {
+        let (_temporary, store) = initialized_store();
+        let language = HoldOpenLanguageServer::completing().await;
+        let extraction = StalledExtractionModel::default();
+        let requests = Arc::clone(&extraction.requests);
+        let session = GatewaySession::new(runtime_for(language.endpoint()), memory_status())
+            .with_memory_extraction(
+                Arc::new(store.clone()),
+                Arc::new(extraction),
+                Arc::new(FixedClock(timestamp(10_000))),
+                crate::MemoryExtractionSettings::new(3, 90),
+            );
+        let mut gateway = InMemoryGateway::start(session).await;
+
+        gateway
+            .write(
+                r#"{"protocol_version":1,"type":"start_turn","request_id":"start-stalled","transcript":"keep answers short"}"#,
+            )
+            .await;
+        gateway.read_until(is_terminal).await;
+        timeout(TEST_TIMEOUT, async {
+            while requests.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("extraction never reached the language model");
+
+        gateway.close().await;
+
+        assert!(
+            requests.lock().unwrap()[0].is_cancelled(),
+            "session shutdown left the extraction request running"
+        );
+        assert!(store.list(timestamp(10_000)).unwrap().is_empty());
+    }
+
+    /// A model that never answers, so the extraction it serves is still in flight when
+    /// the session shuts down. Keeps the cancellation token it was handed so the test
+    /// can see whether shutdown tore the request down.
+    #[derive(Default)]
+    struct StalledExtractionModel {
+        requests: Arc<StdMutex<Vec<CancellationToken>>>,
+        stalled: StdMutex<Vec<mpsc::Sender<Result<GenerationTextDelta, AdapterError>>>>,
+    }
+
+    impl GenerationLanguageModel for StalledExtractionModel {
+        fn stream(
+            &self,
+            _request: GenerationLanguageRequest,
+            cancellation: CancellationToken,
+        ) -> mpsc::Receiver<Result<GenerationTextDelta, AdapterError>> {
+            let (sender, receiver) = mpsc::channel(1);
+            self.stalled.lock().unwrap().push(sender);
+            self.requests.lock().unwrap().push(cancellation);
+            receiver
+        }
     }
 
     #[tokio::test]

@@ -261,6 +261,55 @@ async fn cancelled_voice_output_is_excluded_from_later_text_history() {
     context.discard_turn(text.identity(), false).await.unwrap();
 }
 
+#[tokio::test]
+async fn apply_persona_round_trips_through_persona_snapshot() {
+    let context = ConversationContext::new(quality());
+
+    let (initial_persona, initial_mode) = context.persona_snapshot().await;
+    assert_eq!(initial_persona, PersonaProfile::default());
+    assert_eq!(initial_mode, ConversationMode::DirectAnswer);
+
+    let new_persona = PersonaProfile::new(
+        conversation_protocol::PersonaLevel::new(15).unwrap(),
+        conversation_protocol::PersonaLevel::new(15).unwrap(),
+        conversation_protocol::PersonaLevel::new(15).unwrap(),
+        conversation_protocol::PersonaLevel::new(15).unwrap(),
+        conversation_protocol::PersonaLevel::new(15).unwrap(),
+        conversation_protocol::PersonaLevel::new(15).unwrap(),
+        conversation_protocol::PersonaLevel::new(75).unwrap(),
+        conversation_protocol::PersonaLevel::new(15).unwrap(),
+    );
+    context
+        .apply_persona(new_persona.clone(), ConversationMode::Companionship)
+        .await
+        .unwrap();
+
+    let (snapshot_persona, snapshot_mode) = context.persona_snapshot().await;
+    assert_eq!(snapshot_persona, new_persona);
+    assert_eq!(snapshot_mode, ConversationMode::Companionship);
+}
+
+#[tokio::test]
+async fn apply_persona_is_rejected_while_a_turn_is_active() {
+    let context = ConversationContext::new(quality());
+    let turn = context
+        .begin_turn(ConversationTurnSource::Text, "pending")
+        .await
+        .unwrap();
+
+    let error = context
+        .apply_persona(PersonaProfile::default(), ConversationMode::Brainstorming)
+        .await
+        .unwrap_err();
+    assert!(error.message().contains("pending"));
+
+    context.discard_turn(turn.identity(), false).await.unwrap();
+    context
+        .apply_persona(PersonaProfile::default(), ConversationMode::Brainstorming)
+        .await
+        .unwrap();
+}
+
 #[derive(Default)]
 struct BlockingLanguage {
     started: Arc<Notify>,

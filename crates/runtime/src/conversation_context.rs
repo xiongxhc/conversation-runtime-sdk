@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use conversation_memory::MemoryContextProvider;
 use conversation_protocol::{
-    ExecutionLocation, GenerationId, RuntimeError, RuntimeErrorKind, RuntimeStage, SessionId,
-    TurnId,
+    ConversationMode, ExecutionLocation, GenerationId, PersonaProfile, RuntimeError,
+    RuntimeErrorKind, RuntimeStage, SessionId, TurnId,
 };
 use tokio::sync::Mutex;
 
@@ -95,6 +95,23 @@ impl ConversationContext {
         }
         self.memory = Some(provider);
         Ok(self)
+    }
+
+    /// Mutates the live persona and default conversation mode. Rejected
+    /// while a turn is pending in the quality controller, so a mutation
+    /// can never land mid-turn.
+    pub async fn apply_persona(
+        &self,
+        persona: PersonaProfile,
+        mode: ConversationMode,
+    ) -> Result<(), RuntimeError> {
+        let mut quality = self.quality.lock().await;
+        quality.set_persona(persona, mode)
+    }
+
+    pub async fn persona_snapshot(&self) -> (PersonaProfile, ConversationMode) {
+        let quality = self.quality.lock().await;
+        (quality.saved_persona().clone(), quality.default_mode())
     }
 
     pub async fn active_turn(&self) -> Option<ConversationTurnIdentity> {

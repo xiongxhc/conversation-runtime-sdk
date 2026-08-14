@@ -403,6 +403,81 @@ fn system_guidance_exposes_all_persona_levels_without_intimacy_authorizing_affec
 }
 
 #[test]
+fn set_persona_is_rejected_while_a_turn_is_pending() {
+    let mut controller = controller();
+    controller
+        .resolve_turn(TurnId::new(1), "Hello", None)
+        .unwrap()
+        .unwrap();
+
+    let new_persona = PersonaProfile::new(
+        level(10),
+        level(10),
+        level(10),
+        level(10),
+        level(10),
+        level(10),
+        level(90),
+        level(10),
+    );
+    let error = controller
+        .set_persona(new_persona.clone(), ConversationMode::Brainstorming)
+        .unwrap_err();
+    assert!(error.message().contains("pending"));
+
+    // The rejected mutation must not have taken effect.
+    assert_eq!(controller.saved_persona(), &PersonaProfile::default());
+    assert_eq!(controller.default_mode(), ConversationMode::DirectAnswer);
+
+    controller.complete_turn(TurnId::new(1), "answer").unwrap();
+    controller
+        .set_persona(new_persona.clone(), ConversationMode::Brainstorming)
+        .unwrap();
+    assert_eq!(controller.saved_persona(), &new_persona);
+}
+
+#[test]
+fn set_persona_takes_effect_in_the_next_resolved_turn() {
+    let mut controller = controller();
+    let expansive_persona = PersonaProfile::new(
+        level(50),
+        level(50),
+        level(50),
+        level(50),
+        level(50),
+        level(50),
+        level(85),
+        level(50),
+    );
+
+    controller
+        .set_persona(expansive_persona.clone(), ConversationMode::Reflective)
+        .unwrap();
+
+    assert_eq!(
+        controller.default_controls().maximum_spoken_seconds(),
+        expansive_persona.maximum_spoken_seconds()
+    );
+    assert_eq!(controller.default_mode(), ConversationMode::Reflective);
+
+    let resolved = controller
+        .resolve_turn(
+            TurnId::new(1),
+            "Tell me a long story about the history of this old house",
+            None,
+        )
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(resolved.decision().mode(), ConversationMode::Reflective);
+    assert_eq!(
+        resolved.decision().controls().maximum_spoken_seconds(),
+        expansive_persona.maximum_spoken_seconds()
+    );
+    assert!(resolved.system_guidance().contains("verbosity=85"));
+}
+
+#[test]
 fn silence_creates_no_pending_turn_or_quality_decision() {
     let mut controller = controller();
 

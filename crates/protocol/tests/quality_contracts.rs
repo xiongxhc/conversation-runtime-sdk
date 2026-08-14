@@ -23,6 +23,27 @@ fn persona_levels_and_response_controls_enforce_public_bounds() {
 }
 
 #[test]
+fn maximum_spoken_seconds_follows_the_expansive_verbosity_curve() {
+    let profile = |verbosity: u8| {
+        PersonaProfile::new(
+            level(80),
+            level(60),
+            level(40),
+            level(35),
+            level(80),
+            level(30),
+            level(verbosity),
+            level(25),
+        )
+    };
+
+    assert_eq!(profile(20).maximum_spoken_seconds(), 24);
+    assert_eq!(profile(60).maximum_spoken_seconds(), 52);
+    assert_eq!(profile(85).maximum_spoken_seconds(), 144);
+    assert_eq!(profile(100).maximum_spoken_seconds(), 200);
+}
+
+#[test]
 fn persona_and_response_defaults_are_explicit_and_inspectable() {
     let persona = PersonaProfile::default();
     let controls = ResponseControls::default();
@@ -120,4 +141,8 @@ fn quality_event_serialization_is_content_free_and_nonterminal() {
     ] {
         assert!(!json.contains(forbidden));
     }
+}
+
+fn level(value: u8) -> PersonaLevel {
+    PersonaLevel::new(value).unwrap()
 }

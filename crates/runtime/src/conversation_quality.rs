@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use conversation_protocol::{
     ContextSource, ConversationMessage, ConversationMode, ConversationRole, ConversationSignal,
     FollowUpPolicy, PersonaProfile, QualityDecision, ResponseControls, RuntimeError,
-    RuntimeErrorKind, RuntimeStage, SpeechPace, TurnId,
+    RuntimeErrorKind, RuntimeStage, SilencePolicy, SpeechPace, TurnId,
 };
 
 const MAX_HISTORY_EXCHANGES: usize = 8;
@@ -112,6 +112,31 @@ impl ConversationQualityController {
             .iter()
             .flat_map(|exchange| [exchange.user.clone(), exchange.assistant.clone()])
             .collect()
+    }
+
+    /// Replaces the saved persona, default mode, and default response
+    /// controls used by future turns. Rejected while a turn is pending, the
+    /// same guard `resolve_turn` enforces, so a mutation can never land
+    /// mid-turn.
+    pub fn set_persona(
+        &mut self,
+        persona: PersonaProfile,
+        mode: ConversationMode,
+    ) -> Result<(), RuntimeError> {
+        if self.pending_turn.is_some() {
+            return Err(state_error("a quality-controlled turn is still pending"));
+        }
+        let default_controls = ResponseControls::new(
+            persona.maximum_spoken_seconds(),
+            persona.directness(),
+            SpeechPace::Natural,
+            FollowUpPolicy::Contextual,
+            SilencePolicy::AllowWithoutFiller,
+        )?;
+        self.saved_persona = persona;
+        self.default_mode = mode;
+        self.default_controls = default_controls;
+        Ok(())
     }
 
     pub fn resolve_turn(

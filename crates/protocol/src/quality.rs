@@ -86,6 +86,16 @@ impl PersonaProfile {
     pub const fn follow_up_frequency(&self) -> PersonaLevel {
         self.follow_up_frequency
     }
+
+    /// Verbosity buys the spoken budget up front; the quality controller
+    /// still reduces it per turn. Above the expansive threshold the curve
+    /// steepens into long-form territory (v60 = 52s, v85 = 144s, v100 =
+    /// 200s) so a storyteller persona can actually tell a story.
+    pub const fn maximum_spoken_seconds(&self) -> u16 {
+        let verbosity = self.verbosity.get() as u16;
+        let expansive_bonus = verbosity.saturating_sub(60) * 3;
+        10 + verbosity * 7 / 10 + expansive_bonus
+    }
 }
 
 impl Default for PersonaProfile {

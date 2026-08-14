@@ -3,6 +3,7 @@ import {
   type MemoryCursor,
   type MemoryInspection,
   type MemoryPage,
+  type PersonaState,
   type RuntimeEvent,
   type RuntimeFailure,
   type RuntimeStatus,
@@ -139,6 +140,16 @@ export class ConversationSession {
   async inspectMemory(memoryId: bigint): Promise<MemoryInspection> {
     this.ensureMemoryReady();
     return this.client.inspectMemory(memoryId);
+  }
+
+  async getPersona(): Promise<PersonaState> {
+    this.ensurePersonaReady();
+    return this.client.getPersona();
+  }
+
+  async updatePersona(persona: PersonaState): Promise<PersonaState> {
+    this.ensurePersonaReady();
+    return this.client.updatePersona(persona);
   }
 
   async interrupt(): Promise<void> {
@@ -519,6 +530,18 @@ export class ConversationSession {
   private ensureMemoryReady(): void {
     if (this.phase === "streaming") {
       throw new Error("finish or stop the active response before inspecting memory");
+    }
+    if (this.phase === "closed") {
+      throw new Error("conversation session is closed");
+    }
+    if (this.phase === "failed") {
+      throw this.error ?? new Error("conversation session failed");
+    }
+  }
+
+  private ensurePersonaReady(): void {
+    if (this.phase === "streaming") {
+      throw new Error("finish or stop the active response before changing persona");
     }
     if (this.phase === "closed") {
       throw new Error("conversation session is closed");

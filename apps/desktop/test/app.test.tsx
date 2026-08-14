@@ -8,12 +8,14 @@ import type {
   MemoryCursor,
   MemoryInspection,
   MemoryPage,
+  PersonaState,
 } from "@conversation/runtime/browser";
 import type {
   ConversationHistory,
   ConversationHistoryStore,
   ConversationSummary,
 } from "../src/history/conversation-history.js";
+import { preferencesStorageKey } from "../src/preferences/preferences.js";
 import { setupStorageKey } from "../src/preferences/setup.js";
 import type { ConversationSessionState } from "../src/runtime/conversation-session.js";
 
@@ -21,6 +23,9 @@ type Assert<T extends true> = T;
 type IsRequired<T, Key extends keyof T> = object extends Pick<T, Key> ? false : true;
 type DesktopMemoryMethodsAreRequired = Assert<
   IsRequired<DesktopSession, "listMemories"> & IsRequired<DesktopSession, "inspectMemory">
+>;
+type DesktopPersonaMethodsAreRequired = Assert<
+  IsRequired<DesktopSession, "getPersona"> & IsRequired<DesktopSession, "updatePersona">
 >;
 
 afterEach(cleanup);
@@ -208,7 +213,7 @@ describe("desktop app", () => {
     expect(screen.getByRole("button", { name: "History" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Memory" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Persona" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Settings" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Settings" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Enter Voice Focus" })).toBeNull();
     expect(screen.getByText(/Microphone and speech playback are not connected/i)).toBeTruthy();
     expect(screen.getByRole("button", { name: "Preview Voice Focus" })).toBeTruthy();
@@ -232,10 +237,29 @@ describe("desktop app", () => {
     expect(await screen.findByRole("heading", { name: "Runtime memory" })).toBeTruthy();
     expect(memory.getAttribute("aria-current")).toBe("page");
     expect(screen.queryByRole("button", { name: "Persona" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Settings" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Settings" })).toBeTruthy();
   });
 
-  it("disables Memory during an active response but keeps History available", async () => {
+  it("opens Settings from the rail and shows the persona controls", async () => {
+    const session = new FakeSession(localState());
+    session.getPersona.mockResolvedValueOnce(personaState());
+    render(
+      <App
+        connectSession={vi.fn(async () => session)}
+        historyStore={new FakeHistoryStore()}
+        storage={memoryStorage()}
+      />,
+    );
+
+    connectWithAbsolutePaths();
+    const settings = await screen.findByRole("button", { name: "Settings" });
+    fireEvent.click(settings);
+
+    expect(await screen.findByRole("heading", { name: "Persona settings" })).toBeTruthy();
+    expect(settings.getAttribute("aria-current")).toBe("page");
+  });
+
+  it("disables Memory and Settings during an active response but keeps History available", async () => {
     const session = new FakeSession(memoryState({
       phase: "streaming",
       turns: [conversationTurn(1n, "Active question", "Partial", "streaming")],
@@ -256,10 +280,80 @@ describe("desktop app", () => {
     expect(screen.getByText(
       "Finish or stop the active response before opening Memory.",
     )).toBeTruthy();
+    const settings = screen.getByRole("button", { name: "Settings" });
+    expect(settings.hasAttribute("disabled")).toBe(true);
+    expect(screen.getByText(
+      "Finish or stop the active response before opening Settings.",
+    )).toBeTruthy();
     const history = screen.getByRole("button", { name: "History" });
     expect(history.hasAttribute("disabled")).toBe(false);
     fireEvent.click(history);
     expect(await screen.findByRole("heading", { name: "Conversation history" })).toBeTruthy();
+  });
+
+  it("replays the active persona preset once after connecting", async () => {
+    const storage = memoryStorage();
+    const preset = { name: "Focused", persona: personaState({ mode: "direct_answer", warmth: 20 }) };
+    storage.setItem(preferencesStorageKey, JSON.stringify({
+      version: 4,
+      focusScene: "soft-aurora",
+      focusIntensity: 0.55,
+      focusEntry: "manual",
+      rememberTranscriptVisibility: false,
+      transcriptVisible: false,
+      reducedMotion: "system",
+      personaPresets: [preset],
+      activePresetName: "Focused",
+    }));
+    const session = new FakeSession(localState());
+    session.updatePersona.mockResolvedValueOnce(preset.persona);
+    render(
+      <App
+        connectSession={vi.fn(async () => session)}
+        historyStore={new FakeHistoryStore()}
+        storage={storage}
+      />,
+    );
+
+    connectWithAbsolutePaths();
+    await screen.findByLabelText("Message");
+
+    await waitFor(() => expect(session.updatePersona).toHaveBeenCalledTimes(1));
+    expect(session.updatePersona).toHaveBeenCalledWith(preset.persona);
+  });
+
+  it("shows a non-fatal notice when persona replay fails, without blocking the app", async () => {
+    const storage = memoryStorage();
+    const preset = { name: "Focused", persona: personaState() };
+    storage.setItem(preferencesStorageKey, JSON.stringify({
+      version: 4,
+      focusScene: "soft-aurora",
+      focusIntensity: 0.55,
+      focusEntry: "manual",
+      rememberTranscriptVisibility: false,
+      transcriptVisible: false,
+      reducedMotion: "system",
+      personaPresets: [preset],
+      activePresetName: "Focused",
+    }));
+    const session = new FakeSession(localState());
+    session.updatePersona.mockRejectedValueOnce(new Error("boom"));
+    render(
+      <App
+        connectSession={vi.fn(async () => session)}
+        historyStore={new FakeHistoryStore()}
+        storage={storage}
+      />,
+    );
+
+    connectWithAbsolutePaths();
+    await screen.findByLabelText("Message");
+
+    expect(await screen.findByText(
+      'The "Focused" persona preset could not be applied. Open Settings to reapply it.',
+    )).toBeTruthy();
+    expect(screen.getByLabelText("Message")).toBeTruthy();
+    expect(screen.queryByText("Runtime disconnected")).toBeNull();
   });
 
   it("persists completed chats locally and opens prior chats read-only", async () => {
@@ -627,6 +721,8 @@ class FakeSession implements DesktopSession {
   readonly interrupt = vi.fn(async () => undefined);
   readonly inspectMemory = vi.fn<(memoryId: bigint) => Promise<MemoryInspection>>();
   readonly listMemories = vi.fn<(cursor?: MemoryCursor | null) => Promise<MemoryPage>>();
+  readonly getPersona = vi.fn<() => Promise<PersonaState>>();
+  readonly updatePersona = vi.fn<(persona: PersonaState) => Promise<PersonaState>>();
   readonly pauseVoiceCapture = vi.fn(async () => undefined);
   readonly resumeVoiceCapture = vi.fn(async () => undefined);
   readonly send = vi.fn(async () => 1n);
@@ -794,6 +890,21 @@ class FakeHistoryStore implements ConversationHistoryStore {
     this.nextSave = deferred<void>();
     return this.nextSave;
   }
+}
+
+function personaState(overrides: Partial<PersonaState> = {}): PersonaState {
+  return {
+    mode: "companionship",
+    warmth: 70,
+    humor: 40,
+    teasing: 15,
+    initiative: 55,
+    directness: 60,
+    intimacy: 25,
+    verbosity: 45,
+    followUpFrequency: 35,
+    ...overrides,
+  };
 }
 
 function conversationTurn(

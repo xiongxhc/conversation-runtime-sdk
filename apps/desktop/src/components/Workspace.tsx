@@ -16,6 +16,7 @@ import {
 } from "./PrivacyStatus.js";
 import { ConversationVoiceStatus } from "./ConversationVoiceStatus.js";
 import { MemoryPane } from "./MemoryPane.js";
+import { SettingsPane } from "./SettingsPane.js";
 import { VoiceExitDialog, type VoiceExitChoice } from "./VoiceExitDialog.js";
 import { VoiceFocus } from "./VoiceFocus.js";
 
@@ -28,7 +29,7 @@ export interface WorkspaceProps {
 }
 
 type FocusMode = "live" | "preview";
-type WorkspaceView = "conversation" | "history" | "memory";
+type WorkspaceView = "conversation" | "history" | "memory" | "settings";
 type VoiceControlFailure = { message: string; retry: () => Promise<void> };
 
 export function Workspace({
@@ -48,6 +49,7 @@ export function Workspace({
   const [historyPath, setHistoryPath] = useState<string>();
   const [historyError, setHistoryError] = useState<string>();
   const [operationError, setOperationError] = useState<string>();
+  const [personaReplayNotice, setPersonaReplayNotice] = useState<string>();
   const [voiceControlFailure, setVoiceControlFailure] = useState<VoiceControlFailure>();
   const [exitVoiceSessionId, setExitVoiceSessionId] = useState<bigint | null>();
   const [exitDialogError, setExitDialogError] = useState<string>();
@@ -104,10 +106,26 @@ export function Workspace({
     }
   }, [focusMode]);
   useEffect(() => {
-    if (workspaceView === "memory" && sessionState.phase !== "ready") {
+    if (
+      (workspaceView === "memory" || workspaceView === "settings") &&
+      sessionState.phase !== "ready"
+    ) {
       setWorkspaceView("conversation");
     }
   }, [sessionState.phase, workspaceView]);
+  useEffect(() => {
+    // Replay fires once per connect: this effect depends only on session identity,
+    // so a later preset change or preference edit does not retrigger it.
+    const activePreset = preferences.personaPresets.find(
+      (preset) => preset.name === preferences.activePresetName,
+    );
+    if (!activePreset) return;
+    void session.updatePersona(activePreset.persona).catch(() => {
+      setPersonaReplayNotice(
+        `The "${activePreset.name}" persona preset could not be applied. Open Settings to reapply it.`,
+      );
+    });
+  }, [session]);
   useEffect(() => {
     const pending = typedResume.current;
     if (sessionState.voice.session !== "active") {
@@ -530,6 +548,22 @@ export function Workspace({
             ) : null}
           </>
         ) : null}
+        <button
+          aria-current={workspaceView === "settings" ? "page" : undefined}
+          aria-describedby={sessionState.phase === "streaming"
+            ? "settings-navigation-explanation"
+            : undefined}
+          disabled={sessionState.phase === "streaming"}
+          onClick={() => setWorkspaceView("settings")}
+          type="button"
+        >
+          Settings
+        </button>
+        {sessionState.phase === "streaming" ? (
+          <p className="visually-hidden" id="settings-navigation-explanation">
+            Finish or stop the active response before opening Settings.
+          </p>
+        ) : null}
       </nav>
 
       {workspaceView === "history" ? (
@@ -547,6 +581,13 @@ export function Workspace({
           onBack={() => setWorkspaceView("conversation")}
           session={session}
           status={sessionState.status}
+        />
+      ) : workspaceView === "settings" ? (
+        <SettingsPane
+          onBack={() => setWorkspaceView("conversation")}
+          onPreferencesChange={updatePreferences}
+          preferences={preferences}
+          session={session}
         />
       ) : (
         <section className="conversation-pane" aria-labelledby="conversation-title">
@@ -639,6 +680,9 @@ export function Workspace({
       )}
 
       <aside className="runtime-sidebar" aria-label="Runtime status">
+        {personaReplayNotice ? (
+          <p className="workspace-notice" role="status">{personaReplayNotice}</p>
+        ) : null}
         <div>
           <p className="utility-label">
             {sessionState.phase === "failed" || sessionState.phase === "closed"

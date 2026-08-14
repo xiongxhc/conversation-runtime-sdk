@@ -373,6 +373,8 @@ class MemorySession implements DesktopSession {
   readonly inspectMemory = vi.fn<(memoryId: bigint) => Promise<MemoryInspection>>();
   readonly interrupt = vi.fn(async () => undefined);
   readonly listMemories = vi.fn<(cursor?: MemoryCursor | null) => Promise<MemoryPage>>();
+  readonly getPersona = vi.fn<DesktopSession["getPersona"]>();
+  readonly updatePersona = vi.fn<DesktopSession["updatePersona"]>();
   readonly pauseVoiceCapture = vi.fn(async () => undefined);
   readonly resumeVoiceCapture = vi.fn(async () => undefined);
   readonly send = vi.fn(async () => 1n);

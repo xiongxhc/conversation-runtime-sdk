@@ -4,6 +4,7 @@ import type {
   MemoryCursor,
   MemoryInspection,
   MemoryPage,
+  PersonaState,
 } from "@conversation/runtime/browser";
 
 import { SetupView } from "./components/SetupView.js";
@@ -34,6 +35,8 @@ export interface DesktopSession {
   send(transcript: string): Promise<bigint>;
   listMemories(cursor?: MemoryCursor | null): Promise<MemoryPage>;
   inspectMemory(memoryId: bigint): Promise<MemoryInspection>;
+  getPersona(): Promise<PersonaState>;
+  updatePersona(persona: PersonaState): Promise<PersonaState>;
   interrupt(): Promise<void>;
   startVoice(): Promise<void>;
   stopVoice(): Promise<void>;

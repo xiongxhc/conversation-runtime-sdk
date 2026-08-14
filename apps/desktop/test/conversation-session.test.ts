@@ -4,6 +4,7 @@ import type {
   ClientCommand,
   MemoryInspection,
   MemoryPage,
+  PersonaState,
   RuntimeTransport,
 } from "@conversation/runtime/browser";
 
@@ -72,6 +73,32 @@ const memoryInspection: MemoryInspection = {
   sourcesTruncated: false,
   approvalsTruncated: false,
 };
+
+const personaState: PersonaState = {
+  mode: "companionship",
+  warmth: 70,
+  humor: 40,
+  teasing: 15,
+  initiative: 55,
+  directness: 60,
+  intimacy: 25,
+  verbosity: 45,
+  followUpFrequency: 35,
+};
+
+function personaWire(persona: PersonaState): Record<string, unknown> {
+  return {
+    mode: persona.mode,
+    warmth: persona.warmth,
+    humor: persona.humor,
+    teasing: persona.teasing,
+    initiative: persona.initiative,
+    directness: persona.directness,
+    intimacy: persona.intimacy,
+    verbosity: persona.verbosity,
+    follow_up_frequency: persona.followUpFrequency,
+  };
+}
 
 describe("ConversationSession", () => {
   it("rejects a runtime that does not report a local-only status", async () => {
@@ -542,6 +569,23 @@ describe("ConversationSession", () => {
     );
   });
 
+  it("forwards persona get and update requests only while ready", async () => {
+    const transport = connectedTransport();
+    const session = await ConversationSession.connect(transport);
+
+    await expect(session.getPersona()).resolves.toEqual(personaState);
+    await expect(session.updatePersona({ ...personaState, warmth: 90 })).resolves.toEqual({
+      ...personaState,
+      warmth: 90,
+    });
+
+    await session.send("active turn");
+    await expect(session.getPersona()).rejects.toThrow("finish or stop the active response");
+    await expect(session.updatePersona(personaState)).rejects.toThrow(
+      "finish or stop the active response",
+    );
+  });
+
   it("surfaces a gateway failure", async () => {
     const transport = connectedTransport();
     const session = await ConversationSession.connect(transport);
@@ -750,6 +794,20 @@ class InMemoryTransport implements RuntimeTransport {
           sources_truncated: false,
           approvals_truncated: false,
         },
+      });
+    } else if (command.type === "persona_get") {
+      this.emit({
+        protocol_version: 1,
+        type: "persona_state",
+        request_id: command.requestId,
+        persona: personaWire(personaState),
+      });
+    } else if (command.type === "persona_update") {
+      this.emit({
+        protocol_version: 1,
+        type: "persona_state",
+        request_id: command.requestId,
+        persona: personaWire(command.persona),
       });
     }
   }

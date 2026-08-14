@@ -5,6 +5,7 @@ import { setImmediate } from "node:timers/promises";
 import { CommandRejectedError, RuntimeClient, type RuntimeTransport, type RuntimeTurn } from "../src/client.js";
 import type {
   ClientCommand,
+  PersonaState,
   RuntimeComponentDescriptor,
   RuntimeEvent,
   RuntimeFailure,
@@ -395,6 +396,117 @@ test("rejects out-of-range memory identifiers before sending", async () => {
   assert.throws(() => connected.client.inspectMemory(0n), /u64 range/);
   assert.throws(() => connected.client.inspectMemory(2n ** 64n), /u64 range/);
   assert.equal(connected.transport.sent.length, 0);
+  await connected.client.close();
+});
+
+test("gets and updates persona through the typed persona surface", async () => {
+  const connected = await connectedClient();
+  const client = connected.client;
+
+  const gettingPersona = client.getPersona();
+  const personaGet = command(connected.transport, "persona_get");
+  connected.transport.push(acceptedControl(personaGet.requestId));
+  connected.transport.push(personaStateMessage(personaGet.requestId));
+  assert.deepEqual(await gettingPersona, personaState());
+
+  const updatedPersona: PersonaState = { ...personaState(), warmth: 10 };
+  const updatingPersona = client.updatePersona(updatedPersona);
+  const personaUpdate = command(connected.transport, "persona_update");
+  assert.deepEqual(personaUpdate.persona, updatedPersona);
+  connected.transport.push(acceptedControl(personaUpdate.requestId));
+  connected.transport.push(personaStateMessage(personaUpdate.requestId, updatedPersona));
+  assert.deepEqual(await updatingPersona, updatedPersona);
+  await client.close();
+});
+
+test("rejects an invalid persona before sending and leaves the client usable", async () => {
+  const connected = await connectedClient();
+  assert.throws(() => connected.client.updatePersona({ ...personaState(), warmth: 101 }), /0\.\.=100/);
+  assert.equal(connected.transport.sent.length, 0);
+  await connected.client.close();
+});
+
+test("approves and deletes memory through the typed memory mutation surface", async () => {
+  const connected = await connectedClient();
+  const client = connected.client;
+
+  const approving = client.approveMemory(7n, 2n);
+  const approve = command(connected.transport, "memory_approve");
+  assert.equal(approve.memoryId, 7n);
+  assert.equal(approve.expectedRevision, 2n);
+  connected.transport.push(acceptedControl(approve.requestId));
+  connected.transport.push(memoryInspection(approve.requestId));
+  assert.equal((await approving).record.revision, 3n);
+
+  const deleting = client.deleteMemory(7n, 3n);
+  const del = command(connected.transport, "memory_delete");
+  assert.equal(del.memoryId, 7n);
+  assert.equal(del.expectedRevision, 3n);
+  connected.transport.push(acceptedControl(del.requestId));
+  connected.transport.push({
+    type: "memory_deleted",
+    protocol_version: 1,
+    request_id: del.requestId,
+    memory_id: "7",
+  });
+  assert.equal(await deleting, 7n);
+  await client.close();
+});
+
+test("rejects out-of-range memory approve/delete identifiers before sending", async () => {
+  const connected = await connectedClient();
+  assert.throws(() => connected.client.approveMemory(0n, 2n), /u64 range/);
+  assert.throws(() => connected.client.deleteMemory(7n, 0n), /u64 range/);
+  assert.equal(connected.transport.sent.length, 0);
+  await connected.client.close();
+});
+
+test("exposes a typed memory_conflict rejection and leaves the client healthy", async () => {
+  const connected = await connectedClient();
+  const failure: RuntimeFailure = {
+    code: "memory_conflict",
+    kind: "invalid_state",
+    stage: "memory",
+    message: "memory revision has changed",
+  };
+  const approving = connected.client.approveMemory(7n, 2n);
+  const approve = command(connected.transport, "memory_approve");
+  connected.transport.push(rejected(approve.requestId, failure));
+  await assert.rejects(approving, (error: Error) => assertCommandRejectedError(error, failure));
+
+  const pendingStatus = connected.client.status();
+  const statusCommand = command(connected.transport, "status");
+  connected.transport.push(acceptedControl(statusCommand.requestId));
+  connected.transport.push({ type: "status", protocol_version: 1, request_id: statusCommand.requestId, status: wireStatus() });
+  assert.deepEqual(await pendingStatus, status);
+  await connected.client.close();
+});
+
+test("surfaces memory_extracted as an unsolicited event to subscribers", async () => {
+  const connected = await connectedClient();
+  const received: Array<{ created: number; activated: number; pendingApproval: number }> = [];
+  const unsubscribe = connected.client.onMemoryExtracted((summary) => received.push(summary));
+
+  connected.transport.push({
+    type: "memory_extracted",
+    protocol_version: 1,
+    created: 2,
+    activated: 1,
+    pending_approval: 1,
+  });
+  await setImmediate();
+  assert.deepEqual(received, [{ created: 2, activated: 1, pendingApproval: 1 }]);
+
+  unsubscribe();
+  connected.transport.push({
+    type: "memory_extracted",
+    protocol_version: 1,
+    created: 1,
+    activated: 0,
+    pending_approval: 0,
+  });
+  await setImmediate();
+  assert.deepEqual(received, [{ created: 2, activated: 1, pendingApproval: 1 }]);
   await connected.client.close();
 });
 
@@ -841,6 +953,39 @@ function assertCommandRejectedError(error: Error, failure: RuntimeFailure): bool
   assert.equal(error.message, failure.message);
   assert.deepEqual(error.failure, failure);
   return true;
+}
+
+function personaState(): PersonaState {
+  return {
+    mode: "companionship",
+    warmth: 95,
+    humor: 60,
+    teasing: 40,
+    initiative: 35,
+    directness: 80,
+    intimacy: 30,
+    verbosity: 20,
+    followUpFrequency: 25,
+  };
+}
+
+function personaStateMessage(requestId: string, persona: PersonaState = personaState()): unknown {
+  return {
+    type: "persona_state",
+    protocol_version: 1,
+    request_id: requestId,
+    persona: {
+      mode: persona.mode,
+      warmth: persona.warmth,
+      humor: persona.humor,
+      teasing: persona.teasing,
+      initiative: persona.initiative,
+      directness: persona.directness,
+      intimacy: persona.intimacy,
+      verbosity: persona.verbosity,
+      follow_up_frequency: persona.followUpFrequency,
+    },
+  };
 }
 
 function memoryList(requestId: string, id: string, nextCursor: Record<string, string> | null): unknown {

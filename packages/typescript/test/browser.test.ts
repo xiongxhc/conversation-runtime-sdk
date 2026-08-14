@@ -6,24 +6,28 @@ import * as root from "../src/index.js";
 import type {
   MemoryApproval,
   MemoryCursor,
+  MemoryExtractedSummary,
   MemoryInspection,
   MemoryPage,
   MemoryProvenance,
   MemoryRecord,
   MemoryRetention,
   MemorySummary,
+  PersonaState,
   VoiceSession,
   VoiceSessionEvent,
 } from "../src/browser.js";
 import type {
   MemoryApproval as RootMemoryApproval,
   MemoryCursor as RootMemoryCursor,
+  MemoryExtractedSummary as RootMemoryExtractedSummary,
   MemoryInspection as RootMemoryInspection,
   MemoryPage as RootMemoryPage,
   MemoryProvenance as RootMemoryProvenance,
   MemoryRecord as RootMemoryRecord,
   MemoryRetention as RootMemoryRetention,
   MemorySummary as RootMemorySummary,
+  PersonaState as RootPersonaState,
   VoiceSession as RootVoiceSession,
   VoiceSessionEvent as RootVoiceSessionEvent,
 } from "../src/index.js";
@@ -88,6 +92,29 @@ test("browser and root entries expose browser-safe memory DTOs", () => {
   ] = [cursor, summary, page, record, inspection, provenance, approval, retention];
 
   assert.equal(rootTypes.length, 8);
+});
+
+test("browser and root entries expose persona and memory extraction DTOs", () => {
+  const persona: PersonaState = {
+    mode: "companionship",
+    warmth: 95,
+    humor: 60,
+    teasing: 40,
+    initiative: 35,
+    directness: 80,
+    intimacy: 30,
+    verbosity: 20,
+    followUpFrequency: 25,
+  };
+  const extracted: MemoryExtractedSummary = { created: 2, activated: 1, pendingApproval: 1 };
+  const rootTypes: [RootPersonaState, RootMemoryExtractedSummary] = [persona, extracted];
+
+  assert.equal(rootTypes.length, 2);
+  assert.equal(typeof browser.RuntimeClient.prototype.getPersona, "function");
+  assert.equal(typeof browser.RuntimeClient.prototype.updatePersona, "function");
+  assert.equal(typeof browser.RuntimeClient.prototype.approveMemory, "function");
+  assert.equal(typeof browser.RuntimeClient.prototype.deleteMemory, "function");
+  assert.equal(typeof browser.RuntimeClient.prototype.onMemoryExtracted, "function");
 });
 
 test("browser entry exports complete voice surface without Node builtins", () => {

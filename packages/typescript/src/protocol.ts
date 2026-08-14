@@ -22,7 +22,25 @@ export type ClientCommand =
   | { type: "pause_voice_capture"; requestId: string }
   | { type: "resume_voice_capture"; requestId: string }
   | { type: "memory_list"; requestId: string; cursor: MemoryCursor | null }
-  | { type: "memory_inspect"; requestId: string; memoryId: bigint };
+  | { type: "memory_inspect"; requestId: string; memoryId: bigint }
+  | { type: "persona_get"; requestId: string }
+  | { type: "persona_update"; requestId: string; persona: PersonaState }
+  | { type: "memory_approve"; requestId: string; memoryId: bigint; expectedRevision: bigint }
+  | { type: "memory_delete"; requestId: string; memoryId: bigint; expectedRevision: bigint };
+
+export type PersonaState = {
+  mode: "direct_answer" | "companionship" | "brainstorming" | "reflective";
+  warmth: number;
+  humor: number;
+  teasing: number;
+  initiative: number;
+  directness: number;
+  intimacy: number;
+  verbosity: number;
+  followUpFrequency: number;
+};
+
+export type MemoryExtractedSummary = { created: number; activated: number; pendingApproval: number };
 
 export type MemoryCursor = { beforeId: bigint };
 
@@ -88,7 +106,9 @@ export type RuntimeFailure = {
     | "memory_disabled"
     | "memory_turn_active"
     | "memory_not_found"
-    | "memory_unavailable";
+    | "memory_unavailable"
+    | "memory_conflict"
+    | "persona_invalid";
   kind: "adapter" | "configuration" | "invalid_state";
   stage:
     | "runtime"
@@ -246,7 +266,10 @@ export type GatewayMessage =
   | { type: "memory_inspection"; requestId: string; inspection: MemoryInspection }
   | { type: "runtime_event"; event: RuntimeEvent }
   | { type: "voice_event"; event: VoiceSessionEvent }
-  | { type: "fatal"; error: RuntimeFailure };
+  | { type: "fatal"; error: RuntimeFailure }
+  | { type: "persona_state"; requestId: string; persona: PersonaState }
+  | { type: "memory_deleted"; requestId: string; memoryId: bigint }
+  | ({ type: "memory_extracted" } & MemoryExtractedSummary);
 
 export class ProtocolError extends Error {
   constructor(message: string) {
@@ -290,6 +313,32 @@ export function parseClientCommand(value: unknown): ClientCommand {
       requireExactKeys(object, ["protocol_version", "type", "request_id", "memory_id"]);
       validateProtocolVersion(object);
       return { type, requestId: requireRequestId(object), memoryId: parseIdentifier(object.memory_id) };
+    case "persona_get":
+      requireExactKeys(object, ["protocol_version", "type", "request_id"]);
+      validateProtocolVersion(object);
+      return { type, requestId: requireRequestId(object) };
+    case "persona_update":
+      requireExactKeys(object, ["protocol_version", "type", "request_id", "persona"]);
+      validateProtocolVersion(object);
+      return { type, requestId: requireRequestId(object), persona: parsePersonaState(object.persona) };
+    case "memory_approve":
+      requireExactKeys(object, ["protocol_version", "type", "request_id", "memory_id", "expected_revision"]);
+      validateProtocolVersion(object);
+      return {
+        type,
+        requestId: requireRequestId(object),
+        memoryId: parseIdentifier(object.memory_id),
+        expectedRevision: parseIdentifier(object.expected_revision),
+      };
+    case "memory_delete":
+      requireExactKeys(object, ["protocol_version", "type", "request_id", "memory_id", "expected_revision"]);
+      validateProtocolVersion(object);
+      return {
+        type,
+        requestId: requireRequestId(object),
+        memoryId: parseIdentifier(object.memory_id),
+        expectedRevision: parseIdentifier(object.expected_revision),
+      };
     default:
       throw new ProtocolError("unsupported client command type");
   }
@@ -344,6 +393,23 @@ export function parseGatewayMessage(value: unknown): GatewayMessage {
       requireExactKeys(object, ["protocol_version", "type", "error"]);
       validateProtocolVersion(object);
       return { type, error: parseRuntimeFailure(object.error) };
+    case "persona_state":
+      requireExactKeys(object, ["protocol_version", "type", "request_id", "persona"]);
+      validateProtocolVersion(object);
+      return { type, requestId: requireRequestId(object), persona: parsePersonaState(object.persona) };
+    case "memory_deleted":
+      requireExactKeys(object, ["protocol_version", "type", "request_id", "memory_id"]);
+      validateProtocolVersion(object);
+      return { type, requestId: requireRequestId(object), memoryId: parseIdentifier(object.memory_id) };
+    case "memory_extracted":
+      requireExactKeys(object, ["protocol_version", "type", "created", "activated", "pending_approval"]);
+      validateProtocolVersion(object);
+      return {
+        type,
+        created: requireNonNegativeInteger(object, "created"),
+        activated: requireNonNegativeInteger(object, "activated"),
+        pendingApproval: requireNonNegativeInteger(object, "pending_approval"),
+      };
     default:
       throw new ProtocolError("unsupported gateway message type");
   }
@@ -392,6 +458,24 @@ export function encodeClientCommand(command: ClientCommand): Uint8Array {
           request_id: command.requestId,
           memory_id: command.memoryId.toString(),
         };
+      case "persona_get":
+        return { protocol_version: CLIENT_PROTOCOL_VERSION, type: command.type, request_id: command.requestId };
+      case "persona_update":
+        return {
+          protocol_version: CLIENT_PROTOCOL_VERSION,
+          type: command.type,
+          request_id: command.requestId,
+          persona: encodePersonaState(command.persona),
+        };
+      case "memory_approve":
+      case "memory_delete":
+        return {
+          protocol_version: CLIENT_PROTOCOL_VERSION,
+          type: command.type,
+          request_id: command.requestId,
+          memory_id: command.memoryId.toString(),
+          expected_revision: command.expectedRevision.toString(),
+        };
     }
   })();
   return new TextEncoder().encode(JSON.stringify(wire));
@@ -418,6 +502,77 @@ export function validateClientCommand(command: ClientCommand): void {
   if (command.type === "memory_inspect" && (command.memoryId < 1n || command.memoryId > MAX_U64)) {
     throw new ProtocolError("memory identifier is outside u64 range");
   }
+  if (command.type === "persona_update") {
+    validatePersonaState(command.persona);
+  }
+  if (command.type === "memory_approve" || command.type === "memory_delete") {
+    if (command.memoryId < 1n || command.memoryId > MAX_U64) {
+      throw new ProtocolError("memory identifier is outside u64 range");
+    }
+    if (command.expectedRevision < 1n || command.expectedRevision > MAX_U64) {
+      throw new ProtocolError("expected revision is outside u64 range");
+    }
+  }
+}
+
+function parsePersonaState(value: unknown): PersonaState {
+  const object = requireRecord(value, "persona state");
+  requireExactKeys(object, [
+    "mode",
+    "warmth",
+    "humor",
+    "teasing",
+    "initiative",
+    "directness",
+    "intimacy",
+    "verbosity",
+    "follow_up_frequency",
+  ]);
+  return {
+    mode: requireOneOf(object, "mode", ["direct_answer", "companionship", "brainstorming", "reflective"] as const),
+    warmth: requireIntegerInRange(object, "warmth", 0, 100),
+    humor: requireIntegerInRange(object, "humor", 0, 100),
+    teasing: requireIntegerInRange(object, "teasing", 0, 100),
+    initiative: requireIntegerInRange(object, "initiative", 0, 100),
+    directness: requireIntegerInRange(object, "directness", 0, 100),
+    intimacy: requireIntegerInRange(object, "intimacy", 0, 100),
+    verbosity: requireIntegerInRange(object, "verbosity", 0, 100),
+    followUpFrequency: requireIntegerInRange(object, "follow_up_frequency", 0, 100),
+  };
+}
+
+function validatePersonaState(persona: PersonaState): void {
+  if (!["direct_answer", "companionship", "brainstorming", "reflective"].includes(persona.mode)) {
+    throw new ProtocolError("persona mode has an unsupported value");
+  }
+  for (const level of [
+    persona.warmth,
+    persona.humor,
+    persona.teasing,
+    persona.initiative,
+    persona.directness,
+    persona.intimacy,
+    persona.verbosity,
+    persona.followUpFrequency,
+  ]) {
+    if (!Number.isInteger(level) || level < 0 || level > 100) {
+      throw new ProtocolError("persona level must be an integer within 0..=100");
+    }
+  }
+}
+
+function encodePersonaState(persona: PersonaState): Record<string, unknown> {
+  return {
+    mode: persona.mode,
+    warmth: persona.warmth,
+    humor: persona.humor,
+    teasing: persona.teasing,
+    initiative: persona.initiative,
+    directness: persona.directness,
+    intimacy: persona.intimacy,
+    verbosity: persona.verbosity,
+    follow_up_frequency: persona.followUpFrequency,
+  };
 }
 
 function parseRuntimeStatus(value: unknown): RuntimeStatus {
@@ -907,6 +1062,8 @@ function parseRuntimeFailure(value: unknown): RuntimeFailure {
         "memory_turn_active",
         "memory_not_found",
         "memory_unavailable",
+        "memory_conflict",
+        "persona_invalid",
       ] as const,
     ),
     kind: requireOneOf(object, "kind", ["adapter", "configuration", "invalid_state"] as const),

@@ -47,6 +47,24 @@ test("parses every shared v1 command fixture with bigint identifiers", async () 
     cursor: { beforeId: 7n },
   });
   assert.deepEqual(parsed[9], { type: "memory_inspect", requestId: "req-inspect-1", memoryId: 7n });
+  assert.deepEqual(parsed[10], { type: "persona_get", requestId: "req-persona-get" });
+  assert.deepEqual(parsed[11], {
+    type: "persona_update",
+    requestId: "req-persona-update",
+    persona: fixturePersona(),
+  });
+  assert.deepEqual(parsed[12], {
+    type: "memory_approve",
+    requestId: "req-memory-approve",
+    memoryId: 7n,
+    expectedRevision: 2n,
+  });
+  assert.deepEqual(parsed[13], {
+    type: "memory_delete",
+    requestId: "req-memory-delete",
+    memoryId: 7n,
+    expectedRevision: 2n,
+  });
 });
 
 test("rejects v2 while correlating typed starts through v1 acceptance", () => {
@@ -130,6 +148,13 @@ test("parses every shared v1 gateway fixture with bigint-safe memory values", as
       approvalsTruncated: false,
     },
   });
+  assert.deepEqual(parsed[25], {
+    type: "persona_state",
+    requestId: "req-persona-update",
+    persona: fixturePersona(),
+  });
+  assert.deepEqual(parsed[26], { type: "memory_deleted", requestId: "req-memory-delete", memoryId: 7n });
+  assert.deepEqual(parsed[27], { type: "memory_extracted", created: 2, activated: 1, pendingApproval: 1 });
 });
 
 test("rejects every shared invalid v1 command and gateway fixture", async () => {
@@ -149,6 +174,10 @@ test("rejects every shared invalid v1 command and gateway fixture", async () => 
       || type === "pause_voice_capture"
       || type === "resume_voice_capture"
       || type === "memory_inspect"
+      || type === "persona_get"
+      || type === "persona_update"
+      || type === "memory_approve"
+      || type === "memory_delete"
       || (type === "memory_list" && "cursor" in object)
     )
       ? parseClientCommand
@@ -545,6 +574,233 @@ test("mirrors the complete v1 timing, quality, and status vocabulary", () => {
     status: { ...wireStatus(), capabilities: ["voice"] },
   }));
 });
+
+test("mirrors the complete v1 persona and memory mutation command vocabulary", () => {
+  assert.deepEqual(
+    parseClientCommand({ protocol_version: 1, type: "persona_get", request_id: "request-1" }),
+    { type: "persona_get", requestId: "request-1" },
+  );
+  assert.deepEqual(
+    parseClientCommand({
+      protocol_version: 1,
+      type: "persona_update",
+      request_id: "request-1",
+      persona: wirePersona(),
+    }),
+    { type: "persona_update", requestId: "request-1", persona: fixturePersona() },
+  );
+  assert.deepEqual(
+    parseClientCommand({
+      protocol_version: 1,
+      type: "memory_approve",
+      request_id: "request-1",
+      memory_id: "7",
+      expected_revision: "2",
+    }),
+    { type: "memory_approve", requestId: "request-1", memoryId: 7n, expectedRevision: 2n },
+  );
+  assert.deepEqual(
+    parseClientCommand({
+      protocol_version: 1,
+      type: "memory_delete",
+      request_id: "request-1",
+      memory_id: "7",
+      expected_revision: "2",
+    }),
+    { type: "memory_delete", requestId: "request-1", memoryId: 7n, expectedRevision: 2n },
+  );
+
+  // unsupported: unknown persona mode
+  assert.throws(() => parseClientCommand({
+    protocol_version: 1,
+    type: "persona_update",
+    request_id: "request-1",
+    persona: { ...wirePersona(), mode: "unknown" },
+  }));
+  // invalid: level out of range
+  assert.throws(() => parseClientCommand({
+    protocol_version: 1,
+    type: "persona_update",
+    request_id: "request-1",
+    persona: { ...wirePersona(), warmth: 101 },
+  }));
+  // invalid: expected_revision is zero, which is not a canonical non-zero decimal
+  assert.throws(() => parseClientCommand({
+    protocol_version: 1,
+    type: "memory_delete",
+    request_id: "request-1",
+    memory_id: "7",
+    expected_revision: "0",
+  }));
+  // invalid: expected_revision is not a decimal string
+  assert.throws(() => parseClientCommand({
+    protocol_version: 1,
+    type: "memory_approve",
+    request_id: "request-1",
+    memory_id: "7",
+    expected_revision: "abc",
+  }));
+
+  assert.deepEqual(
+    parseGatewayMessage({
+      protocol_version: 1,
+      type: "persona_state",
+      request_id: "request-1",
+      persona: wirePersona(),
+    }),
+    { type: "persona_state", requestId: "request-1", persona: fixturePersona() },
+  );
+  assert.deepEqual(
+    parseGatewayMessage({ protocol_version: 1, type: "memory_deleted", request_id: "request-1", memory_id: "7" }),
+    { type: "memory_deleted", requestId: "request-1", memoryId: 7n },
+  );
+  assert.deepEqual(
+    parseGatewayMessage({
+      protocol_version: 1,
+      type: "memory_extracted",
+      created: 2,
+      activated: 1,
+      pending_approval: 1,
+    }),
+    { type: "memory_extracted", created: 2, activated: 1, pendingApproval: 1 },
+  );
+
+  for (const code of ["memory_conflict", "persona_invalid"] as const) {
+    assert.deepEqual(
+      parseGatewayMessage({
+        protocol_version: 1,
+        type: "fatal",
+        error: { code, kind: "invalid_state", stage: "memory", message: "rejected" },
+      }),
+      { type: "fatal", error: { code, kind: "invalid_state", stage: "memory", message: "rejected" } },
+    );
+  }
+});
+
+test("encodes v1 persona and memory mutation commands with snake-case decimal wire values", () => {
+  assert.deepEqual(
+    JSON.parse(new TextDecoder().decode(encodeClientCommand({ type: "persona_get", requestId: "request-1" }))),
+    { protocol_version: 1, type: "persona_get", request_id: "request-1" },
+  );
+
+  assert.deepEqual(
+    JSON.parse(new TextDecoder().decode(encodeClientCommand({
+      type: "persona_update",
+      requestId: "request-1",
+      persona: {
+        mode: "brainstorming",
+        warmth: 10,
+        humor: 20,
+        teasing: 30,
+        initiative: 40,
+        directness: 50,
+        intimacy: 60,
+        verbosity: 70,
+        followUpFrequency: 80,
+      },
+    }))),
+    {
+      protocol_version: 1,
+      type: "persona_update",
+      request_id: "request-1",
+      persona: {
+        mode: "brainstorming",
+        warmth: 10,
+        humor: 20,
+        teasing: 30,
+        initiative: 40,
+        directness: 50,
+        intimacy: 60,
+        verbosity: 70,
+        follow_up_frequency: 80,
+      },
+    },
+  );
+
+  assert.deepEqual(
+    JSON.parse(new TextDecoder().decode(encodeClientCommand({
+      type: "memory_approve",
+      requestId: "request-1",
+      memoryId: MAX_U64,
+      expectedRevision: 3n,
+    }))),
+    {
+      protocol_version: 1,
+      type: "memory_approve",
+      request_id: "request-1",
+      memory_id: "18446744073709551615",
+      expected_revision: "3",
+    },
+  );
+
+  assert.deepEqual(
+    JSON.parse(new TextDecoder().decode(encodeClientCommand({
+      type: "memory_delete",
+      requestId: "request-1",
+      memoryId: 7n,
+      expectedRevision: MAX_U64,
+    }))),
+    {
+      protocol_version: 1,
+      type: "memory_delete",
+      request_id: "request-1",
+      memory_id: "7",
+      expected_revision: "18446744073709551615",
+    },
+  );
+
+  assert.throws(() => encodeClientCommand({
+    type: "persona_update",
+    requestId: "request-1",
+    persona: { ...fixturePersona(), mode: "unknown" as never },
+  }));
+  assert.throws(
+    () => encodeClientCommand({ type: "memory_approve", requestId: "request-1", memoryId: 0n, expectedRevision: 1n }),
+    /u64 range/,
+  );
+  assert.throws(
+    () => encodeClientCommand({ type: "memory_delete", requestId: "request-1", memoryId: 1n, expectedRevision: 0n }),
+    /u64 range/,
+  );
+});
+
+function fixturePersona(): {
+  mode: "companionship";
+  warmth: number;
+  humor: number;
+  teasing: number;
+  initiative: number;
+  directness: number;
+  intimacy: number;
+  verbosity: number;
+  followUpFrequency: number;
+} {
+  return {
+    mode: "companionship",
+    warmth: 95,
+    humor: 60,
+    teasing: 40,
+    initiative: 35,
+    directness: 80,
+    intimacy: 30,
+    verbosity: 20,
+    followUpFrequency: 25,
+  };
+}
+
+function wirePersona(): Record<string, unknown> {
+  return {
+    mode: "companionship",
+    warmth: 95,
+    humor: 60,
+    teasing: 40,
+    initiative: 35,
+    directness: 80,
+    intimacy: 30,
+    verbosity: 20,
+    follow_up_frequency: 25,
+  };
+}
 
 function runtimeEvent(event: Record<string, unknown>): Record<string, unknown> {
   return { protocol_version: 1, type: "runtime_event", event };

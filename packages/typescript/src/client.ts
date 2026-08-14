@@ -4,8 +4,10 @@ import {
   type ClientCommand,
   type GatewayMessage,
   type MemoryCursor,
+  type MemoryExtractedSummary,
   type MemoryInspection,
   type MemoryPage,
+  type PersonaState,
   type RuntimeEvent,
   type RuntimeFailure,
   type RuntimeStatus,
@@ -50,6 +52,7 @@ export class RuntimeClient {
   private readonly ready = new Deferred<void>();
   private readonly controls = new Map<string, PendingControl>();
   private readonly unexpectedFailureListeners = new Set<(error: Error) => void>();
+  private readonly memoryExtractedListeners = new Set<(summary: MemoryExtractedSummary) => void>();
   private readonly turns = new Map<bigint, TurnState>();
   private readonly acceptedStartRequests = new Set<string>();
   private activeVoiceSession: VoiceSessionState | undefined;
@@ -103,6 +106,64 @@ export class RuntimeClient {
     const result = new Deferred<MemoryInspection>();
     this.controls.set(requestId, {
       kind: "memory_inspect",
+      accepted: false,
+      result,
+      fail: (error) => result.reject(error),
+    });
+    this.send(command);
+    return result.promise;
+  }
+
+  getPersona(): Promise<PersonaState> {
+    const requestId = this.nextRequestId();
+    const result = new Deferred<PersonaState>();
+    this.controls.set(requestId, {
+      kind: "persona_get",
+      accepted: false,
+      result,
+      fail: (error) => result.reject(error),
+    });
+    this.send({ type: "persona_get", requestId });
+    return result.promise;
+  }
+
+  updatePersona(persona: PersonaState): Promise<PersonaState> {
+    const requestId = this.nextRequestId();
+    const command: ClientCommand = { type: "persona_update", requestId, persona };
+    validateClientCommand(command);
+    const result = new Deferred<PersonaState>();
+    this.controls.set(requestId, {
+      kind: "persona_update",
+      accepted: false,
+      result,
+      fail: (error) => result.reject(error),
+    });
+    this.send(command);
+    return result.promise;
+  }
+
+  approveMemory(memoryId: bigint, expectedRevision: bigint): Promise<MemoryInspection> {
+    const requestId = this.nextRequestId();
+    const command: ClientCommand = { type: "memory_approve", requestId, memoryId, expectedRevision };
+    validateClientCommand(command);
+    const result = new Deferred<MemoryInspection>();
+    this.controls.set(requestId, {
+      kind: "memory_approve",
+      accepted: false,
+      result,
+      fail: (error) => result.reject(error),
+    });
+    this.send(command);
+    return result.promise;
+  }
+
+  deleteMemory(memoryId: bigint, expectedRevision: bigint): Promise<bigint> {
+    const requestId = this.nextRequestId();
+    const command: ClientCommand = { type: "memory_delete", requestId, memoryId, expectedRevision };
+    validateClientCommand(command);
+    const result = new Deferred<bigint>();
+    this.controls.set(requestId, {
+      kind: "memory_delete",
       accepted: false,
       result,
       fail: (error) => result.reject(error),
@@ -191,6 +252,11 @@ export class RuntimeClient {
     return () => this.unexpectedFailureListeners.delete(listener);
   }
 
+  onMemoryExtracted(listener: (summary: MemoryExtractedSummary) => void): () => void {
+    this.memoryExtractedListeners.add(listener);
+    return () => this.memoryExtractedListeners.delete(listener);
+  }
+
   private async consumeMessages(): Promise<void> {
     try {
       for await (const raw of this.transport.messages) {
@@ -257,12 +323,42 @@ export class RuntimeClient {
     }
     if (message.type === "memory_inspection") {
       const control = this.controls.get(message.requestId);
-      if (!control || control.kind !== "memory_inspect" || !control.accepted) {
+      if (!control || (control.kind !== "memory_inspect" && control.kind !== "memory_approve") || !control.accepted) {
         this.fail(new Error("gateway sent an uncorrelated memory inspection response"));
         return;
       }
       this.controls.delete(message.requestId);
       control.result.resolve(message.inspection);
+      return;
+    }
+    if (message.type === "persona_state") {
+      const control = this.controls.get(message.requestId);
+      if (!control || (control.kind !== "persona_get" && control.kind !== "persona_update") || !control.accepted) {
+        this.fail(new Error("gateway sent an uncorrelated persona state response"));
+        return;
+      }
+      this.controls.delete(message.requestId);
+      control.result.resolve(message.persona);
+      return;
+    }
+    if (message.type === "memory_deleted") {
+      const control = this.controls.get(message.requestId);
+      if (!control || control.kind !== "memory_delete" || !control.accepted) {
+        this.fail(new Error("gateway sent an uncorrelated memory deleted response"));
+        return;
+      }
+      this.controls.delete(message.requestId);
+      control.result.resolve(message.memoryId);
+      return;
+    }
+    if (message.type === "memory_extracted") {
+      for (const listener of this.memoryExtractedListeners) {
+        this.notifyMemoryExtractedListener(listener, {
+          created: message.created,
+          activated: message.activated,
+          pendingApproval: message.pendingApproval,
+        });
+      }
       return;
     }
     if (message.type === "voice_event") {
@@ -322,6 +418,10 @@ export class RuntimeClient {
       case "status":
       case "memory_list":
       case "memory_inspect":
+      case "persona_get":
+      case "persona_update":
+      case "memory_approve":
+      case "memory_delete":
         return;
       case "start_turn": {
         this.controls.delete(requestId);
@@ -426,6 +526,17 @@ export class RuntimeClient {
     }
   }
 
+  private notifyMemoryExtractedListener(
+    listener: (summary: MemoryExtractedSummary) => void,
+    summary: MemoryExtractedSummary,
+  ): void {
+    try {
+      listener(summary);
+    } catch {
+      return;
+    }
+  }
+
   private nextRequestId(): string {
     this.requestCounter += 1n;
     return `request-${this.requestCounter}`;
@@ -436,6 +547,10 @@ type PendingControl =
   | { kind: "status"; accepted: boolean; result: Deferred<RuntimeStatus>; fail(error: Error): void }
   | { kind: "memory_list"; accepted: boolean; result: Deferred<MemoryPage>; fail(error: Error): void }
   | { kind: "memory_inspect"; accepted: boolean; result: Deferred<MemoryInspection>; fail(error: Error): void }
+  | { kind: "persona_get"; accepted: boolean; result: Deferred<PersonaState>; fail(error: Error): void }
+  | { kind: "persona_update"; accepted: boolean; result: Deferred<PersonaState>; fail(error: Error): void }
+  | { kind: "memory_approve"; accepted: boolean; result: Deferred<MemoryInspection>; fail(error: Error): void }
+  | { kind: "memory_delete"; accepted: boolean; result: Deferred<bigint>; fail(error: Error): void }
   | { kind: "start_turn"; accepted: boolean; result: Deferred<RuntimeTurn>; fail(error: Error): void }
   | { kind: "interrupt_turn"; accepted: boolean; result: Deferred<void>; fail(error: Error): void }
   | { kind: "start_voice_session"; accepted: boolean; result: Deferred<VoiceSession>; fail(error: Error): void }

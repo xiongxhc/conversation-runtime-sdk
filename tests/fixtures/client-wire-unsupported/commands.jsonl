@@ -1,3 +1,5 @@
 {"protocol_version":99,"type":"status","request_id":"req-status-1"}
 {"protocol_version":99,"type":"start_turn","request_id":"req-start-1","turn_id":"1","transcript":"hello"}
 {"protocol_version":99,"type":"interrupt_turn","request_id":"req-stop-1","turn_id":"18446744073709551615"}
+{"protocol_version":99,"type":"persona_get","request_id":"req-persona-get"}
+{"protocol_version":99,"type":"memory_approve","request_id":"req-memory-approve","memory_id":"7","expected_revision":"2"}

@@ -7,3 +7,5 @@
 {"protocol_version":99,"type":"start_turn","request_id":"req-1","turn_id":"1","transcript":""}
 {"protocol_version":99,"type":"unknown","request_id":"req-1"}
 not-json
+{"protocol_version":99,"type":"persona_update","request_id":"req-1","persona":{"mode":"unknown","warmth":0,"humor":0,"teasing":0,"initiative":0,"directness":0,"intimacy":0,"verbosity":0,"follow_up_frequency":0}}
+{"protocol_version":99,"type":"memory_approve","request_id":"req-1","memory_id":"7","expected_revision":"abc"}

@@ -5,9 +5,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
     ClientComponentDescriptor, ClientMemoryCursor, ClientMemoryInspection, ClientMemoryRecord,
-    ClientMemoryRetention, ClientMemorySummary, ClientVoiceSessionEvent, ConversationMode,
-    FollowUpPolicy, MemoryId, MemoryRetrievalTrace, QualityDecision, ResponseControls,
-    RetrievalTraceId, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage,
+    ClientMemoryRetention, ClientMemorySummary, ClientPersonaState, ClientVoiceSessionEvent,
+    ConversationMode, FollowUpPolicy, MemoryId, MemoryRetrievalTrace, QualityDecision,
+    ResponseControls, RetrievalTraceId, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage,
     RuntimeTimingMilestone, SilencePolicy, SpeechPace, TurnId, MAX_CONVERSATION_MESSAGE_BYTES,
     MAX_MEMORY_CONTENT_BYTES, MAX_MEMORY_INSPECTION_HISTORY_ITEMS, MAX_MEMORY_LIST_PAGE_ITEMS,
     MAX_MEMORY_PREVIEW_BYTES,
@@ -48,6 +48,23 @@ pub enum ClientCommand {
     MemoryInspect {
         request_id: String,
         memory_id: MemoryId,
+    },
+    PersonaGet {
+        request_id: String,
+    },
+    PersonaUpdate {
+        request_id: String,
+        persona: ClientPersonaState,
+    },
+    MemoryApprove {
+        request_id: String,
+        memory_id: MemoryId,
+        expected_revision: u64,
+    },
+    MemoryDelete {
+        request_id: String,
+        memory_id: MemoryId,
+        expected_revision: u64,
     },
 }
 
@@ -195,6 +212,19 @@ pub enum GatewayMessage {
     Fatal {
         error: ClientRuntimeError,
     },
+    PersonaState {
+        request_id: String,
+        persona: ClientPersonaState,
+    },
+    MemoryDeleted {
+        request_id: String,
+        memory_id: MemoryId,
+    },
+    MemoryExtracted {
+        created: u32,
+        activated: u32,
+        pending_approval: u32,
+    },
 }
 
 #[derive(Debug)]
@@ -209,6 +239,7 @@ pub enum ClientWireError {
     InvalidVoiceEvent,
     MismatchedVoiceIdentity,
     InvalidMemoryResponse,
+    InvalidPersonaState,
     PayloadTooLarge { actual: usize, maximum: usize },
     UnsupportedRuntimeEvent { event: &'static str },
 }
@@ -232,6 +263,7 @@ impl fmt::Display for ClientWireError {
                 formatter.write_str("mismatched client voice identity")
             }
             Self::InvalidMemoryResponse => formatter.write_str("invalid client memory response"),
+            Self::InvalidPersonaState => formatter.write_str("invalid client persona state"),
             Self::PayloadTooLarge { actual, maximum } => {
                 write!(
                     formatter,
@@ -497,6 +529,57 @@ pub fn decode_client_command(payload: &[u8]) -> Result<ClientCommand, ClientWire
                     .expect("wire memory identifier was validated as non-zero"),
             })
         }
+        WireClientCommand::PersonaGet {
+            protocol_version,
+            request_id,
+        } => {
+            validate_protocol_version(protocol_version)?;
+            validate_request_id(&request_id)?;
+            Ok(ClientCommand::PersonaGet { request_id })
+        }
+        WireClientCommand::PersonaUpdate {
+            protocol_version,
+            request_id,
+            persona,
+        } => {
+            validate_protocol_version(protocol_version)?;
+            validate_request_id(&request_id)?;
+            crate::client_persona::validate_client_persona_state(&persona)?;
+            Ok(ClientCommand::PersonaUpdate {
+                request_id,
+                persona,
+            })
+        }
+        WireClientCommand::MemoryApprove {
+            protocol_version,
+            request_id,
+            memory_id,
+            expected_revision,
+        } => {
+            validate_protocol_version(protocol_version)?;
+            validate_request_id(&request_id)?;
+            Ok(ClientCommand::MemoryApprove {
+                request_id,
+                memory_id: MemoryId::new(memory_id.0)
+                    .expect("wire memory identifier was validated as non-zero"),
+                expected_revision: expected_revision.0,
+            })
+        }
+        WireClientCommand::MemoryDelete {
+            protocol_version,
+            request_id,
+            memory_id,
+            expected_revision,
+        } => {
+            validate_protocol_version(protocol_version)?;
+            validate_request_id(&request_id)?;
+            Ok(ClientCommand::MemoryDelete {
+                request_id,
+                memory_id: MemoryId::new(memory_id.0)
+                    .expect("wire memory identifier was validated as non-zero"),
+                expected_revision: expected_revision.0,
+            })
+        }
     }
 }
 
@@ -550,6 +633,27 @@ enum WireClientCommand {
         protocol_version: u64,
         request_id: String,
         memory_id: DecimalIdentifier,
+    },
+    PersonaGet {
+        protocol_version: u64,
+        request_id: String,
+    },
+    PersonaUpdate {
+        protocol_version: u64,
+        request_id: String,
+        persona: ClientPersonaState,
+    },
+    MemoryApprove {
+        protocol_version: u64,
+        request_id: String,
+        memory_id: DecimalIdentifier,
+        expected_revision: DecimalIdentifier,
+    },
+    MemoryDelete {
+        protocol_version: u64,
+        request_id: String,
+        memory_id: DecimalIdentifier,
+        expected_revision: DecimalIdentifier,
     },
 }
 
@@ -795,6 +899,22 @@ enum GatewayMessageEnvelope<'a> {
         protocol_version: u64,
         error: &'a ClientRuntimeError,
     },
+    PersonaState {
+        protocol_version: u64,
+        request_id: &'a str,
+        persona: &'a ClientPersonaState,
+    },
+    MemoryDeleted {
+        protocol_version: u64,
+        request_id: &'a str,
+        memory_id: String,
+    },
+    MemoryExtracted {
+        protocol_version: u64,
+        created: u32,
+        activated: u32,
+        pending_approval: u32,
+    },
 }
 
 impl<'a> From<&'a GatewayMessage> for GatewayMessageEnvelope<'a> {
@@ -851,6 +971,32 @@ impl<'a> From<&'a GatewayMessage> for GatewayMessageEnvelope<'a> {
             GatewayMessage::Fatal { error } => Self::Fatal {
                 protocol_version: CLIENT_PROTOCOL_VERSION,
                 error,
+            },
+            GatewayMessage::PersonaState {
+                request_id,
+                persona,
+            } => Self::PersonaState {
+                protocol_version: CLIENT_PROTOCOL_VERSION,
+                request_id,
+                persona,
+            },
+            GatewayMessage::MemoryDeleted {
+                request_id,
+                memory_id,
+            } => Self::MemoryDeleted {
+                protocol_version: CLIENT_PROTOCOL_VERSION,
+                request_id,
+                memory_id: memory_id.get().to_string(),
+            },
+            GatewayMessage::MemoryExtracted {
+                created,
+                activated,
+                pending_approval,
+            } => Self::MemoryExtracted {
+                protocol_version: CLIENT_PROTOCOL_VERSION,
+                created: *created,
+                activated: *activated,
+                pending_approval: *pending_approval,
             },
         }
     }
@@ -942,6 +1088,15 @@ fn validate_gateway_message(message: &GatewayMessage) -> Result<(), ClientWireEr
             crate::client_voice::validate_client_voice_event(event)
         }
         GatewayMessage::Ready { status } => validate_runtime_status(status),
+        GatewayMessage::PersonaState {
+            request_id,
+            persona,
+        } => {
+            validate_request_id(request_id)?;
+            crate::client_persona::validate_client_persona_state(persona)
+        }
+        GatewayMessage::MemoryDeleted { request_id, .. } => validate_request_id(request_id),
+        GatewayMessage::MemoryExtracted { .. } => Ok(()),
     }
 }
 

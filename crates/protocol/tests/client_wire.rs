@@ -2,17 +2,17 @@ use conversation_protocol::{
     decode_client_command, encode_gateway_message, memory_preview, ClientCommand,
     ClientComponentDescriptor, ClientMemoryApproval, ClientMemoryCursor, ClientMemoryInspection,
     ClientMemoryProvenance, ClientMemoryRecord, ClientMemoryRetention, ClientMemorySummary,
-    ClientMemoryTrace, ClientPrivacySummary, ClientQualityDecision, ClientResponseControls,
-    ClientRuntimeError, ClientRuntimeEvent, ClientVoiceSessionEvent, ClientWireError,
-    ComponentDescriptor, ComponentKind, ContextSource, ConversationMode, ConversationSignal,
-    ExecutionLocation, FollowUpPolicy, GatewayMessage, GenerationId, MemoryApproval,
-    MemoryConfidence, MemoryDraft, MemoryId, MemoryInspection, MemoryKind, MemoryProvenance,
-    MemoryProvenanceKind, MemoryRecord, MemoryRetention, MemoryRetrievalReason,
-    MemoryRetrievalTrace, MemoryTraceExclusions, MemoryTraceItem, PersonaLevel, PlaybackState,
-    PrivacyMode, PrivacySummary, QualityDecision, RecoveryDisposition, ResponseControls,
-    RetrievalTraceId, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage, RuntimeStatus,
-    SessionId, SilencePolicy, SpeechPace, TurnId, UnixTimestampMillis, VoiceActivity,
-    VoiceSessionEvent, VoiceTimingMilestone, CLIENT_PROTOCOL_VERSION,
+    ClientMemoryTrace, ClientPersonaState, ClientPrivacySummary, ClientQualityDecision,
+    ClientResponseControls, ClientRuntimeError, ClientRuntimeEvent, ClientVoiceSessionEvent,
+    ClientWireError, ComponentDescriptor, ComponentKind, ContextSource, ConversationMode,
+    ConversationSignal, ExecutionLocation, FollowUpPolicy, GatewayMessage, GenerationId,
+    MemoryApproval, MemoryConfidence, MemoryDraft, MemoryId, MemoryInspection, MemoryKind,
+    MemoryProvenance, MemoryProvenanceKind, MemoryRecord, MemoryRetention, MemoryRetrievalReason,
+    MemoryRetrievalTrace, MemoryTraceExclusions, MemoryTraceItem, PersonaLevel, PersonaProfile,
+    PlaybackState, PrivacyMode, PrivacySummary, QualityDecision, RecoveryDisposition,
+    ResponseControls, RetrievalTraceId, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage,
+    RuntimeStatus, SessionId, SilencePolicy, SpeechPace, TurnId, UnixTimestampMillis,
+    VoiceActivity, VoiceSessionEvent, VoiceTimingMilestone, CLIENT_PROTOCOL_VERSION,
     MAX_CLIENT_COMPONENT_DESCRIPTORS, MAX_CLIENT_FRAME_BYTES, MAX_CLIENT_PROVIDER_LABEL_BYTES,
     MAX_CONVERSATION_MESSAGE_BYTES, MAX_MEMORY_PREVIEW_BYTES,
 };
@@ -630,6 +630,132 @@ fn version_one_memory_commands_decode_and_unsupported_versions_are_rejected() {
     {
         assert!(decode_client_command(line.as_bytes()).is_err());
     }
+}
+
+#[test]
+fn version_one_persona_and_memory_mutation_commands_decode_and_round_trip() {
+    let persona_get = decode_client_command(
+        br#"{"protocol_version":1,"type":"persona_get","request_id":"req-1"}"#,
+    )
+    .unwrap();
+    assert!(matches!(persona_get, ClientCommand::PersonaGet { .. }));
+
+    let persona_update = decode_client_command(
+        br#"{"protocol_version":1,"type":"persona_update","request_id":"req-2","persona":{"mode":"companionship","warmth":95,"humor":60,"teasing":40,"initiative":35,"directness":80,"intimacy":30,"verbosity":20,"follow_up_frequency":25}}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        persona_update,
+        ClientCommand::PersonaUpdate { ref persona, .. }
+            if persona.mode == "companionship" && persona.warmth == 95
+    ));
+
+    let approve = decode_client_command(
+        br#"{"protocol_version":1,"type":"memory_approve","request_id":"req-3","memory_id":"7","expected_revision":"2"}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        approve,
+        ClientCommand::MemoryApprove { memory_id, expected_revision, .. }
+            if memory_id.get() == 7 && expected_revision == 2
+    ));
+
+    let delete = decode_client_command(
+        br#"{"protocol_version":1,"type":"memory_delete","request_id":"req-4","memory_id":"7","expected_revision":"2"}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        delete,
+        ClientCommand::MemoryDelete { memory_id, expected_revision, .. }
+            if memory_id.get() == 7 && expected_revision == 2
+    ));
+
+    assert!(decode_client_command(
+        br#"{"protocol_version":2,"type":"persona_get","request_id":"req-1"}"#,
+    )
+    .is_err());
+}
+
+#[test]
+fn persona_and_memory_mutation_gateway_messages_encode() {
+    let persona = ClientPersonaState::new("companionship", 95, 60, 40, 35, 80, 30, 20, 25).unwrap();
+
+    let value = gateway_value(&GatewayMessage::PersonaState {
+        request_id: "req-2".to_owned(),
+        persona: persona.clone(),
+    });
+    assert_eq!(value["type"], "persona_state");
+    assert_eq!(value["protocol_version"], 1);
+    assert_eq!(value["persona"]["mode"], "companionship");
+    assert_eq!(value["persona"]["warmth"], 95);
+
+    let value = gateway_value(&GatewayMessage::MemoryDeleted {
+        request_id: "req-4".to_owned(),
+        memory_id: MemoryId::new(7).unwrap(),
+    });
+    assert_eq!(value["type"], "memory_deleted");
+    assert_eq!(value["memory_id"], "7");
+
+    let value = gateway_value(&GatewayMessage::MemoryExtracted {
+        created: 2,
+        activated: 1,
+        pending_approval: 1,
+    });
+    assert_eq!(value["type"], "memory_extracted");
+    assert_eq!(value["created"], 2);
+    assert_eq!(value["activated"], 1);
+    assert_eq!(value["pending_approval"], 1);
+}
+
+#[test]
+fn client_persona_state_round_trips_through_persona_profile_and_mode() {
+    let profile = PersonaProfile::default();
+    let mode = ConversationMode::Brainstorming;
+    let state = ClientPersonaState::from_profile(&profile, mode);
+    assert_eq!(state.mode, "brainstorming");
+    assert_eq!(state.warmth, profile.warmth().get());
+
+    let (round_tripped_profile, round_tripped_mode) = state.to_profile().unwrap();
+    assert_eq!(round_tripped_profile, profile);
+    assert_eq!(round_tripped_mode, mode);
+}
+
+#[test]
+fn persona_state_rejects_levels_above_one_hundred_and_unknown_modes() {
+    assert!(ClientPersonaState::new("companionship", 101, 0, 0, 0, 0, 0, 0, 0).is_err());
+    assert!(ClientPersonaState::new("unknown_mode", 0, 0, 0, 0, 0, 0, 0, 0).is_err());
+
+    assert!(decode_client_command(
+        br#"{"protocol_version":1,"type":"persona_update","request_id":"req-1","persona":{"mode":"companionship","warmth":101,"humor":0,"teasing":0,"initiative":0,"directness":0,"intimacy":0,"verbosity":0,"follow_up_frequency":0}}"#
+    )
+    .is_err());
+    assert!(decode_client_command(
+        br#"{"protocol_version":1,"type":"persona_update","request_id":"req-1","persona":{"mode":"unknown","warmth":0,"humor":0,"teasing":0,"initiative":0,"directness":0,"intimacy":0,"verbosity":0,"follow_up_frequency":0}}"#
+    )
+    .is_err());
+
+    let mut invalid_persona =
+        ClientPersonaState::new("companionship", 0, 0, 0, 0, 0, 0, 0, 0).unwrap();
+    invalid_persona.warmth = 101;
+    assert!(matches!(
+        encode_gateway_message(&GatewayMessage::PersonaState {
+            request_id: "req-1".to_owned(),
+            persona: invalid_persona,
+        }),
+        Err(ClientWireError::InvalidPersonaState)
+    ));
+}
+
+#[test]
+fn memory_mutation_commands_reject_non_numeric_or_zero_expected_revision() {
+    assert!(decode_client_command(
+        br#"{"protocol_version":1,"type":"memory_approve","request_id":"req-1","memory_id":"7","expected_revision":"abc"}"#
+    )
+    .is_err());
+    assert!(decode_client_command(
+        br#"{"protocol_version":1,"type":"memory_delete","request_id":"req-1","memory_id":"7","expected_revision":"0"}"#
+    )
+    .is_err());
 }
 
 #[test]
@@ -1368,6 +1494,22 @@ enum FixtureGatewayMessage {
         protocol_version: u64,
         error: FixtureRuntimeError,
     },
+    PersonaState {
+        protocol_version: u64,
+        request_id: FixtureRequestId,
+        persona: FixturePersonaState,
+    },
+    MemoryDeleted {
+        protocol_version: u64,
+        request_id: FixtureRequestId,
+        memory_id: FixtureIdentifier,
+    },
+    MemoryExtracted {
+        protocol_version: u64,
+        created: u32,
+        activated: u32,
+        pending_approval: u32,
+    },
 }
 
 impl FixtureGatewayMessage {
@@ -1398,6 +1540,15 @@ impl FixtureGatewayMessage {
                 protocol_version, ..
             }
             | Self::Fatal {
+                protocol_version, ..
+            }
+            | Self::PersonaState {
+                protocol_version, ..
+            }
+            | Self::MemoryDeleted {
+                protocol_version, ..
+            }
+            | Self::MemoryExtracted {
                 protocol_version, ..
             } => *protocol_version,
         }
@@ -1887,6 +2038,46 @@ struct FixtureMemorySummary {
 #[allow(dead_code)]
 struct FixtureMemoryCursor {
     before_id: FixtureIdentifier,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct FixturePersonaState {
+    mode: FixtureConversationMode,
+    warmth: FixturePersonaLevel,
+    humor: FixturePersonaLevel,
+    teasing: FixturePersonaLevel,
+    initiative: FixturePersonaLevel,
+    directness: FixturePersonaLevel,
+    intimacy: FixturePersonaLevel,
+    verbosity: FixturePersonaLevel,
+    follow_up_frequency: FixturePersonaLevel,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
+enum FixtureConversationMode {
+    DirectAnswer,
+    Companionship,
+    Brainstorming,
+    Reflective,
+}
+
+struct FixturePersonaLevel;
+
+impl<'de> Deserialize<'de> for FixturePersonaLevel {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = u8::deserialize(deserializer)?;
+        if value > 100 {
+            return Err(serde::de::Error::custom("persona level exceeds 100"));
+        }
+        Ok(Self)
+    }
 }
 
 #[derive(Deserialize)]

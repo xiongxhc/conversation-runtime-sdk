@@ -46,3 +46,7 @@
 {"protocol_version":1,"type":"ready","status":{"transport":"stdio","privacy_mode":"local_only","language_location":"local","model_id":"local-model","memory_enabled":true,"memory_location":null,"telemetry_enabled":false,"capabilities":["text","memory_inspection"]}}
 {"protocol_version":1,"type":"ready","status":{"transport":"stdio","privacy_mode":"local_only","language_location":"local","model_id":"local-model","memory_enabled":true,"memory_location":null,"telemetry_enabled":false,"capabilities":["text"]}}
 {"protocol_version":1,"type":"ready","status":{"transport":"stdio","privacy_mode":"local_only","language_location":"local","model_id":"local-model","memory_enabled":true,"memory_location":"local","telemetry_enabled":false,"capabilities":["text"]}}
+{"protocol_version":1,"type":"persona_update","request_id":"req-1","persona":{"mode":"companionship","warmth":101,"humor":0,"teasing":0,"initiative":0,"directness":0,"intimacy":0,"verbosity":0,"follow_up_frequency":0}}
+{"protocol_version":1,"type":"persona_update","request_id":"req-1","persona":{"mode":"unknown","warmth":0,"humor":0,"teasing":0,"initiative":0,"directness":0,"intimacy":0,"verbosity":0,"follow_up_frequency":0}}
+{"protocol_version":1,"type":"memory_approve","request_id":"req-1","memory_id":"7","expected_revision":"abc"}
+{"protocol_version":1,"type":"memory_delete","request_id":"req-1","memory_id":"7","expected_revision":"0"}

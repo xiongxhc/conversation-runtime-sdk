@@ -23,3 +23,6 @@
 {"protocol_version":1,"type":"voice_event","event":{"type":"voice_session_failed","session_id":"1","error":{"code":"adapter_failure","kind":"adapter","stage":"speech_recognizer","message":"speech recognition operation failed"},"recovery":"continue_session"}}
 {"protocol_version":1,"type":"voice_event","event":{"type":"voice_session_ended","session_id":"1"}}
 {"protocol_version":1,"type":"fatal","error":{"code":"configuration_invalid","kind":"configuration","stage":"runtime","message":"stdout is unavailable"}}
+{"protocol_version":1,"type":"persona_state","request_id":"req-persona-update","persona":{"mode":"companionship","warmth":95,"humor":60,"teasing":40,"initiative":35,"directness":80,"intimacy":30,"verbosity":20,"follow_up_frequency":25}}
+{"protocol_version":1,"type":"memory_deleted","request_id":"req-memory-delete","memory_id":"7"}
+{"protocol_version":1,"type":"memory_extracted","created":2,"activated":1,"pending_approval":1}

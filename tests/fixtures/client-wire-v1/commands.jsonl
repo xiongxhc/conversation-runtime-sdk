@@ -8,3 +8,7 @@
 {"protocol_version":1,"type":"memory_list","request_id":"req-list-first","cursor":null}
 {"protocol_version":1,"type":"memory_list","request_id":"req-list-next","cursor":{"before_id":"7"}}
 {"protocol_version":1,"type":"memory_inspect","request_id":"req-inspect-1","memory_id":"7"}
+{"protocol_version":1,"type":"persona_get","request_id":"req-persona-get"}
+{"protocol_version":1,"type":"persona_update","request_id":"req-persona-update","persona":{"mode":"companionship","warmth":95,"humor":60,"teasing":40,"initiative":35,"directness":80,"intimacy":30,"verbosity":20,"follow_up_frequency":25}}
+{"protocol_version":1,"type":"memory_approve","request_id":"req-memory-approve","memory_id":"7","expected_revision":"2"}
+{"protocol_version":1,"type":"memory_delete","request_id":"req-memory-delete","memory_id":"7","expected_revision":"2"}

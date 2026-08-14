@@ -218,9 +218,13 @@ impl GatewayConfig {
             persona_level(self.persona.verbosity)?,
             persona_level(self.persona.follow_up_frequency)?,
         );
-        // Verbosity buys the spoken budget up front (10s floor, 80s ceiling);
-        // the quality controller still reduces it per turn.
-        let maximum_spoken_seconds = 10 + u16::from(self.persona.verbosity) * 7 / 10;
+        // Verbosity buys the spoken budget up front; the quality controller
+        // still reduces it per turn. Above the expansive threshold the curve
+        // steepens into long-form territory (v60 ≈ 52s, v85 ≈ 145s,
+        // v100 ≈ 200s) so a storyteller persona can actually tell a story.
+        let verbosity = u16::from(self.persona.verbosity);
+        let expansive_bonus = verbosity.saturating_sub(60) * 3;
+        let maximum_spoken_seconds = 10 + verbosity * 7 / 10 + expansive_bonus;
         let controls = ResponseControls::new(
             maximum_spoken_seconds,
             persona.directness(),

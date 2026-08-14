@@ -4,7 +4,7 @@ mod memory_extraction;
 mod session;
 mod voice_adapters;
 
-pub use config::{GatewayAdapters, GatewayConfig, GatewayConfigError};
+pub use config::{GatewayAdapters, GatewayConfig, GatewayConfigError, GatewayMemoryExtraction};
 pub use framing::{FrameError, FrameReader, FrameWriter};
 pub use memory_extraction::MemoryExtractionSettings;
 pub use session::{GatewaySession, GatewaySessionError};

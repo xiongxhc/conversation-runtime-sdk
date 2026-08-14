@@ -3,12 +3,16 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use conversation_memory::{MemoryStore, NeverCancelled, SqliteMemoryStore};
+use conversation_model_adapters::{GenerationLanguageModel, GenerationLanguageRequest};
 use conversation_protocol::{
-    encode_gateway_message, GatewayMessage, MemoryConfidence, MemoryDraft, MemoryKind,
-    MemoryProvenance, MemoryProvenanceKind, MemoryRetention, MemoryRetrievalRequest, SessionId,
-    TurnId, UnixTimestampMillis,
+    encode_gateway_message, GatewayMessage, GenerationId, MemoryConfidence, MemoryDraft,
+    MemoryKind, MemoryProvenance, MemoryProvenanceKind, MemoryRetention, MemoryRetrievalRequest,
+    SessionId, TurnId, UnixTimestampMillis,
 };
 use conversation_runtime_gateway::{GatewayAdapters, GatewayConfig, MemoryExtractionSettings};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 
 const VALID_CONFIG: &str = r#"schema_version = 1
 privacy_mode = "local-only"
@@ -287,7 +291,9 @@ fn an_empty_extraction_table_applies_the_documented_defaults() {
     let adapters = GatewayConfig::load(&path).unwrap();
 
     assert_eq!(
-        adapters.memory_extraction,
+        adapters
+            .memory_extraction
+            .map(|extraction| extraction.settings),
         Some(MemoryExtractionSettings::new(3, 90))
     );
 }
@@ -308,9 +314,120 @@ fn extraction_settings_are_read_from_the_memory_extraction_table() {
     let adapters = GatewayConfig::load(&path).unwrap();
 
     assert_eq!(
-        adapters.memory_extraction,
+        adapters
+            .memory_extraction
+            .map(|extraction| extraction.settings),
         Some(MemoryExtractionSettings::new(5, 1))
     );
+}
+
+/// The adapter prepends the deployment's system prompt to every request it is given,
+/// which would seat the persona ahead of the extraction instruction and coax the model
+/// into persona prose instead of the JSON array the parser needs. Asserted through the
+/// wire, because the built model handle is otherwise opaque.
+#[tokio::test]
+async fn the_extraction_model_asks_without_the_persona_system_prompt() {
+    const SYSTEM_PROMPT: &str = "You are a warm companion who always answers in prose.";
+    let fixture = tempfile::tempdir().unwrap();
+    let database = fixture.path().join("runtime.sqlite3");
+    SqliteMemoryStore::initialize(&database).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let contents = memory_config(&database)
+        .replacen(
+            "thinking = false",
+            &format!("thinking = false\nsystem_prompt = \"{SYSTEM_PROMPT}\""),
+            1,
+        )
+        .replacen("http://127.0.0.1:11434", &endpoint, 1)
+        + "\n[memory.extraction]\n";
+    let path = write_config(fixture.path(), &contents);
+
+    let adapters = GatewayConfig::load(&path).unwrap();
+    let extraction = adapters
+        .memory_extraction
+        .expect("extraction is configured");
+
+    let turn_request = ask(&listener, adapters.language.as_ref(), "the turn transcript").await;
+    let extraction_request = ask(
+        &listener,
+        extraction.language.as_ref(),
+        "the extraction prompt",
+    )
+    .await;
+
+    assert!(
+        turn_request.contains(SYSTEM_PROMPT),
+        "the conversation model lost its system prompt: {turn_request}"
+    );
+    assert!(
+        !extraction_request.contains(SYSTEM_PROMPT),
+        "the extraction model carried the persona system prompt: {extraction_request}"
+    );
+    assert!(
+        !extraction_request.contains(r#""role":"system""#),
+        "the extraction model carried a system message: {extraction_request}"
+    );
+    assert!(
+        extraction_request.contains("the extraction prompt"),
+        "the extraction model dropped its instruction: {extraction_request}"
+    );
+    assert!(
+        extraction_request.contains(r#""temperature":0.0"#),
+        "the extraction model did not pin temperature: {extraction_request}"
+    );
+}
+
+/// Drives one generation against `listener`, answering with an immediately-done Ollama
+/// chat response, and returns the request body the model sent.
+async fn ask(
+    listener: &TcpListener,
+    model: &dyn GenerationLanguageModel,
+    transcript: &str,
+) -> String {
+    let mut deltas = model.stream(
+        GenerationLanguageRequest::new(TurnId::new(1), GenerationId::new(1), transcript),
+        CancellationToken::new(),
+    );
+    let (mut stream, _) = listener.accept().await.unwrap();
+    let mut request = Vec::new();
+    let header_end = loop {
+        if let Some(index) = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|index| index + 4)
+        {
+            break index;
+        }
+        let mut chunk = [0_u8; 4096];
+        let count = stream.read(&mut chunk).await.unwrap();
+        assert!(count > 0);
+        request.extend_from_slice(&chunk[..count]);
+    };
+    let content_length = String::from_utf8_lossy(&request[..header_end])
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().unwrap())
+        })
+        .unwrap_or(0);
+    while request.len() < header_end + content_length {
+        let mut chunk = [0_u8; 4096];
+        let count = stream.read(&mut chunk).await.unwrap();
+        assert!(count > 0);
+        request.extend_from_slice(&chunk[..count]);
+    }
+    stream
+        .write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n\
+{\"message\":{\"role\":\"assistant\",\"content\":\"[]\"},\"done\":true}\n",
+        )
+        .await
+        .unwrap();
+    stream.flush().await.unwrap();
+    while deltas.recv().await.is_some() {}
+    String::from_utf8_lossy(&request[header_end..]).into_owned()
 }
 
 #[test]

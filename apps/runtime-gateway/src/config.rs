@@ -56,8 +56,19 @@ pub struct GatewayAdapters {
     pub language: Arc<dyn GenerationLanguageModel>,
     pub voice: Option<GatewayVoiceAdapters>,
     pub memory_store: Option<SqliteMemoryStore>,
-    pub memory_extraction: Option<MemoryExtractionSettings>,
+    pub memory_extraction: Option<GatewayMemoryExtraction>,
     pub status: RuntimeStatus,
+}
+
+/// Extraction runs against its own model handle rather than the turn model's. The
+/// adapter prepends the deployment's persona system prompt to every request it is
+/// given, which would seat that prompt ahead of the extraction instruction and coax a
+/// local model into answering in persona prose instead of the JSON array the parser
+/// needs. This handle carries the same endpoint and model with no system prompt and a
+/// temperature of zero.
+pub struct GatewayMemoryExtraction {
+    pub language: Arc<dyn GenerationLanguageModel>,
+    pub settings: MemoryExtractionSettings,
 }
 
 impl fmt::Debug for GatewayAdapters {
@@ -118,7 +129,7 @@ impl GatewayConfig {
             .memory
             .as_ref()
             .and_then(|memory| memory.extraction.as_ref())
-            .map(MemoryExtractionConfig::settings)
+            .map(|extraction| self.extraction_adapters(extraction))
             .transpose()?;
         let mut context = ConversationContext::new(quality);
         if let Some(provider) = memory_provider {
@@ -183,10 +194,43 @@ impl GatewayConfig {
     }
 
     fn language_config(&self) -> Result<OllamaConfig, GatewayConfigError> {
+        let mut language = self.base_language_config()?;
+        if let Some(system_prompt) = self.language.system_prompt.as_deref() {
+            if system_prompt.trim().is_empty() {
+                return Err(config_error("language system_prompt cannot be empty"));
+            }
+            if system_prompt.len() > MAX_SYSTEM_PROMPT_BYTES {
+                return Err(config_error("language system_prompt exceeded 4 KiB"));
+            }
+            language = language.with_system_prompt(system_prompt);
+        }
+        Ok(language)
+    }
+
+    fn extraction_adapters(
+        &self,
+        extraction: &MemoryExtractionConfig,
+    ) -> Result<GatewayMemoryExtraction, GatewayConfigError> {
+        Ok(GatewayMemoryExtraction {
+            language: Arc::new(OllamaLanguageModel::new_direct(
+                self.base_language_config()?.with_temperature(0.0),
+            )),
+            settings: extraction.settings()?,
+        })
+    }
+
+    /// Everything the deployment configured for the language model except its system
+    /// prompt, which only the conversation model wants.
+    fn base_language_config(&self) -> Result<OllamaConfig, GatewayConfigError> {
         if self.language.model.len() > MAX_MODEL_ID_BYTES {
             return Err(config_error("language model identifier exceeded 256 bytes"));
         }
-        let mut language = OllamaConfig::new(&self.language.model)
+        if !self.language.temperature.is_finite() || self.language.temperature < 0.0 {
+            return Err(config_error(
+                "language temperature must be finite and non-negative",
+            ));
+        }
+        OllamaConfig::new(&self.language.model)
             .map_err(adapter_error)?
             .with_endpoint(&self.language.endpoint)
             .map_err(adapter_error)?
@@ -198,22 +242,7 @@ impl GatewayConfig {
             .with_num_ctx(self.language.num_ctx)
             .map_err(adapter_error)?
             .with_max_assistant_content_bytes(self.language.max_assistant_content_bytes)
-            .map_err(adapter_error)?;
-        if let Some(system_prompt) = self.language.system_prompt.as_deref() {
-            if system_prompt.trim().is_empty() {
-                return Err(config_error("language system_prompt cannot be empty"));
-            }
-            if system_prompt.len() > MAX_SYSTEM_PROMPT_BYTES {
-                return Err(config_error("language system_prompt exceeded 4 KiB"));
-            }
-            language = language.with_system_prompt(system_prompt);
-        }
-        if !self.language.temperature.is_finite() || self.language.temperature < 0.0 {
-            return Err(config_error(
-                "language temperature must be finite and non-negative",
-            ));
-        }
-        Ok(language)
+            .map_err(adapter_error)
     }
 
     fn quality_controller(&self) -> Result<ConversationQualityController, GatewayConfigError> {

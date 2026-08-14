@@ -38,14 +38,19 @@ async fn run() -> Result<(), ()> {
     let runtime = TextTurnRuntime::new(context.clone(), language.clone());
     let mut session = GatewaySession::new(runtime, status);
     if let Some(voice_adapters) = voice {
-        session = session.with_voice(voice_adapters, context, language.clone());
+        session = session.with_voice(voice_adapters, context, language);
     }
     if let Some(store) = memory_store {
         let store: Arc<dyn MemoryStore> = Arc::new(store);
         let clock: Arc<dyn MemoryClock> = Arc::new(SystemMemoryClock);
         session = session.with_memory_inspection(store.clone(), clock.clone());
-        if let Some(settings) = memory_extraction {
-            session = session.with_memory_extraction(store, language, clock, settings);
+        if let Some(extraction) = memory_extraction {
+            session = session.with_memory_extraction(
+                store,
+                extraction.language,
+                clock,
+                extraction.settings,
+            );
         }
     }
     session

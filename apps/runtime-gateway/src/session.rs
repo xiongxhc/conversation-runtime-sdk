@@ -1181,9 +1181,7 @@ async fn pump_voice_events(
     mut control_pending: watch::Receiver<bool>,
 ) -> Result<(), GatewaySessionError> {
     let mut forwarding = true;
-    // The voice lane splits one exchange across two events: the recognized utterance
-    // arrives as `TranscriptFinal`, the completed reply as `TextCompleted`.
-    let mut spoken: Option<(TurnId, String)> = None;
+    let mut exchange = VoiceExchange::default();
     while let Some(event) = events.recv().await {
         if !forwarding {
             continue;
@@ -1195,16 +1193,14 @@ async fn pump_voice_events(
                     ..
                 }
                 | VoiceSessionEvent::TranscriptFinal { turn_id, text, .. } => {
-                    spoken = Some((*turn_id, text.clone()));
+                    exchange.recognized(*turn_id, text);
                 }
                 VoiceSessionEvent::Turn {
                     event: RuntimeEvent::TextCompleted { turn_id, text },
                     ..
                 } => {
-                    if let Some((spoken_turn, spoken_text)) = spoken.take() {
-                        if spoken_turn == *turn_id {
-                            extractor.observe_exchange(*turn_id, &spoken_text, text);
-                        }
+                    if let Some(spoken) = exchange.completed(*turn_id) {
+                        extractor.observe_exchange(*turn_id, &spoken, text);
                     }
                 }
                 _ => {}
@@ -1253,6 +1249,31 @@ async fn pump_voice_events(
         }
     }
     Ok(())
+}
+
+// The voice lane splits one exchange across two events: the recognized utterance
+// arrives as `TranscriptFinal`, the completed reply as `TextCompleted`. This buffers
+// the utterance until its own reply completes.
+#[derive(Default)]
+struct VoiceExchange {
+    spoken: Option<(TurnId, String)>,
+}
+
+impl VoiceExchange {
+    fn recognized(&mut self, turn_id: TurnId, text: &str) {
+        self.spoken = Some((turn_id, text.to_owned()));
+    }
+
+    // The utterance this reply answers, or `None` when the buffered one belongs to a
+    // different turn. A mismatch means the user spoke again before this reply finished,
+    // so the buffered utterance belongs to a turn that has *not* completed yet: it is
+    // kept for that turn rather than discarded along with this reply, which would
+    // otherwise cost two exchanges instead of one.
+    fn completed(&mut self, turn_id: TurnId) -> Option<String> {
+        self.spoken
+            .take_if(|(spoken_turn, _)| *spoken_turn == turn_id)
+            .map(|(_, text)| text)
+    }
 }
 
 // Publishes what each extraction wrote on the event lane. It runs as its own task so
@@ -1802,11 +1823,13 @@ mod tests {
         SqliteMemoryStore,
     };
     use conversation_model_adapters::{
-        AdapterError, AdapterFuture, GenerationLanguageModel, GenerationLanguageRequest,
-        GenerationTextDelta, MockContinuousAudioOutput, MockGenerationLanguageModel,
-        MockStreamingSpeechSynthesizer, MockVoiceCaptureControl, MockVoiceIoFactory, OllamaConfig,
-        OllamaLanguageModel, RecognitionEvent, RecognitionHypothesis, VoiceCaptureControl,
-        VoiceInput, VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
+        AdapterError, AdapterFuture, AudioFrame, GenerationLanguageModel,
+        GenerationLanguageRequest, GenerationTextDelta, MockContinuousAudioOutput,
+        MockGenerationLanguageModel, MockStreamingSpeechSynthesizer, MockVoiceCaptureControl,
+        MockVoiceIoFactory, OllamaConfig, OllamaLanguageModel, PcmFormat, PcmSampleFormat,
+        RecognitionEvent, RecognitionHypothesis, StreamingSpeechRequest,
+        StreamingSpeechSynthesizer, VoiceCaptureControl, VoiceInput, VoiceInputEvent,
+        VoiceIoFactory, VoiceIoSession,
     };
     use conversation_protocol::{
         ClientRuntimeEvent, ComponentDescriptor, ComponentKind, ExecutionLocation, GatewayMessage,
@@ -1825,7 +1848,7 @@ mod tests {
     use crate::voice_adapters::{GatewayVoiceAdapters, VoicePolicyTemplate};
     use crate::FrameReader;
 
-    use super::{voice_failure_diagnostic, GatewaySession, GatewaySessionError};
+    use super::{voice_failure_diagnostic, GatewaySession, GatewaySessionError, VoiceExchange};
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -3713,6 +3736,142 @@ mod tests {
         assert!(extracted.contains(r#""pending_approval":0"#), "{extracted}");
         assert_eq!(store.list(timestamp(10_000)).unwrap().len(), 1);
         gateway.close().await;
+    }
+
+    #[test]
+    fn a_voice_reply_pairs_with_the_utterance_from_its_own_turn() {
+        let mut exchange = VoiceExchange::default();
+
+        exchange.recognized(TurnId::new(1), "i ship rust");
+
+        assert_eq!(
+            exchange.completed(TurnId::new(1)),
+            Some("i ship rust".to_owned())
+        );
+        assert_eq!(exchange.completed(TurnId::new(1)), None);
+    }
+
+    #[test]
+    fn a_voice_reply_from_another_turn_leaves_the_utterance_for_its_own_turn() {
+        let mut exchange = VoiceExchange::default();
+
+        // The user spoke again (turn 2) before turn 1's reply finished.
+        exchange.recognized(TurnId::new(2), "and i review on fridays");
+
+        assert_eq!(exchange.completed(TurnId::new(1)), None);
+        assert_eq!(
+            exchange.completed(TurnId::new(2)),
+            Some("and i review on fridays".to_owned()),
+            "the mismatched reply discarded an utterance that was still waiting for its own turn"
+        );
+    }
+
+    #[test]
+    fn a_voice_reply_without_a_recognized_utterance_pairs_nothing() {
+        assert_eq!(VoiceExchange::default().completed(TurnId::new(1)), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_completed_voice_exchange_reports_extracted_memories() {
+        let (_temporary, store) = initialized_store();
+        let (input, input_receiver) = mpsc::channel(8);
+        let turn_language = Arc::new(MockGenerationLanguageModel::new(["i see"]));
+        let extraction = MockGenerationLanguageModel::new([
+            r#"[{"kind":"semantic","content":"the user ships rust","explicit":true,"confidence":800}]"#,
+        ]);
+        let adapters = GatewayVoiceAdapters {
+            io: Arc::new(TestVoiceIoFactory::with_capture(
+                input_receiver,
+                Arc::new(MockVoiceCaptureControl::new()),
+            )),
+            speech: Arc::new(PerRequestSpeech),
+            policy: voice_policy(),
+        };
+        let session = GatewaySession::new(unused_runtime(), status_with_voice())
+            .with_voice(adapters, test_context(), turn_language)
+            .with_memory_extraction(
+                Arc::new(store.clone()),
+                Arc::new(extraction),
+                Arc::new(FixedClock(timestamp(10_000))),
+                crate::MemoryExtractionSettings::new(3, 90),
+            );
+        let mut gateway = InMemoryGateway::start(session).await;
+
+        gateway
+            .write(
+                r#"{"protocol_version":1,"type":"start_voice_session","request_id":"voice-extract"}"#,
+            )
+            .await;
+        assert_accepted_message(&gateway.read_message().await, "voice-extract");
+
+        send_voice_input(
+            &input,
+            VoiceInputEvent::Activity(VoiceActivity::SpeechStarted { at_ms: 0 }),
+        )
+        .await;
+        send_voice_input(
+            &input,
+            VoiceInputEvent::Recognition(RecognitionEvent::Hypothesis(
+                RecognitionHypothesis::engine_final(1, "i ship rust"),
+            )),
+        )
+        .await;
+        send_voice_input(
+            &input,
+            VoiceInputEvent::Activity(VoiceActivity::SpeechEnded { at_ms: 0 }),
+        )
+        .await;
+        tokio::time::advance(Duration::from_millis(900)).await;
+        // Real time from here: the extraction's own store write runs on the blocking
+        // pool, and a paused clock would otherwise auto-advance the reader's deadline
+        // while the runtime waits on it.
+        tokio::time::resume();
+
+        let messages = gateway
+            .read_until(|message| message_type(message) == "memory_extracted")
+            .await;
+
+        assert!(messages
+            .iter()
+            .any(|message| message.contains(r#""type":"voice_transcript_final""#)));
+        let extracted = messages.last().unwrap();
+        assert!(extracted.contains(r#""created":1"#), "{extracted}");
+        assert!(extracted.contains(r#""activated":1"#), "{extracted}");
+        let records = store.list(timestamp(10_000)).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].content(), "the user ships rust");
+
+        drop(input);
+        gateway.read_until(is_voice_terminal).await;
+        gateway.close().await;
+    }
+
+    /// Answers every synthesis request with one silent frame carrying that request's own
+    /// identities, so a voice turn reaches its completed terminal (and therefore emits
+    /// `TextCompleted`) instead of failing in synthesis the way `no_speech_frames` does.
+    struct PerRequestSpeech;
+
+    impl StreamingSpeechSynthesizer for PerRequestSpeech {
+        fn stream(
+            &self,
+            request: StreamingSpeechRequest,
+            _cancellation: CancellationToken,
+        ) -> mpsc::Receiver<Result<AudioFrame, AdapterError>> {
+            let frame = AudioFrame::new(
+                request.turn_id(),
+                request.generation_id(),
+                request.utterance_id(),
+                0,
+                PcmFormat::new(24_000, 1, PcmSampleFormat::Signed16LittleEndian).unwrap(),
+                vec![0; 960],
+            )
+            .unwrap();
+            let (sender, receiver) = mpsc::channel(1);
+            tokio::spawn(async move {
+                let _ = sender.send(Ok(frame)).await;
+            });
+            receiver
+        }
     }
 
     #[tokio::test]

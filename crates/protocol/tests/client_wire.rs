@@ -708,6 +708,39 @@ fn persona_and_memory_mutation_gateway_messages_encode() {
 }
 
 #[test]
+fn command_rejected_accepts_the_memory_conflict_and_persona_invalid_codes() {
+    for code in ["memory_conflict", "persona_invalid"] {
+        let value = gateway_value(&GatewayMessage::CommandRejected {
+            request_id: "req-1".to_owned(),
+            error: ClientRuntimeError {
+                code: code.to_owned(),
+                kind: "invalid_state".to_owned(),
+                stage: "runtime".to_owned(),
+                message: "rejected".to_owned(),
+            },
+        });
+        assert_eq!(value["type"], "command_rejected");
+        assert_eq!(value["error"]["code"], code);
+    }
+
+    // Pins the accepted-code set as closed: an error code outside it must still
+    // be rejected at encode time, the same way an unmirrored code would silently
+    // desync gateway and client if it slipped onto the wire.
+    assert!(matches!(
+        encode_gateway_message(&GatewayMessage::CommandRejected {
+            request_id: "req-1".to_owned(),
+            error: ClientRuntimeError {
+                code: "not_a_real_code".to_owned(),
+                kind: "invalid_state".to_owned(),
+                stage: "runtime".to_owned(),
+                message: "rejected".to_owned(),
+            },
+        }),
+        Err(ClientWireError::InvalidRuntimeErrorCode)
+    ));
+}
+
+#[test]
 fn client_persona_state_round_trips_through_persona_profile_and_mode() {
     let profile = PersonaProfile::default();
     let mode = ConversationMode::Brainstorming;

@@ -25,8 +25,10 @@ The first release is not a directory-complete platform. It is one local voice lo
   and interruptions rather than process duration alone, plus a bounded
   30-sample acoustic report analyzer.
 - A private local-only configuration and local ASR model now pass preflight,
-  the current macOS source passes an opt-in full-duplex capture/playback smoke,
-  and the release CLI starts under `LocalOnly`. A complete post-fix
+  the current macOS source passes an opt-in full-duplex capture/playback smoke
+  through CoreAudio's rendered-data completion callback, and a release
+  gateway-to-sidecar session reports the active input and output labels through
+  the public SDK. The release CLI starts under `LocalOnly`. A complete post-fix
   human-spoken turn, ten-minute device run, and 30-sample acoustic recording
   remain unperformed, so R3 remains `ACCEPTANCE BLOCKED` despite complete
   deterministic acceptance tooling.
@@ -45,9 +47,13 @@ The first release is not a directory-complete platform. It is one local voice lo
   and bounded close cleanup are deterministic-test covered. The compiled public
   SDK test proves typed→spoken→typed context reuse through a disposable gateway,
   fake sidecar, and loopback providers. Without `[voice]`, the same app remains
-  text-only with a visual Focus preview. Native microphone, playback, device,
-  GPU, ten-minute, first-audible, audible-stop, and acoustic observations remain
-  separately open, as do persona/memory mutation, model setup, and distribution.
+  text-only with a visual Focus preview. Voice Focus now shows bounded active
+  input/output labels while keeping transcripts hidden by default, and exposes
+  only a transient bounded last-heard excerpt after recognition failure. Native
+  capture plus playback completion and the release device-status handshake are
+  observed; a complete audible turn, GPU behavior, ten-minute continuity,
+  first-audible, audible-stop, and acoustic quality remain separately open, as
+  do persona/memory mutation, model setup, and distribution.
 - The deterministic continuity gate now covers five spoken turns with a
   turn-scoped local language failure in the second turn, followed by three
   successful turns in the same session. Post-start recognition failure restarts
@@ -171,13 +177,16 @@ accumulator, avoiding microphone restart gaps during slow in-flight decoding.
 The public acceptance harness and acoustic procedure are present. Process/device
 evidence is `PARTIALLY VALIDATED`: a private local-only configuration and local
 ASR model pass preflight, the current macOS source passes an opt-in full-duplex
-capture/playback smoke, and the release CLI starts under `LocalOnly`. Local
-multilingual fixtures transcribe without control tokens. A complete spoken
+capture/playback smoke through CoreAudio's rendered-data completion callback,
+and the release gateway, release sidecar, and public TypeScript SDK complete a
+live session handshake carrying bounded active input/output labels. The release
+CLI starts under `LocalOnly`. Local multilingual fixtures transcribe without
+control tokens. A complete spoken
 microphone-to-audible-response turn is not yet observed after the latest
 finalization fix, so process/device acceptance remains incomplete. Acoustic
 evidence is `NOT VALIDATED` because no external recording set exists. The latest
-current complete mechanical gate passes the Rust workspace with one intentionally
-ignored fixture writer and `131` Swift tests. No ten-minute continuity,
+complete mechanical gate passes the Rust workspace with one intentionally
+ignored fixture writer and `151` Swift tests. No ten-minute continuity,
 first-audible, audible-stop p95, or R3 completion claim is made. See
 [the R3 evaluation](docs/r3-real-time-voice-evaluation.md).
 

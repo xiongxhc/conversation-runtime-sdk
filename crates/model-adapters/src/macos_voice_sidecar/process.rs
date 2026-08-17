@@ -21,9 +21,9 @@ use super::codec::{
     SidecarFrame, MAX_CONTROL_PAYLOAD_BYTES, PROTOCOL_VERSION,
 };
 use crate::{
-    AdapterError, AdapterFuture, AudioFrame, CaptureEvent, ContinuousAudioOutput, PlaybackReceipt,
-    RecognitionEvent, VoiceCaptureControl, VoiceInput, VoiceInputEvent, VoiceIoFactory,
-    VoiceIoSession,
+    AdapterError, AdapterFuture, AudioDeviceStatus, AudioFrame, CaptureEvent,
+    ContinuousAudioOutput, PlaybackReceipt, RecognitionEvent, VoiceCaptureControl, VoiceInput,
+    VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
 };
 
 const SPEECH_START_MS: std::ops::RangeInclusive<u64> = 100..=1_000;
@@ -1234,15 +1234,17 @@ async fn run_media_writer(
     }
 }
 
-async fn run_stdout_reader(
-    mut stdout: ChildStdout,
+async fn run_stdout_reader<R>(
+    mut stdout: R,
     max_payload_bytes: usize,
     session_id: SessionId,
     shared: Arc<SessionShared>,
     input_publisher: InputPublisher,
     cancellation: CancellationToken,
     supervisor_sender: mpsc::UnboundedSender<SupervisorEvent>,
-) {
+) where
+    R: AsyncRead + Unpin,
+{
     let mut ready = false;
     let mut capture_started = false;
     loop {
@@ -1296,6 +1298,15 @@ async fn run_stdout_reader(
         }
 
         let input_event = match control {
+            // Device labels are informational: a name this session cannot
+            // publish is dropped rather than allowed to end the session.
+            SidecarControl::AudioDeviceStatus {
+                input_label,
+                output_label,
+                ..
+            } => AudioDeviceStatus::new(&input_label, &output_label)
+                .ok()
+                .map(|status| (VoiceInputEvent::DeviceStatus(status), true)),
             SidecarControl::VoiceActivity {
                 activity: VoiceActivity::CaptureDiscontinuity { at_ms },
                 ..
@@ -1576,6 +1587,7 @@ fn control_session_id(control: &SidecarControl) -> SessionId {
         | SidecarControl::CaptureStarted { session_id, .. }
         | SidecarControl::CapturePaused { session_id, .. }
         | SidecarControl::CaptureResumed { session_id, .. }
+        | SidecarControl::AudioDeviceStatus { session_id, .. }
         | SidecarControl::Failure { session_id, .. }
         | SidecarControl::ShutdownComplete { session_id } => *session_id,
     }
@@ -2648,6 +2660,58 @@ mod process_tests {
         );
 
         assert_eq!(result.unwrap_err().message(), "first fatal failure");
+    }
+
+    #[tokio::test]
+    async fn unusable_device_status_labels_are_dropped_without_a_fatal() {
+        let frames = [
+            SidecarFrame::control(SidecarControl::Ready {
+                session_id: SessionId::new(1),
+            }),
+            SidecarFrame::control(SidecarControl::AudioDeviceStatus {
+                session_id: SessionId::new(1),
+                input_label: "   ".to_owned(),
+                output_label: "Speakers".to_owned(),
+            }),
+            SidecarFrame::control(SidecarControl::AudioDeviceStatus {
+                session_id: SessionId::new(1),
+                input_label: "USB Audio Device ".to_owned(),
+                output_label: "Speakers".to_owned(),
+            }),
+        ];
+        let stdout = frames
+            .iter()
+            .flat_map(|frame| encode_frame(frame).unwrap())
+            .collect::<Vec<_>>();
+        let (reliable_sender, mut reliable) = mpsc::channel(RELIABLE_INPUT_QUEUE_CAPACITY);
+        let (nonterminal_sender, _nonterminal) = mpsc::channel(NONTERMINAL_INPUT_QUEUE_CAPACITY);
+        let (supervisor_sender, mut supervisor) = mpsc::unbounded_channel();
+
+        run_stdout_reader(
+            stdout.as_slice(),
+            MAX_CONTROL_PAYLOAD_BYTES,
+            SessionId::new(1),
+            Arc::new(SessionShared::new(SessionId::new(1))),
+            InputPublisher {
+                reliable: reliable_sender,
+                nonterminal: nonterminal_sender,
+                supervisor: supervisor_sender.clone(),
+            },
+            CancellationToken::new(),
+            supervisor_sender,
+        )
+        .await;
+
+        let status = reliable.try_recv().unwrap().unwrap();
+        assert_eq!(
+            status,
+            VoiceInputEvent::DeviceStatus(
+                AudioDeviceStatus::new("USB Audio Device", "Speakers").unwrap()
+            )
+        );
+        assert!(reliable.try_recv().is_err());
+        assert!(matches!(supervisor.try_recv(), Ok(SupervisorEvent::Ready)));
+        assert!(matches!(supervisor.try_recv(), Ok(SupervisorEvent::Eof)));
     }
 
     #[tokio::test]

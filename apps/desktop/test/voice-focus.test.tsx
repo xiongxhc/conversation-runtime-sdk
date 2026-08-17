@@ -307,6 +307,7 @@ describe("Voice Focus", () => {
         ...activeVoice(),
         capture: "paused",
         visual: "error",
+        lastHeardTranscript: "background narration from the speakers",
         error: {
           code: "adapter_failure",
           kind: "adapter",
@@ -324,6 +325,7 @@ describe("Voice Focus", () => {
     expect(await screen.findByText("Microphone paused")).toBeTruthy();
     expect(screen.getByText("recognizer needs attention")).toBeTruthy();
     expect(screen.getByText("Temporary voice issue. The session is still active; speak again or stop voice.")).toBeTruthy();
+    expect(screen.getByText("Last heard: “background narration from the speakers”")).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Retry voice" })).toBeNull();
     expect(session.stopVoice).not.toHaveBeenCalled();
     expect(session.startVoice).not.toHaveBeenCalled();
@@ -348,6 +350,7 @@ describe("Voice Focus", () => {
     renderConnectedApp({ session });
     fireEvent.click(await screen.findByRole("button", { name: "Voice Focus" }));
 
+    expect(screen.queryByLabelText("Active audio devices")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Retry voice" }));
     expect(session.startVoice).toHaveBeenCalledOnce();
     expect(session.stopVoice).not.toHaveBeenCalled();
@@ -470,6 +473,10 @@ describe("Voice Focus", () => {
         capture: "listening",
         visual: "speaking",
         sessionId: 1n,
+        devices: {
+          inputLabel: "MacBook Pro Microphone",
+          outputLabel: "Chris 的 AirPods",
+        },
         partialTranscript: "A fixture transcript",
       },
     })) });
@@ -483,6 +490,8 @@ describe("Voice Focus", () => {
     expect(screen.getByText("TTS local")).toBeTruthy();
     expect(screen.getByText("Audio local")).toBeTruthy();
     expect(screen.getByText("Telemetry disabled")).toBeTruthy();
+    expect(screen.getByText("Input: MacBook Pro Microphone")).toBeTruthy();
+    expect(screen.getByText("Output: Chris 的 AirPods")).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "Show transcript" }));
     expect(await screen.findByText("A fixture transcript")).toBeTruthy();

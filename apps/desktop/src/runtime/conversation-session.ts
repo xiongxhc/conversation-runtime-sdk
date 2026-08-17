@@ -44,6 +44,11 @@ export type VoiceSessionState = {
     | "paused"
     | "error";
   sessionId?: bigint;
+  devices?: {
+    inputLabel: string;
+    outputLabel: string;
+  };
+  lastHeardTranscript?: string;
   partialTranscript: string;
   error?: RuntimeFailure;
 };
@@ -51,6 +56,7 @@ export type VoiceSessionState = {
 type SessionListener = (state: ConversationSessionState) => void;
 
 const voiceCleanupTimeoutMs = 2_000;
+const lastHeardTranscriptCharacters = 160;
 
 export class ConversationSession {
   private readonly listeners = new Set<SessionListener>();
@@ -192,6 +198,8 @@ export class ConversationSession {
       session: "starting",
       capture: "starting",
       visual: "requesting_permission",
+      devices: undefined,
+      lastHeardTranscript: undefined,
       partialTranscript: "",
       error: undefined,
     };
@@ -312,6 +320,8 @@ export class ConversationSession {
       capture: "stopped",
       visual: "idle",
       sessionId: undefined,
+      devices: undefined,
+      lastHeardTranscript: undefined,
       partialTranscript: "",
     };
     this.unsubscribeUnexpectedFailure();
@@ -398,6 +408,15 @@ export class ConversationSession {
           error: undefined,
         };
         break;
+      case "voice_device_status":
+        this.voice = {
+          ...this.voice,
+          devices: {
+            inputLabel: event.inputLabel,
+            outputLabel: event.outputLabel,
+          },
+        };
+        break;
       case "voice_capture_paused":
         this.voice = { ...this.voice, capture: "paused", visual: "paused" };
         break;
@@ -420,6 +439,7 @@ export class ConversationSession {
       case "voice_transcript_partial":
         this.voice = {
           ...this.voice,
+          lastHeardTranscript: diagnosticExcerpt(event.text),
           partialTranscript: event.text,
           visual: "listening",
           error: undefined,
@@ -428,6 +448,7 @@ export class ConversationSession {
       case "voice_transcript_final":
         this.voice = {
           ...this.voice,
+          lastHeardTranscript: undefined,
           partialTranscript: "",
           visual: "thinking",
           error: undefined,
@@ -470,7 +491,7 @@ export class ConversationSession {
             this.finishTurn(activeTurn);
           }
           this.voiceSession = undefined;
-          this.voice = { ...this.voice, sessionId: undefined };
+          this.voice = { ...this.voice, sessionId: undefined, devices: undefined };
         }
         break;
       case "voice_session_ended":
@@ -481,6 +502,8 @@ export class ConversationSession {
           capture: "stopped",
           visual: "idle",
           sessionId: undefined,
+          devices: undefined,
+          lastHeardTranscript: undefined,
           partialTranscript: "",
           error: undefined,
         };
@@ -631,6 +654,10 @@ function initialVoiceState(status: RuntimeStatus): VoiceSessionState {
     visual: "idle",
     partialTranscript: "",
   };
+}
+
+function diagnosticExcerpt(transcript: string): string {
+  return [...transcript].slice(0, lastHeardTranscriptCharacters).join("");
 }
 
 function asError(value: unknown): Error {

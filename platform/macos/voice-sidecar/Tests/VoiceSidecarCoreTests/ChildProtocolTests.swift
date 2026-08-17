@@ -22,6 +22,7 @@ func versionOneCaptureKindCodesArePinned() {
         (.captureStarted, 0x8007),
         (.capturePaused, 0x8008),
         (.captureResumed, 0x8009),
+        (.audioDeviceStatus, 0x800A),
         (.failure, 0x80FE),
         (.shutdownComplete, 0x80FF),
     ]
@@ -45,6 +46,32 @@ func captureControlsRoundTripExactSessionAndOperationIdentity() throws {
     for control in controls {
         let frame = ChildFrame(control: control)
         #expect(try ChildProtocol.decode(ChildProtocol.encode(frame)) == frame)
+    }
+}
+
+@Test
+func audioDeviceStatusRoundTripsUnicodeLabels() throws {
+    let frame = ChildFrame(
+        control: .audioDeviceStatus(
+            sessionID: 7,
+            inputLabel: "MacBook Pro Microphone",
+            outputLabel: "Chris 的 AirPods"
+        )
+    )
+
+    #expect(try ChildProtocol.decode(ChildProtocol.encode(frame)) == frame)
+}
+
+@Test
+func audioDeviceStatusRejectsUnknownPrivateFields() {
+    let payload = Data(
+        #"{"session_id":7,"input_label":"Built-in","output_label":"Speakers","device_uid":"private-id"}"#.utf8
+    )
+
+    #expect(throws: ChildProtocolError.invalidControlJSON) {
+        try ChildProtocol.decode(
+            rawFrame(kind: .audioDeviceStatus, payload: payload)
+        )
     }
 }
 
@@ -640,6 +667,11 @@ func everyControlKindRoundTripsWithExactIdentity() throws {
             sequence: 5
         ),
         .playbackFlushed(sessionID: 1, generationID: 2, operationID: 3),
+        .audioDeviceStatus(
+            sessionID: 1,
+            inputLabel: "MacBook Pro Microphone",
+            outputLabel: "Speakers"
+        ),
         .failure(sessionID: 1, stage: .audioOutput, code: .playbackFailed),
         .shutdownComplete(sessionID: 1),
     ]

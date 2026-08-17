@@ -240,6 +240,62 @@ describe("ConversationSession", () => {
     ]);
   });
 
+  it("surfaces active audio devices without persisting transcript state", async () => {
+    const transport = connectedVoiceTransport();
+    const session = await ConversationSession.connect(transport);
+    await session.startVoice();
+    transport.voiceEvent({
+      type: "voice_session_started",
+      session_id: "1",
+      privacy: { privacy_mode: "local_only", components: localVoiceStatus.components },
+    });
+    transport.voiceEvent({
+      type: "voice_device_status",
+      session_id: "1",
+      input_label: "MacBook Pro Microphone",
+      output_label: "Chris 的 AirPods",
+    });
+
+    await eventually(() => expect(session.state.voice.devices).toEqual({
+      inputLabel: "MacBook Pro Microphone",
+      outputLabel: "Chris 的 AirPods",
+    }));
+  });
+
+  it("clears stale device labels when a voice failure forces a new session", async () => {
+    const transport = connectedVoiceTransport();
+    const session = await ConversationSession.connect(transport);
+    await session.startVoice();
+    transport.voiceEvent({
+      type: "voice_session_started",
+      session_id: "1",
+      privacy: { privacy_mode: "local_only", components: localVoiceStatus.components },
+    });
+    transport.voiceEvent({
+      type: "voice_device_status",
+      session_id: "1",
+      input_label: "MacBook Pro Microphone",
+      output_label: "Chris 的 AirPods",
+    });
+    await eventually(() => expect(session.state.voice.devices).toBeDefined());
+
+    transport.voiceEvent({
+      type: "voice_session_failed",
+      session_id: "1",
+      error: {
+        code: "adapter_failure",
+        kind: "adapter",
+        stage: "voice_sidecar",
+        message: "sidecar closed",
+      },
+      recovery: "new_session",
+    });
+
+    await eventually(() => expect(session.state.voice.session).toBe("error"));
+    expect(session.state.voice.sessionId).toBeUndefined();
+    expect(session.state.voice.devices).toBeUndefined();
+  });
+
   it("controls capture and keeps typed conversation usable after recoverable voice failure", async () => {
     const transport = connectedVoiceTransport();
     const session = await ConversationSession.connect(transport);
@@ -276,6 +332,39 @@ describe("ConversationSession", () => {
     expect(session.state.voice.session).toBe("active");
     expect(session.state.phase).toBe("ready");
     await expect(session.send("typed after voice failure")).resolves.toBe(1n);
+  });
+
+  it("keeps a bounded in-memory last-heard excerpt on recognition failure", async () => {
+    const transport = connectedVoiceTransport();
+    const session = await ConversationSession.connect(transport);
+    await session.startVoice();
+    transport.voiceEvent({
+      type: "voice_session_started",
+      session_id: "1",
+      privacy: { privacy_mode: "local_only", components: localVoiceStatus.components },
+    });
+    transport.voiceEvent({
+      type: "voice_transcript_partial",
+      session_id: "1",
+      segment_id: "1",
+      text: "background audio repeatedly mistaken for the user",
+    });
+    transport.voiceEvent({
+      type: "voice_session_failed",
+      session_id: "1",
+      error: {
+        code: "adapter_failure",
+        kind: "adapter",
+        stage: "speech_recognizer",
+        message: "recognizer hiccup",
+      },
+      recovery: "continue_session",
+    });
+
+    await eventually(() => expect(session.state.voice.error).toBeDefined());
+    expect(session.state.voice.partialTranscript).toBe("");
+    expect(session.state.voice.lastHeardTranscript)
+      .toBe("background audio repeatedly mistaken for the user");
   });
 
   it("clears a recoverable voice error when the next transcript arrives", async () => {

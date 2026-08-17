@@ -73,6 +73,135 @@ func injectedServicesStartOnlyAfterStartCapture() async throws {
 }
 
 @Test
+func startCapturePublishesActiveAudioDeviceLabels() async throws {
+    let devices = AudioDeviceStatus(
+        inputLabel: "MacBook Pro Microphone",
+        outputLabel: "Chris 的 AirPods"
+    )
+    let events = RecordingEventSink()
+    let session = SidecarSession(
+        audioService: RecordingDeviceAudioService(status: devices),
+        recognitionService: RecordingRecognitionService(),
+        playbackService: RecordingPlaybackService(),
+        eventSink: events
+    )
+    try await startSession(session)
+
+    try await session.handleControl(
+        ChildFrame(control: .startCapture(sessionID: 7, operationID: 1))
+    )
+
+    #expect(
+        await events.frames.suffix(2)
+            == [
+                ChildFrame(
+                    control: .audioDeviceStatus(
+                        sessionID: 7,
+                        inputLabel: devices.inputLabel,
+                        outputLabel: devices.outputLabel
+                    )
+                ),
+                ChildFrame(
+                    control: .captureStarted(
+                        sessionID: 7,
+                        operationID: 1
+                    )
+                ),
+            ]
+    )
+}
+
+@Test
+func startCaptureSucceedsWhenTheDeviceLabelLookupFails() async throws {
+    let events = RecordingEventSink()
+    let session = SidecarSession(
+        audioService: RecordingDeviceAudioService(status: nil),
+        recognitionService: RecordingRecognitionService(),
+        playbackService: RecordingPlaybackService(),
+        eventSink: events
+    )
+    try await startSession(session)
+
+    try await session.handleControl(
+        ChildFrame(control: .startCapture(sessionID: 7, operationID: 1))
+    )
+
+    #expect(
+        await events.frames
+            == [
+                ChildFrame(control: .ready(sessionID: 7)),
+                ChildFrame(control: .captureStarted(sessionID: 7, operationID: 1)),
+            ]
+    )
+}
+
+@Test
+func startCaptureSkipsBlankDeviceLabels() async throws {
+    let events = RecordingEventSink()
+    let session = SidecarSession(
+        audioService: RecordingDeviceAudioService(
+            status: AudioDeviceStatus(inputLabel: "  ", outputLabel: "Speakers")
+        ),
+        recognitionService: RecordingRecognitionService(),
+        playbackService: RecordingPlaybackService(),
+        eventSink: events
+    )
+    try await startSession(session)
+
+    try await session.handleControl(
+        ChildFrame(control: .startCapture(sessionID: 7, operationID: 1))
+    )
+
+    #expect(
+        await events.frames
+            == [
+                ChildFrame(control: .ready(sessionID: 7)),
+                ChildFrame(control: .captureStarted(sessionID: 7, operationID: 1)),
+            ]
+    )
+}
+
+@Test
+func resumeCaptureRepublishesActiveAudioDeviceLabels() async throws {
+    let devices = AudioDeviceStatus(
+        inputLabel: "MacBook Pro Microphone",
+        outputLabel: "Chris 的 AirPods"
+    )
+    let events = RecordingEventSink()
+    let session = SidecarSession(
+        audioService: RecordingDeviceAudioService(status: devices),
+        recognitionService: RecordingRecognitionService(),
+        playbackService: RecordingPlaybackService(),
+        eventSink: events
+    )
+    try await startSession(session)
+    try await session.handleControl(
+        ChildFrame(control: .startCapture(sessionID: 7, operationID: 1))
+    )
+    try await session.handleControl(
+        ChildFrame(control: .pauseCapture(sessionID: 7, operationID: 2))
+    )
+
+    try await session.handleControl(
+        ChildFrame(control: .resumeCapture(sessionID: 7, operationID: 3))
+    )
+
+    #expect(
+        await events.frames.suffix(2)
+            == [
+                ChildFrame(
+                    control: .audioDeviceStatus(
+                        sessionID: 7,
+                        inputLabel: devices.inputLabel,
+                        outputLabel: devices.outputLabel
+                    )
+                ),
+                ChildFrame(control: .captureResumed(sessionID: 7, operationID: 3)),
+            ]
+    )
+}
+
+@Test
 func pauseStopsCaptureBeforeAcknowledgementAndResumeRestartsIt() async throws {
     let callLog = CallLog()
     let audio = RecordingAudioService(callLog: callLog)

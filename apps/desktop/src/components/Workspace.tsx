@@ -486,6 +486,8 @@ export function Workspace({
         <VoiceFocus
           capture={sessionState.voice.capture}
           components={components}
+          devices={sessionState.voice.devices}
+          lastHeardTranscript={sessionState.voice.lastHeardTranscript}
           controlError={voiceControlFailure?.message}
           mode="live"
           onExit={requestExitFocus}

@@ -61,7 +61,7 @@ pub use recognition::{RecognitionEvent, RecognitionHypothesis, SpeechRecognizer}
 pub use speech::{AudioFormat, SpeechRequest, SpeechSynthesizer, SynthesizedAudio};
 pub use streaming_speech::{StreamingSpeechRequest, StreamingSpeechSynthesizer};
 pub use voice_capture_control::VoiceCaptureControl;
-pub use voice_input::{VoiceInput, VoiceInputEvent};
+pub use voice_input::{AudioDeviceStatus, VoiceInput, VoiceInputEvent};
 pub use voice_io::{VoiceIoFactory, VoiceIoSession};
 pub use voice_mock::{
     MockAudioCapture, MockContinuousAudioOutput, MockGenerationLanguageModel, MockSpeechRecognizer,

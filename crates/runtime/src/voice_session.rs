@@ -688,6 +688,20 @@ impl VoiceLoop {
         input: Option<Result<VoiceInputEvent, AdapterError>>,
     ) -> Option<LoopExit> {
         match input {
+            Some(Ok(VoiceInputEvent::DeviceStatus(status))) => {
+                if self
+                    .publish_reliable(VoiceSessionEvent::DeviceStatus {
+                        session_id: self.session_id,
+                        input_label: status.input_label().to_owned(),
+                        output_label: status.output_label().to_owned(),
+                    })
+                    .await
+                {
+                    None
+                } else {
+                    Some(LoopExit::ConsumerDropped)
+                }
+            }
             Some(Ok(VoiceInputEvent::Activity(activity))) => self.handle_activity(activity).await,
             Some(Ok(VoiceInputEvent::Recognition(RecognitionEvent::Hypothesis(hypothesis)))) => {
                 let is_engine_final = hypothesis.is_engine_final();

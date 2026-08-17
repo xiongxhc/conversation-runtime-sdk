@@ -1,4 +1,4 @@
-# R3 Real-Time Voice Evaluation — Through 2026-08-12
+# R3 Real-Time Voice Evaluation — Through 2026-08-17
 
 ## Scope and Status
 
@@ -10,6 +10,40 @@ from process/device and acoustic evidence.
 **R3 status: INCOMPLETE.** Repository code and documentation gates pass.
 Process/device evidence is `PARTIALLY VALIDATED`. Acoustic evidence is
 `NOT VALIDATED`.
+
+## Playback and Device Observability Update — 2026-08-17
+
+The opt-in macOS hardware acceptance test now waits for CoreAudio's
+`.dataPlayedBack` completion callback and verifies that the rendered frame
+identity matches the queued frame before cleanup. It passed on the current
+machine together with live microphone capture. This proves that CoreAudio
+accepted and completed the test buffer; it does not prove subjective audibility,
+sentence continuity, or speech quality.
+
+The managed sidecar now reports bounded CoreAudio default input and output
+labels after capture and recognition start successfully, and again after capture
+resumes so a default-device change during a pause is reflected. The labels are
+trimmed and truncated at the sidecar to the wire bound. Reporting is
+best-effort throughout: a device that cannot name itself skips the frame, and a
+label the parent cannot publish is dropped, neither affecting capture. The
+additive event is carried through the Rust adapter, runtime, client protocol,
+and public TypeScript SDK without exposing device identifiers. A live release
+gateway-to-release-sidecar session delivered non-empty input and output labels
+through the public SDK and stopped cleanly. Voice Focus displays those labels
+while keeping transcripts hidden by default; after recognition failure it may
+show a transient, bounded last-heard excerpt that is not added to conversation
+history.
+
+The current deterministic verification passes `151` Swift tests, the Rust
+workspace, `84` public SDK tests, `14` Node example tests, and `171` desktop
+tests. The macOS application bundle also builds from the current source. One
+parallel local HTTP speech test encountered a transient resource-unavailable
+error during the workspace run and passed when rerun serially; no product code
+change was made for that test-environment condition.
+
+R3 remains incomplete. No complete human-spoken microphone-to-audible-response
+turn, ten-minute conversation, first-audible measurement, audible-stop p95, or
+external acoustic-quality recording is claimed by this update.
 
 ## Conversation Continuity Update — 2026-08-12
 

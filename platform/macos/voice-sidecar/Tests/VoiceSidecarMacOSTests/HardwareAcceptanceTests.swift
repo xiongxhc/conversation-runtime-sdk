@@ -53,8 +53,12 @@ func optInFullDuplexHardwareSmoke() async throws {
     let processor = VoiceProcessingAudioProcessor(engine: engine)
     let playback = ContinuousPCMPlayback(scheduler: engine)
     let captured = CaptureBufferWaiter()
+    let rendered = PlaybackRenderWaiter()
     try await withGuaranteedAsyncCleanup(
         operation: {
+            await playback.setRenderedHandler { identity in
+                rendered.signal(identity)
+            }
             try processor.startRecordingLive { samples in
                 guard !samples.isEmpty else {
                     return
@@ -68,6 +72,9 @@ func optInFullDuplexHardwareSmoke() async throws {
                     finalSilenceMilliseconds: 600
                 )
             )
+            let devices = try await engine.activeAudioDeviceStatus()
+            #expect(!devices.inputLabel.isEmpty)
+            #expect(!devices.outputLabel.isEmpty)
             try await captured.wait(timeout: .seconds(10))
             #expect(engine.isRunning)
 
@@ -86,6 +93,10 @@ func optInFullDuplexHardwareSmoke() async throws {
                 )
             )
             try await playback.enqueue(frame)
+            let renderedIdentity = try await rendered.wait(
+                timeout: .seconds(5)
+            )
+            #expect(renderedIdentity == frame.identity)
             try await playback.flush(throughGenerationID: 1)
         },
         cleanup: {
@@ -96,6 +107,48 @@ func optInFullDuplexHardwareSmoke() async throws {
     )
 
     #expect(!engine.isRunning)
+}
+
+final class PlaybackRenderWaiter: @unchecked Sendable {
+    private let stream: AsyncStream<PlaybackFrameIdentity>
+    private let continuation: AsyncStream<PlaybackFrameIdentity>.Continuation
+
+    init() {
+        (stream, continuation) = AsyncStream.makeStream(
+            bufferingPolicy: .bufferingNewest(1)
+        )
+    }
+
+    func signal(_ identity: PlaybackFrameIdentity) {
+        continuation.yield(identity)
+    }
+
+    func wait(timeout: Duration) async throws -> PlaybackFrameIdentity {
+        try await withThrowingTaskGroup(
+            of: PlaybackFrameIdentity.self
+        ) { group in
+            group.addTask { [stream] in
+                for await identity in stream {
+                    return identity
+                }
+                throw CancellationError()
+            }
+            group.addTask {
+                try await Task.sleep(for: timeout)
+                throw HardwareAcceptanceError.playbackTimedOut
+            }
+            defer {
+                group.cancelAll()
+            }
+            let identity = try await group.next()!
+            group.cancelAll()
+            return identity
+        }
+    }
+
+    deinit {
+        continuation.finish()
+    }
 }
 
 func withGuaranteedAsyncCleanup<Result: Sendable>(
@@ -153,6 +206,7 @@ final class CaptureBufferWaiter: @unchecked Sendable {
 
 private enum HardwareAcceptanceError: Error {
     case captureTimedOut
+    case playbackTimedOut
 }
 
 private actor CleanupRecorder {

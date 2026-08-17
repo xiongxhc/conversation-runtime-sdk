@@ -17,6 +17,7 @@ public enum ChildFrameKind: UInt16, CaseIterable, Equatable, Sendable {
     case captureStarted = 0x8007
     case capturePaused = 0x8008
     case captureResumed = 0x8009
+    case audioDeviceStatus = 0x800A
     case failure = 0x80FE
     case shutdownComplete = 0x80FF
 
@@ -59,6 +60,11 @@ public enum ChildControl: Equatable, Sendable {
     case captureStarted(sessionID: UInt64, operationID: UInt64)
     case capturePaused(sessionID: UInt64, operationID: UInt64)
     case captureResumed(sessionID: UInt64, operationID: UInt64)
+    case audioDeviceStatus(
+        sessionID: UInt64,
+        inputLabel: String,
+        outputLabel: String
+    )
     case failure(sessionID: UInt64, stage: RuntimeStage, code: SidecarFailureCode)
     case shutdownComplete(sessionID: UInt64)
 
@@ -94,6 +100,8 @@ public enum ChildControl: Equatable, Sendable {
             .capturePaused
         case .captureResumed:
             .captureResumed
+        case .audioDeviceStatus:
+            .audioDeviceStatus
         case .failure:
             .failure
         case .shutdownComplete:
@@ -118,6 +126,7 @@ public enum ChildControl: Equatable, Sendable {
              let .captureStarted(sessionID, _),
              let .capturePaused(sessionID, _),
              let .captureResumed(sessionID, _),
+             let .audioDeviceStatus(sessionID, _, _),
              let .failure(sessionID, _, _),
              let .shutdownComplete(sessionID):
             sessionID
@@ -451,6 +460,19 @@ public enum ChildProtocol {
                 sessionID: sessionID,
                 hypothesis: hypothesis
             )
+        case let .audioDeviceStatus(sessionID, inputLabel, outputLabel):
+            guard sessionID > 0 else {
+                throw ChildProtocolError.invalidControlJSON
+            }
+            var payload = Data()
+            payload.append(contentsOf: #"{"session_id":"#.utf8)
+            payload.append(contentsOf: String(sessionID).utf8)
+            payload.append(contentsOf: #","input_label":"#.utf8)
+            appendEscapedJSONString(inputLabel, to: &payload)
+            payload.append(contentsOf: #","output_label":"#.utf8)
+            appendEscapedJSONString(outputLabel, to: &payload)
+            payload.append(0x7D)
+            return payload
         case let .playbackAccepted(
             sessionID,
             turnID,
@@ -731,6 +753,20 @@ public enum ChildProtocol {
                         text: value.text,
                         engineFinal: value.engineFinal
                     )
+                )
+            case .audioDeviceStatus:
+                let value: AudioDeviceStatusDTO = try decodeStrict(
+                    payload,
+                    keys: ["session_id", "input_label", "output_label"],
+                    integerKeys: ["session_id"]
+                )
+                guard value.sessionID > 0 else {
+                    throw ChildProtocolError.invalidControlJSON
+                }
+                return .audioDeviceStatus(
+                    sessionID: value.sessionID,
+                    inputLabel: value.inputLabel,
+                    outputLabel: value.outputLabel
                 )
             case .playbackAccepted, .playbackRendered:
                 let value: MediaIdentityDTO = try decodeStrict(
@@ -1088,6 +1124,18 @@ private struct TranscriptHypothesisDTO: Decodable {
         case segmentID = "segment_id"
         case text
         case engineFinal = "engine_final"
+    }
+}
+
+private struct AudioDeviceStatusDTO: Decodable {
+    let sessionID: UInt64
+    let inputLabel: String
+    let outputLabel: String
+
+    enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+        case inputLabel = "input_label"
+        case outputLabel = "output_label"
     }
 }
 

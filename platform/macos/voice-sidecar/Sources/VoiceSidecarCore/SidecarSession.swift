@@ -43,6 +43,10 @@ public protocol SidecarAudioService: Sendable {
     func stop() async
 }
 
+public protocol SidecarAudioDeviceStatusProviding: Sendable {
+    func activeAudioDeviceStatus() async throws -> AudioDeviceStatus
+}
+
 public protocol SidecarRecognitionService: Sendable {
     func prepare(configuration: SidecarConfiguration) async throws
     func start(configuration: SidecarConfiguration) async throws
@@ -538,6 +542,7 @@ public actor SidecarSession {
             recognitionState = .startAttempted
             try await recognitionService.start(configuration: configuration)
             recognitionState = .started
+            try await emitAudioDeviceStatus(configuration)
             phase = .capturing
             try await eventSink.send(
                 ChildFrame(
@@ -580,6 +585,9 @@ public actor SidecarSession {
             recognitionState = .startAttempted
             try await recognitionService.start(configuration: configuration)
             recognitionState = .started
+            // The default device can change while capture is paused, so the
+            // resumed session reports the devices it actually came back on.
+            try await emitAudioDeviceStatus(configuration)
             try await eventSink.send(
                 ChildFrame(
                     control: .captureResumed(
@@ -637,6 +645,7 @@ public actor SidecarSession {
             phase = .terminated
 
         case .ready,
+             .audioDeviceStatus,
              .captureStarted,
              .capturePaused,
              .captureResumed,
@@ -649,6 +658,30 @@ public actor SidecarSession {
              .shutdownComplete:
             throw SidecarSessionError.unexpectedControl
         }
+    }
+
+    // Device labels are informational. A device that cannot name itself
+    // (aggregate and virtual devices often cannot) must never fail a capture
+    // that is otherwise running, so the status frame is simply skipped.
+    private func emitAudioDeviceStatus(
+        _ configuration: SidecarConfiguration
+    ) async throws {
+        guard let statusProvider = audioService as? any SidecarAudioDeviceStatusProviding,
+              let devices = try? await statusProvider.activeAudioDeviceStatus(),
+              !devices.inputLabel.isEmpty,
+              !devices.outputLabel.isEmpty
+        else {
+            return
+        }
+        try await eventSink.send(
+            ChildFrame(
+                control: .audioDeviceStatus(
+                    sessionID: configuration.sessionID,
+                    inputLabel: devices.inputLabel,
+                    outputLabel: devices.outputLabel
+                )
+            )
+        )
     }
 
     private func reserveFlush(

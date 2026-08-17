@@ -109,6 +109,39 @@ public struct PlaybackFrameIdentity: Equatable, Hashable, Sendable {
     }
 }
 
+public struct AudioDeviceStatus: Equatable, Sendable {
+    /// Mirrors the parent's client wire bound for a device label.
+    public static let maximumLabelBytes = 128
+
+    public let inputLabel: String
+    public let outputLabel: String
+
+    /// CoreAudio device names reach the parent's wire validator verbatim, so
+    /// they are normalized here: a padded or over-long name would otherwise
+    /// be rejected downstream and tear the session down.
+    public init(inputLabel: String, outputLabel: String) {
+        self.inputLabel = Self.normalized(inputLabel)
+        self.outputLabel = Self.normalized(outputLabel)
+    }
+
+    private static func normalized(_ label: String) -> String {
+        let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.utf8.count > maximumLabelBytes else {
+            return trimmed
+        }
+        var truncated = ""
+        var bytes = 0
+        for character in trimmed {
+            bytes += String(character).utf8.count
+            if bytes > maximumLabelBytes {
+                break
+            }
+            truncated.append(character)
+        }
+        return truncated
+    }
+}
+
 public enum VoiceActivity: Equatable, Sendable {
     case speechStarted(atMilliseconds: UInt64)
     case speechContinued(atMilliseconds: UInt64)

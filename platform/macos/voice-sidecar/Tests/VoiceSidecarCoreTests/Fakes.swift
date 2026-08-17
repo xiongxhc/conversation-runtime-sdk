@@ -279,6 +279,34 @@ actor RecordingAudioService: SidecarAudioService {
     }
 }
 
+actor RecordingDeviceAudioService:
+    SidecarAudioService,
+    SidecarAudioDeviceStatusProviding
+{
+    let status: AudioDeviceStatus?
+    private(set) var statusLookupCount = 0
+
+    init(status: AudioDeviceStatus?) {
+        self.status = status
+    }
+
+    func start(configuration _: SidecarConfiguration) async throws {}
+    func pauseCapture() async throws {}
+    func resumeCapture() async throws {}
+    func stop() async {}
+
+    func activeAudioDeviceStatus() async throws -> AudioDeviceStatus {
+        statusLookupCount += 1
+        guard let status else {
+            throw SidecarServiceFailure(
+                stage: .audioCapture,
+                code: .audioDeviceUnavailable
+            )
+        }
+        return status
+    }
+}
+
 actor RecordingRecognitionService: SidecarRecognitionService {
     private let callLog: CallLog?
     private(set) var preparedConfigurations: [SidecarConfiguration] = []

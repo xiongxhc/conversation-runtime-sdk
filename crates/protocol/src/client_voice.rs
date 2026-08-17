@@ -8,6 +8,7 @@ use crate::{
 };
 
 pub const MAX_CLIENT_PROVIDER_LABEL_BYTES: usize = 128;
+pub const MAX_CLIENT_DEVICE_LABEL_BYTES: usize = 128;
 pub const MAX_CLIENT_COMPONENT_DESCRIPTORS: usize = 32;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -41,6 +42,12 @@ pub enum ClientVoiceSessionEvent {
         #[serde(serialize_with = "serialize_session_id")]
         session_id: SessionId,
         privacy: ClientPrivacySummary,
+    },
+    VoiceDeviceStatus {
+        #[serde(serialize_with = "serialize_session_id")]
+        session_id: SessionId,
+        input_label: String,
+        output_label: String,
     },
     VoiceCapturePaused {
         #[serde(serialize_with = "serialize_session_id")]
@@ -149,6 +156,15 @@ impl TryFrom<VoiceSessionEvent> for ClientVoiceSessionEvent {
             } => Self::VoiceSessionStarted {
                 session_id,
                 privacy: ClientPrivacySummary::try_from(&privacy)?,
+            },
+            VoiceSessionEvent::DeviceStatus {
+                session_id,
+                input_label,
+                output_label,
+            } => Self::VoiceDeviceStatus {
+                session_id,
+                input_label,
+                output_label,
             },
             VoiceSessionEvent::CapturePaused { session_id } => {
                 Self::VoiceCapturePaused { session_id }
@@ -321,6 +337,7 @@ pub(crate) fn validate_client_voice_event(
             *session_id
         }
         ClientVoiceSessionEvent::VoiceCapturePaused { session_id }
+        | ClientVoiceSessionEvent::VoiceDeviceStatus { session_id, .. }
         | ClientVoiceSessionEvent::VoiceCaptureResumed { session_id }
         | ClientVoiceSessionEvent::VoiceActivity { session_id, .. }
         | ClientVoiceSessionEvent::VoiceTranscriptPartial { session_id, .. }
@@ -335,6 +352,14 @@ pub(crate) fn validate_client_voice_event(
     validate_identifier(session_id.get())?;
 
     match event {
+        ClientVoiceSessionEvent::VoiceDeviceStatus {
+            input_label,
+            output_label,
+            ..
+        } => {
+            validate_device_label(input_label)?;
+            validate_device_label(output_label)
+        }
         ClientVoiceSessionEvent::VoiceTranscriptPartial {
             segment_id, text, ..
         } => {
@@ -443,6 +468,20 @@ fn validate_voice_text(text: &str) -> Result<(), ClientWireError> {
         Err(ClientWireError::InvalidVoiceEvent)
     } else {
         Ok(())
+    }
+}
+
+/// The single device-label rule every producer must satisfy before a status
+/// event reaches this projection: anything else fails the session.
+pub fn is_valid_device_label(label: &str) -> bool {
+    !label.is_empty() && label.trim() == label && label.len() <= MAX_CLIENT_DEVICE_LABEL_BYTES
+}
+
+fn validate_device_label(label: &str) -> Result<(), ClientWireError> {
+    if is_valid_device_label(label) {
+        Ok(())
+    } else {
+        Err(ClientWireError::InvalidVoiceEvent)
     }
 }
 

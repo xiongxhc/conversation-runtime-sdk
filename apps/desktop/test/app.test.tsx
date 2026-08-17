@@ -438,6 +438,35 @@ describe("desktop app", () => {
     expect(screen.queryByText("Runtime disconnected")).toBeNull();
   });
 
+  it("does not replay any persona when no preset is active", async () => {
+    const storage = memoryStorage();
+    const preset = { name: "Focused", persona: personaState() };
+    storage.setItem(preferencesStorageKey, JSON.stringify({
+      version: 4,
+      focusScene: "soft-aurora",
+      focusIntensity: 0.55,
+      focusEntry: "manual",
+      rememberTranscriptVisibility: false,
+      transcriptVisible: false,
+      reducedMotion: "system",
+      personaPresets: [preset],
+      activePresetName: null,
+    }));
+    const session = new FakeSession(localState());
+    render(
+      <App
+        connectSession={vi.fn(async () => session)}
+        historyStore={new FakeHistoryStore()}
+        storage={storage}
+      />,
+    );
+
+    connectWithAbsolutePaths();
+    await screen.findByLabelText("Message");
+
+    expect(session.updatePersona).not.toHaveBeenCalled();
+  });
+
   it("persists completed chats locally and opens prior chats read-only", async () => {
     const historyStore = new FakeHistoryStore();
     const firstSession = new FakeSession(localState());
@@ -509,6 +538,7 @@ describe("desktop app", () => {
         visual: "listening",
         sessionId: 1n,
         partialTranscript: "unfinished spoken words",
+        lastHeardTranscript: "unfinished spoken words",
       },
     }));
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -535,6 +565,7 @@ describe("desktop app", () => {
       failureMessage: undefined,
     });
     expect(Object.keys(historyStore.saved[0].turns[0])).not.toContain("partialTranscript");
+    expect(Object.keys(historyStore.saved[0].turns[0])).not.toContain("lastHeardTranscript");
     expect(Object.keys(historyStore.saved[0].turns[0])).not.toContain("audio");
   });
 

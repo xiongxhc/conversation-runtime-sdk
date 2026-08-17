@@ -47,6 +47,11 @@ pub enum VoiceSessionEvent {
         session_id: SessionId,
         privacy: PrivacySummary,
     },
+    DeviceStatus {
+        session_id: SessionId,
+        input_label: String,
+        output_label: String,
+    },
     CapturePaused {
         session_id: SessionId,
     },

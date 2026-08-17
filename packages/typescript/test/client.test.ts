@@ -522,6 +522,12 @@ test("startVoiceSession resolves on acceptance and streams events to terminal", 
     session_id: "1",
     privacy: { privacy_mode: "local_only", components: wireVoiceComponents() },
   }));
+  connected.transport.push(voiceEvent({
+    type: "voice_device_status",
+    session_id: "1",
+    input_label: "MacBook Pro Microphone",
+    output_label: "Chris 的 AirPods",
+  }));
   const midSessionFailure: RuntimeFailure = {
     code: "adapter_failure",
     kind: "adapter",
@@ -538,6 +544,12 @@ test("startVoiceSession resolves on acceptance and streams events to terminal", 
 
   assert.deepEqual(await collect(session.events()), [
     { type: "voice_session_started", sessionId: 1n, privacy: { privacyMode: "local_only", components: parsedVoiceComponents() } },
+    {
+      type: "voice_device_status",
+      sessionId: 1n,
+      inputLabel: "MacBook Pro Microphone",
+      outputLabel: "Chris 的 AirPods",
+    },
     { type: "voice_session_failed", sessionId: 1n, error: midSessionFailure, recovery: "continue_session" },
     { type: "voice_session_ended", sessionId: 1n },
   ]);

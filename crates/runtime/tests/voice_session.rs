@@ -8,8 +8,8 @@ use conversation_memory::{
     SqliteMemoryContextProvider, SqliteMemoryStore,
 };
 use conversation_model_adapters::{
-    AdapterError, AdapterFuture, AudioFrame, CaptureEvent, ContinuousAudioOutput,
-    GenerationLanguageModel, GenerationLanguageRequest, GenerationTextDelta,
+    AdapterError, AdapterFuture, AudioDeviceStatus, AudioFrame, CaptureEvent,
+    ContinuousAudioOutput, GenerationLanguageModel, GenerationLanguageRequest, GenerationTextDelta,
     MockContinuousAudioOutput, MockGenerationLanguageModel, MockStreamingSpeechSynthesizer,
     MockVoiceCaptureControl, PcmFormat, PcmSampleFormat, PlaybackReceipt, StreamingSpeechRequest,
     StreamingSpeechSynthesizer, VoiceCaptureControl, VoiceInput, VoiceInputEvent, VoiceIoFactory,
@@ -32,6 +32,30 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 const SESSION_ID: SessionId = SessionId::new(1);
+
+#[tokio::test]
+async fn active_audio_devices_are_published_as_session_status() {
+    let harness = VoiceSessionHarness::new();
+    let mut events = harness.start().await;
+    assert_session_started(events.recv().await);
+
+    harness
+        .send(VoiceInputEvent::DeviceStatus(
+            AudioDeviceStatus::new("MacBook Pro Microphone", "Chris 的 AirPods").unwrap(),
+        ))
+        .await;
+
+    assert!(matches!(
+        events.recv().await,
+        Some(VoiceSessionEvent::DeviceStatus {
+            input_label,
+            output_label,
+            ..
+        }) if input_label == "MacBook Pro Microphone"
+            && output_label == "Chris 的 AirPods"
+    ));
+    harness.shutdown(&mut events).await;
+}
 
 #[tokio::test(start_paused = true)]
 async fn typed_voice_typed_turns_share_history_and_monotonic_ids() {

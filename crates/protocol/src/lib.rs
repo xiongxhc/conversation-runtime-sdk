@@ -19,8 +19,9 @@ pub use client_memory::{
 };
 pub use client_persona::ClientPersonaState;
 pub use client_voice::{
-    ClientComponentDescriptor, ClientPrivacySummary, ClientVoiceActivity, ClientVoiceSessionEvent,
-    MAX_CLIENT_COMPONENT_DESCRIPTORS, MAX_CLIENT_PROVIDER_LABEL_BYTES,
+    is_valid_device_label, ClientComponentDescriptor, ClientPrivacySummary, ClientVoiceActivity,
+    ClientVoiceSessionEvent, MAX_CLIENT_COMPONENT_DESCRIPTORS, MAX_CLIENT_DEVICE_LABEL_BYTES,
+    MAX_CLIENT_PROVIDER_LABEL_BYTES,
 };
 pub use client_wire::{
     decode_client_command, encode_gateway_message, ClientCommand, ClientMemoryTrace,

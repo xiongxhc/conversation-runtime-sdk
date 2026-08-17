@@ -33,6 +33,7 @@ fn version_one_capture_kind_codes_are_pinned() {
         (SidecarFrameKind::CaptureStarted, 0x8007),
         (SidecarFrameKind::CapturePaused, 0x8008),
         (SidecarFrameKind::CaptureResumed, 0x8009),
+        (SidecarFrameKind::AudioDeviceStatus, 0x800a),
         (SidecarFrameKind::Failure, 0x80fe),
         (SidecarFrameKind::ShutdownComplete, 0x80ff),
     ];
@@ -40,6 +41,31 @@ fn version_one_capture_kind_codes_are_pinned() {
     for (kind, code) in expected {
         assert_eq!(kind.code(), code);
     }
+}
+
+#[test]
+fn audio_device_status_round_trips_unicode_labels() {
+    let frame = SidecarFrame::control(SidecarControl::AudioDeviceStatus {
+        session_id: SessionId::new(7),
+        input_label: "MacBook Pro Microphone".to_owned(),
+        output_label: "Chris 的 AirPods".to_owned(),
+    });
+
+    assert_eq!(decode_frame(&encode_frame(&frame).unwrap()).unwrap(), frame);
+}
+
+#[test]
+fn audio_device_status_rejects_unknown_private_fields() {
+    let bytes = raw_frame(
+        PROTOCOL_VERSION,
+        SidecarFrameKind::AudioDeviceStatus.code(),
+        br#"{"session_id":7,"input_label":"Built-in","output_label":"Speakers","device_uid":"private-id"}"#,
+    );
+
+    assert_eq!(
+        decode_frame(&bytes),
+        Err(SidecarCodecError::InvalidControlJson)
+    );
 }
 
 #[test]
@@ -655,6 +681,11 @@ fn every_control_kind_round_trips_with_exact_identity_fields() {
             session_id: SessionId::new(1),
             generation_id: GenerationId::new(2),
             operation_id: 3,
+        },
+        SidecarControl::AudioDeviceStatus {
+            session_id: SessionId::new(1),
+            input_label: "MacBook Pro Microphone".to_owned(),
+            output_label: "Speakers".to_owned(),
         },
         SidecarControl::Failure {
             session_id: SessionId::new(1),

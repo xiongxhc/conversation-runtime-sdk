@@ -33,6 +33,7 @@ pub(crate) enum SidecarFrameKind {
     CaptureStarted,
     CapturePaused,
     CaptureResumed,
+    AudioDeviceStatus,
     Failure,
     ShutdownComplete,
 }
@@ -56,6 +57,7 @@ impl SidecarFrameKind {
             Self::CaptureStarted => 0x8007,
             Self::CapturePaused => 0x8008,
             Self::CaptureResumed => 0x8009,
+            Self::AudioDeviceStatus => 0x800a,
             Self::Failure => 0x80fe,
             Self::ShutdownComplete => 0x80ff,
         }
@@ -90,6 +92,7 @@ impl TryFrom<u16> for SidecarFrameKind {
             0x8007 => Ok(Self::CaptureStarted),
             0x8008 => Ok(Self::CapturePaused),
             0x8009 => Ok(Self::CaptureResumed),
+            0x800a => Ok(Self::AudioDeviceStatus),
             0x80fe => Ok(Self::Failure),
             0x80ff => Ok(Self::ShutdownComplete),
             _ => Err(SidecarCodecError::UnknownKind(value)),
@@ -178,6 +181,11 @@ pub(crate) enum SidecarControl {
         session_id: SessionId,
         operation_id: u64,
     },
+    AudioDeviceStatus {
+        session_id: SessionId,
+        input_label: String,
+        output_label: String,
+    },
     Failure {
         session_id: SessionId,
         stage: RuntimeStage,
@@ -206,6 +214,7 @@ impl SidecarControl {
             Self::CaptureStarted { .. } => SidecarFrameKind::CaptureStarted,
             Self::CapturePaused { .. } => SidecarFrameKind::CapturePaused,
             Self::CaptureResumed { .. } => SidecarFrameKind::CaptureResumed,
+            Self::AudioDeviceStatus { .. } => SidecarFrameKind::AudioDeviceStatus,
             Self::Failure { .. } => SidecarFrameKind::Failure,
             Self::ShutdownComplete { .. } => SidecarFrameKind::ShutdownComplete,
         }
@@ -664,6 +673,15 @@ fn encode_control(control: &SidecarControl) -> Result<Vec<u8>, SidecarCodecError
             text: hypothesis.text(),
             engine_final: hypothesis.is_engine_final(),
         }),
+        SidecarControl::AudioDeviceStatus {
+            session_id,
+            input_label,
+            output_label,
+        } => serialize(&AudioDeviceStatusRefDto {
+            session_id: session_id.get(),
+            input_label,
+            output_label,
+        }),
         SidecarControl::Failure {
             session_id,
             stage,
@@ -814,6 +832,14 @@ fn decode_control(
                 hypothesis,
             })
         }
+        SidecarFrameKind::AudioDeviceStatus => {
+            let value: AudioDeviceStatusDto = deserialize(json)?;
+            Ok(SidecarControl::AudioDeviceStatus {
+                session_id: SessionId::new(value.session_id),
+                input_label: value.input_label,
+                output_label: value.output_label,
+            })
+        }
         SidecarFrameKind::Failure => {
             let value: FailureDto = deserialize(json)?;
             Ok(SidecarControl::Failure {
@@ -938,6 +964,22 @@ struct TranscriptHypothesisDto<'a> {
     #[serde(borrow)]
     text: &'a str,
     engine_final: bool,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct AudioDeviceStatusRefDto<'a> {
+    session_id: u64,
+    input_label: &'a str,
+    output_label: &'a str,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AudioDeviceStatusDto {
+    session_id: u64,
+    input_label: String,
+    output_label: String,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]

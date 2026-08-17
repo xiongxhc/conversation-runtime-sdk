@@ -11,6 +11,8 @@ export interface VoiceFocusProps {
   mode: "live" | "preview";
   capture: VoiceSessionState["capture"];
   components: ComponentStatusSnapshot;
+  devices?: VoiceSessionState["devices"];
+  lastHeardTranscript?: string;
   preferences: Preferences;
   reducedMotion: boolean;
   runtimeError?: string;
@@ -32,6 +34,8 @@ export function VoiceFocus({
   mode,
   capture,
   components,
+  devices,
+  lastHeardTranscript,
   preferences,
   reducedMotion,
   runtimeError,
@@ -142,6 +146,12 @@ export function VoiceFocus({
         <p aria-live="polite" className="voice-state-label">
           {stateLabel(visualState)}
         </p>
+        {mode === "live" && devices ? (
+          <div aria-label="Active audio devices" className="focus-device-status">
+            <span>Input: {devices.inputLabel}</span>
+            <span>Output: {devices.outputLabel}</span>
+          </div>
+        ) : null}
         {mode === "live" && (session === "idle" || session === "error") ? (
           <button className="focus-start-voice" onClick={onStart} type="button">
             {session === "error" ? "Retry voice" : "Start voice"}
@@ -157,6 +167,11 @@ export function VoiceFocus({
             {session === "active"
               ? "Temporary voice issue. The session is still active; speak again or stop voice."
               : "Voice session needs attention. Retry locally or exit Focus and review setup."}
+          </p>
+        ) : null}
+        {visualState === "error" && lastHeardTranscript ? (
+          <p className="focus-last-heard">
+            Last heard: “{lastHeardTranscript}”
           </p>
         ) : null}
         {runtimeError ? <p className="voice-control-error" role="alert">{runtimeError}</p> : null}

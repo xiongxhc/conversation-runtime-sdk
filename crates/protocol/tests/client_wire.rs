@@ -13,8 +13,8 @@ use conversation_protocol::{
     ResponseControls, RetrievalTraceId, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage,
     RuntimeStatus, SessionId, SilencePolicy, SpeechPace, TurnId, UnixTimestampMillis,
     VoiceActivity, VoiceSessionEvent, VoiceTimingMilestone, CLIENT_PROTOCOL_VERSION,
-    MAX_CLIENT_COMPONENT_DESCRIPTORS, MAX_CLIENT_FRAME_BYTES, MAX_CLIENT_PROVIDER_LABEL_BYTES,
-    MAX_CONVERSATION_MESSAGE_BYTES, MAX_MEMORY_PREVIEW_BYTES,
+    MAX_CLIENT_COMPONENT_DESCRIPTORS, MAX_CLIENT_DEVICE_LABEL_BYTES, MAX_CLIENT_FRAME_BYTES,
+    MAX_CLIENT_PROVIDER_LABEL_BYTES, MAX_CONVERSATION_MESSAGE_BYTES, MAX_MEMORY_PREVIEW_BYTES,
 };
 use serde::{Deserialize, Deserializer};
 
@@ -503,6 +503,39 @@ fn public_voice_string_enums_reject_unknown_values_at_encode_time() {
             Err(ClientWireError::InvalidVoiceEvent)
         ));
     }
+}
+
+#[test]
+fn voice_device_status_projects_exact_bounded_labels() {
+    let event = ClientVoiceSessionEvent::try_from(VoiceSessionEvent::DeviceStatus {
+        session_id: SessionId::new(1),
+        input_label: "MacBook Pro Microphone".to_owned(),
+        output_label: "Chris 的 AirPods".to_owned(),
+    })
+    .unwrap();
+
+    assert_eq!(
+        gateway_value(&GatewayMessage::VoiceEvent { event }),
+        serde_json::json!({
+            "protocol_version": 1,
+            "type": "voice_event",
+            "event": {
+                "type": "voice_device_status",
+                "session_id": "1",
+                "input_label": "MacBook Pro Microphone",
+                "output_label": "Chris 的 AirPods"
+            }
+        })
+    );
+
+    assert!(
+        ClientVoiceSessionEvent::try_from(VoiceSessionEvent::DeviceStatus {
+            session_id: SessionId::new(1),
+            input_label: "x".repeat(MAX_CLIENT_DEVICE_LABEL_BYTES + 1),
+            output_label: "Speakers".to_owned(),
+        },)
+        .is_err()
+    );
 }
 
 #[test]

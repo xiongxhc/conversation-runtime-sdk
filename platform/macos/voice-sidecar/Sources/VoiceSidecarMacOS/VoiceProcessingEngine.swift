@@ -1,5 +1,6 @@
 import AudioToolbox
 @preconcurrency import AVFoundation
+import CoreAudio
 import Darwin
 @preconcurrency import Dispatch
 import Foundation
@@ -331,6 +332,7 @@ final class CaptureBufferPump: @unchecked Sendable {
 
 public final class VoiceProcessingEngine:
     SidecarAudioService,
+    SidecarAudioDeviceStatusProviding,
     PCMPlaybackScheduling,
     @unchecked Sendable
 {
@@ -384,6 +386,23 @@ public final class VoiceProcessingEngine:
         stateLock.withLock {
             captureActive
         }
+    }
+
+    public func activeAudioDeviceStatus() async throws -> AudioDeviceStatus {
+        guard isRunning else {
+            throw SidecarServiceFailure(
+                stage: .audioCapture,
+                code: .invalidState
+            )
+        }
+        return AudioDeviceStatus(
+            inputLabel: try Self.defaultAudioDeviceLabel(
+                selector: kAudioHardwarePropertyDefaultInputDevice
+            ),
+            outputLabel: try Self.defaultAudioDeviceLabel(
+                selector: kAudioHardwarePropertyDefaultOutputDevice
+            )
+        )
     }
 
     public convenience init() {
@@ -712,6 +731,65 @@ public final class VoiceProcessingEngine:
                 code: .audioDeviceUnavailable
             )
         }
+    }
+
+    private static func defaultAudioDeviceLabel(
+        selector: AudioObjectPropertySelector
+    ) throws -> String {
+        var address = AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var deviceID = AudioObjectID(kAudioObjectUnknown)
+        var size = UInt32(MemoryLayout<AudioObjectID>.size)
+        guard AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            0,
+            nil,
+            &size,
+            &deviceID
+        ) == noErr,
+            deviceID != kAudioObjectUnknown
+        else {
+            throw SidecarServiceFailure(
+                stage: .audioCapture,
+                code: .audioDeviceUnavailable
+            )
+        }
+
+        address = AudioObjectPropertyAddress(
+            mSelector: kAudioObjectPropertyName,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var label: Unmanaged<CFString>?
+        size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        guard AudioObjectGetPropertyData(
+            deviceID,
+            &address,
+            0,
+            nil,
+            &size,
+            &label
+        ) == noErr,
+            let label
+        else {
+            throw SidecarServiceFailure(
+                stage: .audioCapture,
+                code: .audioDeviceUnavailable
+            )
+        }
+        // kAudioObjectPropertyName hands back a +1 CFString; the caller owns it.
+        let value = label.takeRetainedValue() as String
+        guard !value.isEmpty else {
+            throw SidecarServiceFailure(
+                stage: .audioCapture,
+                code: .audioDeviceUnavailable
+            )
+        }
+        return value
     }
 
     private func deliverCapture(_ event: CapturePCMEvent) {

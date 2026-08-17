@@ -218,6 +218,12 @@ export type VoiceSessionEvent =
       sessionId: bigint;
       privacy: { privacyMode: "local_only"; components: RuntimeComponentDescriptor[] };
     }
+  | {
+      type: "voice_device_status";
+      sessionId: bigint;
+      inputLabel: string;
+      outputLabel: string;
+    }
   | { type: "voice_capture_paused"; sessionId: bigint }
   | { type: "voice_capture_resumed"; sessionId: bigint }
   | { type: "voice_activity"; sessionId: bigint; activity: VoiceActivity }
@@ -877,6 +883,14 @@ function parseVoiceSessionEvent(value: unknown): VoiceSessionEvent {
     case "voice_session_ended":
       requireExactKeys(object, ["type", "session_id"]);
       return { type, sessionId: sessionId() };
+    case "voice_device_status":
+      requireExactKeys(object, ["type", "session_id", "input_label", "output_label"]);
+      return {
+        type,
+        sessionId: sessionId(),
+        inputLabel: requireDeviceLabel(object, "input_label"),
+        outputLabel: requireDeviceLabel(object, "output_label"),
+      };
     case "voice_activity": {
       requireExactKeys(object, ["type", "session_id", "activity"]);
       const activity = requireRecord(object.activity, "voice activity");
@@ -973,6 +987,21 @@ function parseVoiceSessionEvent(value: unknown): VoiceSessionEvent {
     default:
       throw new ProtocolError("unsupported voice session event type");
   }
+}
+
+function requireDeviceLabel(
+  object: Record<string, unknown>,
+  key: string,
+): string {
+  const value = requireString(object, key);
+  if (
+    value.length === 0
+    || value.trim() !== value
+    || new TextEncoder().encode(value).length > 128
+  ) {
+    throw new ProtocolError(`invalid ${key}`);
+  }
+  return value;
 }
 
 function requireMatchingVoiceIdentity(turnId: bigint, generationId: bigint): void {

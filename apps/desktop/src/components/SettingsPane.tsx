@@ -40,6 +40,20 @@ type PersonaLevelKey =
   | "verbosity"
   | "followUpFrequency";
 
+function personaEquals(a: PersonaState, b: PersonaState): boolean {
+  return (
+    a.mode === b.mode &&
+    a.warmth === b.warmth &&
+    a.humor === b.humor &&
+    a.teasing === b.teasing &&
+    a.initiative === b.initiative &&
+    a.directness === b.directness &&
+    a.intimacy === b.intimacy &&
+    a.verbosity === b.verbosity &&
+    a.followUpFrequency === b.followUpFrequency
+  );
+}
+
 export function SettingsPane({ session, preferences, onPreferencesChange, onBack }: SettingsPaneProps) {
   const [draft, setDraft] = useState<PersonaState>();
   const [loading, setLoading] = useState(true);
@@ -97,6 +111,13 @@ export function SettingsPane({ session, preferences, onPreferencesChange, onBack
     try {
       const applied = await session.updatePersona(draft);
       setDraft(applied);
+      const current = preferencesRef.current;
+      const activePreset = current.personaPresets.find(
+        (preset) => preset.name === current.activePresetName,
+      );
+      if (activePreset && !personaEquals(activePreset.persona, applied)) {
+        onPreferencesChange({ ...current, activePresetName: null });
+      }
     } catch {
       setApplyError("Persona could not be applied.");
     } finally {

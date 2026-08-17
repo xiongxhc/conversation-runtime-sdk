@@ -87,6 +87,63 @@ describe("SettingsPane", () => {
     expect(screen.getByLabelText("Mode")).toHaveProperty("value", "reflective");
   });
 
+  it("clears the active preset badge when Apply diverges from the active preset", async () => {
+    const onPreferencesChange = vi.fn();
+    const session = new PersonaSession();
+    const preset: PersonaPreset = { name: "Calm", persona: personaState({ mode: "reflective", warmth: 30 }) };
+    session.getPersona.mockResolvedValueOnce(preset.persona);
+    session.updatePersona.mockResolvedValueOnce(personaState({ mode: "reflective", warmth: 55 }));
+
+    const preferences: Preferences = {
+      ...defaultPreferences,
+      personaPresets: [preset],
+      activePresetName: "Calm",
+    };
+    const { rerender } = renderPane(session, { preferences, onPreferencesChange });
+    await screen.findByLabelText("Warmth");
+    expect(screen.getByText("Active")).toBeTruthy();
+
+    fireEvent.change(screen.getByLabelText("Warmth"), { target: { value: "55" } });
+    fireEvent.click(screen.getByRole("button", { name: "Apply" }));
+
+    await waitFor(() => expect(onPreferencesChange).toHaveBeenCalledWith({
+      ...preferences,
+      activePresetName: null,
+    }));
+
+    rerender(
+      <SettingsPane
+        onBack={vi.fn()}
+        onPreferencesChange={onPreferencesChange}
+        preferences={{ ...preferences, activePresetName: null }}
+        session={session}
+      />,
+    );
+    expect(screen.queryByText("Active")).toBeNull();
+  });
+
+  it("keeps the active preset badge when Apply matches the active preset", async () => {
+    const onPreferencesChange = vi.fn();
+    const session = new PersonaSession();
+    const preset: PersonaPreset = { name: "Calm", persona: personaState({ mode: "reflective", warmth: 30 }) };
+    session.getPersona.mockResolvedValueOnce(preset.persona);
+    session.updatePersona.mockResolvedValueOnce(preset.persona);
+
+    const preferences: Preferences = {
+      ...defaultPreferences,
+      personaPresets: [preset],
+      activePresetName: "Calm",
+    };
+    renderPane(session, { preferences, onPreferencesChange });
+    await screen.findByLabelText("Warmth");
+
+    fireEvent.click(screen.getByRole("button", { name: "Apply" }));
+
+    await waitFor(() => expect(session.updatePersona).toHaveBeenCalledWith(preset.persona));
+    expect(onPreferencesChange).not.toHaveBeenCalled();
+    expect(screen.getByText("Active")).toBeTruthy();
+  });
+
   it("saves the current draft as a named preset and persists it", async () => {
     const onPreferencesChange = vi.fn();
     const session = new PersonaSession();

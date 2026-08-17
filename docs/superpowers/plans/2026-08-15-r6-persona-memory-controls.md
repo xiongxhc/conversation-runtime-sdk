@@ -145,5 +145,5 @@
 
 - [ ] `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, `packages/typescript`: `npm run build && npm test`, `apps/desktop`: `npx vitest run` — all green; fix anything found.
 - [ ] Desktop production build (`npm run build` in apps/desktop) so the running app includes the new panes.
-- [ ] Personal config (NOT committed): init memory DB via the `tests/memory` probe CLI at `~/.local/share/conversation-runtime/memory/runtime.sqlite3`; add `[memory]` (`maximum_items = 6`, `maximum_bytes = 4096`) + `[memory.extraction]` to `~/.config/conversation-runtime/gateway.toml`; replace `system_prompt` with the bilingual Serena prompt whose capability list truthfully names History, Voice Focus, Memory pane (view/approve/delete), and Persona Settings.
+- [ ] Deployment config (private, NOT committed): init a memory DB via the `tests/memory` probe CLI at an absolute path of the operator's choosing; add `[memory]` + `[memory.extraction]` to the private gateway configuration (generic shape in `configs/gateway.example.toml`); ensure the configured `system_prompt` truthfully names History, Voice Focus, Memory pane (view/approve/delete), and Persona Settings.
 - [ ] Report results; surface commit SHAs; ask before any push.

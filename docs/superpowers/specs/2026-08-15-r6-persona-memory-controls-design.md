@@ -179,10 +179,10 @@ TDD throughout, following existing patterns:
   `cargo clippy --workspace` (strict), TS build + `node --test`,
   `vitest run` — all locally.
 
-## 6. Personal configuration (not in the repo)
+## 6. Enabling the feature in a deployment (outside the repo)
 
-On the user's machine only: initialize the memory database with the
-`tests/memory` probe CLI, add `[memory]` (+ `[memory.extraction]`) to
-`~/.config/conversation-runtime/gateway.toml`, and replace the system prompt
-with the bilingual Serena persona prompt whose capability list stays truthful
-as features land.
+Deployment configuration is private and never committed. To turn the feature
+on: initialize a memory database with the `tests/memory` probe CLI, add
+`[memory]` (+ `[memory.extraction]`) to the private gateway configuration, and
+keep the configured `system_prompt`'s capability description truthful as
+features land (see `configs/gateway.example.toml` for the generic shape).

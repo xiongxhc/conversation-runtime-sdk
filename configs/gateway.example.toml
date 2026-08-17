@@ -32,6 +32,14 @@ follow_up_frequency = 25
 # database = "/absolute/path/to/runtime.sqlite3"
 # maximum_items = 4
 # maximum_bytes = 4096
+#
+# Optional, requires [memory]. When present, the gateway extracts memory
+# candidates from completed exchanges using a dedicated prompt-free instance
+# of the configured language model. Identity and relationship memories still
+# require explicit approval before they become active.
+# [memory.extraction]
+# max_memories_per_turn = 3
+# episodic_retention_days = 90
 
 # Optional local voice composition. Loading this configuration validates these
 # values but does not start capture, spawn the sidecar, or contact providers.

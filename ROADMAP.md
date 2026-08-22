@@ -28,10 +28,10 @@ The first release is not a directory-complete platform. It is one local voice lo
   the current macOS source passes an opt-in full-duplex capture/playback smoke
   through CoreAudio's rendered-data completion callback, and a release
   gateway-to-sidecar session reports the active input and output labels through
-  the public SDK. The release CLI starts under `LocalOnly`. A complete post-fix
-  human-spoken turn, ten-minute device run, and 30-sample acoustic recording
-  remain unperformed, so R3 remains `ACCEPTANCE BLOCKED` despite complete
-  deterministic acceptance tooling.
+  the public SDK. The release CLI starts under `LocalOnly`. R3 was closed by
+  product-owner acceptance on 2026-08-23. Raw human and acoustic measurements
+  remain outside this checkout and are not independently reproducible from the
+  repository evidence alone.
 - R4 bounded in-session conversation quality controls are implemented and
   regression-tested: visible persona dimensions, four modes, response limits,
   temporary corrections, completed-only history, typed provider envelopes,
@@ -51,9 +51,8 @@ The first release is not a directory-complete platform. It is one local voice lo
   input/output labels while keeping transcripts hidden by default, and exposes
   only a transient bounded last-heard excerpt after recognition failure. Native
   capture plus playback completion and the release device-status handshake are
-  observed; a complete audible turn, GPU behavior, ten-minute continuity,
-  first-audible, audible-stop, and acoustic quality remain separately open, as
-  do persona/memory mutation, model setup, and distribution.
+  observed. Product-owner acceptance closed R3 on 2026-08-23; persona/memory
+  mutation, model setup, and distribution remain open R6 work.
 - The deterministic continuity gate now covers five spoken turns with a
   turn-scoped local language failure in the second turn, followed by three
   successful turns in the same session. Post-start recognition failure restarts
@@ -174,20 +173,19 @@ capture graph now remains active for the full session while WhisperKit rotates
 bounded logical turn buffers with `300 ms` of pre-roll and a bounded transition
 accumulator, avoiding microphone restart gaps during slow in-flight decoding.
 
-The public acceptance harness and acoustic procedure are present. Process/device
-evidence is `PARTIALLY VALIDATED`: a private local-only configuration and local
+The public acceptance harness and acoustic procedure are present. R3 was closed
+by product-owner acceptance on 2026-08-23. Repository process/device evidence
+remains `PARTIALLY VALIDATED`: a private local-only configuration and local
 ASR model pass preflight, the current macOS source passes an opt-in full-duplex
 capture/playback smoke through CoreAudio's rendered-data completion callback,
 and the release gateway, release sidecar, and public TypeScript SDK complete a
 live session handshake carrying bounded active input/output labels. The release
 CLI starts under `LocalOnly`. Local multilingual fixtures transcribe without
-control tokens. A complete spoken
-microphone-to-audible-response turn is not yet observed after the latest
-finalization fix, so process/device acceptance remains incomplete. Acoustic
-evidence is `NOT VALIDATED` because no external recording set exists. The latest
+control tokens. Raw product-owner observations and an external acoustic
+recording set are not checked in, so those results are not independently
+reproducible from this repository. The latest
 complete mechanical gate passes the Rust workspace with one intentionally
-ignored fixture writer and `151` Swift tests. No ten-minute continuity,
-first-audible, audible-stop p95, or R3 completion claim is made. See
+ignored fixture writer and `151` Swift tests. See
 [the R3 evaluation](docs/r3-real-time-voice-evaluation.md).
 
 ### Deliverables
@@ -242,6 +240,9 @@ Schema-v1 configuration exposes persona, response, and content-free metric
 controls with explicit defaults and pre-capture validation. Relationship
 guidance is derived from visible persona, supplied context, reciprocity, pacing,
 and rapport; no scripted expression, hidden unlock, or frequency quota exists.
+Explicit topic pivots and actual persona or mode changes start fresh bounded
+in-session context, while additive transitions retain relevant recent history;
+saved conversation records and approved runtime memory remain separate.
 The deterministic R4 gate passes the complete Rust workspace and `127` Swift
 tests. Subjective model quality remains deployment-specific; SQLite persistence
 remains R5 and application controls remain R6.
@@ -283,8 +284,8 @@ R5 does not automatically persist transcripts or generated responses, provide a
 desktop editor, claim semantic-search quality, encrypt SQLite independently of
 the host filesystem, or provide cryptographic secure erasure. Relationship
 memory remains fallible context and never directly authorizes an expression.
-R3 human, ten-minute, and acoustic acceptance remain separate and blocked on
-their documented external evidence.
+R3 was closed by product-owner acceptance on 2026-08-23; its raw external
+device observations are not stored in this checkout.
 
 ### Deliverables
 
@@ -353,9 +354,8 @@ turn, playback, timing, barge-in, failure, and terminal events. The desktop now
 consumes that lane; without `[voice]`, gateway behavior remains text-only and
 Focus remains a visual preview. Persona inspection/mutation backed by runtime
 state, runtime-memory mutation and management, model setup/benchmark UI,
-packaging, signing, and installation remain open. R3 human-spoken, ten-minute,
-first-audible, audible-stop, and acoustic acceptance remains a separate blocked
-milestone and is not advanced by deterministic desktop integration.
+packaging, signing, and installation remain open. R3 was closed separately by
+product-owner acceptance on 2026-08-23.
 
 See [the R6 local-gateway evaluation](docs/r6-local-gateway-evaluation.md) and
 [the R6 desktop-app evaluation](docs/r6-desktop-app-evaluation.md).
@@ -396,7 +396,6 @@ See [the R6 local-gateway evaluation](docs/r6-local-gateway-evaluation.md) and
 - Backend-neutral local provider supervision with explicit executable,
   argument, readiness, ownership, and cleanup contracts; never a shell command
   or silent remote fallback.
-- Human-spoken, ten-minute, and 30-sample acoustic evidence required by R3.
 - Native desktop observation of permission, one spoken turn, playback, audible
   barge-in, exit choices, device selection, and child cleanup.
 - Later application-owned transport work required before any opt-in LAN binding

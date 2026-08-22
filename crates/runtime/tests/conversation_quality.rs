@@ -114,6 +114,11 @@ fn explicit_multilingual_signals_resolve_conservative_turn_controls() {
         ("别解释了", ConversationSignal::StopExplaining),
         ("um... maybe", ConversationSignal::Hesitation),
         ("换个话题，聊音乐", ConversationSignal::RapidTopicChange),
+        (
+            "Let's talk about something else",
+            ConversationSignal::RapidTopicChange,
+        ),
+        ("不聊这个了，说点别的", ConversationSignal::RapidTopicChange),
     ];
 
     for (input, expected_signal) in scenarios {
@@ -137,6 +142,87 @@ fn explicit_multilingual_signals_resolve_conservative_turn_controls() {
                 FollowUpPolicy::Never
             );
         }
+    }
+}
+
+#[test]
+fn explicit_topic_change_omits_prior_topic_from_the_generation_context() {
+    let mut controller = controller();
+    controller
+        .resolve_turn(
+            TurnId::new(1),
+            "Explain why the database migration failed",
+            None,
+        )
+        .unwrap()
+        .unwrap();
+    controller
+        .complete_turn(
+            TurnId::new(1),
+            "The migration failed because the schema version was stale.",
+        )
+        .unwrap();
+
+    let resolved = controller
+        .resolve_turn(TurnId::new(2), "换个话题，聊音乐", None)
+        .unwrap()
+        .unwrap();
+
+    assert!(resolved
+        .decision()
+        .signals()
+        .contains(&ConversationSignal::RapidTopicChange));
+    assert!(resolved.history_messages().is_empty());
+    assert_eq!(resolved.decision().history_message_count(), 0);
+    assert!(!resolved
+        .decision()
+        .context_sources()
+        .contains(&ContextSource::RecentHistory));
+    assert!(resolved
+        .decision()
+        .context_sources()
+        .contains(&ContextSource::TemporaryCorrection));
+    assert!(controller.history_messages().is_empty());
+
+    controller
+        .complete_turn(TurnId::new(2), "Let's discuss rhythm and melody.")
+        .unwrap();
+    let following = controller
+        .resolve_turn(TurnId::new(3), "Start with rhythm", None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(following.history_messages().len(), 2);
+    assert!(following
+        .history_messages()
+        .iter()
+        .all(|message| !message.text().contains("migration")));
+}
+
+#[test]
+fn additive_transitions_preserve_relevant_conversation_history() {
+    for input in [
+        "By the way, which migration version did we use?",
+        "另外，我们还要检查回滚方案",
+    ] {
+        let mut controller = controller();
+        controller
+            .resolve_turn(TurnId::new(1), "Review the database migration", None)
+            .unwrap()
+            .unwrap();
+        controller
+            .complete_turn(TurnId::new(1), "The migration uses schema version seven.")
+            .unwrap();
+
+        let resolved = controller
+            .resolve_turn(TurnId::new(2), input, None)
+            .unwrap()
+            .unwrap();
+
+        assert!(!resolved
+            .decision()
+            .signals()
+            .contains(&ConversationSignal::RapidTopicChange));
+        assert_eq!(resolved.history_messages().len(), 2);
     }
 }
 
@@ -475,6 +561,35 @@ fn set_persona_takes_effect_in_the_next_resolved_turn() {
         expansive_persona.maximum_spoken_seconds()
     );
     assert!(resolved.system_guidance().contains("verbosity=85"));
+}
+
+#[test]
+fn changing_conversation_mode_clears_prior_conversation_history() {
+    let mut controller = controller();
+    controller
+        .resolve_turn(
+            TurnId::new(1),
+            "Keep discussing the database migration",
+            None,
+        )
+        .unwrap()
+        .unwrap();
+    controller
+        .complete_turn(TurnId::new(1), "The migration still needs a schema update.")
+        .unwrap();
+    assert_eq!(controller.history_messages().len(), 2);
+
+    controller
+        .set_persona(PersonaProfile::default(), ConversationMode::Brainstorming)
+        .unwrap();
+
+    assert!(controller.history_messages().is_empty());
+    let resolved = controller
+        .resolve_turn(TurnId::new(2), "Let's explore a new product idea", None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(resolved.decision().mode(), ConversationMode::Brainstorming);
+    assert!(resolved.history_messages().is_empty());
 }
 
 #[test]

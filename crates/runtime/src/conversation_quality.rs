@@ -115,7 +115,8 @@ impl ConversationQualityController {
     }
 
     /// Replaces the saved persona, default mode, and default response
-    /// controls used by future turns. Rejected while a turn is pending, the
+    /// controls used by future turns. An actual change starts a fresh
+    /// in-session conversation context. Rejected while a turn is pending, the
     /// same guard `resolve_turn` enforces, so a mutation can never land
     /// mid-turn.
     pub fn set_persona(
@@ -133,9 +134,13 @@ impl ConversationQualityController {
             FollowUpPolicy::Contextual,
             SilencePolicy::AllowWithoutFiller,
         )?;
+        let changed = self.saved_persona != persona || self.default_mode != mode;
         self.saved_persona = persona;
         self.default_mode = mode;
         self.default_controls = default_controls;
+        if changed {
+            self.clear_history();
+        }
         Ok(())
     }
 
@@ -159,6 +164,9 @@ impl ConversationQualityController {
         if self.interruption_pending {
             signals.insert(0, ConversationSignal::Interrupted);
             self.interruption_pending = false;
+        }
+        if signals.contains(&ConversationSignal::RapidTopicChange) {
+            self.clear_history();
         }
 
         let controls = self.resolve_controls(user.text(), &signals)?;
@@ -241,8 +249,7 @@ impl ConversationQualityController {
         // terse prompt or an incidental interruption reduces the budget
         // proportionally instead of forcing the absolute short cap. An
         // explicit request for brevity always wins.
-        let expansive =
-            self.saved_persona.verbosity().get() >= EXPANSIVE_VERBOSITY_THRESHOLD;
+        let expansive = self.saved_persona.verbosity().get() >= EXPANSIVE_VERBOSITY_THRESHOLD;
         let reduced_budget = if expansive {
             (self.default_controls.maximum_spoken_seconds() / 2).max(SHORT_RESPONSE_SECONDS)
         } else {
@@ -309,6 +316,11 @@ impl ConversationQualityController {
             self.history_bytes -= removed.bytes;
         }
     }
+
+    fn clear_history(&mut self) {
+        self.history.clear();
+        self.history_bytes = 0;
+    }
 }
 
 fn detect_signals(
@@ -348,7 +360,20 @@ fn detect_signals(
     }
     if contains_any(
         &normalized,
-        &["different topic", "by the way", "换个话题", "另外"],
+        &[
+            "different topic",
+            "change the subject",
+            "switch topics",
+            "new topic",
+            "talk about something else",
+            "let's move on",
+            "换个话题",
+            "换一个话题",
+            "不聊这个",
+            "先不说这个",
+            "说点别的",
+            "聊点别的",
+        ],
     ) {
         signals.push(ConversationSignal::RapidTopicChange);
     }
@@ -413,6 +438,7 @@ fn context_sources(signals: &[ConversationSignal], history_is_empty: bool) -> Ve
             ConversationSignal::ShorterRequested
                 | ConversationSignal::StopExplaining
                 | ConversationSignal::QuestionRejected
+                | ConversationSignal::RapidTopicChange
         )
     }) {
         sources.push(ContextSource::TemporaryCorrection);

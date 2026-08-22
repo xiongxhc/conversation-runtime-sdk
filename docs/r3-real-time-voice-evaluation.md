@@ -1,4 +1,4 @@
-# R3 Real-Time Voice Evaluation — Through 2026-08-17
+# R3 Real-Time Voice Evaluation — Through 2026-08-23
 
 ## Scope and Status
 
@@ -7,9 +7,20 @@ commit `fd6e2f12d9a4bd3d1e0869e3006d1b90ad495ff8` on
 `feature/r3-real-time-voice-loop`. It separates repository contract evidence
 from process/device and acoustic evidence.
 
-**R3 status: INCOMPLETE.** Repository code and documentation gates pass.
-Process/device evidence is `PARTIALLY VALIDATED`. Acoustic evidence is
-`NOT VALIDATED`.
+**R3 status: CLOSED by product-owner acceptance on 2026-08-23.** Repository
+code and documentation gates pass. The checked-in process/device evidence
+remains partial, and raw human/acoustic measurements are not available in this
+checkout for independent reproduction. Sections below preserve the status that
+was recorded at each earlier evaluation date.
+
+## Product-Owner Closure — 2026-08-23
+
+The product owner reported R3 closed after external human acceptance. This
+closure supersedes the earlier milestone-status statements below but does not
+retroactively create repository evidence: the checkout still does not contain
+the raw ten-minute session, first-audible samples, audible-stop measurements, or
+external acoustic recordings. Mechanical claims remain limited to the commands
+and artifacts recorded in this document.
 
 ## Playback and Device Observability Update — 2026-08-17
 

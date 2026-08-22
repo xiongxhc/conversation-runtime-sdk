@@ -97,9 +97,10 @@ impl ConversationContext {
         Ok(self)
     }
 
-    /// Mutates the live persona and default conversation mode. Rejected
-    /// while a turn is pending in the quality controller, so a mutation
-    /// can never land mid-turn.
+    /// Mutates the live persona and default conversation mode, starting fresh
+    /// in-session context when either value changes. Rejected while a turn is
+    /// pending in the quality controller, so a mutation can never land
+    /// mid-turn.
     pub async fn apply_persona(
         &self,
         persona: PersonaProfile,

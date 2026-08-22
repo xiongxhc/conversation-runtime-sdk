@@ -34,6 +34,12 @@ const localStatus: ConversationSessionState["status"] = {
 };
 
 describe("SettingsPane", () => {
+  it("discloses that changing persona or mode starts fresh conversational context", () => {
+    renderPane(new PersonaSession());
+
+    expect(screen.getByText(/Changing the persona or mode starts fresh conversational context/)).toBeTruthy();
+  });
+
   it("shows a loading state, then populates sliders and mode from getPersona", async () => {
     const session = new PersonaSession();
     const pending = deferred<PersonaState>();

@@ -186,8 +186,9 @@ export function SettingsPane({ session, preferences, onPreferencesChange, onBack
         </button>
       </header>
       <p className="settings-disclosure">
-        These controls shape how the connected model responds. Changes apply immediately and
-        never leave this Mac.
+        These controls shape how the connected model responds. Changing the persona or mode starts
+        fresh conversational context. Saved history remains local; approved memory is not deleted
+        and may still supply relevant facts.
       </p>
 
       {loadError ? (

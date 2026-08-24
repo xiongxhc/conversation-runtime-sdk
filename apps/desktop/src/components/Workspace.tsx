@@ -44,6 +44,8 @@ export function Workspace({
   const [sessionState, setSessionState] = useState<ConversationSessionState>(session.state);
   const [message, setMessage] = useState("");
   const [preferences, setPreferences] = useState(initialPreferences);
+  const preferencesRef = useRef(initialPreferences);
+  const personaApplicationGeneration = useRef(0);
   const [focusMode, setFocusMode] = useState<FocusMode>();
   const [workspaceView, setWorkspaceView] = useState<WorkspaceView>("conversation");
   const [history, setHistory] = useState<ConversationSummary[]>([]);
@@ -70,14 +72,26 @@ export function Workspace({
   const pausedForComposerSession = useRef<bigint | undefined>(undefined);
   const composerFocused = useRef(false);
   const runtimeHealthy = sessionState.phase === "ready" || sessionState.phase === "streaming";
+  const personaAvailable = sessionState.status.capabilities.includes("persona_control");
   const memoryAvailable =
     sessionState.status.memoryEnabled &&
     sessionState.status.memoryLocation === "local" &&
-    sessionState.status.capabilities[1] === "memory_inspection";
+    sessionState.status.capabilities.includes("memory_inspection");
   const voiceConfigured = sessionState.voice.availability === "configured";
   const voiceRunning = sessionState.voice.session !== "idle" && (
     sessionState.voice.session !== "error" || sessionState.voice.sessionId !== undefined
   );
+  const runtimeControlsUnavailable = sessionState.phase === "streaming" || voiceRunning;
+  const memoryNavigationGuidance = voiceRunning
+    ? "Stop voice before opening Memory."
+    : sessionState.phase === "streaming"
+      ? "Finish or stop the active response before opening Memory."
+      : undefined;
+  const settingsNavigationGuidance = voiceRunning
+    ? "Stop voice before opening Settings."
+    : sessionState.phase === "streaming"
+      ? "Finish or stop the active response before opening Settings."
+      : undefined;
   const exitChoiceVisible = exitVoiceSessionId !== undefined;
   const canRenderLiveFocus = focusMode === "live" && runtimeHealthy && voiceConfigured;
   const components = voiceConfigured
@@ -134,20 +148,31 @@ export function Workspace({
   }, [focusMode]);
   useEffect(() => {
     if (
-      (workspaceView === "memory" || workspaceView === "settings") &&
-      sessionState.phase !== "ready"
+      ((workspaceView === "memory" && !memoryAvailable)
+        || (workspaceView === "settings" && !personaAvailable)
+        || ((workspaceView === "memory" || workspaceView === "settings")
+          && (sessionState.phase !== "ready" || runtimeControlsUnavailable)))
     ) {
       setWorkspaceView("conversation");
     }
-  }, [sessionState.phase, workspaceView]);
+  }, [memoryAvailable, personaAvailable, runtimeControlsUnavailable, sessionState.phase, workspaceView]);
   useEffect(() => {
     // Replay fires once per connect: this effect depends only on session identity,
     // so a later preset change or preference edit does not retrigger it.
-    const activePreset = preferences.personaPresets.find(
-      (preset) => preset.name === preferences.activePresetName,
+    const replayPreferences = preferencesRef.current;
+    const replayPersonaApplicationGeneration = personaApplicationGeneration.current;
+    const activePreset = replayPreferences.personaPresets.find(
+      (preset) => preset.name === replayPreferences.activePresetName,
     );
-    if (!activePreset) return;
+    if (!activePreset || !personaAvailable) return;
     void session.updatePersona(activePreset.persona).catch(() => {
+      const currentPreferences = preferencesRef.current;
+      if (
+        personaApplicationGeneration.current === replayPersonaApplicationGeneration
+        && currentPreferences.activePresetName === activePreset.name
+      ) {
+        updatePreferences({ ...currentPreferences, activePresetName: null });
+      }
       setPersonaReplayNotice(
         `The "${activePreset.name}" persona preset could not be applied. Open Settings to reapply it.`,
       );
@@ -222,6 +247,7 @@ export function Workspace({
   }, [exitVoiceSessionId, sessionState.voice.sessionId, voiceRunning]);
 
   const updatePreferences = (nextPreferences: Preferences) => {
+    preferencesRef.current = nextPreferences;
     setPreferences(nextPreferences);
     savePreferences(storage, nextPreferences);
   };
@@ -561,37 +587,41 @@ export function Workspace({
           <>
             <button
               aria-current={workspaceView === "memory" ? "page" : undefined}
-              aria-describedby={sessionState.phase === "streaming"
+              aria-describedby={memoryNavigationGuidance
                 ? "memory-navigation-explanation"
                 : undefined}
-              disabled={sessionState.phase === "streaming"}
+              disabled={runtimeControlsUnavailable}
               onClick={() => setWorkspaceView("memory")}
               type="button"
             >
               Memory
             </button>
-            {sessionState.phase === "streaming" ? (
-              <p className="visually-hidden" id="memory-navigation-explanation">
-                Finish or stop the active response before opening Memory.
+            {memoryNavigationGuidance ? (
+              <p id="memory-navigation-explanation">
+                {memoryNavigationGuidance}
               </p>
             ) : null}
           </>
         ) : null}
-        <button
-          aria-current={workspaceView === "settings" ? "page" : undefined}
-          aria-describedby={sessionState.phase === "streaming"
-            ? "settings-navigation-explanation"
-            : undefined}
-          disabled={sessionState.phase === "streaming"}
-          onClick={() => setWorkspaceView("settings")}
-          type="button"
-        >
-          Settings
-        </button>
-        {sessionState.phase === "streaming" ? (
-          <p className="visually-hidden" id="settings-navigation-explanation">
-            Finish or stop the active response before opening Settings.
-          </p>
+        {personaAvailable ? (
+          <>
+            <button
+              aria-current={workspaceView === "settings" ? "page" : undefined}
+              aria-describedby={settingsNavigationGuidance
+                ? "settings-navigation-explanation"
+                : undefined}
+              disabled={runtimeControlsUnavailable}
+              onClick={() => setWorkspaceView("settings")}
+              type="button"
+            >
+              Settings
+            </button>
+            {settingsNavigationGuidance ? (
+              <p id="settings-navigation-explanation">
+                {settingsNavigationGuidance}
+              </p>
+            ) : null}
+          </>
         ) : null}
       </nav>
 
@@ -615,6 +645,9 @@ export function Workspace({
       ) : workspaceView === "settings" ? (
         <SettingsPane
           onBack={() => setWorkspaceView("conversation")}
+          onPersonaApplied={() => {
+            personaApplicationGeneration.current += 1;
+          }}
           onPreferencesChange={updatePreferences}
           preferences={preferences}
           session={session}

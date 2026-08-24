@@ -2,15 +2,18 @@
 
 ## Status
 
-The first R6 local-gateway slice is complete for deterministic text
-interoperability. It includes the persistent Rust gateway, versioned bounded
-framed stdio, the public TypeScript client, and the minimal Node chat example.
+The first R6 local-gateway slice is complete for deterministic interoperability.
+It includes the persistent Rust gateway, versioned bounded framed stdio, the
+public TypeScript client, the minimal Node chat example, and public persona and
+memory control commands.
 
 R6 is not complete overall. Tauri and React, microphone and playback controls,
-persona and memory mutation controls, model setup and benchmark UI, packaging,
-signing, and installation remain open. R3 human-spoken, ten-minute device, and
-external acoustic acceptance also remain open and are not affected by this
-text-only evidence.
+model setup and benchmark UI, packaging, signing, and installation remain open.
+Additional runtime-memory management beyond candidate approval and
+revision-bound deletion remains open. R3 was closed separately by
+product-owner acceptance on 2026-08-23; its human-spoken, ten-minute device,
+and external acoustic observations are not established by this gateway
+evidence.
 
 ## Deterministic Verification
 
@@ -135,6 +138,16 @@ These checks prove framing, protocol validation, command correlation, streamed
 text interoperability, terminal completion, interruption, connection cleanup,
 and process reuse. They do not measure first-token latency, response quality,
 model suitability, audible output, or acoustic interruption.
+
+Typed public-SDK tests separately exercise `getPersona` and `updatePersona`,
+plus revision-bound `approveMemory` and `deleteMemory`, including command
+validation and correlated responses. Desktop session and pane tests exercise
+the same public methods for runtime-backed persona update, candidate-memory
+approval, and deletion. This is automated interface evidence, not a native or
+human observation, and it is separate from the compiled SDK-to-gateway smoke.
+That compiled smoke currently covers text and typed/spoken conversation flow,
+not persona or memory mutation; compiled mutation coverage remains R6
+completion work.
 
 ## Private Local Smoke Result
 

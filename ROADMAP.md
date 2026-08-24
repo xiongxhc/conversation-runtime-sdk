@@ -51,8 +51,10 @@ The first release is not a directory-complete platform. It is one local voice lo
   input/output labels while keeping transcripts hidden by default, and exposes
   only a transient bounded last-heard excerpt after recognition failure. Native
   capture plus playback completion and the release device-status handshake are
-  observed. Product-owner acceptance closed R3 on 2026-08-23; persona/memory
-  mutation, model setup, and distribution remain open R6 work.
+  observed. Product-owner acceptance closed R3 on 2026-08-23. The public SDK
+  and desktop now support persona inspection and update, candidate-memory
+  approval, and revision-bound memory deletion; model setup and distribution
+  remain open R6 work.
 - The deterministic continuity gate now covers five spoken turns with a
   turn-scoped local language failure in the second turn, followed by three
   successful turns in the same session. Post-start recognition failure restarts
@@ -147,7 +149,7 @@ All listed R2 deliverables are implemented and deterministic-test covered. The r
 - Timing output separates model, synthesis, and orchestration latency.
 - Replacing a mock adapter requires no change to protocol types.
 
-The first-audible timestamp is intentionally not inferred from playback-process launch. Microphone input, ASR, and user-speech-driven barge-in remain R3 work.
+The first-audible timestamp is intentionally not inferred from playback-process launch. Microphone input, ASR, and user-speech-driven barge-in were deferred to R3.
 
 ## R3 — Real-Time Voice Loop and Barge-In
 
@@ -336,7 +338,8 @@ conversation view. Soft Aurora (the default), Silk, Threads, Prism, Orb, Still
 Gradient, and None remain selectable with hidden transcript by default. When an
 explicitly initialized local memory store is configured and the gateway advertises protocol-v1
 `memory_inspection`, the desktop uses the public browser-safe SDK to provide
-read-only list and detail inspection. History remains separately owned local
+list/detail inspection, candidate approval, and revision-bound deletion. The
+same SDK surface provides persona inspection and update. History remains separately owned local
 transcript storage; the desktop neither initializes runtime memory nor
 automatically captures conversations into it. Inspection exposes at most the
 latest 50 summaries per page and the latest 32 provenance and approval entries,
@@ -348,13 +351,19 @@ acceptance, text streaming, completion, and a separate cancellation run. It is
 interoperability evidence only; it does not select a model, measure latency or
 quality, or close any R3 human, device, or acoustic acceptance gate.
 
+Typed SDK tests exercise persona inspection/update and candidate-memory
+approval/revision-bound deletion through a test transport. That evidence is
+separate from the compiled SDK-to-gateway smoke, which currently covers the
+typed/spoken conversation flow rather than persona or memory mutation. A
+compiled SDK-to-gateway mutation test remains R6 completion work.
+
 R6 remains open overall. When `[voice]` is configured, the compiled gateway
 advertises and hosts `voice_session` start, stop, capture pause/resume, transcript,
 turn, playback, timing, barge-in, failure, and terminal events. The desktop now
 consumes that lane; without `[voice]`, gateway behavior remains text-only and
-Focus remains a visual preview. Persona inspection/mutation backed by runtime
-state, runtime-memory mutation and management, model setup/benchmark UI,
-packaging, signing, and installation remain open. R3 was closed separately by
+Focus remains a visual preview. Model setup/benchmark UI, packaging, signing,
+and installation remain open. Additional runtime-memory management beyond
+candidate approval and deletion also remains open. R3 was closed separately by
 product-owner acceptance on 2026-08-23.
 
 See [the R6 local-gateway evaluation](docs/r6-local-gateway-evaluation.md) and
@@ -375,8 +384,10 @@ See [the R6 local-gateway evaluation](docs/r6-local-gateway-evaluation.md) and
 - macOS Tauri process bridge using explicit absolute gateway and configuration
   paths.
 - Local text-chat workspace with streamed output, Stop, close, and reconnect.
-- Protocol-v1 read-only runtime-memory list and detail inspection through the
-  public browser-safe SDK, gated on an explicitly configured local store.
+- Protocol-v1 runtime-memory list/detail inspection, candidate approval, and
+  revision-bound deletion through the public browser-safe SDK, gated on an
+  explicitly configured local store.
+- Persona inspection and update through the public browser-safe SDK.
 - Shared typed/spoken runtime context with monotonic gateway-owned turn and
   generation identifiers and completed-only bounded history.
 - Explicit live Voice Focus start, truthful requesting/listening/paused/thinking/
@@ -388,8 +399,8 @@ See [the R6 local-gateway evaluation](docs/r6-local-gateway-evaluation.md) and
 
 ### Remaining Deliverables
 
-- Persona inspection and mutation controls, plus runtime-memory mutation
-  controls backed by actual runtime state.
+- Additional runtime-memory management beyond candidate approval and deletion.
+- Compiled SDK-to-gateway coverage for persona and runtime-memory mutation.
 - Local model setup and benchmark reporting.
 - Packaging, signing, installation, and private configuration workflows that
   contain no model weights.

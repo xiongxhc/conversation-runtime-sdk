@@ -858,7 +858,7 @@ impl From<&crate::ClientMemoryApproval> for WireClientMemoryApproval {
 enum GatewayMessageEnvelope<'a> {
     Ready {
         protocol_version: u64,
-        status: &'a RuntimeStatus,
+        status: RuntimeStatus,
     },
     CommandAccepted {
         protocol_version: u64,
@@ -874,7 +874,7 @@ enum GatewayMessageEnvelope<'a> {
     Status {
         protocol_version: u64,
         request_id: &'a str,
-        status: &'a RuntimeStatus,
+        status: RuntimeStatus,
     },
     MemoryList {
         protocol_version: u64,
@@ -922,7 +922,7 @@ impl<'a> From<&'a GatewayMessage> for GatewayMessageEnvelope<'a> {
         match message {
             GatewayMessage::Ready { status } => Self::Ready {
                 protocol_version: CLIENT_PROTOCOL_VERSION,
-                status,
+                status: status_with_explicit_controls(status),
             },
             GatewayMessage::CommandAccepted {
                 request_id,
@@ -940,7 +940,7 @@ impl<'a> From<&'a GatewayMessage> for GatewayMessageEnvelope<'a> {
             GatewayMessage::Status { request_id, status } => Self::Status {
                 protocol_version: CLIENT_PROTOCOL_VERSION,
                 request_id,
-                status,
+                status: status_with_explicit_controls(status),
             },
             GatewayMessage::MemoryList {
                 request_id,
@@ -1000,6 +1000,33 @@ impl<'a> From<&'a GatewayMessage> for GatewayMessageEnvelope<'a> {
             },
         }
     }
+}
+
+fn status_with_explicit_controls(status: &RuntimeStatus) -> RuntimeStatus {
+    let mut status = status.clone();
+    if !status
+        .capabilities
+        .iter()
+        .any(|capability| capability == "persona_control")
+    {
+        status.capabilities.insert(1, "persona_control".to_owned());
+    }
+    if let Some(memory_index) = status
+        .capabilities
+        .iter()
+        .position(|capability| capability == "memory_inspection")
+    {
+        if !status
+            .capabilities
+            .iter()
+            .any(|capability| capability == "memory_mutation")
+        {
+            status
+                .capabilities
+                .insert(memory_index + 1, "memory_mutation".to_owned());
+        }
+    }
+    status
 }
 
 fn validate_protocol_version(version: u64) -> Result<(), ClientWireError> {
@@ -1128,17 +1155,44 @@ fn validate_runtime_status(status: &RuntimeStatus) -> Result<(), ClientWireError
         return Err(ClientWireError::InvalidRuntimeStatus);
     }
 
-    let memory = status.capabilities == ["text", "memory_inspection"]
-        || status.capabilities == ["text", "memory_inspection", "voice_session"];
-    let voice = status.capabilities == ["text", "voice_session"]
-        || status.capabilities == ["text", "memory_inspection", "voice_session"];
-    if status.capabilities != ["text"]
-        && status.capabilities != ["text", "memory_inspection"]
-        && status.capabilities != ["text", "voice_session"]
-        && status.capabilities != ["text", "memory_inspection", "voice_session"]
+    let capability_rank = |capability: &str| match capability {
+        "text" => Some(0),
+        "persona_control" => Some(1),
+        "memory_inspection" => Some(2),
+        "memory_mutation" => Some(3),
+        "voice_session" => Some(4),
+        _ => None,
+    };
+    let mut previous_rank = None;
+    for capability in &status.capabilities {
+        let Some(rank) = capability_rank(capability) else {
+            return Err(ClientWireError::InvalidRuntimeStatus);
+        };
+        if previous_rank.is_some_and(|previous| rank <= previous) {
+            return Err(ClientWireError::InvalidRuntimeStatus);
+        }
+        previous_rank = Some(rank);
+    }
+    if status.capabilities.first().map(String::as_str) != Some("text")
+        || (status
+            .capabilities
+            .iter()
+            .any(|value| value == "memory_mutation")
+            && !status
+                .capabilities
+                .iter()
+                .any(|value| value == "memory_inspection"))
     {
         return Err(ClientWireError::InvalidRuntimeStatus);
     }
+    let memory = status
+        .capabilities
+        .iter()
+        .any(|capability| capability == "memory_inspection");
+    let voice = status
+        .capabilities
+        .iter()
+        .any(|capability| capability == "voice_session");
 
     let memory_descriptors = status
         .components
@@ -1522,4 +1576,68 @@ fn runtime_stage_name(stage: RuntimeStage) -> &'static str {
 
 fn unsupported_event(event: &'static str) -> ClientWireError {
     ClientWireError::UnsupportedRuntimeEvent { event }
+}
+
+#[cfg(test)]
+mod runtime_status_capability_tests {
+    use super::*;
+
+    fn status(capabilities: &[&str], memory_enabled: bool) -> RuntimeStatus {
+        let mut components = vec![ClientComponentDescriptor {
+            kind: "language_model".to_owned(),
+            execution_location: "local".to_owned(),
+            provider_label: "test-language".to_owned(),
+        }];
+        if memory_enabled {
+            components.push(ClientComponentDescriptor {
+                kind: "memory".to_owned(),
+                execution_location: "local".to_owned(),
+                provider_label: "test-memory".to_owned(),
+            });
+        }
+        RuntimeStatus {
+            transport: "stdio".to_owned(),
+            privacy_mode: "local_only".to_owned(),
+            language_location: "local".to_owned(),
+            model_id: "test-model".to_owned(),
+            memory_enabled,
+            memory_location: memory_enabled.then(|| "local".to_owned()),
+            telemetry_enabled: false,
+            capabilities: capabilities
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
+            components,
+        }
+    }
+
+    #[test]
+    fn accepts_explicit_persona_and_memory_mutation_capabilities() {
+        assert!(validate_runtime_status(&status(
+            &[
+                "text",
+                "persona_control",
+                "memory_inspection",
+                "memory_mutation",
+            ],
+            true,
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn accepts_legacy_statuses_for_mixed_version_clients() {
+        assert!(validate_runtime_status(&status(&["text", "memory_inspection"], true)).is_ok());
+    }
+
+    #[test]
+    fn rejects_memory_mutation_without_memory_inspection() {
+        assert!(matches!(
+            validate_runtime_status(&status(
+                &["text", "persona_control", "memory_mutation"],
+                false,
+            )),
+            Err(ClientWireError::InvalidRuntimeStatus)
+        ));
+    }
 }

@@ -124,6 +124,13 @@ export type RuntimeFailure = {
   message: string;
 };
 
+export type RuntimeCapability =
+  | "text"
+  | "persona_control"
+  | "memory_inspection"
+  | "memory_mutation"
+  | "voice_session";
+
 export type RuntimeStatus = {
   transport: "stdio";
   privacyMode: "local_only";
@@ -132,11 +139,7 @@ export type RuntimeStatus = {
   memoryEnabled: boolean;
   memoryLocation: "local" | null;
   telemetryEnabled: false;
-  capabilities:
-    | ["text"]
-    | ["text", "memory_inspection"]
-    | ["text", "voice_session"]
-    | ["text", "memory_inspection", "voice_session"];
+  capabilities: ["text", ...Exclude<RuntimeCapability, "text">[]];
   components: RuntimeComponentDescriptor[];
 };
 
@@ -1262,19 +1265,31 @@ function requireStringArray(object: Record<string, unknown>, key: string): strin
 
 function requireCapabilities(object: Record<string, unknown>): RuntimeStatus["capabilities"] {
   const capabilities = requireStringArray(object, "capabilities");
-  const canonical = capabilities.join(",");
-  switch (canonical) {
-    case "text":
-      return ["text"];
-    case "text,memory_inspection":
-      return ["text", "memory_inspection"];
-    case "text,voice_session":
-      return ["text", "voice_session"];
-    case "text,memory_inspection,voice_session":
-      return ["text", "memory_inspection", "voice_session"];
-    default:
+  const ranks: Record<RuntimeCapability, number> = {
+    text: 0,
+    persona_control: 1,
+    memory_inspection: 2,
+    memory_mutation: 3,
+    voice_session: 4,
+  };
+  let previousRank = -1;
+  for (const capability of capabilities) {
+    if (!(capability in ranks)) {
       throw new ProtocolError("capabilities has an unsupported value");
+    }
+    const rank = ranks[capability as RuntimeCapability];
+    if (rank <= previousRank) {
+      throw new ProtocolError("capabilities has an unsupported value");
+    }
+    previousRank = rank;
   }
+  if (
+    capabilities[0] !== "text"
+    || (capabilities.includes("memory_mutation") && !capabilities.includes("memory_inspection"))
+  ) {
+    throw new ProtocolError("capabilities has an unsupported value");
+  }
+  return capabilities as RuntimeStatus["capabilities"];
 }
 
 function validateRuntimeMemoryStatus(

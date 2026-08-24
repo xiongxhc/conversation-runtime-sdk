@@ -3,7 +3,8 @@
 This macOS Tauri reference app exercises the public browser-safe runtime SDK
 against the compiled local gateway. It supports local text chat, explicit local
 voice sessions, shared typed/spoken conversation state, app-owned transcript
-history, optional read-only runtime-memory inspection, and Voice Focus scenes.
+history, optional runtime-memory inspection/approval/deletion, persona update,
+and Voice Focus scenes.
 
 The desktop is a reference application, not the SDK boundary. It owns UI state,
 setup paths, Focus preferences, and transcript-history presentation. The public
@@ -114,8 +115,12 @@ Runtime memory is opt-in. Initialize a chosen SQLite database explicitly with
 The desktop neither creates that database nor automatically captures
 conversations into it. `Memory` appears only when the gateway reports enabled
 local memory and protocol-v1 `memory_inspection`. The desktop reads summaries
-and records through the public SDK only; it has no runtime SQLite access and no
-memory mutation controls.
+and records through the public SDK, approves candidate memories, and deletes
+records with their expected revision; it has no runtime SQLite access. Settings
+loads and updates the runtime persona through the same public SDK surface.
+Typed SDK tests cover those commands separately from the compiled
+SDK-to-gateway smoke; compiled persona and memory mutation coverage remains
+R6 completion work.
 
 ## Developer Checks
 
@@ -133,7 +138,8 @@ continuity.
 
 ## Open Work
 
-- Persona inspection/mutation and runtime-memory mutation controls.
+- Additional runtime-memory management beyond candidate approval and deletion.
+- Compiled SDK-to-gateway coverage for persona and runtime-memory mutation.
 - Model setup and benchmark UI.
 - Packaging, signing, notarization, installation, and upgrade validation.
 - Native microphone, playback, GPU-scene, ten-minute, first-audible,

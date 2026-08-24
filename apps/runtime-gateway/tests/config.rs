@@ -9,7 +9,10 @@ use conversation_protocol::{
     MemoryKind, MemoryProvenance, MemoryProvenanceKind, MemoryRetention, MemoryRetrievalRequest,
     SessionId, TurnId, UnixTimestampMillis,
 };
-use conversation_runtime_gateway::{GatewayAdapters, GatewayConfig, MemoryExtractionSettings};
+use conversation_runtime_gateway::{
+    GatewayAdapters, GatewayConfig, GatewayDeploymentConfig, LanguageDeployment,
+    MemoryExtractionSettings, ProviderEnvironmentPolicy, ProviderHost, ProviderHostOwnership,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -41,6 +44,413 @@ intimacy = 30
 verbosity = 20
 follow_up_frequency = 25
 "#;
+
+const EXTERNAL_HOST: &str = r#"[[provider_hosts]]
+id = "language-host"
+ownership = "external"
+readiness_url = "http://127.0.0.1:11434/api/tags"
+startup_timeout_ms = 5000
+environment = "inherit"
+"#;
+
+const GATEWAY_OWNED_HOST: &str = r#"[[provider_hosts]]
+id = "language-host"
+ownership = "gateway-owned"
+readiness_url = "http://127.0.0.1:11434/api/tags"
+startup_timeout_ms = 5000
+environment = "clear"
+executable = "/usr/bin/provider-host"
+argv = ["serve", "--host", "127.0.0.1"]
+"#;
+
+const PROVIDER_READINESS_LIMIT_BYTES: usize = 2_048;
+
+#[test]
+fn schema_v2_external_host_is_validated_and_carried_without_changing_display_labels() {
+    let fixture = tempfile::tempdir().unwrap();
+    let path = write_config(
+        fixture.path(),
+        &schema_v2_config(EXTERNAL_HOST, "language-host"),
+    );
+
+    let adapters = GatewayConfig::load(&path).unwrap();
+
+    assert_eq!(
+        adapters.status.components[0].provider_label,
+        "local-language"
+    );
+    assert_eq!(adapters.provider_hosts().len(), 1);
+    let host = &adapters.provider_hosts()[0];
+    assert_eq!(host.id(), "language-host");
+    assert_eq!(host.ownership(), ProviderHostOwnership::External);
+    assert_eq!(host.readiness_url(), "http://127.0.0.1:11434/api/tags");
+    assert_eq!(host.startup_timeout_ms(), 5000);
+    assert_eq!(host.environment(), ProviderEnvironmentPolicy::Inherit);
+    assert_eq!(host.executable(), None);
+    assert_eq!(host.argv(), None);
+}
+
+#[test]
+fn schema_v2_gateway_owned_host_carries_literal_launch_plan_without_spawning() {
+    let fixture = tempfile::tempdir().unwrap();
+    let spawn_marker = fixture.path().join("provider-spawned");
+    let host = GATEWAY_OWNED_HOST.replace("/usr/bin/provider-host", &toml_path(&spawn_marker));
+    let path = write_config(fixture.path(), &schema_v2_config(&host, "language-host"));
+
+    let adapters = GatewayConfig::load(&path).unwrap();
+
+    let host = &adapters.provider_hosts()[0];
+    assert_eq!(host.ownership(), ProviderHostOwnership::GatewayOwned);
+    assert_eq!(host.environment(), ProviderEnvironmentPolicy::Clear);
+    assert_eq!(host.executable(), Some(spawn_marker.as_path()));
+    assert_eq!(
+        host.argv()
+            .unwrap()
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["serve", "--host", "127.0.0.1"]
+    );
+    assert!(!spawn_marker.exists());
+}
+
+#[test]
+fn schema_v2_rejects_duplicate_or_invalid_provider_host_ids() {
+    for hosts in [
+        format!("{EXTERNAL_HOST}\n{EXTERNAL_HOST}"),
+        EXTERNAL_HOST.replace("language-host", ""),
+        EXTERNAL_HOST.replace("language-host", " language-host"),
+        EXTERNAL_HOST.replace("language-host", &"x".repeat(129)),
+    ] {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = write_config(fixture.path(), &schema_v2_config(&hosts, "language-host"));
+
+        assert!(
+            GatewayConfig::load(&path).is_err(),
+            "accepted hosts:\n{hosts}"
+        );
+    }
+}
+
+#[test]
+fn schema_v2_rejects_invalid_readiness_urls_and_startup_timeouts() {
+    for host in [
+        EXTERNAL_HOST.replace("http://127.0.0.1:11434", "https://127.0.0.1:11434"),
+        EXTERNAL_HOST.replace("127.0.0.1", "localhost"),
+        EXTERNAL_HOST.replace("127.0.0.1", "192.0.2.1"),
+        EXTERNAL_HOST.replace("startup_timeout_ms = 5000", "startup_timeout_ms = 99"),
+        EXTERNAL_HOST.replace("startup_timeout_ms = 5000", "startup_timeout_ms = 120001"),
+    ] {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = write_config(fixture.path(), &schema_v2_config(&host, "language-host"));
+
+        assert!(
+            GatewayConfig::load(&path).is_err(),
+            "accepted host:\n{host}"
+        );
+    }
+}
+
+#[test]
+fn provider_readiness_url_enforces_the_documented_utf8_byte_bound() {
+    let boundary = readiness_url_with_bytes(PROVIDER_READINESS_LIMIT_BYTES);
+    assert_eq!(boundary.len(), PROVIDER_READINESS_LIMIT_BYTES);
+    assert!(ProviderHost::external(
+        "language-host",
+        boundary,
+        5000,
+        ProviderEnvironmentPolicy::Inherit,
+    )
+    .is_ok());
+
+    let oversized = readiness_url_with_bytes(PROVIDER_READINESS_LIMIT_BYTES + 1);
+    assert!(ProviderHost::external(
+        "language-host",
+        oversized,
+        5000,
+        ProviderEnvironmentPolicy::Inherit,
+    )
+    .is_err());
+}
+
+#[test]
+fn schema_v2_enforces_external_and_gateway_owned_launch_fields() {
+    let external_with_executable =
+        format!("{EXTERNAL_HOST}executable = \"/usr/bin/provider-host\"\n");
+    let external_with_argv = format!("{EXTERNAL_HOST}argv = []\n");
+    let owned_without_executable = GATEWAY_OWNED_HOST
+        .lines()
+        .filter(|line| !line.starts_with("executable ="))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let owned_without_argv = GATEWAY_OWNED_HOST
+        .lines()
+        .filter(|line| !line.starts_with("argv ="))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let owned_with_relative_executable =
+        GATEWAY_OWNED_HOST.replace("/usr/bin/provider-host", "relative/provider-host");
+
+    for host in [
+        external_with_executable,
+        external_with_argv,
+        owned_without_executable,
+        owned_without_argv,
+        owned_with_relative_executable,
+    ] {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = write_config(fixture.path(), &schema_v2_config(&host, "language-host"));
+
+        assert!(
+            GatewayConfig::load(&path).is_err(),
+            "accepted host:\n{host}"
+        );
+    }
+}
+
+#[test]
+fn schema_v2_enforces_literal_argv_bounds() {
+    let too_many = (0..33)
+        .map(|index| format!("\"arg-{index}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let oversized = "x".repeat(4097);
+    let aggregate = [
+        "a".repeat(4096),
+        "b".repeat(4096),
+        "c".repeat(4096),
+        "d".repeat(4096),
+        "e".to_owned(),
+    ];
+    let aggregate = aggregate
+        .iter()
+        .map(|argument| format!("\"{argument}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let nul = "\\u0000";
+
+    for argv in [
+        format!("[{too_many}]"),
+        format!("[\"{oversized}\"]"),
+        format!("[{aggregate}]"),
+        format!("[\"{nul}\"]"),
+    ] {
+        let host = GATEWAY_OWNED_HOST.replace("[\"serve\", \"--host\", \"127.0.0.1\"]", &argv);
+        let fixture = tempfile::tempdir().unwrap();
+        let path = write_config(fixture.path(), &schema_v2_config(&host, "language-host"));
+
+        assert!(GatewayConfig::load(&path).is_err(), "accepted argv {argv}");
+    }
+}
+
+#[test]
+fn schema_v2_requires_a_declared_language_host_reference() {
+    let fixture = tempfile::tempdir().unwrap();
+    let missing_language_reference = write_config(
+        fixture.path(),
+        &schema_v2_config(EXTERNAL_HOST, "missing-host"),
+    );
+    assert!(GatewayConfig::load(&missing_language_reference).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn schema_v2_voice_requires_a_speech_host_reference() {
+    let fixture = GatewayFixture::voice(false);
+    let voice_v2 = schema_v2_voice_config(&fixture, None, EXTERNAL_HOST);
+    let path = write_config(fixture.directory(), &voice_v2);
+
+    assert!(GatewayConfig::load(&path).is_err());
+    assert!(!fixture.sidecar_spawned());
+}
+
+#[cfg(unix)]
+#[test]
+fn schema_v2_voice_speech_host_must_reference_a_declared_host() {
+    let fixture = GatewayFixture::voice(false);
+    let voice_v2 = schema_v2_voice_config(&fixture, Some("missing-speech-host"), EXTERNAL_HOST);
+    let path = write_config(fixture.directory(), &voice_v2);
+
+    assert!(GatewayConfig::load(&path).is_err());
+    assert!(!fixture.sidecar_spawned());
+}
+
+#[cfg(unix)]
+#[test]
+fn schema_v2_voice_accepts_a_declared_speech_host_reference() {
+    let fixture = GatewayFixture::voice(false);
+    let speech_host = EXTERNAL_HOST
+        .replace("language-host", "speech-host")
+        .replace("11434/api/tags", "8000/health");
+    let hosts = format!("{EXTERNAL_HOST}\n{speech_host}");
+    let voice_v2 = schema_v2_voice_config(&fixture, Some("speech-host"), &hosts);
+    let path = write_config(fixture.directory(), &voice_v2);
+
+    let adapters = GatewayConfig::load(&path).unwrap();
+
+    assert_eq!(adapters.provider_hosts().len(), 2);
+    assert!(!fixture.sidecar_spawned());
+}
+
+#[test]
+fn typed_deployment_builder_serializes_deterministically_to_strict_toml() {
+    let language = LanguageDeployment::ollama_compatible(
+        "local-language",
+        "http://127.0.0.1:11434",
+        "private-model-id",
+        "language-host",
+    );
+    let first = GatewayDeploymentConfig::builder(language.clone())
+        .provider_host(
+            ProviderHost::external(
+                "z-host",
+                "http://127.0.0.1:9000/ready",
+                120_000,
+                ProviderEnvironmentPolicy::Clear,
+            )
+            .unwrap(),
+        )
+        .provider_host(
+            ProviderHost::external(
+                "language-host",
+                "http://127.0.0.1:11434/api/tags",
+                100,
+                ProviderEnvironmentPolicy::Inherit,
+            )
+            .unwrap(),
+        )
+        .to_toml()
+        .unwrap();
+    let second = GatewayDeploymentConfig::builder(language)
+        .provider_host(
+            ProviderHost::external(
+                "language-host",
+                "http://127.0.0.1:11434/api/tags",
+                100,
+                ProviderEnvironmentPolicy::Inherit,
+            )
+            .unwrap(),
+        )
+        .provider_host(
+            ProviderHost::external(
+                "z-host",
+                "http://127.0.0.1:9000/ready",
+                120_000,
+                ProviderEnvironmentPolicy::Clear,
+            )
+            .unwrap(),
+        )
+        .to_toml()
+        .unwrap();
+
+    assert_eq!(first, second);
+    assert!(first.starts_with("schema_version = 2\nprivacy_mode = \"local-only\"\n"));
+    assert!(first.find("id = \"language-host\"").unwrap() < first.find("id = \"z-host\"").unwrap());
+    assert!(first.contains("provider_host = \"language-host\""));
+
+    let fixture = tempfile::tempdir().unwrap();
+    let path = write_config(fixture.path(), &first);
+    assert!(GatewayConfig::load(&path).is_ok());
+
+    let unknown = first.replacen(
+        "startup_timeout_ms = 100",
+        "startup_timeout_ms = 100\nunknown = true",
+        1,
+    );
+    let path = write_config(fixture.path(), &unknown);
+    assert!(GatewayConfig::load(&path).is_err());
+}
+
+#[test]
+fn every_typed_serializer_success_is_accepted_by_the_exact_loader_limit() {
+    const LOADER_LIMIT_BYTES: usize = 64 * 1024;
+
+    let fixture = tempfile::tempdir().unwrap();
+    let readiness_url = readiness_url_with_bytes(PROVIDER_READINESS_LIMIT_BYTES);
+    let mut largest_accepted = 0;
+    let mut saw_size_rejection = false;
+
+    for host_count in 1..=40 {
+        let mut deployment =
+            GatewayDeploymentConfig::builder(LanguageDeployment::ollama_compatible(
+                "local-language",
+                "http://127.0.0.1:11434",
+                "private-model-id",
+                "language-host",
+            ))
+            .provider_host(
+                ProviderHost::external(
+                    "language-host",
+                    &readiness_url,
+                    5000,
+                    ProviderEnvironmentPolicy::Inherit,
+                )
+                .unwrap(),
+            );
+        for index in 1..host_count {
+            deployment = deployment.provider_host(
+                ProviderHost::external(
+                    format!("provider-host-{index:02}"),
+                    &readiness_url,
+                    5000,
+                    ProviderEnvironmentPolicy::Clear,
+                )
+                .unwrap(),
+            );
+        }
+
+        match deployment.to_toml() {
+            Ok(contents) => {
+                assert!(contents.len() <= LOADER_LIMIT_BYTES);
+                largest_accepted = largest_accepted.max(contents.len());
+                let path = write_config(fixture.path(), &contents);
+                assert!(GatewayConfig::load(&path).is_ok());
+            }
+            Err(error) => {
+                assert!(error.to_string().contains("64 KiB"));
+                saw_size_rejection = true;
+            }
+        }
+    }
+
+    assert!(largest_accepted > 60 * 1024);
+    assert!(saw_size_rejection);
+}
+
+#[test]
+fn deployment_errors_do_not_echo_model_ids_or_private_paths() {
+    let private_model = format!("private-model-{}", "x".repeat(300));
+    let model_error = GatewayDeploymentConfig::builder(LanguageDeployment::ollama_compatible(
+        "local-language",
+        "http://127.0.0.1:11434",
+        &private_model,
+        "language-host",
+    ))
+    .provider_host(
+        ProviderHost::external(
+            "language-host",
+            "http://127.0.0.1:11434/api/tags",
+            5000,
+            ProviderEnvironmentPolicy::Inherit,
+        )
+        .unwrap(),
+    )
+    .to_toml()
+    .unwrap_err();
+    assert!(!model_error.to_string().contains(&private_model));
+
+    let private_path = "private/provider/path";
+    let path_error = ProviderHost::gateway_owned(
+        "language-host",
+        "http://127.0.0.1:11434/api/tags",
+        5000,
+        ProviderEnvironmentPolicy::Clear,
+        private_path,
+        vec!["serve".to_owned()],
+    )
+    .unwrap_err();
+    assert!(!path_error.to_string().contains(private_path));
+}
 
 #[test]
 fn accepts_an_optional_deployment_system_prompt() {
@@ -88,6 +498,7 @@ fn loads_an_explicit_valid_local_only_configuration() {
         "local-language"
     );
     assert!(adapters.voice.is_none());
+    assert!(adapters.provider_hosts().is_empty());
 }
 
 #[test]
@@ -496,6 +907,7 @@ fn valid_voice_reuses_root_configuration_without_spawning() {
         .components
         .iter()
         .all(|component| component.execution_location == "local"));
+    assert!(adapters.provider_hosts().is_empty());
     let voice = adapters.voice.as_ref().unwrap();
     let policy = voice.policy.for_session(SessionId::new(7)).unwrap();
     assert_eq!(policy.session_id(), SessionId::new(7));
@@ -807,6 +1219,49 @@ fn memory_config(database: &Path) -> String {
         "{VALID_CONFIG}\n[memory]\ndatabase = \"{}\"\nmaximum_items = 4\nmaximum_bytes = 4096\n",
         database.display()
     )
+}
+
+fn schema_v2_config(hosts: &str, language_host: &str) -> String {
+    format!(
+        "{}\n{hosts}",
+        VALID_CONFIG
+            .replacen("schema_version = 1", "schema_version = 2", 1)
+            .replacen(
+                "provider = \"local-language\"",
+                &format!("provider = \"local-language\"\nprovider_host = \"{language_host}\""),
+                1,
+            )
+    )
+}
+
+fn readiness_url_with_bytes(total_bytes: usize) -> String {
+    const PREFIX: &str = "http://127.0.0.1/";
+    assert!(total_bytes >= PREFIX.len());
+    format!("{PREFIX}{}", "r".repeat(total_bytes - PREFIX.len()))
+}
+
+#[cfg(unix)]
+fn schema_v2_voice_config(
+    fixture: &GatewayFixture,
+    speech_host: Option<&str>,
+    hosts: &str,
+) -> String {
+    let mut config = fixture
+        .contents()
+        .replacen("schema_version = 1", "schema_version = 2", 1)
+        .replacen(
+            "provider = \"local-language\"",
+            "provider = \"local-language\"\nprovider_host = \"language-host\"",
+            1,
+        );
+    if let Some(speech_host) = speech_host {
+        config = config.replacen(
+            "provider = \"local-speech-synthesis\"",
+            &format!("provider = \"local-speech-synthesis\"\nprovider_host = \"{speech_host}\""),
+            1,
+        );
+    }
+    format!("{config}\n{hosts}")
 }
 
 #[cfg(unix)]

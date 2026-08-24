@@ -77,11 +77,12 @@ describe("SettingsPane", () => {
   });
 
   it("applies edited slider and mode values via updatePersona", async () => {
+    const onPersonaApplied = vi.fn();
     const session = new PersonaSession();
     session.getPersona.mockResolvedValueOnce(personaState());
     session.updatePersona.mockResolvedValueOnce(personaState({ warmth: 90, mode: "reflective" }));
 
-    renderPane(session);
+    renderPane(session, { onPersonaApplied });
     await screen.findByLabelText("Warmth");
 
     fireEvent.change(screen.getByLabelText("Warmth"), { target: { value: "90" } });
@@ -89,6 +90,7 @@ describe("SettingsPane", () => {
     fireEvent.click(screen.getByRole("button", { name: "Apply" }));
 
     expect(session.updatePersona).toHaveBeenCalledWith(personaState({ warmth: 90, mode: "reflective" }));
+    await waitFor(() => expect(onPersonaApplied).toHaveBeenCalledOnce());
     expect(await screen.findByLabelText("Warmth")).toHaveProperty("value", "90");
     expect(screen.getByLabelText("Mode")).toHaveProperty("value", "reflective");
   });
@@ -152,10 +154,11 @@ describe("SettingsPane", () => {
 
   it("saves the current draft as a named preset and persists it", async () => {
     const onPreferencesChange = vi.fn();
+    const onPersonaApplied = vi.fn();
     const session = new PersonaSession();
     session.getPersona.mockResolvedValueOnce(personaState());
 
-    renderPane(session, { onPreferencesChange });
+    renderPane(session, { onPersonaApplied, onPreferencesChange });
     await screen.findByLabelText("Warmth");
 
     fireEvent.change(screen.getByLabelText("Warmth"), { target: { value: "82" } });
@@ -166,10 +169,12 @@ describe("SettingsPane", () => {
       ...defaultPreferences,
       personaPresets: [{ name: "Cozy chat", persona: personaState({ warmth: 82 }) }],
     });
+    expect(onPersonaApplied).not.toHaveBeenCalled();
   });
 
   it("activates a stored preset by applying it and marking it active", async () => {
     const onPreferencesChange = vi.fn();
+    const onPersonaApplied = vi.fn();
     const session = new PersonaSession();
     session.getPersona.mockResolvedValueOnce(personaState());
     const preset: PersonaPreset = { name: "Focused", persona: personaState({ mode: "direct_answer", warmth: 20 }) };
@@ -177,6 +182,7 @@ describe("SettingsPane", () => {
 
     renderPane(session, {
       preferences: { ...defaultPreferences, personaPresets: [preset] },
+      onPersonaApplied,
       onPreferencesChange,
     });
     await screen.findByLabelText("Warmth");
@@ -185,6 +191,7 @@ describe("SettingsPane", () => {
 
     expect(await screen.findByLabelText("Warmth")).toHaveProperty("value", "20");
     expect(session.updatePersona).toHaveBeenCalledWith(preset.persona);
+    expect(onPersonaApplied).toHaveBeenCalledOnce();
     expect(onPreferencesChange).toHaveBeenCalledWith({
       ...defaultPreferences,
       personaPresets: [preset],
@@ -243,6 +250,7 @@ describe("SettingsPane", () => {
   });
 
   it("deletes a stored preset, clears the active preset name when it was active, and restores focus to Back", async () => {
+    const onPersonaApplied = vi.fn();
     const onPreferencesChange = vi.fn();
     const session = new PersonaSession();
     session.getPersona.mockResolvedValueOnce(personaState());
@@ -250,6 +258,7 @@ describe("SettingsPane", () => {
 
     const { rerender } = renderPane(session, {
       preferences: { ...defaultPreferences, personaPresets: [preset], activePresetName: "Focused" },
+      onPersonaApplied,
       onPreferencesChange,
     });
     await screen.findByLabelText("Warmth");
@@ -261,6 +270,7 @@ describe("SettingsPane", () => {
       personaPresets: [],
       activePresetName: null,
     });
+    expect(onPersonaApplied).not.toHaveBeenCalled();
 
     rerender(
       <SettingsPane
@@ -277,11 +287,16 @@ describe("SettingsPane", () => {
 
 function renderPane(
   session: DesktopSession,
-  overrides: { preferences?: Preferences; onPreferencesChange?: (preferences: Preferences) => void } = {},
+  overrides: {
+    preferences?: Preferences;
+    onPersonaApplied?: () => void;
+    onPreferencesChange?: (preferences: Preferences) => void;
+  } = {},
 ) {
   return render(
     <SettingsPane
       onBack={vi.fn()}
+      onPersonaApplied={overrides.onPersonaApplied ?? vi.fn()}
       onPreferencesChange={overrides.onPreferencesChange ?? vi.fn()}
       preferences={overrides.preferences ?? defaultPreferences}
       session={session}

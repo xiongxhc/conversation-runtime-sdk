@@ -393,6 +393,20 @@ fn runtime_status_accepts_only_canonical_capability_and_component_combinations()
 
     assert_eq!(encoded_statuses, fixture_statuses);
 
+    for status in &valid_statuses {
+        let ready = gateway_value(&GatewayMessage::Ready {
+            status: status.clone(),
+        });
+        let correlated = gateway_value(&GatewayMessage::Status {
+            request_id: "canonical-status".to_owned(),
+            status: status.clone(),
+        });
+        assert_eq!(
+            ready["status"]["capabilities"],
+            correlated["status"]["capabilities"]
+        );
+    }
+
     let invalid_statuses = [
         RuntimeStatus {
             capabilities: vec!["voice_session".to_owned(), "text".to_owned()],
@@ -1674,14 +1688,47 @@ impl FixtureRuntimeStatus {
             return Err("runtime components are invalid".to_owned());
         }
 
-        let memory = self.capabilities == ["text", "memory_inspection"]
-            || self.capabilities == ["text", "memory_inspection", "voice_session"];
-        let voice = self.capabilities == ["text", "voice_session"]
-            || self.capabilities == ["text", "memory_inspection", "voice_session"];
-        if self.capabilities != ["text"]
-            && self.capabilities != ["text", "memory_inspection"]
-            && self.capabilities != ["text", "voice_session"]
-            && self.capabilities != ["text", "memory_inspection", "voice_session"]
+        let memory = self.capabilities
+            == [
+                "text",
+                "persona_control",
+                "memory_inspection",
+                "memory_mutation",
+            ]
+            || self.capabilities
+                == [
+                    "text",
+                    "persona_control",
+                    "memory_inspection",
+                    "memory_mutation",
+                    "voice_session",
+                ];
+        let voice = self.capabilities == ["text", "persona_control", "voice_session"]
+            || self.capabilities
+                == [
+                    "text",
+                    "persona_control",
+                    "memory_inspection",
+                    "memory_mutation",
+                    "voice_session",
+                ];
+        if self.capabilities != ["text", "persona_control"]
+            && self.capabilities
+                != [
+                    "text",
+                    "persona_control",
+                    "memory_inspection",
+                    "memory_mutation",
+                ]
+            && self.capabilities != ["text", "persona_control", "voice_session"]
+            && self.capabilities
+                != [
+                    "text",
+                    "persona_control",
+                    "memory_inspection",
+                    "memory_mutation",
+                    "voice_session",
+                ]
         {
             return Err("runtime capabilities are not canonical".to_owned());
         }

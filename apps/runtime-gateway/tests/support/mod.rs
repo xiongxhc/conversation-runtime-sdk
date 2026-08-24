@@ -282,6 +282,20 @@ impl WireMessage {
         string_after(&self.raw, r#""event":{"type":""#)
     }
 
+    pub fn capabilities(&self) -> Vec<String> {
+        serde_json::from_str::<serde_json::Value>(&self.raw).unwrap()["status"]["capabilities"]
+            .as_array()
+            .expect("runtime capabilities missing")
+            .iter()
+            .map(|capability| {
+                capability
+                    .as_str()
+                    .expect("runtime capability was not a string")
+                    .to_owned()
+            })
+            .collect()
+    }
+
     pub fn event_turn_id(&self) -> Option<&str> {
         let event = self.raw.split_once(r#""event":{"#)?.1;
         string_after(event, r#""turn_id":""#)
@@ -546,12 +560,14 @@ pub fn assert_local_status(message: &WireMessage, memory_enabled: bool) {
     }
     assert!(message.raw.contains(r#""telemetry_enabled":false"#));
     if memory_enabled {
-        assert!(message
-            .raw
-            .contains(r#""capabilities":["text","memory_inspection"]"#));
+        assert!(message.raw.contains(
+            r#""capabilities":["text","persona_control","memory_inspection","memory_mutation"]"#
+        ));
         assert!(message.raw.contains(r#""kind":"memory""#));
     } else {
-        assert!(message.raw.contains(r#""capabilities":["text"]"#));
+        assert!(message
+            .raw
+            .contains(r#""capabilities":["text","persona_control"]"#));
         assert!(!message.raw.contains(r#""kind":"memory""#));
     }
     assert!(message.raw.contains(r#""kind":"language_model""#));
@@ -574,7 +590,7 @@ pub fn assert_voice_status(message: &WireMessage) {
     assert!(message.raw.contains(r#""telemetry_enabled":false"#));
     assert!(message
         .raw
-        .contains(r#""capabilities":["text","voice_session"]"#));
+        .contains(r#""capabilities":["text","persona_control","voice_session"]"#));
     assert!(!message.raw.contains(r#""kind":"memory""#));
     assert!(message.raw.contains(r#""kind":"language_model""#));
     assert!(message

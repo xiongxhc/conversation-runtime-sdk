@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::io::Read;
@@ -7,8 +8,9 @@ use std::sync::Arc;
 
 use conversation_memory::{SqliteMemoryContextProvider, SqliteMemoryStore, SystemMemoryClock};
 use conversation_model_adapters::{
-    BufferedStreamingSpeechSynthesizer, GenerationLanguageModel, MacOsVoiceSidecar,
-    MacOsVoiceSidecarConfig, OllamaConfig, OllamaLanguageModel, OpenAiCompatibleSpeechConfig,
+    AdapterError, BufferedStreamingSpeechSynthesizer, GenerationLanguageModel,
+    GenerationLanguageRequest, GenerationTextDelta, MacOsVoiceSidecar, MacOsVoiceSidecarConfig,
+    OllamaConfig, OllamaLanguageModel, OpenAiCompatibleSpeechConfig,
     OpenAiCompatibleSpeechSynthesizer, OpenAiCompatibleStreamingSpeechConfig,
     OpenAiCompatibleStreamingSpeechSynthesizer, SidecarAsrBackend, SpeechSynthesizer,
     StreamingSpeechSynthesizer, SystemDevice,
@@ -20,7 +22,9 @@ use conversation_protocol::{
     MAX_CLIENT_PROVIDER_LABEL_BYTES,
 };
 use conversation_runtime::{ConversationContext, ConversationQualityController};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::memory_extraction::MemoryExtractionSettings;
 use crate::voice_adapters::{GatewayVoiceAdapters, VoicePolicyTemplate};
@@ -28,6 +32,14 @@ use crate::voice_adapters::{GatewayVoiceAdapters, VoicePolicyTemplate};
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const MAX_MODEL_ID_BYTES: usize = 256;
 const MAX_SYSTEM_PROMPT_BYTES: usize = 4 * 1024;
+const MAX_PROVIDER_HOST_ID_BYTES: usize = 128;
+/// Maximum UTF-8 byte length accepted for a provider readiness URL.
+pub const MAX_PROVIDER_READINESS_URL_BYTES: usize = 2_048;
+const MAX_PROVIDER_ARG_COUNT: usize = 32;
+const MAX_PROVIDER_ARG_BYTES: usize = 4_096;
+const MAX_PROVIDER_ARGV_BYTES: usize = 16_384;
+const MIN_PROVIDER_STARTUP_TIMEOUT_MS: u64 = 100;
+const MAX_PROVIDER_STARTUP_TIMEOUT_MS: u64 = 120_000;
 
 #[derive(Debug)]
 pub struct GatewayConfigError(String);
@@ -40,24 +52,282 @@ impl fmt::Display for GatewayConfigError {
 
 impl std::error::Error for GatewayConfigError {}
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GatewayConfig {
     schema_version: u32,
     privacy_mode: GatewayPrivacyMode,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    provider_hosts: Vec<ProviderHost>,
     language: LanguageConfig,
     persona: PersonaConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
     memory: Option<MemoryConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     voice: Option<VoiceConfig>,
 }
 
 pub struct GatewayAdapters {
     pub context: ConversationContext,
-    pub language: Arc<dyn GenerationLanguageModel>,
+    pub language: Arc<GatewayLanguageAdapter>,
     pub voice: Option<GatewayVoiceAdapters>,
     pub memory_store: Option<SqliteMemoryStore>,
     pub memory_extraction: Option<GatewayMemoryExtraction>,
     pub status: RuntimeStatus,
+}
+
+pub struct GatewayLanguageAdapter {
+    language: Arc<dyn GenerationLanguageModel>,
+    provider_hosts: Arc<[ProviderHost]>,
+}
+
+impl GenerationLanguageModel for GatewayLanguageAdapter {
+    fn stream(
+        &self,
+        request: GenerationLanguageRequest,
+        cancellation: CancellationToken,
+    ) -> mpsc::Receiver<Result<GenerationTextDelta, AdapterError>> {
+        self.language.stream(request, cancellation)
+    }
+}
+
+impl GatewayLanguageAdapter {
+    pub fn provider_hosts(&self) -> &[ProviderHost] {
+        &self.provider_hosts
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderHostOwnership {
+    External,
+    GatewayOwned,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderEnvironmentPolicy {
+    Inherit,
+    Clear,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderHost {
+    id: String,
+    ownership: ProviderHostOwnership,
+    readiness_url: String,
+    startup_timeout_ms: u64,
+    environment: ProviderEnvironmentPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    executable: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    argv: Option<Vec<String>>,
+}
+
+impl ProviderHost {
+    pub fn external(
+        id: impl Into<String>,
+        readiness_url: impl Into<String>,
+        startup_timeout_ms: u64,
+        environment: ProviderEnvironmentPolicy,
+    ) -> Result<Self, GatewayConfigError> {
+        let host = Self {
+            id: id.into(),
+            ownership: ProviderHostOwnership::External,
+            readiness_url: readiness_url.into(),
+            startup_timeout_ms,
+            environment,
+            executable: None,
+            argv: None,
+        };
+        host.validate()?;
+        Ok(host)
+    }
+
+    pub fn gateway_owned(
+        id: impl Into<String>,
+        readiness_url: impl Into<String>,
+        startup_timeout_ms: u64,
+        environment: ProviderEnvironmentPolicy,
+        executable: impl Into<PathBuf>,
+        argv: Vec<String>,
+    ) -> Result<Self, GatewayConfigError> {
+        let host = Self {
+            id: id.into(),
+            ownership: ProviderHostOwnership::GatewayOwned,
+            readiness_url: readiness_url.into(),
+            startup_timeout_ms,
+            environment,
+            executable: Some(executable.into()),
+            argv: Some(argv),
+        };
+        host.validate()?;
+        Ok(host)
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub const fn ownership(&self) -> ProviderHostOwnership {
+        self.ownership
+    }
+
+    pub fn readiness_url(&self) -> &str {
+        &self.readiness_url
+    }
+
+    pub const fn startup_timeout_ms(&self) -> u64 {
+        self.startup_timeout_ms
+    }
+
+    pub const fn environment(&self) -> ProviderEnvironmentPolicy {
+        self.environment
+    }
+
+    pub fn executable(&self) -> Option<&Path> {
+        self.executable.as_deref()
+    }
+
+    pub fn argv(&self) -> Option<&[String]> {
+        self.argv.as_deref()
+    }
+
+    fn validate(&self) -> Result<(), GatewayConfigError> {
+        if self.id.is_empty()
+            || self.id.trim() != self.id
+            || self.id.len() > MAX_PROVIDER_HOST_ID_BYTES
+        {
+            return Err(config_error(
+                "provider host id must be trimmed and within 1..=128 bytes",
+            ));
+        }
+        if self.readiness_url.len() > MAX_PROVIDER_READINESS_URL_BYTES {
+            return Err(config_error(
+                "provider readiness URL exceeded 2048 UTF-8 bytes",
+            ));
+        }
+        validate_loopback_http_endpoint(&self.readiness_url, "provider readiness")?;
+        if !(MIN_PROVIDER_STARTUP_TIMEOUT_MS..=MAX_PROVIDER_STARTUP_TIMEOUT_MS)
+            .contains(&self.startup_timeout_ms)
+        {
+            return Err(config_error(
+                "provider startup_timeout_ms must be within 100..=120000",
+            ));
+        }
+        match self.ownership {
+            ProviderHostOwnership::External => {
+                if self.executable.is_some() || self.argv.is_some() {
+                    return Err(config_error(
+                        "external provider hosts must not define executable or argv",
+                    ));
+                }
+            }
+            ProviderHostOwnership::GatewayOwned => {
+                let executable = self.executable.as_deref().ok_or_else(|| {
+                    config_error("gateway-owned provider host requires an executable")
+                })?;
+                if !executable.is_absolute() {
+                    return Err(config_error(
+                        "gateway-owned provider executable must be absolute",
+                    ));
+                }
+                let argv = self
+                    .argv
+                    .as_deref()
+                    .ok_or_else(|| config_error("gateway-owned provider host requires argv"))?;
+                validate_provider_argv(argv)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct LanguageDeployment {
+    provider: String,
+    endpoint: String,
+    model: String,
+    provider_host: String,
+}
+
+impl LanguageDeployment {
+    pub fn ollama_compatible(
+        provider: impl Into<String>,
+        endpoint: impl Into<String>,
+        model: impl Into<String>,
+        provider_host: impl Into<String>,
+    ) -> Self {
+        Self {
+            provider: provider.into(),
+            endpoint: endpoint.into(),
+            model: model.into(),
+            provider_host: provider_host.into(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct GatewayDeploymentConfig {
+    language: LanguageDeployment,
+    provider_hosts: Vec<ProviderHost>,
+}
+
+impl GatewayDeploymentConfig {
+    pub fn builder(language: LanguageDeployment) -> Self {
+        Self {
+            language,
+            provider_hosts: Vec::new(),
+        }
+    }
+
+    pub fn provider_host(mut self, provider_host: ProviderHost) -> Self {
+        self.provider_hosts.push(provider_host);
+        self
+    }
+
+    pub fn to_toml(self) -> Result<String, GatewayConfigError> {
+        let mut config = GatewayConfig {
+            schema_version: 2,
+            privacy_mode: GatewayPrivacyMode::LocalOnly,
+            provider_hosts: self.provider_hosts,
+            language: LanguageConfig {
+                backend: LanguageBackend::OllamaCompatible,
+                execution: ExecutionConfig::Local,
+                provider: self.language.provider,
+                provider_host: Some(self.language.provider_host),
+                endpoint: self.language.endpoint,
+                model: self.language.model,
+                system_prompt: None,
+                thinking: false,
+                temperature: 0.7,
+                seed: 42,
+                num_predict: 1024,
+                num_ctx: 8192,
+                max_assistant_content_bytes: 65_536,
+            },
+            persona: default_persona_config(),
+            memory: None,
+            voice: None,
+        };
+        config.validate_provider_hosts()?;
+        config.build_adapters()?;
+        config
+            .provider_hosts
+            .sort_by(|left, right| left.id.cmp(&right.id));
+        let contents = toml::to_string_pretty(&config)
+            .map_err(|_| config_error("gateway configuration could not be serialized"))?;
+        if contents.len() as u64 > MAX_CONFIG_BYTES {
+            return Err(config_error(
+                "serialized gateway configuration exceeded 64 KiB",
+            ));
+        }
+        let parsed: GatewayConfig = toml::from_str(&contents)
+            .map_err(|_| config_error("gateway configuration could not be serialized"))?;
+        parsed.build_adapters()?;
+        Ok(contents)
+    }
 }
 
 /// Extraction runs against its own model handle rather than the turn model's. The
@@ -81,6 +351,10 @@ impl fmt::Debug for GatewayAdapters {
 }
 
 impl GatewayAdapters {
+    pub fn provider_hosts(&self) -> &[ProviderHost] {
+        self.language.provider_hosts()
+    }
+
     pub fn text_only_status(&self) -> RuntimeStatus {
         let mut status = self.status.clone();
         status
@@ -102,11 +376,7 @@ impl GatewayConfig {
     }
 
     fn build_adapters(&self) -> Result<GatewayAdapters, GatewayConfigError> {
-        if self.schema_version != 1 {
-            return Err(config_error(
-                "gateway configuration schema_version must be 1",
-            ));
-        }
+        let provider_hosts = self.validate_provider_hosts()?;
         if !matches!(self.privacy_mode, GatewayPrivacyMode::LocalOnly) {
             return Err(config_error("gateway privacy_mode must be local-only"));
         }
@@ -117,8 +387,10 @@ impl GatewayConfig {
         validate_provider_label(&self.language.provider, "language")?;
         validate_loopback_http_endpoint(&self.language.endpoint, "language")?;
 
-        let language: Arc<dyn GenerationLanguageModel> =
-            Arc::new(OllamaLanguageModel::new_direct(self.language_config()?));
+        let language = Arc::new(GatewayLanguageAdapter {
+            language: Arc::new(OllamaLanguageModel::new_direct(self.language_config()?)),
+            provider_hosts: provider_hosts.into(),
+        });
         let quality = self.quality_controller()?;
         let memory = self.memory.as_ref().map(memory_adapters).transpose()?;
         let (memory_provider, memory_store) = match memory {
@@ -191,6 +463,59 @@ impl GatewayConfig {
             memory_extraction,
             status,
         })
+    }
+
+    fn validate_provider_hosts(&self) -> Result<Vec<ProviderHost>, GatewayConfigError> {
+        match self.schema_version {
+            1 => {
+                if !self.provider_hosts.is_empty()
+                    || self.language.provider_host.is_some()
+                    || self
+                        .voice
+                        .as_ref()
+                        .and_then(|voice| voice.speech.provider_host.as_ref())
+                        .is_some()
+                {
+                    return Err(config_error(
+                        "schema v1 uses legacy external providers without provider hosts",
+                    ));
+                }
+                Ok(Vec::new())
+            }
+            2 => {
+                let mut ids = BTreeSet::new();
+                for host in &self.provider_hosts {
+                    host.validate()?;
+                    if !ids.insert(host.id.as_str()) {
+                        return Err(config_error("provider host ids must be unique"));
+                    }
+                }
+                let language_host = self.language.provider_host.as_deref().ok_or_else(|| {
+                    config_error("schema v2 language must reference a provider host")
+                })?;
+                if !ids.contains(language_host) {
+                    return Err(config_error(
+                        "schema v2 language provider host was not declared",
+                    ));
+                }
+                if let Some(voice) = self.voice.as_ref() {
+                    let speech_host = voice.speech.provider_host.as_deref().ok_or_else(|| {
+                        config_error("schema v2 voice speech must reference a provider host")
+                    })?;
+                    if !ids.contains(speech_host) {
+                        return Err(config_error(
+                            "schema v2 voice speech provider host was not declared",
+                        ));
+                    }
+                }
+                let mut hosts = self.provider_hosts.clone();
+                hosts.sort_by(|left, right| left.id.cmp(&right.id));
+                Ok(hosts)
+            }
+            _ => Err(config_error(
+                "gateway configuration schema_version must be 1 or 2",
+            )),
+        }
     }
 
     fn language_config(&self) -> Result<OllamaConfig, GatewayConfigError> {
@@ -503,6 +828,36 @@ fn validate_provider_label(label: &str, component: &str) -> Result<(), GatewayCo
     Ok(())
 }
 
+fn validate_provider_argv(argv: &[String]) -> Result<(), GatewayConfigError> {
+    if argv.len() > MAX_PROVIDER_ARG_COUNT {
+        return Err(config_error(
+            "gateway-owned provider argv exceeded 32 arguments",
+        ));
+    }
+    let mut aggregate_bytes = 0_usize;
+    for argument in argv {
+        if argument.len() > MAX_PROVIDER_ARG_BYTES {
+            return Err(config_error(
+                "gateway-owned provider argument exceeded 4096 bytes",
+            ));
+        }
+        if argument.contains('\0') {
+            return Err(config_error(
+                "gateway-owned provider arguments must be literal strings",
+            ));
+        }
+        aggregate_bytes = aggregate_bytes
+            .checked_add(argument.len())
+            .ok_or_else(|| config_error("gateway-owned provider argv exceeded 16384 bytes"))?;
+    }
+    if aggregate_bytes > MAX_PROVIDER_ARGV_BYTES {
+        return Err(config_error(
+            "gateway-owned provider argv exceeded 16384 bytes",
+        ));
+    }
+    Ok(())
+}
+
 fn local_component(
     kind: ComponentKind,
     provider: &str,
@@ -549,7 +904,21 @@ fn config_error(message: impl Into<String>) -> GatewayConfigError {
     GatewayConfigError(message.into())
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+fn default_persona_config() -> PersonaConfig {
+    PersonaConfig {
+        mode: GatewayConversationMode::DirectAnswer,
+        warmth: 80,
+        humor: 60,
+        teasing: 40,
+        initiative: 35,
+        directness: 80,
+        intimacy: 30,
+        verbosity: 20,
+        follow_up_frequency: 25,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum GatewayPrivacyMode {
     LocalOnly,
@@ -557,15 +926,17 @@ enum GatewayPrivacyMode {
     Cloud,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct LanguageConfig {
     backend: LanguageBackend,
     execution: ExecutionConfig,
     provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_host: Option<String>,
     endpoint: String,
     model: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     system_prompt: Option<String>,
     thinking: bool,
     temperature: f32,
@@ -575,13 +946,13 @@ struct LanguageConfig {
     max_assistant_content_bytes: usize,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum LanguageBackend {
     OllamaCompatible,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PersonaConfig {
     mode: GatewayConversationMode,
@@ -595,7 +966,7 @@ struct PersonaConfig {
     follow_up_frequency: u8,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum GatewayConversationMode {
     DirectAnswer,
@@ -615,7 +986,7 @@ impl From<GatewayConversationMode> for ConversationMode {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct MemoryConfig {
     database: PathBuf,
@@ -628,7 +999,7 @@ struct MemoryConfig {
 
 const MAXIMUM_MEMORIES_PER_TURN: usize = 5;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct MemoryExtractionConfig {
     #[serde(default = "default_max_memories_per_turn")]
@@ -664,7 +1035,7 @@ const fn default_episodic_retention_days() -> u16 {
     90
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct VoiceConfig {
     capture: VoiceCaptureConfig,
@@ -674,26 +1045,26 @@ struct VoiceConfig {
     audio: VoiceAudioConfig,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct VoiceCaptureConfig {
     device: VoiceCaptureDevice,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum VoiceCaptureDevice {
     SystemDefault,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct VoiceTurnConfig {
     speech_start_ms: u64,
     final_silence_ms: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct VoiceAsrConfig {
     backend: VoiceAsrBackend,
@@ -704,19 +1075,21 @@ struct VoiceAsrConfig {
     language: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum VoiceAsrBackend {
     Whisperkit,
     Sensevoice,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct VoiceSpeechConfig {
     backend: VoiceSpeechBackend,
     execution: ExecutionConfig,
     provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_host: Option<String>,
     mode: VoiceSpeechMode,
     streaming_interval: Option<f32>,
     endpoint: String,
@@ -731,20 +1104,20 @@ struct VoiceSpeechConfig {
     max_audio_bytes: usize,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum VoiceSpeechBackend {
     OpenaiCompatible,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum VoiceSpeechMode {
     Buffered,
     Streaming,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct VoiceAudioConfig {
     backend: VoiceAudioBackend,
@@ -754,13 +1127,13 @@ struct VoiceAudioConfig {
     max_error_bytes: usize,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum VoiceAudioBackend {
     ManagedSidecar,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum ExecutionConfig {
     Local,

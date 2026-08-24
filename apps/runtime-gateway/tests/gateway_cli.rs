@@ -42,6 +42,7 @@ async fn persistent_session_reports_local_status_and_preserves_completed_history
     let ready = gateway.read_message().await;
     assert_eq!(ready.message_type(), "ready");
     assert_local_status(&ready, false);
+    assert_eq!(ready.capabilities(), ["text", "persona_control"]);
 
     gateway
         .write_message(r#"{"protocol_version":1,"type":"status","request_id":"status-1"}"#)
@@ -51,6 +52,7 @@ async fn persistent_session_reports_local_status_and_preserves_completed_history
     assert_eq!(status.message_type(), "status");
     assert_eq!(status.request_id(), Some("status-1"));
     assert_local_status(&status, false);
+    assert_eq!(status.capabilities(), ["text", "persona_control"]);
 
     gateway
         .write_message(&start_turn("start-1", "fixture-first-transcript"))
@@ -96,12 +98,31 @@ async fn status_reports_exact_model_and_enabled_local_memory() {
     let ready = gateway.read_message().await;
     assert_eq!(ready.message_type(), "ready");
     assert_local_status(&ready, true);
+    assert_eq!(
+        ready.capabilities(),
+        [
+            "text",
+            "persona_control",
+            "memory_inspection",
+            "memory_mutation",
+        ]
+    );
 
     gateway
         .write_message(r#"{"protocol_version":1,"type":"status","request_id":"status-memory"}"#)
         .await;
     assert_accepted(&gateway.read_message().await, "status-memory");
-    assert_local_status(&gateway.read_message().await, true);
+    let status = gateway.read_message().await;
+    assert_local_status(&status, true);
+    assert_eq!(
+        status.capabilities(),
+        [
+            "text",
+            "persona_control",
+            "memory_inspection",
+            "memory_mutation",
+        ]
+    );
 
     let exit = gateway.close().await;
     assert!(exit.status.success());

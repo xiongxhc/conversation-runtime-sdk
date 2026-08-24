@@ -8,8 +8,13 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
-import { RuntimeClient, type RuntimeTurn } from "../src/client.js";
-import type { RuntimeEvent, VoiceSessionEvent } from "../src/protocol.js";
+import { CommandRejectedError, RuntimeClient, type RuntimeTurn } from "../src/client.js";
+import type {
+  PersonaState,
+  RuntimeEvent,
+  RuntimeStatus,
+  VoiceSessionEvent,
+} from "../src/protocol.js";
 import { StdioGatewayTransport } from "../src/stdio.js";
 
 const execFileAsync = promisify(execFile);
@@ -23,6 +28,12 @@ const TEST_TIMEOUT_MS = 60 * 1000;
 const REPO_ROOT = fileURLToPath(new URL("../../../../", import.meta.url));
 const FIXTURE_MODEL_ID = "fixture-private-local-model";
 const SCENARIO_ENV = "CONVERSATION_FAKE_VOICE_SIDECAR_SCENARIO";
+const EXPLICIT_CONTROL_CAPABILITIES: RuntimeStatus["capabilities"] = [
+  "text",
+  "persona_control",
+  "memory_inspection",
+  "memory_mutation",
+];
 
 test(
   "typed then spoken then typed turns share one context through the public SDK",
@@ -113,15 +124,93 @@ test(
   },
 );
 
+test(
+  "compiled gateway exposes explicit controls through the public SDK",
+  { timeout: TEST_TIMEOUT_MS },
+  async () => {
+    const [gatewayPath, memoryProbePath] = await Promise.all([
+      buildCargoBinary("conversation-runtime-gateway", "conversation-runtime-gateway"),
+      buildCargoBinary("conversation-memory-probe", "conversation-memory-probe"),
+    ]);
+    const directory = await mkdtemp(join(tmpdir(), "conversation-runtime-controls-"));
+    const databasePath = join(directory, "memory.sqlite3");
+    const configPath = join(directory, "gateway.toml");
+    const privateContent = "fixture private memory content";
+
+    try {
+      await runMemoryProbe(memoryProbePath, databasePath, ["init"]);
+      await runMemoryProbe(memoryProbePath, databasePath, [
+        "add",
+        "--kind",
+        "identity",
+        "--content",
+        privateContent,
+        "--confidence",
+        "900",
+        "--at",
+        "100",
+      ]);
+      await writeFile(configPath, controlGatewayConfigContents(databasePath));
+
+      const transport = await spawnGateway({ gatewayPath, configPath });
+      const client = await RuntimeClient.connect(transport);
+      try {
+        const status = await client.status();
+        assert.deepEqual(status.capabilities, EXPLICIT_CONTROL_CAPABILITIES);
+
+        const originalPersona = await client.getPersona();
+        const updatedPersona: PersonaState = {
+          ...originalPersona,
+          mode: "reflective",
+          warmth: originalPersona.warmth === 73 ? 72 : 73,
+        };
+        assert.deepEqual(await client.updatePersona(updatedPersona), updatedPersona);
+        assert.deepEqual(await client.getPersona(), updatedPersona);
+
+        const page = await client.listMemories();
+        assert.equal(page.records.length, 1);
+        const memoryId = page.records[0].id;
+        const candidate = await client.inspectMemory(memoryId);
+        assert.equal(candidate.record.state, "candidate");
+
+        const approved = await client.approveMemory(memoryId, candidate.record.revision);
+        assert.equal(approved.record.state, "active");
+        await assertPrivateRejection(
+          client.deleteMemory(memoryId, candidate.record.revision),
+          "memory_conflict",
+          privateContent,
+        );
+        assert.equal(
+          await client.deleteMemory(memoryId, approved.record.revision),
+          memoryId,
+        );
+        await assertPrivateRejection(
+          client.inspectMemory(memoryId),
+          "memory_not_found",
+          privateContent,
+        );
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  },
+);
+
 async function spawnGateway(options: {
   gatewayPath: string;
   configPath: string;
-  scenario: string;
+  scenario?: string;
 }): Promise<StdioGatewayTransport> {
+  const env = { ...process.env };
+  if (options.scenario !== undefined) {
+    env[SCENARIO_ENV] = options.scenario;
+  }
   const child = spawn(options.gatewayPath, ["--config", options.configPath], {
     shell: false,
     stdio: ["pipe", "pipe", "pipe"],
-    env: { ...process.env, [SCENARIO_ENV]: options.scenario },
+    env,
   }) as ChildProcessWithoutNullStreams;
   await new Promise<void>((resolve, reject) => {
     child.once("spawn", resolve);
@@ -131,6 +220,31 @@ async function spawnGateway(options: {
     startWithChildForTest(childProcess: ChildProcessWithoutNullStreams): StdioGatewayTransport;
   };
   return testable.startWithChildForTest(child);
+}
+
+async function runMemoryProbe(
+  executable: string,
+  databasePath: string,
+  args: string[],
+): Promise<void> {
+  await execFileAsync(executable, ["--database", databasePath, ...args], {
+    cwd: REPO_ROOT,
+    timeout: TEST_TIMEOUT_MS,
+    maxBuffer: 1024 * 1024,
+  });
+}
+
+async function assertPrivateRejection(
+  operation: Promise<unknown>,
+  code: string,
+  privateContent: string,
+): Promise<void> {
+  await assert.rejects(operation, (error: unknown) => {
+    assert.ok(error instanceof CommandRejectedError);
+    assert.equal(error.code, code);
+    assert.equal(error.message.includes(privateContent), false);
+    return true;
+  });
 }
 
 async function drainTurn(turn: RuntimeTurn): Promise<RuntimeEvent[]> {
@@ -250,6 +364,41 @@ execution = "local"
 provider = "fixture-audio"
 sidecar_executable = "${options.sidecarExecutable}"
 max_error_bytes = 65536
+`;
+}
+
+function controlGatewayConfigContents(databasePath: string): string {
+  return `schema_version = 1
+privacy_mode = "local-only"
+
+[language]
+backend = "ollama-compatible"
+execution = "local"
+provider = "fixture-language"
+endpoint = "http://127.0.0.1:9"
+model = "${FIXTURE_MODEL_ID}"
+thinking = false
+temperature = 0.0
+seed = 1
+num_predict = 128
+num_ctx = 1024
+max_assistant_content_bytes = 65536
+
+[persona]
+mode = "direct-answer"
+warmth = 50
+humor = 50
+teasing = 50
+initiative = 50
+directness = 50
+intimacy = 50
+verbosity = 50
+follow_up_frequency = 50
+
+[memory]
+database = "${databasePath}"
+maximum_items = 4
+maximum_bytes = 4096
 `;
 }
 

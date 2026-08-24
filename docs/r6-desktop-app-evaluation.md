@@ -1,6 +1,6 @@
 # R6 Desktop App Evaluation
 
-**Date:** 2026-08-10
+**Date:** 2026-08-24
 **Scope:** Public SDK, compiled local gateway voice lane, shared typed/spoken
 desktop session model, live-capable Voice Focus, and native-acceptance boundary
 
@@ -10,13 +10,16 @@ The R6 desktop voice-session slice passes the complete mechanical gate. The
 desktop now consumes the public voice-session surface rather than presenting an
 idle-only shell: explicit Start, acknowledged capture pause/resume, Stop,
 shared typed/spoken history, recoverable failure, background microphone status,
-and Voice Focus exit choices are implemented and independently reviewed.
+Voice Focus exit choices, persona inspection/update, candidate-memory approval,
+and revision-bound memory deletion are implemented and independently reviewed.
 
 This is deterministic and compiled integration evidence, not native acoustic
 evidence. No current-branch human observation is recorded for microphone
 permission, physical input/output devices, audible playback, audible barge-in,
 GPU scene quality, first-audible latency, audible-stop latency, or ten-minute
-continuity. R3 therefore remains `ACCEPTANCE BLOCKED`.
+continuity. Those observations remain unverified in this document. R3 was
+closed separately by product-owner acceptance on 2026-08-23; the underlying
+raw human and acoustic observations are not stored in this checkout.
 
 ## Ownership and Protocol Boundary
 
@@ -41,7 +44,7 @@ protocol are separate version domains. Unsupported versions fail explicitly.
 | Voice Focus exit | Stop, Keep, Cancel, session replacement, pending-stop focus trap, persistent failure, and retry are test-covered. | Audible stop and child observation require native/acoustic checks. |
 | Barge-in and cleanup | Rust tests cover generation/synthesis/queue/playback cancellation, blocked output, EOF, repeated Stop, failure, and child reaping. | No external recording proves audible-stop p95. |
 | Partial/final text | Partial hypotheses remain transient; final transcript and exact completed assistant text are retained under backpressure. | No private transcript or ASR-quality claim is recorded. |
-| History and memory | App history is local SQLite and separate from optional read-only runtime memory inspection. | Persona mutation and all runtime-memory mutation remain open. |
+| History, memory, and persona | App history is local SQLite and separate from optional runtime memory. The public SDK provides memory inspection, candidate approval, revision-bound deletion, persona inspection, and persona update. | Memory creation, editing, pinning, and other management controls remain open. |
 | Focus scenes | Seven scenes, lazy chunks, hidden transcript default, preference migration, and reduced-motion fallback pass automated checks. | Native GPU appearance has not received a recorded human pass. |
 
 ## Complete Mechanical Gate
@@ -81,7 +84,13 @@ temporary directory and providers. Rust compiled-gateway tests separately cover
 voice accept-to-terminal, request-scoped rejection, EOF child reaping, capture
 pause/resume acknowledgement, blocked output, and terminal ordering. Runtime
 tests separately cover barge-in cleanup; it is not claimed as compiled-gateway
-integration or audible evidence.
+integration or audible evidence. Typed public-SDK tests exercise `getPersona`
+and `updatePersona`, plus revision-bound `approveMemory` and `deleteMemory`,
+through a test transport; desktop session and pane tests exercise the same
+calls through the desktop boundary. This is separate from the compiled
+SDK-to-gateway smoke, which currently covers typed/spoken conversation flow
+only. A compiled SDK-to-gateway persona and memory mutation test remains R6
+completion work.
 
 ## Developer Run
 
@@ -122,7 +131,8 @@ in an untracked local record.
 
 ## Open Work
 
-- Persona inspection/mutation and runtime-memory mutation controls.
+- Additional runtime-memory management beyond candidate approval and deletion.
+- Compiled SDK-to-gateway coverage for persona and runtime-memory mutation.
 - Local model setup and benchmark UI.
 - Packaging, signing, notarization, installation, and upgrade validation.
 - Native microphone, playback, device, GPU scene, and child-process observation.
@@ -133,5 +143,6 @@ in an untracked local record.
 
 The R6 shared desktop voice-session implementation is mechanically validated
 and developer-runnable. R6 remains open for the product and distribution work
-above. R3 remains `ACCEPTANCE BLOCKED` until its separately defined human,
-device, latency, continuity, and acoustic evidence is recorded.
+above. R3 was closed separately by product-owner acceptance on 2026-08-23;
+this document does not independently verify its human, device, latency,
+continuity, or acoustic observations.

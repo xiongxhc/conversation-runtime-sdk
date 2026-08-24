@@ -228,6 +228,26 @@ describe("desktop app", () => {
     expect(screen.getByRole("button", { name: "Preview Voice Focus" })).toBeTruthy();
   });
 
+  it("hides unsupported controls for a legacy mixed-version runtime", async () => {
+    const session = new FakeSession(localState({
+      status: { ...localState().status, capabilities: ["text"] },
+    }));
+    render(
+      <App
+        connectSession={vi.fn(async () => session)}
+        historyStore={new FakeHistoryStore()}
+        storage={memoryStorage()}
+      />,
+    );
+
+    connectWithAbsolutePaths();
+    await screen.findByLabelText("Message");
+
+    expect(screen.queryByRole("button", { name: "Settings" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Memory" })).toBeNull();
+    expect(session.getPersona).not.toHaveBeenCalled();
+  });
+
   it("shows Memory only for verified local inspection capability", async () => {
     const session = new FakeSession(memoryState());
     session.listMemories.mockResolvedValueOnce({ records: [], nextCursor: null });
@@ -373,6 +393,46 @@ describe("desktop app", () => {
     expect(await screen.findByRole("heading", { name: "Conversation history" })).toBeTruthy();
   });
 
+  it("disables Memory and Settings with visible guidance while voice is active", async () => {
+    const session = new FakeSession(memoryState({
+      status: {
+        ...memoryState().status,
+        capabilities: [
+          "text",
+          "persona_control",
+          "memory_inspection",
+          "memory_mutation",
+          "voice_session",
+        ],
+      },
+      voice: {
+        availability: "configured",
+        session: "active",
+        capture: "listening",
+        visual: "listening",
+        sessionId: 1n,
+        partialTranscript: "",
+      },
+    }));
+    render(
+      <App
+        connectSession={vi.fn(async () => session)}
+        historyStore={new FakeHistoryStore()}
+        storage={memoryStorage()}
+      />,
+    );
+
+    connectWithAbsolutePaths();
+    const memory = await screen.findByRole("button", { name: "Memory" });
+    const settings = screen.getByRole("button", { name: "Settings" });
+
+    expect(memory.hasAttribute("disabled")).toBe(true);
+    expect(settings.hasAttribute("disabled")).toBe(true);
+    expect(screen.getByText("Stop voice before opening Memory.")).toBeTruthy();
+    expect(screen.getByText("Stop voice before opening Settings.")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "History" }).hasAttribute("disabled")).toBe(false);
+  });
+
   it("replays the active persona preset once after connecting", async () => {
     const storage = memoryStorage();
     const preset = { name: "Focused", persona: personaState({ mode: "direct_answer", warmth: 20 }) };
@@ -434,8 +494,170 @@ describe("desktop app", () => {
     expect(await screen.findByText(
       'The "Focused" persona preset could not be applied. Open Settings to reapply it.',
     )).toBeTruthy();
+    await waitFor(() => expect(JSON.parse(storage.getItem(preferencesStorageKey) ?? "null")).toEqual({
+      version: 4,
+      focusScene: "soft-aurora",
+      focusIntensity: 0.55,
+      focusEntry: "manual",
+      rememberTranscriptVisibility: false,
+      transcriptVisible: false,
+      reducedMotion: "system",
+      personaPresets: [preset],
+      activePresetName: null,
+    }));
     expect(screen.getByLabelText("Message")).toBeTruthy();
     expect(screen.queryByText("Runtime disconnected")).toBeNull();
+  });
+
+  it("preserves intervening preference changes when an older preset replay fails", async () => {
+    const storage = memoryStorage();
+    const replay = deferred<PersonaState>();
+    const presetA = { name: "A", persona: personaState({ warmth: 20 }) };
+    const presetB = { name: "B", persona: personaState({ warmth: 80 }) };
+    storage.setItem(preferencesStorageKey, JSON.stringify({
+      version: 4,
+      focusScene: "soft-aurora",
+      focusIntensity: 0.55,
+      focusEntry: "manual",
+      rememberTranscriptVisibility: false,
+      transcriptVisible: false,
+      reducedMotion: "system",
+      personaPresets: [presetA, presetB],
+      activePresetName: "A",
+    }));
+    const session = new FakeSession(localState());
+    session.getPersona.mockResolvedValueOnce(presetA.persona);
+    session.updatePersona
+      .mockReturnValueOnce(replay.promise)
+      .mockResolvedValueOnce(presetB.persona);
+    render(
+      <App
+        connectSession={vi.fn(async () => session)}
+        historyStore={new FakeHistoryStore()}
+        storage={storage}
+      />,
+    );
+
+    connectWithAbsolutePaths();
+    await waitFor(() => expect(session.updatePersona).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    await screen.findByRole("heading", { name: "Persona settings" });
+    fireEvent.change(screen.getByLabelText("Preset name"), { target: { value: "C" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save as preset" }));
+    fireEvent.click(screen.getByRole("button", { name: "Activate B" }));
+    await waitFor(() => expect(session.updatePersona).toHaveBeenCalledTimes(2));
+
+    await act(async () => replay.reject(new Error("replay failed")));
+
+    await waitFor(() => expect(JSON.parse(storage.getItem(preferencesStorageKey) ?? "null")).toEqual({
+      version: 4,
+      focusScene: "soft-aurora",
+      focusIntensity: 0.55,
+      focusEntry: "manual",
+      rememberTranscriptVisibility: false,
+      transcriptVisible: false,
+      reducedMotion: "system",
+      personaPresets: [presetA, presetB, { name: "C", persona: presetA.persona }],
+      activePresetName: "B",
+    }));
+    expect(screen.getByText(
+      'The "A" persona preset could not be applied. Open Settings to reapply it.',
+    )).toBeTruthy();
+  });
+
+  it("preserves a newer same-name activation when an older preset replay fails", async () => {
+    const storage = memoryStorage();
+    const replay = deferred<PersonaState>();
+    const reactivate = deferred<PersonaState>();
+    const preset = { name: "A", persona: personaState({ warmth: 20 }) };
+    storage.setItem(preferencesStorageKey, JSON.stringify({
+      version: 4,
+      focusScene: "soft-aurora",
+      focusIntensity: 0.55,
+      focusEntry: "manual",
+      rememberTranscriptVisibility: false,
+      transcriptVisible: false,
+      reducedMotion: "system",
+      personaPresets: [preset],
+      activePresetName: "A",
+    }));
+    const session = new FakeSession(localState());
+    session.getPersona.mockResolvedValueOnce(preset.persona);
+    session.updatePersona
+      .mockReturnValueOnce(replay.promise)
+      .mockReturnValueOnce(reactivate.promise);
+    render(
+      <App
+        connectSession={vi.fn(async () => session)}
+        historyStore={new FakeHistoryStore()}
+        storage={storage}
+      />,
+    );
+
+    connectWithAbsolutePaths();
+    await waitFor(() => expect(session.updatePersona).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    await screen.findByRole("heading", { name: "Persona settings" });
+    fireEvent.click(screen.getByRole("button", { name: "Activate A" }));
+    await waitFor(() => expect(session.updatePersona).toHaveBeenCalledTimes(2));
+    await act(async () => reactivate.resolve(preset.persona));
+    await screen.findByText("Active");
+
+    await act(async () => replay.reject(new Error("older replay failed")));
+
+    await waitFor(() => expect(
+      JSON.parse(storage.getItem(preferencesStorageKey) ?? "null").activePresetName,
+    ).toBe("A"));
+    expect(screen.getByText("Active")).toBeTruthy();
+  });
+
+  it("clears failed active replay while preserving an unrelated saved preset", async () => {
+    const storage = memoryStorage();
+    const replay = deferred<PersonaState>();
+    const preset = { name: "A", persona: personaState({ warmth: 20 }) };
+    storage.setItem(preferencesStorageKey, JSON.stringify({
+      version: 4,
+      focusScene: "soft-aurora",
+      focusIntensity: 0.55,
+      focusEntry: "manual",
+      rememberTranscriptVisibility: false,
+      transcriptVisible: false,
+      reducedMotion: "system",
+      personaPresets: [preset],
+      activePresetName: "A",
+    }));
+    const session = new FakeSession(localState());
+    session.getPersona.mockResolvedValueOnce(preset.persona);
+    session.updatePersona.mockReturnValueOnce(replay.promise);
+    render(
+      <App
+        connectSession={vi.fn(async () => session)}
+        historyStore={new FakeHistoryStore()}
+        storage={storage}
+      />,
+    );
+
+    connectWithAbsolutePaths();
+    await waitFor(() => expect(session.updatePersona).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    await screen.findByRole("heading", { name: "Persona settings" });
+    fireEvent.change(screen.getByLabelText("Preset name"), { target: { value: "C" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save as preset" }));
+    await screen.findByRole("button", { name: "Activate C" });
+
+    await act(async () => replay.reject(new Error("replay failed")));
+
+    await waitFor(() => expect(JSON.parse(storage.getItem(preferencesStorageKey) ?? "null")).toEqual({
+      version: 4,
+      focusScene: "soft-aurora",
+      focusIntensity: 0.55,
+      focusEntry: "manual",
+      rememberTranscriptVisibility: false,
+      transcriptVisible: false,
+      reducedMotion: "system",
+      personaPresets: [preset, { name: "C", persona: preset.persona }],
+      activePresetName: null,
+    }));
   });
 
   it("does not replay any persona when no preset is active", async () => {
@@ -878,7 +1100,12 @@ function memoryState(
       ...localState().status,
       memoryEnabled: true,
       memoryLocation: "local",
-      capabilities: ["text", "memory_inspection"],
+      capabilities: [
+        "text",
+        "persona_control",
+        "memory_inspection",
+        "memory_mutation",
+      ],
     },
     ...overrides,
   });
@@ -917,7 +1144,7 @@ function localState(
       memoryEnabled: false,
       memoryLocation: null,
       telemetryEnabled: false,
-      capabilities: ["text"],
+      capabilities: ["text", "persona_control"],
       components: [{ kind: "language_model", executionLocation: "local", providerLabel: "Local language" }],
     },
     turns: [],

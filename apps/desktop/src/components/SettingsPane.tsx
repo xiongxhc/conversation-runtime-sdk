@@ -8,6 +8,7 @@ import type { Preferences } from "../preferences/preferences.js";
 export interface SettingsPaneProps {
   session: DesktopSession;
   preferences: Preferences;
+  onPersonaApplied?(): void;
   onPreferencesChange(preferences: Preferences): void;
   onBack(): void;
 }
@@ -54,7 +55,13 @@ function personaEquals(a: PersonaState, b: PersonaState): boolean {
   );
 }
 
-export function SettingsPane({ session, preferences, onPreferencesChange, onBack }: SettingsPaneProps) {
+export function SettingsPane({
+  session,
+  preferences,
+  onPersonaApplied,
+  onPreferencesChange,
+  onBack,
+}: SettingsPaneProps) {
   const [draft, setDraft] = useState<PersonaState>();
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string>();
@@ -110,6 +117,7 @@ export function SettingsPane({ session, preferences, onPreferencesChange, onBack
     setApplyError(undefined);
     try {
       const applied = await session.updatePersona(draft);
+      onPersonaApplied?.();
       setDraft(applied);
       const current = preferencesRef.current;
       const activePreset = current.personaPresets.find(
@@ -149,6 +157,7 @@ export function SettingsPane({ session, preferences, onPreferencesChange, onBack
     setApplyError(undefined);
     try {
       const applied = await session.updatePersona(preset.persona);
+      onPersonaApplied?.();
       setDraft(applied);
       onPreferencesChange({ ...preferencesRef.current, activePresetName: name });
     } catch {

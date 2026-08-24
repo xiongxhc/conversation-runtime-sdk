@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -26,7 +26,7 @@ const localMemoryStatus: RuntimeStatus = {
   memoryEnabled: true,
   memoryLocation: "local",
   telemetryEnabled: false,
-  capabilities: ["text", "memory_inspection"],
+  capabilities: ["text", "persona_control", "memory_inspection", "memory_mutation"],
   components: [
     { kind: "language_model", executionLocation: "local", providerLabel: "Local language" },
     { kind: "memory", executionLocation: "local", providerLabel: "Local memory" },
@@ -158,6 +158,8 @@ describe("MemoryPane", () => {
     fireEvent.click(await screen.findByRole("button", { name: /Prefers concise explanations/ }));
 
     const detail = await screen.findByLabelText("Memory detail");
+    expect(within(detail).getByText("Review and manage")).toBeTruthy();
+    expect(within(detail).queryByText("Read-only inspection")).toBeNull();
     expect(within(detail).getByText("Prefers concise explanations in technical discussions.")).toBeTruthy();
     expect(within(detail).getByText("Semantic")).toBeTruthy();
     expect(within(detail).getByText("Active")).toBeTruthy();
@@ -344,6 +346,29 @@ describe("MemoryPane", () => {
     expect(screen.getByRole("button", { name: "Delete" })).toBeTruthy();
   });
 
+  it("keeps inspection available but hides mutation controls without memory_mutation", async () => {
+    const session = sessionForInspection(inspection());
+    const inspectionOnlyStatus: RuntimeStatus = {
+      ...localMemoryStatus,
+      capabilities: ["text", "persona_control", "memory_inspection"],
+    };
+
+    render(
+      <MemoryPane
+        onBack={vi.fn()}
+        session={session}
+        status={inspectionOnlyStatus}
+      />,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: /Prefers concise explanations/ }));
+    await screen.findByLabelText("Memory detail");
+
+    expect(screen.queryByRole("button", { name: "Approve" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
+    expect(session.approveMemory).not.toHaveBeenCalled();
+    expect(session.deleteMemory).not.toHaveBeenCalled();
+  });
+
   it("shows Approve only for a candidate memory, not for an active one", async () => {
     const activeSession = sessionForInspection(inspection());
     renderPane(activeSession);
@@ -386,7 +411,90 @@ describe("MemoryPane", () => {
     expect(session.approveMemory).toHaveBeenCalledWith(7n, 3n);
   });
 
-  it("deletes a memory, returning to a refreshed list with a notice", async () => {
+  it("ignores an approve completion after a later memory is selected", async () => {
+    const pendingApprove = deferred<MemoryInspection>();
+    const first = inspectionFor(7n, "First candidate", "candidate");
+    const second = inspectionFor(8n, "Later selection");
+    const session = sessionForTwoSelections(first, second);
+    session.approveMemory.mockReturnValueOnce(pendingApprove.promise);
+
+    renderPane(session);
+    fireEvent.click(await screen.findByRole("button", { name: /First candidate/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Approve" }));
+    fireEvent.click(screen.getByRole("button", { name: "All memories" }));
+    fireEvent.click(screen.getByRole("button", { name: /Later selection/ }));
+    expect(await screen.findByText("Later selection")).toBeTruthy();
+
+    await act(async () => pendingApprove.resolve({
+      ...first,
+      record: { ...first.record, state: "active", revision: 4n },
+    }));
+
+    expect(screen.getByLabelText("Memory detail")).toBeTruthy();
+    expect(screen.getByText("Later selection")).toBeTruthy();
+    expect(screen.queryByText("First candidate")).toBeNull();
+    expect(screen.queryByText("Memory approved")).toBeNull();
+  });
+
+  it("ignores an approve error after a later memory is selected", async () => {
+    const pendingApprove = deferred<MemoryInspection>();
+    const first = inspectionFor(7n, "First candidate", "candidate");
+    const second = inspectionFor(8n, "Later selection");
+    const session = sessionForTwoSelections(first, second);
+    session.approveMemory.mockReturnValueOnce(pendingApprove.promise);
+
+    renderPane(session);
+    fireEvent.click(await screen.findByRole("button", { name: /First candidate/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Approve" }));
+    fireEvent.click(screen.getByRole("button", { name: "All memories" }));
+    fireEvent.click(screen.getByRole("button", { name: /Later selection/ }));
+    expect(await screen.findByText("Later selection")).toBeTruthy();
+
+    await act(async () => pendingApprove.reject(new Error("stale approve")));
+
+    expect(screen.getByLabelText("Memory detail")).toBeTruthy();
+    expect(screen.getByText("Later selection")).toBeTruthy();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("resets delete confirmation when approval changes the revision", async () => {
+    const candidate = inspectionFor(7n, "Candidate memory", "candidate");
+    const session = sessionForInspection(candidate);
+    session.approveMemory.mockResolvedValueOnce({
+      ...candidate,
+      record: { ...candidate.record, state: "active", revision: 4n },
+    });
+
+    renderPane(session);
+    fireEvent.click(await screen.findByRole("button", { name: /Prefers concise explanations/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+
+    await screen.findByText("Memory approved");
+    expect(screen.queryByRole("button", { name: "Confirm delete" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Delete" })).toBeTruthy();
+  });
+
+  it("resets delete confirmation when a conflict refresh changes the revision", async () => {
+    const candidate = inspectionFor(7n, "Candidate memory", "candidate");
+    const session = sessionForInspection(candidate);
+    session.approveMemory.mockRejectedValueOnce(commandError("memory_conflict"));
+    session.inspectMemory.mockResolvedValueOnce({
+      ...candidate,
+      record: { ...candidate.record, revision: 5n },
+    });
+
+    renderPane(session);
+    fireEvent.click(await screen.findByRole("button", { name: /Prefers concise explanations/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+
+    await waitFor(() => expect(session.inspectMemory).toHaveBeenCalledTimes(2));
+    expect(screen.queryByRole("button", { name: "Confirm delete" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Delete" })).toBeTruthy();
+  });
+
+  it("requires inline confirmation before deleting a memory", async () => {
     const session = sessionForInspection(inspection());
     session.deleteMemory.mockResolvedValueOnce(4n);
     session.listMemories.mockResolvedValueOnce({ records: [], nextCursor: null });
@@ -395,11 +503,58 @@ describe("MemoryPane", () => {
     fireEvent.click(await screen.findByRole("button", { name: /Prefers concise explanations/ }));
     fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
 
+    expect(session.deleteMemory).not.toHaveBeenCalled();
+    expect(screen.getByText("Delete this memory permanently?")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Confirm delete" }));
+
     expect(await screen.findByRole("heading", { name: "Runtime memory" })).toBeTruthy();
     expect((await screen.findByRole("status")).textContent).toBe("Memory deleted");
     expect(screen.getByText("No memories to inspect.")).toBeTruthy();
     expect(session.deleteMemory).toHaveBeenCalledWith(7n, 3n);
     expect(session.listMemories).toHaveBeenCalledTimes(2);
+  });
+
+  it("ignores a delete completion after a later memory is selected", async () => {
+    const pendingDelete = deferred<bigint>();
+    const first = inspectionFor(7n, "First memory");
+    const second = inspectionFor(8n, "Later selection");
+    const session = sessionForTwoSelections(first, second);
+    session.deleteMemory.mockReturnValueOnce(pendingDelete.promise);
+
+    renderPane(session);
+    fireEvent.click(await screen.findByRole("button", { name: /First memory/ }));
+    await confirmDelete();
+    fireEvent.click(screen.getByRole("button", { name: "All memories" }));
+    fireEvent.click(screen.getByRole("button", { name: /Later selection/ }));
+    expect(await screen.findByText("Later selection")).toBeTruthy();
+
+    await act(async () => pendingDelete.resolve(4n));
+
+    expect(screen.getByLabelText("Memory detail")).toBeTruthy();
+    expect(screen.getByText("Later selection")).toBeTruthy();
+    expect(screen.queryByText("Memory deleted")).toBeNull();
+  });
+
+  it("ignores a delete not-found error after a later memory is selected", async () => {
+    const pendingDelete = deferred<bigint>();
+    const first = inspectionFor(7n, "First memory");
+    const second = inspectionFor(8n, "Later selection");
+    const session = sessionForTwoSelections(first, second);
+    session.deleteMemory.mockReturnValueOnce(pendingDelete.promise);
+
+    renderPane(session);
+    fireEvent.click(await screen.findByRole("button", { name: /First memory/ }));
+    await confirmDelete();
+    fireEvent.click(screen.getByRole("button", { name: "All memories" }));
+    fireEvent.click(screen.getByRole("button", { name: /Later selection/ }));
+    expect(await screen.findByText("Later selection")).toBeTruthy();
+
+    await act(async () => pendingDelete.reject(commandError("memory_not_found")));
+
+    expect(screen.getByLabelText("Memory detail")).toBeTruthy();
+    expect(screen.getByText("Later selection")).toBeTruthy();
+    expect(screen.queryByText(/no longer exists/i)).toBeNull();
+    expect(session.listMemories).toHaveBeenCalledTimes(1);
   });
 
   it("shows a retry-copy notice and re-inspects on a memory_conflict rejection from approve", async () => {
@@ -437,7 +592,7 @@ describe("MemoryPane", () => {
 
     renderPane(session);
     fireEvent.click(await screen.findByRole("button", { name: /Prefers concise explanations/ }));
-    fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+    await confirmDelete();
 
     expect(await screen.findByRole("status")).toHaveProperty(
       "textContent",
@@ -473,7 +628,7 @@ describe("MemoryPane", () => {
 
     renderPane(session);
     fireEvent.click(await screen.findByRole("button", { name: /Prefers concise explanations/ }));
-    fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+    await confirmDelete();
 
     expect((await screen.findByRole("alert")).textContent).toContain(
       "This memory could not be deleted.",
@@ -510,7 +665,7 @@ describe("MemoryPane", () => {
 
     renderPane(session);
     fireEvent.click(await screen.findByRole("button", { name: /Prefers concise explanations/ }));
-    fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+    await confirmDelete();
 
     expect(await screen.findByRole("heading", { name: "Runtime memory" })).toBeTruthy();
     expect((await screen.findByRole("status")).textContent).toContain(
@@ -549,6 +704,11 @@ function renderPane(session: DesktopSession) {
       status={localMemoryStatus}
     />,
   );
+}
+
+async function confirmDelete() {
+  fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+  fireEvent.click(screen.getByRole("button", { name: "Confirm delete" }));
 }
 
 class MemorySession implements DesktopSession {
@@ -594,6 +754,24 @@ function sessionForInspection(value: MemoryInspection): MemorySession {
     nextCursor: null,
   });
   session.inspectMemory.mockResolvedValueOnce(value);
+  return session;
+}
+
+function sessionForTwoSelections(
+  first: MemoryInspection,
+  second: MemoryInspection,
+): MemorySession {
+  const session = new MemorySession();
+  session.listMemories.mockResolvedValueOnce({
+    records: [
+      summary(first.record.id, first.record.content),
+      summary(second.record.id, second.record.content),
+    ],
+    nextCursor: null,
+  });
+  session.inspectMemory
+    .mockResolvedValueOnce(first)
+    .mockResolvedValueOnce(second);
   return session;
 }
 
@@ -657,6 +835,18 @@ function inspection(): MemoryInspection {
   };
 }
 
+function inspectionFor(
+  id: bigint,
+  content: string,
+  state: MemoryInspection["record"]["state"] = "active",
+): MemoryInspection {
+  const value = inspection();
+  return {
+    ...value,
+    record: { ...value.record, id, content, state },
+  };
+}
+
 function commandError(code: "memory_not_found" | "memory_unavailable" | "memory_conflict") {
   const messages = {
     memory_not_found: "memory record was not found",
@@ -673,8 +863,10 @@ function commandError(code: "memory_not_found" | "memory_unavailable" | "memory_
 
 function deferred<T>() {
   let resolvePromise!: (value: T) => void;
-  const promise = new Promise<T>((resolve) => {
+  let rejectPromise!: (error: unknown) => void;
+  const promise = new Promise<T>((resolve, reject) => {
     resolvePromise = resolve;
+    rejectPromise = reject;
   });
-  return { promise, resolve: resolvePromise };
+  return { promise, reject: rejectPromise, resolve: resolvePromise };
 }

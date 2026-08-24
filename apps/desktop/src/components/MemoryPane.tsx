@@ -40,6 +40,7 @@ export function MemoryPane({ session, status, onBack, refreshSignal = 0 }: Memor
   const [loadingList, setLoadingList] = useState(true);
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [actionPending, setActionPending] = useState(false);
+  const [deleteConfirmationPending, setDeleteConfirmationPending] = useState(false);
   const [error, setError] = useState<MemoryError>();
   const [notice, setNotice] = useState<string>();
   const listGeneration = useRef(0);
@@ -108,8 +109,13 @@ export function MemoryPane({ session, status, onBack, refreshSignal = 0 }: Memor
     const target = origin === undefined ? undefined : rowRefs.current.get(origin);
     (target ?? listBackRef.current)?.focus();
   }, [loadingList, records, selectedId]);
+  useEffect(() => {
+    setDeleteConfirmationPending(false);
+  }, [inspection?.record.id, inspection?.record.revision]);
 
-  const returnToListAfterNotFound = async () => {
+  const returnToListAfterNotFound = async (generation: number) => {
+    if (generation !== selectionGeneration.current) return;
+    selectionGeneration.current += 1;
     restoreListFocus.current = true;
     setSelectedId(undefined);
     setInspection(undefined);
@@ -127,8 +133,10 @@ export function MemoryPane({ session, status, onBack, refreshSignal = 0 }: Memor
     setSelectedId(memoryId);
     setInspection(undefined);
     setLoadingDetail(true);
+    setActionPending(false);
     setError(undefined);
     setNotice(undefined);
+    setDeleteConfirmationPending(false);
     try {
       const detail = await session.inspectMemory(memoryId);
       if (generation === selectionGeneration.current) setInspection(detail);
@@ -138,7 +146,7 @@ export function MemoryPane({ session, status, onBack, refreshSignal = 0 }: Memor
         inspectionError instanceof CommandRejectedError
         && inspectionError.code === "memory_not_found"
       ) {
-        await returnToListAfterNotFound();
+        await returnToListAfterNotFound(generation);
       } else {
         setError({
           message: memoryErrorMessage(inspectionError),
@@ -156,7 +164,9 @@ export function MemoryPane({ session, status, onBack, refreshSignal = 0 }: Memor
     setSelectedId(undefined);
     setInspection(undefined);
     setLoadingDetail(false);
+    setActionPending(false);
     setError(undefined);
+    setDeleteConfirmationPending(false);
   };
 
   const retry = () => {
@@ -169,8 +179,8 @@ export function MemoryPane({ session, status, onBack, refreshSignal = 0 }: Memor
     }
   };
 
-  const refreshAfterConflict = async (memoryId: bigint) => {
-    const generation = ++selectionGeneration.current;
+  const refreshAfterConflict = async (memoryId: bigint, generation: number) => {
+    if (generation !== selectionGeneration.current) return;
     setLoadingDetail(true);
     try {
       const detail = await session.inspectMemory(memoryId);
@@ -186,15 +196,18 @@ export function MemoryPane({ session, status, onBack, refreshSignal = 0 }: Memor
     mutationError: unknown,
     memoryId: bigint,
     action: "approved" | "deleted",
+    generation: number,
   ) => {
+    if (generation !== selectionGeneration.current) return;
     if (mutationError instanceof CommandRejectedError && mutationError.code === "memory_conflict") {
       setNotice("This memory changed elsewhere — refreshed; try again.");
-      await refreshAfterConflict(memoryId);
+      setDeleteConfirmationPending(false);
+      await refreshAfterConflict(memoryId, generation);
     } else if (
       mutationError instanceof CommandRejectedError
       && mutationError.code === "memory_not_found"
     ) {
-      await returnToListAfterNotFound();
+      await returnToListAfterNotFound(generation);
     } else {
       setError({ message: mutationErrorMessage(mutationError, action), scope: "detail" });
     }
@@ -203,26 +216,33 @@ export function MemoryPane({ session, status, onBack, refreshSignal = 0 }: Memor
   const approve = async () => {
     if (!inspection || inspection.record.state !== "candidate") return;
     const { id, revision } = inspection.record;
+    const generation = selectionGeneration.current;
     setActionPending(true);
     setError(undefined);
     try {
       const updated = await session.approveMemory(id, revision);
+      if (generation !== selectionGeneration.current) return;
       setInspection(updated);
+      setDeleteConfirmationPending(false);
       setNotice("Memory approved");
     } catch (approveError) {
-      await handleMutationError(approveError, id, "approved");
+      await handleMutationError(approveError, id, "approved", generation);
     } finally {
-      setActionPending(false);
+      if (generation === selectionGeneration.current) setActionPending(false);
     }
   };
 
   const deleteRecord = async () => {
     if (!inspection) return;
     const { id, revision } = inspection.record;
+    const generation = selectionGeneration.current;
+    setDeleteConfirmationPending(false);
     setActionPending(true);
     setError(undefined);
     try {
       await session.deleteMemory(id, revision);
+      if (generation !== selectionGeneration.current) return;
+      setActionPending(false);
       selectionGeneration.current += 1;
       restoreListFocus.current = true;
       setSelectedId(undefined);
@@ -230,13 +250,14 @@ export function MemoryPane({ session, status, onBack, refreshSignal = 0 }: Memor
       setLoadingDetail(false);
       await loadPage(null, true, "Memory deleted");
     } catch (deleteError) {
-      await handleMutationError(deleteError, id, "deleted");
+      await handleMutationError(deleteError, id, "deleted", generation);
     } finally {
-      setActionPending(false);
+      if (generation === selectionGeneration.current) setActionPending(false);
     }
   };
 
   if (selectedId !== undefined) {
+    const memoryMutationAvailable = status.capabilities.includes("memory_mutation");
     return (
       <section
         aria-busy={loadingDetail || actionPending}
@@ -246,7 +267,7 @@ export function MemoryPane({ session, status, onBack, refreshSignal = 0 }: Memor
         <MemoryHeader
           actionLabel="All memories"
           actionRef={detailBackRef}
-          eyebrow="Read-only inspection"
+          eyebrow={memoryMutationAvailable ? "Review and manage" : "Read-only inspection"}
           onAction={showList}
           title="Memory detail"
         />
@@ -256,7 +277,7 @@ export function MemoryPane({ session, status, onBack, refreshSignal = 0 }: Memor
         {inspection ? (
           <>
             <MemoryDetail inspection={inspection} />
-            <div className="memory-detail-actions">
+            {memoryMutationAvailable ? <div className="memory-detail-actions">
               {inspection.record.state === "candidate" ? (
                 <button
                   className="quiet-action"
@@ -267,15 +288,37 @@ export function MemoryPane({ session, status, onBack, refreshSignal = 0 }: Memor
                   Approve
                 </button>
               ) : null}
-              <button
-                className="delete-history-action"
-                disabled={actionPending}
-                onClick={() => void deleteRecord()}
-                type="button"
-              >
-                Delete
-              </button>
-            </div>
+              {deleteConfirmationPending ? (
+                <div>
+                  <p>Delete this memory permanently?</p>
+                  <button
+                    className="delete-history-action"
+                    disabled={actionPending}
+                    onClick={() => void deleteRecord()}
+                    type="button"
+                  >
+                    Confirm delete
+                  </button>
+                  <button
+                    className="quiet-action"
+                    disabled={actionPending}
+                    onClick={() => setDeleteConfirmationPending(false)}
+                    type="button"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              ) : (
+                <button
+                  className="delete-history-action"
+                  disabled={actionPending}
+                  onClick={() => setDeleteConfirmationPending(true)}
+                  type="button"
+                >
+                  Delete
+                </button>
+              )}
+            </div> : null}
           </>
         ) : null}
       </section>

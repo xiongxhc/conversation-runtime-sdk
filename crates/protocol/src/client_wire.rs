@@ -858,7 +858,7 @@ impl From<&crate::ClientMemoryApproval> for WireClientMemoryApproval {
 enum GatewayMessageEnvelope<'a> {
     Ready {
         protocol_version: u64,
-        status: RuntimeStatus,
+        status: &'a RuntimeStatus,
     },
     CommandAccepted {
         protocol_version: u64,
@@ -874,7 +874,7 @@ enum GatewayMessageEnvelope<'a> {
     Status {
         protocol_version: u64,
         request_id: &'a str,
-        status: RuntimeStatus,
+        status: &'a RuntimeStatus,
     },
     MemoryList {
         protocol_version: u64,
@@ -922,7 +922,7 @@ impl<'a> From<&'a GatewayMessage> for GatewayMessageEnvelope<'a> {
         match message {
             GatewayMessage::Ready { status } => Self::Ready {
                 protocol_version: CLIENT_PROTOCOL_VERSION,
-                status: status_with_explicit_controls(status),
+                status,
             },
             GatewayMessage::CommandAccepted {
                 request_id,
@@ -940,7 +940,7 @@ impl<'a> From<&'a GatewayMessage> for GatewayMessageEnvelope<'a> {
             GatewayMessage::Status { request_id, status } => Self::Status {
                 protocol_version: CLIENT_PROTOCOL_VERSION,
                 request_id,
-                status: status_with_explicit_controls(status),
+                status,
             },
             GatewayMessage::MemoryList {
                 request_id,
@@ -1000,33 +1000,6 @@ impl<'a> From<&'a GatewayMessage> for GatewayMessageEnvelope<'a> {
             },
         }
     }
-}
-
-fn status_with_explicit_controls(status: &RuntimeStatus) -> RuntimeStatus {
-    let mut status = status.clone();
-    if !status
-        .capabilities
-        .iter()
-        .any(|capability| capability == "persona_control")
-    {
-        status.capabilities.insert(1, "persona_control".to_owned());
-    }
-    if let Some(memory_index) = status
-        .capabilities
-        .iter()
-        .position(|capability| capability == "memory_inspection")
-    {
-        if !status
-            .capabilities
-            .iter()
-            .any(|capability| capability == "memory_mutation")
-        {
-            status
-                .capabilities
-                .insert(memory_index + 1, "memory_mutation".to_owned());
-        }
-    }
-    status
 }
 
 fn validate_protocol_version(version: u64) -> Result<(), ClientWireError> {

@@ -154,7 +154,7 @@
 - [ ] Make the gateway's voice-sidecar path optional by resolving the adjacent bundled executable when no advanced override is configured.
 - [ ] Configure macOS 14, hardened-runtime microphone entitlement, `app` and `dmg` targets, and target-triple-suffixed external binaries.
 - [ ] Implement deterministic staging, unsigned verification, optional Developer ID signing/notarization/stapling, and local replacement-upgrade smoke without embedding private configuration.
-- [ ] Build the macOS app and DMG; verify packaged executables, minimum OS, architectures, Info.plist disclosure, entitlements, and the honest signed/unsigned gate.
+- [ ] Build the macOS app and DMG; verify packaged executables, minimum OS, architectures, Info.plist disclosure, entitlements, and the signed/unsigned gate.
 
 ### Task 8: Close Mechanical R6 Evidence
 

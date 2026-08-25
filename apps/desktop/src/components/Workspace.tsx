@@ -81,7 +81,7 @@ export function Workspace({
   const voiceRunning = sessionState.voice.session !== "idle" && (
     sessionState.voice.session !== "error" || sessionState.voice.sessionId !== undefined
   );
-  const runtimeControlsUnavailable = sessionState.phase === "streaming" || voiceRunning;
+  const runtimeControlsUnavailable = sessionState.phase !== "ready" || voiceRunning;
   const memoryNavigationGuidance = voiceRunning
     ? "Stop voice before opening Memory."
     : sessionState.phase === "streaming"
@@ -148,14 +148,13 @@ export function Workspace({
   }, [focusMode]);
   useEffect(() => {
     if (
-      ((workspaceView === "memory" && !memoryAvailable)
-        || (workspaceView === "settings" && !personaAvailable)
-        || ((workspaceView === "memory" || workspaceView === "settings")
-          && (sessionState.phase !== "ready" || runtimeControlsUnavailable)))
+      (workspaceView === "memory" && !memoryAvailable)
+      || (workspaceView === "settings" && !personaAvailable)
+      || ((workspaceView === "memory" || workspaceView === "settings") && runtimeControlsUnavailable)
     ) {
       setWorkspaceView("conversation");
     }
-  }, [memoryAvailable, personaAvailable, runtimeControlsUnavailable, sessionState.phase, workspaceView]);
+  }, [memoryAvailable, personaAvailable, runtimeControlsUnavailable, workspaceView]);
   useEffect(() => {
     // Replay fires once per connect: this effect depends only on session identity,
     // so a later preset change or preference edit does not retrigger it.
@@ -172,10 +171,10 @@ export function Workspace({
         && currentPreferences.activePresetName === activePreset.name
       ) {
         updatePreferences({ ...currentPreferences, activePresetName: null });
+        setPersonaReplayNotice(
+          `The "${activePreset.name}" persona preset could not be applied. Open Settings to reapply it.`,
+        );
       }
-      setPersonaReplayNotice(
-        `The "${activePreset.name}" persona preset could not be applied. Open Settings to reapply it.`,
-      );
     });
   }, [session]);
   useEffect(() => {
@@ -597,7 +596,7 @@ export function Workspace({
               Memory
             </button>
             {memoryNavigationGuidance ? (
-              <p id="memory-navigation-explanation">
+              <p className="visually-hidden" id="memory-navigation-explanation">
                 {memoryNavigationGuidance}
               </p>
             ) : null}
@@ -617,7 +616,7 @@ export function Workspace({
               Settings
             </button>
             {settingsNavigationGuidance ? (
-              <p id="settings-navigation-explanation">
+              <p className="visually-hidden" id="settings-navigation-explanation">
                 {settingsNavigationGuidance}
               </p>
             ) : null}

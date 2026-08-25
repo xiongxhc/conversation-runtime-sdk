@@ -129,7 +129,7 @@ The repository produces and verifies an unsigned current-target macOS `.app`
 and DMG for local testing. A release script supports optional Developer ID
 signing, hardened runtime, notarization, and stapling only when deployment
 credentials are explicitly supplied through the environment. Absence of
-credentials is reported as an honest skipped release gate, not a passed
+credentials is reported as a skipped release gate, not a passed
 signature or notarization. A local install/upgrade smoke mounts the DMG, replaces
 an earlier app version, preserves app-data, and checks that no child process is
 left behind; it does not bypass Gatekeeper or claim a fresh-Mac release pass.
@@ -147,7 +147,11 @@ left behind; it does not bypass Gatekeeper or claim a fresh-Mac release pass.
 - Advanced manual-path setup remains functional.
 - Persona get/update and memory list/inspect/approve/delete remain backed by the
   live runtime through the public SDK.
-- Control capabilities are advertised explicitly; controls cannot be opened
+- Control capabilities are declared by the runtime that hosts the handlers and
+  reach the wire unchanged. A client older than this checkpoint rejects the new
+  capability names and must be updated together with the gateway; a current
+  client still accepts a gateway that predates them.
+- Controls cannot be opened
   while a live voice session would cause the gateway to reject them; failed
   preset replay never remains labeled Active; deletion requires confirmation.
 - Full Rust, TypeScript, desktop, Swift, bundle-content, and config-permission

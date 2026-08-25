@@ -433,6 +433,57 @@ describe("desktop app", () => {
     expect(screen.getByRole("button", { name: "History" }).hasAttribute("disabled")).toBe(false);
   });
 
+  it("keeps navigation guidance screen-reader-only while streaming", async () => {
+    const session = new FakeSession(memoryState({
+      phase: "streaming",
+      turns: [conversationTurn(1n, "Active question", "Partial", "streaming")],
+      activeTurn: conversationTurn(1n, "Active question", "Partial", "streaming"),
+    }));
+    render(
+      <App
+        connectSession={vi.fn(async () => session)}
+        historyStore={new FakeHistoryStore()}
+        storage={memoryStorage()}
+      />,
+    );
+
+    connectWithAbsolutePaths();
+    await screen.findByRole("button", { name: "Memory" });
+
+    expect(screen.getByText(
+      "Finish or stop the active response before opening Memory.",
+    ).className).toContain("visually-hidden");
+    expect(screen.getByText(
+      "Finish or stop the active response before opening Settings.",
+    ).className).toContain("visually-hidden");
+  });
+
+  it("disables Memory and Settings once the runtime has failed or closed", async () => {
+    const session = new FakeSession(memoryState());
+    render(
+      <App
+        connectSession={vi.fn(async () => session)}
+        historyStore={new FakeHistoryStore()}
+        storage={memoryStorage()}
+      />,
+    );
+
+    connectWithAbsolutePaths();
+    const memory = await screen.findByRole("button", { name: "Memory" });
+    const settings = screen.getByRole("button", { name: "Settings" });
+    expect(memory.hasAttribute("disabled")).toBe(false);
+    expect(settings.hasAttribute("disabled")).toBe(false);
+
+    act(() => session.emit(memoryState({ phase: "failed", error: new Error("gateway exited") })));
+    await screen.findByText("Runtime disconnected");
+    expect(screen.getByRole("button", { name: "Memory" }).hasAttribute("disabled")).toBe(true);
+    expect(screen.getByRole("button", { name: "Settings" }).hasAttribute("disabled")).toBe(true);
+
+    act(() => session.emit(memoryState({ phase: "closed" })));
+    expect(screen.getByRole("button", { name: "Memory" }).hasAttribute("disabled")).toBe(true);
+    expect(screen.getByRole("button", { name: "Settings" }).hasAttribute("disabled")).toBe(true);
+  });
+
   it("replays the active persona preset once after connecting", async () => {
     const storage = memoryStorage();
     const preset = { name: "Focused", persona: personaState({ mode: "direct_answer", warmth: 20 }) };
@@ -560,9 +611,9 @@ describe("desktop app", () => {
       personaPresets: [presetA, presetB, { name: "C", persona: presetA.persona }],
       activePresetName: "B",
     }));
-    expect(screen.getByText(
+    expect(screen.queryByText(
       'The "A" persona preset could not be applied. Open Settings to reapply it.',
-    )).toBeTruthy();
+    )).toBeNull();
   });
 
   it("preserves a newer same-name activation when an older preset replay fails", async () => {
@@ -609,6 +660,9 @@ describe("desktop app", () => {
       JSON.parse(storage.getItem(preferencesStorageKey) ?? "null").activePresetName,
     ).toBe("A"));
     expect(screen.getByText("Active")).toBeTruthy();
+    expect(screen.queryByText(
+      'The "A" persona preset could not be applied. Open Settings to reapply it.',
+    )).toBeNull();
   });
 
   it("clears failed active replay while preserving an unrelated saved preset", async () => {

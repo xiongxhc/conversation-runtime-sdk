@@ -8,9 +8,8 @@ use std::sync::Arc;
 
 use conversation_memory::{SqliteMemoryContextProvider, SqliteMemoryStore, SystemMemoryClock};
 use conversation_model_adapters::{
-    AdapterError, BufferedStreamingSpeechSynthesizer, GenerationLanguageModel,
-    GenerationLanguageRequest, GenerationTextDelta, MacOsVoiceSidecar, MacOsVoiceSidecarConfig,
-    OllamaConfig, OllamaLanguageModel, OpenAiCompatibleSpeechConfig,
+    BufferedStreamingSpeechSynthesizer, GenerationLanguageModel, MacOsVoiceSidecar,
+    MacOsVoiceSidecarConfig, OllamaConfig, OllamaLanguageModel, OpenAiCompatibleSpeechConfig,
     OpenAiCompatibleSpeechSynthesizer, OpenAiCompatibleStreamingSpeechConfig,
     OpenAiCompatibleStreamingSpeechSynthesizer, SidecarAsrBackend, SpeechSynthesizer,
     StreamingSpeechSynthesizer, SystemDevice,
@@ -23,8 +22,6 @@ use conversation_protocol::{
 };
 use conversation_runtime::{ConversationContext, ConversationQualityController};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 
 use crate::memory_extraction::MemoryExtractionSettings;
 use crate::voice_adapters::{GatewayVoiceAdapters, VoicePolicyTemplate};
@@ -34,7 +31,7 @@ const MAX_MODEL_ID_BYTES: usize = 256;
 const MAX_SYSTEM_PROMPT_BYTES: usize = 4 * 1024;
 const MAX_PROVIDER_HOST_ID_BYTES: usize = 128;
 /// Maximum UTF-8 byte length accepted for a provider readiness URL.
-pub const MAX_PROVIDER_READINESS_URL_BYTES: usize = 2_048;
+const MAX_PROVIDER_READINESS_URL_BYTES: usize = 2_048;
 const MAX_PROVIDER_ARG_COUNT: usize = 32;
 const MAX_PROVIDER_ARG_BYTES: usize = 4_096;
 const MAX_PROVIDER_ARGV_BYTES: usize = 16_384;
@@ -69,32 +66,13 @@ pub struct GatewayConfig {
 
 pub struct GatewayAdapters {
     pub context: ConversationContext,
-    pub language: Arc<GatewayLanguageAdapter>,
+    pub language: Arc<dyn GenerationLanguageModel>,
     pub voice: Option<GatewayVoiceAdapters>,
     pub memory_store: Option<SqliteMemoryStore>,
     pub memory_extraction: Option<GatewayMemoryExtraction>,
+    /// Provider processes the gateway supervises for this deployment, sorted by id.
+    pub provider_hosts: Vec<ProviderHost>,
     pub status: RuntimeStatus,
-}
-
-pub struct GatewayLanguageAdapter {
-    language: Arc<dyn GenerationLanguageModel>,
-    provider_hosts: Arc<[ProviderHost]>,
-}
-
-impl GenerationLanguageModel for GatewayLanguageAdapter {
-    fn stream(
-        &self,
-        request: GenerationLanguageRequest,
-        cancellation: CancellationToken,
-    ) -> mpsc::Receiver<Result<GenerationTextDelta, AdapterError>> {
-        self.language.stream(request, cancellation)
-    }
-}
-
-impl GatewayLanguageAdapter {
-    pub fn provider_hosts(&self) -> &[ProviderHost] {
-        &self.provider_hosts
-    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -311,8 +289,6 @@ impl GatewayDeploymentConfig {
             memory: None,
             voice: None,
         };
-        config.validate_provider_hosts()?;
-        config.build_adapters()?;
         config
             .provider_hosts
             .sort_by(|left, right| left.id.cmp(&right.id));
@@ -352,7 +328,7 @@ impl fmt::Debug for GatewayAdapters {
 
 impl GatewayAdapters {
     pub fn provider_hosts(&self) -> &[ProviderHost] {
-        self.language.provider_hosts()
+        &self.provider_hosts
     }
 
     pub fn text_only_status(&self) -> RuntimeStatus {
@@ -387,10 +363,8 @@ impl GatewayConfig {
         validate_provider_label(&self.language.provider, "language")?;
         validate_loopback_http_endpoint(&self.language.endpoint, "language")?;
 
-        let language = Arc::new(GatewayLanguageAdapter {
-            language: Arc::new(OllamaLanguageModel::new_direct(self.language_config()?)),
-            provider_hosts: provider_hosts.into(),
-        });
+        let language: Arc<dyn GenerationLanguageModel> =
+            Arc::new(OllamaLanguageModel::new_direct(self.language_config()?));
         let quality = self.quality_controller()?;
         let memory = self.memory.as_ref().map(memory_adapters).transpose()?;
         let (memory_provider, memory_store) = match memory {
@@ -436,9 +410,10 @@ impl GatewayConfig {
             .map(ClientComponentDescriptor::from)
             .collect();
         let memory_enabled = memory_store.is_some();
-        let mut capabilities = vec!["text".to_owned()];
+        let mut capabilities = vec!["text".to_owned(), "persona_control".to_owned()];
         if memory_enabled {
             capabilities.push("memory_inspection".to_owned());
+            capabilities.push("memory_mutation".to_owned());
         }
         if voice.is_some() {
             capabilities.push("voice_session".to_owned());
@@ -461,6 +436,7 @@ impl GatewayConfig {
             voice,
             memory_store,
             memory_extraction,
+            provider_hosts,
             status,
         })
     }

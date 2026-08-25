@@ -13,8 +13,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{ProviderEnvironmentPolicy, ProviderHost, ProviderHostOwnership};
 
-const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(20);
-const READINESS_REQUEST_TIMEOUT: Duration = Duration::from_millis(100);
+const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// Bounds one readiness probe so a hung endpoint cannot stall polling; the
+/// host's startup timeout bounds readiness as a whole.
+const READINESS_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 const KILL_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
 const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
@@ -51,6 +53,12 @@ pub struct ProviderSupervisorError {
 }
 
 impl ProviderSupervisorError {
+    /// Startup stopped because its cancellation token fired, not because a
+    /// provider misbehaved.
+    pub const fn is_startup_cancelled(self) -> bool {
+        matches!(self.kind, ProviderSupervisorErrorKind::StartupCancelled)
+    }
+
     pub const fn diagnostic_code(self) -> &'static str {
         match self.kind {
             ProviderSupervisorErrorKind::Spawn => "provider_spawn_failed",
@@ -189,6 +197,10 @@ async fn start_owned_provider(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // Its own process group, so shutdown reaches servers started through a
+    // wrapper (a shell, `uv run`, `npx`) and not only the wrapper itself.
+    #[cfg(unix)]
+    command.process_group(0);
     if matches!(host.environment(), ProviderEnvironmentPolicy::Clear) {
         command.env_clear();
     }
@@ -283,12 +295,17 @@ async fn monitor_owned_provider(
     shutdown: oneshot::Receiver<()>,
     exit_sender: mpsc::UnboundedSender<ProviderSupervisorError>,
 ) -> Result<(), ProviderSupervisorError> {
+    #[cfg(unix)]
+    let pid = provider.child.id();
     tokio::select! {
         result = provider.child.wait() => {
-            let error = match result {
-                Ok(_) => supervisor_error(ProviderSupervisorErrorKind::ExitedAfterReady),
-                Err(_) => supervisor_error(ProviderSupervisorErrorKind::ExitedAfterReady),
-            };
+            let _ = result;
+            let error = supervisor_error(ProviderSupervisorErrorKind::ExitedAfterReady);
+            // Whatever the exited process left behind in its group goes with it.
+            #[cfg(unix)]
+            if let Some(pid) = pid {
+                let _ = signal_group(pid, "-TERM").await;
+            }
             finish_output_drains(&mut provider).await;
             let _ = exit_sender.send(error);
             Ok(())
@@ -311,8 +328,10 @@ async fn terminate_and_wait(child: &mut Child) -> Result<(), ProviderSupervisorE
     }
 
     #[cfg(unix)]
-    let graceful = match child.id() {
-        Some(pid) => send_terminate(pid).await,
+    let pid = child.id();
+    #[cfg(unix)]
+    let graceful = match pid {
+        Some(pid) => signal_group(pid, "-TERM").await,
         None => false,
     };
     #[cfg(not(unix))]
@@ -328,6 +347,10 @@ async fn terminate_and_wait(child: &mut Child) -> Result<(), ProviderSupervisorE
         }
     }
 
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        let _ = signal_group(pid, "-KILL").await;
+    }
     if child.start_kill().is_err() && child.try_wait().ok().flatten().is_none() {
         return Err(supervisor_error(ProviderSupervisorErrorKind::Shutdown));
     }
@@ -337,11 +360,14 @@ async fn terminate_and_wait(child: &mut Child) -> Result<(), ProviderSupervisorE
     }
 }
 
+/// Signals the process group the gateway created for the provider with `pid`.
+/// Goes through `kill(1)` because the workspace forbids the unsafe `kill(2)` call.
 #[cfg(unix)]
-async fn send_terminate(pid: u32) -> bool {
+async fn signal_group(pid: u32, signal: &str) -> bool {
     Command::new("/bin/kill")
-        .arg("-TERM")
-        .arg(pid.to_string())
+        .arg(signal)
+        .arg("--")
+        .arg(format!("-{pid}"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

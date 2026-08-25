@@ -19,6 +19,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{JoinError, JoinHandle};
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 
 use crate::memory_extraction::{MemoryExtractedCounts, MemoryExtractionSettings, MemoryExtractor};
 use crate::voice_adapters::GatewayVoiceAdapters;
@@ -37,6 +38,7 @@ pub struct GatewaySession {
     memory_extraction: Option<Arc<MemoryExtractor>>,
     extracted_counts: Option<mpsc::UnboundedReceiver<MemoryExtractedCounts>>,
     voice: Option<VoiceLane>,
+    provider_failure: Option<CancellationToken>,
 }
 
 struct MemoryInspectionAdapters {
@@ -123,7 +125,15 @@ impl GatewaySession {
             memory_extraction: None,
             extracted_counts: None,
             voice: None,
+            provider_failure: None,
         }
+    }
+
+    /// When `provider_failure` is cancelled the session tells the client that a
+    /// gateway-owned provider exited, then ends.
+    pub fn with_provider_failure(mut self, provider_failure: CancellationToken) -> Self {
+        self.provider_failure = Some(provider_failure);
+        self
     }
 
     pub fn with_memory_inspection(
@@ -193,6 +203,7 @@ impl GatewaySession {
         W: AsyncWrite + Unpin + Send + 'static,
     {
         let mut reader = FrameReader::new(reader);
+        let provider_failure = self.provider_failure.clone().unwrap_or_default();
         let WriterLanes {
             urgent_sender,
             urgent_receiver,
@@ -237,6 +248,7 @@ impl GatewaySession {
                         biased;
                         terminal = terminal_written_receiver.recv(), if !terminal_written_receiver.is_closed() => SessionInput::VoiceTerminalWritten(terminal),
                         writer = &mut writer_task => SessionInput::Writer(writer),
+                        _ = provider_failure.cancelled() => SessionInput::ProviderFailure,
                         forwarding = active_task => SessionInput::Forwarder(forwarding),
                         frame = reader.read_frame() => SessionInput::Frame(frame),
                     }
@@ -247,6 +259,7 @@ impl GatewaySession {
                             biased;
                             terminal = terminal_written_receiver.recv(), if !terminal_written_receiver.is_closed() => SessionInput::VoiceTerminalWritten(terminal),
                             writer = &mut writer_task => SessionInput::Writer(writer),
+                        _ = provider_failure.cancelled() => SessionInput::ProviderFailure,
                             pumped = voice_task => SessionInput::VoicePump(pumped),
                             controlled = &mut control.task => SessionInput::VoiceControl(controlled),
                             frame = reader.read_frame() => SessionInput::Frame(frame),
@@ -256,6 +269,7 @@ impl GatewaySession {
                             biased;
                             terminal = terminal_written_receiver.recv(), if !terminal_written_receiver.is_closed() => SessionInput::VoiceTerminalWritten(terminal),
                             writer = &mut writer_task => SessionInput::Writer(writer),
+                        _ = provider_failure.cancelled() => SessionInput::ProviderFailure,
                             pumped = voice_task => SessionInput::VoicePump(pumped),
                             frame = reader.read_frame() => SessionInput::Frame(frame),
                         }
@@ -265,6 +279,7 @@ impl GatewaySession {
                         biased;
                         terminal = terminal_written_receiver.recv(), if !terminal_written_receiver.is_closed() => SessionInput::VoiceTerminalWritten(terminal),
                         writer = &mut writer_task => SessionInput::Writer(writer),
+                        _ = provider_failure.cancelled() => SessionInput::ProviderFailure,
                         frame = reader.read_frame() => SessionInput::Frame(frame),
                     }
                 };
@@ -394,6 +409,7 @@ impl GatewaySession {
                         }
                     }
                     SessionInput::Frame(Ok(None)) => break SessionExit::Normal,
+                    SessionInput::ProviderFailure => break SessionExit::ProviderFailure,
                     SessionInput::Frame(Err(error)) => {
                         break SessionExit::fatal(
                             GatewaySessionError::Framing(error),
@@ -408,6 +424,9 @@ impl GatewaySession {
         shutdown_active_voice(&mut voice.active).await;
         if let Some(message) = exit.fatal_message() {
             let _ = send_urgent(&urgent_sender, fatal_message(message));
+        }
+        if matches!(exit, SessionExit::ProviderFailure) {
+            let _ = send_urgent(&urgent_sender, provider_failure_message());
         }
         // Cancelled before the lanes close so an in-flight extraction stops instead of
         // running on detached past the session that started it.
@@ -430,7 +449,7 @@ impl GatewaySession {
             shutdown_writer(&mut writer_task).await
         };
         match exit {
-            SessionExit::Normal => writer_shutdown,
+            SessionExit::Normal | SessionExit::ProviderFailure => writer_shutdown,
             SessionExit::Failure { error, .. } | SessionExit::Writer(error) => {
                 let _ = writer_shutdown;
                 Err(error)
@@ -1009,6 +1028,7 @@ enum MemoryOperationError {
 
 enum SessionExit {
     Normal,
+    ProviderFailure,
     Failure {
         error: GatewaySessionError,
         fatal: Option<&'static str>,
@@ -1031,7 +1051,7 @@ impl SessionExit {
     fn fatal_message(&self) -> Option<&'static str> {
         match self {
             Self::Failure { fatal, .. } => *fatal,
-            Self::Normal | Self::Writer(_) => None,
+            Self::Normal | Self::ProviderFailure | Self::Writer(_) => None,
         }
     }
 }
@@ -1056,6 +1076,7 @@ impl CommandFailure {
 
 enum SessionInput {
     Frame(Result<Option<Vec<u8>>, FrameError>),
+    ProviderFailure,
     Forwarder(Result<Result<(), GatewaySessionError>, JoinError>),
     VoicePump(Result<Result<(), GatewaySessionError>, JoinError>),
     VoiceControl(Result<Result<(), RuntimeError>, JoinError>),
@@ -1635,6 +1656,17 @@ fn send_bounded(
         mpsc::error::TrySendError::Full(_) => GatewaySessionError::WriterBackpressure,
         mpsc::error::TrySendError::Closed(_) => GatewaySessionError::WriterUnavailable,
     })
+}
+
+fn provider_failure_message() -> GatewayMessage {
+    GatewayMessage::Fatal {
+        error: ClientRuntimeError {
+            code: "adapter_failure".to_owned(),
+            kind: "adapter".to_owned(),
+            stage: "runtime".to_owned(),
+            message: "a gateway-owned provider process exited".to_owned(),
+        },
+    }
 }
 
 fn fatal_message(message: &'static str) -> GatewayMessage {

@@ -326,6 +326,38 @@ test("rejects unsupported status and error enum values", () => {
   );
 });
 
+test("rejects capabilities named after Object.prototype members", () => {
+  for (const capabilities of [
+    ["text", "constructor"],
+    ["text", "toString"],
+    ["text", "__proto__", "memory_inspection"],
+    ["text", "hasOwnProperty", "text"],
+  ]) {
+    assert.throws(
+      () =>
+        parseGatewayMessage({
+          protocol_version: 1,
+          type: "ready",
+          status: {
+            transport: "stdio",
+            privacy_mode: "local_only",
+            language_location: "local",
+            model_id: "local-model",
+            memory_enabled: false,
+            memory_location: null,
+            telemetry_enabled: false,
+            capabilities,
+            components: [
+              { kind: "language_model", execution_location: "local", provider_label: "Local" },
+            ],
+          },
+        }),
+      /capabilities has an unsupported value/,
+      capabilities.join(","),
+    );
+  }
+});
+
 test("rejects incoherent runtime memory status combinations", () => {
   assert.doesNotThrow(() => parseGatewayMessage({
     protocol_version: 1,

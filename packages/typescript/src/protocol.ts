@@ -1265,20 +1265,17 @@ function requireStringArray(object: Record<string, unknown>, key: string): strin
 
 function requireCapabilities(object: Record<string, unknown>): RuntimeStatus["capabilities"] {
   const capabilities = requireStringArray(object, "capabilities");
-  const ranks: Record<RuntimeCapability, number> = {
-    text: 0,
-    persona_control: 1,
-    memory_inspection: 2,
-    memory_mutation: 3,
-    voice_session: 4,
-  };
+  const ranks = new Map<RuntimeCapability, number>([
+    ["text", 0],
+    ["persona_control", 1],
+    ["memory_inspection", 2],
+    ["memory_mutation", 3],
+    ["voice_session", 4],
+  ]);
   let previousRank = -1;
   for (const capability of capabilities) {
-    if (!(capability in ranks)) {
-      throw new ProtocolError("capabilities has an unsupported value");
-    }
-    const rank = ranks[capability as RuntimeCapability];
-    if (rank <= previousRank) {
+    const rank = ranks.get(capability as RuntimeCapability);
+    if (rank === undefined || rank <= previousRank) {
       throw new ProtocolError("capabilities has an unsupported value");
     }
     previousRank = rank;

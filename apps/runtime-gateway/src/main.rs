@@ -1,5 +1,4 @@
 use std::env;
-use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -7,15 +6,10 @@ use std::sync::Arc;
 use conversation_memory::{MemoryClock, MemoryStore, SystemMemoryClock};
 use conversation_runtime::TextTurnRuntime;
 use conversation_runtime_gateway::{
-    GatewayAdapters, GatewayConfig, GatewaySession, ProviderSupervisor,
+    input_relay, GatewayAdapters, GatewayConfig, GatewaySession, ProviderSupervisor,
+    ProviderSupervisorError,
 };
-use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-
-const INPUT_RELAY_BYTES: usize = 64 * 1024;
-const INPUT_CHUNK_BYTES: usize = 8 * 1024;
-const INPUT_CHUNK_COUNT: usize = INPUT_RELAY_BYTES / INPUT_CHUNK_BYTES;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -32,18 +26,6 @@ async fn run() -> Result<(), ()> {
     let adapters = GatewayConfig::load(&config_path).map_err(|_| {
         eprintln!("gateway configuration failed");
     })?;
-    let provider_hosts = adapters.provider_hosts().to_vec();
-    let cancellation = CancellationToken::new();
-    let (session_input, input_task) = input_relay(cancellation.clone());
-    let mut providers = ProviderSupervisor::start(provider_hosts, cancellation.clone())
-        .await
-        .map_err(|error| {
-            cancellation.cancel();
-            eprintln!(
-                "gateway provider supervision failed: {}",
-                error.diagnostic_code()
-            );
-        })?;
     let status = if adapters.voice.is_some() {
         adapters.status.clone()
     } else {
@@ -55,10 +37,27 @@ async fn run() -> Result<(), ()> {
         voice,
         memory_store,
         memory_extraction,
+        provider_hosts,
         status: _,
     } = adapters;
+    let cancellation = CancellationToken::new();
+    let relay = input_relay(std::io::stdin(), cancellation.clone());
+    let mut providers = match ProviderSupervisor::start(provider_hosts, relay.ended.clone()).await {
+        Ok(providers) => providers,
+        // The client left before the providers were ready: nothing failed.
+        Err(error) if error.is_startup_cancelled() => return Ok(()),
+        Err(error) => {
+            eprintln!(
+                "gateway provider supervision failed: {}",
+                error.diagnostic_code()
+            );
+            return Err(());
+        }
+    };
     let runtime = TextTurnRuntime::new(context.clone(), language.clone());
-    let mut session = GatewaySession::new(runtime, status);
+    let provider_failure = CancellationToken::new();
+    let mut session =
+        GatewaySession::new(runtime, status).with_provider_failure(provider_failure.clone());
     if let Some(voice_adapters) = voice {
         session = session.with_voice(voice_adapters, context, language);
     }
@@ -75,87 +74,43 @@ async fn run() -> Result<(), ()> {
             );
         }
     }
-    let session = session.run(session_input, tokio::io::stdout());
+    let session = session.run(relay.input, tokio::io::stdout());
     tokio::pin!(session);
-    let outcome = tokio::select! {
+    let (session_result, provider_error) = tokio::select! {
         biased;
         provider_error = providers.wait_for_exit() => {
-            cancellation.cancel();
-            let session_result = session.await;
-            (session_result, Some(provider_error))
+            provider_failure.cancel();
+            (session.await, Some(provider_error))
         }
-        session_result = &mut session => {
-            cancellation.cancel();
-            (session_result, None)
-        }
+        session_result = &mut session => (session_result, None),
     };
-    let _ = input_task.await;
+    cancellation.cancel();
+    let input_result = relay.task.await;
     let shutdown = providers.shutdown().await;
-    if let Some(error) = outcome.1 {
-        eprintln!(
-            "gateway provider supervision failed: {}",
-            error.diagnostic_code()
-        );
-        return Err(());
-    }
-    if let Err(error) = outcome.0 {
-        eprintln!("gateway session failed: {}", error.diagnostic_code());
-        return Err(());
-    }
-    if let Err(error) = shutdown {
-        eprintln!(
-            "gateway provider supervision failed: {}",
-            error.diagnostic_code()
-        );
+    let failure = provider_error
+        .map(supervision_failure)
+        .or_else(|| {
+            session_result
+                .err()
+                .map(|error| format!("gateway session failed: {}", error.diagnostic_code()))
+        })
+        .or_else(|| {
+            matches!(input_result, Ok(Err(_)))
+                .then(|| "gateway session failed: input_read_failed".to_owned())
+        })
+        .or_else(|| shutdown.err().map(supervision_failure));
+    if let Some(failure) = failure {
+        eprintln!("{failure}");
         return Err(());
     }
     Ok(())
 }
 
-fn input_relay(
-    cancellation: CancellationToken,
-) -> (
-    tokio::io::DuplexStream,
-    tokio::task::JoinHandle<std::io::Result<()>>,
-) {
-    let (input_sender, mut input_receiver) = mpsc::channel::<Vec<u8>>(INPUT_CHUNK_COUNT);
-    std::thread::spawn(move || {
-        let mut stdin = std::io::stdin().lock();
-        let mut buffer = [0_u8; INPUT_CHUNK_BYTES];
-        loop {
-            let count = match stdin.read(&mut buffer) {
-                Ok(0) | Err(_) => return,
-                Ok(count) => count,
-            };
-            if input_sender
-                .blocking_send(buffer[..count].to_vec())
-                .is_err()
-            {
-                return;
-            }
-        }
-    });
-
-    let (session_input, mut input_sink) = tokio::io::duplex(INPUT_RELAY_BYTES);
-    let input_cancellation = cancellation.clone();
-    let input_task = tokio::spawn(async move {
-        let result = loop {
-            let chunk = tokio::select! {
-                biased;
-                _ = input_cancellation.cancelled() => break Ok(()),
-                chunk = input_receiver.recv() => chunk,
-            };
-            let Some(chunk) = chunk else {
-                break Ok(());
-            };
-            if let Err(error) = input_sink.write_all(&chunk).await {
-                break Err(error);
-            }
-        };
-        input_cancellation.cancel();
-        result
-    });
-    (session_input, input_task)
+fn supervision_failure(error: ProviderSupervisorError) -> String {
+    format!(
+        "gateway provider supervision failed: {}",
+        error.diagnostic_code()
+    )
 }
 
 fn parse_config_path() -> Option<PathBuf> {

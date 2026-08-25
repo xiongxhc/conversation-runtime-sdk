@@ -490,7 +490,7 @@ fn loads_an_explicit_valid_local_only_configuration() {
 
     let adapters: GatewayAdapters = GatewayConfig::load(&path).unwrap();
     assert_eq!(adapters.status.model_id, "local-model-id");
-    assert_eq!(adapters.status.capabilities, ["text"]);
+    assert_eq!(adapters.status.capabilities, ["text", "persona_control"]);
     assert_eq!(adapters.status.components.len(), 1);
     assert_eq!(adapters.status.components[0].kind, "language_model");
     assert_eq!(
@@ -661,7 +661,15 @@ async fn memory_configuration_returns_shared_retrieval_and_inspection_handles() 
 
     assert_eq!(retrieval.items().len(), 1);
     assert_eq!(retrieval.items()[0].memory_id(), record.id());
-    assert_eq!(adapters.status.capabilities, ["text", "memory_inspection"]);
+    assert_eq!(
+        adapters.status.capabilities,
+        [
+            "text",
+            "persona_control",
+            "memory_inspection",
+            "memory_mutation"
+        ]
+    );
     assert_eq!(adapters.status.components[1].kind, "memory");
 }
 
@@ -885,7 +893,13 @@ fn valid_voice_reuses_root_configuration_without_spawning() {
     assert!(adapters.voice.is_some());
     assert_eq!(
         adapters.status.capabilities,
-        ["text", "memory_inspection", "voice_session"]
+        [
+            "text",
+            "persona_control",
+            "memory_inspection",
+            "memory_mutation",
+            "voice_session"
+        ]
     );
     assert_eq!(
         adapters
@@ -917,7 +931,15 @@ fn valid_voice_reuses_root_configuration_without_spawning() {
     })
     .unwrap();
     let running_status = adapters.text_only_status();
-    assert_eq!(running_status.capabilities, ["text", "memory_inspection"]);
+    assert_eq!(
+        running_status.capabilities,
+        [
+            "text",
+            "persona_control",
+            "memory_inspection",
+            "memory_mutation"
+        ]
+    );
     assert_eq!(
         running_status
             .components

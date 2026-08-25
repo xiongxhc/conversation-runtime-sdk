@@ -344,11 +344,19 @@ fn public_runtime_errors_do_not_expose_adapter_details() {
 fn runtime_status_accepts_only_canonical_capability_and_component_combinations() {
     let memory_component = client_component("memory", "Local memory");
     let valid_statuses = [
-        status(),
+        RuntimeStatus {
+            capabilities: vec!["text".to_owned(), "persona_control".to_owned()],
+            ..status()
+        },
         RuntimeStatus {
             memory_enabled: true,
             memory_location: Some("local".to_owned()),
-            capabilities: vec!["text".to_owned(), "memory_inspection".to_owned()],
+            capabilities: vec![
+                "text".to_owned(),
+                "persona_control".to_owned(),
+                "memory_inspection".to_owned(),
+                "memory_mutation".to_owned(),
+            ],
             components: vec![
                 client_component("language_model", "Local language"),
                 memory_component.clone(),
@@ -356,7 +364,11 @@ fn runtime_status_accepts_only_canonical_capability_and_component_combinations()
             ..status()
         },
         RuntimeStatus {
-            capabilities: vec!["text".to_owned(), "voice_session".to_owned()],
+            capabilities: vec![
+                "text".to_owned(),
+                "persona_control".to_owned(),
+                "voice_session".to_owned(),
+            ],
             components: voice_components(),
             ..status()
         },
@@ -365,7 +377,9 @@ fn runtime_status_accepts_only_canonical_capability_and_component_combinations()
             memory_location: Some("local".to_owned()),
             capabilities: vec![
                 "text".to_owned(),
+                "persona_control".to_owned(),
                 "memory_inspection".to_owned(),
+                "memory_mutation".to_owned(),
                 "voice_session".to_owned(),
             ],
             components: voice_components()
@@ -752,6 +766,28 @@ fn persona_and_memory_mutation_gateway_messages_encode() {
     assert_eq!(value["created"], 2);
     assert_eq!(value["activated"], 1);
     assert_eq!(value["pending_approval"], 1);
+}
+
+#[test]
+fn gateway_status_capabilities_are_encoded_exactly_as_declared() {
+    // The wire advertises what the runtime declared: no capability is spliced in
+    // at serialization time, so a runtime that does not declare persona control
+    // never advertises it.
+    let value = gateway_value(&GatewayMessage::Ready { status: status() });
+    assert_eq!(value["status"]["capabilities"], serde_json::json!(["text"]));
+
+    let declared = RuntimeStatus {
+        capabilities: vec!["text".to_owned(), "persona_control".to_owned()],
+        ..status()
+    };
+    let value = gateway_value(&GatewayMessage::Status {
+        request_id: "req-status".to_owned(),
+        status: declared,
+    });
+    assert_eq!(
+        value["status"]["capabilities"],
+        serde_json::json!(["text", "persona_control"])
+    );
 }
 
 #[test]

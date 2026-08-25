@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod support;
+
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -13,7 +15,6 @@ use tokio::process::{Child, Command};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
-const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 const PRIVATE_OUTPUT: &str = "private-provider-output";
 
 const PROVIDER_FIXTURE: &str = r#"
@@ -86,6 +87,8 @@ while True:
         active = None
         connection.close()
         continue
+    if mode == "slow-ready":
+        time.sleep(0.3)
     connection.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
     connection.close()
     if mode == "exit-after":
@@ -165,7 +168,7 @@ async fn child_exit_before_readiness_is_reaped_and_content_free() {
         .unwrap_err();
     assert_eq!(error.diagnostic_code(), "provider_exited_before_ready");
     assert!(!error.to_string().contains(PRIVATE_OUTPUT));
-    assert_process_reaped(read_pid(temporary.path()).await).await;
+    support::assert_process_reaped(read_pid(temporary.path()).await).await;
 }
 
 #[tokio::test]
@@ -185,11 +188,11 @@ async fn child_exit_after_readiness_is_monitored_without_restart() {
         .await
         .unwrap();
     let pid = read_pid(temporary.path()).await;
-    let error = timeout(TEST_TIMEOUT, supervisor.wait_for_exit())
+    let error = timeout(support::PROCESS_TIMEOUT, supervisor.wait_for_exit())
         .await
         .unwrap();
     assert_eq!(error.diagnostic_code(), "provider_exited_after_ready");
-    assert_process_reaped(pid).await;
+    support::assert_process_reaped(pid).await;
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert_eq!(read_pid(temporary.path()).await, pid);
     supervisor.shutdown().await.unwrap();
@@ -214,7 +217,7 @@ async fn startup_timeout_reaps_the_owned_child() {
         .await
         .unwrap_err();
     assert_eq!(error.diagnostic_code(), "provider_startup_timeout");
-    assert_process_reaped(read_pid(temporary.path()).await).await;
+    support::assert_process_reaped(read_pid(temporary.path()).await).await;
 }
 
 #[tokio::test]
@@ -232,12 +235,12 @@ async fn startup_cancellation_reaps_the_owned_child() {
     );
     let cancellation = CancellationToken::new();
     let start = tokio::spawn(ProviderSupervisor::start(vec![host], cancellation.clone()));
-    wait_for_path(&temporary.path().join("pid")).await;
+    support::wait_for_path(&temporary.path().join("pid")).await;
     let pid = read_pid(temporary.path()).await;
     cancellation.cancel();
     let error = start.await.unwrap().unwrap_err();
     assert_eq!(error.diagnostic_code(), "provider_startup_cancelled");
-    assert_process_reaped(pid).await;
+    support::assert_process_reaped(pid).await;
 }
 
 #[tokio::test]
@@ -254,7 +257,7 @@ async fn stdout_and_stderr_are_continuously_drained_without_blocking_readiness()
         ProviderEnvironmentPolicy::Clear,
     );
     let supervisor = timeout(
-        TEST_TIMEOUT,
+        support::PROCESS_TIMEOUT,
         ProviderSupervisor::start(vec![host], CancellationToken::new()),
     )
     .await
@@ -287,7 +290,71 @@ async fn shutdown_terminates_gracefully_before_waiting() {
             .unwrap(),
         "received"
     );
-    assert_process_reaped(pid).await;
+    support::assert_process_reaped(pid).await;
+}
+
+#[tokio::test]
+async fn slow_readiness_responses_still_count_as_ready() {
+    let temporary = tempfile::tempdir().unwrap();
+    let host = fixture_host_with_timeout(
+        "slow",
+        "slow-ready",
+        unused_port(),
+        temporary.path(),
+        "literal",
+        0,
+        0,
+        ProviderEnvironmentPolicy::Clear,
+        3_000,
+    );
+    // A readiness endpoint that answers in 300 ms is healthy; only the
+    // configured startup timeout bounds how long readiness may take.
+    let supervisor = ProviderSupervisor::start(vec![host], CancellationToken::new())
+        .await
+        .expect("a slow but healthy readiness endpoint counts as ready");
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_terminates_providers_launched_through_a_wrapper() {
+    let temporary = tempfile::tempdir().unwrap();
+    let port = unused_port();
+    // The server is a grandchild: the wrapper shell stays the direct child and
+    // does not forward signals.
+    let mut argv = vec![
+        "-c".to_owned(),
+        "\"$0\" \"$@\" & wait".to_owned(),
+        python_executable().display().to_string(),
+    ];
+    argv.extend(fixture_argv(
+        "persistent",
+        port,
+        temporary.path(),
+        "literal",
+        0,
+        0,
+    ));
+    let host = ProviderHost::gateway_owned(
+        "wrapped",
+        readiness_url(port),
+        2_000,
+        ProviderEnvironmentPolicy::Clear,
+        PathBuf::from("/bin/sh"),
+        argv,
+    )
+    .unwrap();
+    let supervisor = ProviderSupervisor::start(vec![host], CancellationToken::new())
+        .await
+        .unwrap();
+    let server_pid = read_pid(temporary.path()).await;
+    supervisor.shutdown().await.unwrap();
+    support::assert_process_reaped(server_pid).await;
+    assert_eq!(
+        tokio::fs::read_to_string(temporary.path().join("term"))
+            .await
+            .unwrap(),
+        "received"
+    );
 }
 
 #[tokio::test]
@@ -309,9 +376,9 @@ async fn shutdown_escalates_to_bounded_kill_and_wait() {
     let pid = read_pid(temporary.path()).await;
     let started = Instant::now();
     supervisor.shutdown().await.unwrap();
-    assert!(started.elapsed() < TEST_TIMEOUT);
+    assert!(started.elapsed() < support::PROCESS_TIMEOUT);
     assert!(!temporary.path().join("term").exists());
-    assert_process_reaped(pid).await;
+    support::assert_process_reaped(pid).await;
 }
 
 #[tokio::test]
@@ -366,8 +433,8 @@ async fn partial_multi_host_startup_failure_cleans_up_ready_owned_children() {
         .await
         .unwrap_err();
     assert_eq!(error.diagnostic_code(), "provider_exited_before_ready");
-    assert_process_reaped(read_pid(&first_dir).await).await;
-    assert_process_reaped(read_pid(&second_dir).await).await;
+    support::assert_process_reaped(read_pid(&first_dir).await).await;
+    support::assert_process_reaped(read_pid(&second_dir).await).await;
 }
 
 #[tokio::test]
@@ -398,14 +465,7 @@ async fn compiled_gateway_fails_when_an_owned_provider_exits_after_readiness() {
     let config_path = temporary.path().join("gateway.toml");
     tokio::fs::write(&config_path, config).await.unwrap();
 
-    let mut gateway = Command::new(env!("CARGO_BIN_EXE_conversation-runtime-gateway"))
-        .arg("--config")
-        .arg(&config_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut gateway = support::gateway_command(&config_path).spawn().unwrap();
     let _stdin = gateway.stdin.take().unwrap();
     let stdout = gateway.stdout.take().unwrap();
     let stderr = gateway.stderr.take().unwrap();
@@ -418,7 +478,7 @@ async fn compiled_gateway_fails_when_an_owned_provider_exits_after_readiness() {
         bytes
     });
     let mut frames = FrameReader::new(BufReader::new(stdout));
-    let ready = timeout(TEST_TIMEOUT, frames.read_frame())
+    let ready = timeout(support::PROCESS_TIMEOUT, frames.read_frame())
         .await
         .unwrap()
         .unwrap()
@@ -426,8 +486,24 @@ async fn compiled_gateway_fails_when_an_owned_provider_exits_after_readiness() {
     assert!(String::from_utf8(ready)
         .unwrap()
         .contains(r#""type":"ready""#));
+    // The client learns why the session ended from a fatal frame, not only from
+    // the process exit code and stderr.
+    let fatal = timeout(support::PROCESS_TIMEOUT, frames.read_frame())
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("a fatal frame precedes the output closing");
+    let fatal = String::from_utf8(fatal).unwrap();
+    assert!(fatal.contains(r#""type":"fatal""#), "{fatal}");
+    assert!(fatal.contains(r#""code":"adapter_failure""#), "{fatal}");
+    assert!(!fatal.contains("private-fixture-model"), "{fatal}");
+    assert!(timeout(support::PROCESS_TIMEOUT, frames.read_frame())
+        .await
+        .unwrap()
+        .unwrap()
+        .is_none());
 
-    let status = match timeout(TEST_TIMEOUT, gateway.wait()).await {
+    let status = match timeout(support::PROCESS_TIMEOUT, gateway.wait()).await {
         Ok(status) => status.unwrap(),
         Err(_) => {
             gateway.kill().await.unwrap();
@@ -443,7 +519,71 @@ async fn compiled_gateway_fails_when_an_owned_provider_exits_after_readiness() {
             .trim(),
         "gateway provider supervision failed: provider_exited_after_ready"
     );
-    assert_process_reaped(read_pid(&provider_dir).await).await;
+    support::assert_process_reaped(read_pid(&provider_dir).await).await;
+}
+
+#[tokio::test]
+async fn compiled_gateway_exits_cleanly_when_the_client_leaves_during_provider_startup() {
+    let temporary = tempfile::tempdir().unwrap();
+    let provider_dir = temporary.path().join("provider");
+    std::fs::create_dir(&provider_dir).unwrap();
+    let port = unused_port();
+    let host = fixture_host_with_timeout(
+        "gateway-provider",
+        "serve",
+        port,
+        &provider_dir,
+        "literal",
+        1_500,
+        0,
+        ProviderEnvironmentPolicy::Clear,
+        10_000,
+    );
+    let config = GatewayDeploymentConfig::builder(LanguageDeployment::ollama_compatible(
+        "fixture-provider",
+        format!("http://127.0.0.1:{port}"),
+        "private-fixture-model",
+        "gateway-provider",
+    ))
+    .provider_host(host)
+    .to_toml()
+    .unwrap();
+    let config_path = temporary.path().join("gateway.toml");
+    tokio::fs::write(&config_path, config).await.unwrap();
+
+    let started = Instant::now();
+    let mut gateway = support::gateway_command(&config_path).spawn().unwrap();
+    let stderr = gateway.stderr.take().unwrap();
+    let stderr_task = tokio::spawn(async move {
+        let mut stderr = BufReader::new(stderr);
+        let mut bytes = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut stderr, &mut bytes)
+            .await
+            .unwrap();
+        bytes
+    });
+    let provider_pid = read_pid(&provider_dir).await;
+    // The client goes away while the provider is still becoming ready.
+    drop(gateway.stdin.take());
+
+    let status = match timeout(support::PROCESS_TIMEOUT, gateway.wait()).await {
+        Ok(status) => status.unwrap(),
+        Err(_) => {
+            gateway.kill().await.unwrap();
+            gateway.wait().await.unwrap();
+            let stderr = String::from_utf8(stderr_task.await.unwrap()).unwrap();
+            panic!("gateway did not exit; stderr: {stderr}");
+        }
+    };
+    // Nothing failed: the provider was abandoned because nobody was left to use it.
+    assert!(status.success(), "exit status: {status:?}");
+    assert!(
+        started.elapsed() < Duration::from_millis(1_400),
+        "the gateway waited for readiness nobody needed: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(String::from_utf8(stderr_task.await.unwrap()).unwrap(), "");
+    support::assert_process_reaped(provider_pid).await;
 }
 
 #[tokio::test]
@@ -474,14 +614,7 @@ async fn compiled_gateway_stops_runtime_work_before_owned_providers() {
     let config_path = temporary.path().join("gateway.toml");
     tokio::fs::write(&config_path, config).await.unwrap();
 
-    let mut gateway = Command::new(env!("CARGO_BIN_EXE_conversation-runtime-gateway"))
-        .arg("--config")
-        .arg(&config_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut gateway = support::gateway_command(&config_path).spawn().unwrap();
     let mut stdin = gateway.stdin.take().unwrap();
     let stdout = gateway.stdout.take().unwrap();
     let mut frames = FrameReader::new(BufReader::new(stdout));
@@ -495,7 +628,7 @@ async fn compiled_gateway_stops_runtime_work_before_owned_providers() {
         bytes
     });
 
-    let ready = timeout(TEST_TIMEOUT, frames.read_frame())
+    let ready = timeout(support::PROCESS_TIMEOUT, frames.read_frame())
         .await
         .unwrap()
         .unwrap()
@@ -508,16 +641,16 @@ async fn compiled_gateway_stops_runtime_work_before_owned_providers() {
         r#"{"protocol_version":1,"type":"start_turn","request_id":"start","transcript":"private-runtime-content"}"#,
     )
     .await;
-    wait_for_path(&provider_dir.join("runtime-active")).await;
+    support::wait_for_path(&provider_dir.join("runtime-active")).await;
     drop(stdin);
 
-    let status = timeout(TEST_TIMEOUT, gateway.wait())
+    let status = timeout(support::PROCESS_TIMEOUT, gateway.wait())
         .await
         .unwrap()
         .unwrap();
     assert!(status.success());
     let provider_pid = read_pid(&provider_dir).await;
-    assert_process_reaped(provider_pid).await;
+    support::assert_process_reaped(provider_pid).await;
     assert_eq!(
         tokio::fs::read_to_string(provider_dir.join("order"))
             .await
@@ -661,40 +794,10 @@ async fn write_frame(stdin: &mut tokio::process::ChildStdin, payload: &str) {
 }
 
 async fn read_pid(marker_dir: &Path) -> u32 {
-    wait_for_path(&marker_dir.join("pid")).await;
+    support::wait_for_path(&marker_dir.join("pid")).await;
     tokio::fs::read_to_string(marker_dir.join("pid"))
         .await
         .unwrap()
         .parse()
         .unwrap()
-}
-
-async fn wait_for_path(path: &Path) {
-    timeout(TEST_TIMEOUT, async {
-        while !tokio::fs::try_exists(path).await.unwrap_or(false) {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("fixture path was not created: {}", path.display()));
-}
-
-async fn assert_process_reaped(pid: u32) {
-    timeout(TEST_TIMEOUT, async {
-        while process_exists(pid) {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("provider process {pid} was not reaped"));
-}
-
-fn process_exists(pid: u32) -> bool {
-    std::process::Command::new("/bin/kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
 }

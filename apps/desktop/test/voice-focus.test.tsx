@@ -747,8 +747,9 @@ async function enabledVoiceEntry(name: "Voice Focus" | "Preview Voice Focus") {
 }
 
 async function waitForWorkspaceRecovery() {
+  const connection = await screen.findByRole("button", { name: "Disconnect local runtime" });
   await waitFor(() => {
-    expect(screen.queryAllByText(/^Wait for Session recovery/)).toHaveLength(0);
+    expect(connection).toHaveProperty("disabled", false);
   });
 }
 

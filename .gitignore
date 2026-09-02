@@ -19,3 +19,6 @@
 
 # Local benchmark output
 /artifacts/
+
+# SDD controller scratch
+.superpowers/

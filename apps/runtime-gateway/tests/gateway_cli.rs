@@ -42,7 +42,10 @@ async fn persistent_session_reports_local_status_and_preserves_completed_history
     let ready = gateway.read_message().await;
     assert_eq!(ready.message_type(), "ready");
     assert_local_status(&ready, false);
-    assert_eq!(ready.capabilities(), ["text", "persona_control"]);
+    assert_eq!(
+        ready.capabilities(),
+        ["text", "conversation_context_seed", "persona_control"]
+    );
 
     gateway
         .write_message(r#"{"protocol_version":1,"type":"status","request_id":"status-1"}"#)
@@ -52,7 +55,10 @@ async fn persistent_session_reports_local_status_and_preserves_completed_history
     assert_eq!(status.message_type(), "status");
     assert_eq!(status.request_id(), Some("status-1"));
     assert_local_status(&status, false);
-    assert_eq!(status.capabilities(), ["text", "persona_control"]);
+    assert_eq!(
+        status.capabilities(),
+        ["text", "conversation_context_seed", "persona_control"]
+    );
 
     gateway
         .write_message(&start_turn("start-1", "fixture-first-transcript"))
@@ -102,6 +108,7 @@ async fn status_reports_exact_model_and_enabled_local_memory() {
         ready.capabilities(),
         [
             "text",
+            "conversation_context_seed",
             "persona_control",
             "memory_inspection",
             "memory_mutation",
@@ -118,6 +125,7 @@ async fn status_reports_exact_model_and_enabled_local_memory() {
         status.capabilities(),
         [
             "text",
+            "conversation_context_seed",
             "persona_control",
             "memory_inspection",
             "memory_mutation",
@@ -344,7 +352,7 @@ async fn interrupt_is_accepted_before_one_cancelled_terminal() {
 
 #[tokio::test]
 async fn malformed_command_is_rejected_and_the_session_survives() {
-    let server = FakeOllamaServer::completing(0).await;
+    let server = FakeOllamaServer::completing(1).await;
     let mut gateway = GatewayProcess::start(server.endpoint()).await;
     assert_eq!(gateway.read_message().await.message_type(), "ready");
 
@@ -358,9 +366,10 @@ async fn malformed_command_is_rejected_and_the_session_survives() {
             r#"{"protocol_version":2,"type":"start_turn","request_id":"version-two-start","transcript":"old peer"}"#,
         )
         .await;
-    let rejection = gateway.read_message().await;
-    assert_eq!(rejection.message_type(), "command_rejected");
-    assert_eq!(rejection.request_id(), Some("invalid-command"));
+    assert_accepted(&gateway.read_message().await, "version-two-start");
+    let events = gateway.read_turn("1").await;
+    assert_eq!(terminal_count(&events), 1);
+    assert_eq!(terminal_type(&events), "turn_completed");
 
     gateway
         .write_message(
@@ -372,7 +381,7 @@ async fn malformed_command_is_rejected_and_the_session_survives() {
 
     let exit = gateway.close().await;
     assert!(exit.status.success());
-    exit.assert_content_free_stderr(&["status-after-rejection"]);
+    exit.assert_content_free_stderr(&["old peer", "status-after-rejection"]);
 }
 
 #[tokio::test]

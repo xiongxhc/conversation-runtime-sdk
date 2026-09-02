@@ -1,6 +1,7 @@
 use crate::{RuntimeError, RuntimeErrorKind, RuntimeStage, TurnId};
 
-pub const MAX_HISTORY_MESSAGE_COUNT: usize = 16;
+pub const MAX_HISTORY_MESSAGE_COUNT: usize = 32;
+pub const MAX_HISTORY_BYTES: usize = 32 * 1024;
 pub const MAX_CONVERSATION_MESSAGE_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -357,7 +358,7 @@ impl QualityDecision {
         context_sources: impl IntoIterator<Item = ContextSource>,
     ) -> Result<Self, RuntimeError> {
         if history_message_count > MAX_HISTORY_MESSAGE_COUNT {
-            return Err(quality_error("quality history exceeds eight exchanges"));
+            return Err(quality_error("quality history exceeds sixteen exchanges"));
         }
         Ok(Self {
             turn_id,

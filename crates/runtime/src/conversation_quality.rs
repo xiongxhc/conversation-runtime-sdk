@@ -1,13 +1,14 @@
 use std::collections::VecDeque;
 
 use conversation_protocol::{
-    ContextSource, ConversationMessage, ConversationMode, ConversationRole, ConversationSignal,
-    FollowUpPolicy, PersonaProfile, QualityDecision, ResponseControls, RuntimeError,
-    RuntimeErrorKind, RuntimeStage, SilencePolicy, SpeechPace, TurnId,
+    ContextSource, ConversationContextExchange, ConversationMessage, ConversationMode,
+    ConversationRole, ConversationSignal, FollowUpPolicy, PersonaProfile, QualityDecision,
+    ResponseControls, RuntimeError, RuntimeErrorKind, RuntimeStage, SilencePolicy, SpeechPace,
+    TurnId, MAX_HISTORY_BYTES, MAX_HISTORY_MESSAGE_COUNT,
 };
 
-const MAX_HISTORY_EXCHANGES: usize = 8;
-const MAX_HISTORY_BYTES: usize = 16 * 1024;
+const _: () = assert!(MAX_HISTORY_MESSAGE_COUNT.is_multiple_of(2));
+const MAX_HISTORY_EXCHANGES: usize = MAX_HISTORY_MESSAGE_COUNT / 2;
 const SHORT_PROMPT_CHARACTERS: usize = 24;
 const SHORT_PROMPT_WORDS: usize = 6;
 const SHORT_RESPONSE_SECONDS: u16 = 8;
@@ -112,6 +113,48 @@ impl ConversationQualityController {
             .iter()
             .flat_map(|exchange| [exchange.user.clone(), exchange.assistant.clone()])
             .collect()
+    }
+
+    pub fn replace_completed_history(
+        &mut self,
+        exchanges: &[ConversationContextExchange],
+    ) -> Result<(), RuntimeError> {
+        if self.pending_turn.is_some() {
+            return Err(state_error("a quality-controlled turn is still pending"));
+        }
+        if exchanges.is_empty() || exchanges.len() > MAX_HISTORY_EXCHANGES {
+            return Err(state_error(format!(
+                "completed history must contain between one and {MAX_HISTORY_EXCHANGES} exchanges"
+            )));
+        }
+
+        let mut replacement = VecDeque::with_capacity(exchanges.len());
+        let mut replacement_bytes = 0usize;
+        for exchange in exchanges {
+            let user = ConversationMessage::new(ConversationRole::User, exchange.user())?;
+            let assistant =
+                ConversationMessage::new(ConversationRole::Assistant, exchange.assistant())?;
+            let bytes = user
+                .text()
+                .len()
+                .checked_add(assistant.text().len())
+                .ok_or_else(|| state_error("completed history byte count overflowed"))?;
+            replacement_bytes = replacement_bytes
+                .checked_add(bytes)
+                .ok_or_else(|| state_error("completed history byte count overflowed"))?;
+            if replacement_bytes > MAX_HISTORY_BYTES {
+                return Err(state_error("completed history exceeded 32768 UTF-8 bytes"));
+            }
+            replacement.push_back(CompletedExchange {
+                user,
+                assistant,
+                bytes,
+            });
+        }
+
+        self.history = replacement;
+        self.history_bytes = replacement_bytes;
+        Ok(())
     }
 
     /// Replaces the saved persona, default mode, and default response

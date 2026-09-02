@@ -1,5 +1,6 @@
 import {
   RuntimeClient,
+  type ConversationContextExchange,
   type MemoryCursor,
   type MemoryExtractedSummary,
   type MemoryInspection,
@@ -21,11 +22,25 @@ export type ConversationTurnState = {
   failure: RuntimeFailure | undefined;
 };
 
+export type CarriedConversationContext = {
+  sourceId: string;
+  sourceTitle: string;
+  operationId: string;
+  exchanges: readonly ConversationContextExchange[];
+  bytes: number;
+};
+
+export type ConversationContinuationState = {
+  inProgress: boolean;
+  carriedContext?: CarriedConversationContext;
+};
+
 export type ConversationSessionState = {
   phase: "ready" | "streaming" | "failed" | "closed";
   status: RuntimeStatus;
   turns: readonly ConversationTurnState[];
   activeTurn: ConversationTurnState | undefined;
+  continuation: ConversationContinuationState;
   voice: VoiceSessionState;
   error: Error | undefined;
 };
@@ -64,6 +79,8 @@ export class ConversationSession {
   private activeTurn: ConversationTurnState | undefined;
   private activeTurnSource: "typed" | "voice" | undefined;
   private closePromise: Promise<void> | undefined;
+  private continuationInProgress = false;
+  private carriedContext: CarriedConversationContext | undefined;
   private error: Error | undefined;
   private phase: ConversationSessionState["phase"] = "ready";
   private startPending = false;
@@ -101,6 +118,12 @@ export class ConversationSession {
       status: this.status,
       turns: this.turns.map(copyTurn),
       activeTurn: this.activeTurn ? copyTurn(this.activeTurn) : undefined,
+      continuation: {
+        inProgress: this.continuationInProgress,
+        ...(this.carriedContext
+          ? { carriedContext: copyCarriedContext(this.carriedContext) }
+          : {}),
+      },
       voice: { ...this.voice },
       error: this.error,
     };
@@ -137,6 +160,26 @@ export class ConversationSession {
     this.publish();
     void this.consumeTurn(state, turn.events);
     return turn.turnId;
+  }
+
+  async continueWithSeed(context: CarriedConversationContext): Promise<void> {
+    this.ensureReady();
+    if (!this.isVoiceIdle()) {
+      throw new Error("voice session is not idle");
+    }
+    const snapshot = copyCarriedContext(context);
+    this.continuationInProgress = true;
+    this.publish();
+    try {
+      await this.client.seedConversationContext(snapshot.exchanges, snapshot.operationId);
+      this.turns.length = 0;
+      this.activeTurn = undefined;
+      this.activeTurnSource = undefined;
+      this.carriedContext = snapshot;
+    } finally {
+      this.continuationInProgress = false;
+      this.publish();
+    }
   }
 
   async listMemories(cursor: MemoryCursor | null = null): Promise<MemoryPage> {
@@ -218,7 +261,13 @@ export class ConversationSession {
     try {
       const voiceSession = await this.client.startVoiceSession();
       this.voiceSession = voiceSession;
-      this.voiceEventsPromise = this.consumeVoice(voiceSession);
+      const consuming = this.consumeVoice(voiceSession);
+      const tracked = consuming.finally(() => {
+        if (this.voiceEventsPromise === tracked) {
+          this.voiceEventsPromise = undefined;
+        }
+      });
+      this.voiceEventsPromise = tracked;
     } catch (error) {
       if (!this.closePromise) {
         this.voice = {
@@ -302,6 +351,9 @@ export class ConversationSession {
   }
 
   close(): Promise<void> {
+    if (this.activeConversationWork() === "continuation") {
+      return Promise.reject(new Error("continuation is in progress"));
+    }
     if (this.closePromise) {
       return this.closePromise;
     }
@@ -543,9 +595,34 @@ export class ConversationSession {
 
   private ensureReady(): void {
     this.ensureOpen();
-    if (this.activeTurn || this.startPending) {
+    const activeWork = this.activeConversationWork();
+    if (activeWork === "continuation") {
+      throw new Error("continuation is in progress");
+    }
+    if (activeWork === "turn") {
       throw new Error("a conversation turn is already active");
     }
+  }
+
+  private activeConversationWork(): "turn" | "continuation" | undefined {
+    if (this.continuationInProgress) {
+      return "continuation";
+    }
+    if (this.activeTurn || this.startPending) {
+      return "turn";
+    }
+    return undefined;
+  }
+
+  private isVoiceIdle(): boolean {
+    return (
+      this.voice.session === "idle"
+      && this.voice.capture === "stopped"
+      && this.voiceSession === undefined
+      && this.voiceStartPromise === undefined
+      && this.voiceEventsPromise === undefined
+      && this.voiceStopPromise === undefined
+    );
   }
 
   private ensureOpen(): void {
@@ -578,6 +655,9 @@ export class ConversationSession {
   }
 
   private ensurePersonaReady(): void {
+    if (this.activeConversationWork() === "continuation") {
+      throw new Error("continuation is in progress");
+    }
     if (this.phase === "streaming") {
       throw new Error("finish or stop the active response before changing persona");
     }
@@ -642,6 +722,13 @@ function validateLocalStatus(status: RuntimeStatus): void {
 
 function copyTurn(turn: ConversationTurnState): ConversationTurnState {
   return { ...turn };
+}
+
+function copyCarriedContext(context: CarriedConversationContext): CarriedConversationContext {
+  return {
+    ...context,
+    exchanges: context.exchanges.map((exchange) => ({ ...exchange })),
+  };
 }
 
 function initialVoiceState(status: RuntimeStatus): VoiceSessionState {

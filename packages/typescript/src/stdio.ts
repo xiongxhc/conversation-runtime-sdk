@@ -2,7 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { isAbsolute } from "node:path";
 
 import { FrameDecoder, encodeFrame } from "./framing.js";
-import { encodeClientCommand, type ClientCommand } from "./protocol.js";
+import { encodeClientCommand, type ClientCommand, type ClientProtocolVersion } from "./protocol.js";
 import type { RuntimeTransport } from "./client.js";
 
 const MAX_STDERR_BYTES = 64 * 1024;
@@ -73,14 +73,14 @@ export class StdioGatewayTransport implements RuntimeTransport {
     return new StdioGatewayTransport(child);
   }
 
-  async send(message: ClientCommand): Promise<void> {
+  async send(message: ClientCommand, version: ClientProtocolVersion): Promise<void> {
     if (this.failure) {
       throw this.failure;
     }
     if (this.closing) {
       throw new Error("gateway transport is closed");
     }
-    const frame = encodeFrame(encodeClientCommand(message));
+    const frame = encodeFrame(encodeClientCommand(message, version));
     const write = this.writeChain.then(() => this.write(frame));
     this.writeChain = write.catch(() => undefined);
     await write;

@@ -1,6 +1,7 @@
 use conversation_protocol::{
-    ContextSource, ConversationMode, ConversationRole, ConversationSignal, FollowUpPolicy,
-    PersonaLevel, PersonaProfile, ResponseControls, SilencePolicy, SpeechPace, TurnId,
+    ContextSource, ConversationContextExchange, ConversationMode, ConversationRole,
+    ConversationSignal, FollowUpPolicy, PersonaLevel, PersonaProfile, ResponseControls,
+    SilencePolicy, SpeechPace, TurnId, MAX_HISTORY_BYTES,
 };
 use conversation_runtime::ConversationQualityController;
 
@@ -361,7 +362,7 @@ fn only_completed_turns_enter_bounded_history() {
     assert_eq!(history[1].role(), ConversationRole::Assistant);
     assert_eq!(history[1].text(), "completed assistant text");
 
-    for turn in 3..=11 {
+    for turn in 3..=18 {
         controller
             .resolve_turn(TurnId::new(turn), format!("user {turn}"), None)
             .unwrap()
@@ -371,11 +372,13 @@ fn only_completed_turns_enter_bounded_history() {
             .unwrap();
     }
     let history = controller.history_messages();
-    assert_eq!(history.len(), 16);
+    assert_eq!(history.len(), 32);
     assert!(!history
         .iter()
         .any(|message| message.text() == "completed user text"));
-    assert!(controller.history_bytes() <= 16 * 1024);
+    assert_eq!(history[0].text(), "user 3");
+    assert_eq!(history[1].text(), "assistant 3");
+    assert!(controller.history_bytes() <= 32 * 1024);
 }
 
 #[test]
@@ -385,7 +388,7 @@ fn history_byte_budget_evicts_whole_old_exchanges() {
         controller
             .resolve_turn(
                 TurnId::new(turn),
-                format!("user-{turn}-{}", "u".repeat(1_100)),
+                format!("user-{turn}-{}", "u".repeat(2_100)),
                 None,
             )
             .unwrap()
@@ -393,7 +396,7 @@ fn history_byte_budget_evicts_whole_old_exchanges() {
         controller
             .complete_turn(
                 TurnId::new(turn),
-                format!("assistant-{turn}-{}", "a".repeat(1_100)),
+                format!("assistant-{turn}-{}", "a".repeat(2_100)),
             )
             .unwrap();
     }
@@ -401,10 +404,121 @@ fn history_byte_budget_evicts_whole_old_exchanges() {
     let history = controller.history_messages();
     assert!(history.len() < 16);
     assert_eq!(history.len() % 2, 0);
-    assert!(controller.history_bytes() <= 16 * 1024);
+    assert!(controller.history_bytes() <= 32 * 1024);
     assert!(!history
         .iter()
         .any(|message| message.text().starts_with("user-1-")));
+}
+
+#[test]
+fn history_byte_budget_counts_multibyte_utf8_bytes_and_evicts_whole_exchanges() {
+    let mut controller = controller();
+    let max_message = format!("{}x", "界".repeat(5_461));
+    assert_eq!(max_message.len(), 16 * 1024);
+
+    controller
+        .resolve_turn(TurnId::new(1), max_message.clone(), None)
+        .unwrap()
+        .unwrap();
+    controller
+        .complete_turn(TurnId::new(1), max_message)
+        .unwrap();
+    assert_eq!(controller.history_bytes(), 32 * 1024);
+
+    controller
+        .resolve_turn(TurnId::new(2), "next", None)
+        .unwrap()
+        .unwrap();
+    controller.complete_turn(TurnId::new(2), "reply").unwrap();
+
+    let history = controller.history_messages();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].text(), "next");
+    assert_eq!(history[1].text(), "reply");
+    assert_eq!(controller.history_bytes(), "next".len() + "reply".len());
+}
+
+#[test]
+fn completed_history_replacement_accepts_exact_count_and_byte_boundaries() {
+    let mut controller = controller();
+    let sixteen = (0..16)
+        .map(|index| {
+            ConversationContextExchange::new(
+                format!("seeded user {index}"),
+                format!("seeded assistant {index}"),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+
+    controller.replace_completed_history(&sixteen).unwrap();
+
+    let messages = controller.history_messages();
+    assert_eq!(messages.len(), 32);
+    assert_eq!(messages[0].text(), "seeded user 0");
+    assert_eq!(messages[1].text(), "seeded assistant 0");
+    assert_eq!(messages[30].text(), "seeded user 15");
+    assert_eq!(messages[31].text(), "seeded assistant 15");
+
+    let exact_bytes = vec![ConversationContextExchange::new(
+        "u".repeat(MAX_HISTORY_BYTES / 2),
+        "a".repeat(MAX_HISTORY_BYTES / 2),
+    )
+    .unwrap()];
+    controller.replace_completed_history(&exact_bytes).unwrap();
+
+    assert_eq!(controller.history_bytes(), MAX_HISTORY_BYTES);
+    assert_eq!(controller.history_messages().len(), 2);
+}
+
+#[test]
+fn completed_history_replacement_validates_every_exchange_before_mutating() {
+    let mut controller = controller();
+    let original =
+        [ConversationContextExchange::new("original user", "original assistant").unwrap()];
+    controller.replace_completed_history(&original).unwrap();
+    let expected = controller.history_messages();
+
+    let too_many = (0..17)
+        .map(|index| {
+            ConversationContextExchange::new(format!("user {index}"), "assistant").unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert!(controller.replace_completed_history(&too_many).is_err());
+    assert_eq!(controller.history_messages(), expected);
+
+    let too_large = [
+        ConversationContextExchange::new(
+            "u".repeat(MAX_HISTORY_BYTES / 2),
+            "a".repeat(MAX_HISTORY_BYTES / 2),
+        )
+        .unwrap(),
+        ConversationContextExchange::new("later user", "later assistant").unwrap(),
+    ];
+    assert!(controller.replace_completed_history(&too_large).is_err());
+    assert_eq!(controller.history_messages(), expected);
+}
+
+#[test]
+fn completed_history_replacement_rejects_pending_turn_without_changing_state() {
+    let mut controller = controller();
+    let persona = controller.saved_persona().clone();
+    controller
+        .resolve_turn(TurnId::new(1), "pending user", None)
+        .unwrap()
+        .unwrap();
+
+    let seed = [ConversationContextExchange::new("seeded user", "seeded assistant").unwrap()];
+    let error = controller.replace_completed_history(&seed).unwrap_err();
+
+    assert!(error.message().contains("pending"));
+    assert_eq!(controller.saved_persona(), &persona);
+    controller
+        .complete_turn(TurnId::new(1), "completed assistant")
+        .unwrap();
+    let messages = controller.history_messages();
+    assert_eq!(messages[0].text(), "pending user");
+    assert_eq!(messages[1].text(), "completed assistant");
 }
 
 #[test]

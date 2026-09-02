@@ -24,9 +24,10 @@ pub use client_voice::{
     MAX_CLIENT_PROVIDER_LABEL_BYTES,
 };
 pub use client_wire::{
-    decode_client_command, encode_gateway_message, ClientCommand, ClientMemoryTrace,
-    ClientQualityDecision, ClientResponseControls, ClientRuntimeError, ClientRuntimeEvent,
-    ClientWireError, GatewayMessage, RuntimeStatus, CLIENT_PROTOCOL_VERSION,
+    decode_client_command, encode_gateway_message, encode_gateway_message_for_version,
+    ClientCommand, ClientMemoryTrace, ClientQualityDecision, ClientResponseControls,
+    ClientRuntimeError, ClientRuntimeEvent, ClientWireError, ConversationContextExchange,
+    GatewayMessage, RuntimeStatus, CLIENT_PROTOCOL_VERSION, LEGACY_CLIENT_PROTOCOL_VERSION,
     MAX_CLIENT_FRAME_BYTES,
 };
 pub use command::RuntimeCommand;
@@ -48,7 +49,7 @@ pub use privacy::{
 pub use quality::{
     ContextSource, ConversationMessage, ConversationMode, ConversationRole, ConversationSignal,
     FollowUpPolicy, PersonaLevel, PersonaProfile, QualityDecision, ResponseControls, SilencePolicy,
-    SpeechPace, MAX_CONVERSATION_MESSAGE_BYTES, MAX_HISTORY_MESSAGE_COUNT,
+    SpeechPace, MAX_CONVERSATION_MESSAGE_BYTES, MAX_HISTORY_BYTES, MAX_HISTORY_MESSAGE_COUNT,
 };
 pub use voice_event::{
     PlaybackState, RecoveryDisposition, VoiceActivity, VoiceSessionEvent, VoiceTimingMilestone,

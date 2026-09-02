@@ -11,8 +11,8 @@ use conversation_model_adapters::{
     MockGenerationLanguageModel,
 };
 use conversation_protocol::{
-    ConversationMode, ExecutionLocation, GenerationId, PersonaProfile, ResponseControls,
-    RuntimeErrorKind, RuntimeEvent, RuntimeStage, RuntimeTimingMilestone, TurnId,
+    ConversationContextExchange, ConversationMode, ExecutionLocation, GenerationId, PersonaProfile,
+    ResponseControls, RuntimeErrorKind, RuntimeEvent, RuntimeStage, RuntimeTimingMilestone, TurnId,
     UnixTimestampMillis, MAX_CONVERSATION_MESSAGE_BYTES,
 };
 use conversation_runtime::{
@@ -109,6 +109,65 @@ async fn completion_adds_only_completed_exchange_to_next_history() {
     assert_eq!(requests[1].input().recent_messages().len(), 2);
     assert_eq!(requests[1].input().recent_messages()[0].text(), "hello");
     assert_eq!(requests[1].input().recent_messages()[1].text(), "answer");
+}
+
+#[tokio::test]
+async fn first_text_turn_after_seed_receives_all_thirty_two_messages_in_order() {
+    let language = Arc::new(MockGenerationLanguageModel::new(["live answer"]));
+    let context = context();
+    let seed = context_seed();
+    context
+        .seed_completed_history("continue-text", &seed)
+        .await
+        .unwrap();
+    let runtime = TextTurnRuntime::new(context, language.clone());
+
+    assert!(language.requests().is_empty());
+    let mut events = start_turn(&runtime, "live question").await;
+    assert!(matches!(
+        collect_terminal(&mut events).await,
+        RuntimeEvent::TurnCompleted { .. }
+    ));
+
+    let requests = language.requests();
+    let history = requests[0].input().recent_messages();
+    assert_eq!(history.len(), 32);
+    for index in 0..16 {
+        assert_eq!(history[index * 2].text(), format!("seed user {index}"));
+        assert_eq!(
+            history[index * 2 + 1].text(),
+            format!("seed assistant {index}")
+        );
+    }
+}
+
+#[tokio::test]
+async fn seeding_history_preserves_the_configured_memory_provider() {
+    let temporary = tempdir().unwrap();
+    let store = SqliteMemoryStore::initialize(temporary.path().join("runtime.sqlite3")).unwrap();
+    let provider = Arc::new(SqliteMemoryContextProvider::new(
+        store,
+        Arc::new(FixedClock(UnixTimestampMillis::new(2_000).unwrap())),
+    ));
+    let context = context()
+        .with_memory_provider(provider, ExecutionLocation::Local)
+        .unwrap();
+    context
+        .seed_completed_history(
+            "continue-memory",
+            &[ConversationContextExchange::new("seed user", "seed assistant").unwrap()],
+        )
+        .await
+        .unwrap();
+    let language = Arc::new(MockGenerationLanguageModel::new(["answer"]));
+    let runtime = TextTurnRuntime::new(context, language);
+
+    let mut events = start_turn(&runtime, "question").await;
+    let observed = drain_with_timeout(&mut events).await;
+
+    assert!(observed
+        .iter()
+        .any(|event| matches!(event, RuntimeEvent::MemoryRetrieved { .. })));
 }
 
 #[tokio::test]
@@ -712,6 +771,18 @@ impl MemoryContextProvider for FailingMemoryProvider {
 struct PanicOnceMemoryProvider {
     inner: SqliteMemoryContextProvider,
     panicked: AtomicBool,
+}
+
+fn context_seed() -> Vec<ConversationContextExchange> {
+    (0..16)
+        .map(|index| {
+            ConversationContextExchange::new(
+                format!("seed user {index}"),
+                format!("seed assistant {index}"),
+            )
+            .unwrap()
+        })
+        .collect()
 }
 
 impl MemoryContextProvider for PanicOnceMemoryProvider {

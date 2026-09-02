@@ -410,7 +410,11 @@ impl GatewayConfig {
             .map(ClientComponentDescriptor::from)
             .collect();
         let memory_enabled = memory_store.is_some();
-        let mut capabilities = vec!["text".to_owned(), "persona_control".to_owned()];
+        let mut capabilities = vec![
+            "text".to_owned(),
+            "conversation_context_seed".to_owned(),
+            "persona_control".to_owned(),
+        ];
         if memory_enabled {
             capabilities.push("memory_inspection".to_owned());
             capabilities.push("memory_mutation".to_owned());
@@ -428,6 +432,7 @@ impl GatewayConfig {
             telemetry_enabled: false,
             capabilities,
             components,
+            last_context_seed_operation_id: None,
         };
 
         Ok(GatewayAdapters {

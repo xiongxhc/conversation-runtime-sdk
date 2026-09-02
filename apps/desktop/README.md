@@ -107,20 +107,45 @@ can be remembered explicitly. Reduced-motion uses static fallbacks.
 Conversation transcripts are stored by the native app in
 `conversations.sqlite3` under the operating system's private app-data directory.
 The exact resolved path is shown at the bottom of `History`. History is separate
-from runtime semantic memory, and opening a saved transcript does not restore it
-to the model's active context.
+from runtime semantic memory, and opening a saved transcript is read-only: it
+does not restore a provider session or change the model's active context.
+
+Sessions can be revision-safely deleted from either the list or detail view.
+**Continue as new conversation** checks the saved source revision, leaves that
+source immutable, and creates a separately persisted branch. It copies only the
+latest whole completed nonblank exchanges that fit all three limits: 16 pairs,
+32,768 UTF-8 content bytes, and 16 KiB for each individual user or assistant
+message. It never truncates, summarizes, compresses, or skips across an
+oversized gap. The copied context is labelled separately from new live turns;
+future turns use the currently connected model, current response persona, and
+currently active and eligible memory policy.
+
+The branch records source provenance, copied-context versus live-turn origin,
+and revision-checked `preparing`, `confirmed`, or `unconfirmed` recovery state.
+The runtime exposes only the last opaque context-seed operation ID for
+reconciliation. Deleting the source later does not delete or mutate its copied
+branch context.
 
 Runtime memory is opt-in. Initialize a chosen SQLite database explicitly with
 `conversation-memory-probe`, then configure its absolute path in the gateway.
 The desktop neither creates that database nor automatically captures
 conversations into it. `Memory` appears only when the gateway reports enabled
-local memory and protocol-v1 `memory_inspection`. The desktop reads summaries
+local memory and `memory_inspection`. The desktop reads summaries
 and records through the public SDK, approves candidate memories, and deletes
 records with their expected revision; it has no runtime SQLite access. Settings
 loads and updates the runtime persona through the same public SDK surface.
 Typed SDK tests cover those commands separately from the compiled
-SDK-to-gateway smoke; compiled persona and memory mutation coverage remains
-R6 completion work.
+SDK-to-gateway smoke; compiled public-SDK persona and memory mutation coverage
+is present.
+
+## Protocol Compatibility
+
+The current gateway speaks protocol v2. The updated `@conversation/runtime`
+client reads the Ready version once and uses the matching strict codec: its
+existing status, text, voice, persona, and memory operations continue to work
+with a v1 server, while context seeding is locally unavailable unless v2 and
+`conversation_context_seed` are advertised. An old v1-only client binary cannot
+connect to the v2 gateway.
 
 ## Developer Checks
 
@@ -139,9 +164,13 @@ continuity.
 ## Open Work
 
 - Additional runtime-memory management beyond candidate approval and deletion.
-- Compiled SDK-to-gateway coverage for persona and runtime-memory mutation.
 - Model setup and benchmark UI.
 - Packaging, signing, notarization, installation, and upgrade validation.
+- Native data-mutating Session deletion/continuation, typed and spoken
+  follow-up, branch reopening, source-deletion survival, restart reconciliation,
+  and v1-unavailable disclosure. A fresh debug bundle has received a
+  non-destructive inspection of the controls, confirmation/cancel focus, and
+  continuation preview.
 - Native microphone, playback, GPU-scene, ten-minute, first-audible,
   audible-stop, and 30-sample acoustic acceptance.
 

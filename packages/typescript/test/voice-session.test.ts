@@ -30,13 +30,14 @@ const FIXTURE_MODEL_ID = "fixture-private-local-model";
 const SCENARIO_ENV = "CONVERSATION_FAKE_VOICE_SIDECAR_SCENARIO";
 const EXPLICIT_CONTROL_CAPABILITIES: RuntimeStatus["capabilities"] = [
   "text",
+  "conversation_context_seed",
   "persona_control",
   "memory_inspection",
   "memory_mutation",
 ];
 
 test(
-  "typed then spoken then typed turns share one context through the public SDK",
+  "a 16-pair seed supports typed and spoken follow-ups through the public SDK",
   { timeout: TEST_TIMEOUT_MS },
   async () => {
     const [gatewayPath, sidecarPath] = await Promise.all([
@@ -65,9 +66,16 @@ test(
       const transport = await spawnGateway({ gatewayPath, configPath, scenario: "partial-final" });
       const client = await RuntimeClient.connect(transport);
 
+      const seededExchanges = Array.from({ length: 16 }, (_, index) => ({
+        user: `seeded user ${index + 1}`,
+        assistant: `seeded assistant ${index + 1}`,
+      }));
+      await client.seedConversationContext(seededExchanges, "compiled-seed-16");
+
       const firstTurn = await client.startTurn("first typed request");
       const firstEvents = await drainTurn(firstTurn);
       assert.equal(lastEventType(firstEvents), "turn_completed");
+      assert.equal(historyMessageCount(firstEvents), 32);
 
       const session = await client.startVoiceSession();
       const beforeStop: VoiceSessionEvent[] = [];
@@ -88,6 +96,11 @@ test(
           (event) => event.type === "voice_turn_event" && event.event.type === "turn_completed",
         ),
         "voice turn never completed",
+      );
+      assert.equal(
+        historyMessageCount(beforeStop.flatMap((event) =>
+          event.type === "voice_turn_event" ? [event.event] : [])),
+        32,
       );
 
       const stopPromise = session.stop();
@@ -257,6 +270,11 @@ async function drainTurn(turn: RuntimeTurn): Promise<RuntimeEvent[]> {
 
 function lastEventType(events: Array<{ type: string }>): string | undefined {
   return events.at(-1)?.type;
+}
+
+function historyMessageCount(events: RuntimeEvent[]): number | undefined {
+  const quality = events.find((event) => event.type === "quality_resolved");
+  return quality?.type === "quality_resolved" ? quality.decision.historyMessageCount : undefined;
 }
 
 /// Builds (or locates, if already fresh) a workspace binary the same way

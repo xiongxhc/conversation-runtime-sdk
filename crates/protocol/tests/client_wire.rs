@@ -1,10 +1,11 @@
 use conversation_protocol::{
-    decode_client_command, encode_gateway_message, memory_preview, ClientCommand,
-    ClientComponentDescriptor, ClientMemoryApproval, ClientMemoryCursor, ClientMemoryInspection,
-    ClientMemoryProvenance, ClientMemoryRecord, ClientMemoryRetention, ClientMemorySummary,
-    ClientMemoryTrace, ClientPersonaState, ClientPrivacySummary, ClientQualityDecision,
-    ClientResponseControls, ClientRuntimeError, ClientRuntimeEvent, ClientVoiceSessionEvent,
-    ClientWireError, ComponentDescriptor, ComponentKind, ContextSource, ConversationMode,
+    decode_client_command, encode_gateway_message, encode_gateway_message_for_version,
+    memory_preview, ClientCommand, ClientComponentDescriptor, ClientMemoryApproval,
+    ClientMemoryCursor, ClientMemoryInspection, ClientMemoryProvenance, ClientMemoryRecord,
+    ClientMemoryRetention, ClientMemorySummary, ClientMemoryTrace, ClientPersonaState,
+    ClientPrivacySummary, ClientQualityDecision, ClientResponseControls, ClientRuntimeError,
+    ClientRuntimeEvent, ClientVoiceSessionEvent, ClientWireError, ComponentDescriptor,
+    ComponentKind, ContextSource, ConversationContextExchange, ConversationMode,
     ConversationSignal, ExecutionLocation, FollowUpPolicy, GatewayMessage, GenerationId,
     MemoryApproval, MemoryConfidence, MemoryDraft, MemoryId, MemoryInspection, MemoryKind,
     MemoryProvenance, MemoryProvenanceKind, MemoryRecord, MemoryRetention, MemoryRetrievalReason,
@@ -13,13 +14,18 @@ use conversation_protocol::{
     ResponseControls, RetrievalTraceId, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage,
     RuntimeStatus, SessionId, SilencePolicy, SpeechPace, TurnId, UnixTimestampMillis,
     VoiceActivity, VoiceSessionEvent, VoiceTimingMilestone, CLIENT_PROTOCOL_VERSION,
-    MAX_CLIENT_COMPONENT_DESCRIPTORS, MAX_CLIENT_DEVICE_LABEL_BYTES, MAX_CLIENT_FRAME_BYTES,
-    MAX_CLIENT_PROVIDER_LABEL_BYTES, MAX_CONVERSATION_MESSAGE_BYTES, MAX_MEMORY_PREVIEW_BYTES,
+    LEGACY_CLIENT_PROTOCOL_VERSION, MAX_CLIENT_COMPONENT_DESCRIPTORS,
+    MAX_CLIENT_DEVICE_LABEL_BYTES, MAX_CLIENT_FRAME_BYTES, MAX_CLIENT_PROVIDER_LABEL_BYTES,
+    MAX_CONVERSATION_MESSAGE_BYTES, MAX_HISTORY_BYTES, MAX_MEMORY_PREVIEW_BYTES,
 };
 use serde::{Deserialize, Deserializer};
 
 fn gateway_value(message: &GatewayMessage) -> serde_json::Value {
     serde_json::from_slice(&encode_gateway_message(message).unwrap()).unwrap()
+}
+
+fn gateway_value_for_version(message: &GatewayMessage, version: u64) -> serde_json::Value {
+    serde_json::from_slice(&encode_gateway_message_for_version(message, version).unwrap()).unwrap()
 }
 
 fn status() -> RuntimeStatus {
@@ -33,6 +39,7 @@ fn status() -> RuntimeStatus {
         telemetry_enabled: false,
         capabilities: vec!["text".to_owned()],
         components: vec![client_component("language_model", "Local language")],
+        last_context_seed_operation_id: None,
     }
 }
 
@@ -147,21 +154,286 @@ fn approval(
 }
 
 #[test]
-fn version_one_start_turns_reject_version_two_and_client_selected_identifiers() {
-    let command = decode_client_command(
-        br#"{"protocol_version":1,"type":"start_turn","request_id":"req-1","transcript":"hello"}"#,
-    )
-    .unwrap();
+fn both_protocol_versions_accept_start_turns_without_client_selected_identifiers() {
+    for version in [LEGACY_CLIENT_PROTOCOL_VERSION, CLIENT_PROTOCOL_VERSION] {
+        let payload = format!(
+            r#"{{"protocol_version":{version},"type":"start_turn","request_id":"req-1","transcript":"hello"}}"#
+        );
+        let command = decode_client_command(payload.as_bytes()).unwrap();
+        assert!(matches!(command, ClientCommand::StartTurn { .. }));
+    }
 
-    assert!(matches!(command, ClientCommand::StartTurn { .. }));
-    assert!(decode_client_command(
-        br#"{"protocol_version":2,"type":"start_turn","request_id":"req-1","transcript":"hello"}"#,
-    )
-    .is_err());
     assert!(decode_client_command(
         br#"{"protocol_version":1,"type":"start_turn","request_id":"req-1","turn_id":"1","transcript":"hello"}"#,
     )
     .is_err());
+}
+
+#[test]
+fn version_two_seed_command_decodes_the_exact_wire_contract() {
+    let command = decode_client_command(
+        br#"{"protocol_version":2,"type":"seed_conversation_context","request_id":"request-1","operation_id":"continue-1","exchanges":[{"user":"hello","assistant":"hi"}]}"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        command,
+        ClientCommand::SeedConversationContext {
+            request_id: "request-1".to_owned(),
+            operation_id: "continue-1".to_owned(),
+            exchanges: vec![ConversationContextExchange::new("hello", "hi").unwrap()],
+        }
+    );
+}
+
+#[test]
+fn seed_command_rejects_v1_empty_malformed_and_unknown_fields() {
+    let invalid = [
+        r#"{"protocol_version":1,"type":"seed_conversation_context","request_id":"request-1","operation_id":"continue-1","exchanges":[{"user":"hello","assistant":"hi"}]}"#,
+        r#"{"protocol_version":2,"type":"seed_conversation_context","request_id":"request-1","operation_id":"continue-1","exchanges":[]}"#,
+        r#"{"protocol_version":2,"type":"seed_conversation_context","request_id":"request-1","operation_id":"continue-1","exchanges":[{"user":" ","assistant":"hi"}]}"#,
+        r#"{"protocol_version":2,"type":"seed_conversation_context","request_id":"request-1","operation_id":"continue-1","exchanges":[{"user":"hello","assistant":"\n\t"}]}"#,
+        r#"{"protocol_version":2,"type":"seed_conversation_context","request_id":"request-1","operation_id":"continue-1","exchanges":[{"user":"hello"}]}"#,
+        r#"{"protocol_version":2,"type":"seed_conversation_context","request_id":"request-1","operation_id":"continue-1","exchanges":[{"user":"hello","assistant":"hi","extra":true}]}"#,
+        r#"{"protocol_version":2,"type":"seed_conversation_context","request_id":"request-1","operation_id":"continue-1","exchanges":[{"user":"hello","assistant":"hi"}],"extra":true}"#,
+        r#"{"protocol_version":2,"type":"seed_conversation_context","request_id":"request-1","operation_id":"continue-1","operation_id":"duplicate","exchanges":[{"user":"hello","assistant":"hi"}]}"#,
+    ];
+
+    for payload in invalid {
+        assert!(
+            decode_client_command(payload.as_bytes()).is_err(),
+            "accepted invalid seed payload: {payload}"
+        );
+    }
+}
+
+#[test]
+fn seed_command_enforces_operation_pair_message_and_aggregate_byte_bounds() {
+    let valid_operation_id = "🙂".repeat(16);
+    let exact_limit_exchanges = vec![serde_json::json!({
+        "user": "🙂".repeat(MAX_CONVERSATION_MESSAGE_BYTES / 4),
+        "assistant": "🙂".repeat(MAX_CONVERSATION_MESSAGE_BYTES / 4),
+    })];
+    let valid = serde_json::json!({
+        "protocol_version": 2,
+        "type": "seed_conversation_context",
+        "request_id": "request-1",
+        "operation_id": valid_operation_id,
+        "exchanges": exact_limit_exchanges,
+    });
+    assert!(decode_client_command(&serde_json::to_vec(&valid).unwrap()).is_ok());
+
+    let sixteen_pairs = serde_json::json!({
+        "protocol_version": 2,
+        "type": "seed_conversation_context",
+        "request_id": "request-1",
+        "operation_id": "continue-1",
+        "exchanges": (0..16).map(|_| serde_json::json!({"user":"u","assistant":"a"})).collect::<Vec<_>>(),
+    });
+    assert!(decode_client_command(&serde_json::to_vec(&sixteen_pairs).unwrap()).is_ok());
+
+    let invalid = [
+        serde_json::json!({
+            "protocol_version": 2,
+            "type": "seed_conversation_context",
+            "request_id": "request-1",
+            "operation_id": "",
+            "exchanges": [{"user":"hello","assistant":"hi"}],
+        }),
+        serde_json::json!({
+            "protocol_version": 2,
+            "type": "seed_conversation_context",
+            "request_id": "request-1",
+            "operation_id": "🙂".repeat(17),
+            "exchanges": [{"user":"hello","assistant":"hi"}],
+        }),
+        serde_json::json!({
+            "protocol_version": 2,
+            "type": "seed_conversation_context",
+            "request_id": "request-1",
+            "operation_id": "continue-1",
+            "exchanges": (0..17).map(|_| serde_json::json!({"user":"u","assistant":"a"})).collect::<Vec<_>>(),
+        }),
+        serde_json::json!({
+            "protocol_version": 2,
+            "type": "seed_conversation_context",
+            "request_id": "request-1",
+            "operation_id": "continue-1",
+            "exchanges": [{"user":"u".repeat(MAX_CONVERSATION_MESSAGE_BYTES + 1),"assistant":"a"}],
+        }),
+        serde_json::json!({
+            "protocol_version": 2,
+            "type": "seed_conversation_context",
+            "request_id": "request-1",
+            "operation_id": "continue-1",
+            "exchanges": [
+                {"user":"u".repeat(MAX_CONVERSATION_MESSAGE_BYTES),"assistant":"a".repeat(MAX_CONVERSATION_MESSAGE_BYTES - 1)},
+                {"user":"u","assistant":"a"},
+            ],
+        }),
+    ];
+
+    for payload in invalid {
+        assert!(
+            decode_client_command(&serde_json::to_vec(&payload).unwrap()).is_err(),
+            "accepted invalid seed payload with {} bytes of JSON",
+            serde_json::to_vec(&payload).unwrap().len()
+        );
+    }
+
+    assert_eq!(MAX_HISTORY_BYTES, 32_768);
+}
+
+#[test]
+fn gateway_status_encoding_is_strictly_version_specific() {
+    let legacy_status = RuntimeStatus {
+        last_context_seed_operation_id: Some("continue-1".to_owned()),
+        ..status()
+    };
+    let legacy_ready = gateway_value_for_version(
+        &GatewayMessage::Ready {
+            status: legacy_status,
+        },
+        LEGACY_CLIENT_PROTOCOL_VERSION,
+    );
+    assert_eq!(legacy_ready["protocol_version"], 1);
+    assert!(!legacy_ready["status"]
+        .as_object()
+        .unwrap()
+        .contains_key("last_context_seed_operation_id"));
+
+    let v2_status = RuntimeStatus {
+        capabilities: vec!["text".to_owned(), "conversation_context_seed".to_owned()],
+        last_context_seed_operation_id: None,
+        ..status()
+    };
+    let v2_ready = gateway_value_for_version(
+        &GatewayMessage::Ready {
+            status: v2_status.clone(),
+        },
+        CLIENT_PROTOCOL_VERSION,
+    );
+    assert_eq!(
+        v2_ready,
+        serde_json::json!({
+            "protocol_version": 2,
+            "type": "ready",
+            "status": {
+                "transport": "stdio",
+                "privacy_mode": "local_only",
+                "language_location": "local",
+                "model_id": "local-model",
+                "memory_enabled": false,
+                "memory_location": null,
+                "telemetry_enabled": false,
+                "capabilities": ["text", "conversation_context_seed"],
+                "components": [{
+                    "kind": "language_model",
+                    "execution_location": "local",
+                    "provider_label": "Local language"
+                }],
+                "last_context_seed_operation_id": null
+            }
+        })
+    );
+
+    let v2_status_with_operation = RuntimeStatus {
+        last_context_seed_operation_id: Some("continue-1".to_owned()),
+        ..v2_status
+    };
+    let correlated = gateway_value_for_version(
+        &GatewayMessage::Status {
+            request_id: "request-1".to_owned(),
+            status: v2_status_with_operation,
+        },
+        CLIENT_PROTOCOL_VERSION,
+    );
+    assert_eq!(
+        correlated["status"]["last_context_seed_operation_id"],
+        "continue-1"
+    );
+}
+
+#[test]
+fn status_capability_and_operation_identity_are_validated_per_version() {
+    let v2 = RuntimeStatus {
+        capabilities: vec![
+            "text".to_owned(),
+            "conversation_context_seed".to_owned(),
+            "persona_control".to_owned(),
+        ],
+        ..status()
+    };
+    assert!(encode_gateway_message_for_version(
+        &GatewayMessage::Ready { status: v2 },
+        CLIENT_PROTOCOL_VERSION,
+    )
+    .is_ok());
+
+    let invalid = [
+        (
+            LEGACY_CLIENT_PROTOCOL_VERSION,
+            RuntimeStatus {
+                capabilities: vec!["text".to_owned(), "conversation_context_seed".to_owned()],
+                ..status()
+            },
+        ),
+        (
+            CLIENT_PROTOCOL_VERSION,
+            RuntimeStatus {
+                capabilities: vec![
+                    "text".to_owned(),
+                    "persona_control".to_owned(),
+                    "conversation_context_seed".to_owned(),
+                ],
+                ..status()
+            },
+        ),
+        (
+            CLIENT_PROTOCOL_VERSION,
+            RuntimeStatus {
+                capabilities: vec![
+                    "text".to_owned(),
+                    "conversation_context_seed".to_owned(),
+                    "conversation_context_seed".to_owned(),
+                ],
+                ..status()
+            },
+        ),
+        (
+            CLIENT_PROTOCOL_VERSION,
+            RuntimeStatus {
+                capabilities: vec!["text".to_owned(), "conversation_context_seed".to_owned()],
+                last_context_seed_operation_id: Some(String::new()),
+                ..status()
+            },
+        ),
+        (
+            CLIENT_PROTOCOL_VERSION,
+            RuntimeStatus {
+                capabilities: vec!["text".to_owned(), "conversation_context_seed".to_owned()],
+                last_context_seed_operation_id: Some("x".repeat(65)),
+                ..status()
+            },
+        ),
+    ];
+
+    for (version, status) in invalid {
+        assert!(matches!(
+            encode_gateway_message_for_version(&GatewayMessage::Ready { status }, version,),
+            Err(ClientWireError::InvalidRuntimeStatus)
+        ));
+    }
+}
+
+#[test]
+fn compatibility_gateway_encoder_preserves_the_exact_v1_schema() {
+    let message = GatewayMessage::Ready { status: status() };
+    assert_eq!(
+        gateway_value(&message),
+        gateway_value_for_version(&message, LEGACY_CLIENT_PROTOCOL_VERSION)
+    );
+    assert_eq!(gateway_value(&message)["protocol_version"], 1);
 }
 
 #[test]
@@ -689,7 +961,14 @@ fn version_one_memory_commands_decode_and_unsupported_versions_are_rejected() {
     for line in
         include_str!("../../../tests/fixtures/client-wire-unsupported/invalid.jsonl").lines()
     {
-        assert!(decode_client_command(line.as_bytes()).is_err());
+        if line == r#"{"protocol_version":2,"type":"status","request_id":"req-1"}"# {
+            assert!(matches!(
+                decode_client_command(line.as_bytes()).unwrap(),
+                ClientCommand::Status { .. }
+            ));
+        } else {
+            assert!(decode_client_command(line.as_bytes()).is_err());
+        }
     }
 }
 
@@ -731,10 +1010,13 @@ fn version_one_persona_and_memory_mutation_commands_decode_and_round_trip() {
             if memory_id.get() == 7 && expected_revision == 2
     ));
 
-    assert!(decode_client_command(
-        br#"{"protocol_version":2,"type":"persona_get","request_id":"req-1"}"#,
-    )
-    .is_err());
+    assert!(matches!(
+        decode_client_command(
+            br#"{"protocol_version":2,"type":"persona_get","request_id":"req-1"}"#,
+        )
+        .unwrap(),
+        ClientCommand::PersonaGet { .. }
+    ));
 }
 
 #[test]
@@ -1102,6 +1384,17 @@ fn version_one_fixtures_parse_and_invalid_cases_are_rejected() {
         .lines()
         .enumerate()
     {
+        let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        if value["protocol_version"] == CLIENT_PROTOCOL_VERSION
+            && matches!(
+                value["type"].as_str(),
+                Some("status" | "start_voice_session")
+            )
+        {
+            assert!(decode_client_command(line.as_bytes()).is_ok());
+            assert!(parse_event_fixture(line).is_err());
+            continue;
+        }
         assert!(
             decode_client_command(line.as_bytes()).is_err() && parse_event_fixture(line).is_err(),
             "invalid fixture line {} must be rejected by every v1 envelope",
@@ -1525,7 +1818,7 @@ fn parse_event_fixture(payload: &str) -> Result<(), String> {
     validate_required_nullable_keys(&value)?;
     let message: FixtureGatewayMessage =
         serde_json::from_str(payload).map_err(|error| error.to_string())?;
-    if message.protocol_version() != CLIENT_PROTOCOL_VERSION {
+    if message.protocol_version() != LEGACY_CLIENT_PROTOCOL_VERSION {
         return Err("unsupported protocol version".to_owned());
     }
     message.validate()?;

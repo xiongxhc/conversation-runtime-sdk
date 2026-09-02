@@ -1,6 +1,10 @@
-export const CLIENT_PROTOCOL_VERSION = 1;
+export const LEGACY_CLIENT_PROTOCOL_VERSION = 1;
+export const CLIENT_PROTOCOL_VERSION = 2;
+export type ClientProtocolVersion = 1 | 2;
 export const MAX_CONVERSATION_MESSAGE_BYTES = 16 * 1024;
-export const MAX_HISTORY_MESSAGE_COUNT = 16;
+export const MAX_HISTORY_MESSAGE_COUNT = 32;
+export const MAX_CONVERSATION_CONTEXT_EXCHANGES = 16;
+export const MAX_CONVERSATION_CONTEXT_BYTES = 32 * 1024;
 export const MAX_U64 = 2n ** 64n - 1n;
 export const MAX_MEMORY_LIST_PAGE_ITEMS = 50;
 export const MAX_MEMORY_PREVIEW_BYTES = 192;
@@ -9,6 +13,7 @@ export const MAX_MEMORY_CONTENT_BYTES = 4 * 1024;
 
 const MAX_U64_DECIMAL = "18446744073709551615";
 const MAX_I64_DECIMAL = "9223372036854775807";
+const LEGACY_MAX_HISTORY_MESSAGE_COUNT = 16;
 const MAX_MEMORY_CONFIDENCE_DECIMAL = "1000";
 const MAX_COMPONENT_DESCRIPTORS = 32;
 const MAX_PROVIDER_LABEL_BYTES = 128;
@@ -23,10 +28,18 @@ export type ClientCommand =
   | { type: "resume_voice_capture"; requestId: string }
   | { type: "memory_list"; requestId: string; cursor: MemoryCursor | null }
   | { type: "memory_inspect"; requestId: string; memoryId: bigint }
+  | {
+      type: "seed_conversation_context";
+      requestId: string;
+      operationId: string;
+      exchanges: ConversationContextExchange[];
+    }
   | { type: "persona_get"; requestId: string }
   | { type: "persona_update"; requestId: string; persona: PersonaState }
   | { type: "memory_approve"; requestId: string; memoryId: bigint; expectedRevision: bigint }
   | { type: "memory_delete"; requestId: string; memoryId: bigint; expectedRevision: bigint };
+
+export type ConversationContextExchange = { user: string; assistant: string };
 
 export type PersonaState = {
   mode: "direct_answer" | "companionship" | "brainstorming" | "reflective";
@@ -126,6 +139,7 @@ export type RuntimeFailure = {
 
 export type RuntimeCapability =
   | "text"
+  | "conversation_context_seed"
   | "persona_control"
   | "memory_inspection"
   | "memory_mutation"
@@ -141,6 +155,7 @@ export type RuntimeStatus = {
   telemetryEnabled: false;
   capabilities: ["text", ...Exclude<RuntimeCapability, "text">[]];
   components: RuntimeComponentDescriptor[];
+  lastContextSeedOperationId?: string | null;
 };
 
 export type RuntimeComponentDescriptor = {
@@ -287,17 +302,18 @@ export class ProtocolError extends Error {
   }
 }
 
-export function parseClientCommand(value: unknown): ClientCommand {
+export function parseClientCommand(value: unknown): ClientCommand;
+export function parseClientCommand(value: unknown, expectedVersion: ClientProtocolVersion): ClientCommand;
+export function parseClientCommand(value: unknown, expectedVersion?: ClientProtocolVersion): ClientCommand {
   const object = requireRecord(value, "client command");
+  const version = validateProtocolVersion(object, expectedVersion);
   const type = requireString(object, "type");
   switch (type) {
     case "status":
       requireExactKeys(object, ["protocol_version", "type", "request_id"]);
-      validateProtocolVersion(object);
       return { type, requestId: requireRequestId(object) };
     case "start_turn":
       requireExactKeys(object, ["protocol_version", "type", "request_id", "transcript"]);
-      validateProtocolVersion(object);
       return {
         type,
         requestId: requireRequestId(object),
@@ -305,34 +321,38 @@ export function parseClientCommand(value: unknown): ClientCommand {
       };
     case "interrupt_turn":
       requireExactKeys(object, ["protocol_version", "type", "request_id", "turn_id"]);
-      validateProtocolVersion(object);
       return { type, requestId: requireRequestId(object), turnId: parseIdentifier(object.turn_id) };
     case "start_voice_session":
     case "stop_voice_session":
     case "pause_voice_capture":
     case "resume_voice_capture":
       requireExactKeys(object, ["protocol_version", "type", "request_id"]);
-      validateProtocolVersion(object);
       return { type, requestId: requireRequestId(object) };
     case "memory_list":
       requireExactKeys(object, ["protocol_version", "type", "request_id", "cursor"]);
-      validateProtocolVersion(object);
       return { type, requestId: requireRequestId(object), cursor: parseMemoryCursor(object.cursor) };
     case "memory_inspect":
       requireExactKeys(object, ["protocol_version", "type", "request_id", "memory_id"]);
-      validateProtocolVersion(object);
       return { type, requestId: requireRequestId(object), memoryId: parseIdentifier(object.memory_id) };
+    case "seed_conversation_context":
+      requireExactKeys(object, ["protocol_version", "type", "request_id", "operation_id", "exchanges"]);
+      if (version !== CLIENT_PROTOCOL_VERSION) {
+        throw new ProtocolError("conversation context seeding requires protocol version 2");
+      }
+      return {
+        type,
+        requestId: requireRequestId(object),
+        operationId: requireOperationId(object.operation_id),
+        exchanges: parseConversationContextExchanges(object.exchanges),
+      };
     case "persona_get":
       requireExactKeys(object, ["protocol_version", "type", "request_id"]);
-      validateProtocolVersion(object);
       return { type, requestId: requireRequestId(object) };
     case "persona_update":
       requireExactKeys(object, ["protocol_version", "type", "request_id", "persona"]);
-      validateProtocolVersion(object);
       return { type, requestId: requireRequestId(object), persona: parsePersonaState(object.persona) };
     case "memory_approve":
       requireExactKeys(object, ["protocol_version", "type", "request_id", "memory_id", "expected_revision"]);
-      validateProtocolVersion(object);
       return {
         type,
         requestId: requireRequestId(object),
@@ -341,7 +361,6 @@ export function parseClientCommand(value: unknown): ClientCommand {
       };
     case "memory_delete":
       requireExactKeys(object, ["protocol_version", "type", "request_id", "memory_id", "expected_revision"]);
-      validateProtocolVersion(object);
       return {
         type,
         requestId: requireRequestId(object),
@@ -353,14 +372,40 @@ export function parseClientCommand(value: unknown): ClientCommand {
   }
 }
 
-export function parseGatewayMessage(value: unknown): GatewayMessage {
+export function parseReadyMessage(
+  value: unknown,
+): { version: ClientProtocolVersion; message: Extract<GatewayMessage, { type: "ready" }> } {
+  const object = requireRecord(value, "ready message");
+  const version = validateProtocolVersion(object);
+  if (requireString(object, "type") !== "ready") {
+    throw new ProtocolError("expected a ready message");
+  }
+  const message = parseGatewayMessage(object, version) as Extract<GatewayMessage, { type: "ready" }>;
+  return {
+    version,
+    message: {
+      ...message,
+      status: {
+        ...message.status,
+        lastContextSeedOperationId: message.status.lastContextSeedOperationId ?? null,
+      },
+    },
+  };
+}
+
+export function parseGatewayMessage(value: unknown): GatewayMessage;
+export function parseGatewayMessage(value: unknown, version: ClientProtocolVersion): GatewayMessage;
+export function parseGatewayMessage(
+  value: unknown,
+  version: ClientProtocolVersion = LEGACY_CLIENT_PROTOCOL_VERSION,
+): GatewayMessage {
   const object = requireRecord(value, "gateway message");
   const type = requireString(object, "type");
   switch (type) {
     case "ready":
       requireExactKeys(object, ["protocol_version", "type", "status"]);
-      validateProtocolVersion(object);
-      return { type, status: parseRuntimeStatus(object.status) };
+      validateProtocolVersion(object, version);
+      return { type, status: parseRuntimeStatus(object.status, version) };
     case "command_accepted":
       requireExactKeys(
         object,
@@ -368,7 +413,7 @@ export function parseGatewayMessage(value: unknown): GatewayMessage {
           ? ["protocol_version", "type", "request_id", "turn_id"]
           : ["protocol_version", "type", "request_id"],
       );
-      validateProtocolVersion(object);
+      validateProtocolVersion(object, version);
       return {
         type,
         requestId: requireRequestId(object),
@@ -376,43 +421,43 @@ export function parseGatewayMessage(value: unknown): GatewayMessage {
       };
     case "command_rejected":
       requireExactKeys(object, ["protocol_version", "type", "request_id", "error"]);
-      validateProtocolVersion(object);
+      validateProtocolVersion(object, version);
       return { type, requestId: requireRequestId(object), error: parseRuntimeFailure(object.error) };
     case "status":
       requireExactKeys(object, ["protocol_version", "type", "request_id", "status"]);
-      validateProtocolVersion(object);
-      return { type, requestId: requireRequestId(object), status: parseRuntimeStatus(object.status) };
+      validateProtocolVersion(object, version);
+      return { type, requestId: requireRequestId(object), status: parseRuntimeStatus(object.status, version) };
     case "memory_list":
       requireExactKeys(object, ["protocol_version", "type", "request_id", "records", "next_cursor"]);
-      validateProtocolVersion(object);
+      validateProtocolVersion(object, version);
       return parseMemoryList(object);
     case "memory_inspection":
       requireExactKeys(object, ["protocol_version", "type", "request_id", "inspection"]);
-      validateProtocolVersion(object);
+      validateProtocolVersion(object, version);
       return { type, requestId: requireRequestId(object), inspection: parseMemoryInspection(object.inspection) };
     case "runtime_event":
       requireExactKeys(object, ["protocol_version", "type", "event"]);
-      validateProtocolVersion(object);
-      return { type, event: parseRuntimeEvent(object.event) };
+      validateProtocolVersion(object, version);
+      return { type, event: parseRuntimeEvent(object.event, version) };
     case "voice_event":
       requireExactKeys(object, ["protocol_version", "type", "event"]);
-      validateProtocolVersion(object);
-      return { type, event: parseVoiceSessionEvent(object.event) };
+      validateProtocolVersion(object, version);
+      return { type, event: parseVoiceSessionEvent(object.event, version) };
     case "fatal":
       requireExactKeys(object, ["protocol_version", "type", "error"]);
-      validateProtocolVersion(object);
+      validateProtocolVersion(object, version);
       return { type, error: parseRuntimeFailure(object.error) };
     case "persona_state":
       requireExactKeys(object, ["protocol_version", "type", "request_id", "persona"]);
-      validateProtocolVersion(object);
+      validateProtocolVersion(object, version);
       return { type, requestId: requireRequestId(object), persona: parsePersonaState(object.persona) };
     case "memory_deleted":
       requireExactKeys(object, ["protocol_version", "type", "request_id", "memory_id"]);
-      validateProtocolVersion(object);
+      validateProtocolVersion(object, version);
       return { type, requestId: requireRequestId(object), memoryId: parseIdentifier(object.memory_id) };
     case "memory_extracted":
       requireExactKeys(object, ["protocol_version", "type", "created", "activated", "pending_approval"]);
-      validateProtocolVersion(object);
+      validateProtocolVersion(object, version);
       return {
         type,
         created: requireNonNegativeInteger(object, "created"),
@@ -424,22 +469,27 @@ export function parseGatewayMessage(value: unknown): GatewayMessage {
   }
 }
 
-export function encodeClientCommand(command: ClientCommand): Uint8Array {
-  validateClientCommand(command);
+export function encodeClientCommand(command: ClientCommand): Uint8Array;
+export function encodeClientCommand(command: ClientCommand, version: ClientProtocolVersion): Uint8Array;
+export function encodeClientCommand(
+  command: ClientCommand,
+  version: ClientProtocolVersion = LEGACY_CLIENT_PROTOCOL_VERSION,
+): Uint8Array {
+  validateClientCommand(command, version);
   const wire = (() => {
     switch (command.type) {
       case "status":
-        return { protocol_version: CLIENT_PROTOCOL_VERSION, type: command.type, request_id: command.requestId };
+        return { protocol_version: version, type: command.type, request_id: command.requestId };
       case "start_turn":
         return {
-          protocol_version: CLIENT_PROTOCOL_VERSION,
+          protocol_version: version,
           type: command.type,
           request_id: command.requestId,
           transcript: command.transcript,
         };
       case "interrupt_turn":
         return {
-          protocol_version: CLIENT_PROTOCOL_VERSION,
+          protocol_version: version,
           type: command.type,
           request_id: command.requestId,
           turn_id: command.turnId.toString(),
@@ -449,29 +499,29 @@ export function encodeClientCommand(command: ClientCommand): Uint8Array {
       case "pause_voice_capture":
       case "resume_voice_capture":
         return {
-          protocol_version: CLIENT_PROTOCOL_VERSION,
+          protocol_version: version,
           type: command.type,
           request_id: command.requestId,
         };
       case "memory_list":
         return {
-          protocol_version: CLIENT_PROTOCOL_VERSION,
+          protocol_version: version,
           type: command.type,
           request_id: command.requestId,
           cursor: command.cursor === null ? null : { before_id: command.cursor.beforeId.toString() },
         };
       case "memory_inspect":
         return {
-          protocol_version: CLIENT_PROTOCOL_VERSION,
+          protocol_version: version,
           type: command.type,
           request_id: command.requestId,
           memory_id: command.memoryId.toString(),
         };
       case "persona_get":
-        return { protocol_version: CLIENT_PROTOCOL_VERSION, type: command.type, request_id: command.requestId };
+        return { protocol_version: version, type: command.type, request_id: command.requestId };
       case "persona_update":
         return {
-          protocol_version: CLIENT_PROTOCOL_VERSION,
+          protocol_version: version,
           type: command.type,
           request_id: command.requestId,
           persona: encodePersonaState(command.persona),
@@ -479,18 +529,34 @@ export function encodeClientCommand(command: ClientCommand): Uint8Array {
       case "memory_approve":
       case "memory_delete":
         return {
-          protocol_version: CLIENT_PROTOCOL_VERSION,
+          protocol_version: version,
           type: command.type,
           request_id: command.requestId,
           memory_id: command.memoryId.toString(),
           expected_revision: command.expectedRevision.toString(),
+        };
+      case "seed_conversation_context":
+        return {
+          protocol_version: version,
+          type: command.type,
+          request_id: command.requestId,
+          operation_id: command.operationId,
+          exchanges: command.exchanges.map((exchange) => ({
+            user: exchange.user,
+            assistant: exchange.assistant,
+          })),
         };
     }
   })();
   return new TextEncoder().encode(JSON.stringify(wire));
 }
 
-export function validateClientCommand(command: ClientCommand): void {
+export function validateClientCommand(command: ClientCommand): void;
+export function validateClientCommand(command: ClientCommand, version: ClientProtocolVersion): void;
+export function validateClientCommand(
+  command: ClientCommand,
+  version: ClientProtocolVersion = LEGACY_CLIENT_PROTOCOL_VERSION,
+): void {
   if (!isRecord(command)) {
     throw new ProtocolError("client command must be an object");
   }
@@ -507,6 +573,13 @@ export function validateClientCommand(command: ClientCommand): void {
   }
   if (command.type === "memory_list") {
     validateMemoryCursor(command.cursor);
+  }
+  if (command.type === "seed_conversation_context") {
+    if (version !== CLIENT_PROTOCOL_VERSION) {
+      throw new ProtocolError("conversation context seeding requires protocol version 2");
+    }
+    requireOperationId(command.operationId);
+    validateConversationContextExchanges(command.exchanges);
   }
   if (command.type === "memory_inspect" && (command.memoryId < 1n || command.memoryId > MAX_U64)) {
     throw new ProtocolError("memory identifier is outside u64 range");
@@ -584,9 +657,9 @@ function encodePersonaState(persona: PersonaState): Record<string, unknown> {
   };
 }
 
-function parseRuntimeStatus(value: unknown): RuntimeStatus {
+function parseRuntimeStatus(value: unknown, version: ClientProtocolVersion): RuntimeStatus {
   const object = requireRecord(value, "runtime status");
-  requireExactKeys(object, [
+  const expectedKeys = [
     "transport",
     "privacy_mode",
     "language_location",
@@ -596,14 +669,16 @@ function parseRuntimeStatus(value: unknown): RuntimeStatus {
     "telemetry_enabled",
     "capabilities",
     "components",
-  ]);
+    ...(version === CLIENT_PROTOCOL_VERSION ? ["last_context_seed_operation_id"] : []),
+  ];
+  requireExactKeys(object, expectedKeys);
   const memoryLocation = object.memory_location;
   if (memoryLocation !== null && typeof memoryLocation !== "string") {
     throw new ProtocolError("runtime status memory_location must be a string or null");
   }
   const memoryEnabled = requireBoolean(object, "memory_enabled");
   const parsedMemoryLocation = requireMemoryLocation(memoryLocation);
-  const capabilities = requireCapabilities(object);
+  const capabilities = requireCapabilities(object, version);
   const components = requireRuntimeComponents(object);
   validateRuntimeStatusComponents(capabilities, components);
   validateRuntimeMemoryStatus(memoryEnabled, parsedMemoryLocation, capabilities, components);
@@ -617,6 +692,9 @@ function parseRuntimeStatus(value: unknown): RuntimeStatus {
     telemetryEnabled: requireOneOf(object, "telemetry_enabled", [false] as const),
     capabilities,
     components,
+    ...(version === CLIENT_PROTOCOL_VERSION
+      ? { lastContextSeedOperationId: requireNullableOperationId(object.last_context_seed_operation_id) }
+      : {}),
   };
 }
 
@@ -793,7 +871,11 @@ function validateMemoryHistory(record: MemoryRecord, sources: MemoryProvenance[]
   }
 }
 
-function parseRuntimeEvent(value: unknown, voiceEvent = false): RuntimeEvent {
+function parseRuntimeEvent(
+  value: unknown,
+  version: ClientProtocolVersion,
+  voiceEvent = false,
+): RuntimeEvent {
   const object = requireRecord(value, "runtime event");
   const type = requireString(object, "type");
   switch (type) {
@@ -820,7 +902,7 @@ function parseRuntimeEvent(value: unknown, voiceEvent = false): RuntimeEvent {
       return { type, turnId: parseIdentifier(object.turn_id), text: requireTranscript(object, "text") };
     case "quality_resolved":
       requireExactKeys(object, ["type", "decision"]);
-      return { type, decision: parseQualityDecision(object.decision) };
+      return { type, decision: parseQualityDecision(object.decision, version) };
     case "memory_retrieved":
       requireExactKeys(object, ["type", "trace"]);
       return { type, trace: parseMemoryTrace(object.trace) };
@@ -861,7 +943,10 @@ function parseRuntimeEvent(value: unknown, voiceEvent = false): RuntimeEvent {
   }
 }
 
-function parseVoiceSessionEvent(value: unknown): VoiceSessionEvent {
+function parseVoiceSessionEvent(
+  value: unknown,
+  version: ClientProtocolVersion,
+): VoiceSessionEvent {
   const object = requireRecord(value, "voice session event");
   const type = requireString(object, "type");
   const sessionId = (): bigint => parseIdentifier(object.session_id);
@@ -942,7 +1027,7 @@ function parseVoiceSessionEvent(value: unknown): VoiceSessionEvent {
     case "voice_turn_event": {
       requireExactKeys(object, ["type", "session_id", "generation_id", "event"]);
       const generationId = parseIdentifier(object.generation_id);
-      const event = parseRuntimeEvent(object.event, true);
+      const event = parseRuntimeEvent(object.event, version, true);
       requireMatchingVoiceIdentity(runtimeEventTurnId(event), generationId);
       return { type, sessionId: sessionId(), generationId, event };
     }
@@ -1023,7 +1108,10 @@ function runtimeEventTurnId(event: RuntimeEvent): bigint {
   return event.turnId;
 }
 
-function parseQualityDecision(value: unknown): Extract<RuntimeEvent, { type: "quality_resolved" }>["decision"] {
+function parseQualityDecision(
+  value: unknown,
+  version: ClientProtocolVersion,
+): Extract<RuntimeEvent, { type: "quality_resolved" }>["decision"] {
   const object = requireRecord(value, "quality decision");
   requireExactKeys(object, ["turn_id", "mode", "controls", "signals", "history_message_count", "context_sources"]);
   return {
@@ -1046,7 +1134,9 @@ function parseQualityDecision(value: unknown): Extract<RuntimeEvent, { type: "qu
       object,
       "history_message_count",
       0,
-      MAX_HISTORY_MESSAGE_COUNT,
+      version === LEGACY_CLIENT_PROTOCOL_VERSION
+        ? LEGACY_MAX_HISTORY_MESSAGE_COUNT
+        : MAX_HISTORY_MESSAGE_COUNT,
     ),
     contextSources: requireUniqueEnumArray(
       object,
@@ -1179,10 +1269,18 @@ function validateMemoryCursor(cursor: MemoryCursor | null): void {
   }
 }
 
-function validateProtocolVersion(object: Record<string, unknown>): void {
-  if (object.protocol_version !== CLIENT_PROTOCOL_VERSION) {
+function validateProtocolVersion(
+  object: Record<string, unknown>,
+  expectedVersion?: ClientProtocolVersion,
+): ClientProtocolVersion {
+  const version = object.protocol_version;
+  if (version !== LEGACY_CLIENT_PROTOCOL_VERSION && version !== CLIENT_PROTOCOL_VERSION) {
     throw new ProtocolError("unsupported protocol version");
   }
+  if (expectedVersion !== undefined && version !== expectedVersion) {
+    throw new ProtocolError("unsupported protocol version");
+  }
+  return version;
 }
 
 function requireRequestId(object: Record<string, unknown>): string {
@@ -1247,6 +1345,68 @@ function validateTranscript(transcript: string): void {
   }
 }
 
+function requireOperationId(value: unknown): string {
+  if (typeof value !== "string" || !isCanonicalRequestId(value)) {
+    throw new ProtocolError("operation identifier must be non-empty and at most 64 bytes");
+  }
+  return value;
+}
+
+function requireNullableOperationId(value: unknown): string | null {
+  if (value === null) {
+    return null;
+  }
+  return requireOperationId(value);
+}
+
+function parseConversationContextExchanges(value: unknown): ConversationContextExchange[] {
+  if (!Array.isArray(value)) {
+    throw new ProtocolError("conversation context exchanges must be an array");
+  }
+  const exchanges = value.map((entry) => {
+    const exchange = requireRecord(entry, "conversation context exchange");
+    requireExactKeys(exchange, ["user", "assistant"]);
+    return {
+      user: requireContextMessage(exchange, "user"),
+      assistant: requireContextMessage(exchange, "assistant"),
+    };
+  });
+  validateConversationContextExchanges(exchanges);
+  return exchanges;
+}
+
+function validateConversationContextExchanges(exchanges: ConversationContextExchange[]): void {
+  if (
+    !Array.isArray(exchanges)
+    || exchanges.length === 0
+    || exchanges.length > MAX_CONVERSATION_CONTEXT_EXCHANGES
+  ) {
+    throw new ProtocolError("conversation context requires at least one and at most 16 exchanges");
+  }
+  let totalBytes = 0;
+  for (const exchange of exchanges) {
+    if (!isRecord(exchange) || Object.keys(exchange).length !== 2
+      || !("user" in exchange) || !("assistant" in exchange)) {
+      throw new ProtocolError("conversation context exchange is invalid");
+    }
+    const user = requireContextMessage(exchange, "user");
+    const assistant = requireContextMessage(exchange, "assistant");
+    totalBytes += new TextEncoder().encode(user).length + new TextEncoder().encode(assistant).length;
+  }
+  if (totalBytes > MAX_CONVERSATION_CONTEXT_BYTES) {
+    throw new ProtocolError("conversation context exceeds 32768 bytes");
+  }
+}
+
+function requireContextMessage(object: Record<string, unknown>, key: string): string {
+  const message = requireString(object, key);
+  if (message.trim().length === 0) {
+    throw new ProtocolError(`conversation context ${key} must be nonblank`);
+  }
+  requireMaximumUtf8Bytes(message, MAX_CONVERSATION_MESSAGE_BYTES, `conversation context ${key}`);
+  return message;
+}
+
 function requireBoolean(object: Record<string, unknown>, key: string): boolean {
   const value = object[key];
   if (typeof value !== "boolean") {
@@ -1263,14 +1423,18 @@ function requireStringArray(object: Record<string, unknown>, key: string): strin
   return [...value];
 }
 
-function requireCapabilities(object: Record<string, unknown>): RuntimeStatus["capabilities"] {
+function requireCapabilities(
+  object: Record<string, unknown>,
+  version: ClientProtocolVersion,
+): RuntimeStatus["capabilities"] {
   const capabilities = requireStringArray(object, "capabilities");
   const ranks = new Map<RuntimeCapability, number>([
     ["text", 0],
-    ["persona_control", 1],
-    ["memory_inspection", 2],
-    ["memory_mutation", 3],
-    ["voice_session", 4],
+    ["conversation_context_seed", 1],
+    ["persona_control", 2],
+    ["memory_inspection", 3],
+    ["memory_mutation", 4],
+    ["voice_session", 5],
   ]);
   let previousRank = -1;
   for (const capability of capabilities) {
@@ -1282,6 +1446,7 @@ function requireCapabilities(object: Record<string, unknown>): RuntimeStatus["ca
   }
   if (
     capabilities[0] !== "text"
+    || (version === LEGACY_CLIENT_PROTOCOL_VERSION && capabilities.includes("conversation_context_seed"))
     || (capabilities.includes("memory_mutation") && !capabilities.includes("memory_inspection"))
   ) {
     throw new ProtocolError("capabilities has an unsupported value");

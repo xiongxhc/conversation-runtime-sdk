@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { focusScenes, resolveScene } from "../focus-scenes/registry.js";
 import type { VoiceVisualState } from "../focus-scenes/types.js";
@@ -27,8 +27,6 @@ export interface VoiceFocusProps {
   onStop(): void;
 }
 
-const secondaryControlTimeoutMs = 2_400;
-
 export function VoiceFocus({
   controlError,
   mode,
@@ -49,25 +47,21 @@ export function VoiceFocus({
   onStart,
   onStop,
 }: VoiceFocusProps) {
-  const [secondaryControlsVisible, setSecondaryControlsVisible] = useState(true);
   const [transcriptVisible, setTranscriptVisible] = useState(
     preferences.rememberTranscriptVisibility && preferences.transcriptVisible,
   );
-  const hideTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const exitButton = useRef<HTMLButtonElement>(null);
   const onExitRef = useRef(onExit);
   const suspendedRef = useRef(suspended);
   const scene = resolveScene(preferences.focusScene);
   const visualState = mode === "preview" ? "idle" : state;
-
-  const revealSecondaryControls = useCallback(() => {
-    setSecondaryControlsVisible(true);
-    if (hideTimer.current !== undefined) clearTimeout(hideTimer.current);
-    hideTimer.current = setTimeout(
-      () => setSecondaryControlsVisible(false),
-      secondaryControlTimeoutMs,
-    );
-  }, []);
+  const orbitalMotion = reducedMotion || ![
+    "listening",
+    "thinking",
+    "speaking",
+  ].includes(visualState)
+    ? "static"
+    : "looping";
 
   useEffect(() => {
     onExitRef.current = onExit;
@@ -78,16 +72,14 @@ export function VoiceFocus({
 
   useEffect(() => {
     exitButton.current?.focus();
-    revealSecondaryControls();
     const escape = (event: KeyboardEvent) => {
       if (event.key === "Escape" && !suspendedRef.current) onExitRef.current();
     };
     document.addEventListener("keydown", escape);
     return () => {
       document.removeEventListener("keydown", escape);
-      if (hideTimer.current !== undefined) clearTimeout(hideTimer.current);
     };
-  }, [revealSecondaryControls]);
+  }, []);
 
   const updatePreferences = (changes: Partial<Preferences>) => {
     onPreferencesChange({ ...preferences, ...changes });
@@ -101,9 +93,6 @@ export function VoiceFocus({
       className="voice-focus"
       data-state={visualState}
       inert={suspended}
-      onKeyDown={revealSecondaryControls}
-      onPointerMove={revealSecondaryControls}
-      onTouchStart={revealSecondaryControls}
       role="dialog"
     >
       <div className="focus-scene" aria-hidden="true">
@@ -136,13 +125,27 @@ export function VoiceFocus({
         {mode === "preview" ? (
           <p className="focus-preview-label">Visual preview — no live voice session</p>
         ) : null}
-        {!scene.integratesVoicePresence ? (
+        <div className="voice-presence-visual">
           <div
             aria-hidden="true"
-            className="voice-presence-orb"
-            data-voice-presence="separate"
-          />
-        ) : null}
+            className="voice-locality-trace"
+            data-cadence={visualState}
+            data-motion={orbitalMotion}
+            data-route={visualState === "error" ? "broken" : "continuous"}
+          >
+            <span data-orbit-segment="1" />
+            <span data-orbit-segment="2" />
+            <span data-orbit-segment="3" />
+            <span data-orbit-segment="4" />
+          </div>
+          {!scene.integratesVoicePresence ? (
+            <div
+              aria-hidden="true"
+              className="voice-presence-orb"
+              data-voice-presence="separate"
+            />
+          ) : null}
+        </div>
         <p aria-live="polite" className="voice-state-label">
           {stateLabel(visualState)}
         </p>
@@ -177,14 +180,14 @@ export function VoiceFocus({
         {runtimeError ? <p className="voice-control-error" role="alert">{runtimeError}</p> : null}
         {controlError ? <p className="voice-control-error" role="alert">{controlError}</p> : null}
         {controlError && onRetryControl ? (
-          <button onClick={onRetryControl} type="button">Retry voice control</button>
+          <button className="focus-retry-control" onClick={onRetryControl} type="button">Retry voice control</button>
         ) : null}
       </div>
 
       <div
         className="focus-secondary-controls"
         data-secondary-controls=""
-        data-visible={secondaryControlsVisible}
+        data-visible="true"
       >
         <label>
           <span>Scene</span>

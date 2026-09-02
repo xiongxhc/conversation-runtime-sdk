@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use conversation_memory::MemoryContextProvider;
 use conversation_protocol::{
-    ConversationMode, ExecutionLocation, GenerationId, PersonaProfile, RuntimeError,
-    RuntimeErrorKind, RuntimeStage, SessionId, TurnId,
+    ConversationContextExchange, ConversationMode, ExecutionLocation, GenerationId, PersonaProfile,
+    RuntimeError, RuntimeErrorKind, RuntimeStage, SessionId, TurnId,
 };
 use tokio::sync::Mutex;
 
@@ -62,6 +62,13 @@ impl PreparedConversationTurn {
 struct ConversationLifecycle {
     sequence: u64,
     active: Option<ActiveConversationTurn>,
+    last_seed: Option<AppliedContextSeed>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AppliedContextSeed {
+    operation_id: String,
+    exchanges: Vec<ConversationContextExchange>,
 }
 
 struct ActiveConversationTurn {
@@ -122,6 +129,43 @@ impl ConversationContext {
             .active
             .as_ref()
             .map(|active| active.identity)
+    }
+
+    pub async fn seed_completed_history(
+        &self,
+        operation_id: &str,
+        exchanges: &[ConversationContextExchange],
+    ) -> Result<(), RuntimeError> {
+        let mut lifecycle = self.lifecycle.lock().await;
+        if lifecycle.active.is_some() {
+            return Err(runtime_error(
+                "conversation history cannot be seeded while a turn is active",
+            ));
+        }
+        if operation_id.is_empty() || operation_id.len() > 64 {
+            return Err(runtime_error(
+                "context seed operation identifier must contain between 1 and 64 UTF-8 bytes",
+            ));
+        }
+        if let Some(last_seed) = lifecycle.last_seed.as_ref() {
+            if last_seed.operation_id == operation_id {
+                return if last_seed.exchanges == exchanges {
+                    Ok(())
+                } else {
+                    Err(runtime_error(
+                        "context seed operation identifier was reused with different content",
+                    ))
+                };
+            }
+        }
+
+        let mut quality = self.quality.lock().await;
+        quality.replace_completed_history(exchanges)?;
+        lifecycle.last_seed = Some(AppliedContextSeed {
+            operation_id: operation_id.to_owned(),
+            exchanges: exchanges.to_vec(),
+        });
+        Ok(())
     }
 
     pub async fn begin_turn(

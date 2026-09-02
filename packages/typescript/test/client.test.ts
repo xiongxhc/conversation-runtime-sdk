@@ -5,6 +5,8 @@ import { setImmediate } from "node:timers/promises";
 import { CommandRejectedError, RuntimeClient, type RuntimeTransport, type RuntimeTurn } from "../src/client.js";
 import type {
   ClientCommand,
+  ClientProtocolVersion,
+  ConversationContextExchange,
   PersonaState,
   RuntimeComponentDescriptor,
   RuntimeEvent,
@@ -64,13 +66,281 @@ test("connects, correlates status, and streams an accepted turn", async () => {
   await client.close();
 });
 
-test("rejects a version two gateway before any typed start is accepted", async () => {
+test("stores a version two ready and uses it for existing commands", async () => {
   const transport = new InMemoryTransport();
   const connecting = RuntimeClient.connect(transport);
-  transport.push({ type: "ready", protocol_version: 2, status: wireStatus() });
+  transport.push(readyV2());
+  const client = await connecting;
 
-  await assert.rejects(connecting, /unsupported protocol version/);
-  await transport.close();
+  const pending = [
+    client.status(),
+    client.startTurn("hello"),
+    client.startVoiceSession(),
+    client.getPersona(),
+    client.listMemories(),
+  ];
+
+  assert.deepEqual(transport.sentVersions, [2, 2, 2, 2, 2]);
+  await client.close();
+  await Promise.all(pending.map((operation) => assert.rejects(operation, /runtime client closed/)));
+});
+
+test("rejects a non-ready frame before the authoritative ready message", async () => {
+  const transport = new InMemoryTransport();
+  const connecting = RuntimeClient.connect(transport);
+  transport.push({
+    type: "status",
+    protocol_version: 1,
+    request_id: "request-1",
+    status: wireStatus(),
+  });
+
+  await assert.rejects(connecting, /expected a ready message/);
+  assert.equal(transport.closeCalls, 1);
+});
+
+test("rejects a duplicate ready message after connection", async () => {
+  const connected = await connectedClient();
+  const pendingStatus = connected.client.status();
+
+  connected.transport.push(ready());
+
+  await assert.rejects(pendingStatus, /duplicate ready messages/);
+  assert.equal(connected.transport.closeCalls, 1);
+});
+
+test("rejects a mixed-version frame after ready", async () => {
+  const connected = await connectedClient();
+  const pendingStatus = connected.client.status();
+  const statusCommand = command(connected.transport, "status");
+
+  connected.transport.push(acceptedForVersion(statusCommand.requestId, 2));
+
+  await assert.rejects(pendingStatus, /unsupported protocol version/);
+  assert.equal(connected.transport.closeCalls, 1);
+});
+
+test("preserves version one sends and rejects context seeding locally", async () => {
+  const connected = await connectedClient();
+
+  await assert.rejects(
+    connected.client.seedConversationContext([{ user: "hello", assistant: "hi" }], "continue-1"),
+    /requires protocol version 2/,
+  );
+  assert.equal(connected.transport.sent.length, 0);
+
+  const startingVoice = connected.client.startVoiceSession();
+  const voiceStart = command(connected.transport, "start_voice_session");
+  connected.transport.push(acceptedControl(voiceStart.requestId));
+  const voice = await startingVoice;
+  const pending = [
+    connected.client.status(),
+    connected.client.startTurn("hello"),
+    connected.client.getPersona(),
+    connected.client.listMemories(),
+    connected.client.interrupt(1n),
+    voice.stop(),
+    voice.pauseCapture(),
+    voice.resumeCapture(),
+    connected.client.updatePersona(personaState()),
+    connected.client.inspectMemory(7n),
+    connected.client.approveMemory(7n, 2n),
+    connected.client.deleteMemory(7n, 2n),
+  ];
+  assert.deepEqual(connected.transport.sent.map((item) => item.type), [
+    "start_voice_session",
+    "status",
+    "start_turn",
+    "persona_get",
+    "memory_list",
+    "interrupt_turn",
+    "stop_voice_session",
+    "pause_voice_capture",
+    "resume_voice_capture",
+    "persona_update",
+    "memory_inspect",
+    "memory_approve",
+    "memory_delete",
+  ]);
+  assert.deepEqual(connected.transport.sentVersions, Array(13).fill(1));
+  await connected.client.close();
+  await Promise.all(pending.map((operation) => assert.rejects(operation, /runtime client closed/)));
+});
+
+test("validates context seeding before send and requires the ready capability", async () => {
+  const capable = await connectedV2Client();
+  await assert.rejects(
+    capable.client.seedConversationContext([], "continue-1"),
+    /at least one and at most 16 exchanges/,
+  );
+  await assert.rejects(
+    capable.client.seedConversationContext([{ user: "hello", assistant: "hi" }], ""),
+    /operation identifier/,
+  );
+  assert.equal(capable.transport.sent.length, 0);
+  await capable.client.close();
+
+  const incapable = await connectedV2Client(["text"]);
+  await assert.rejects(
+    incapable.client.seedConversationContext([{ user: "hello", assistant: "hi" }], "continue-1"),
+    /does not support conversation context seeding/,
+  );
+  assert.equal(incapable.transport.sent.length, 0);
+  await incapable.client.close();
+});
+
+test("context seeding waits for correlated acceptance and uses version two", async () => {
+  const connected = await connectedV2Client();
+  const exchanges: readonly ConversationContextExchange[] = [
+    { user: "hello", assistant: "hi" },
+  ];
+  let settled = false;
+  const seeding = connected.client.seedConversationContext(exchanges, "continue-1");
+  void seeding.finally(() => {
+    settled = true;
+  });
+  const seed = command(connected.transport, "seed_conversation_context");
+
+  assert.deepEqual(seed.exchanges, exchanges);
+  assert.equal(seed.operationId, "continue-1");
+  assert.equal(connected.transport.sentVersions.at(-1), 2);
+  await setImmediate();
+  assert.equal(settled, false);
+
+  connected.transport.push(acceptedForVersion(seed.requestId, 2));
+  await seeding;
+  assert.equal(settled, true);
+  await connected.client.close();
+});
+
+test("context seeding rejects correlated failure without failing the connection", async () => {
+  const connected = await connectedV2Client();
+  const failure: RuntimeFailure = {
+    code: "invalid_state",
+    kind: "invalid_state",
+    stage: "runtime",
+    message: "an active turn already exists",
+  };
+  const seeding = connected.client.seedConversationContext(
+    [{ user: "hello", assistant: "hi" }],
+    "continue-1",
+  );
+  const seed = command(connected.transport, "seed_conversation_context");
+  connected.transport.push(rejectedForVersion(seed.requestId, failure, 2));
+  await assert.rejects(seeding, (error: Error) => assertCommandRejectedError(error, failure));
+
+  const pendingStatus = connected.client.status();
+  const statusCommand = command(connected.transport, "status");
+  connected.transport.push(acceptedForVersion(statusCommand.requestId, 2));
+  connected.transport.push(statusForVersion(statusCommand.requestId, 2, "continue-previous"));
+  assert.equal((await pendingStatus).lastContextSeedOperationId, "continue-previous");
+  await connected.client.close();
+});
+
+test("decodes representative version two responses and runtime events", async () => {
+  const connected = await connectedV2Client();
+  const pendingStatus = connected.client.status();
+  const statusCommand = command(connected.transport, "status");
+  connected.transport.push(acceptedForVersion(statusCommand.requestId, 2));
+  connected.transport.push(statusForVersion(statusCommand.requestId, 2, "continue-previous"));
+  assert.equal((await pendingStatus).lastContextSeedOperationId, "continue-previous");
+
+  const starting = connected.client.startTurn("hello after continuation");
+  const start = command(connected.transport, "start_turn");
+  connected.transport.push(acceptedForVersion(start.requestId, 2, 42n));
+  const turn = await starting;
+  connected.transport.push(eventForVersion("turn_started", turn.turnId, 2));
+  connected.transport.push(eventForVersion("text_delta", turn.turnId, 2, "v2 response"));
+  connected.transport.push(eventForVersion("turn_completed", turn.turnId, 2));
+
+  assert.deepEqual(await collect(turn.events), [
+    { type: "turn_started", requestId: "request-start", turnId: 42n },
+    { type: "text_delta", turnId: 42n, delta: "v2 response" },
+    { type: "turn_completed", turnId: 42n },
+  ]);
+  await connected.client.close();
+});
+
+test("keeps a version two typed turn open for quality with 32 history messages", async () => {
+  const connected = await connectedV2Client();
+  const starting = connected.client.startTurn("hello after full continuation");
+  const start = command(connected.transport, "start_turn");
+  connected.transport.push(acceptedForVersion(start.requestId, 2, 42n));
+  const turn = await starting;
+
+  connected.transport.push(qualityEventForVersion(turn.turnId, 32, 2));
+  connected.transport.push(eventForVersion("turn_completed", turn.turnId, 2));
+
+  const events = await collect(turn.events);
+  assert.equal(events[0]?.type, "quality_resolved");
+  assert.equal(
+    events[0]?.type === "quality_resolved" ? events[0].decision.historyMessageCount : undefined,
+    32,
+  );
+  assert.equal(events[1]?.type, "turn_completed");
+  assert.equal(connected.transport.closeCalls, 0);
+  await connected.client.close();
+});
+
+test("keeps a version two voice session open for nested quality with 32 history messages", async () => {
+  const connected = await connectedV2Client();
+  const starting = connected.client.startVoiceSession();
+  const start = command(connected.transport, "start_voice_session");
+  connected.transport.push(acceptedForVersion(start.requestId, 2));
+  const session = await starting;
+
+  connected.transport.push(voiceEventForVersion({
+    type: "voice_session_started",
+    session_id: "1",
+    privacy: { privacy_mode: "local_only", components: wireVoiceComponents() },
+  }, 2));
+  connected.transport.push(voiceEventForVersion({
+    type: "voice_turn_event",
+    session_id: "1",
+    generation_id: "1",
+    event: qualityDecisionEvent("1", 32),
+  }, 2));
+  connected.transport.push(voiceEventForVersion({ type: "voice_session_ended", session_id: "1" }, 2));
+
+  const events = await collect(session.events());
+  assert.equal(events[1]?.type, "voice_turn_event");
+  assert.equal(
+    events[1]?.type === "voice_turn_event" && events[1].event.type === "quality_resolved"
+      ? events[1].event.decision.historyMessageCount
+      : undefined,
+    32,
+  );
+  assert.equal(events[2]?.type, "voice_session_ended");
+  assert.equal(connected.transport.closeCalls, 0);
+  await connected.client.close();
+});
+
+test("duplicate context-seed terminal messages fail pending work", async () => {
+  const connected = await connectedV2Client();
+  const seeding = connected.client.seedConversationContext(
+    [{ user: "hello", assistant: "hi" }],
+    "continue-1",
+  );
+  const seed = command(connected.transport, "seed_conversation_context");
+  connected.transport.push(acceptedForVersion(seed.requestId, 2));
+  await seeding;
+
+  const pendingStatus = connected.client.status();
+  connected.transport.push(acceptedForVersion(seed.requestId, 2));
+  await assert.rejects(pendingStatus, /accepted an unknown command/);
+  await connected.client.close();
+});
+
+test("close rejects a pending context seed", async () => {
+  const connected = await connectedV2Client();
+  const seeding = connected.client.seedConversationContext(
+    [{ user: "hello", assistant: "hi" }],
+    "continue-1",
+  );
+
+  await connected.client.close();
+
+  await assert.rejects(seeding, /runtime client closed/);
 });
 
 test("resolves interruption after acceptance and retains the turn until terminal", async () => {
@@ -812,11 +1082,13 @@ class InMemoryTransport implements RuntimeTransport {
   readonly inbox = new AsyncChannel<unknown>();
   readonly messages = this.inbox;
   readonly sent: ClientCommand[] = [];
+  readonly sentVersions: ClientProtocolVersion[] = [];
   closed = false;
   closeCalls = 0;
 
-  async send(message: ClientCommand): Promise<void> {
+  async send(message: ClientCommand, version: ClientProtocolVersion): Promise<void> {
     this.sent.push(message);
+    this.sentVersions.push(version);
   }
 
   async close(): Promise<void> {
@@ -835,7 +1107,7 @@ class InMemoryTransport implements RuntimeTransport {
 }
 
 class ThrowingTransport extends InMemoryTransport {
-  send(_message: ClientCommand): Promise<void> {
+  send(_message: ClientCommand, _version: ClientProtocolVersion): Promise<void> {
     throw new Error("synchronous send failure");
   }
 }
@@ -898,6 +1170,15 @@ async function connectedClient(): Promise<{ client: RuntimeClient; transport: In
   return { client: await connecting, transport };
 }
 
+async function connectedV2Client(
+  capabilities: RuntimeStatus["capabilities"] = ["text", "conversation_context_seed"],
+): Promise<{ client: RuntimeClient; transport: InMemoryTransport }> {
+  const transport = new InMemoryTransport();
+  const connecting = RuntimeClient.connect(transport);
+  transport.push(readyV2(capabilities));
+  return { client: await connecting, transport };
+}
+
 async function connectThrowingTransport(transport: ThrowingTransport): Promise<RuntimeClient> {
   const connecting = RuntimeClient.connect(transport);
   transport.push(ready());
@@ -930,6 +1211,18 @@ function ready(): unknown {
   return { type: "ready", protocol_version: 1, status: wireStatus() };
 }
 
+function readyV2(capabilities: RuntimeStatus["capabilities"] = ["text", "conversation_context_seed"]): unknown {
+  return {
+    type: "ready",
+    protocol_version: 2,
+    status: {
+      ...wireStatus(),
+      capabilities,
+      last_context_seed_operation_id: null,
+    },
+  };
+}
+
 async function acceptTurn(
   starting: Promise<RuntimeTurn>,
   transport: InMemoryTransport,
@@ -953,8 +1246,46 @@ function acceptedControl(requestId: string): unknown {
   return { type: "command_accepted", protocol_version: 1, request_id: requestId };
 }
 
+function acceptedForVersion(
+  requestId: string,
+  version: ClientProtocolVersion,
+  turnId?: bigint,
+): unknown {
+  return {
+    type: "command_accepted",
+    protocol_version: version,
+    request_id: requestId,
+    ...(turnId === undefined ? {} : { turn_id: turnId.toString() }),
+  };
+}
+
 function rejected(requestId: string, error: RuntimeFailure): unknown {
   return { type: "command_rejected", protocol_version: 1, request_id: requestId, error };
+}
+
+function rejectedForVersion(
+  requestId: string,
+  error: RuntimeFailure,
+  version: ClientProtocolVersion,
+): unknown {
+  return { type: "command_rejected", protocol_version: version, request_id: requestId, error };
+}
+
+function statusForVersion(
+  requestId: string,
+  version: ClientProtocolVersion,
+  lastContextSeedOperationId: string | null,
+): unknown {
+  return {
+    type: "status",
+    protocol_version: version,
+    request_id: requestId,
+    status: {
+      ...wireStatus(),
+      capabilities: ["text", "conversation_context_seed"],
+      last_context_seed_operation_id: lastContextSeedOperationId,
+    },
+  };
 }
 
 function assertCommandRejectedError(error: Error, failure: RuntimeFailure): boolean {
@@ -1065,6 +1396,67 @@ function event(type: "turn_started" | "turn_completed" | "turn_cancelled" | "tex
   };
 }
 
+function eventForVersion(
+  type: "turn_started" | "turn_completed",
+  turnId: bigint,
+  version: ClientProtocolVersion,
+): unknown;
+function eventForVersion(
+  type: "text_delta",
+  turnId: bigint,
+  version: ClientProtocolVersion,
+  delta: string,
+): unknown;
+function eventForVersion(
+  type: "turn_started" | "turn_completed" | "text_delta",
+  turnId: bigint,
+  version: ClientProtocolVersion,
+  delta?: string,
+): unknown {
+  return {
+    type: "runtime_event",
+    protocol_version: version,
+    event:
+      type === "text_delta"
+        ? { type, turn_id: turnId.toString(), delta }
+        : type === "turn_started"
+          ? { type, request_id: "request-start", turn_id: turnId.toString() }
+          : { type, turn_id: turnId.toString() },
+  };
+}
+
+function qualityEventForVersion(
+  turnId: bigint,
+  historyMessageCount: number,
+  version: ClientProtocolVersion,
+): unknown {
+  return {
+    type: "runtime_event",
+    protocol_version: version,
+    event: qualityDecisionEvent(turnId.toString(), historyMessageCount),
+  };
+}
+
+function qualityDecisionEvent(turnId: string, historyMessageCount: number): Record<string, unknown> {
+  return {
+    type: "quality_resolved",
+    decision: {
+      turn_id: turnId,
+      mode: "direct_answer",
+      controls: {
+        maximum_spoken_seconds: 20,
+        directness: 80,
+        pace: "natural",
+        follow_up_policy: "contextual",
+        silence_policy: "allow_without_filler",
+      },
+      signals: [],
+      history_message_count: historyMessageCount,
+      context_sources: ["saved_persona", "recent_history", "current_turn"],
+    },
+  };
+}
+
 function wireStatus(): Record<string, unknown> {
   return {
     transport: "stdio",
@@ -1104,6 +1496,10 @@ async function collect<T>(events: AsyncIterable<T>): Promise<T[]> {
 
 function voiceEvent(event: unknown): unknown {
   return { type: "voice_event", protocol_version: 1, event };
+}
+
+function voiceEventForVersion(event: unknown, version: ClientProtocolVersion): unknown {
+  return { type: "voice_event", protocol_version: version, event };
 }
 
 function wireVoiceComponents(): Record<string, unknown>[] {

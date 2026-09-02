@@ -2,6 +2,7 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import {
   encodeClientCommand,
   type ClientCommand,
+  type ClientProtocolVersion,
   type RuntimeTransport,
 } from "@conversation/runtime/browser";
 
@@ -68,11 +69,11 @@ export class TauriGatewayTransport implements RuntimeTransport {
     }
   }
 
-  async send(message: ClientCommand): Promise<void> {
+  async send(message: ClientCommand, version: ClientProtocolVersion): Promise<void> {
     if (this.closing) {
       throw new Error("runtime transport is closed");
     }
-    const payload = new TextDecoder("utf-8", { fatal: true }).decode(encodeClientCommand(message));
+    const payload = new TextDecoder("utf-8", { fatal: true }).decode(encodeClientCommand(message, version));
     try {
       await this.native.invoke("send_runtime", { payload });
     } catch {

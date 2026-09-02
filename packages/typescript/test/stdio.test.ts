@@ -7,6 +7,7 @@ import test from "node:test";
 import { setTimeout } from "node:timers/promises";
 
 import { RuntimeClient } from "../src/client.js";
+import { type ClientProtocolVersion } from "../src/protocol.js";
 import { StdioGatewayTransport } from "../src/stdio.js";
 
 test("requires absolute gateway and configuration paths", async () => {
@@ -76,7 +77,7 @@ test("discards buffered status responses when exit follows", async () => {
   const iterator = transport.messages[Symbol.asyncIterator]();
   child.stdout.emit("data", framedReady());
   await iterator.next();
-  await transport.send({ type: "status", requestId: "request-1" });
+  await transport.send({ type: "status", requestId: "request-1" }, 1);
   child.stdout.emit("data", Buffer.concat([
     framedMessage({
       type: "command_accepted",
@@ -94,6 +95,20 @@ test("discards buffered status responses when exit follows", async () => {
   child.emit("exit");
 
   await assert.rejects(iterator.next(), /gateway process exited/);
+  await transport.close();
+});
+
+test("encodes stdio commands with the negotiated protocol version", async () => {
+  const child = new FakeChild();
+  const transport = startWithChild(child);
+
+  await transport.send({ type: "status", requestId: "request-1" }, 2);
+
+  assert.deepEqual(decodeWrittenFrame(child.stdin.frames[0]!), {
+    protocol_version: 2,
+    type: "status",
+    request_id: "request-1",
+  });
   await transport.close();
 });
 
@@ -235,6 +250,7 @@ class FakeChild extends EventEmitter {
 }
 
 class FakeStdin extends EventEmitter {
+  readonly frames: Uint8Array[] = [];
   destroy(): this {
     return this;
   }
@@ -243,8 +259,15 @@ class FakeStdin extends EventEmitter {
     return this;
   }
 
-  write(_frame: Uint8Array, callback: (error: Error | null | undefined) => void): boolean {
+  write(frame: Uint8Array, callback: (error: Error | null | undefined) => void): boolean {
+    this.frames.push(frame);
     callback(undefined);
     return true;
   }
+}
+
+function decodeWrittenFrame(frame: Uint8Array): unknown {
+  const view = Buffer.from(frame);
+  const length = view.readUInt32BE(0);
+  return JSON.parse(view.subarray(4, 4 + length).toString("utf8"));
 }

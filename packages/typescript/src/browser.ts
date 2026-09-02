@@ -1,6 +1,7 @@
 export { CommandRejectedError, RuntimeClient, type RuntimeTransport, type RuntimeTurn, type VoiceSession } from "./client.js";
 export {
   CLIENT_PROTOCOL_VERSION,
+  LEGACY_CLIENT_PROTOCOL_VERSION,
   MAX_CONVERSATION_MESSAGE_BYTES,
   MAX_HISTORY_MESSAGE_COUNT,
   MAX_MEMORY_CONTENT_BYTES,
@@ -14,6 +15,8 @@ export {
   parseGatewayMessage,
   validateClientCommand,
   type ClientCommand,
+  type ClientProtocolVersion,
+  type ConversationContextExchange,
   type GatewayMessage,
   type MemoryApproval,
   type MemoryCursor,

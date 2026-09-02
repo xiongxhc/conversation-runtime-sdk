@@ -1,6 +1,9 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type {
@@ -34,10 +37,18 @@ const localStatus: ConversationSessionState["status"] = {
 };
 
 describe("SettingsPane", () => {
-  it("discloses that changing persona or mode starts fresh conversational context", () => {
-    renderPane(new PersonaSession());
+  it("puts the active-conversation reset disclosure beside Apply", async () => {
+    const session = new PersonaSession();
+    session.getPersona.mockResolvedValueOnce(personaState());
+    renderPane(session);
 
-    expect(screen.getByText(/Changing the persona or mode starts fresh conversational context/)).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "How it responds" })).toBeTruthy();
+    const disclosure = await screen.findByText(
+      "Changing how it responds starts a fresh active conversation. Saved Sessions and approved memories remain.",
+    );
+    const decision = disclosure.closest(".settings-apply-decision");
+    expect(decision).toBeTruthy();
+    expect(within(decision as HTMLElement).getByRole("button", { name: "Apply" })).toBeTruthy();
   });
 
   it("shows a loading state, then populates sliders and mode from getPersona", async () => {
@@ -48,7 +59,7 @@ describe("SettingsPane", () => {
     renderPane(session);
 
     expect(screen.getByText("Loading persona…")).toBeTruthy();
-    expect(screen.getByLabelText("Persona settings").getAttribute("aria-busy")).toBe("true");
+    expect(screen.getByLabelText("How it responds").getAttribute("aria-busy")).toBe("true");
 
     pending.resolve(personaState());
 
@@ -61,6 +72,60 @@ describe("SettingsPane", () => {
     expect(screen.getByLabelText("Verbosity")).toHaveProperty("value", "45");
     expect(screen.getByLabelText("Follow-up frequency")).toHaveProperty("value", "35");
     expect(screen.getByLabelText("Mode")).toHaveProperty("value", "companionship");
+  });
+
+  it("keeps mode and preset controls in the shared dark-aware control treatment", async () => {
+    const session = new PersonaSession();
+    session.getPersona.mockResolvedValueOnce(personaState());
+    renderPane(session);
+
+    const style = installApplicationStyles();
+    const root = document.documentElement;
+    root.style.setProperty("--canvas", "#202226");
+    root.style.setProperty("--ink", "#F1EEE7");
+    root.style.setProperty("--rule", "#46494D");
+
+    const mode = await screen.findByLabelText("Mode");
+    const presetName = screen.getByLabelText("Preset name");
+    const savePreset = screen.getByRole("button", { name: "Save as preset" });
+    const presetRow = savePreset.closest(".settings-preset-save");
+    const selectedMode = within(mode).getByRole("option", { name: "Companionship" });
+
+    try {
+      for (const field of [mode, presetName]) {
+        const computed = getComputedStyle(field);
+        expect(computed.color).toBe("var(--ink)");
+        expect(computed.minHeight).toBe("42px");
+        expect(computed.paddingTop).toBe("10px");
+        expect(computed.paddingRight).toBe("12px");
+      }
+      expect(getComputedStyle(selectedMode).color).toBe("var(--ink)");
+
+      const buttonStyle = getComputedStyle(savePreset);
+      expect(buttonStyle.color).toBe("var(--canvas)");
+      expect(buttonStyle.minHeight).toBe("42px");
+      expect(buttonStyle.paddingTop).toBe("10px");
+      expect(buttonStyle.paddingRight).toBe("14px");
+
+      const fieldRule = stylesheetRule(style, ".settings-field");
+      expect(fieldRule.style.getPropertyValue("background")).toContain("var(--canvas)");
+      expect(fieldRule.style.getPropertyValue("border")).toContain("var(--rule)");
+      expect(fieldRule.style.getPropertyValue("color")).toBe("var(--ink)");
+      const optionRule = stylesheetRule(style, ".settings-mode select.settings-field option");
+      expect(optionRule.style.getPropertyValue("background")).toBe("var(--canvas)");
+      expect(optionRule.style.getPropertyValue("color")).toBe("var(--ink)");
+      const actionRule = stylesheetRule(style, ".settings-preset-save-action");
+      expect(actionRule.style.getPropertyValue("background")).toBe("var(--ink)");
+      expect(actionRule.style.getPropertyValue("border")).toContain("var(--ink)");
+      expect(actionRule.style.getPropertyValue("color")).toBe("var(--canvas)");
+      expect(presetRow).not.toBeNull();
+      expect(getComputedStyle(presetRow as Element).alignItems).toBe("flex-end");
+    } finally {
+      style.remove();
+      for (const token of ["--canvas", "--ink", "--rule"]) {
+        root.style.removeProperty(token);
+      }
+    }
   });
 
   it("shows an error with retry when persona cannot be loaded", async () => {
@@ -304,6 +369,30 @@ function renderPane(
   );
 }
 
+function installApplicationStyles(): HTMLStyleElement {
+  const foundation = readFileSync(
+    join(process.cwd(), "src/styles/foundation.css"),
+    "utf8",
+  );
+  const application = readFileSync(
+    join(process.cwd(), "src/styles.css"),
+    "utf8",
+  ).replace(/^@import\s+[^;]+;\s*$/gm, "");
+  const style = document.createElement("style");
+  style.textContent = `${foundation}\n${application}`;
+  document.head.append(style);
+  return style;
+}
+
+function stylesheetRule(style: HTMLStyleElement, selector: string): CSSStyleRule {
+  const rule = Array.from(style.sheet?.cssRules ?? []).find(
+    (candidate): candidate is CSSStyleRule => "selectorText" in candidate
+      && candidate.selectorText === selector,
+  );
+  if (!rule) throw new Error(`Missing stylesheet rule: ${selector}`);
+  return rule;
+}
+
 function personaState(overrides: Partial<PersonaState> = {}): PersonaState {
   return {
     mode: "companionship",
@@ -335,6 +424,7 @@ class PersonaSession implements DesktopSession {
     status: localStatus,
     turns: [],
     activeTurn: undefined,
+    continuation: { inProgress: false },
     voice: {
       availability: "unavailable",
       session: "idle",
@@ -345,6 +435,7 @@ class PersonaSession implements DesktopSession {
     error: undefined,
   };
   readonly close = vi.fn(async () => undefined);
+  readonly continueWithSeed = vi.fn<DesktopSession["continueWithSeed"]>(async () => undefined);
   readonly inspectMemory = vi.fn<(memoryId: bigint) => Promise<MemoryInspection>>();
   readonly approveMemory = vi.fn<DesktopSession["approveMemory"]>();
   readonly deleteMemory = vi.fn<DesktopSession["deleteMemory"]>();

@@ -561,13 +561,13 @@ pub fn assert_local_status(message: &WireMessage, memory_enabled: bool) {
     assert!(message.raw.contains(r#""telemetry_enabled":false"#));
     if memory_enabled {
         assert!(message.raw.contains(
-            r#""capabilities":["text","persona_control","memory_inspection","memory_mutation"]"#
+            r#""capabilities":["text","conversation_context_seed","persona_control","memory_inspection","memory_mutation"]"#
         ));
         assert!(message.raw.contains(r#""kind":"memory""#));
     } else {
         assert!(message
             .raw
-            .contains(r#""capabilities":["text","persona_control"]"#));
+            .contains(r#""capabilities":["text","conversation_context_seed","persona_control"]"#));
         assert!(!message.raw.contains(r#""kind":"memory""#));
     }
     assert!(message.raw.contains(r#""kind":"language_model""#));
@@ -588,9 +588,9 @@ pub fn assert_voice_status(message: &WireMessage) {
     assert!(message.raw.contains(r#""memory_enabled":false"#));
     assert!(message.raw.contains(r#""memory_location":null"#));
     assert!(message.raw.contains(r#""telemetry_enabled":false"#));
-    assert!(message
-        .raw
-        .contains(r#""capabilities":["text","persona_control","voice_session"]"#));
+    assert!(message.raw.contains(
+        r#""capabilities":["text","conversation_context_seed","persona_control","voice_session"]"#
+    ));
     assert!(!message.raw.contains(r#""kind":"memory""#));
     assert!(message.raw.contains(r#""kind":"language_model""#));
     assert!(message

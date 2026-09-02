@@ -10,9 +10,11 @@ import { setImmediate } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
 import {
+  CLIENT_PROTOCOL_VERSION,
   parseGatewayMessage,
   StdioGatewayTransport,
   ClientCommand,
+  type ClientProtocolVersion,
   type GatewayMessage,
   RuntimeStatus,
   type RuntimeTransport,
@@ -66,6 +68,7 @@ test("streams UTF-8 deltas for two prompts through one persistent client", async
       .map((command) => command.transcript),
     ["first prompt", "second prompt"],
   );
+  assert.deepEqual(transport.sentVersions, Array(transport.sent.length).fill(1));
   assert.ok(fixture.output.text.indexOf("privacy: local-only") < fixture.output.text.indexOf("you> "));
   assert.match(fixture.output.text, /assistant> 你好🙂\n\[completed\]/);
   assert.match(fixture.output.text, /assistant> مرحبا\n\[completed\]/);
@@ -239,7 +242,8 @@ test("streams completion through the compiled Rust gateway over framed pipes", {
     });
     try {
       const messages = transport.messages[Symbol.asyncIterator]();
-      const ready = await nextGatewayMessage(messages);
+      const version = CLIENT_PROTOCOL_VERSION;
+      const ready = await nextGatewayMessage(messages, version);
       assert.equal(ready.type, "ready");
       assert.equal(ready.status.privacyMode, "local_only");
 
@@ -247,8 +251,8 @@ test("streams completion through the compiled Rust gateway over framed pipes", {
         type: "start_turn",
         requestId: "completion-start",
         transcript: "completion fixture",
-      });
-      const observed = await collectUntilTerminal(messages);
+      }, version);
+      const observed = await collectUntilTerminal(messages, version);
 
       assert.equal(observed[0]?.type, "command_accepted");
       assert.equal(
@@ -274,14 +278,16 @@ test("cancels independently through a second compiled Rust gateway process", { t
     });
     try {
       const messages = transport.messages[Symbol.asyncIterator]();
-      assert.equal((await nextGatewayMessage(messages)).type, "ready");
+      const version = CLIENT_PROTOCOL_VERSION;
+      const ready = await nextGatewayMessage(messages, version);
+      assert.equal(ready.type, "ready");
       await transport.send({
         type: "start_turn",
         requestId: "cancellation-start",
         transcript: "cancellation fixture",
-      });
+      }, version);
 
-      const observed: GatewayMessage[] = [await nextGatewayMessage(messages)];
+      const observed: GatewayMessage[] = [await nextGatewayMessage(messages, version)];
       assert.equal(observed[0]?.type, "command_accepted");
       await fixture.waitForRequestStart();
 
@@ -289,12 +295,12 @@ test("cancels independently through a second compiled Rust gateway process", { t
         type: "interrupt_turn",
         requestId: "cancellation-interrupt",
         turnId: 1n,
-      });
+      }, version);
       while (
         !observed.some((message) => message.type === "command_accepted" && message.requestId === "cancellation-interrupt")
         || terminalType(observed) === undefined
       ) {
-        observed.push(await nextGatewayMessage(messages));
+        observed.push(await nextGatewayMessage(messages, version));
       }
 
       assert.equal(terminalType(observed), "turn_cancelled");
@@ -460,20 +466,26 @@ follow_up_frequency = 50
 
 async function nextGatewayMessage(
   messages: AsyncIterator<unknown>,
+  version: ClientProtocolVersion,
 ): Promise<GatewayMessage> {
+  return parseGatewayMessage(await nextRawMessage(messages), version);
+}
+
+async function nextRawMessage(messages: AsyncIterator<unknown>): Promise<unknown> {
   const next = await withDeadline(messages.next(), 3_000, "gateway message timed out");
   if (next.done) {
     throw new Error("gateway messages ended before the expected terminal event");
   }
-  return parseGatewayMessage(next.value);
+  return next.value;
 }
 
 async function collectUntilTerminal(
   messages: AsyncIterator<unknown>,
+  version: ClientProtocolVersion,
 ): Promise<GatewayMessage[]> {
   const observed: GatewayMessage[] = [];
   while (terminalType(observed) === undefined) {
-    observed.push(await nextGatewayMessage(messages));
+    observed.push(await nextGatewayMessage(messages, version));
   }
   return observed;
 }
@@ -530,14 +542,16 @@ class ScriptedTransport implements RuntimeTransport {
   private startReleased = false;
   readonly messages = this.inbox;
   readonly sent: ClientCommand[] = [];
+  readonly sentVersions: ClientProtocolVersion[] = [];
   closeCount = 0;
 
   constructor(private readonly script: Script) {
     this.inbox.push({ type: "ready", protocol_version: 1, status: wireStatus() });
   }
 
-  async send(command: ClientCommand): Promise<void> {
+  async send(command: ClientCommand, version: ClientProtocolVersion): Promise<void> {
     this.sent.push(command);
+    this.sentVersions.push(version);
     for (const resolve of this.waiters.get(command.type)?.splice(0) ?? []) {
       resolve();
     }

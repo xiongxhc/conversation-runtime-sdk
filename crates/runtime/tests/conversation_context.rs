@@ -5,8 +5,8 @@ use conversation_model_adapters::{
     MockContinuousAudioOutput, MockStreamingSpeechSynthesizer,
 };
 use conversation_protocol::{
-    ConversationMode, ConversationRole, GenerationId, PersonaProfile, ResponseControls,
-    RuntimeErrorKind, RuntimeEvent, RuntimeStage, TurnId,
+    ConversationContextExchange, ConversationMode, ConversationRole, GenerationId, PersonaProfile,
+    ResponseControls, RuntimeErrorKind, RuntimeEvent, RuntimeStage, TurnId,
 };
 use conversation_runtime::{
     ConversationContext, ConversationQualityController, ConversationTurnSource,
@@ -308,6 +308,95 @@ async fn apply_persona_is_rejected_while_a_turn_is_active() {
         .apply_persona(PersonaProfile::default(), ConversationMode::Brainstorming)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn context_seed_is_idempotent_only_for_the_last_operation_and_same_content() {
+    let context = ConversationContext::new(quality());
+    let original = [ConversationContextExchange::new("seed user", "seed assistant").unwrap()];
+
+    context
+        .seed_completed_history("continue-1", &original)
+        .await
+        .unwrap();
+    context
+        .seed_completed_history("continue-1", &original)
+        .await
+        .unwrap();
+
+    let conflicting = [ConversationContextExchange::new("other user", "other assistant").unwrap()];
+    let error = context
+        .seed_completed_history("continue-1", &conflicting)
+        .await
+        .unwrap_err();
+    assert!(error.message().contains("operation"));
+
+    let next = context
+        .begin_turn(ConversationTurnSource::Text, "live user")
+        .await
+        .unwrap();
+    let history = next.resolved().history_messages();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].text(), "seed user");
+    assert_eq!(history[1].text(), "seed assistant");
+    context.discard_turn(next.identity(), false).await.unwrap();
+
+    context
+        .seed_completed_history("continue-2", &conflicting)
+        .await
+        .unwrap();
+    let after_new_operation = context
+        .begin_turn(ConversationTurnSource::Text, "next live user")
+        .await
+        .unwrap();
+    let history = after_new_operation.resolved().history_messages();
+    assert_eq!(history[0].text(), "other user");
+    assert_eq!(history[1].text(), "other assistant");
+}
+
+#[tokio::test]
+async fn context_seed_rejects_active_turn_and_preserves_persona_history_and_sequence() {
+    let context = ConversationContext::new(quality());
+    let first = context
+        .begin_turn(ConversationTurnSource::Text, "existing user")
+        .await
+        .unwrap();
+    context
+        .complete_turn(first.identity(), "existing assistant")
+        .await
+        .unwrap();
+    let active = context
+        .begin_turn(ConversationTurnSource::Text, "active user")
+        .await
+        .unwrap();
+    let (persona, mode) = context.persona_snapshot().await;
+
+    let seed = [ConversationContextExchange::new("seed user", "seed assistant").unwrap()];
+    let error = context
+        .seed_completed_history("continue-active", &seed)
+        .await
+        .unwrap_err();
+    assert!(error.message().contains("active"));
+    assert_eq!(context.persona_snapshot().await, (persona, mode));
+
+    context
+        .complete_turn(active.identity(), "active assistant")
+        .await
+        .unwrap();
+    context
+        .seed_completed_history("continue-idle", &seed)
+        .await
+        .unwrap();
+    let next = context
+        .begin_turn(ConversationTurnSource::Text, "post-seed user")
+        .await
+        .unwrap();
+    assert_eq!(next.identity().turn_id(), TurnId::new(3));
+    assert_eq!(next.identity().generation_id(), GenerationId::new(3));
+    let history = next.resolved().history_messages();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].text(), "seed user");
+    assert_eq!(history[1].text(), "seed assistant");
 }
 
 #[derive(Default)]

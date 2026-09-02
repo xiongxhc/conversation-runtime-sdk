@@ -2,6 +2,7 @@ use conversation_protocol::{
     ContextSource, ConversationMessage, ConversationMode, ConversationRole, ConversationSignal,
     FollowUpPolicy, PersonaLevel, PersonaProfile, QualityDecision, ResponseControls,
     RuntimeErrorKind, RuntimeEvent, RuntimeStage, SilencePolicy, SpeechPace, TurnId,
+    MAX_CONVERSATION_MESSAGE_BYTES, MAX_HISTORY_BYTES, MAX_HISTORY_MESSAGE_COUNT,
 };
 
 #[test]
@@ -94,7 +95,19 @@ fn all_modes_signals_and_context_messages_have_typed_representations() {
     assert_eq!(user.text(), "hello");
     assert_eq!(assistant.role(), ConversationRole::Assistant);
     assert!(ConversationMessage::new(ConversationRole::User, " \t\n").is_err());
+    assert!(ConversationMessage::new(
+        ConversationRole::User,
+        "x".repeat(MAX_CONVERSATION_MESSAGE_BYTES),
+    )
+    .is_ok());
     assert!(ConversationMessage::new(ConversationRole::User, "x".repeat(16 * 1024 + 1)).is_err());
+}
+
+#[test]
+fn history_envelope_constants_distinguish_message_and_history_limits() {
+    assert_eq!(MAX_HISTORY_MESSAGE_COUNT, 32);
+    assert_eq!(MAX_HISTORY_BYTES, 32 * 1024);
+    assert_eq!(MAX_CONVERSATION_MESSAGE_BYTES, 16 * 1024);
 }
 
 #[test]

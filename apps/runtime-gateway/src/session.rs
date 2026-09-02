@@ -5,11 +5,11 @@ use std::time::Duration;
 use conversation_memory::{MemoryClock, MemoryStore, MemoryStoreErrorKind};
 use conversation_model_adapters::GenerationLanguageModel;
 use conversation_protocol::{
-    decode_client_command, encode_gateway_message, ClientCommand, ClientMemoryCursor,
+    decode_client_command, encode_gateway_message_for_version, ClientCommand, ClientMemoryCursor,
     ClientMemoryInspection, ClientMemorySummary, ClientPersonaState, ClientRuntimeError,
     ClientRuntimeEvent, ClientVoiceSessionEvent, GatewayMessage, MemoryApproval,
     RecoveryDisposition, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStatus, SessionId,
-    TurnId, VoiceSessionEvent,
+    TurnId, VoiceSessionEvent, CLIENT_PROTOCOL_VERSION,
 };
 use conversation_runtime::{
     ConversationContext, TextTurnEventStream, TextTurnRuntime, VoiceSessionAdapters,
@@ -169,12 +169,14 @@ impl GatewaySession {
         self
     }
 
+    /// Configures voice I/O and providers against the text runtime's conversation
+    /// context so both lanes always share persona, history, memory, and sequence.
     pub fn with_voice(
         mut self,
         voice: GatewayVoiceAdapters,
-        context: ConversationContext,
         language: Arc<dyn GenerationLanguageModel>,
     ) -> Self {
+        let context = self.runtime.context();
         self.voice = Some(VoiceLane {
             adapters: voice,
             context,
@@ -458,7 +460,7 @@ impl GatewaySession {
     }
 
     async fn handle_command(
-        &self,
+        &mut self,
         command: ClientCommand,
         urgent: &mpsc::Sender<GatewayMessage>,
         normal: &mpsc::Sender<GatewayMessage>,
@@ -540,6 +542,57 @@ impl GatewaySession {
                         self.memory_extraction.clone(),
                     );
                 Ok(())
+            }
+            ClientCommand::SeedConversationContext {
+                request_id,
+                operation_id,
+                exchanges,
+            } => {
+                if active.is_some() {
+                    return send_rejection(
+                        normal,
+                        &request_id,
+                        command_error(
+                            "conversation history cannot be seeded while a text turn is active",
+                        ),
+                    )
+                    .map_err(CommandFailure::response);
+                }
+                if voice.terminal_pending() {
+                    return send_rejection(
+                        normal,
+                        &request_id,
+                        command_error(
+                            "conversation history cannot be seeded while a voice session is finishing",
+                        ),
+                    )
+                    .map_err(CommandFailure::response);
+                }
+                if voice.active.is_some() {
+                    return send_rejection(
+                        normal,
+                        &request_id,
+                        command_error(
+                            "conversation history cannot be seeded while a voice session is active",
+                        ),
+                    )
+                    .map_err(CommandFailure::response);
+                }
+                match self
+                    .runtime
+                    .context()
+                    .seed_completed_history(&operation_id, &exchanges)
+                    .await
+                {
+                    Ok(()) => {
+                        self.status.last_context_seed_operation_id = Some(operation_id);
+                        send_accepted(normal, &request_id).map_err(CommandFailure::response)
+                    }
+                    Err(error) => {
+                        send_rejection(normal, &request_id, ClientRuntimeError::from(error))
+                            .map_err(CommandFailure::response)
+                    }
+                }
             }
             ClientCommand::InterruptTurn {
                 request_id,
@@ -1484,7 +1537,8 @@ where
     W: AsyncWrite + Unpin,
 {
     let terminal = is_terminal_voice_message(&message);
-    let payload = encode_gateway_message(&message).map_err(|_| GatewaySessionError::Encoding)?;
+    let payload = encode_gateway_message_for_version(&message, CLIENT_PROTOCOL_VERSION)
+        .map_err(|_| GatewaySessionError::Encoding)?;
     if terminal {
         writer
             .write_frame_with_ack(&payload, || {
@@ -1868,7 +1922,7 @@ mod tests {
         MemoryConfidence, MemoryDraft, MemoryKind, MemoryPatch, MemoryProvenance,
         MemoryProvenanceKind, MemoryRetention, PrivacyMode, RecoveryDisposition, RuntimeError,
         RuntimeErrorKind, RuntimeStage, RuntimeStatus, SessionId, TurnId, UnixTimestampMillis,
-        VoiceActivity, MAX_CLIENT_FRAME_BYTES, MAX_MEMORY_CONTENT_BYTES,
+        VoiceActivity, CLIENT_PROTOCOL_VERSION, MAX_CLIENT_FRAME_BYTES, MAX_MEMORY_CONTENT_BYTES,
     };
     use tempfile::TempDir;
     use tokio::io::{duplex, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
@@ -1915,6 +1969,522 @@ mod tests {
         assert!(response.contains(&format!(r#""id":"{}""#, record.id().get())));
         assert!(response.contains(r#""content_preview":"gateway list fixture""#));
         gateway.close().await;
+    }
+
+    #[tokio::test]
+    async fn context_seed_is_atomic_idempotent_recoverable_and_does_not_extract_memory() {
+        let (_temporary, store) = initialized_store();
+        let extraction = Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new()));
+        let context = test_context();
+        let runtime = conversation_runtime::TextTurnRuntime::new(
+            context.clone(),
+            Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new())),
+        );
+        let session = GatewaySession::new(runtime, status()).with_memory_extraction(
+            Arc::new(store),
+            extraction.clone(),
+            Arc::new(FixedClock(timestamp(10_000))),
+            crate::MemoryExtractionSettings::new(3, 90),
+        );
+        let mut gateway = InMemoryGateway::start(session).await;
+        let seed = r#"{"protocol_version":2,"type":"seed_conversation_context","request_id":"seed-1","operation_id":"continue-1","exchanges":[{"user":"seed user","assistant":"seed assistant"}]}"#;
+
+        gateway.write(seed).await;
+        assert_accepted_message(&gateway.read_message().await, "seed-1");
+        assert!(extraction.requests().is_empty());
+
+        let turn = context
+            .begin_turn(
+                conversation_runtime::ConversationTurnSource::Text,
+                "live user",
+            )
+            .await
+            .unwrap();
+        assert_eq!(turn.resolved().history_messages()[0].text(), "seed user");
+        assert_eq!(
+            turn.resolved().history_messages()[1].text(),
+            "seed assistant"
+        );
+        context.discard_turn(turn.identity(), false).await.unwrap();
+
+        gateway.write(seed).await;
+        assert_accepted_message(&gateway.read_message().await, "seed-1");
+
+        gateway
+            .write(
+                r#"{"protocol_version":2,"type":"seed_conversation_context","request_id":"seed-conflict","operation_id":"continue-1","exchanges":[{"user":"different user","assistant":"different assistant"}]}"#,
+            )
+            .await;
+        assert_rejected_message(
+            &gateway.read_message().await,
+            "seed-conflict",
+            "invalid_state",
+        );
+
+        gateway
+            .write(r#"{"protocol_version":2,"type":"status","request_id":"seed-status"}"#)
+            .await;
+        assert_accepted_message(&gateway.read_message().await, "seed-status");
+        let status = gateway.read_message().await;
+        assert!(status.contains(r#""last_context_seed_operation_id":"continue-1""#));
+        assert!(extraction.requests().is_empty());
+
+        gateway.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn context_seed_is_visible_to_the_next_voice_provider_request() {
+        let (input, input_receiver) = mpsc::channel(8);
+        let language = Arc::new(MockGenerationLanguageModel::new(["voice answer"]));
+        let session =
+            session_with_interactive_voice(input_receiver, language.clone(), no_speech_frames());
+        let mut gateway = InMemoryGateway::start(session).await;
+
+        gateway
+            .write(
+                r#"{"protocol_version":2,"type":"seed_conversation_context","request_id":"seed-before-voice","operation_id":"continue-before-voice","exchanges":[{"user":"seed user","assistant":"seed assistant"}]}"#,
+            )
+            .await;
+        assert_accepted_message(&gateway.read_message().await, "seed-before-voice");
+
+        gateway
+            .write(
+                r#"{"protocol_version":1,"type":"start_voice_session","request_id":"voice-after-seed"}"#,
+            )
+            .await;
+        let started = gateway
+            .read_until(|message| message.contains(r#""type":"voice_session_started""#))
+            .await;
+        assert!(started.iter().any(|message| {
+            message.contains(r#""type":"command_accepted""#)
+                && message.contains(r#""request_id":"voice-after-seed""#)
+        }));
+
+        send_voice_input(
+            &input,
+            VoiceInputEvent::Activity(VoiceActivity::SpeechStarted { at_ms: 0 }),
+        )
+        .await;
+        send_voice_input(
+            &input,
+            VoiceInputEvent::Recognition(RecognitionEvent::Hypothesis(
+                RecognitionHypothesis::engine_final(1, "live voice question"),
+            )),
+        )
+        .await;
+        send_voice_input(
+            &input,
+            VoiceInputEvent::Activity(VoiceActivity::SpeechEnded { at_ms: 0 }),
+        )
+        .await;
+        tokio::time::advance(Duration::from_millis(900)).await;
+        timeout(TEST_TIMEOUT, async {
+            while language.requests().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("voice provider request did not start");
+
+        let requests = language.requests();
+        let history = requests[0].input().recent_messages();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].text(), "seed user");
+        assert_eq!(history[1].text(), "seed assistant");
+
+        drop(input);
+        let _ = gateway.read_until(is_voice_terminal).await;
+        gateway.close().await;
+    }
+
+    #[tokio::test]
+    async fn context_seed_capability_follows_text_in_the_v2_ready_message() {
+        let ready = first_ready_message(GatewaySession::new(unused_runtime(), status())).await;
+
+        assert!(ready.contains(&format!(r#""protocol_version":{CLIENT_PROTOCOL_VERSION}"#)));
+        assert_eq!(
+            ready_capabilities(&ready),
+            vec!["text".to_owned(), "conversation_context_seed".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn context_seed_is_rejected_once_while_a_text_turn_is_active() {
+        let language = Arc::new(PendingLanguageModel::default());
+        let runtime = conversation_runtime::TextTurnRuntime::new(test_context(), language.clone());
+        let mut gateway = InMemoryGateway::start(GatewaySession::new(runtime, status())).await;
+
+        gateway
+            .write(
+                r#"{"protocol_version":1,"type":"start_turn","request_id":"text-active","transcript":"hold this turn"}"#,
+            )
+            .await;
+        let _ = gateway
+            .read_until(|message| message.contains(r#""request_id":"text-active""#))
+            .await;
+        timeout(TEST_TIMEOUT, language.started.notified())
+            .await
+            .expect("pending language model did not start");
+
+        gateway
+            .write(
+                r#"{"protocol_version":2,"type":"seed_conversation_context","request_id":"seed-text-active","operation_id":"continue-text-active","exchanges":[{"user":"seed user","assistant":"seed assistant"}]}"#,
+            )
+            .await;
+        let messages = gateway
+            .read_until(|message| message.contains(r#""request_id":"seed-text-active""#))
+            .await;
+        let correlated = messages
+            .iter()
+            .filter(|message| message.contains(r#""request_id":"seed-text-active""#))
+            .collect::<Vec<_>>();
+        assert_eq!(correlated.len(), 1);
+        assert_rejected_message(correlated[0], "seed-text-active", "invalid_state");
+
+        gateway.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn context_seed_is_rejected_during_voice_start_listening_and_pause() {
+        let (input, input_receiver) = mpsc::channel(8);
+        let language = Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new()));
+        let session = session_with_interactive_voice(input_receiver, language, no_speech_frames());
+        let mut gateway = InMemoryGateway::start(session).await;
+
+        gateway
+            .write(
+                r#"{"protocol_version":1,"type":"start_voice_session","request_id":"voice-seed"}"#,
+            )
+            .await;
+        gateway
+            .write(
+                r#"{"protocol_version":2,"type":"seed_conversation_context","request_id":"seed-voice-starting","operation_id":"continue-voice-starting","exchanges":[{"user":"seed user","assistant":"seed assistant"}]}"#,
+            )
+            .await;
+        let starting_messages = gateway
+            .read_until(|message| message.contains(r#""request_id":"seed-voice-starting""#))
+            .await;
+        let starting_response = starting_messages
+            .iter()
+            .find(|message| message.contains(r#""request_id":"seed-voice-starting""#))
+            .unwrap();
+        assert_rejected_message(starting_response, "seed-voice-starting", "invalid_state");
+
+        gateway
+            .write(
+                r#"{"protocol_version":1,"type":"pause_voice_capture","request_id":"pause-seed"}"#,
+            )
+            .await;
+        let _ = gateway
+            .read_until(|message| message.contains(r#""type":"voice_capture_paused""#))
+            .await;
+        gateway
+            .write(
+                r#"{"protocol_version":2,"type":"seed_conversation_context","request_id":"seed-voice-paused","operation_id":"continue-voice-paused","exchanges":[{"user":"seed user","assistant":"seed assistant"}]}"#,
+            )
+            .await;
+        assert_rejected_message(
+            &gateway.read_message().await,
+            "seed-voice-paused",
+            "invalid_state",
+        );
+
+        drop(input);
+        let _ = gateway.read_until(is_voice_terminal).await;
+        gateway.close().await;
+    }
+
+    #[tokio::test]
+    async fn context_seed_is_rejected_once_while_voice_startup_is_gated() {
+        let (input, input_receiver) = mpsc::channel(8);
+        let context = test_context();
+        context
+            .seed_completed_history(
+                "original-startup-history",
+                &[conversation_protocol::ConversationContextExchange::new(
+                    "original user",
+                    "original assistant",
+                )
+                .unwrap()],
+            )
+            .await
+            .unwrap();
+        let runtime = conversation_runtime::TextTurnRuntime::new(
+            context.clone(),
+            Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new())),
+        );
+        let factory = GatedVoiceIoFactory::new(input_receiver);
+        let adapters = GatewayVoiceAdapters {
+            io: factory.clone(),
+            speech: no_speech_frames(),
+            policy: voice_policy(),
+        };
+        let session = GatewaySession::new(runtime, status_with_voice()).with_voice(
+            adapters,
+            Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new())),
+        );
+        let mut gateway = InMemoryGateway::start(session).await;
+
+        gateway
+            .write(
+                r#"{"protocol_version":1,"type":"start_voice_session","request_id":"voice-starting-gated"}"#,
+            )
+            .await;
+        timeout(TEST_TIMEOUT, factory.startup_started.wait())
+            .await
+            .expect("voice I/O startup was never invoked");
+        gateway
+            .write(
+                r#"{"protocol_version":2,"type":"seed_conversation_context","request_id":"seed-during-startup","operation_id":"replacement-during-startup","exchanges":[{"user":"replacement user","assistant":"replacement assistant"}]}"#,
+            )
+            .await;
+
+        let mut messages = gateway
+            .read_until(|message| message.contains(r#""request_id":"seed-during-startup""#))
+            .await;
+        let correlated = messages
+            .iter()
+            .filter(|message| message.contains(r#""request_id":"seed-during-startup""#))
+            .collect::<Vec<_>>();
+        assert_eq!(correlated.len(), 1);
+        assert_rejected_message(correlated[0], "seed-during-startup", "invalid_state");
+        assert!(!messages
+            .iter()
+            .any(|message| message.contains(r#""type":"voice_session_started""#)));
+
+        factory.startup_release.set();
+        messages.extend(
+            gateway
+                .read_until(|message| message.contains(r#""type":"voice_session_started""#))
+                .await,
+        );
+        drop(input);
+        messages.extend(gateway.read_until(is_voice_terminal).await);
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.contains(r#""request_id":"seed-during-startup""#))
+                .count(),
+            1
+        );
+        assert_single_history_exchange(&context, "original user", "original assistant").await;
+        gateway.close().await;
+    }
+
+    #[tokio::test]
+    async fn context_seed_is_rejected_once_during_pausing_and_resuming() {
+        let (input, input_receiver) = mpsc::channel(8);
+        let context = test_context();
+        context
+            .seed_completed_history(
+                "original-control-history",
+                &[conversation_protocol::ConversationContextExchange::new(
+                    "original user",
+                    "original assistant",
+                )
+                .unwrap()],
+            )
+            .await
+            .unwrap();
+        let runtime = conversation_runtime::TextTurnRuntime::new(
+            context.clone(),
+            Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new())),
+        );
+        let capture = GatedVoiceCaptureControl::new();
+        let adapters = GatewayVoiceAdapters {
+            io: Arc::new(TestVoiceIoFactory::with_capture(
+                input_receiver,
+                capture.clone(),
+            )),
+            speech: no_speech_frames(),
+            policy: voice_policy(),
+        };
+        let session = GatewaySession::new(runtime, status_with_voice()).with_voice(
+            adapters,
+            Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new())),
+        );
+        let mut gateway = InMemoryGateway::start(session).await;
+
+        gateway
+            .write(
+                r#"{"protocol_version":1,"type":"start_voice_session","request_id":"voice-controls-gated"}"#,
+            )
+            .await;
+        let _ = gateway
+            .read_until(|message| message.contains(r#""type":"voice_session_started""#))
+            .await;
+
+        gateway
+            .write(
+                r#"{"protocol_version":1,"type":"pause_voice_capture","request_id":"pause-gated"}"#,
+            )
+            .await;
+        timeout(TEST_TIMEOUT, capture.pause_started.wait())
+            .await
+            .expect("pause transition never started");
+        gateway
+            .write(
+                r#"{"protocol_version":2,"type":"seed_conversation_context","request_id":"seed-during-pausing","operation_id":"replacement-during-pausing","exchanges":[{"user":"pausing replacement","assistant":"pausing replacement answer"}]}"#,
+            )
+            .await;
+        let pausing = gateway
+            .read_until(|message| message.contains(r#""request_id":"seed-during-pausing""#))
+            .await;
+        let pausing_correlated = pausing
+            .iter()
+            .filter(|message| message.contains(r#""request_id":"seed-during-pausing""#))
+            .collect::<Vec<_>>();
+        assert_eq!(pausing_correlated.len(), 1);
+        assert_rejected_message(
+            pausing_correlated[0],
+            "seed-during-pausing",
+            "invalid_state",
+        );
+
+        capture.pause_release.set();
+        let _ = gateway
+            .read_until(|message| message.contains(r#""type":"voice_capture_paused""#))
+            .await;
+        gateway
+            .write(
+                r#"{"protocol_version":1,"type":"resume_voice_capture","request_id":"resume-gated"}"#,
+            )
+            .await;
+        timeout(TEST_TIMEOUT, capture.resume_started.wait())
+            .await
+            .expect("resume transition never started");
+        gateway
+            .write(
+                r#"{"protocol_version":2,"type":"seed_conversation_context","request_id":"seed-during-resuming","operation_id":"replacement-during-resuming","exchanges":[{"user":"resuming replacement","assistant":"resuming replacement answer"}]}"#,
+            )
+            .await;
+        let resuming = gateway
+            .read_until(|message| message.contains(r#""request_id":"seed-during-resuming""#))
+            .await;
+        let resuming_correlated = resuming
+            .iter()
+            .filter(|message| message.contains(r#""request_id":"seed-during-resuming""#))
+            .collect::<Vec<_>>();
+        assert_eq!(resuming_correlated.len(), 1);
+        assert_rejected_message(
+            resuming_correlated[0],
+            "seed-during-resuming",
+            "invalid_state",
+        );
+
+        capture.resume_release.set();
+        let _ = gateway
+            .read_until(|message| message.contains(r#""type":"voice_capture_resumed""#))
+            .await;
+        drop(input);
+        let _ = gateway.read_until(is_voice_terminal).await;
+        assert_single_history_exchange(&context, "original user", "original assistant").await;
+        gateway.close().await;
+    }
+
+    #[tokio::test]
+    async fn context_seed_queued_during_voice_stop_rejects_while_terminal_is_pending() {
+        let (input, input_receiver) = mpsc::channel(8);
+        let context = test_context();
+        context
+            .seed_completed_history(
+                "original-stop-history",
+                &[conversation_protocol::ConversationContextExchange::new(
+                    "original user",
+                    "original assistant",
+                )
+                .unwrap()],
+            )
+            .await
+            .unwrap();
+        let runtime = conversation_runtime::TextTurnRuntime::new(
+            context.clone(),
+            Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new())),
+        );
+        let language = Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new()));
+        let adapters = GatewayVoiceAdapters {
+            io: Arc::new(TestVoiceIoFactory::with_capture(
+                input_receiver,
+                Arc::new(MockVoiceCaptureControl::new()),
+            )),
+            speech: no_speech_frames(),
+            policy: voice_policy(),
+        };
+        let session =
+            GatewaySession::new(runtime, status_with_voice()).with_voice(adapters, language);
+        let (mut client_input, reader) = duplex(4096);
+        let (writer, writer_state) = ReadyFlushBlockingWriter::new();
+        let writer_lanes = super::WriterLanes::new();
+        let urgent_monitor = writer_lanes.urgent_sender.clone();
+        let normal_monitor = writer_lanes.normal_sender.clone();
+        let event_monitor = writer_lanes.event_sender.clone();
+        let session_task =
+            tokio::spawn(session.run_with_writer_lanes(reader, writer, writer_lanes));
+
+        timeout(TEST_TIMEOUT, writer_state.blocked.wait())
+            .await
+            .expect("gateway writer did not block while flushing ready");
+        write_command(
+            &mut client_input,
+            r#"{"protocol_version":1,"type":"start_voice_session","request_id":"voice-1"}"#,
+        )
+        .await;
+        wait_for_queued_start_acceptance_and_turn_started(&urgent_monitor, &event_monitor).await;
+        write_command(
+            &mut client_input,
+            r#"{"protocol_version":1,"type":"stop_voice_session","request_id":"stop-1"}"#,
+        )
+        .await;
+        timeout(TEST_TIMEOUT, async {
+            while queued_messages(&normal_monitor) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("voice terminal and stop acceptance were not queued");
+        write_command(
+            &mut client_input,
+            r#"{"protocol_version":2,"type":"seed_conversation_context","request_id":"seed-stopping","operation_id":"continue-stopping","exchanges":[{"user":"seed user","assistant":"seed assistant"}]}"#,
+        )
+        .await;
+        timeout(TEST_TIMEOUT, async {
+            while queued_messages(&normal_monitor) < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("seed queued during stop did not receive a response");
+
+        drop(urgent_monitor);
+        drop(normal_monitor);
+        drop(event_monitor);
+        writer_state.release();
+        drop(input);
+        drop(client_input);
+        timeout(TEST_TIMEOUT, session_task)
+            .await
+            .expect("gateway session did not close")
+            .unwrap()
+            .unwrap();
+
+        let messages = decode_frames(&writer_state.bytes());
+        let correlated = messages
+            .iter()
+            .filter(|message| message.contains(r#""request_id":"seed-stopping""#))
+            .collect::<Vec<_>>();
+        assert_eq!(correlated.len(), 1);
+        assert_rejected_message(correlated[0], "seed-stopping", "invalid_state");
+        let terminal = message_index(&messages, is_voice_terminal);
+        let stop_accepted = message_index(&messages, |message| {
+            message.contains(r#""type":"command_accepted""#)
+                && message.contains(r#""request_id":"stop-1""#)
+        });
+        let seed_rejected = message_index(&messages, |message| {
+            message.contains(r#""request_id":"seed-stopping""#)
+        });
+        assert!(terminal < stop_accepted);
+        assert!(stop_accepted < seed_rejected);
+        assert_single_history_exchange(&context, "original user", "original assistant").await;
     }
 
     #[tokio::test]
@@ -2781,8 +3351,16 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn start_turn_requires_active_voice_capture_to_be_paused() {
         let (input, input_receiver) = mpsc::channel(8);
-        let language = Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new()));
-        let session = session_with_interactive_voice(input_receiver, language, no_speech_frames());
+        let voice_language = Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new()));
+        let text_language = Arc::new(PendingLanguageModel::default());
+        let text_runtime =
+            conversation_runtime::TextTurnRuntime::new(test_context(), text_language.clone());
+        let session = session_with_voice_and_runtime(
+            text_runtime,
+            input_receiver,
+            voice_language,
+            no_speech_frames(),
+        );
         let mut gateway = InMemoryGateway::start(session).await;
 
         gateway
@@ -2819,6 +3397,9 @@ mod tests {
             )
             .await;
         assert_accepted_message(&gateway.read_message().await, "text-paused");
+        timeout(TEST_TIMEOUT, text_language.started.notified())
+            .await
+            .expect("text turn did not remain active for the resume rejection");
         gateway
             .write(r#"{"protocol_version":1,"type":"resume_voice_capture","request_id":"resume-during-text"}"#)
             .await;
@@ -2830,6 +3411,7 @@ mod tests {
             "resume-during-text",
             "invalid_state",
         );
+        text_language.release.notify_one();
         let is_text_terminal = |message: &str| {
             message.contains(r#""type":"turn_completed""#)
                 || message.contains(r#""type":"turn_cancelled""#)
@@ -3820,7 +4402,7 @@ mod tests {
             policy: voice_policy(),
         };
         let session = GatewaySession::new(unused_runtime(), status_with_voice())
-            .with_voice(adapters, test_context(), turn_language)
+            .with_voice(adapters, turn_language)
             .with_memory_extraction(
                 Arc::new(store.clone()),
                 Arc::new(extraction),
@@ -3962,6 +4544,39 @@ mod tests {
             let (sender, receiver) = mpsc::channel(1);
             self.stalled.lock().unwrap().push(sender);
             self.requests.lock().unwrap().push(cancellation);
+            receiver
+        }
+    }
+
+    #[derive(Default)]
+    struct PendingLanguageModel {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    impl GenerationLanguageModel for PendingLanguageModel {
+        fn stream(
+            &self,
+            request: GenerationLanguageRequest,
+            cancellation: CancellationToken,
+        ) -> mpsc::Receiver<Result<GenerationTextDelta, AdapterError>> {
+            let (sender, receiver) = mpsc::channel(1);
+            let started = Arc::clone(&self.started);
+            let release = Arc::clone(&self.release);
+            tokio::spawn(async move {
+                started.notify_one();
+                tokio::select! {
+                    _ = cancellation.cancelled() => {}
+                    _ = release.notified() => {
+                        let _ = sender.send(Ok(GenerationTextDelta::new(
+                            request.turn_id(),
+                            request.generation_id(),
+                            "completed response",
+                        ))).await;
+                    }
+                }
+                drop(sender);
+            });
             receiver
         }
     }
@@ -4489,9 +5104,18 @@ mod tests {
     }
 
     fn assert_rejected_message(message: &str, request_id: &str, code: &str) {
-        assert!(message.contains(r#""type":"command_rejected""#));
-        assert!(message.contains(&format!(r#""request_id":"{request_id}""#)));
-        assert!(message.contains(&format!(r#""code":"{code}""#)));
+        assert!(
+            message.contains(r#""type":"command_rejected""#),
+            "expected command rejection, received {message}"
+        );
+        assert!(
+            message.contains(&format!(r#""request_id":"{request_id}""#)),
+            "expected request {request_id}, received {message}"
+        );
+        assert!(
+            message.contains(&format!(r#""code":"{code}""#)),
+            "expected error code {code}, received {message}"
+        );
     }
 
     async fn assert_rejection_then_status(
@@ -4563,12 +5187,13 @@ mod tests {
             memory_enabled: false,
             memory_location: None,
             telemetry_enabled: false,
-            capabilities: vec!["text".to_owned()],
+            capabilities: vec!["text".to_owned(), "conversation_context_seed".to_owned()],
             components: vec![conversation_protocol::ClientComponentDescriptor {
                 kind: "language_model".to_owned(),
                 execution_location: "local".to_owned(),
                 provider_label: "test-language".to_owned(),
             }],
+            last_context_seed_operation_id: None,
         }
     }
 
@@ -4576,7 +5201,11 @@ mod tests {
         RuntimeStatus {
             memory_enabled: true,
             memory_location: Some("local".to_owned()),
-            capabilities: vec!["text".to_owned(), "memory_inspection".to_owned()],
+            capabilities: vec![
+                "text".to_owned(),
+                "conversation_context_seed".to_owned(),
+                "memory_inspection".to_owned(),
+            ],
             components: vec![
                 conversation_protocol::ClientComponentDescriptor {
                     kind: "language_model".to_owned(),
@@ -4595,7 +5224,11 @@ mod tests {
 
     fn status_with_voice() -> RuntimeStatus {
         RuntimeStatus {
-            capabilities: vec!["text".to_owned(), "voice_session".to_owned()],
+            capabilities: vec![
+                "text".to_owned(),
+                "conversation_context_seed".to_owned(),
+                "voice_session".to_owned(),
+            ],
             components: vec![
                 conversation_protocol::ClientComponentDescriptor {
                     kind: "speech_recognition".to_owned(),
@@ -4694,11 +5327,8 @@ mod tests {
 
     fn session_with_voice() -> (GatewaySession, VoiceTestGuards) {
         let (voice_adapters, guards) = test_voice_adapters();
-        let session = GatewaySession::new(unused_runtime(), status_with_voice()).with_voice(
-            voice_adapters,
-            test_context(),
-            test_language(),
-        );
+        let session = GatewaySession::new(unused_runtime(), status_with_voice())
+            .with_voice(voice_adapters, test_language());
         (session, guards)
     }
 
@@ -4772,6 +5402,39 @@ mod tests {
                         Ok(())
                     }),
                 })
+            })
+        }
+    }
+
+    struct GatedVoiceIoFactory {
+        inner: TestVoiceIoFactory,
+        startup_started: Condition,
+        startup_release: Condition,
+    }
+
+    impl GatedVoiceIoFactory {
+        fn new(input_receiver: mpsc::Receiver<Result<VoiceInputEvent, AdapterError>>) -> Arc<Self> {
+            Arc::new(Self {
+                inner: TestVoiceIoFactory::with_capture(
+                    input_receiver,
+                    Arc::new(MockVoiceCaptureControl::new()),
+                ),
+                startup_started: Condition::default(),
+                startup_release: Condition::default(),
+            })
+        }
+    }
+
+    impl VoiceIoFactory for GatedVoiceIoFactory {
+        fn start<'a>(
+            &'a self,
+            session_id: SessionId,
+            cancellation: CancellationToken,
+        ) -> AdapterFuture<'a, VoiceIoSession> {
+            Box::pin(async move {
+                self.startup_started.set();
+                self.startup_release.wait().await;
+                self.inner.start(session_id, cancellation).await
             })
         }
     }
@@ -4863,11 +5526,7 @@ mod tests {
             speech,
             policy: voice_policy(),
         };
-        GatewaySession::new(unused_runtime(), status_with_voice()).with_voice(
-            adapters,
-            test_context(),
-            language,
-        )
+        GatewaySession::new(unused_runtime(), status_with_voice()).with_voice(adapters, language)
     }
 
     /// Like `session_with_interactive_voice`, but also returns a handle a test can
@@ -4889,11 +5548,8 @@ mod tests {
             speech,
             policy: voice_policy(),
         };
-        let session = GatewaySession::new(unused_runtime(), status_with_voice()).with_voice(
-            adapters,
-            test_context(),
-            language,
-        );
+        let session = GatewaySession::new(unused_runtime(), status_with_voice())
+            .with_voice(adapters, language);
         (session, cancelled)
     }
 
@@ -4914,11 +5570,7 @@ mod tests {
             speech,
             policy: voice_policy(),
         };
-        GatewaySession::new(runtime, status_with_voice()).with_voice(
-            adapters,
-            test_context(),
-            language,
-        )
+        GatewaySession::new(runtime, status_with_voice()).with_voice(adapters, language)
     }
 
     fn no_speech_frames() -> Arc<MockStreamingSpeechSynthesizer> {
@@ -4937,6 +5589,25 @@ mod tests {
         message.contains(r#""type":"voice_session_ended""#)
             || (message.contains(r#""type":"voice_session_failed""#)
                 && message.contains(r#""recovery":"new_session""#))
+    }
+
+    async fn assert_single_history_exchange(
+        context: &conversation_runtime::ConversationContext,
+        user: &str,
+        assistant: &str,
+    ) {
+        let turn = context
+            .begin_turn(
+                conversation_runtime::ConversationTurnSource::Text,
+                "history inspection probe",
+            )
+            .await
+            .unwrap();
+        let history = turn.resolved().history_messages();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].text(), user);
+        assert_eq!(history[1].text(), assistant);
+        context.discard_turn(turn.identity(), false).await.unwrap();
     }
 
     async fn first_ready_message(session: GatewaySession) -> String {

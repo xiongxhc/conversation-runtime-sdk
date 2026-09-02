@@ -42,7 +42,8 @@ describe("MemoryPane", () => {
     renderPane(session);
 
     expect(screen.getByText("Loading memories…")).toBeTruthy();
-    expect(screen.getByLabelText("Runtime memory").getAttribute("aria-busy")).toBe("true");
+    expect(screen.getByLabelText("Memory review").getAttribute("aria-busy")).toBe("true");
+    expect(screen.getByRole("heading", { name: "Memory review" })).toBeTruthy();
 
     pendingPage.resolve({ records: [], nextCursor: null });
 
@@ -507,7 +508,7 @@ describe("MemoryPane", () => {
     expect(screen.getByText("Delete this memory permanently?")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Confirm delete" }));
 
-    expect(await screen.findByRole("heading", { name: "Runtime memory" })).toBeTruthy();
+    expect(await screen.findByRole("heading", { name: "Memory review" })).toBeTruthy();
     expect((await screen.findByRole("status")).textContent).toBe("Memory deleted");
     expect(screen.getByText("No memories to inspect.")).toBeTruthy();
     expect(session.deleteMemory).toHaveBeenCalledWith(7n, 3n);
@@ -650,7 +651,7 @@ describe("MemoryPane", () => {
     fireEvent.click(await screen.findByRole("button", { name: /Prefers concise explanations/ }));
     fireEvent.click(await screen.findByRole("button", { name: "Approve" }));
 
-    expect(await screen.findByRole("heading", { name: "Runtime memory" })).toBeTruthy();
+    expect(await screen.findByRole("heading", { name: "Memory review" })).toBeTruthy();
     expect((await screen.findByRole("status")).textContent).toContain(
       "That memory no longer exists. The list has been refreshed.",
     );
@@ -667,7 +668,7 @@ describe("MemoryPane", () => {
     fireEvent.click(await screen.findByRole("button", { name: /Prefers concise explanations/ }));
     await confirmDelete();
 
-    expect(await screen.findByRole("heading", { name: "Runtime memory" })).toBeTruthy();
+    expect(await screen.findByRole("heading", { name: "Memory review" })).toBeTruthy();
     expect((await screen.findByRole("status")).textContent).toContain(
       "That memory no longer exists. The list has been refreshed.",
     );
@@ -717,6 +718,7 @@ class MemorySession implements DesktopSession {
     status: localMemoryStatus,
     turns: [],
     activeTurn: undefined,
+    continuation: { inProgress: false },
     voice: {
       availability: "unavailable",
       session: "idle",
@@ -727,6 +729,7 @@ class MemorySession implements DesktopSession {
     error: undefined,
   };
   readonly close = vi.fn(async () => undefined);
+  readonly continueWithSeed = vi.fn<DesktopSession["continueWithSeed"]>(async () => undefined);
   readonly inspectMemory = vi.fn<(memoryId: bigint) => Promise<MemoryInspection>>();
   readonly approveMemory = vi.fn<DesktopSession["approveMemory"]>();
   readonly deleteMemory = vi.fn<DesktopSession["deleteMemory"]>();

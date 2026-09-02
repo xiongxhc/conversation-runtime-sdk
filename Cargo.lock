@@ -396,9 +396,11 @@ dependencies = [
 name = "conversation-desktop"
 version = "0.1.0"
 dependencies = [
+ "conversation-model-adapters",
  "conversation-protocol",
  "conversation-runtime-gateway",
  "libc",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
@@ -406,6 +408,7 @@ dependencies = [
  "tauri-build",
  "tempfile",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

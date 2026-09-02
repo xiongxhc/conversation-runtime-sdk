@@ -183,7 +183,7 @@ fn generation_language_carries_bounded_typed_quality_input() {
 }
 
 #[test]
-fn language_input_enforces_a_forty_kib_aggregate_with_typed_memory() {
+fn language_input_accepts_typed_memory_beyond_the_former_forty_kib_envelope() {
     let turn_id = TurnId::new(5);
     let decision = QualityDecision::new(
         turn_id,
@@ -223,18 +223,15 @@ fn language_input_enforces_a_forty_kib_aggregate_with_typed_memory() {
         MemoryRetrievalReason::SharedTerm,
     )
     .unwrap();
-    let error = LanguageModelInput::with_quality_and_memory(
+    let extended = LanguageModelInput::with_quality_and_memory(
         transcript,
         history,
         decision,
         guidance,
         [full_item, extra_item],
     )
-    .unwrap_err();
-    assert_eq!(
-        error.message(),
-        "language-model aggregate input exceeds 40 KiB"
-    );
+    .unwrap();
+    assert_eq!(extended.memory_items().len(), 2);
 }
 
 #[tokio::test]

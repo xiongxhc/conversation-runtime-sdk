@@ -9,12 +9,41 @@ use crate::{
     ConversationMode, FollowUpPolicy, MemoryId, MemoryRetrievalTrace, QualityDecision,
     ResponseControls, RetrievalTraceId, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage,
     RuntimeTimingMilestone, SilencePolicy, SpeechPace, TurnId, MAX_CONVERSATION_MESSAGE_BYTES,
-    MAX_MEMORY_CONTENT_BYTES, MAX_MEMORY_INSPECTION_HISTORY_ITEMS, MAX_MEMORY_LIST_PAGE_ITEMS,
-    MAX_MEMORY_PREVIEW_BYTES,
+    MAX_HISTORY_BYTES, MAX_MEMORY_CONTENT_BYTES, MAX_MEMORY_INSPECTION_HISTORY_ITEMS,
+    MAX_MEMORY_LIST_PAGE_ITEMS, MAX_MEMORY_PREVIEW_BYTES,
 };
 
-pub const CLIENT_PROTOCOL_VERSION: u64 = 1;
+pub const LEGACY_CLIENT_PROTOCOL_VERSION: u64 = 1;
+pub const CLIENT_PROTOCOL_VERSION: u64 = 2;
 pub const MAX_CLIENT_FRAME_BYTES: usize = 512 * 1024;
+const MAX_CONVERSATION_CONTEXT_EXCHANGES: usize = 16;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConversationContextExchange {
+    user: String,
+    assistant: String,
+}
+
+impl ConversationContextExchange {
+    pub fn new(
+        user: impl Into<String>,
+        assistant: impl Into<String>,
+    ) -> Result<Self, ClientWireError> {
+        let user = user.into();
+        let assistant = assistant.into();
+        validate_context_content(&user)?;
+        validate_context_content(&assistant)?;
+        Ok(Self { user, assistant })
+    }
+
+    pub fn user(&self) -> &str {
+        &self.user
+    }
+
+    pub fn assistant(&self) -> &str {
+        &self.assistant
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClientCommand {
@@ -40,6 +69,11 @@ pub enum ClientCommand {
     },
     ResumeVoiceCapture {
         request_id: String,
+    },
+    SeedConversationContext {
+        request_id: String,
+        operation_id: String,
+        exchanges: Vec<ConversationContextExchange>,
     },
     MemoryList {
         request_id: String,
@@ -175,6 +209,7 @@ pub struct RuntimeStatus {
     pub telemetry_enabled: bool,
     pub capabilities: Vec<String>,
     pub components: Vec<ClientComponentDescriptor>,
+    pub last_context_seed_operation_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -233,6 +268,7 @@ pub enum ClientWireError {
     UnsupportedProtocolVersion(u64),
     InvalidRequestId,
     InvalidTranscript,
+    InvalidConversationContext,
     InvalidIdentifier,
     InvalidRuntimeErrorCode,
     InvalidRuntimeStatus,
@@ -253,6 +289,9 @@ impl fmt::Display for ClientWireError {
             }
             Self::InvalidRequestId => formatter.write_str("invalid client request identifier"),
             Self::InvalidTranscript => formatter.write_str("invalid client transcript"),
+            Self::InvalidConversationContext => {
+                formatter.write_str("invalid client conversation context")
+            }
             Self::InvalidIdentifier => formatter.write_str("invalid decimal identifier"),
             Self::InvalidRuntimeErrorCode => {
                 formatter.write_str("invalid client runtime error code")
@@ -501,6 +540,26 @@ pub fn decode_client_command(payload: &[u8]) -> Result<ClientCommand, ClientWire
             validate_request_id(&request_id)?;
             Ok(ClientCommand::ResumeVoiceCapture { request_id })
         }
+        WireClientCommand::SeedConversationContext {
+            protocol_version,
+            request_id,
+            operation_id,
+            exchanges,
+        } => {
+            if protocol_version != CLIENT_PROTOCOL_VERSION {
+                return Err(ClientWireError::UnsupportedProtocolVersion(
+                    protocol_version,
+                ));
+            }
+            validate_request_id(&request_id)?;
+            validate_request_id(&operation_id)?;
+            let exchanges = validate_context_exchanges(exchanges)?;
+            Ok(ClientCommand::SeedConversationContext {
+                request_id,
+                operation_id,
+                exchanges,
+            })
+        }
         WireClientCommand::MemoryList {
             protocol_version,
             request_id,
@@ -584,8 +643,16 @@ pub fn decode_client_command(payload: &[u8]) -> Result<ClientCommand, ClientWire
 }
 
 pub fn encode_gateway_message(message: &GatewayMessage) -> Result<Vec<u8>, ClientWireError> {
-    validate_gateway_message(message)?;
-    let encoded = serde_json::to_vec(&GatewayMessageEnvelope::from(message))
+    encode_gateway_message_for_version(message, LEGACY_CLIENT_PROTOCOL_VERSION)
+}
+
+pub fn encode_gateway_message_for_version(
+    message: &GatewayMessage,
+    protocol_version: u64,
+) -> Result<Vec<u8>, ClientWireError> {
+    validate_protocol_version(protocol_version)?;
+    validate_gateway_message(message, protocol_version)?;
+    let encoded = serde_json::to_vec(&GatewayMessageEnvelope::new(message, protocol_version))
         .expect("client wire DTOs must serialize");
     validate_payload_size(encoded.len())?;
     Ok(encoded)
@@ -624,6 +691,12 @@ enum WireClientCommand {
         protocol_version: u64,
         request_id: String,
     },
+    SeedConversationContext {
+        protocol_version: u64,
+        request_id: String,
+        operation_id: String,
+        exchanges: Vec<WireConversationContextExchange>,
+    },
     MemoryList {
         protocol_version: u64,
         request_id: String,
@@ -655,6 +728,13 @@ enum WireClientCommand {
         memory_id: DecimalIdentifier,
         expected_revision: DecimalIdentifier,
     },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireConversationContextExchange {
+    user: String,
+    assistant: String,
 }
 
 #[derive(Deserialize)]
@@ -854,11 +934,45 @@ impl From<&crate::ClientMemoryApproval> for WireClientMemoryApproval {
 }
 
 #[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct WireRuntimeStatus<'a> {
+    transport: &'a str,
+    privacy_mode: &'a str,
+    language_location: &'a str,
+    model_id: &'a str,
+    memory_enabled: bool,
+    memory_location: Option<&'a str>,
+    telemetry_enabled: bool,
+    capabilities: &'a [String],
+    components: &'a [ClientComponentDescriptor],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_context_seed_operation_id: Option<Option<&'a str>>,
+}
+
+impl<'a> WireRuntimeStatus<'a> {
+    fn new(status: &'a RuntimeStatus, protocol_version: u64) -> Self {
+        Self {
+            transport: &status.transport,
+            privacy_mode: &status.privacy_mode,
+            language_location: &status.language_location,
+            model_id: &status.model_id,
+            memory_enabled: status.memory_enabled,
+            memory_location: status.memory_location.as_deref(),
+            telemetry_enabled: status.telemetry_enabled,
+            capabilities: &status.capabilities,
+            components: &status.components,
+            last_context_seed_operation_id: (protocol_version == CLIENT_PROTOCOL_VERSION)
+                .then_some(status.last_context_seed_operation_id.as_deref()),
+        }
+    }
+}
+
+#[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum GatewayMessageEnvelope<'a> {
     Ready {
         protocol_version: u64,
-        status: &'a RuntimeStatus,
+        status: WireRuntimeStatus<'a>,
     },
     CommandAccepted {
         protocol_version: u64,
@@ -874,7 +988,7 @@ enum GatewayMessageEnvelope<'a> {
     Status {
         protocol_version: u64,
         request_id: &'a str,
-        status: &'a RuntimeStatus,
+        status: WireRuntimeStatus<'a>,
     },
     MemoryList {
         protocol_version: u64,
@@ -917,37 +1031,37 @@ enum GatewayMessageEnvelope<'a> {
     },
 }
 
-impl<'a> From<&'a GatewayMessage> for GatewayMessageEnvelope<'a> {
-    fn from(message: &'a GatewayMessage) -> Self {
+impl<'a> GatewayMessageEnvelope<'a> {
+    fn new(message: &'a GatewayMessage, protocol_version: u64) -> Self {
         match message {
             GatewayMessage::Ready { status } => Self::Ready {
-                protocol_version: CLIENT_PROTOCOL_VERSION,
-                status,
+                protocol_version,
+                status: WireRuntimeStatus::new(status, protocol_version),
             },
             GatewayMessage::CommandAccepted {
                 request_id,
                 turn_id,
             } => Self::CommandAccepted {
-                protocol_version: CLIENT_PROTOCOL_VERSION,
+                protocol_version,
                 request_id,
                 turn_id: turn_id.map(|turn_id| turn_id.get().to_string()),
             },
             GatewayMessage::CommandRejected { request_id, error } => Self::CommandRejected {
-                protocol_version: CLIENT_PROTOCOL_VERSION,
+                protocol_version,
                 request_id,
                 error,
             },
             GatewayMessage::Status { request_id, status } => Self::Status {
-                protocol_version: CLIENT_PROTOCOL_VERSION,
+                protocol_version,
                 request_id,
-                status,
+                status: WireRuntimeStatus::new(status, protocol_version),
             },
             GatewayMessage::MemoryList {
                 request_id,
                 records,
                 next_cursor,
             } => Self::MemoryList {
-                protocol_version: CLIENT_PROTOCOL_VERSION,
+                protocol_version,
                 request_id,
                 records: records.iter().map(WireClientMemorySummary::from).collect(),
                 next_cursor: next_cursor.as_ref().map(WireClientMemoryCursor::from),
@@ -956,27 +1070,27 @@ impl<'a> From<&'a GatewayMessage> for GatewayMessageEnvelope<'a> {
                 request_id,
                 inspection,
             } => Self::MemoryInspection {
-                protocol_version: CLIENT_PROTOCOL_VERSION,
+                protocol_version,
                 request_id,
                 inspection: Box::new(WireClientMemoryInspection::from(inspection)),
             },
             GatewayMessage::RuntimeEvent { event } => Self::RuntimeEvent {
-                protocol_version: CLIENT_PROTOCOL_VERSION,
+                protocol_version,
                 event,
             },
             GatewayMessage::VoiceEvent { event } => Self::VoiceEvent {
-                protocol_version: CLIENT_PROTOCOL_VERSION,
+                protocol_version,
                 event,
             },
             GatewayMessage::Fatal { error } => Self::Fatal {
-                protocol_version: CLIENT_PROTOCOL_VERSION,
+                protocol_version,
                 error,
             },
             GatewayMessage::PersonaState {
                 request_id,
                 persona,
             } => Self::PersonaState {
-                protocol_version: CLIENT_PROTOCOL_VERSION,
+                protocol_version,
                 request_id,
                 persona,
             },
@@ -984,7 +1098,7 @@ impl<'a> From<&'a GatewayMessage> for GatewayMessageEnvelope<'a> {
                 request_id,
                 memory_id,
             } => Self::MemoryDeleted {
-                protocol_version: CLIENT_PROTOCOL_VERSION,
+                protocol_version,
                 request_id,
                 memory_id: memory_id.get().to_string(),
             },
@@ -993,7 +1107,7 @@ impl<'a> From<&'a GatewayMessage> for GatewayMessageEnvelope<'a> {
                 activated,
                 pending_approval,
             } => Self::MemoryExtracted {
-                protocol_version: CLIENT_PROTOCOL_VERSION,
+                protocol_version,
                 created: *created,
                 activated: *activated,
                 pending_approval: *pending_approval,
@@ -1003,7 +1117,10 @@ impl<'a> From<&'a GatewayMessage> for GatewayMessageEnvelope<'a> {
 }
 
 fn validate_protocol_version(version: u64) -> Result<(), ClientWireError> {
-    if version == CLIENT_PROTOCOL_VERSION {
+    if matches!(
+        version,
+        LEGACY_CLIENT_PROTOCOL_VERSION | CLIENT_PROTOCOL_VERSION
+    ) {
         Ok(())
     } else {
         Err(ClientWireError::UnsupportedProtocolVersion(version))
@@ -1028,7 +1145,33 @@ fn validate_request_id(request_id: &str) -> Result<(), ClientWireError> {
     Ok(())
 }
 
-fn validate_gateway_message(message: &GatewayMessage) -> Result<(), ClientWireError> {
+fn validate_context_exchanges(
+    exchanges: Vec<WireConversationContextExchange>,
+) -> Result<Vec<ConversationContextExchange>, ClientWireError> {
+    if exchanges.is_empty() || exchanges.len() > MAX_CONVERSATION_CONTEXT_EXCHANGES {
+        return Err(ClientWireError::InvalidConversationContext);
+    }
+
+    let mut used_bytes = 0usize;
+    let mut validated = Vec::with_capacity(exchanges.len());
+    for exchange in exchanges {
+        let exchange = ConversationContextExchange::new(exchange.user, exchange.assistant)?;
+        used_bytes = used_bytes
+            .checked_add(exchange.user().len())
+            .and_then(|used| used.checked_add(exchange.assistant().len()))
+            .ok_or(ClientWireError::InvalidConversationContext)?;
+        if used_bytes > MAX_HISTORY_BYTES {
+            return Err(ClientWireError::InvalidConversationContext);
+        }
+        validated.push(exchange);
+    }
+    Ok(validated)
+}
+
+fn validate_gateway_message(
+    message: &GatewayMessage,
+    protocol_version: u64,
+) -> Result<(), ClientWireError> {
     match message {
         GatewayMessage::CommandAccepted {
             request_id,
@@ -1039,7 +1182,7 @@ fn validate_gateway_message(message: &GatewayMessage) -> Result<(), ClientWireEr
         }
         GatewayMessage::Status { request_id, status } => {
             validate_request_id(request_id)?;
-            validate_runtime_status(status)
+            validate_runtime_status(status, protocol_version)
         }
         GatewayMessage::MemoryList {
             request_id,
@@ -1087,7 +1230,7 @@ fn validate_gateway_message(message: &GatewayMessage) -> Result<(), ClientWireEr
         GatewayMessage::VoiceEvent { event } => {
             crate::client_voice::validate_client_voice_event(event)
         }
-        GatewayMessage::Ready { status } => validate_runtime_status(status),
+        GatewayMessage::Ready { status } => validate_runtime_status(status, protocol_version),
         GatewayMessage::PersonaState {
             request_id,
             persona,
@@ -1100,7 +1243,10 @@ fn validate_gateway_message(message: &GatewayMessage) -> Result<(), ClientWireEr
     }
 }
 
-fn validate_runtime_status(status: &RuntimeStatus) -> Result<(), ClientWireError> {
+fn validate_runtime_status(
+    status: &RuntimeStatus,
+    protocol_version: u64,
+) -> Result<(), ClientWireError> {
     if status.transport != "stdio"
         || status.privacy_mode != "local_only"
         || status.language_location != "local"
@@ -1128,12 +1274,17 @@ fn validate_runtime_status(status: &RuntimeStatus) -> Result<(), ClientWireError
         return Err(ClientWireError::InvalidRuntimeStatus);
     }
 
+    if let Some(operation_id) = status.last_context_seed_operation_id.as_deref() {
+        validate_request_id(operation_id).map_err(|_| ClientWireError::InvalidRuntimeStatus)?;
+    }
+
     let capability_rank = |capability: &str| match capability {
         "text" => Some(0),
-        "persona_control" => Some(1),
-        "memory_inspection" => Some(2),
-        "memory_mutation" => Some(3),
-        "voice_session" => Some(4),
+        "conversation_context_seed" if protocol_version == CLIENT_PROTOCOL_VERSION => Some(1),
+        "persona_control" => Some(2),
+        "memory_inspection" => Some(3),
+        "memory_mutation" => Some(4),
+        "voice_session" => Some(5),
         _ => None,
     };
     let mut previous_rank = None;
@@ -1445,6 +1596,13 @@ fn validate_transcript(transcript: &str) -> Result<(), ClientWireError> {
     Ok(())
 }
 
+fn validate_context_content(content: &str) -> Result<(), ClientWireError> {
+    if content.trim().is_empty() || content.len() > MAX_CONVERSATION_MESSAGE_BYTES {
+        return Err(ClientWireError::InvalidConversationContext);
+    }
+    Ok(())
+}
+
 fn validate_bounded_text(text: &str) -> Result<(), ClientWireError> {
     if text.len() > MAX_CONVERSATION_MESSAGE_BYTES {
         Err(ClientWireError::InvalidTranscript)
@@ -1581,35 +1739,43 @@ mod runtime_status_capability_tests {
                 .map(|value| (*value).to_owned())
                 .collect(),
             components,
+            last_context_seed_operation_id: None,
         }
     }
 
     #[test]
     fn accepts_explicit_persona_and_memory_mutation_capabilities() {
-        assert!(validate_runtime_status(&status(
-            &[
-                "text",
-                "persona_control",
-                "memory_inspection",
-                "memory_mutation",
-            ],
-            true,
-        ))
+        assert!(validate_runtime_status(
+            &status(
+                &[
+                    "text",
+                    "persona_control",
+                    "memory_inspection",
+                    "memory_mutation",
+                ],
+                true,
+            ),
+            LEGACY_CLIENT_PROTOCOL_VERSION,
+        )
         .is_ok());
     }
 
     #[test]
     fn accepts_legacy_statuses_for_mixed_version_clients() {
-        assert!(validate_runtime_status(&status(&["text", "memory_inspection"], true)).is_ok());
+        assert!(validate_runtime_status(
+            &status(&["text", "memory_inspection"], true),
+            LEGACY_CLIENT_PROTOCOL_VERSION,
+        )
+        .is_ok());
     }
 
     #[test]
     fn rejects_memory_mutation_without_memory_inspection() {
         assert!(matches!(
-            validate_runtime_status(&status(
-                &["text", "persona_control", "memory_mutation"],
-                false,
-            )),
+            validate_runtime_status(
+                &status(&["text", "persona_control", "memory_mutation"], false),
+                LEGACY_CLIENT_PROTOCOL_VERSION,
+            ),
             Err(ClientWireError::InvalidRuntimeStatus)
         ));
     }

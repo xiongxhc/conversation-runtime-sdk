@@ -14,6 +14,8 @@ import type {
   MemoryRetention,
   MemorySummary,
   PersonaState,
+  ConversationContextExchange,
+  RuntimeStatus,
   VoiceSession,
   VoiceSessionEvent,
 } from "../src/browser.js";
@@ -28,6 +30,8 @@ import type {
   MemoryRetention as RootMemoryRetention,
   MemorySummary as RootMemorySummary,
   PersonaState as RootPersonaState,
+  ConversationContextExchange as RootConversationContextExchange,
+  RuntimeStatus as RootRuntimeStatus,
   VoiceSession as RootVoiceSession,
   VoiceSessionEvent as RootVoiceSessionEvent,
 } from "../src/index.js";
@@ -115,6 +119,26 @@ test("browser and root entries expose persona and memory extraction DTOs", () =>
   assert.equal(typeof browser.RuntimeClient.prototype.approveMemory, "function");
   assert.equal(typeof browser.RuntimeClient.prototype.deleteMemory, "function");
   assert.equal(typeof browser.RuntimeClient.prototype.onMemoryExtracted, "function");
+});
+
+test("browser and root entries expose context seeding and status DTOs", () => {
+  const exchange: ConversationContextExchange = { user: "hello", assistant: "hi" };
+  const runtimeStatus: RuntimeStatus = {
+    transport: "stdio",
+    privacyMode: "local_only",
+    languageLocation: "local",
+    modelId: "local-model",
+    memoryEnabled: false,
+    memoryLocation: null,
+    telemetryEnabled: false,
+    capabilities: ["text", "conversation_context_seed"],
+    components: [{ kind: "language_model", executionLocation: "local", providerLabel: "Local language" }],
+    lastContextSeedOperationId: "continue-1",
+  };
+  const rootTypes: [RootConversationContextExchange, RootRuntimeStatus] = [exchange, runtimeStatus];
+
+  assert.equal(rootTypes.length, 2);
+  assert.equal(typeof browser.RuntimeClient.prototype.seedConversationContext, "function");
 });
 
 test("browser entry exports complete voice surface without Node builtins", () => {

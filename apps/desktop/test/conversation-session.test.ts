@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import type {
   ClientCommand,
+  ClientProtocolVersion,
   MemoryInspection,
   MemoryPage,
   PersonaState,
@@ -9,7 +10,10 @@ import type {
 } from "@conversation/runtime/browser";
 
 import { AsyncQueue } from "../src/runtime/async-queue.js";
-import { ConversationSession } from "../src/runtime/conversation-session.js";
+import {
+  ConversationSession,
+  type CarriedConversationContext,
+} from "../src/runtime/conversation-session.js";
 
 const localStatus = {
   transport: "stdio",
@@ -34,6 +38,26 @@ const localVoiceStatus = {
     { kind: "speech_synthesis", execution_location: "local", provider_label: "Local speech synthesis" },
     { kind: "audio_io", execution_location: "local", provider_label: "System audio" },
   ],
+};
+
+const localSeedStatus = {
+  ...localStatus,
+  capabilities: ["text", "conversation_context_seed"],
+  last_context_seed_operation_id: null,
+};
+
+const localSeedVoiceStatus = {
+  ...localVoiceStatus,
+  capabilities: ["text", "conversation_context_seed", "voice_session"],
+  last_context_seed_operation_id: null,
+};
+
+const carriedContext: CarriedConversationContext = {
+  sourceId: "conversation-source",
+  sourceTitle: "Earlier conversation",
+  operationId: "continue-operation-1",
+  exchanges: [{ user: "Earlier question", assistant: "Earlier answer" }],
+  bytes: 38,
 };
 
 const memoryPage: MemoryPage = {
@@ -675,6 +699,264 @@ describe("ConversationSession", () => {
     );
   });
 
+  it("publishes copied carried context and clears old live turns only after correlated seed success", async () => {
+    const transport = connectedSeedTransport();
+    const session = await ConversationSession.connect(transport);
+    await session.send("old live question");
+    transport.turnEvent({ type: "text_completed", turn_id: "1", text: "old live answer" });
+    transport.turnEvent({ type: "turn_completed", turn_id: "1" });
+    await eventually(() => expect(session.state.phase).toBe("ready"));
+    transport.holdSeedAcceptance = true;
+
+    const continuing = session.continueWithSeed(carriedContext);
+    await flushMicrotasks();
+
+    expect(session.state.continuation).toEqual({ inProgress: true });
+    expect(session.state.turns).toHaveLength(1);
+    expect(session.state.turns[0]).toMatchObject({
+      turnId: 1n,
+      transcript: "old live question",
+      response: "old live answer",
+    });
+    const seed = transport.sent.at(-1);
+    expect(seed).toEqual({
+      type: "seed_conversation_context",
+      requestId: "request-3",
+      operationId: "continue-operation-1",
+      exchanges: [{ user: "Earlier question", assistant: "Earlier answer" }],
+    });
+    expect(transport.sentVersions.at(-1)).toBe(2);
+
+    transport.releaseSeedAcceptance();
+    await continuing;
+
+    expect(session.state.continuation).toEqual({
+      inProgress: false,
+      carriedContext,
+    });
+    expect(session.state.turns).toEqual([]);
+
+    await expect(session.send("new branch question")).resolves.toBe(2n);
+    expect(session.state.turns).toEqual([expect.objectContaining({
+      turnId: 2n,
+      transcript: "new branch question",
+    })]);
+    expect(session.state.continuation.carriedContext).toEqual(carriedContext);
+  });
+
+  it("snapshots all carried context before awaiting seed acceptance", async () => {
+    const transport = connectedSeedTransport();
+    const session = await ConversationSession.connect(transport);
+    transport.holdSeedAcceptance = true;
+    const mutableContext = {
+      sourceId: "source-before",
+      sourceTitle: "Title before",
+      operationId: "operation-before",
+      exchanges: [{ user: "user before", assistant: "assistant before" }],
+      bytes: 27,
+    };
+
+    const continuing = session.continueWithSeed(mutableContext);
+    await flushMicrotasks();
+    mutableContext.sourceId = "source-after";
+    mutableContext.sourceTitle = "Title after";
+    mutableContext.operationId = "operation-after";
+    mutableContext.bytes = 999;
+    mutableContext.exchanges[0]!.user = "user after";
+    mutableContext.exchanges[0]!.assistant = "assistant after";
+    mutableContext.exchanges.push({ user: "added later", assistant: "added later" });
+
+    expect(transport.sent.at(-1)).toMatchObject({
+      type: "seed_conversation_context",
+      operationId: "operation-before",
+      exchanges: [{ user: "user before", assistant: "assistant before" }],
+    });
+    transport.releaseSeedAcceptance();
+    await continuing;
+
+    expect(session.state.continuation.carriedContext).toEqual({
+      sourceId: "source-before",
+      sourceTitle: "Title before",
+      operationId: "operation-before",
+      exchanges: [{ user: "user before", assistant: "assistant before" }],
+      bytes: 27,
+    });
+  });
+
+  it("blocks text, voice, persona, close, and another continuation while seeding", async () => {
+    const transport = connectedSeedVoiceTransport();
+    const session = await ConversationSession.connect(transport);
+    transport.holdSeedAcceptance = true;
+
+    const continuing = session.continueWithSeed(carriedContext);
+    await flushMicrotasks();
+
+    await expect(session.send("racing text")).rejects.toThrow("continuation is in progress");
+    await expect(session.startVoice()).rejects.toThrow("continuation is in progress");
+    await expect(session.updatePersona(personaState)).rejects.toThrow("continuation is in progress");
+    await expect(session.close()).rejects.toThrow("continuation is in progress");
+    await expect(session.continueWithSeed({
+      ...carriedContext,
+      operationId: "continue-operation-2",
+    })).rejects.toThrow("continuation is in progress");
+    expect(transport.sent.map((command) => command.type)).toEqual([
+      "status",
+      "seed_conversation_context",
+    ]);
+    expect(transport.closeCalls).toBe(0);
+
+    transport.releaseSeedAcceptance();
+    await continuing;
+  });
+
+  it("rejects continuation while a text start is pending and while its turn is active", async () => {
+    const transport = connectedSeedTransport();
+    const session = await ConversationSession.connect(transport);
+    transport.holdStartAcceptance = true;
+
+    const starting = session.send("pending question");
+    await expect(session.continueWithSeed(carriedContext)).rejects.toThrow("already active");
+    expect(transport.sent.some((command) => command.type === "seed_conversation_context")).toBe(false);
+
+    transport.releaseStartAcceptance();
+    await starting;
+    await expect(session.continueWithSeed(carriedContext)).rejects.toThrow("already active");
+    expect(transport.sent.some((command) => command.type === "seed_conversation_context")).toBe(false);
+  });
+
+  it("rejects continuation throughout starting, listening, pause, resume, stop, and terminal-pending voice states", async () => {
+    const transport = connectedSeedVoiceTransport();
+    const session = await ConversationSession.connect(transport);
+    transport.holdVoiceStartAcceptance = true;
+
+    const starting = session.startVoice();
+    await expect(session.continueWithSeed(carriedContext)).rejects.toThrow("voice session is not idle");
+    transport.releaseVoiceStartAcceptance();
+    await starting;
+    transport.voiceEvent({
+      type: "voice_session_started",
+      session_id: "1",
+      privacy: { privacy_mode: "local_only", components: localSeedVoiceStatus.components },
+    });
+    await eventually(() => expect(session.state.voice.capture).toBe("listening"));
+    await expect(session.continueWithSeed(carriedContext)).rejects.toThrow("voice session is not idle");
+
+    await session.pauseVoiceCapture();
+    expect(session.state.voice.capture).toBe("pausing");
+    await expect(session.continueWithSeed(carriedContext)).rejects.toThrow("voice session is not idle");
+    transport.voiceEvent({ type: "voice_capture_paused", session_id: "1" });
+    await eventually(() => expect(session.state.voice.capture).toBe("paused"));
+    await expect(session.continueWithSeed(carriedContext)).rejects.toThrow("voice session is not idle");
+
+    await session.resumeVoiceCapture();
+    expect(session.state.voice.capture).toBe("resuming");
+    await expect(session.continueWithSeed(carriedContext)).rejects.toThrow("voice session is not idle");
+    transport.voiceEvent({ type: "voice_capture_resumed", session_id: "1" });
+    await eventually(() => expect(session.state.voice.capture).toBe("listening"));
+
+    let terminalPendingContinuation: Promise<void> | undefined;
+    const unsubscribe = session.subscribe((state) => {
+      if (state.voice.session === "idle" && terminalPendingContinuation === undefined) {
+        terminalPendingContinuation = session.continueWithSeed(carriedContext);
+        void terminalPendingContinuation.catch(() => undefined);
+      }
+    });
+    const stopping = session.stopVoice();
+    expect(session.state.voice.session).toBe("stopping");
+    await expect(session.continueWithSeed(carriedContext)).rejects.toThrow("voice session is not idle");
+    transport.voiceEvent({ type: "voice_session_ended", session_id: "1" });
+    await eventually(() => expect(terminalPendingContinuation).toBeDefined());
+    await expect(terminalPendingContinuation).rejects.toThrow("voice session is not idle");
+    await stopping;
+    unsubscribe();
+  });
+
+  it("retains unsolicited terminal voice ownership through the synchronous idle publication", async () => {
+    const transport = connectedSeedVoiceTransport();
+    const session = await ConversationSession.connect(transport);
+    await session.startVoice();
+    transport.voiceEvent({
+      type: "voice_session_started",
+      session_id: "1",
+      privacy: { privacy_mode: "local_only", components: localSeedVoiceStatus.components },
+    });
+    await eventually(() => expect(session.state.voice.session).toBe("active"));
+
+    let terminalPublicationAttempt: Promise<void> | undefined;
+    const unsubscribe = session.subscribe((state) => {
+      if (state.voice.session === "idle" && terminalPublicationAttempt === undefined) {
+        terminalPublicationAttempt = session.continueWithSeed(carriedContext);
+        void terminalPublicationAttempt.catch(() => undefined);
+      }
+    });
+    transport.voiceEvent({ type: "voice_session_ended", session_id: "1" });
+
+    await eventually(() => expect(terminalPublicationAttempt).toBeDefined());
+    await expect(terminalPublicationAttempt).rejects.toThrow("voice session is not idle");
+    expect(transport.sent.some((command) => command.type === "seed_conversation_context")).toBe(false);
+    unsubscribe();
+
+    await flushMicrotasks();
+    await expect(session.continueWithSeed(carriedContext)).resolves.toBeUndefined();
+    expect(transport.sent.filter((command) => command.type === "seed_conversation_context"))
+      .toHaveLength(1);
+  });
+
+  it("rejects continuation from a non-idle voice error state", async () => {
+    const transport = connectedSeedVoiceTransport();
+    const session = await ConversationSession.connect(transport);
+    await session.startVoice();
+    transport.voiceEvent({
+      type: "voice_session_failed",
+      session_id: "1",
+      error: {
+        code: "adapter_failure",
+        kind: "adapter",
+        stage: "voice_sidecar",
+        message: "sidecar closed",
+      },
+      recovery: "new_session",
+    });
+    await eventually(() => expect(session.state.voice.session).toBe("error"));
+
+    await expect(session.continueWithSeed(carriedContext)).rejects.toThrow("voice session is not idle");
+    expect(transport.sent.some((command) => command.type === "seed_conversation_context")).toBe(false);
+  });
+
+  it("retains the existing local presentation after a correlated seed rejection", async () => {
+    const transport = connectedSeedTransport();
+    const session = await ConversationSession.connect(transport);
+    await session.send("keep this question");
+    transport.turnEvent({ type: "text_completed", turn_id: "1", text: "keep this answer" });
+    transport.turnEvent({ type: "turn_completed", turn_id: "1" });
+    await eventually(() => expect(session.state.phase).toBe("ready"));
+    const before = session.state.turns;
+    transport.rejectNextSeed = true;
+
+    await expect(session.continueWithSeed(carriedContext)).rejects.toThrow("seed rejected");
+
+    expect(session.state.phase).toBe("ready");
+    expect(session.state.turns).toEqual(before);
+    expect(session.state.continuation).toEqual({ inProgress: false });
+  });
+
+  it("retains the existing local presentation after a seed transport failure", async () => {
+    const transport = connectedSeedTransport();
+    const session = await ConversationSession.connect(transport);
+    await session.send("keep this question");
+    transport.turnEvent({ type: "text_completed", turn_id: "1", text: "keep this answer" });
+    transport.turnEvent({ type: "turn_completed", turn_id: "1" });
+    await eventually(() => expect(session.state.phase).toBe("ready"));
+    const before = session.state.turns;
+    transport.failNextSeedSend = true;
+
+    await expect(session.continueWithSeed(carriedContext)).rejects.toThrow("seed transport failed");
+
+    expect(session.state.turns).toEqual(before);
+    expect(session.state.continuation).toEqual({ inProgress: false });
+    expect(session.state.phase).toBe("failed");
+  });
+
   it("surfaces a gateway failure", async () => {
     const transport = connectedTransport();
     const session = await ConversationSession.connect(transport);
@@ -756,23 +1038,70 @@ function connectedVoiceTransport(): InMemoryTransport {
   return transport;
 }
 
+function connectedSeedTransport(): InMemoryTransport {
+  const transport = new InMemoryTransport(localSeedStatus, 2);
+  transport.ready();
+  return transport;
+}
+
+function connectedSeedVoiceTransport(): InMemoryTransport {
+  const transport = new InMemoryTransport(localSeedVoiceStatus, 2);
+  transport.ready();
+  return transport;
+}
+
 class InMemoryTransport implements RuntimeTransport {
   readonly messages = new AsyncQueue<unknown>();
   readonly sent: ClientCommand[] = [];
+  readonly sentVersions: ClientProtocolVersion[] = [];
   closeCalls = 0;
   holdStartAcceptance = false;
   holdVoiceStartAcceptance = false;
+  holdSeedAcceptance = false;
+  failNextSeedSend = false;
+  rejectNextSeed = false;
   rejectNextVoiceStart = false;
   rejectNextVoiceStop = false;
   rejectNextStart = false;
   private heldStart: ClientCommand | undefined;
+  private heldSeed: ClientCommand | undefined;
   private heldVoiceStart: ClientCommand | undefined;
   private turnCounter = 0n;
 
-  constructor(private readonly status: Record<string, unknown>) {}
+  constructor(
+    private readonly status: Record<string, unknown>,
+    private readonly protocolVersion: ClientProtocolVersion = 1,
+  ) {}
 
-  async send(command: ClientCommand): Promise<void> {
+  async send(command: ClientCommand, version: ClientProtocolVersion): Promise<void> {
+    if (version !== this.protocolVersion) {
+      throw new Error(`expected protocol version ${this.protocolVersion}, received ${version}`);
+    }
     this.sent.push(command);
+    this.sentVersions.push(version);
+    if (command.type === "seed_conversation_context" && this.failNextSeedSend) {
+      this.failNextSeedSend = false;
+      throw new Error("seed transport failed");
+    }
+    if (command.type === "seed_conversation_context" && this.holdSeedAcceptance) {
+      this.heldSeed = command;
+      return;
+    }
+    if (command.type === "seed_conversation_context" && this.rejectNextSeed) {
+      this.rejectNextSeed = false;
+      this.emit({
+        protocol_version: this.protocolVersion,
+        type: "command_rejected",
+        request_id: command.requestId,
+        error: {
+          code: "invalid_state",
+          kind: "invalid_state",
+          stage: "runtime",
+          message: "seed rejected",
+        },
+      });
+      return;
+    }
     if (command.type === "start_turn" && this.holdStartAcceptance) {
       this.heldStart = command;
       return;
@@ -784,7 +1113,7 @@ class InMemoryTransport implements RuntimeTransport {
     if (command.type === "start_voice_session" && this.rejectNextVoiceStart) {
       this.rejectNextVoiceStart = false;
       this.emit({
-        protocol_version: 1,
+        protocol_version: this.protocolVersion,
         type: "command_rejected",
         request_id: command.requestId,
         error: {
@@ -799,7 +1128,7 @@ class InMemoryTransport implements RuntimeTransport {
     if (command.type === "start_turn" && this.rejectNextStart) {
       this.rejectNextStart = false;
       this.emit({
-        protocol_version: 1,
+        protocol_version: this.protocolVersion,
         type: "command_rejected",
         request_id: command.requestId,
         error: {
@@ -814,7 +1143,7 @@ class InMemoryTransport implements RuntimeTransport {
     if (command.type === "stop_voice_session" && this.rejectNextVoiceStop) {
       this.rejectNextVoiceStop = false;
       this.emit({
-        protocol_version: 1,
+        protocol_version: this.protocolVersion,
         type: "command_rejected",
         request_id: command.requestId,
         error: {
@@ -829,18 +1158,27 @@ class InMemoryTransport implements RuntimeTransport {
     this.emit(
       command.type === "start_turn"
         ? {
-          protocol_version: 1,
+          protocol_version: this.protocolVersion,
           type: "command_accepted",
           request_id: command.requestId,
           turn_id: (++this.turnCounter).toString(),
         }
-        : { protocol_version: 1, type: "command_accepted", request_id: command.requestId },
+        : {
+          protocol_version: this.protocolVersion,
+          type: "command_accepted",
+          request_id: command.requestId,
+        },
     );
     if (command.type === "status") {
-      this.emit({ protocol_version: 1, type: "status", request_id: command.requestId, status: this.status });
+      this.emit({
+        protocol_version: this.protocolVersion,
+        type: "status",
+        request_id: command.requestId,
+        status: this.status,
+      });
     } else if (command.type === "memory_list") {
       this.emit({
-        protocol_version: 1,
+        protocol_version: this.protocolVersion,
         type: "memory_list",
         request_id: command.requestId,
         records: memoryPage.records.map((record) => ({
@@ -855,7 +1193,7 @@ class InMemoryTransport implements RuntimeTransport {
       });
     } else if (command.type === "memory_inspect") {
       this.emit({
-        protocol_version: 1,
+        protocol_version: this.protocolVersion,
         type: "memory_inspection",
         request_id: command.requestId,
         inspection: {
@@ -886,14 +1224,14 @@ class InMemoryTransport implements RuntimeTransport {
       });
     } else if (command.type === "persona_get") {
       this.emit({
-        protocol_version: 1,
+        protocol_version: this.protocolVersion,
         type: "persona_state",
         request_id: command.requestId,
         persona: personaWire(personaState),
       });
     } else if (command.type === "persona_update") {
       this.emit({
-        protocol_version: 1,
+        protocol_version: this.protocolVersion,
         type: "persona_state",
         request_id: command.requestId,
         persona: personaWire(command.persona),
@@ -911,7 +1249,7 @@ class InMemoryTransport implements RuntimeTransport {
     this.heldStart = undefined;
     if (command) {
       this.emit({
-        protocol_version: 1,
+        protocol_version: this.protocolVersion,
         type: "command_accepted",
         request_id: command.requestId,
         turn_id: (++this.turnCounter).toString(),
@@ -924,7 +1262,19 @@ class InMemoryTransport implements RuntimeTransport {
     this.heldVoiceStart = undefined;
     if (command) {
       this.emit({
-        protocol_version: 1,
+        protocol_version: this.protocolVersion,
+        type: "command_accepted",
+        request_id: command.requestId,
+      });
+    }
+  }
+
+  releaseSeedAcceptance(): void {
+    const command = this.heldSeed;
+    this.heldSeed = undefined;
+    if (command) {
+      this.emit({
+        protocol_version: this.protocolVersion,
         type: "command_accepted",
         request_id: command.requestId,
       });
@@ -932,11 +1282,11 @@ class InMemoryTransport implements RuntimeTransport {
   }
 
   ready(): void {
-    this.emit({ protocol_version: 1, type: "ready", status: this.status });
+    this.emit({ protocol_version: this.protocolVersion, type: "ready", status: this.status });
   }
 
   turnEvent(event: Record<string, unknown>): void {
-    this.emit({ protocol_version: 1, type: "runtime_event", event });
+    this.emit({ protocol_version: this.protocolVersion, type: "runtime_event", event });
   }
 
   voiceEvent(event: Record<string, unknown>): void {
@@ -946,7 +1296,7 @@ class InMemoryTransport implements RuntimeTransport {
         this.turnCounter = turnId;
       }
     }
-    this.emit({ protocol_version: 1, type: "voice_event", event });
+    this.emit({ protocol_version: this.protocolVersion, type: "voice_event", event });
   }
 
   voiceTurnEvent(generationId: bigint, event: Record<string, unknown>): void {

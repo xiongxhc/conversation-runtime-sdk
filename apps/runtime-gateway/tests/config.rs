@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 use conversation_memory::{MemoryStore, NeverCancelled, SqliteMemoryStore};
 use conversation_model_adapters::{GenerationLanguageModel, GenerationLanguageRequest};
 use conversation_protocol::{
-    encode_gateway_message, GatewayMessage, GenerationId, MemoryConfidence, MemoryDraft,
-    MemoryKind, MemoryProvenance, MemoryProvenanceKind, MemoryRetention, MemoryRetrievalRequest,
-    SessionId, TurnId, UnixTimestampMillis,
+    encode_gateway_message_for_version, GatewayMessage, GenerationId, MemoryConfidence,
+    MemoryDraft, MemoryKind, MemoryProvenance, MemoryProvenanceKind, MemoryRetention,
+    MemoryRetrievalRequest, SessionId, TurnId, UnixTimestampMillis, CLIENT_PROTOCOL_VERSION,
 };
 use conversation_runtime_gateway::{
     GatewayAdapters, GatewayConfig, GatewayDeploymentConfig, LanguageDeployment,
@@ -490,7 +490,10 @@ fn loads_an_explicit_valid_local_only_configuration() {
 
     let adapters: GatewayAdapters = GatewayConfig::load(&path).unwrap();
     assert_eq!(adapters.status.model_id, "local-model-id");
-    assert_eq!(adapters.status.capabilities, ["text", "persona_control"]);
+    assert_eq!(
+        adapters.status.capabilities,
+        ["text", "conversation_context_seed", "persona_control"]
+    );
     assert_eq!(adapters.status.components.len(), 1);
     assert_eq!(adapters.status.components[0].kind, "language_model");
     assert_eq!(
@@ -665,6 +668,7 @@ async fn memory_configuration_returns_shared_retrieval_and_inspection_handles() 
         adapters.status.capabilities,
         [
             "text",
+            "conversation_context_seed",
             "persona_control",
             "memory_inspection",
             "memory_mutation"
@@ -895,6 +899,7 @@ fn valid_voice_reuses_root_configuration_without_spawning() {
         adapters.status.capabilities,
         [
             "text",
+            "conversation_context_seed",
             "persona_control",
             "memory_inspection",
             "memory_mutation",
@@ -926,15 +931,19 @@ fn valid_voice_reuses_root_configuration_without_spawning() {
     let policy = voice.policy.for_session(SessionId::new(7)).unwrap();
     assert_eq!(policy.session_id(), SessionId::new(7));
     assert_eq!(policy.components().len(), 5);
-    encode_gateway_message(&GatewayMessage::Ready {
-        status: adapters.status.clone(),
-    })
+    encode_gateway_message_for_version(
+        &GatewayMessage::Ready {
+            status: adapters.status.clone(),
+        },
+        CLIENT_PROTOCOL_VERSION,
+    )
     .unwrap();
     let running_status = adapters.text_only_status();
     assert_eq!(
         running_status.capabilities,
         [
             "text",
+            "conversation_context_seed",
             "persona_control",
             "memory_inspection",
             "memory_mutation"
@@ -948,9 +957,12 @@ fn valid_voice_reuses_root_configuration_without_spawning() {
             .collect::<Vec<_>>(),
         ["language_model", "memory"]
     );
-    encode_gateway_message(&GatewayMessage::Ready {
-        status: running_status,
-    })
+    encode_gateway_message_for_version(
+        &GatewayMessage::Ready {
+            status: running_status,
+        },
+        CLIENT_PROTOCOL_VERSION,
+    )
     .unwrap();
     assert!(!fixture.sidecar_spawned());
 }

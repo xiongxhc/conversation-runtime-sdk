@@ -53,7 +53,15 @@ The first release is not a directory-complete platform. It is one local voice lo
   capture plus playback completion and the release device-status handshake are
   observed. Product-owner acceptance closed R3 on 2026-08-23. The public SDK
   and desktop now support persona inspection and update, candidate-memory
-  approval, and revision-bound memory deletion; model setup and distribution
+  approval, and revision-bound memory deletion. Session Management and
+  Continuation now adds revision-checked list/detail deletion and explicit
+  **Continue as new conversation**: desktop SQLite creates a separately
+  persisted branch from an immutable source, the protocol-v2 runtime receives
+  only the latest whole completed nonblank exchanges within 16-pair,
+  32,768-byte, and 16-KiB-per-message limits, and copied context stays visibly
+  separate from new live turns. The operation restores no provider session,
+  historical model, persona, memory snapshot, device state, or runtime IDs and
+  performs no summarization or compression. Model setup and distribution
   remain open R6 work.
 - The deterministic continuity gate now covers five spoken turns with a
   turn-scoped local language failure in the second turn, followed by three
@@ -231,9 +239,11 @@ ignored fixture writer and `151` Swift tests. See
 Complete for bounded in-session controls. The protocol exposes validated
 persona, mode, response, signal, message, context-source, and content-free
 decision types. The runtime resolves short answers and explicit corrections,
-retains at most eight completed exchanges within `16 KiB`, excludes cancelled
-or failed partial output, and carries one typed generation envelope into the
-selected language adapter. The Ollama-compatible reference translation
+excludes cancelled or failed partial output, and carries one typed generation
+envelope into the selected language adapter. R4 originally established an
+eight-exchange/`16 KiB` completed-history bound; R6 Session Continuation expands
+the current shared bound to 16 whole exchanges/`32 KiB` without changing the
+16-KiB individual-message limit. The Ollama-compatible reference translation
 preserves deployment guidance, runtime guidance, ordered history, and current
 input while lowering its output-token cap to the resolved spoken-duration
 budget.
@@ -336,7 +346,7 @@ send and resumes after the typed terminal. Stop, Keep, and Cancel preserve
 session intent when leaving Focus, and a kept session remains visible in the
 conversation view. Soft Aurora (the default), Silk, Threads, Prism, Orb, Still
 Gradient, and None remain selectable with hidden transcript by default. When an
-explicitly initialized local memory store is configured and the gateway advertises protocol-v1
+explicitly initialized local memory store is configured and the gateway advertises
 `memory_inspection`, the desktop uses the public browser-safe SDK to provide
 list/detail inspection, candidate approval, and revision-bound deletion. The
 same SDK surface provides persona inspection and update. History remains separately owned local
@@ -345,6 +355,20 @@ automatically captures conversations into it. Inspection exposes at most the
 latest 50 summaries per page and the latest 32 provenance and approval entries,
 and labels truncated older history; due expiry may be applied during inspection.
 
+Desktop-owned Session history now uses schema-2 revisions and compare-and-set
+saves/deletes. A continuation transaction checks the source revision, leaves
+the source immutable, creates a new branch with copied-context provenance, and
+records `preparing`, `confirmed`, or `unconfirmed` recovery state plus the last
+opaque operation ID. A source can later be deleted without cascading into the
+branch. Opening a saved Session remains read-only; continuation is an explicit
+new runtime operation, not a reopened provider session.
+
+The public gateway protocol is now v2 and adds bounded structured context
+seeding. The updated TypeScript client reads the server's authoritative Ready
+version and preserves existing status, text, voice, persona, and memory
+operations with a v1 server; context seeding requires v2. Existing v1-only
+client binaries are incompatible with the v2 gateway.
+
 The deterministic cross-language smoke compiles the actual Rust binary and
 uses a temporary loopback Ollama-compatible fixture to prove ready, command
 acceptance, text streaming, completion, and a separate cancellation run. It is
@@ -352,10 +376,9 @@ interoperability evidence only; it does not select a model, measure latency or
 quality, or close any R3 human, device, or acoustic acceptance gate.
 
 Typed SDK tests exercise persona inspection/update and candidate-memory
-approval/revision-bound deletion through a test transport. That evidence is
-separate from the compiled SDK-to-gateway smoke, which currently covers the
-typed/spoken conversation flow rather than persona or memory mutation. A
-compiled SDK-to-gateway mutation test remains R6 completion work.
+approval/revision-bound deletion through a test transport. The compiled
+public-SDK-to-gateway coverage also exercises persona and runtime-memory
+mutation.
 
 R6 remains open overall. When `[voice]` is configured, the compiled gateway
 advertises and hosts `voice_session` start, stop, capture pause/resume, transcript,
@@ -384,7 +407,7 @@ See [the R6 local-gateway evaluation](docs/r6-local-gateway-evaluation.md) and
 - macOS Tauri process bridge using explicit absolute gateway and configuration
   paths.
 - Local text-chat workspace with streamed output, Stop, close, and reconnect.
-- Protocol-v1 runtime-memory list/detail inspection, candidate approval, and
+- Version-aware runtime-memory list/detail inspection, candidate approval, and
   revision-bound deletion through the public browser-safe SDK, gated on an
   explicitly configured local store.
 - Persona inspection and update through the public browser-safe SDK.
@@ -396,17 +419,50 @@ See [the R6 local-gateway evaluation](docs/r6-local-gateway-evaluation.md) and
 - Composer pause-before-type and same-session resume-after-terminal behavior.
 - Seven selectable Focus scenes, hidden transcript by default, reduced-motion
   fallback, and explicit visual-preview labeling when voice is unavailable.
+- Native guided model setup backend: four Tauri commands for bounded loopback
+  discovery, numeric-only benchmarking, private configuration preparation, and
+  temporary-provider ownership cleanup.
+- Revision-CAS Session save/delete, schema-2 migration, and source-independent
+  continuation-branch persistence with copied-context/live-turn provenance.
+- Continue as new conversation through protocol v2 and the public TypeScript
+  SDK, with at most 16 whole completed nonblank exchanges and 32,768 UTF-8
+  content bytes, an unchanged 16-KiB per-message limit, and no compression or
+  summarization.
+- Labelled carried context kept separate from subsequent live turns, plus
+  operation-ID-based preparing/confirmed/unconfirmed recovery.
+
+### UI/UX Foundation
+
+The connected desktop's conversation-first Local Signal Instrument foundation
+is implemented and mechanically verified. It keeps runtime, voice, history,
+persona, and memory behavior unchanged while adding a shared semantic visual
+system, stable Conversation/Sessions/Memory review/How it responds navigation,
+truthful local-state presentation, durable new-memory review cues, coherent
+Voice Focus controls, and labelled responsive layouts. The UI/UX-specific
+pre-Session checkpoint passed 208 desktop tests and the production build (both
+TypeScript checks and scene chunk assertion); the later complete Session gate
+passes 257 desktop tests. The existing native guided-setup gate passes 18 tests.
+
+This is source and automated-test evidence, not product-owner visual
+acceptance. Connected rendering at the documented window sizes, light/dark
+appearance, keyboard flow, 200% zoom, reduced motion, Voice Focus cohesion,
+and real-device voice/device behavior remain open for human review.
+
+See [the approved design](docs/superpowers/specs/2026-09-01-r6-ui-ux-foundation-design.md)
+and [implementation plan](docs/superpowers/plans/2026-09-01-r6-ui-ux-foundation.md).
 
 ### Remaining Deliverables
 
 - Additional runtime-memory management beyond candidate approval and deletion.
-- Compiled SDK-to-gateway coverage for persona and runtime-memory mutation.
-- Local model setup and benchmark reporting.
+- Product-owner native interaction acceptance for Session list/detail deletion,
+  continuation confirmation and carried-context clarity, keyboard/focus order,
+  source-deletion survival, restart recovery, 200% zoom, and narrow layouts.
+- Product-owner native visual acceptance of the UI/UX Foundation at the
+  documented window sizes, including the remaining human visual and
+  real-device checks.
+- Guided React setup UI and user-facing benchmark reporting.
 - Packaging, signing, installation, and private configuration workflows that
   contain no model weights.
-- Backend-neutral local provider supervision with explicit executable,
-  argument, readiness, ownership, and cleanup contracts; never a shell command
-  or silent remote fallback.
 - Native desktop observation of permission, one spoken turn, playback, audible
   barge-in, exit choices, device selection, and child cleanup.
 - Later application-owned transport work required before any opt-in LAN binding

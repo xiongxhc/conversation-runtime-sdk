@@ -2,54 +2,81 @@
 
 ## Status
 
-The first R6 local-gateway slice is complete for deterministic interoperability.
-It includes the persistent Rust gateway, versioned bounded framed stdio, the
-public TypeScript client, the minimal Node chat example, and public persona and
-memory control commands.
+The R6 local-gateway boundary is implemented for deterministic interoperability.
+It includes the persistent Rust gateway, strict versioned bounded framed stdio,
+the public TypeScript client, the minimal Node chat example, public persona and
+memory controls, and protocol-v2 structured conversation-context seeding.
 
-R6 is not complete overall. Tauri and React, microphone and playback controls,
-model setup and benchmark UI, packaging, signing, and installation remain open.
+R6 is not complete overall. The Tauri/React microphone and playback controls
+are implemented, while model setup and benchmark UI, packaging, signing, and
+installation remain open.
 Additional runtime-memory management beyond candidate approval and
 revision-bound deletion remains open. R3 was closed separately by
 product-owner acceptance on 2026-08-23; its human-spoken, ten-minute device,
 and external acoustic observations are not established by this gateway
 evidence.
 
+Task 5 is implemented and independently reviewed. Its four native setup
+commands cover bounded loopback discovery, numeric-only model benchmarking,
+private configuration preparation, and temporary-provider ownership cleanup.
+The guided React UI, bundle/DMG, signing/install work, final packaging and
+release evidence, and real-device acceptance remain open.
+
+The v2 gateway accepts a bounded seed only while the shared text/voice
+conversation context is fully idle. It atomically replaces completed runtime
+history, records the opaque operation ID, and preserves current provider,
+persona, memory-retrieval policy, and runtime identifier ownership. It neither
+opens the desktop SQLite database nor restores an old provider session. Seeds
+contain at most 16 whole completed exchanges and 32,768 UTF-8 content bytes,
+with the existing 16-KiB per-message bound and no truncation, summarization, or
+compression.
+
+The updated TypeScript client reads the authoritative Ready version and keeps
+existing status, text, voice, persona, and memory operations compatible with a
+v1 server. Context seeding requires v2. An old v1-only client binary is not
+compatible with the v2 gateway.
+
 ## Deterministic Verification
 
-Final verification used the pinned repository toolchains:
+Current Session Management verification on 2026-09-02 used the explicit PATH
+toolchains:
 
 ```text
 rustc 1.97.1 (8bab26f4f 2026-07-14)
 cargo 1.97.1 (c980f4866 2026-06-30)
-Node.js v18.17.1
-npm 9.6.7
+Node.js v24.9.0
+npm 11.6.0
 ```
 
-From the repository root, the complete final gates were:
+From the Session worktree, the complete current gates were:
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked --no-fail-fast
-npm ci
-npm run build --workspaces
-npm test --workspaces
-git diff --check master...HEAD
+CARGO_TARGET_DIR=/Users/cx/Workspace/conversation-runtime-sdk/target cargo clippy --locked --workspace --all-targets -- -D warnings
+CARGO_TARGET_DIR=/Users/cx/Workspace/conversation-runtime-sdk/target cargo test --locked --workspace -- --test-threads=1
+env PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin npm run build --workspace @conversation/runtime
+env PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin npm run build --workspace conversation-desktop
+env PATH=/opt/homebrew/bin:/opt/homebrew/opt/rustup/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin npm test
+git diff --check
 ```
 
-All final commands exited zero. The Rust workspace run included every target
-and doc-test under the default parallel test harness. Loopback fixture tests
-were run in an environment that permits temporary numeric-loopback listeners.
-The TypeScript build completed for both workspaces. The Node results were:
+All current commands exited zero. The Rust workspace run included every target
+and doc test, serialized to avoid shared fixture interference. Loopback fixture
+tests ran with local-listener permission. The TypeScript SDK and desktop
+production builds passed. The Node results were:
 
 ```text
-@conversation/runtime: 40 passed, 0 failed
-conversation-node-chat: 11 passed, 0 failed
+@conversation/runtime: 109 passed, 0 failed
+conversation-node-chat: 14 passed, 0 failed
+conversation-desktop: 257 passed, 0 failed across 13 files
 ```
 
 The Node chat suite builds and spawns the real Rust gateway for completion,
 cancellation, and active-EOF process smokes.
+
+The defect history below comes from the earlier pre-Session R6 checkpoint. It
+is retained as historical provenance rather than presented as the current
+final evidence.
 
 ### Verification Finding and Fix
 
@@ -143,11 +170,9 @@ Typed public-SDK tests separately exercise `getPersona` and `updatePersona`,
 plus revision-bound `approveMemory` and `deleteMemory`, including command
 validation and correlated responses. Desktop session and pane tests exercise
 the same public methods for runtime-backed persona update, candidate-memory
-approval, and deletion. This is automated interface evidence, not a native or
-human observation, and it is separate from the compiled SDK-to-gateway smoke.
-That compiled smoke currently covers text and typed/spoken conversation flow,
-not persona or memory mutation; compiled mutation coverage remains R6
-completion work.
+approval, and deletion. Compiled public-SDK-to-gateway coverage for persona
+and runtime-memory mutation is also present. This is automated interface
+evidence, not a native or human observation.
 
 ## Private Local Smoke Result
 
@@ -221,6 +246,9 @@ method and reproducible deployment configuration.
   listener. All client traffic uses child-process stdin and stdout.
 - Optional memory opens one explicitly configured existing local SQLite store;
   it is never created or silently substituted by the gateway.
+- Desktop Session IDs, titles, revisions, SQLite paths, turn-state metadata,
+  and deletion provenance never cross the gateway boundary; the protocol sees
+  only bounded structured exchanges and an opaque seed operation ID.
 - Public examples remain backend-neutral and contain no deployment model,
   private path, prompt, response, persona, or memory content.
 - The completed slice is a client/runtime interoperability boundary, not a

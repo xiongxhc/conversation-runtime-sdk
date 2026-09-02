@@ -1,7 +1,7 @@
 use conversation_protocol::{
     ConversationMessage, MemoryContextItem, QualityDecision, TurnId,
-    MAX_CONVERSATION_MESSAGE_BYTES, MAX_HISTORY_MESSAGE_COUNT, MAX_MEMORY_RETRIEVAL_BYTES,
-    MAX_MEMORY_RETRIEVAL_ITEMS,
+    MAX_CONVERSATION_MESSAGE_BYTES, MAX_HISTORY_BYTES, MAX_HISTORY_MESSAGE_COUNT,
+    MAX_MEMORY_RETRIEVAL_BYTES, MAX_MEMORY_RETRIEVAL_ITEMS,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use crate::AdapterError;
 
 pub const MAX_RUNTIME_GUIDANCE_BYTES: usize = 4 * 1024;
-pub const MAX_LANGUAGE_MODEL_INPUT_BYTES: usize = 40 * 1024;
+pub const MAX_LANGUAGE_MODEL_INPUT_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LanguageModelInput {
@@ -58,14 +58,14 @@ impl LanguageModelInput {
         let recent_messages = recent_messages.into_iter().collect::<Vec<_>>();
         if recent_messages.len() > MAX_HISTORY_MESSAGE_COUNT {
             return Err(AdapterError::new(
-                "language-model history exceeds eight exchanges",
+                "language-model history exceeds sixteen exchanges",
             ));
         }
         let history_bytes = recent_messages.iter().try_fold(0_usize, |total, message| {
             total.checked_add(message.text().len())
         });
-        if history_bytes.is_none_or(|bytes| bytes > MAX_CONVERSATION_MESSAGE_BYTES) {
-            return Err(AdapterError::new("language-model history exceeds 16 KiB"));
+        if history_bytes.is_none_or(|bytes| bytes > MAX_HISTORY_BYTES) {
+            return Err(AdapterError::new("language-model history exceeds 32 KiB"));
         }
         let runtime_guidance = runtime_guidance.into();
         if runtime_guidance.trim().is_empty() {
@@ -107,7 +107,7 @@ impl LanguageModelInput {
             });
         if aggregate_bytes.is_none_or(|bytes| bytes > MAX_LANGUAGE_MODEL_INPUT_BYTES) {
             return Err(AdapterError::new(
-                "language-model aggregate input exceeds 40 KiB",
+                "language-model aggregate input exceeds 64 KiB",
             ));
         }
 

@@ -22,6 +22,7 @@ import {
 } from "./preferences/setup.js";
 import {
   ConversationSession,
+  type CarriedConversationContext,
   type ConversationSessionState,
 } from "./runtime/conversation-session.js";
 import {
@@ -34,6 +35,7 @@ export interface DesktopSession {
   readonly state: ConversationSessionState;
   subscribe(listener: (state: ConversationSessionState) => void): () => void;
   send(transcript: string): Promise<bigint>;
+  continueWithSeed(context: CarriedConversationContext): Promise<void>;
   listMemories(cursor?: MemoryCursor | null): Promise<MemoryPage>;
   inspectMemory(memoryId: bigint): Promise<MemoryInspection>;
   approveMemory(memoryId: bigint, expectedRevision: bigint): Promise<MemoryInspection>;

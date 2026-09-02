@@ -1,15 +1,17 @@
 // @vitest-environment jsdom
 
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { App, type DesktopSession } from "../src/App.js";
+import { VoiceFocus, type VoiceFocusProps } from "../src/components/VoiceFocus.js";
 import {
   focusScenes,
   registerSceneRenderer,
   resetSceneRenderersForTests,
 } from "../src/focus-scenes/registry.js";
-import { preferencesStorageKey } from "../src/preferences/preferences.js";
+import type { VoiceVisualState } from "../src/focus-scenes/types.js";
+import { defaultPreferences, preferencesStorageKey } from "../src/preferences/preferences.js";
 import type { ConversationSessionState } from "../src/runtime/conversation-session.js";
 
 beforeEach(() => {
@@ -28,14 +30,55 @@ afterEach(() => {
 });
 
 describe("Voice Focus", () => {
+  it("renders a four-segment orbital trace with distinct truthful visual-state cadences", () => {
+    const { container, rerender } = render(
+      <VoiceFocus {...voiceFocusProps("idle")} />,
+    );
+    const trace = container.querySelector<HTMLElement>(".voice-locality-trace");
+
+    expect(trace).toBeTruthy();
+    expect(trace?.getAttribute("aria-hidden")).toBe("true");
+    expect(trace?.querySelectorAll("[data-orbit-segment]")).toHaveLength(4);
+    expect(trace?.getAttribute("data-motion")).toBe("static");
+    expect(trace?.getAttribute("data-cadence")).toBe("idle");
+    expect(trace?.getAttribute("data-route")).toBe("continuous");
+    expect(trace?.textContent).toBe("");
+
+    for (const state of ["listening", "thinking", "speaking"] as const) {
+      rerender(<VoiceFocus {...voiceFocusProps(state)} />);
+      expect(trace?.getAttribute("data-motion")).toBe("looping");
+      expect(trace?.getAttribute("data-cadence")).toBe(state);
+      expect(trace?.getAttribute("data-route")).toBe("continuous");
+    }
+
+    rerender(<VoiceFocus {...voiceFocusProps("interrupted")} />);
+    expect(trace?.getAttribute("data-motion")).toBe("static");
+    expect(trace?.getAttribute("data-cadence")).toBe("interrupted");
+
+    rerender(<VoiceFocus {...voiceFocusProps("error")} />);
+    expect(trace?.getAttribute("data-motion")).toBe("static");
+    expect(trace?.getAttribute("data-route")).toBe("broken");
+  });
+
+  it("keeps the orbital trace static when reduced motion is requested", () => {
+    const { container } = render(
+      <VoiceFocus {...voiceFocusProps("speaking", true)} />,
+    );
+
+    const trace = container.querySelector(".voice-locality-trace");
+    expect(trace?.getAttribute("data-motion")).toBe("static");
+    expect(trace?.getAttribute("data-cadence")).toBe("speaking");
+    expect(trace?.getAttribute("data-route")).toBe("continuous");
+  });
+
   it("hides live voice for the text gateway but offers a labeled visual preview", async () => {
     renderConnectedApp();
 
-    await screen.findByRole("button", { name: "Preview Voice Focus" });
+    const preview = await enabledVoiceEntry("Preview Voice Focus");
     expect(screen.queryByRole("button", { name: "Enter Voice Focus" })).toBeNull();
     expect(screen.getByText(/Microphone and speech playback are not connected/)).toBeTruthy();
 
-    fireEvent.click(screen.getByRole("button", { name: "Preview Voice Focus" }));
+    fireEvent.click(preview);
 
     expect(await screen.findByText("Visual preview — no live voice session")).toBeTruthy();
     expect(screen.getByText("STT unavailable")).toBeTruthy();
@@ -48,6 +91,7 @@ describe("Voice Focus", () => {
     renderConnectedApp({ session });
 
     const entry = await screen.findByRole("button", { name: "Voice Focus" });
+    await waitFor(() => expect(entry).toHaveProperty("disabled", false));
     fireEvent.click(entry);
 
     expect(await screen.findByRole("dialog", { name: "Voice Focus" })).toBeTruthy();
@@ -68,7 +112,7 @@ describe("Voice Focus", () => {
       },
     }));
     renderConnectedApp({ session });
-    fireEvent.click(await screen.findByRole("button", { name: "Voice Focus" }));
+    fireEvent.click(await enabledVoiceEntry("Voice Focus"));
     fireEvent.click(await screen.findByRole("button", { name: "Exit Focus" }));
 
     expect(await screen.findByRole("dialog", { name: "Leave Voice Focus?" })).toBeTruthy();
@@ -85,7 +129,7 @@ describe("Voice Focus", () => {
       voice: activeVoice(),
     }));
     renderConnectedApp({ session });
-    fireEvent.click(await screen.findByRole("button", { name: "Voice Focus" }));
+    fireEvent.click(await enabledVoiceEntry("Voice Focus"));
 
     fireEvent.keyDown(document, { key: "Escape" });
     expect(await screen.findByRole("dialog", { name: "Leave Voice Focus?" })).toBeTruthy();
@@ -102,7 +146,7 @@ describe("Voice Focus", () => {
   it("closes a stale exit dialog instead of stopping a replacement session", async () => {
     const session = new FakeSession(configuredVoiceState({ voice: activeVoice() }));
     renderConnectedApp({ session });
-    fireEvent.click(await screen.findByRole("button", { name: "Voice Focus" }));
+    fireEvent.click(await enabledVoiceEntry("Voice Focus"));
     fireEvent.click(screen.getByRole("button", { name: "Exit Focus" }));
     expect(await screen.findByRole("dialog", { name: "Leave Voice Focus?" })).toBeTruthy();
 
@@ -118,7 +162,7 @@ describe("Voice Focus", () => {
     const session = new FakeSession(configuredVoiceState({ voice: activeVoice() }));
     session.stopVoice.mockRejectedValueOnce(new Error("stop failed"));
     renderConnectedApp({ session });
-    fireEvent.click(await screen.findByRole("button", { name: "Voice Focus" }));
+    fireEvent.click(await enabledVoiceEntry("Voice Focus"));
     fireEvent.click(screen.getByRole("button", { name: "Exit Focus" }));
 
     const cancel = await screen.findByRole("button", { name: "Cancel" });
@@ -138,7 +182,7 @@ describe("Voice Focus", () => {
     const stopping = deferred<undefined>();
     session.stopVoice.mockReturnValueOnce(stopping.promise);
     renderConnectedApp({ session });
-    fireEvent.click(await screen.findByRole("button", { name: "Voice Focus" }));
+    fireEvent.click(await enabledVoiceEntry("Voice Focus"));
     fireEvent.click(screen.getByRole("button", { name: "Exit Focus" }));
     fireEvent.click(await screen.findByRole("button", { name: "Stop voice and exit" }));
     fireEvent.keyDown(document, { key: "Escape" });
@@ -162,6 +206,7 @@ describe("Voice Focus", () => {
     }));
     renderConnectedApp({ session });
     const composer = await screen.findByLabelText("Message");
+    await waitForWorkspaceRecovery();
 
     fireEvent.focus(composer);
     expect(session.pauseVoiceCapture).toHaveBeenCalledOnce();
@@ -205,6 +250,7 @@ describe("Voice Focus", () => {
     const session = new FakeSession(configuredVoiceState({ voice: activeVoice() }));
     renderConnectedApp({ session });
     const composer = await screen.findByLabelText("Message");
+    await waitForWorkspaceRecovery();
 
     fireEvent.focus(composer);
     fireEvent.blur(composer);
@@ -219,6 +265,7 @@ describe("Voice Focus", () => {
     const session = new FakeSession(configuredVoiceState({ voice: activeVoice() }));
     renderConnectedApp({ session });
     const composer = await screen.findByLabelText("Message");
+    await waitForWorkspaceRecovery();
     fireEvent.focus(composer);
     act(() => session.emit(configuredVoiceState({
       voice: { ...activeVoice(), capture: "paused", visual: "paused" },
@@ -245,6 +292,7 @@ describe("Voice Focus", () => {
     const session = new FakeSession(configuredVoiceState({ voice: activeVoice() }));
     renderConnectedApp({ session });
     const composer = await screen.findByLabelText("Message");
+    await waitForWorkspaceRecovery();
     fireEvent.focus(composer);
     act(() => session.emit(configuredVoiceState({
       voice: { ...activeVoice(), capture: "paused", visual: "paused" },
@@ -266,6 +314,7 @@ describe("Voice Focus", () => {
       voice: { ...activeVoice(), capture: "resuming" },
     }));
     renderConnectedApp({ session });
+    await waitForWorkspaceRecovery();
     fireEvent.focus(await screen.findByLabelText("Message"));
     expect(session.pauseVoiceCapture).not.toHaveBeenCalled();
 
@@ -278,6 +327,7 @@ describe("Voice Focus", () => {
     session.pauseVoiceCapture.mockRejectedValueOnce(new Error("pause failed"));
     renderConnectedApp({ session });
 
+    await waitForWorkspaceRecovery();
     fireEvent.focus(await screen.findByLabelText("Message"));
     expect((await screen.findByRole("alert")).textContent).toContain("Microphone pause failed");
     fireEvent.click(screen.getByRole("button", { name: "Retry voice control" }));
@@ -292,6 +342,7 @@ describe("Voice Focus", () => {
     session.pauseVoiceCapture.mockReturnValueOnce(pause.promise);
     session.stopVoice.mockRejectedValueOnce(new Error("stop failed"));
     renderConnectedApp({ session });
+    await waitForWorkspaceRecovery();
     fireEvent.focus(await screen.findByLabelText("Message"));
     fireEvent.click(screen.getByRole("button", { name: "Stop voice" }));
     expect((await screen.findByRole("alert")).textContent).toContain("Voice could not stop cleanly");
@@ -321,7 +372,7 @@ describe("Voice Focus", () => {
     expect(await screen.findByText("Voice remains active locally")).toBeTruthy();
     expect(screen.getByText("recognizer needs attention")).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Retry voice" })).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Voice Focus" }));
+    fireEvent.click(await enabledVoiceEntry("Voice Focus"));
     expect(await screen.findByText("Microphone paused")).toBeTruthy();
     expect(screen.getByText("recognizer needs attention")).toBeTruthy();
     expect(screen.getByText("Temporary voice issue. The session is still active; speak again or stop voice.")).toBeTruthy();
@@ -348,7 +399,7 @@ describe("Voice Focus", () => {
       },
     }));
     renderConnectedApp({ session });
-    fireEvent.click(await screen.findByRole("button", { name: "Voice Focus" }));
+    fireEvent.click(await enabledVoiceEntry("Voice Focus"));
 
     expect(screen.queryByLabelText("Active audio devices")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Retry voice" }));
@@ -360,7 +411,7 @@ describe("Voice Focus", () => {
     const session = new FakeSession(configuredVoiceState({ voice: activeVoice() }));
     session.stopVoice.mockRejectedValueOnce(new Error("stop failed"));
     renderConnectedApp({ session });
-    fireEvent.click(await screen.findByRole("button", { name: "Voice Focus" }));
+    fireEvent.click(await enabledVoiceEntry("Voice Focus"));
     fireEvent.click(screen.getByRole("button", { name: "Stop voice" }));
 
     expect((await screen.findByRole("alert")).textContent).toContain("Voice could not stop cleanly");
@@ -420,7 +471,7 @@ describe("Voice Focus", () => {
       />,
     );
     connectWithAbsolutePaths();
-    fireEvent.click(await screen.findByRole("button", { name: "Voice Focus" }));
+    fireEvent.click(await enabledVoiceEntry("Voice Focus"));
     expect(await screen.findByRole("dialog", { name: "Voice Focus" })).toBeTruthy();
     renderedStates.length = 0;
 
@@ -435,7 +486,7 @@ describe("Voice Focus", () => {
   it("renders disconnected recovery immediately when the runtime fails in live Focus", async () => {
     const session = new FakeSession(configuredVoiceState());
     renderConnectedApp({ session });
-    fireEvent.click(await screen.findByRole("button", { name: "Voice Focus" }));
+    fireEvent.click(await enabledVoiceEntry("Voice Focus"));
     expect(await screen.findByRole("dialog", { name: "Voice Focus" })).toBeTruthy();
 
     act(() => session.emit(localState({
@@ -445,8 +496,10 @@ describe("Voice Focus", () => {
 
     expect(screen.queryByRole("dialog", { name: "Voice Focus" })).toBeNull();
     expect(screen.getByText("Runtime disconnected")).toBeTruthy();
-    expect(screen.getByText("LLM unavailable")).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Reconnect runtime" })).toBeTruthy();
+    const diagnostics = screen.getByText("Diagnostics").closest("details");
+    fireEvent.click(screen.getByText("Diagnostics"));
+    expect(within(diagnostics!).getByText("LLM unavailable")).toBeTruthy();
+    expect(screen.getAllByRole("button", { name: "Reconnect local runtime" })).toHaveLength(1);
   });
 
   it("migrates remembered automatic entry to manual Focus", async () => {
@@ -480,7 +533,7 @@ describe("Voice Focus", () => {
         partialTranscript: "A fixture transcript",
       },
     })) });
-    fireEvent.click(await screen.findByRole("button", { name: "Voice Focus" }));
+    fireEvent.click(await enabledVoiceEntry("Voice Focus"));
 
     expect(await screen.findByText("Speaking")).toBeTruthy();
     expect(screen.getByText("Speaking").getAttribute("aria-live")).toBe("polite");
@@ -507,7 +560,7 @@ describe("Voice Focus", () => {
         partialTranscript: "Session-only transcript",
       },
     })) });
-    fireEvent.click(await screen.findByRole("button", { name: "Voice Focus" }));
+    fireEvent.click(await enabledVoiceEntry("Voice Focus"));
     fireEvent.click(screen.getByRole("button", { name: "Show transcript" }));
     expect(screen.getByText("Session-only transcript")).toBeTruthy();
 
@@ -530,7 +583,7 @@ describe("Voice Focus", () => {
         },
       })),
     });
-    fireEvent.click(await screen.findByRole("button", { name: "Voice Focus" }));
+    fireEvent.click(await enabledVoiceEntry("Voice Focus"));
     fireEvent.click(screen.getByLabelText("Remember transcript visibility"));
     fireEvent.click(screen.getByRole("button", { name: "Show transcript" }));
 
@@ -546,7 +599,7 @@ describe("Voice Focus", () => {
   it("exposes all seven scenes and persists the selected scene", async () => {
     const storage = memoryStorage();
     renderConnectedApp({ storage });
-    fireEvent.click(await screen.findByRole("button", { name: "Preview Voice Focus" }));
+    fireEvent.click(await enabledVoiceEntry("Preview Voice Focus"));
 
     const chooser = screen.getByLabelText("Scene") as HTMLSelectElement;
     expect([...chooser.options].map((option) => option.text)).toEqual(
@@ -563,9 +616,9 @@ describe("Voice Focus", () => {
     expect((screen.getByLabelText("Scene") as HTMLSelectElement).value).toBe("threads");
   });
 
-  it("fades only secondary controls while Exit Focus and privacy remain visible", async () => {
+  it("keeps secondary controls visible and keyboard reachable after inactivity", async () => {
     renderConnectedApp();
-    fireEvent.click(await screen.findByRole("button", { name: "Preview Voice Focus" }));
+    fireEvent.click(await enabledVoiceEntry("Preview Voice Focus"));
     const focus = await screen.findByRole("dialog", { name: "Voice Focus" });
 
     vi.useFakeTimers();
@@ -573,19 +626,25 @@ describe("Voice Focus", () => {
     act(() => vi.advanceTimersByTime(3_000));
 
     expect(focus.querySelector("[data-secondary-controls]")?.getAttribute("data-visible"))
-      .toBe("false");
+      .toBe("true");
     expect(screen.getByRole("button", { name: "Exit Focus" })).toBeTruthy();
     expect(screen.getByLabelText("Component locality")).toBeTruthy();
 
-    fireEvent.keyDown(focus, { key: "Tab" });
-    expect(focus.querySelector("[data-secondary-controls]")?.getAttribute("data-visible"))
-      .toBe("true");
+    const scene = screen.getByLabelText("Scene");
+    const transcript = screen.getByRole("button", { name: "Show transcript" });
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Exit Focus" }));
+    pressTab();
+    expect(document.activeElement).toBe(scene);
+    pressTab();
+    expect(document.activeElement).toBe(screen.getByLabelText("Remember transcript visibility"));
+    pressTab();
+    expect(document.activeElement).toBe(transcript);
   });
 
   it("does not steal control focus when live voice state updates", async () => {
     const session = new FakeSession(configuredVoiceState({ voice: activeVoice() }));
     renderConnectedApp({ session });
-    fireEvent.click(await screen.findByRole("button", { name: "Voice Focus" }));
+    fireEvent.click(await enabledVoiceEntry("Voice Focus"));
     const transcriptButton = await screen.findByRole("button", { name: "Show transcript" });
     transcriptButton.focus();
 
@@ -597,9 +656,46 @@ describe("Voice Focus", () => {
   });
 });
 
+function voiceFocusProps(
+  state: VoiceVisualState,
+  reducedMotion = false,
+): VoiceFocusProps {
+  return {
+    capture: state === "listening" ? "listening" : "paused",
+    components: {
+      audio: { status: "ready", location: "local" },
+      llm: { status: "ready", location: "local" },
+      stt: { status: "ready", location: "local" },
+      telemetry: { status: "disabled", location: null },
+      tts: { status: "ready", location: "local" },
+    },
+    mode: "live",
+    onExit: vi.fn(),
+    onPreferencesChange: vi.fn(),
+    onStart: vi.fn(),
+    onStop: vi.fn(),
+    preferences: { ...defaultPreferences, focusScene: "none" },
+    reducedMotion,
+    session: "active",
+    state,
+    suspended: false,
+    transcript: "",
+  };
+}
+
+function pressTab() {
+  fireEvent.keyDown(document, { key: "Tab" });
+  const tabbable = [...document.querySelectorAll<HTMLElement>(
+    "button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [href]",
+  )].filter((element) => element.tabIndex >= 0);
+  const currentIndex = tabbable.indexOf(document.activeElement as HTMLElement);
+  tabbable[currentIndex + 1]?.focus();
+}
+
 class FakeSession implements DesktopSession {
   state: ConversationSessionState;
   readonly close = vi.fn(async () => undefined);
+  readonly continueWithSeed = vi.fn<DesktopSession["continueWithSeed"]>(async () => undefined);
   readonly inspectMemory = vi.fn<DesktopSession["inspectMemory"]>();
   readonly approveMemory = vi.fn<DesktopSession["approveMemory"]>();
   readonly deleteMemory = vi.fn<DesktopSession["deleteMemory"]>();
@@ -644,6 +740,18 @@ function renderConnectedApp(options: {
   connectWithAbsolutePaths();
 }
 
+async function enabledVoiceEntry(name: "Voice Focus" | "Preview Voice Focus") {
+  const entry = await screen.findByRole("button", { name });
+  await waitFor(() => expect(entry).toHaveProperty("disabled", false));
+  return entry;
+}
+
+async function waitForWorkspaceRecovery() {
+  await waitFor(() => {
+    expect(screen.queryAllByText(/^Wait for Session recovery/)).toHaveLength(0);
+  });
+}
+
 function connectWithAbsolutePaths() {
   fireEvent.change(screen.getByLabelText("Gateway executable"), {
     target: { value: "/Applications/Conversation Runtime/runtime-gateway" },
@@ -657,7 +765,7 @@ function connectWithAbsolutePaths() {
 function localState(
   overrides: Partial<ConversationSessionState> = {},
 ): ConversationSessionState {
-  return {
+  const state: ConversationSessionState = {
     phase: "ready",
     status: {
       transport: "stdio",
@@ -679,8 +787,13 @@ function localState(
       visual: "idle",
       partialTranscript: "",
     },
+    continuation: { inProgress: false },
     error: undefined,
+  };
+  return {
+    ...state,
     ...overrides,
+    continuation: overrides.continuation ?? state.continuation,
   };
 }
 

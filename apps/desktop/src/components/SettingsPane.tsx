@@ -184,20 +184,19 @@ export function SettingsPane({
   }, [preferences.personaPresets]);
 
   return (
-    <section aria-busy={loading} aria-label="Persona settings" className="settings-pane">
+    <section aria-busy={loading} aria-label="How it responds" className="settings-pane">
       <header className="settings-header">
         <div>
-          <p className="utility-label">Local persona controls</p>
-          <h1>Persona settings</h1>
+          <p className="utility-label">Response controls</p>
+          <h1>How it responds</h1>
         </div>
         <button className="quiet-action" onClick={onBack} ref={backRef} type="button">
           Conversation
         </button>
       </header>
       <p className="settings-disclosure">
-        These controls shape how the connected model responds. Changing the persona or mode starts
-        fresh conversational context. Saved history remains local; approved memory is not deleted
-        and may still supply relevant facts.
+        These controls shape how the connected model responds. Presets stay in this app, while the
+        active values are applied to the connected local runtime.
       </p>
 
       {loadError ? (
@@ -214,6 +213,7 @@ export function SettingsPane({
             <span>Mode</span>
             <select
               aria-label="Mode"
+              className="settings-field"
               onChange={(event) => setMode(event.target.value as PersonaState["mode"])}
               value={draft.mode}
             >
@@ -241,21 +241,29 @@ export function SettingsPane({
           </div>
 
           {applyError ? <p className="settings-error" role="alert">{applyError}</p> : null}
-          <button className="primary-action" disabled={applyBusy} onClick={() => void apply()} type="button">
-            Apply
-          </button>
+          <div className="settings-apply-decision">
+            <p>
+              Changing how it responds starts a fresh active conversation. Saved Sessions and approved memories remain.
+            </p>
+            <button className="primary-action" disabled={applyBusy} onClick={() => void apply()} type="button">
+              Apply
+            </button>
+          </div>
 
           <div className="settings-preset-save">
             <label>
               <span>Preset name</span>
               <input
                 aria-label="Preset name"
+                className="settings-field"
                 onChange={(event) => setPresetName(event.target.value)}
                 type="text"
                 value={presetName}
               />
             </label>
-            <button onClick={saveAsPreset} type="button">Save as preset</button>
+            <button className="settings-preset-save-action" onClick={saveAsPreset} type="button">
+              Save as preset
+            </button>
             {presetError ? <p className="settings-error" role="alert">{presetError}</p> : null}
           </div>
 

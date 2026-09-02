@@ -54,12 +54,12 @@ async fn run() -> Result<(), ()> {
             return Err(());
         }
     };
-    let runtime = TextTurnRuntime::new(context.clone(), language.clone());
+    let runtime = TextTurnRuntime::new(context, language.clone());
     let provider_failure = CancellationToken::new();
     let mut session =
         GatewaySession::new(runtime, status).with_provider_failure(provider_failure.clone());
     if let Some(voice_adapters) = voice {
-        session = session.with_voice(voice_adapters, context, language);
+        session = session.with_voice(voice_adapters, language);
     }
     if let Some(store) = memory_store {
         let store: Arc<dyn MemoryStore> = Arc::new(store);

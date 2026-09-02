@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use conversation_model_adapters::{
     GenerationLanguageRequest, LanguageModel, LanguageModelInput, LanguageModelRequest,
-    OllamaConfig, OllamaLanguageModel, OllamaThinkingLevel,
+    OllamaConfig, OllamaLanguageModel, OllamaThinkingLevel, MAX_LANGUAGE_MODEL_INPUT_BYTES,
 };
 use conversation_protocol::{
     ContextSource, ConversationMessage, ConversationMode, ConversationRole, GenerationId,
@@ -20,6 +20,78 @@ use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
 const DIRECT_PROXY_TEST_CHILD: &str = "CONVERSATION_OLLAMA_DIRECT_PROXY_TEST_CHILD";
+
+#[test]
+fn language_model_input_accepts_the_exact_sixty_kib_component_envelope() {
+    let turn_id = TurnId::new(99);
+    let history = (0..32)
+        .map(|index| {
+            ConversationMessage::new(
+                if index % 2 == 0 {
+                    ConversationRole::User
+                } else {
+                    ConversationRole::Assistant
+                },
+                "h".repeat(1024),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let memory = [
+        MemoryContextItem::new(
+            MemoryId::new(99).unwrap(),
+            MemoryKind::Semantic,
+            "m".repeat(4 * 1024),
+            MemoryRetrievalReason::ExactPhrase,
+        )
+        .unwrap(),
+        MemoryContextItem::new(
+            MemoryId::new(100).unwrap(),
+            MemoryKind::Episodic,
+            "n".repeat(4 * 1024),
+            MemoryRetrievalReason::SharedTerm,
+        )
+        .unwrap(),
+    ];
+
+    let input = LanguageModelInput::with_quality_and_memory(
+        "t".repeat(16 * 1024),
+        history,
+        QualityDecision::new(
+            turn_id,
+            ConversationMode::DirectAnswer,
+            ResponseControls::default(),
+            [],
+            32,
+            [ContextSource::RecentHistory],
+        )
+        .unwrap(),
+        "g".repeat(4 * 1024),
+        memory,
+    )
+    .unwrap();
+
+    assert_eq!(MAX_LANGUAGE_MODEL_INPUT_BYTES, 64 * 1024);
+    assert_eq!(input.recent_messages().len(), 32);
+    assert_eq!(
+        input
+            .recent_messages()
+            .iter()
+            .map(|message| message.text().len())
+            .sum::<usize>(),
+        32 * 1024
+    );
+    assert_eq!(input.transcript().len(), 16 * 1024);
+    assert_eq!(input.runtime_guidance().unwrap().len(), 4 * 1024);
+    assert_eq!(
+        input
+            .memory_items()
+            .iter()
+            .map(MemoryContextItem::content_bytes)
+            .sum::<usize>(),
+        8 * 1024
+    );
+}
 
 #[tokio::test]
 async fn generation_language_stream_preserves_turn_and_generation_identity() {

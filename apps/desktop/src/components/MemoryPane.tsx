@@ -326,13 +326,13 @@ export function MemoryPane({ session, status, onBack, refreshSignal = 0 }: Memor
   }
 
   return (
-    <section aria-busy={loadingList} aria-label="Runtime memory" className="memory-pane">
+    <section aria-busy={loadingList} aria-label="Memory review" className="memory-pane">
       <MemoryHeader
         actionLabel="Conversation"
         actionRef={listBackRef}
         eyebrow="Stored on this Mac"
         onAction={onBack}
-        title="Runtime memory"
+        title="Memory review"
       />
       <p className="memory-disclosure">
         Memory for {status.modelId} stays local. Stored memory is fallible context, not an

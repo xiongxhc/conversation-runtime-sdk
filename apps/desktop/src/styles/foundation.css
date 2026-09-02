@@ -1,0 +1,44 @@
+:root {
+  --canvas: #F6F3EC;
+  --ink: #282A2B;
+  --muted: #626560;
+  --rule: #CDCAC2;
+  --signal: #315F5C;
+  --attention: #8A4039;
+
+  --dark-canvas: #202226;
+  --dark-ink: #F1EEE7;
+  --dark-muted: #B7B5AE;
+  --dark-rule: #46494D;
+  --dark-signal: #A8D8D3;
+  --dark-attention: #FFB4AB;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+  --space-8: 64px;
+
+  --radius-control: 8px;
+  --radius-field: 12px;
+  --radius-pill: 999px;
+
+  --type-display: -apple-system, BlinkMacSystemFont, "SF Pro Display", system-ui, sans-serif;
+  --type-body: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+  --type-utility: "SF Mono", "SFMono-Regular", ui-monospace, Menlo, Monaco, monospace;
+  --focus-ring: var(--signal);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --canvas: var(--dark-canvas);
+    --ink: var(--dark-ink);
+    --muted: var(--dark-muted);
+    --rule: var(--dark-rule);
+    --signal: var(--dark-signal);
+    --attention: var(--dark-attention);
+  }
+}

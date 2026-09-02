@@ -6,9 +6,11 @@ import { fileURLToPath } from "node:url";
 import {
   encodeClientCommand,
   MAX_CONVERSATION_MESSAGE_BYTES,
+  MAX_HISTORY_MESSAGE_COUNT,
   MAX_U64,
   parseClientCommand,
   parseGatewayMessage,
+  parseReadyMessage,
 } from "../src/protocol.js";
 
 const fixtureDirectory = new URL(
@@ -32,7 +34,7 @@ async function fixtureLines(name: string): Promise<unknown[]> {
 
 test("parses every shared v1 command fixture with bigint identifiers", async () => {
   const commands = await fixtureLines("commands.jsonl");
-  const parsed = commands.map(parseClientCommand);
+  const parsed = commands.map((command) => parseClientCommand(command, 1));
 
   assert.equal(parsed[1]?.type, "start_turn");
   assert.deepEqual(parsed[1], { type: "start_turn", requestId: "req-start-1", transcript: "hello" });
@@ -67,7 +69,7 @@ test("parses every shared v1 command fixture with bigint identifiers", async () 
   });
 });
 
-test("rejects v2 while correlating typed starts through v1 acceptance", () => {
+test("keeps v1 and v2 typed-start decoding version-specific", () => {
   assert.deepEqual(
     parseClientCommand({
       protocol_version: 1,
@@ -77,12 +79,12 @@ test("rejects v2 while correlating typed starts through v1 acceptance", () => {
     }),
     { type: "start_turn", requestId: "request-1", transcript: "hello" },
   );
-  assert.throws(() => parseClientCommand({
+  assert.deepEqual(parseClientCommand({
     protocol_version: 2,
     type: "start_turn",
     request_id: "request-1",
     transcript: "hello",
-  }));
+  }, 2), { type: "start_turn", requestId: "request-1", transcript: "hello" });
   assert.deepEqual(
     parseGatewayMessage({
       protocol_version: 1,
@@ -92,17 +94,210 @@ test("rejects v2 while correlating typed starts through v1 acceptance", () => {
     }),
     { type: "command_accepted", requestId: "request-1", turnId: 9n },
   );
-  assert.throws(() => parseGatewayMessage({
+  assert.deepEqual(parseGatewayMessage({
     protocol_version: 2,
     type: "command_accepted",
     request_id: "request-1",
     turn_id: "9",
+  }, 2), { type: "command_accepted", requestId: "request-1", turnId: 9n });
+});
+
+test("detects a v2 ready message and decodes its context-seed status", () => {
+  assert.deepEqual(parseReadyMessage({
+    protocol_version: 2,
+    type: "ready",
+    status: {
+      ...wireStatus(),
+      capabilities: ["text", "conversation_context_seed"],
+      last_context_seed_operation_id: "continue-1",
+    },
+  }), {
+    version: 2,
+    message: {
+      type: "ready",
+      status: {
+        transport: "stdio",
+        privacyMode: "local_only",
+        languageLocation: "local",
+        modelId: "local-model",
+        memoryEnabled: false,
+        memoryLocation: null,
+        telemetryEnabled: false,
+        capabilities: ["text", "conversation_context_seed"],
+        components: [{
+          kind: "language_model",
+          executionLocation: "local",
+          providerLabel: "Local language",
+        }],
+        lastContextSeedOperationId: "continue-1",
+      },
+    },
+  });
+});
+
+test("decodes and encodes the exact v2 context-seed command", () => {
+  const command = {
+    protocol_version: 2,
+    type: "seed_conversation_context",
+    request_id: "request-1",
+    operation_id: "continue-1",
+    exchanges: [{ user: "hello", assistant: "hi" }],
+  };
+  assert.deepEqual(parseClientCommand(command), {
+    type: "seed_conversation_context",
+    requestId: "request-1",
+    operationId: "continue-1",
+    exchanges: [{ user: "hello", assistant: "hi" }],
+  });
+  assert.deepEqual(
+    JSON.parse(new TextDecoder().decode(encodeClientCommand({
+      type: "seed_conversation_context",
+      requestId: "request-1",
+      operationId: "continue-1",
+      exchanges: [{ user: "hello", assistant: "hi" }],
+    }, 2))),
+    command,
+  );
+});
+
+test("keeps v1 status exact and rejects v1 context seeding", () => {
+  assert.deepEqual(parseReadyMessage({
+    protocol_version: 1,
+    type: "ready",
+    status: wireStatus(),
+  }), {
+    version: 1,
+    message: {
+      type: "ready",
+      status: {
+        transport: "stdio",
+        privacyMode: "local_only",
+        languageLocation: "local",
+        modelId: "local-model",
+        memoryEnabled: false,
+        memoryLocation: null,
+        telemetryEnabled: false,
+        capabilities: ["text"],
+        components: [{
+          kind: "language_model",
+          executionLocation: "local",
+          providerLabel: "Local language",
+        }],
+        lastContextSeedOperationId: null,
+      },
+    },
+  });
+  assert.throws(() => parseGatewayMessage({
+    protocol_version: 1,
+    type: "ready",
+    status: { ...wireStatus(), last_context_seed_operation_id: null },
   }));
+  assert.throws(() => parseClientCommand({
+    protocol_version: 1,
+    type: "seed_conversation_context",
+    request_id: "request-1",
+    operation_id: "continue-1",
+    exchanges: [{ user: "hello", assistant: "hi" }],
+  }, 1));
+  assert.throws(() => encodeClientCommand({
+    type: "seed_conversation_context",
+    requestId: "request-1",
+    operationId: "continue-1",
+    exchanges: [{ user: "hello", assistant: "hi" }],
+  }, 1));
+});
+
+test("rejects malformed v2 context-seed payloads at byte and exchange boundaries", () => {
+  const valid = {
+    protocol_version: 2,
+    type: "seed_conversation_context",
+    request_id: "request-1",
+    operation_id: "continue-1",
+    exchanges: [{ user: "hello", assistant: "hi" }],
+  };
+  assert.throws(() => parseClientCommand({ ...valid, operation_id: "🙂".repeat(17) }));
+  assert.throws(() => parseClientCommand({
+    ...valid,
+    exchanges: [{ user: "hello", assistant: "🙂".repeat((32 * 1024) / 4) }],
+  }));
+  assert.throws(() => parseClientCommand({
+    ...valid,
+    exchanges: Array.from({ length: 17 }, () => ({ user: "hello", assistant: "hi" })),
+  }));
+  assert.throws(() => parseReadyMessage({
+    protocol_version: 2,
+    type: "ready",
+    status: { ...wireStatus(), capabilities: ["text", "conversation_context_seed"] },
+  }));
+});
+
+test("rejects empty context exchange lists in parsed and encoded v2 commands", () => {
+  const wire = contextSeedWire([]);
+  assert.throws(() => parseClientCommand(wire, 2), /requires at least one/);
+  assert.throws(() => encodeClientCommand(contextSeedCommand([]), 2), /requires at least one/);
+});
+
+test("rejects blank context messages and accepts exactly sixteen exchanges", () => {
+  for (const exchanges of [
+    [{ user: " ", assistant: "assistant" }],
+    [{ user: "user", assistant: "\n\t" }],
+  ]) {
+    assert.throws(() => parseClientCommand(contextSeedWire(exchanges), 2), /nonblank/);
+    assert.throws(() => encodeClientCommand(contextSeedCommand(exchanges), 2), /nonblank/);
+  }
+
+  const exchanges = Array.from({ length: 16 }, (_, index) => ({
+    user: `user-${index + 1}`,
+    assistant: `assistant-${index + 1}`,
+  }));
+  assert.deepEqual(parseClientCommand(contextSeedWire(exchanges), 2), contextSeedCommand(exchanges));
+  assert.doesNotThrow(() => encodeClientCommand(contextSeedCommand(exchanges), 2));
+});
+
+test("enforces individual and aggregate UTF-8 context bounds independently", () => {
+  const individualOversize = [{
+    user: "u".repeat(MAX_CONVERSATION_MESSAGE_BYTES + 1),
+    assistant: "assistant",
+  }];
+  assert.throws(() => parseClientCommand(contextSeedWire(individualOversize), 2), /16384 bytes/);
+  assert.throws(() => encodeClientCommand(contextSeedCommand(individualOversize), 2), /16384 bytes/);
+
+  const aggregateOversize = [
+    {
+      user: "u".repeat(MAX_CONVERSATION_MESSAGE_BYTES),
+      assistant: "a".repeat(MAX_CONVERSATION_MESSAGE_BYTES - 1),
+    },
+    { user: "u", assistant: "a" },
+  ];
+  assert.throws(() => parseClientCommand(contextSeedWire(aggregateOversize), 2), /32768 bytes/);
+  assert.throws(() => encodeClientCommand(contextSeedCommand(aggregateOversize), 2), /32768 bytes/);
+});
+
+test("accepts a null v2 context-seed status and rejects out-of-order capabilities", () => {
+  const ready = parseReadyMessage({
+    protocol_version: 2,
+    type: "ready",
+    status: {
+      ...wireStatus(),
+      capabilities: ["text", "conversation_context_seed"],
+      last_context_seed_operation_id: null,
+    },
+  });
+  assert.equal(ready.message.status.lastContextSeedOperationId, null);
+  assert.throws(() => parseReadyMessage({
+    protocol_version: 2,
+    type: "ready",
+    status: {
+      ...wireStatus(),
+      capabilities: ["text", "persona_control", "conversation_context_seed"],
+      last_context_seed_operation_id: null,
+    },
+  }), /capabilities has an unsupported value/);
 });
 
 test("parses every shared v1 gateway fixture with bigint-safe memory values", async () => {
   const messages = await fixtureLines("events.jsonl");
-  const parsed = messages.map(parseGatewayMessage);
+  const parsed = messages.map((message) => parseGatewayMessage(message, 1));
 
   assert.equal(parsed[9]?.type, "runtime_event");
   assert.equal(parsed[9]?.event.type, "turn_started");
@@ -182,7 +377,7 @@ test("rejects every shared invalid v1 command and gateway fixture", async () => 
     )
       ? parseClientCommand
       : parseGatewayMessage;
-    assert.throws(() => parse(value));
+    assert.throws(() => parse(value, 1));
   }
 });
 
@@ -607,6 +802,44 @@ test("mirrors the complete v1 timing, quality, and status vocabulary", () => {
   }));
 });
 
+test("applies version-specific history bounds to typed and nested voice quality events", () => {
+  assert.equal(MAX_HISTORY_MESSAGE_COUNT, 32);
+  assert.throws(
+    () => parseGatewayMessage(runtimeEvent(qualityResolved({ history_message_count: 17 })), 1),
+    /history_message_count/,
+  );
+
+  const typed = parseGatewayMessage(
+    runtimeEvent(qualityResolved({ history_message_count: 32 }), 2),
+    2,
+  );
+  assert.equal(typed.type, "runtime_event");
+  assert.equal(typed.event.type, "quality_resolved");
+  assert.equal(typed.event.decision.historyMessageCount, 32);
+  assert.throws(
+    () => parseGatewayMessage(
+      runtimeEvent(qualityResolved({ history_message_count: 33 }), 2),
+      2,
+    ),
+    /history_message_count/,
+  );
+
+  const spoken = parseGatewayMessage({
+    protocol_version: 2,
+    type: "voice_event",
+    event: {
+      type: "voice_turn_event",
+      session_id: "1",
+      generation_id: "1",
+      event: qualityResolved({ history_message_count: 32 }),
+    },
+  }, 2);
+  assert.equal(spoken.type, "voice_event");
+  assert.equal(spoken.event.type, "voice_turn_event");
+  assert.equal(spoken.event.event.type, "quality_resolved");
+  assert.equal(spoken.event.event.decision.historyMessageCount, 32);
+});
+
 test("mirrors the complete v1 persona and memory mutation command vocabulary", () => {
   assert.deepEqual(
     parseClientCommand({ protocol_version: 1, type: "persona_get", request_id: "request-1" }),
@@ -834,8 +1067,8 @@ function wirePersona(): Record<string, unknown> {
   };
 }
 
-function runtimeEvent(event: Record<string, unknown>): Record<string, unknown> {
-  return { protocol_version: 1, type: "runtime_event", event };
+function runtimeEvent(event: Record<string, unknown>, version = 1): Record<string, unknown> {
+  return { protocol_version: version, type: "runtime_event", event };
 }
 
 function qualityDecision(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -877,6 +1110,25 @@ function wireStatus(): Record<string, unknown> {
     components: [
       { kind: "language_model", execution_location: "local", provider_label: "Local language" },
     ],
+  };
+}
+
+function contextSeedWire(exchanges: Array<{ user: string; assistant: string }>): Record<string, unknown> {
+  return {
+    protocol_version: 2,
+    type: "seed_conversation_context",
+    request_id: "request-1",
+    operation_id: "continue-1",
+    exchanges,
+  };
+}
+
+function contextSeedCommand(exchanges: Array<{ user: string; assistant: string }>) {
+  return {
+    type: "seed_conversation_context" as const,
+    requestId: "request-1",
+    operationId: "continue-1",
+    exchanges,
   };
 }
 

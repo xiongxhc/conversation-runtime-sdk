@@ -48,7 +48,7 @@ describe("TauriGatewayTransport", () => {
     const native = createFakeNativeBridge();
     const transport = await TauriGatewayTransport.start(paths, native);
 
-    await transport.send({ type: "start_turn", requestId: "request-1", transcript: "Hello" });
+    await transport.send({ type: "start_turn", requestId: "request-1", transcript: "Hello" }, 1);
 
     expect(native.invocations).toEqual([
       {
@@ -69,12 +69,37 @@ describe("TauriGatewayTransport", () => {
     ]);
   });
 
+  it("encodes context seeding with the negotiated protocol version", async () => {
+    const native = createFakeNativeBridge();
+    const transport = await TauriGatewayTransport.start(paths, native);
+
+    await transport.send({
+      type: "seed_conversation_context",
+      requestId: "request-1",
+      operationId: "continue-1",
+      exchanges: [{ user: "hello", assistant: "hi" }],
+    }, 2);
+
+    expect(native.invocations.at(-1)).toEqual({
+      command: "send_runtime",
+      args: {
+        payload: JSON.stringify({
+          protocol_version: 2,
+          type: "seed_conversation_context",
+          request_id: "request-1",
+          operation_id: "continue-1",
+          exchanges: [{ user: "hello", assistant: "hi" }],
+        }),
+      },
+    });
+  });
+
   it("fails the message stream when the native bridge rejects a send", async () => {
     const native = createFakeNativeBridge();
     native.sendError = new Error("native failure");
     const transport = await TauriGatewayTransport.start(paths, native);
 
-    await expect(transport.send({ type: "status", requestId: "request-1" })).rejects.toThrow("runtime send failed");
+    await expect(transport.send({ type: "status", requestId: "request-1" }, 1)).rejects.toThrow("runtime send failed");
     await expect(transport.messages[Symbol.asyncIterator]().next()).rejects.toThrow("runtime send failed");
   });
 

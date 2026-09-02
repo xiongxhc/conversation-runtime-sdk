@@ -1,7 +1,10 @@
 import {
   parseGatewayMessage,
+  parseReadyMessage,
   validateClientCommand,
   type ClientCommand,
+  type ClientProtocolVersion,
+  type ConversationContextExchange,
   type GatewayMessage,
   type MemoryCursor,
   type MemoryExtractedSummary,
@@ -16,7 +19,7 @@ import {
 
 export interface RuntimeTransport {
   readonly messages: AsyncIterable<unknown>;
-  send(message: ClientCommand): Promise<void>;
+  send(message: ClientCommand, version: ClientProtocolVersion): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -60,6 +63,8 @@ export class RuntimeClient {
   private closing = false;
   private closePromise: Promise<void> | undefined;
   private readyReceived = false;
+  private protocolVersion: ClientProtocolVersion | undefined;
+  private readyStatus: RuntimeStatus | undefined;
   private requestCounter = 0n;
 
   private constructor(private readonly transport: RuntimeTransport) {}
@@ -172,6 +177,35 @@ export class RuntimeClient {
     return result.promise;
   }
 
+  async seedConversationContext(
+    exchanges: readonly ConversationContextExchange[],
+    operationId: string,
+  ): Promise<void> {
+    if (this.protocolVersion === undefined || this.readyStatus === undefined) {
+      throw new Error("runtime client is not ready");
+    }
+    const requestId = this.nextRequestId();
+    const command: ClientCommand = {
+      type: "seed_conversation_context",
+      requestId,
+      operationId,
+      exchanges: exchanges.map((exchange) => ({ ...exchange })),
+    };
+    validateClientCommand(command, this.protocolVersion);
+    if (!this.readyStatus.capabilities.includes("conversation_context_seed")) {
+      throw new Error("connected runtime does not support conversation context seeding");
+    }
+    const result = new Deferred<void>();
+    this.controls.set(requestId, {
+      kind: "seed_conversation_context",
+      accepted: false,
+      result,
+      fail: (error) => result.reject(error),
+    });
+    this.send(command);
+    return result.promise;
+  }
+
   startTurn(transcript: string): Promise<RuntimeTurn> {
     const requestId = this.nextRequestId();
     validateClientCommand({ type: "start_turn", requestId, transcript });
@@ -260,7 +294,14 @@ export class RuntimeClient {
   private async consumeMessages(): Promise<void> {
     try {
       for await (const raw of this.transport.messages) {
-        this.route(parseGatewayMessage(raw));
+        if (!this.readyReceived) {
+          const ready = parseReadyMessage(raw);
+          this.protocolVersion = ready.version;
+          this.readyStatus = ready.message.status;
+          this.route(ready.message);
+        } else {
+          this.route(parseGatewayMessage(raw, this.protocolVersion!));
+        }
         if (this.failure) {
           return;
         }
@@ -423,6 +464,10 @@ export class RuntimeClient {
       case "memory_approve":
       case "memory_delete":
         return;
+      case "seed_conversation_context":
+        this.controls.delete(requestId);
+        control.result.resolve();
+        return;
       case "start_turn": {
         this.controls.delete(requestId);
         if (turnId === undefined || this.turns.has(turnId)) {
@@ -485,7 +530,11 @@ export class RuntimeClient {
       return;
     }
     try {
-      void Promise.resolve(this.transport.send(command)).catch((error: unknown) => this.fail(asError(error)));
+      if (this.protocolVersion === undefined) {
+        this.fail(new Error("runtime client is not ready"));
+        return;
+      }
+      void Promise.resolve(this.transport.send(command, this.protocolVersion)).catch((error: unknown) => this.fail(asError(error)));
     } catch (error) {
       this.fail(asError(error));
     }
@@ -551,6 +600,7 @@ type PendingControl =
   | { kind: "persona_update"; accepted: boolean; result: Deferred<PersonaState>; fail(error: Error): void }
   | { kind: "memory_approve"; accepted: boolean; result: Deferred<MemoryInspection>; fail(error: Error): void }
   | { kind: "memory_delete"; accepted: boolean; result: Deferred<bigint>; fail(error: Error): void }
+  | { kind: "seed_conversation_context"; accepted: boolean; result: Deferred<void>; fail(error: Error): void }
   | { kind: "start_turn"; accepted: boolean; result: Deferred<RuntimeTurn>; fail(error: Error): void }
   | { kind: "interrupt_turn"; accepted: boolean; result: Deferred<void>; fail(error: Error): void }
   | { kind: "start_voice_session"; accepted: boolean; result: Deferred<VoiceSession>; fail(error: Error): void }

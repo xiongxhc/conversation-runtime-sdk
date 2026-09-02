@@ -7,8 +7,8 @@ use conversation_model_adapters::{
     PlaybackReceipt, StreamingSpeechRequest, StreamingSpeechSynthesizer,
 };
 use conversation_protocol::{
-    ConversationMode, GenerationId, PersonaProfile, PlaybackState, ResponseControls, RuntimeEvent,
-    RuntimeTimingMilestone, SessionId, TurnId, UtteranceId,
+    ConversationContextExchange, ConversationMode, GenerationId, PersonaProfile, PlaybackState,
+    ResponseControls, RuntimeEvent, RuntimeTimingMilestone, SessionId, TurnId, UtteranceId,
 };
 use conversation_runtime::{
     ConversationContext, ConversationQualityController, ConversationTurnSource,
@@ -174,6 +174,56 @@ async fn streaming_turn_publishes_original_text_and_enqueues_ordered_frames() {
         requests[1].input().recent_messages()[1].text(),
         "hello world"
     );
+}
+
+#[tokio::test]
+async fn first_spoken_turn_after_seed_receives_all_thirty_two_messages_in_order() {
+    let language = Arc::new(MockGenerationLanguageModel::new(["spoken answer"]));
+    let speech = Arc::new(MockStreamingSpeechSynthesizer::new([]));
+    let output = Arc::new(MockContinuousAudioOutput::new());
+    let context = context();
+    let seed = (0..16)
+        .map(|index| {
+            ConversationContextExchange::new(
+                format!("seed user {index}"),
+                format!("seed assistant {index}"),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    context
+        .seed_completed_history("continue-voice", &seed)
+        .await
+        .unwrap();
+    let runtime = StreamingTurnRuntime::new(context, language.clone(), speech.clone(), output);
+
+    assert!(language.requests().is_empty());
+    assert!(speech.requests().is_empty());
+    let mut stream = runtime
+        .start_turn(
+            ConversationTurnSource::Voice {
+                session_id: SessionId::new(1),
+            },
+            "live spoken question",
+        )
+        .await
+        .unwrap();
+    let observed = drain(&mut stream).await;
+
+    assert_eq!(
+        observed.iter().filter(|event| event.is_terminal()).count(),
+        1
+    );
+    let requests = language.requests();
+    let history = requests[0].input().recent_messages();
+    assert_eq!(history.len(), 32);
+    for index in 0..16 {
+        assert_eq!(history[index * 2].text(), format!("seed user {index}"));
+        assert_eq!(
+            history[index * 2 + 1].text(),
+            format!("seed assistant {index}")
+        );
+    }
 }
 
 #[tokio::test]

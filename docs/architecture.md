@@ -64,9 +64,14 @@ paths, and memory contents do not become diagnostics. The same gateway process
 remains reusable after typed or spoken completion, cancellation, and a clean
 voice-session restart.
 
-Public protocol v1 is independent from gateway configuration schema v1 and the
-private managed-sidecar protocol version. Version disagreement fails explicitly;
-there is no compatibility guess or silent fallback.
+Public protocol v2 adds bounded structured context seeding on top of v1. The
+gateway advertises its version in Ready; the TypeScript client selects the
+matching strict codec and keeps status, text, voice, persona, and memory
+operations working against a v1 server, while a v1-only client cannot connect
+to a v2 gateway. The public protocol version is independent from the gateway
+configuration schema version and the private managed-sidecar protocol version.
+Version disagreement fails explicitly; there is no compatibility guess or
+silent fallback.
 
 ### Shared Conversation and Voice Activation
 

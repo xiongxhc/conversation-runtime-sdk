@@ -6,9 +6,11 @@ This document defines the external measurement procedure. It is not acoustic
 evidence. No repository test, playback acknowledgement, or process timestamp
 can validate physical speaker output.
 
-R3 remains `ACCEPTANCE BLOCKED` until both the canonical ten-minute device run
-and the calibrated acoustic set pass with current-run evidence. Passing the
-repository tests or the analyzer alone does not change that status.
+R3 was closed by product-owner acceptance on 2026-08-23 using external human
+and acoustic measurements that are not stored in this repository. This
+procedure remains the only way to reproduce acoustic evidence for a current
+build. Passing the repository tests or the analyzer alone is not acoustic
+evidence.
 
 ## Canonical Ten-Minute Device Run
 

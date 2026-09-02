@@ -2156,6 +2156,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn responses_are_encoded_for_the_protocol_version_the_client_speaks() {
+        let mut gateway =
+            InMemoryGateway::start(GatewaySession::new(unused_runtime(), status())).await;
+
+        gateway
+            .write(r#"{"protocol_version":2,"type":"status","request_id":"status-v2"}"#)
+            .await;
+        let accepted = frame_value(&gateway.read_message().await);
+        assert_eq!(accepted["type"], "command_accepted");
+        assert_eq!(accepted["protocol_version"], 2);
+        let answered = frame_value(&gateway.read_message().await);
+        assert_eq!(answered["type"], "status");
+        assert_eq!(answered["protocol_version"], 2);
+        let reported = answered["status"].as_object().unwrap();
+        assert!(!reported.contains_key("profile"));
+        assert!(reported.contains_key("last_context_seed_operation_id"));
+
+        // This session's status names a version 2 capability, so a version 1
+        // frame cannot state it: the floor keeps the answer at version 2.
+        gateway
+            .write(r#"{"protocol_version":1,"type":"status","request_id":"status-v1"}"#)
+            .await;
+        assert_eq!(
+            frame_value(&gateway.read_message().await)["protocol_version"],
+            2
+        );
+        let floored = frame_value(&gateway.read_message().await);
+        assert_eq!(floored["type"], "status");
+        assert_eq!(floored["protocol_version"], 2);
+        assert!(!floored["status"]
+            .as_object()
+            .unwrap()
+            .contains_key("profile"));
+
+        gateway
+            .write(r#"{"protocol_version":3,"type":"status","request_id":"status-v3"}"#)
+            .await;
+        assert_eq!(
+            frame_value(&gateway.read_message().await)["protocol_version"],
+            3
+        );
+        let newest = frame_value(&gateway.read_message().await);
+        assert_eq!(newest["type"], "status");
+        assert_eq!(newest["protocol_version"], 3);
+        assert_eq!(newest["status"]["profile"], "offline");
+
+        gateway.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_version_one_capable_status_is_answered_at_version_one() {
+        let legacy_status = RuntimeStatus {
+            capabilities: vec!["text".to_owned()],
+            ..status()
+        };
+        let mut gateway =
+            InMemoryGateway::start(GatewaySession::new(unused_runtime(), legacy_status)).await;
+
+        gateway
+            .write(r#"{"protocol_version":1,"type":"status","request_id":"status-v1"}"#)
+            .await;
+        assert_eq!(
+            frame_value(&gateway.read_message().await)["protocol_version"],
+            1
+        );
+        let answered = frame_value(&gateway.read_message().await);
+        assert_eq!(answered["type"], "status");
+        assert_eq!(answered["protocol_version"], 1);
+        let reported = answered["status"].as_object().unwrap();
+        assert!(!reported.contains_key("profile"));
+        assert!(!reported.contains_key("last_context_seed_operation_id"));
+
+        gateway.close().await;
+    }
+
+    #[tokio::test]
     async fn context_seed_is_rejected_once_while_a_text_turn_is_active() {
         let language = Arc::new(PendingLanguageModel::default());
         let runtime = conversation_runtime::TextTurnRuntime::new(test_context(), language.clone());
@@ -6128,6 +6204,10 @@ mod tests {
             offset += length;
         }
         messages
+    }
+
+    fn frame_value(message: &str) -> serde_json::Value {
+        serde_json::from_str(message).expect("gateway frames are JSON objects")
     }
 
     fn message_type(message: &str) -> &str {

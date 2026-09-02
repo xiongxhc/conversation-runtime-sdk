@@ -1,4 +1,3 @@
-use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::credential::{validate_credential_env_name, Credential};
 use crate::{
     AdapterError, AdapterFuture, AudioCapture, AudioFrame, CaptureEvent, PcmFormat,
     PcmSampleFormat, RecognitionEvent, RecognitionHypothesis, SpeechRecognizer,
@@ -21,7 +21,6 @@ const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_EVENT_BYTES: usize = 64 * 1024;
 const MAX_MODEL_BYTES: usize = 256;
 const MAX_LANGUAGE_BYTES: usize = 64;
-const MAX_CREDENTIAL_ENV_NAME_BYTES: usize = 128;
 const MAX_CONSECUTIVE_TRANSPORT_FAILURES: u32 = 16;
 const DEFAULT_CONSECUTIVE_TRANSPORT_FAILURES: u32 = 3;
 const DEFAULT_RESPONSE_START_TIMEOUT: Duration = Duration::from_secs(30);
@@ -594,25 +593,6 @@ async fn await_transport<T>(
     }
 }
 
-/// The provider credential.
-///
-/// Deliberately not `Debug`-derived, not `Serialize`, and never stored on a
-/// configuration: the value exists only for the lifetime of one session's task
-/// and only reaches the Authorization header.
-struct Credential(String);
-
-impl Credential {
-    fn expose(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Debug for Credential {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("Credential(<redacted>)")
-    }
-}
-
 #[derive(Serialize)]
 struct TranscriptionRequest<'a> {
     model: &'a str,
@@ -647,11 +627,7 @@ enum ProviderEvent {
 }
 
 fn read_credential(name: &str) -> Result<Credential, AdapterError> {
-    std::env::var(name)
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
-        .map(Credential)
+    Credential::read(name)
         .ok_or_else(|| AdapterError::new("online speech recognition credential is not available"))
 }
 
@@ -685,23 +661,8 @@ fn transcription_endpoint(endpoint: &reqwest::Url) -> reqwest::Url {
     endpoint
 }
 
-/// Mirrors the gateway's rule for the *name* of a credential variable, so a
-/// configuration the gateway accepts is a configuration this adapter accepts.
 fn validate_credential_env(name: String) -> Result<String, AdapterError> {
-    if name.is_empty() || name.len() > MAX_CREDENTIAL_ENV_NAME_BYTES {
-        return Err(invalid_config(
-            "credential environment variable name must be within 1..=128 bytes",
-        ));
-    }
-    if name.starts_with(|character: char| character.is_ascii_digit())
-        || !name
-            .bytes()
-            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
-    {
-        return Err(invalid_config(
-            "credential environment variable name must be uppercase ASCII letters, digits, and underscores",
-        ));
-    }
+    validate_credential_env_name(&name).map_err(invalid_config)?;
     Ok(name)
 }
 

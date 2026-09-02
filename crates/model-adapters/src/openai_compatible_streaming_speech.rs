@@ -4,6 +4,7 @@ use reqwest::redirect::Policy;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::credential::{validate_credential_env_name, Credential};
 use crate::openai_compatible_speech::{
     cancelled_error, http_error, speech_endpoint, validate_speech_text,
     OpenAiCompatibleSpeechRequest,
@@ -24,6 +25,10 @@ pub struct OpenAiCompatibleStreamingSpeechConfig {
     streaming_interval: f32,
     response_start_timeout: Duration,
     stall_timeout: Duration,
+    /// The NAME of an environment variable holding the provider credential,
+    /// never its value. `None` is the loopback deployment this adapter was
+    /// written for: no credential is read and no Authorization header is sent.
+    credential_env: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -38,15 +43,19 @@ impl OpenAiCompatibleStreamingSpeechConfig {
         streaming_interval: f32,
     ) -> Result<Self, AdapterError> {
         if !streaming_interval.is_finite() || !(0.10..=2.00).contains(&streaming_interval) {
-            return Err(AdapterError::new(
-                "invalid OpenAI-compatible streaming speech configuration: streaming interval must be within 0.10..=2.00",
+            return Err(configuration_error(
+                "streaming interval must be within 0.10..=2.00",
             ));
+        }
+        if !speech.endpoint().username().is_empty() || speech.endpoint().password().is_some() {
+            return Err(configuration_error("endpoint must not carry credentials"));
         }
         Ok(Self {
             speech,
             streaming_interval,
             response_start_timeout: DEFAULT_RESPONSE_START_TIMEOUT,
             stall_timeout: DEFAULT_STALL_TIMEOUT,
+            credential_env: None,
         })
     }
 
@@ -55,22 +64,40 @@ impl OpenAiCompatibleStreamingSpeechConfig {
         response_start_timeout: Duration,
     ) -> Result<Self, AdapterError> {
         if response_start_timeout.is_zero() {
-            return Err(AdapterError::new(
-                "invalid OpenAI-compatible streaming speech configuration: response start timeout must be non-zero",
+            return Err(configuration_error(
+                "response start timeout must be non-zero",
             ));
         }
         self.response_start_timeout = response_start_timeout;
         Ok(self)
     }
 
+    /// Points the adapter at a remote endpoint that authenticates requests.
+    ///
+    /// The argument is the NAME of an environment variable; the value is read
+    /// once per request and never stored on this configuration.
+    pub fn with_credential_env(
+        mut self,
+        credential_env: impl Into<String>,
+    ) -> Result<Self, AdapterError> {
+        let credential_env = credential_env.into();
+        validate_credential_env_name(&credential_env).map_err(configuration_error)?;
+        self.credential_env = Some(credential_env);
+        Ok(self)
+    }
+
     pub fn with_stall_timeout(mut self, stall_timeout: Duration) -> Result<Self, AdapterError> {
         if stall_timeout.is_zero() {
-            return Err(AdapterError::new(
-                "invalid OpenAI-compatible streaming speech configuration: stall timeout must be non-zero",
-            ));
+            return Err(configuration_error("stall timeout must be non-zero"));
         }
         self.stall_timeout = stall_timeout;
         Ok(self)
+    }
+
+    /// The NAME of the environment variable holding the credential, never its
+    /// value, and `None` when the endpoint needs no credential.
+    pub fn credential_env(&self) -> Option<&str> {
+        self.credential_env.as_deref()
     }
 }
 
@@ -125,16 +152,20 @@ async fn stream_response(
     cancellation: &CancellationToken,
 ) -> Result<(), AdapterError> {
     validate_speech_text(request.text(), config.speech.max_text_bytes())?;
+    let credential = read_credential(config.credential_env.as_deref())?;
     let payload = OpenAiCompatibleSpeechRequest::streaming(
         &config.speech,
         request.text(),
         config.streaming_interval,
     );
+    let mut post = client
+        .post(speech_endpoint(config.speech.endpoint()))
+        .json(&payload);
+    if let Some(credential) = &credential {
+        post = post.bearer_auth(credential.expose());
+    }
     let response = await_transport(
-        client
-            .post(speech_endpoint(config.speech.endpoint()))
-            .json(&payload)
-            .send(),
+        post.send(),
         config.response_start_timeout,
         cancellation,
         sender,
@@ -306,6 +337,25 @@ fn ensure_stream_open(
     } else {
         Ok(())
     }
+}
+
+/// Reads the configured credential, if one is configured at all.
+///
+/// A configured variable that is unset or blank fails the request closed; the
+/// diagnostic never names the variable it read.
+fn read_credential(credential_env: Option<&str>) -> Result<Option<Credential>, AdapterError> {
+    match credential_env {
+        None => Ok(None),
+        Some(name) => Credential::read(name)
+            .map(Some)
+            .ok_or_else(|| AdapterError::new("speech synthesis credential is not available")),
+    }
+}
+
+fn configuration_error(detail: &str) -> AdapterError {
+    AdapterError::new(format!(
+        "invalid OpenAI-compatible streaming speech configuration: {detail}"
+    ))
 }
 
 fn receiver_closed_error() -> AdapterError {

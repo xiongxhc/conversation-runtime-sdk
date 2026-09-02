@@ -3,6 +3,7 @@ mod audio_output;
 mod buffered_streaming_speech;
 mod capture;
 mod continuous_audio_output;
+mod credential;
 mod generation_language;
 mod language_model;
 mod macos_afplay;
@@ -12,6 +13,7 @@ mod mock;
 mod ollama;
 mod openai_compatible_speech;
 mod openai_compatible_streaming_speech;
+mod openai_language;
 mod openai_speech_recognition;
 mod recognition;
 mod speech;
@@ -58,6 +60,7 @@ pub use openai_compatible_speech::{
 pub use openai_compatible_streaming_speech::{
     OpenAiCompatibleStreamingSpeechConfig, OpenAiCompatibleStreamingSpeechSynthesizer,
 };
+pub use openai_language::{OpenAiLanguageConfig, OpenAiLanguageModel};
 pub use openai_speech_recognition::{
     OnlineRecognitionSegment, OpenAiSpeechRecognitionConfig, OpenAiSpeechRecognizer,
 };

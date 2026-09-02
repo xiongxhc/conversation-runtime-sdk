@@ -50,8 +50,4 @@ impl VoicePolicyTemplate {
             self.components.clone(),
         )
     }
-
-    pub(crate) fn components(&self) -> &[ComponentDescriptor] {
-        &self.components
-    }
 }

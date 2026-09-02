@@ -1423,3 +1423,687 @@ fn write_config(directory: &Path, contents: &str) -> PathBuf {
     std::fs::write(&path, contents).unwrap();
     path
 }
+
+// ---------------------------------------------------------------------------
+// Schema v3: explicit profile selection, remote providers by credential
+// environment reference, and the encrypted recording section.
+// ---------------------------------------------------------------------------
+
+/// Deliberately fake. Nothing in the repository may contain a real credential,
+/// and the redaction test asserts this exact string never reaches a diagnostic.
+const ONLINE_CREDENTIAL_VALUE: &str = "fake-not-a-real-credential-0000";
+const ONLINE_CREDENTIAL_ENV: &str = "CONVERSATION_TEST_ONLINE_CREDENTIAL";
+const RECORDING_KEY_ENV: &str = "CONVERSATION_TEST_RECORDING_KEY";
+
+const ONLINE_CONFIG: &str = r#"schema_version = 3
+profile = "online"
+privacy_mode = "cloud"
+
+[language]
+backend = "openai-compatible"
+execution = "remote"
+provider = "openai"
+endpoint = "https://api.example.invalid/v1"
+model = "operator-supplied-text-model"
+credential_env = "CONVERSATION_TEST_ONLINE_CREDENTIAL"
+thinking = false
+temperature = 0.7
+seed = 42
+num_predict = 1024
+num_ctx = 8192
+max_assistant_content_bytes = 65536
+
+[persona]
+mode = "direct-answer"
+warmth = 80
+humor = 60
+teasing = 40
+initiative = 35
+directness = 80
+intimacy = 30
+verbosity = 20
+follow_up_frequency = 25
+
+[voice]
+response_mode = "external_gate"
+
+[voice.capture]
+device = "system-default"
+
+[voice.turn]
+speech_start_ms = 200
+final_silence_ms = 600
+
+[voice.asr]
+backend = "openai-streaming"
+execution = "remote"
+provider = "openai-streaming"
+model = "operator-supplied-transcription-model"
+credential_env = "CONVERSATION_TEST_ONLINE_CREDENTIAL"
+
+[voice.speech]
+backend = "openai-compatible"
+execution = "remote"
+provider = "openai-compatible-streaming"
+mode = "streaming"
+streaming_interval = 0.2
+endpoint = "https://api.example.invalid/v1"
+model = "operator-supplied-tts-model"
+voice = "operator-supplied-voice"
+credential_env = "CONVERSATION_TEST_ONLINE_CREDENTIAL"
+speed = 1.0
+language = "auto"
+instructions = "Speak naturally and clearly."
+max_tokens = 128
+repetition_penalty = 1.05
+max_text_bytes = 4096
+max_audio_bytes = 8388608
+
+[voice.audio]
+backend = "managed-sidecar"
+execution = "local"
+provider = "local-audio"
+sidecar_executable = "/absolute/path/to/conversation-voice-sidecar"
+max_error_bytes = 65536
+"#;
+
+fn set_online_credential() {
+    std::env::set_var(ONLINE_CREDENTIAL_ENV, ONLINE_CREDENTIAL_VALUE);
+}
+
+fn schema_v3_offline_config() -> String {
+    schema_v2_config(EXTERNAL_HOST, "language-host").replacen(
+        "schema_version = 2",
+        "schema_version = 3",
+        1,
+    )
+}
+
+fn component(status: &conversation_protocol::RuntimeStatus, kind: &str) -> (String, String) {
+    let component = status
+        .components
+        .iter()
+        .find(|component| component.kind == kind)
+        .unwrap_or_else(|| panic!("status carries no {kind} component"));
+    (
+        component.execution_location.clone(),
+        component.provider_label.clone(),
+    )
+}
+
+#[test]
+fn an_omitted_profile_selects_offline_on_every_schema_version() {
+    for contents in [VALID_CONFIG.to_owned(), schema_v3_offline_config()] {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = write_config(fixture.path(), &contents);
+
+        let status = GatewayConfig::validate(&path).unwrap();
+
+        assert_eq!(status.profile, "offline");
+        assert_eq!(status.privacy_mode, "local_only");
+        assert_eq!(status.language_location, "local");
+        assert_eq!(component(&status, "language_model").0, "local");
+        assert_eq!(GatewayConfig::load(&path).unwrap().status, status);
+    }
+}
+
+#[test]
+fn an_explicit_offline_profile_is_accepted_only_from_schema_version_three() {
+    let online_key = "profile = \"online\"";
+    let offline = schema_v3_offline_config().replacen(
+        "schema_version = 3",
+        "schema_version = 3\nprofile = \"offline\"",
+        1,
+    );
+    let fixture = tempfile::tempdir().unwrap();
+    let path = write_config(fixture.path(), &offline);
+    assert_eq!(GatewayConfig::validate(&path).unwrap().profile, "offline");
+
+    let downgraded = offline.replacen("schema_version = 3", "schema_version = 2", 1);
+    let path = write_config(fixture.path(), &downgraded);
+    assert!(GatewayConfig::validate(&path).is_err());
+
+    // An online profile is never reachable from a legacy schema version.
+    let legacy_online = offline
+        .replacen("schema_version = 3", "schema_version = 2", 1)
+        .replacen("profile = \"offline\"", online_key, 1);
+    let path = write_config(fixture.path(), &legacy_online);
+    assert!(GatewayConfig::validate(&path).is_err());
+}
+
+#[test]
+fn a_valid_online_configuration_reports_cloud_privacy_and_remote_components() {
+    set_online_credential();
+    let fixture = tempfile::tempdir().unwrap();
+    let path = write_config(fixture.path(), ONLINE_CONFIG);
+
+    let status = GatewayConfig::validate(&path).unwrap();
+
+    assert_eq!(status.profile, "online");
+    assert_eq!(status.privacy_mode, "cloud");
+    assert_eq!(status.language_location, "remote");
+    assert_eq!(status.model_id, "operator-supplied-text-model");
+    assert_eq!(
+        component(&status, "language_model"),
+        ("remote".to_owned(), "openai".to_owned())
+    );
+    assert_eq!(
+        component(&status, "speech_recognition"),
+        ("remote".to_owned(), "openai-streaming".to_owned())
+    );
+    assert_eq!(
+        component(&status, "speech_synthesis"),
+        (
+            "remote".to_owned(),
+            "openai-compatible-streaming".to_owned()
+        )
+    );
+    assert_eq!(
+        component(&status, "audio_io"),
+        ("local".to_owned(), "local-audio".to_owned())
+    );
+    assert_eq!(
+        status.capabilities,
+        [
+            "text",
+            "conversation_context_seed",
+            "persona_control",
+            "voice_session"
+        ]
+    );
+
+    // The protocol layer must accept the status this configuration describes.
+    encode_gateway_message_for_version(
+        &GatewayMessage::Ready {
+            status: status.clone(),
+        },
+        CLIENT_PROTOCOL_VERSION,
+    )
+    .unwrap();
+}
+
+#[test]
+fn an_online_text_only_configuration_reports_a_remote_language_model() {
+    set_online_credential();
+    let fixture = tempfile::tempdir().unwrap();
+    let voice = ONLINE_CONFIG.find("[voice]").unwrap();
+    let path = write_config(fixture.path(), &ONLINE_CONFIG[..voice]);
+
+    let status = GatewayConfig::validate(&path).unwrap();
+
+    assert_eq!(status.profile, "online");
+    assert_eq!(status.language_location, "remote");
+    assert_eq!(status.components.len(), 1);
+    assert_eq!(
+        component(&status, "language_model"),
+        ("remote".to_owned(), "openai".to_owned())
+    );
+    assert_eq!(
+        status.capabilities,
+        ["text", "conversation_context_seed", "persona_control"]
+    );
+    encode_gateway_message_for_version(&GatewayMessage::Ready { status }, CLIENT_PROTOCOL_VERSION)
+        .unwrap();
+}
+
+#[test]
+fn unknown_profile_and_backend_values_fail_closed() {
+    set_online_credential();
+    let fixture = tempfile::tempdir().unwrap();
+
+    for profile in ["meeting", "Online", "online ", ""] {
+        let path = write_config(
+            fixture.path(),
+            &ONLINE_CONFIG.replacen(
+                "profile = \"online\"",
+                &format!("profile = \"{profile}\""),
+                1,
+            ),
+        );
+        assert!(
+            GatewayConfig::validate(&path).is_err(),
+            "accepted {profile:?}"
+        );
+    }
+
+    for backend in ["openai", "openai_compatible", "OpenaiCompatible"] {
+        let path = write_config(
+            fixture.path(),
+            &ONLINE_CONFIG.replacen(
+                "backend = \"openai-compatible\"",
+                &format!("backend = \"{backend}\""),
+                1,
+            ),
+        );
+        assert!(
+            GatewayConfig::validate(&path).is_err(),
+            "accepted {backend}"
+        );
+    }
+}
+
+#[test]
+fn an_online_configuration_requires_every_named_credential_variable() {
+    set_online_credential();
+    let missing = "CONVERSATION_TEST_ABSENT_CREDENTIAL";
+    std::env::remove_var(missing);
+
+    for section in [
+        "provider = \"openai\"",
+        "provider = \"openai-streaming\"",
+        "provider = \"openai-compatible-streaming\"",
+    ] {
+        // Replace only the credential reference that follows this provider label.
+        let position = ONLINE_CONFIG.find(section).unwrap();
+        let (head, tail) = ONLINE_CONFIG.split_at(position);
+        let contents = format!("{head}{}", tail.replacen(ONLINE_CREDENTIAL_ENV, missing, 1));
+
+        let fixture = tempfile::tempdir().unwrap();
+        let path = write_config(fixture.path(), &contents);
+
+        let error = GatewayConfig::validate(&path).unwrap_err().to_string();
+
+        assert!(error.contains(missing), "for {section}: {error}");
+        assert!(!error.contains(ONLINE_CREDENTIAL_VALUE));
+    }
+}
+
+#[test]
+fn an_online_configuration_rejects_endpoints_that_are_not_remote_https() {
+    set_online_credential();
+    for endpoint in [
+        "http://api.example.invalid/v1",
+        "https://127.0.0.1:8443/v1",
+        "https://user:password@api.example.invalid/v1",
+        "https://api.example.invalid/v1?token=value",
+        "https://api.example.invalid/v1#fragment",
+        "ftp://api.example.invalid/v1",
+        "not-a-url",
+    ] {
+        let fixture = tempfile::tempdir().unwrap();
+        let contents = ONLINE_CONFIG.replacen("https://api.example.invalid/v1", endpoint, 1);
+        let path = write_config(fixture.path(), &contents);
+
+        assert!(
+            GatewayConfig::validate(&path).is_err(),
+            "accepted language endpoint {endpoint}"
+        );
+
+        let contents = ONLINE_CONFIG.replacen(
+            "endpoint = \"https://api.example.invalid/v1\"\nmodel = \"operator-supplied-tts-model\"",
+            &format!("endpoint = \"{endpoint}\"\nmodel = \"operator-supplied-tts-model\""),
+            1,
+        );
+        let path = write_config(fixture.path(), &contents);
+
+        assert!(
+            GatewayConfig::validate(&path).is_err(),
+            "accepted speech endpoint {endpoint}"
+        );
+    }
+}
+
+#[test]
+fn an_offline_configuration_still_rejects_remote_endpoints_and_executions() {
+    let fixture = tempfile::tempdir().unwrap();
+    let contents = VALID_CONFIG.replacen(
+        "endpoint = \"http://127.0.0.1:11434\"",
+        "endpoint = \"https://api.example.invalid/v1\"",
+        1,
+    );
+    let path = write_config(fixture.path(), &contents);
+    assert!(GatewayConfig::validate(&path).is_err());
+
+    let contents = VALID_CONFIG.replacen("execution = \"local\"", "execution = \"remote\"", 1);
+    let path = write_config(fixture.path(), &contents);
+    assert!(GatewayConfig::validate(&path).is_err());
+}
+
+#[test]
+fn online_and_offline_profiles_reject_incompatible_privacy_and_locations() {
+    set_online_credential();
+    let fixture = tempfile::tempdir().unwrap();
+
+    // Online with local-only privacy.
+    let path = write_config(
+        fixture.path(),
+        &ONLINE_CONFIG.replacen(
+            "privacy_mode = \"cloud\"",
+            "privacy_mode = \"local-only\"",
+            1,
+        ),
+    );
+    assert!(GatewayConfig::validate(&path).is_err());
+
+    // Online with a hybrid privacy mode the runtime cannot report per component.
+    let path = write_config(
+        fixture.path(),
+        &ONLINE_CONFIG.replacen("privacy_mode = \"cloud\"", "privacy_mode = \"hybrid\"", 1),
+    );
+    assert!(GatewayConfig::validate(&path).is_err());
+
+    // Online with a locally executed language model.
+    let path = write_config(
+        fixture.path(),
+        &ONLINE_CONFIG.replacen("execution = \"remote\"", "execution = \"local\"", 1),
+    );
+    assert!(GatewayConfig::validate(&path).is_err());
+
+    // Online with remote audio; the media path stays local until it is built.
+    let path = write_config(
+        fixture.path(),
+        &ONLINE_CONFIG.replacen(
+            "execution = \"local\"\nprovider = \"local-audio\"",
+            "execution = \"remote\"\nprovider = \"local-audio\"",
+            1,
+        ),
+    );
+    assert!(GatewayConfig::validate(&path).is_err());
+
+    // Offline with a cloud privacy mode.
+    let path = write_config(
+        fixture.path(),
+        &schema_v3_offline_config().replacen(
+            "privacy_mode = \"local-only\"",
+            "privacy_mode = \"cloud\"",
+            1,
+        ),
+    );
+    assert!(GatewayConfig::validate(&path).is_err());
+}
+
+#[test]
+fn a_backend_must_agree_with_the_execution_it_declares() {
+    set_online_credential();
+    let fixture = tempfile::tempdir().unwrap();
+
+    // A local backend cannot be declared remote inside an online deployment.
+    let path = write_config(
+        fixture.path(),
+        &ONLINE_CONFIG.replacen(
+            "backend = \"openai-streaming\"",
+            "backend = \"whisperkit\"",
+            1,
+        ),
+    );
+    assert!(GatewayConfig::validate(&path).is_err());
+
+    // The remote language backend cannot appear in an offline deployment.
+    let path = write_config(
+        fixture.path(),
+        &schema_v3_offline_config().replacen(
+            "backend = \"ollama-compatible\"",
+            "backend = \"openai-compatible\"",
+            1,
+        ),
+    );
+    assert!(GatewayConfig::validate(&path).is_err());
+}
+
+#[test]
+fn the_streaming_online_recognizer_forbids_local_model_material() {
+    set_online_credential();
+    let fixture = tempfile::tempdir().unwrap();
+
+    for extra in [
+        "model_path = \"/absolute/path/to/local-asr-model\"",
+        "download = true",
+        "download = false",
+    ] {
+        let path = write_config(
+            fixture.path(),
+            &ONLINE_CONFIG.replacen(
+                "backend = \"openai-streaming\"",
+                &format!("backend = \"openai-streaming\"\n{extra}"),
+                1,
+            ),
+        );
+        assert!(GatewayConfig::validate(&path).is_err(), "accepted {extra}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn local_recognizers_still_require_a_model_path_and_disabled_download() {
+    for removed in ["model_path = \"", "download = false"] {
+        let fixture = GatewayFixture::voice(false);
+        let contents: String = fixture
+            .contents()
+            .lines()
+            .filter(|line| !line.starts_with(removed))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let path = write_config(fixture.directory(), &contents);
+
+        assert!(
+            GatewayConfig::validate(&path).is_err(),
+            "accepted a voice ASR section without {removed}"
+        );
+    }
+}
+
+#[test]
+fn credential_environment_names_are_bounded_and_never_carry_a_value() {
+    set_online_credential();
+    let fixture = tempfile::tempdir().unwrap();
+
+    for name in [
+        "",
+        "lowercase_name",
+        "0LEADING_DIGIT",
+        "HAS-DASH",
+        "HAS SPACE",
+    ] {
+        let path = write_config(
+            fixture.path(),
+            &ONLINE_CONFIG.replace(ONLINE_CREDENTIAL_ENV, name),
+        );
+        assert!(GatewayConfig::validate(&path).is_err(), "accepted {name:?}");
+    }
+
+    let oversized = "X".repeat(129);
+    let path = write_config(
+        fixture.path(),
+        &ONLINE_CONFIG.replace(ONLINE_CREDENTIAL_ENV, &oversized),
+    );
+    assert!(GatewayConfig::validate(&path).is_err());
+}
+
+#[test]
+fn credential_values_never_reach_diagnostics_while_the_name_may() {
+    set_online_credential();
+    let fixture = tempfile::tempdir().unwrap();
+
+    // A successful load: the value is nowhere in the status the runtime reports.
+    let path = write_config(fixture.path(), ONLINE_CONFIG);
+    let status = GatewayConfig::validate(&path).unwrap();
+    let rendered = format!("{status:?}");
+    assert!(!rendered.contains(ONLINE_CREDENTIAL_VALUE));
+    assert!(!rendered.contains(ONLINE_CREDENTIAL_ENV));
+
+    // Every failing shape: the value is nowhere in the operator diagnostic.
+    for contents in [
+        ONLINE_CONFIG.replacen("https://api.example.invalid/v1", "http://127.0.0.1:1/v1", 1),
+        ONLINE_CONFIG.replacen(
+            "privacy_mode = \"cloud\"",
+            "privacy_mode = \"local-only\"",
+            1,
+        ),
+        ONLINE_CONFIG.replacen("schema_version = 3", "schema_version = 2", 1),
+        ONLINE_CONFIG.replacen("execution = \"remote\"", "execution = \"local\"", 1),
+    ] {
+        let path = write_config(fixture.path(), &contents);
+        let error = GatewayConfig::validate(&path).unwrap_err().to_string();
+        assert!(
+            !error.contains(ONLINE_CREDENTIAL_VALUE),
+            "leaked in {error}"
+        );
+    }
+}
+
+#[test]
+fn schema_three_keys_are_refused_by_older_schema_versions() {
+    set_online_credential();
+    std::env::set_var(RECORDING_KEY_ENV, ONLINE_CREDENTIAL_VALUE);
+    let base = schema_v2_config(EXTERNAL_HOST, "language-host");
+    let fixture = tempfile::tempdir().unwrap();
+
+    for addition in [
+        format!("credential_env = \"{ONLINE_CREDENTIAL_ENV}\""),
+        "profile = \"online\"".to_owned(),
+    ] {
+        let contents = base.replacen(
+            "provider = \"local-language\"",
+            &format!("provider = \"local-language\"\n{addition}"),
+            1,
+        );
+        let path = write_config(fixture.path(), &contents);
+        assert!(
+            GatewayConfig::validate(&path).is_err(),
+            "accepted {addition}"
+        );
+    }
+
+    let contents = format!(
+        "{base}\n[recording]\ndirectory = \"/absolute/private/path/recordings\"\nkey_env = \"{RECORDING_KEY_ENV}\"\n"
+    );
+    let path = write_config(fixture.path(), &contents);
+    assert!(GatewayConfig::validate(&path).is_err());
+}
+
+#[test]
+fn the_recording_section_requires_an_absolute_directory_and_a_present_key() {
+    std::env::set_var(RECORDING_KEY_ENV, ONLINE_CREDENTIAL_VALUE);
+    let fixture = tempfile::tempdir().unwrap();
+    let base = schema_v3_offline_config();
+
+    let accepted = format!(
+        "{base}\n[recording]\ndirectory = \"/absolute/private/path/recordings\"\nkey_env = \"{RECORDING_KEY_ENV}\"\n"
+    );
+    let path = write_config(fixture.path(), &accepted);
+    assert!(GatewayConfig::validate(&path).is_ok());
+
+    for (directory, key_env) in [
+        ("relative/recordings", RECORDING_KEY_ENV),
+        ("/absolute/../escaping/recordings", RECORDING_KEY_ENV),
+        ("", RECORDING_KEY_ENV),
+        (
+            "/absolute/private/path/recordings",
+            "CONVERSATION_TEST_ABSENT_RECORDING_KEY",
+        ),
+        ("/absolute/private/path/recordings", "lowercase"),
+    ] {
+        let contents =
+            format!("{base}\n[recording]\ndirectory = \"{directory}\"\nkey_env = \"{key_env}\"\n");
+        let path = write_config(fixture.path(), &contents);
+        assert!(
+            GatewayConfig::validate(&path).is_err(),
+            "accepted {directory} / {key_env}"
+        );
+    }
+}
+
+#[test]
+fn model_and_voice_identifiers_are_bounded_in_both_profiles() {
+    set_online_credential();
+    let fixture = tempfile::tempdir().unwrap();
+    let oversized = "x".repeat(257);
+    let oversized_voice = "v".repeat(129);
+
+    for (needle, replacement) in [
+        ("operator-supplied-text-model", oversized.as_str()),
+        ("operator-supplied-transcription-model", oversized.as_str()),
+        ("operator-supplied-tts-model", oversized.as_str()),
+        ("operator-supplied-voice", oversized_voice.as_str()),
+        ("operator-supplied-voice", ""),
+        ("operator-supplied-tts-model", ""),
+    ] {
+        let path = write_config(
+            fixture.path(),
+            &ONLINE_CONFIG.replacen(needle, replacement, 1),
+        );
+        assert!(
+            GatewayConfig::validate(&path).is_err(),
+            "accepted {needle} = {replacement:?}"
+        );
+    }
+}
+
+#[test]
+fn the_voice_response_mode_defaults_to_automatic_and_accepts_the_external_gate() {
+    set_online_credential();
+    let fixture = tempfile::tempdir().unwrap();
+
+    let path = write_config(
+        fixture.path(),
+        &ONLINE_CONFIG.replacen("response_mode = \"external_gate\"\n", "", 1),
+    );
+    assert!(GatewayConfig::validate(&path).is_ok());
+
+    let path = write_config(
+        fixture.path(),
+        &ONLINE_CONFIG.replacen(
+            "response_mode = \"external_gate\"",
+            "response_mode = \"automatic\"",
+            1,
+        ),
+    );
+    assert!(GatewayConfig::validate(&path).is_ok());
+
+    for invalid in ["external-gate", "gated", ""] {
+        let path = write_config(
+            fixture.path(),
+            &ONLINE_CONFIG.replacen("\"external_gate\"", &format!("\"{invalid}\""), 1),
+        );
+        assert!(
+            GatewayConfig::validate(&path).is_err(),
+            "accepted {invalid}"
+        );
+    }
+}
+
+#[test]
+fn the_published_meeting_online_example_configuration_stays_valid() {
+    std::env::set_var("OPENAI_API_KEY", ONLINE_CREDENTIAL_VALUE);
+    std::env::set_var("MEETING_RECORDING_KEY", ONLINE_CREDENTIAL_VALUE);
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../configs/gateway.meeting-online.example.toml");
+
+    let status = GatewayConfig::validate(&path).unwrap();
+
+    assert_eq!(status.profile, "online");
+    assert_eq!(status.privacy_mode, "cloud");
+    assert_eq!(status.language_location, "remote");
+    assert!(status
+        .components
+        .iter()
+        .any(|component| component.execution_location == "remote"));
+    encode_gateway_message_for_version(&GatewayMessage::Ready { status }, CLIENT_PROTOCOL_VERSION)
+        .unwrap();
+}
+
+#[test]
+fn the_published_offline_example_configuration_stays_offline() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs/gateway.example.toml");
+
+    let status = GatewayConfig::validate(&path).unwrap();
+
+    assert_eq!(status.profile, "offline");
+    assert_eq!(status.privacy_mode, "local_only");
+    assert_eq!(status.language_location, "local");
+}
+
+#[test]
+fn the_online_profile_does_not_silently_build_offline_adapters() {
+    set_online_credential();
+    let fixture = tempfile::tempdir().unwrap();
+    let path = write_config(fixture.path(), ONLINE_CONFIG);
+
+    // Validation succeeds; adapter construction is wired separately and must
+    // never fall back to a local provider.
+    GatewayConfig::validate(&path).unwrap();
+    let error = GatewayConfig::load(&path).unwrap_err().to_string();
+
+    assert!(error.contains("online"), "{error}");
+    assert!(!error.contains(ONLINE_CREDENTIAL_VALUE));
+}

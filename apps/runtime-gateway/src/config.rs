@@ -18,7 +18,7 @@ use conversation_protocol::{
     ClientComponentDescriptor, ComponentDescriptor, ComponentKind, ConversationMode,
     ExecutionLocation, FollowUpPolicy, PersonaLevel, PersonaProfile,
     PrivacyMode as ProtocolPrivacyMode, ResponseControls, RuntimeProfile, RuntimeStatus,
-    SilencePolicy, SpeechPace, MAX_CLIENT_PROVIDER_LABEL_BYTES,
+    SilencePolicy, SpeechPace, VoiceResponseMode, MAX_CLIENT_PROVIDER_LABEL_BYTES,
 };
 use conversation_runtime::{ConversationContext, ConversationQualityController};
 use serde::{Deserialize, Serialize};
@@ -37,6 +37,15 @@ const MAX_PROVIDER_ARG_BYTES: usize = 4_096;
 const MAX_PROVIDER_ARGV_BYTES: usize = 16_384;
 const MIN_PROVIDER_STARTUP_TIMEOUT_MS: u64 = 100;
 const MAX_PROVIDER_STARTUP_TIMEOUT_MS: u64 = 120_000;
+const MAX_VOICE_ID_BYTES: usize = 128;
+/// Maximum UTF-8 byte length accepted for the *name* of an environment
+/// variable holding a credential. The value of that variable is never read
+/// into this crate's data structures.
+const MAX_CREDENTIAL_ENV_NAME_BYTES: usize = 128;
+const MAX_REMOTE_ENDPOINT_BYTES: usize = 2_048;
+/// The longest legal DNS name, so a remote endpoint host stays bounded.
+const MAX_REMOTE_ENDPOINT_HOST_BYTES: usize = 253;
+const MAX_RECORDING_DIRECTORY_BYTES: usize = 1_024;
 
 #[derive(Debug)]
 pub struct GatewayConfigError(String);
@@ -53,6 +62,15 @@ impl std::error::Error for GatewayConfigError {}
 #[serde(deny_unknown_fields)]
 pub struct GatewayConfig {
     schema_version: u32,
+    /// Absent selects `offline`. Only schema version 3 may name a profile at
+    /// all, so a version 1 or 2 file keeps exactly the meaning it had before
+    /// profiles existed.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "optional_runtime_profile"
+    )]
+    profile: Option<RuntimeProfile>,
     privacy_mode: GatewayPrivacyMode,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     provider_hosts: Vec<ProviderHost>,
@@ -62,6 +80,8 @@ pub struct GatewayConfig {
     memory: Option<MemoryConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     voice: Option<VoiceConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recording: Option<RecordingConfig>,
 }
 
 pub struct GatewayAdapters {
@@ -268,6 +288,7 @@ impl GatewayDeploymentConfig {
     pub fn to_toml(self) -> Result<String, GatewayConfigError> {
         let mut config = GatewayConfig {
             schema_version: 2,
+            profile: None,
             privacy_mode: GatewayPrivacyMode::LocalOnly,
             provider_hosts: self.provider_hosts,
             language: LanguageConfig {
@@ -277,6 +298,7 @@ impl GatewayDeploymentConfig {
                 provider_host: Some(self.language.provider_host),
                 endpoint: self.language.endpoint,
                 model: self.language.model,
+                credential_env: None,
                 system_prompt: None,
                 thinking: false,
                 temperature: 0.7,
@@ -288,6 +310,7 @@ impl GatewayDeploymentConfig {
             persona: default_persona_config(),
             memory: None,
             voice: None,
+            recording: None,
         };
         config
             .provider_hosts
@@ -351,22 +374,144 @@ impl GatewayConfig {
         load_toml(path)?.build_adapters()
     }
 
-    fn build_adapters(&self) -> Result<GatewayAdapters, GatewayConfigError> {
+    /// Parse and fully validate a configuration file, returning the runtime
+    /// status the deployment will report. Adapters are deliberately not
+    /// constructed: an online deployment names remote providers whose adapters
+    /// are wired by the runtime, not by this loader.
+    pub fn validate(path: &Path) -> Result<RuntimeStatus, GatewayConfigError> {
+        Ok(load_toml(path)?.deployment_plan()?.status)
+    }
+
+    const fn profile(&self) -> RuntimeProfile {
+        match self.profile {
+            Some(profile) => profile,
+            None => RuntimeProfile::Offline,
+        }
+    }
+
+    /// Everything a deployment needs that can be decided from the file alone:
+    /// which provider processes are supervised, which components run where,
+    /// and the status the gateway will state. Every profile-dependent rule
+    /// lives here so `validate` and `build_adapters` cannot drift apart.
+    fn deployment_plan(&self) -> Result<DeploymentPlan, GatewayConfigError> {
         let provider_hosts = self.validate_provider_hosts()?;
-        if !matches!(self.privacy_mode, GatewayPrivacyMode::LocalOnly) {
-            return Err(config_error("gateway privacy_mode must be local-only"));
+        let profile = self.profile();
+        match (profile, self.privacy_mode) {
+            (RuntimeProfile::Offline, GatewayPrivacyMode::LocalOnly)
+            | (RuntimeProfile::Online, GatewayPrivacyMode::Cloud) => {}
+            (RuntimeProfile::Offline, _) => {
+                return Err(config_error(
+                    "offline gateway privacy_mode must be local-only",
+                ));
+            }
+            (RuntimeProfile::Online, _) => {
+                return Err(config_error("online gateway privacy_mode must be cloud"));
+            }
+            _ => return Err(config_error("gateway profile is not supported")),
         }
-        if !matches!(self.language.backend, LanguageBackend::OllamaCompatible) {
-            return Err(config_error("language backend must be ollama-compatible"));
-        }
-        require_local_execution(self.language.execution, "language")?;
+        let profile_execution = profile_execution(profile);
+
+        require_declared_execution(
+            self.language.execution,
+            language_execution(self.language.backend),
+            profile_execution,
+            "language",
+        )?;
         validate_provider_label(&self.language.provider, "language")?;
-        validate_loopback_http_endpoint(&self.language.endpoint, "language")?;
+        validate_endpoint(&self.language.endpoint, self.language.execution, "language")?;
+        validate_credential_reference(
+            self.language.credential_env.as_deref(),
+            self.language.execution,
+            "language",
+        )?;
+        self.validate_language_tuning()?;
+
+        let quality = self.quality_controller()?;
+        let memory = self.memory.as_ref().map(memory_adapters).transpose()?;
+        let language_component = component_descriptor(
+            ComponentKind::LanguageModel,
+            &self.language.provider,
+            self.language.execution,
+            "language",
+        )?;
+        let memory_component = memory.as_ref().map(|_| {
+            ComponentDescriptor::new(ComponentKind::Memory, "sqlite", ExecutionLocation::Local)
+        });
+        let voice_configured = self.voice.is_some();
+        let components = match self.voice.as_ref() {
+            Some(voice) => voice.validate(
+                profile_execution,
+                language_component,
+                memory_component.clone(),
+            )?,
+            None => {
+                let mut components = vec![language_component];
+                components.extend(memory_component.clone());
+                components
+            }
+        };
+        if let Some(recording) = self.recording.as_ref() {
+            recording.validate()?;
+        }
+
+        let memory_enabled = memory.is_some();
+        let mut capabilities = vec![
+            "text".to_owned(),
+            "conversation_context_seed".to_owned(),
+            "persona_control".to_owned(),
+        ];
+        if memory_enabled {
+            capabilities.push("memory_inspection".to_owned());
+            capabilities.push("memory_mutation".to_owned());
+        }
+        if voice_configured {
+            capabilities.push("voice_session".to_owned());
+        }
+        let status = RuntimeStatus {
+            profile: profile.as_str().to_owned(),
+            transport: "stdio".to_owned(),
+            privacy_mode: self.privacy_mode.protocol_name().to_owned(),
+            language_location: execution_name(self.language.execution).to_owned(),
+            model_id: self.language.model.clone(),
+            memory_enabled,
+            memory_location: memory_enabled.then(|| "local".to_owned()),
+            telemetry_enabled: false,
+            capabilities,
+            components: components
+                .iter()
+                .map(ClientComponentDescriptor::from)
+                .collect(),
+            last_context_seed_operation_id: None,
+        };
+
+        Ok(DeploymentPlan {
+            provider_hosts,
+            components,
+            memory,
+            quality,
+            status,
+        })
+    }
+
+    fn build_adapters(&self) -> Result<GatewayAdapters, GatewayConfigError> {
+        let DeploymentPlan {
+            provider_hosts,
+            components,
+            memory,
+            quality,
+            status,
+        } = self.deployment_plan()?;
+        if !matches!(self.profile(), RuntimeProfile::Offline) {
+            // Online provider adapters are wired explicitly by the runtime.
+            // Constructing a local adapter here would silently downgrade a
+            // meeting the operator deliberately placed online.
+            return Err(config_error(
+                "online profile adapters are not constructed by the configuration loader",
+            ));
+        }
 
         let language: Arc<dyn GenerationLanguageModel> =
             Arc::new(OllamaLanguageModel::new_direct(self.language_config()?));
-        let quality = self.quality_controller()?;
-        let memory = self.memory.as_ref().map(memory_adapters).transpose()?;
         let (memory_provider, memory_store) = match memory {
             Some((provider, store)) => (Some(provider), Some(store)),
             None => (None, None),
@@ -384,59 +529,11 @@ impl GatewayConfig {
                 .map_err(runtime_error)?;
         }
 
-        let language_component = local_component(
-            ComponentKind::LanguageModel,
-            &self.language.provider,
-            "language",
-        )?;
-        let memory_component = memory_store.as_ref().map(|_| {
-            ComponentDescriptor::new(ComponentKind::Memory, "sqlite", ExecutionLocation::Local)
-        });
         let voice = self
             .voice
             .as_ref()
-            .map(|voice| voice.build(language_component.clone(), memory_component.clone()))
+            .map(|voice| voice.build(self.privacy_mode.into(), components))
             .transpose()?;
-
-        let component_descriptors = if let Some(voice) = voice.as_ref() {
-            voice.policy.components().to_vec()
-        } else {
-            let mut components = vec![language_component];
-            components.extend(memory_component);
-            components
-        };
-        let components = component_descriptors
-            .iter()
-            .map(ClientComponentDescriptor::from)
-            .collect();
-        let memory_enabled = memory_store.is_some();
-        let mut capabilities = vec![
-            "text".to_owned(),
-            "conversation_context_seed".to_owned(),
-            "persona_control".to_owned(),
-        ];
-        if memory_enabled {
-            capabilities.push("memory_inspection".to_owned());
-            capabilities.push("memory_mutation".to_owned());
-        }
-        if voice.is_some() {
-            capabilities.push("voice_session".to_owned());
-        }
-        let status = RuntimeStatus {
-            // Every configuration this gateway accepts today runs locally, so
-            // the status reports the default offline profile.
-            profile: RuntimeProfile::Offline.as_str().to_owned(),
-            transport: "stdio".to_owned(),
-            privacy_mode: "local_only".to_owned(),
-            language_location: "local".to_owned(),
-            model_id: self.language.model.clone(),
-            memory_enabled,
-            memory_location: memory_enabled.then(|| "local".to_owned()),
-            telemetry_enabled: false,
-            capabilities,
-            components,
-            last_context_seed_operation_id: None,
-        };
 
         Ok(GatewayAdapters {
             context,
@@ -449,9 +546,50 @@ impl GatewayConfig {
         })
     }
 
+    fn validate_language_tuning(&self) -> Result<(), GatewayConfigError> {
+        validate_identifier(&self.language.model, MAX_MODEL_ID_BYTES, "language model")?;
+        if !self.language.temperature.is_finite() || self.language.temperature < 0.0 {
+            return Err(config_error(
+                "language temperature must be finite and non-negative",
+            ));
+        }
+        if let Some(system_prompt) = self.language.system_prompt.as_deref() {
+            if system_prompt.trim().is_empty() {
+                return Err(config_error("language system_prompt cannot be empty"));
+            }
+            if system_prompt.len() > MAX_SYSTEM_PROMPT_BYTES {
+                return Err(config_error("language system_prompt exceeded 4 KiB"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Schema versions 1 and 2 predate profiles, credential references, the
+    /// response mode, and recording, so naming any of them is an error there
+    /// rather than a silently ignored key.
+    fn require_legacy_schema_keys_absent(&self) -> Result<(), GatewayConfigError> {
+        let voice_keys = self.voice.as_ref().is_some_and(|voice| {
+            voice.response_mode.is_some()
+                || voice.asr.model.is_some()
+                || voice.asr.credential_env.is_some()
+                || voice.speech.credential_env.is_some()
+        });
+        if self.profile.is_some()
+            || self.language.credential_env.is_some()
+            || self.recording.is_some()
+            || voice_keys
+        {
+            return Err(config_error(
+                "profile, credential_env, response_mode, and recording require schema_version 3",
+            ));
+        }
+        Ok(())
+    }
+
     fn validate_provider_hosts(&self) -> Result<Vec<ProviderHost>, GatewayConfigError> {
         match self.schema_version {
             1 => {
+                self.require_legacy_schema_keys_absent()?;
                 if !self.provider_hosts.is_empty()
                     || self.language.provider_host.is_some()
                     || self
@@ -467,13 +605,8 @@ impl GatewayConfig {
                 Ok(Vec::new())
             }
             2 => {
-                let mut ids = BTreeSet::new();
-                for host in &self.provider_hosts {
-                    host.validate()?;
-                    if !ids.insert(host.id.as_str()) {
-                        return Err(config_error("provider host ids must be unique"));
-                    }
-                }
+                self.require_legacy_schema_keys_absent()?;
+                let ids = self.declared_host_ids()?;
                 let language_host = self.language.provider_host.as_deref().ok_or_else(|| {
                     config_error("schema v2 language must reference a provider host")
                 })?;
@@ -492,14 +625,47 @@ impl GatewayConfig {
                         ));
                     }
                 }
-                let mut hosts = self.provider_hosts.clone();
-                hosts.sort_by(|left, right| left.id.cmp(&right.id));
-                Ok(hosts)
+                Ok(self.sorted_provider_hosts())
+            }
+            3 => {
+                let ids = self.declared_host_ids()?;
+                require_host_reference(
+                    self.language.provider_host.as_deref(),
+                    self.language.execution,
+                    &ids,
+                    "language",
+                )?;
+                if let Some(voice) = self.voice.as_ref() {
+                    require_host_reference(
+                        voice.speech.provider_host.as_deref(),
+                        voice.speech.execution,
+                        &ids,
+                        "voice speech",
+                    )?;
+                }
+                Ok(self.sorted_provider_hosts())
             }
             _ => Err(config_error(
-                "gateway configuration schema_version must be 1 or 2",
+                "gateway configuration schema_version must be 1, 2, or 3",
             )),
         }
+    }
+
+    fn declared_host_ids(&self) -> Result<BTreeSet<&str>, GatewayConfigError> {
+        let mut ids = BTreeSet::new();
+        for host in &self.provider_hosts {
+            host.validate()?;
+            if !ids.insert(host.id.as_str()) {
+                return Err(config_error("provider host ids must be unique"));
+            }
+        }
+        Ok(ids)
+    }
+
+    fn sorted_provider_hosts(&self) -> Vec<ProviderHost> {
+        let mut hosts = self.provider_hosts.clone();
+        hosts.sort_by(|left, right| left.id.cmp(&right.id));
+        hosts
     }
 
     fn language_config(&self) -> Result<OllamaConfig, GatewayConfigError> {
@@ -582,55 +748,135 @@ impl GatewayConfig {
 }
 
 impl VoiceConfig {
-    fn build(
+    /// Validates the voice lane and returns its component descriptors in the
+    /// rank order `validate_runtime_status` requires.
+    fn validate(
         &self,
+        profile_execution: ExecutionConfig,
         language: ComponentDescriptor,
         memory: Option<ComponentDescriptor>,
-    ) -> Result<GatewayVoiceAdapters, GatewayConfigError> {
-        match (
-            self.capture.device,
-            self.asr.backend,
-            self.speech.backend,
-            self.audio.backend,
-        ) {
-            (
-                VoiceCaptureDevice::SystemDefault,
-                VoiceAsrBackend::Whisperkit | VoiceAsrBackend::Sensevoice,
-                VoiceSpeechBackend::OpenaiCompatible,
-                VoiceAudioBackend::ManagedSidecar,
-            ) => {}
+    ) -> Result<Vec<ComponentDescriptor>, GatewayConfigError> {
+        // Exhaustive over the capture and audio backends: adding one is a
+        // compile error here until this file decides what it means.
+        match (self.capture.device, self.audio.backend) {
+            (VoiceCaptureDevice::SystemDefault, VoiceAudioBackend::ManagedSidecar) => {}
         }
-        require_local_execution(self.asr.execution, "voice ASR")?;
-        require_local_execution(self.speech.execution, "voice speech")?;
-        require_local_execution(self.audio.execution, "voice audio")?;
-        if self.asr.download {
-            return Err(config_error("voice ASR model download must be disabled"));
-        }
-        if !self.asr.model_path.is_absolute() {
-            return Err(config_error("voice ASR model path must be absolute"));
-        }
-        if !self.asr.model_path.is_dir() {
-            return Err(config_error(
-                "voice ASR model path must be an existing directory",
-            ));
-        }
-        validate_loopback_http_endpoint(&self.speech.endpoint, "voice speech")?;
-
-        let recognition = local_component(
-            ComponentKind::SpeechRecognition,
-            &self.asr.provider,
+        require_declared_execution(
+            self.asr.execution,
+            asr_execution(self.asr.backend),
+            profile_execution,
             "voice ASR",
         )?;
-        let speech_component = local_component(
-            ComponentKind::SpeechSynthesis,
-            &self.speech.provider,
+        require_declared_execution(
+            self.speech.execution,
+            speech_execution(self.speech.backend, profile_execution),
+            profile_execution,
             "voice speech",
         )?;
-        let audio = local_component(ComponentKind::AudioIo, &self.audio.provider, "voice audio")?;
-        let mut components = vec![recognition, language, speech_component, audio];
+        // Audio capture and playback stay on the local sidecar in every
+        // profile; nothing in this repository moves them off the machine.
+        require_execution(self.audio.execution, ExecutionConfig::Local, "voice audio")?;
+
+        match self.asr.execution {
+            ExecutionConfig::Local => {
+                if self.asr.model.is_some() {
+                    return Err(config_error(
+                        "local voice ASR must not name a remote transcription model",
+                    ));
+                }
+                let model_path = self
+                    .asr
+                    .model_path
+                    .as_deref()
+                    .ok_or_else(|| config_error("local voice ASR requires a model path"))?;
+                let download = self
+                    .asr
+                    .download
+                    .ok_or_else(|| config_error("local voice ASR requires a download flag"))?;
+                if download {
+                    return Err(config_error("voice ASR model download must be disabled"));
+                }
+                if !model_path.is_absolute() {
+                    return Err(config_error("voice ASR model path must be absolute"));
+                }
+                if !model_path.is_dir() {
+                    return Err(config_error(
+                        "voice ASR model path must be an existing directory",
+                    ));
+                }
+            }
+            ExecutionConfig::Remote => {
+                if self.asr.model_path.is_some() || self.asr.download.is_some() {
+                    return Err(config_error(
+                        "streaming online voice ASR must not configure local model material",
+                    ));
+                }
+                let model =
+                    self.asr.model.as_deref().ok_or_else(|| {
+                        config_error("streaming online voice ASR requires a model")
+                    })?;
+                validate_identifier(model, MAX_MODEL_ID_BYTES, "voice ASR model")?;
+            }
+        }
+        validate_credential_reference(
+            self.asr.credential_env.as_deref(),
+            self.asr.execution,
+            "voice ASR",
+        )?;
+
+        validate_endpoint(&self.speech.endpoint, self.speech.execution, "voice speech")?;
+        validate_credential_reference(
+            self.speech.credential_env.as_deref(),
+            self.speech.execution,
+            "voice speech",
+        )?;
+        validate_identifier(&self.speech.model, MAX_MODEL_ID_BYTES, "voice speech model")?;
+        validate_identifier(&self.speech.voice, MAX_VOICE_ID_BYTES, "voice speech voice")?;
+        if !self.audio.sidecar_executable.is_absolute() {
+            return Err(config_error(
+                "voice audio sidecar executable must be absolute",
+            ));
+        }
+
+        let recognition = component_descriptor(
+            ComponentKind::SpeechRecognition,
+            &self.asr.provider,
+            self.asr.execution,
+            "voice ASR",
+        )?;
+        let speech = component_descriptor(
+            ComponentKind::SpeechSynthesis,
+            &self.speech.provider,
+            self.speech.execution,
+            "voice speech",
+        )?;
+        let audio = component_descriptor(
+            ComponentKind::AudioIo,
+            &self.audio.provider,
+            self.audio.execution,
+            "voice audio",
+        )?;
+        let mut components = vec![recognition, language, speech, audio];
         components.extend(memory);
+        Ok(components)
+    }
+
+    fn build(
+        &self,
+        privacy_mode: ProtocolPrivacyMode,
+        components: Vec<ComponentDescriptor>,
+    ) -> Result<GatewayVoiceAdapters, GatewayConfigError> {
+        let model_path = self
+            .asr
+            .model_path
+            .as_deref()
+            .ok_or_else(|| config_error("local voice ASR requires a model path"))?;
+        let download = self
+            .asr
+            .download
+            .ok_or_else(|| config_error("local voice ASR requires a download flag"))?;
         let policy = VoicePolicyTemplate::new(
-            ProtocolPrivacyMode::LocalOnly,
+            privacy_mode,
             self.turn.speech_start_ms,
             self.turn.final_silence_ms,
             components,
@@ -639,9 +885,9 @@ impl VoiceConfig {
 
         let mut sidecar = MacOsVoiceSidecarConfig::new(
             &self.audio.sidecar_executable,
-            &self.asr.model_path,
+            model_path,
             SystemDevice::SystemDefault,
-            self.asr.download,
+            download,
             self.turn.speech_start_ms,
             self.turn.final_silence_ms,
         )
@@ -792,15 +1038,206 @@ fn validate_loopback_http_endpoint(
     Ok(())
 }
 
-fn require_local_execution(
+/// A remote provider endpoint. Unlike a supervised loopback process this is a
+/// third-party API, so the rule is transport security and the absence of any
+/// credential material in the URL itself rather than a loopback address.
+fn validate_remote_https_endpoint(
+    endpoint: &str,
+    component: &str,
+) -> Result<(), GatewayConfigError> {
+    if endpoint.len() > MAX_REMOTE_ENDPOINT_BYTES {
+        return Err(config_error(format!(
+            "{component} endpoint exceeded 2048 UTF-8 bytes"
+        )));
+    }
+    let endpoint = reqwest::Url::parse(endpoint)
+        .map_err(|_| config_error(format!("{component} endpoint must be a valid URL")))?;
+    if endpoint.scheme() != "https" {
+        return Err(config_error(format!("{component} endpoint must use HTTPS")));
+    }
+    if !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+    {
+        return Err(config_error(format!(
+            "{component} endpoint must not contain credentials, a query, or a fragment"
+        )));
+    }
+    let host = endpoint
+        .host_str()
+        .ok_or_else(|| config_error(format!("{component} endpoint must name a host")))?;
+    if host.is_empty() || host.len() > MAX_REMOTE_ENDPOINT_HOST_BYTES {
+        return Err(config_error(format!(
+            "{component} endpoint host must be within 1..=253 bytes"
+        )));
+    }
+    if host
+        .parse::<IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
+    {
+        return Err(config_error(format!(
+            "{component} endpoint must not be a loopback address"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_endpoint(
+    endpoint: &str,
     execution: ExecutionConfig,
     component: &str,
 ) -> Result<(), GatewayConfigError> {
-    if matches!(execution, ExecutionConfig::Local) {
+    match execution {
+        ExecutionConfig::Local => validate_loopback_http_endpoint(endpoint, component),
+        ExecutionConfig::Remote => validate_remote_https_endpoint(endpoint, component),
+    }
+}
+
+fn require_execution(
+    execution: ExecutionConfig,
+    expected: ExecutionConfig,
+    component: &str,
+) -> Result<(), GatewayConfigError> {
+    if execution == expected {
         Ok(())
     } else {
-        Err(config_error(format!("{component} execution must be local")))
+        Err(config_error(format!(
+            "{component} execution must be {}",
+            execution_name(expected)
+        )))
     }
+}
+
+/// The declared `execution`, the backend's own locality, and the profile's
+/// locality must all agree. An offline profile therefore still refuses every
+/// remote component, while an online profile refuses a component the operator
+/// left pointing at a local provider.
+fn require_declared_execution(
+    declared: ExecutionConfig,
+    backend: ExecutionConfig,
+    profile: ExecutionConfig,
+    component: &str,
+) -> Result<(), GatewayConfigError> {
+    require_execution(declared, profile, component)?;
+    require_execution(backend, profile, &format!("{component} backend"))
+}
+
+const fn profile_execution(profile: RuntimeProfile) -> ExecutionConfig {
+    match profile {
+        RuntimeProfile::Online => ExecutionConfig::Remote,
+        _ => ExecutionConfig::Local,
+    }
+}
+
+const fn language_execution(backend: LanguageBackend) -> ExecutionConfig {
+    match backend {
+        LanguageBackend::OllamaCompatible => ExecutionConfig::Local,
+        LanguageBackend::OpenaiCompatible => ExecutionConfig::Remote,
+    }
+}
+
+const fn asr_execution(backend: VoiceAsrBackend) -> ExecutionConfig {
+    match backend {
+        VoiceAsrBackend::Whisperkit | VoiceAsrBackend::Sensevoice => ExecutionConfig::Local,
+        VoiceAsrBackend::OpenaiStreaming => ExecutionConfig::Remote,
+    }
+}
+
+/// The OpenAI-compatible synthesizer serves a supervised loopback server and a
+/// remote API alike, so the profile alone decides where it runs.
+const fn speech_execution(
+    backend: VoiceSpeechBackend,
+    profile: ExecutionConfig,
+) -> ExecutionConfig {
+    match backend {
+        VoiceSpeechBackend::OpenaiCompatible => profile,
+    }
+}
+
+const fn execution_name(execution: ExecutionConfig) -> &'static str {
+    match execution {
+        ExecutionConfig::Local => "local",
+        ExecutionConfig::Remote => "remote",
+    }
+}
+
+/// Provider hosts are supervised local processes. A remote API is not one, and
+/// referencing a host from a remote component would ask the supervisor to poll
+/// and reap something it does not own.
+fn require_host_reference(
+    reference: Option<&str>,
+    execution: ExecutionConfig,
+    ids: &BTreeSet<&str>,
+    component: &str,
+) -> Result<(), GatewayConfigError> {
+    match (execution, reference) {
+        (ExecutionConfig::Local, Some(id)) if ids.contains(id) => Ok(()),
+        (ExecutionConfig::Local, _) => Err(config_error(format!(
+            "local {component} must reference a declared provider host"
+        ))),
+        (ExecutionConfig::Remote, None) => Ok(()),
+        (ExecutionConfig::Remote, Some(_)) => Err(config_error(format!(
+            "remote {component} must not reference a supervised provider host"
+        ))),
+    }
+}
+
+/// Credentials live in the process environment, never in the file. This checks
+/// the *name* of the variable and that the variable is set; the value is read
+/// only to prove it is not empty and is never bound, stored, or reported.
+fn validate_credential_reference(
+    credential_env: Option<&str>,
+    execution: ExecutionConfig,
+    component: &str,
+) -> Result<(), GatewayConfigError> {
+    match (execution, credential_env) {
+        (ExecutionConfig::Local, None) => Ok(()),
+        (ExecutionConfig::Local, Some(_)) => Err(config_error(format!(
+            "local {component} must not name a credential environment variable"
+        ))),
+        (ExecutionConfig::Remote, None) => Err(config_error(format!(
+            "remote {component} requires a credential environment variable"
+        ))),
+        (ExecutionConfig::Remote, Some(name)) => validate_environment_reference(name, component),
+    }
+}
+
+fn validate_environment_reference(name: &str, component: &str) -> Result<(), GatewayConfigError> {
+    if name.is_empty() || name.len() > MAX_CREDENTIAL_ENV_NAME_BYTES {
+        return Err(config_error(format!(
+            "{component} environment variable name must be within 1..=128 bytes"
+        )));
+    }
+    if name.starts_with(|character: char| character.is_ascii_digit())
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        return Err(config_error(format!(
+            "{component} environment variable name must be uppercase ASCII letters, digits, and underscores"
+        )));
+    }
+    if !std::env::var(name).is_ok_and(|value| !value.trim().is_empty()) {
+        return Err(config_error(format!(
+            "{component} environment variable {name} is not set"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_identifier(
+    value: &str,
+    maximum_bytes: usize,
+    component: &str,
+) -> Result<(), GatewayConfigError> {
+    if value.trim().is_empty() || value.len() > maximum_bytes || value.chars().any(char::is_control)
+    {
+        return Err(config_error(format!(
+            "{component} must be non-empty, free of control characters, and within {maximum_bytes} bytes"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_provider_label(label: &str, component: &str) -> Result<(), GatewayConfigError> {
@@ -842,16 +1279,20 @@ fn validate_provider_argv(argv: &[String]) -> Result<(), GatewayConfigError> {
     Ok(())
 }
 
-fn local_component(
+fn component_descriptor(
     kind: ComponentKind,
     provider: &str,
+    execution: ExecutionConfig,
     name: &str,
 ) -> Result<ComponentDescriptor, GatewayConfigError> {
     validate_provider_label(provider, name)?;
     Ok(ComponentDescriptor::new(
         kind,
         provider,
-        ExecutionLocation::Local,
+        match execution {
+            ExecutionConfig::Local => ExecutionLocation::Local,
+            ExecutionConfig::Remote => ExecutionLocation::Remote,
+        },
     ))
 }
 
@@ -910,6 +1351,26 @@ enum GatewayPrivacyMode {
     Cloud,
 }
 
+impl GatewayPrivacyMode {
+    const fn protocol_name(self) -> &'static str {
+        match self {
+            Self::LocalOnly => "local_only",
+            Self::Hybrid => "hybrid",
+            Self::Cloud => "cloud",
+        }
+    }
+}
+
+impl From<GatewayPrivacyMode> for ProtocolPrivacyMode {
+    fn from(value: GatewayPrivacyMode) -> Self {
+        match value {
+            GatewayPrivacyMode::LocalOnly => Self::LocalOnly,
+            GatewayPrivacyMode::Hybrid => Self::Hybrid,
+            GatewayPrivacyMode::Cloud => Self::Cloud,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct LanguageConfig {
@@ -920,6 +1381,10 @@ struct LanguageConfig {
     provider_host: Option<String>,
     endpoint: String,
     model: String,
+    /// The NAME of an environment variable holding this provider's credential.
+    /// The value never enters this structure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential_env: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     system_prompt: Option<String>,
     thinking: bool,
@@ -934,6 +1399,7 @@ struct LanguageConfig {
 #[serde(rename_all = "kebab-case")]
 enum LanguageBackend {
     OllamaCompatible,
+    OpenaiCompatible,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1022,6 +1488,12 @@ const fn default_episodic_retention_days() -> u16 {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct VoiceConfig {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "optional_voice_response_mode"
+    )]
+    response_mode: Option<VoiceResponseMode>,
     capture: VoiceCaptureConfig,
     turn: VoiceTurnConfig,
     asr: VoiceAsrConfig,
@@ -1054,8 +1526,17 @@ struct VoiceAsrConfig {
     backend: VoiceAsrBackend,
     execution: ExecutionConfig,
     provider: String,
-    model_path: PathBuf,
-    download: bool,
+    /// Remote transcription model identifier; local backends load a model
+    /// directory instead and must leave this unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    /// The NAME of an environment variable holding this provider's credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential_env: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    download: Option<bool>,
     language: Option<String>,
 }
 
@@ -1064,6 +1545,7 @@ struct VoiceAsrConfig {
 enum VoiceAsrBackend {
     Whisperkit,
     Sensevoice,
+    OpenaiStreaming,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1079,6 +1561,9 @@ struct VoiceSpeechConfig {
     endpoint: String,
     model: String,
     voice: String,
+    /// The NAME of an environment variable holding this provider's credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential_env: Option<String>,
     speed: f32,
     language: String,
     instructions: String,
@@ -1117,9 +1602,97 @@ enum VoiceAudioBackend {
     ManagedSidecar,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum ExecutionConfig {
     Local,
     Remote,
+}
+
+/// Encrypted session recording. `key_env` names the environment variable that
+/// holds the encryption key; the key itself never enters this structure, the
+/// serialized configuration, a status, or an error.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RecordingConfig {
+    directory: PathBuf,
+    key_env: String,
+}
+
+impl RecordingConfig {
+    fn validate(&self) -> Result<(), GatewayConfigError> {
+        if !self.directory.is_absolute() {
+            return Err(config_error("recording directory must be absolute"));
+        }
+        if self.directory.as_os_str().len() > MAX_RECORDING_DIRECTORY_BYTES {
+            return Err(config_error("recording directory exceeded 1024 bytes"));
+        }
+        if self
+            .directory
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(config_error(
+                "recording directory must not traverse parent directories",
+            ));
+        }
+        validate_environment_reference(&self.key_env, "recording key")
+    }
+}
+
+/// Everything decided from the configuration file before any adapter exists.
+struct DeploymentPlan {
+    provider_hosts: Vec<ProviderHost>,
+    components: Vec<ComponentDescriptor>,
+    memory: Option<(SqliteMemoryContextProvider, SqliteMemoryStore)>,
+    quality: ConversationQualityController,
+    status: RuntimeStatus,
+}
+
+mod optional_runtime_profile {
+    use conversation_protocol::RuntimeProfile;
+    use serde::de::Error as _;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(
+        value: &Option<RuntimeProfile>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        value.map(RuntimeProfile::as_str).serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<RuntimeProfile>, D::Error> {
+        Option::<String>::deserialize(deserializer)?
+            .map(|value| {
+                RuntimeProfile::parse(&value)
+                    .ok_or_else(|| D::Error::custom("unsupported runtime profile"))
+            })
+            .transpose()
+    }
+}
+
+mod optional_voice_response_mode {
+    use conversation_protocol::VoiceResponseMode;
+    use serde::de::Error as _;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(
+        value: &Option<VoiceResponseMode>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        value.map(VoiceResponseMode::as_str).serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<VoiceResponseMode>, D::Error> {
+        Option::<String>::deserialize(deserializer)?
+            .map(|value| {
+                VoiceResponseMode::parse(&value)
+                    .ok_or_else(|| D::Error::custom("unsupported voice response mode"))
+            })
+            .transpose()
+    }
 }

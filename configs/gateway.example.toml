@@ -1,4 +1,6 @@
 schema_version = 1
+# An omitted `profile` selects `offline`, which is what this file describes.
+# See gateway.meeting-online.example.toml for the explicit online profile.
 privacy_mode = "local-only"
 
 [language]

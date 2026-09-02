@@ -1,0 +1,94 @@
+# Online meeting profile. Selecting it is explicit and deliberate: this
+# deployment sends audio and text to third-party providers. Omitting `profile`
+# selects `offline`, and every other example in this directory is offline.
+#
+# Credentials are never written here. Each `credential_env` and `key_env` names
+# an environment variable the operator sets before starting the gateway; the
+# gateway refuses to start when a named variable is unset or empty.
+#
+# Model and voice identifiers below are placeholders. Substitute the ones the
+# deployment's provider account actually offers.
+schema_version = 3
+profile = "online"
+privacy_mode = "cloud"
+
+[language]
+backend = "openai-compatible"
+execution = "remote"
+provider = "openai"
+endpoint = "https://api.openai.com/v1"
+model = "operator-supplied-text-model"
+credential_env = "OPENAI_API_KEY"
+# Deployment policy only. Keep this public and backend-neutral.
+system_prompt = "Describe only application capabilities explicitly present in the conversation. Never invent tabs, menus, settings, storage locations, or unavailable features."
+thinking = false
+temperature = 0.7
+seed = 42
+num_predict = 1024
+num_ctx = 8192
+max_assistant_content_bytes = 65536
+
+[persona]
+mode = "direct-answer"
+warmth = 80
+humor = 60
+teasing = 40
+initiative = 35
+directness = 80
+intimacy = 30
+verbosity = 20
+follow_up_frequency = 25
+
+[voice]
+# "external_gate" keeps listening and transcription running while a response is
+# produced only for a segment the meeting client authorizes. "automatic"
+# answers every finalized segment.
+response_mode = "external_gate"
+
+[voice.capture]
+device = "system-default"
+
+[voice.turn]
+speech_start_ms = 200
+final_silence_ms = 600
+
+[voice.asr]
+backend = "openai-streaming"
+execution = "remote"
+provider = "openai-streaming"
+model = "operator-supplied-transcription-model"
+credential_env = "OPENAI_API_KEY"
+
+[voice.speech]
+backend = "openai-compatible"
+execution = "remote"
+provider = "openai-compatible-streaming"
+mode = "streaming"
+streaming_interval = 0.2
+endpoint = "https://api.openai.com/v1"
+model = "operator-supplied-tts-model"
+voice = "operator-supplied-voice"
+credential_env = "OPENAI_API_KEY"
+speed = 1.0
+language = "auto"
+instructions = "Speak naturally and clearly."
+max_tokens = 128
+repetition_penalty = 1.05
+max_text_bytes = 4096
+max_audio_bytes = 8388608
+
+# Audio capture and playback stay on the local sidecar in every profile.
+[voice.audio]
+backend = "managed-sidecar"
+execution = "local"
+provider = "local-audio"
+sidecar_executable = "/absolute/path/to/conversation-voice-sidecar"
+max_error_bytes = 65536
+
+# Encrypted session recording. The directory holds ciphertext only and must be
+# private to the account running the gateway. `key_env` names the variable
+# holding the encryption key; the key is never written to this file, a status,
+# a log line, or an error.
+[recording]
+directory = "/absolute/private/path/recordings"
+key_env = "MEETING_RECORDING_KEY"

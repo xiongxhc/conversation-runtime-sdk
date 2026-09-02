@@ -12,6 +12,7 @@ mod mock;
 mod ollama;
 mod openai_compatible_speech;
 mod openai_compatible_streaming_speech;
+mod openai_speech_recognition;
 mod recognition;
 mod speech;
 mod streaming_speech;
@@ -56,6 +57,9 @@ pub use openai_compatible_speech::{
 };
 pub use openai_compatible_streaming_speech::{
     OpenAiCompatibleStreamingSpeechConfig, OpenAiCompatibleStreamingSpeechSynthesizer,
+};
+pub use openai_speech_recognition::{
+    OnlineRecognitionSegment, OpenAiSpeechRecognitionConfig, OpenAiSpeechRecognizer,
 };
 pub use recognition::{RecognitionEvent, RecognitionHypothesis, SpeechRecognizer};
 pub use speech::{AudioFormat, SpeechRequest, SpeechSynthesizer, SynthesizedAudio};

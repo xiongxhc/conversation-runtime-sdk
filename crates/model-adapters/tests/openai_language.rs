@@ -267,19 +267,74 @@ async fn a_malformed_stream_event_fails_closed() {
 }
 
 #[tokio::test]
-async fn an_unrecognized_stream_field_fails_closed() {
+async fn an_unrecognized_sse_field_is_ignored_rather_than_rejected() {
     set_credential();
     let server = LanguageServer::start([Reply::raw(format!(
-        "surprise: {PRIVATE_TEXT}\n\ndata: [DONE]\n\n"
+        "surprise: {PRIVATE_TEXT}\ndata: {}\n\ndata: [DONE]\n\n",
+        content("kept")
     ))])
     .await;
 
     let items = collect(model(server.endpoint()).stream(request(), CancellationToken::new())).await;
 
+    assert_eq!(assert_single_terminal(&items), vec!["kept"]);
+}
+
+#[tokio::test]
+async fn an_event_field_before_each_data_line_produces_the_same_deltas() {
+    set_credential();
+    let plain =
+        LanguageServer::start([Reply::sse([content("The "), content("agenda"), done()])]).await;
+    let typed = LanguageServer::start([Reply::raw(format!(
+        "event: message\ndata: {}\n\nevent: message\ndata: {}\n\nevent: done\ndata: [DONE]\n\n",
+        content("The "),
+        content("agenda")
+    ))])
+    .await;
+
+    let from_plain =
+        collect(model(plain.endpoint()).stream(request(), CancellationToken::new())).await;
+    let from_typed =
+        collect(model(typed.endpoint()).stream(request(), CancellationToken::new())).await;
+
+    assert_eq!(assert_single_terminal(&from_plain), vec!["The ", "agenda"]);
     assert_eq!(
-        terminal_error(&items).message(),
+        assert_single_terminal(&from_typed),
+        assert_single_terminal(&from_plain),
+        "a typed SSE stream must produce exactly the deltas an untyped one does"
+    );
+}
+
+#[tokio::test]
+async fn id_and_retry_fields_are_ignored() {
+    set_credential();
+    let server = LanguageServer::start([Reply::raw(format!(
+        "retry: 3000\nid: 42\ndata: {}\n\nid\n: a comment\ndata: [DONE]\n\n",
+        content("only the data")
+    ))])
+    .await;
+
+    let items = collect(model(server.endpoint()).stream(request(), CancellationToken::new())).await;
+
+    assert_eq!(assert_single_terminal(&items), vec!["only the data"]);
+}
+
+#[tokio::test]
+async fn a_line_that_is_not_valid_sse_field_syntax_fails_closed() {
+    set_credential();
+    let server = LanguageServer::start([Reply::raw(format!(
+        "bad\u{7}field: {PRIVATE_TEXT}\n\ndata: [DONE]\n\n"
+    ))])
+    .await;
+
+    let items = collect(model(server.endpoint()).stream(request(), CancellationToken::new())).await;
+
+    let error = terminal_error(&items);
+    assert_eq!(
+        error.message(),
         "online text generation returned a malformed response"
     );
+    assert!(!error.message().contains(PRIVATE_TEXT));
 }
 
 #[tokio::test]
@@ -407,8 +462,8 @@ async fn every_error_variant_redacts_the_credential_and_the_transcript() {
             Reply::raw(format!("data: {{not json {leak}\n\n")),
         ),
         (
-            "unknown field",
-            Reply::raw(format!("mystery: {leak}\n\ndata: [DONE]\n\n")),
+            "invalid sse syntax",
+            Reply::raw(format!("bad\u{7}field: {leak}\n\ndata: [DONE]\n\n")),
         ),
         (
             "provider error",

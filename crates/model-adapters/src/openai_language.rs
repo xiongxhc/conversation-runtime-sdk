@@ -315,17 +315,26 @@ impl Generation {
 
     /// Reads one server-sent-events line.
     ///
-    /// Only blank lines, comments, and `data:` fields are recognised; anything
-    /// else fails closed rather than being skipped as if it were understood.
+    /// The specification requires a consumer to ignore a field whose name it
+    /// does not recognise, so `event`, `id`, `retry` and any other well-formed
+    /// field are consumed and dropped; only `data` is interpreted. Input that
+    /// is not SSE field syntax at all, and a `data` payload that does not
+    /// parse, still fail closed.
     async fn read_line(&mut self, line: &[u8]) -> Result<Continuation, StreamStop> {
         let line = trim_ascii(line);
         if line.is_empty() || line.starts_with(b":") {
             return Ok(Continuation::More);
         }
-        let Some(data) = line.strip_prefix(b"data:") else {
-            return Err(StreamStop::Failed(malformed_response()));
+        let (name, data) = match line.iter().position(|byte| *byte == b':') {
+            Some(colon) => (&line[..colon], trim_ascii(&line[colon + 1..])),
+            None => (line, &line[line.len()..]),
         };
-        let data = trim_ascii(data);
+        if !is_field_name(name) {
+            return Err(StreamStop::Failed(malformed_response()));
+        }
+        if name != b"data".as_slice() {
+            return Ok(Continuation::More);
+        }
         if data == DONE_SENTINEL.as_bytes() {
             return Ok(Continuation::Done);
         }
@@ -548,6 +557,12 @@ fn validate_configured_text(
         return Err(invalid_config(&format!("{subject} must be bounded text")));
     }
     Ok(())
+}
+
+/// An SSE field name: non-empty, and free of the control characters a field
+/// name cannot contain.
+fn is_field_name(name: &[u8]) -> bool {
+    !name.is_empty() && !name.iter().any(u8::is_ascii_control)
 }
 
 fn trim_ascii(bytes: &[u8]) -> &[u8] {

@@ -61,8 +61,11 @@ The first release is not a directory-complete platform. It is one local voice lo
   32,768-byte, and 16-KiB-per-message limits, and copied context stays visibly
   separate from new live turns. The operation restores no provider session,
   historical model, persona, memory snapshot, device state, or runtime IDs and
-  performs no summarization or compression. Model setup and distribution
-  remain open R6 work.
+  performs no summarization or compression. The gateway configuration schema
+  is now v2 and can declare `[[provider_hosts]]`: gateway-owned hosts are
+  launched from an explicit executable and argv, external hosts are only
+  checked, and both require a readiness URL and startup timeout with bounded
+  cleanup on shutdown. Model setup and distribution remain open R6 work.
 - The deterministic continuity gate now covers five spoken turns with a
   turn-scoped local language failure in the second turn, followed by three
   successful turns in the same session. Post-start recognition failure restarts
@@ -292,7 +295,10 @@ memory probe, and opt-in local voice configuration. Deterministic tests prove
 that deletion prevents later retrieval and that configured failures stop before
 language generation or sidecar startup.
 
-R5 does not automatically persist transcripts or generated responses, provide a
+R5 does not persist transcripts or generated responses unless the gateway's
+opt-in `[memory.extraction]` is configured, in which case only bounded memory
+candidates are derived from completed exchanges and identity and relationship
+candidates still require explicit approval. It does not provide a
 desktop editor, claim semantic-search quality, encrypt SQLite independently of
 the host filesystem, or provide cryptographic secure erasure. Relationship
 memory remains fallible context and never directly authorizes an expression.
@@ -422,6 +428,11 @@ See [the R6 local-gateway evaluation](docs/r6-local-gateway-evaluation.md) and
 - Native guided model setup backend: four Tauri commands for bounded loopback
   discovery, numeric-only benchmarking, private configuration preparation, and
   temporary-provider ownership cleanup.
+- Schema-v2 gateway configuration with `[[provider_hosts]]` supervision:
+  gateway-owned or external local provider processes with readiness checks,
+  startup timeouts, environment policy, and child cleanup.
+- Opt-in `[memory.extraction]` that derives bounded memory candidates from
+  completed exchanges through the configured local language model.
 - Revision-CAS Session save/delete, schema-2 migration, and source-independent
   continuation-branch persistence with copied-context/live-turn provenance.
 - Continue as new conversation through protocol v2 and the public TypeScript

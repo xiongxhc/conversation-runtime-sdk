@@ -152,6 +152,36 @@ impl SpeechPace {
     }
 }
 
+/// Whether a finalized transcript starts a response by itself.
+///
+/// `Automatic` is the runtime's own behaviour: a finalized turn immediately
+/// starts generation. `ExternalGate` hands that decision to whoever is driving
+/// the session, so the runtime keeps listening until it is told to answer.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum VoiceResponseMode {
+    #[default]
+    Automatic,
+    ExternalGate,
+}
+
+impl VoiceResponseMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Automatic => "automatic",
+            Self::ExternalGate => "external_gate",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "automatic" => Some(Self::Automatic),
+            "external_gate" => Some(Self::ExternalGate),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum FollowUpPolicy {

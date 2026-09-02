@@ -15,6 +15,7 @@ import type {
 } from "../src/protocol.js";
 
 const status: RuntimeStatus = {
+  profile: "offline",
   transport: "stdio",
   privacyMode: "local_only",
   languageLocation: "local",

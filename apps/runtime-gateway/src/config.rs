@@ -17,8 +17,8 @@ use conversation_model_adapters::{
 use conversation_protocol::{
     ClientComponentDescriptor, ComponentDescriptor, ComponentKind, ConversationMode,
     ExecutionLocation, FollowUpPolicy, PersonaLevel, PersonaProfile,
-    PrivacyMode as ProtocolPrivacyMode, ResponseControls, RuntimeStatus, SilencePolicy, SpeechPace,
-    MAX_CLIENT_PROVIDER_LABEL_BYTES,
+    PrivacyMode as ProtocolPrivacyMode, ResponseControls, RuntimeProfile, RuntimeStatus,
+    SilencePolicy, SpeechPace, MAX_CLIENT_PROVIDER_LABEL_BYTES,
 };
 use conversation_runtime::{ConversationContext, ConversationQualityController};
 use serde::{Deserialize, Serialize};
@@ -423,6 +423,9 @@ impl GatewayConfig {
             capabilities.push("voice_session".to_owned());
         }
         let status = RuntimeStatus {
+            // Every configuration this gateway accepts today runs locally, so
+            // the status reports the default offline profile.
+            profile: RuntimeProfile::Offline.as_str().to_owned(),
             transport: "stdio".to_owned(),
             privacy_mode: "local_only".to_owned(),
             language_location: "local".to_owned(),

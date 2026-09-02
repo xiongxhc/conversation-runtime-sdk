@@ -2631,6 +2631,7 @@ function localState(
   const state: ConversationSessionState = {
     phase: "ready",
     status: {
+      profile: "offline",
       transport: "stdio",
       privacyMode: "local_only",
       languageLocation: "local",

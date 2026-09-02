@@ -1,6 +1,11 @@
 export const LEGACY_CLIENT_PROTOCOL_VERSION = 1;
-export const CLIENT_PROTOCOL_VERSION = 2;
-export type ClientProtocolVersion = 1 | 2;
+/** The version that introduced context seeding and its status field. */
+export const CONTEXT_SEED_PROTOCOL_VERSION = 2;
+/** The version that introduced the runtime profile and remote execution. */
+export const RUNTIME_PROFILE_PROTOCOL_VERSION = 3;
+/** The newest version this build speaks; feature gates name their own version. */
+export const CLIENT_PROTOCOL_VERSION = RUNTIME_PROFILE_PROTOCOL_VERSION;
+export type ClientProtocolVersion = 1 | 2 | 3;
 export const MAX_CONVERSATION_MESSAGE_BYTES = 16 * 1024;
 export const MAX_HISTORY_MESSAGE_COUNT = 32;
 export const MAX_CONVERSATION_CONTEXT_EXCHANGES = 16;
@@ -137,6 +142,16 @@ export type RuntimeFailure = {
   message: string;
 };
 
+/**
+ * Which execution posture the operator selected. `offline` is the default
+ * whenever a payload states no profile; `online` is always explicit and must
+ * name each remote component truthfully.
+ */
+export type RuntimeProfile = "offline" | "online";
+
+/** Whether a finalized transcript starts a response by itself. */
+export type VoiceResponseMode = "automatic" | "external_gate";
+
 export type RuntimeCapability =
   | "text"
   | "conversation_context_seed"
@@ -146,9 +161,10 @@ export type RuntimeCapability =
   | "voice_session";
 
 export type RuntimeStatus = {
+  profile: RuntimeProfile;
   transport: "stdio";
-  privacyMode: "local_only";
-  languageLocation: "local";
+  privacyMode: "local_only" | "hybrid" | "cloud";
+  languageLocation: "local" | "remote";
   modelId: string;
   memoryEnabled: boolean;
   memoryLocation: "local" | null;
@@ -234,7 +250,10 @@ export type VoiceSessionEvent =
   | {
       type: "voice_session_started";
       sessionId: bigint;
-      privacy: { privacyMode: "local_only"; components: RuntimeComponentDescriptor[] };
+      privacy: {
+        privacyMode: RuntimeStatus["privacyMode"];
+        components: RuntimeComponentDescriptor[];
+      };
     }
   | {
       type: "voice_device_status";
@@ -336,7 +355,7 @@ export function parseClientCommand(value: unknown, expectedVersion?: ClientProto
       return { type, requestId: requireRequestId(object), memoryId: parseIdentifier(object.memory_id) };
     case "seed_conversation_context":
       requireExactKeys(object, ["protocol_version", "type", "request_id", "operation_id", "exchanges"]);
-      if (version !== CLIENT_PROTOCOL_VERSION) {
+      if (version < CONTEXT_SEED_PROTOCOL_VERSION) {
         throw new ProtocolError("conversation context seeding requires protocol version 2");
       }
       return {
@@ -575,7 +594,7 @@ export function validateClientCommand(
     validateMemoryCursor(command.cursor);
   }
   if (command.type === "seed_conversation_context") {
-    if (version !== CLIENT_PROTOCOL_VERSION) {
+    if (version < CONTEXT_SEED_PROTOCOL_VERSION) {
       throw new ProtocolError("conversation context seeding requires protocol version 2");
     }
     requireOperationId(command.operationId);
@@ -669,7 +688,8 @@ function parseRuntimeStatus(value: unknown, version: ClientProtocolVersion): Run
     "telemetry_enabled",
     "capabilities",
     "components",
-    ...(version === CLIENT_PROTOCOL_VERSION ? ["last_context_seed_operation_id"] : []),
+    ...(version >= CONTEXT_SEED_PROTOCOL_VERSION ? ["last_context_seed_operation_id"] : []),
+    ...(version >= RUNTIME_PROFILE_PROTOCOL_VERSION ? ["profile"] : []),
   ];
   requireExactKeys(object, expectedKeys);
   const memoryLocation = object.memory_location;
@@ -680,19 +700,28 @@ function parseRuntimeStatus(value: unknown, version: ClientProtocolVersion): Run
   const parsedMemoryLocation = requireMemoryLocation(memoryLocation);
   const capabilities = requireCapabilities(object, version);
   const components = requireRuntimeComponents(object);
-  validateRuntimeStatusComponents(capabilities, components);
+  // A payload older than the profile version states no profile, and every such
+  // runtime ran locally, so it decodes as offline.
+  const profile: RuntimeProfile = version >= RUNTIME_PROFILE_PROTOCOL_VERSION
+    ? requireOneOf(object, "profile", ["offline", "online"] as const)
+    : "offline";
+  const privacyMode = requireOneOf(object, "privacy_mode", ["local_only", "hybrid", "cloud"] as const);
+  const languageLocation = requireOneOf(object, "language_location", ["local", "remote"] as const);
+  validateRuntimeStatusComponents(capabilities, components, languageLocation, privacyMode);
+  validateRuntimeProfile(profile, privacyMode, components);
   validateRuntimeMemoryStatus(memoryEnabled, parsedMemoryLocation, capabilities, components);
   return {
+    profile,
     transport: requireOneOf(object, "transport", ["stdio"] as const),
-    privacyMode: requireOneOf(object, "privacy_mode", ["local_only"] as const),
-    languageLocation: requireOneOf(object, "language_location", ["local"] as const),
+    privacyMode,
+    languageLocation,
     modelId: requireString(object, "model_id"),
     memoryEnabled,
     memoryLocation: parsedMemoryLocation,
     telemetryEnabled: requireOneOf(object, "telemetry_enabled", [false] as const),
     capabilities,
     components,
-    ...(version === CLIENT_PROTOCOL_VERSION
+    ...(version >= CONTEXT_SEED_PROTOCOL_VERSION
       ? { lastContextSeedOperationId: requireNullableOperationId(object.last_context_seed_operation_id) }
       : {}),
   };
@@ -956,14 +985,16 @@ function parseVoiceSessionEvent(
       const privacy = requireRecord(object.privacy, "voice privacy summary");
       requireExactKeys(privacy, ["privacy_mode", "components"]);
       const components = requireRuntimeComponents(privacy);
-      validateVoiceComponents(components);
+      const privacyMode = requireOneOf(
+        privacy,
+        "privacy_mode",
+        ["local_only", "hybrid", "cloud"] as const,
+      );
+      validateVoiceComponents(components, privacyMode);
       return {
         type,
         sessionId: sessionId(),
-        privacy: {
-          privacyMode: requireOneOf(privacy, "privacy_mode", ["local_only"] as const),
-          components,
-        },
+        privacy: { privacyMode, components },
       };
     }
     case "voice_capture_paused":
@@ -1274,7 +1305,11 @@ function validateProtocolVersion(
   expectedVersion?: ClientProtocolVersion,
 ): ClientProtocolVersion {
   const version = object.protocol_version;
-  if (version !== LEGACY_CLIENT_PROTOCOL_VERSION && version !== CLIENT_PROTOCOL_VERSION) {
+  if (
+    version !== LEGACY_CLIENT_PROTOCOL_VERSION
+    && version !== CONTEXT_SEED_PROTOCOL_VERSION
+    && version !== RUNTIME_PROFILE_PROTOCOL_VERSION
+  ) {
     throw new ProtocolError("unsupported protocol version");
   }
   if (expectedVersion !== undefined && version !== expectedVersion) {
@@ -1446,7 +1481,7 @@ function requireCapabilities(
   }
   if (
     capabilities[0] !== "text"
-    || (version === LEGACY_CLIENT_PROTOCOL_VERSION && capabilities.includes("conversation_context_seed"))
+    || (version < CONTEXT_SEED_PROTOCOL_VERSION && capabilities.includes("conversation_context_seed"))
     || (capabilities.includes("memory_mutation") && !capabilities.includes("memory_inspection"))
   ) {
     throw new ProtocolError("capabilities has an unsupported value");
@@ -1521,17 +1556,20 @@ function requireRuntimeComponents(
 function validateRuntimeStatusComponents(
   capabilities: RuntimeStatus["capabilities"],
   components: RuntimeComponentDescriptor[],
+  languageLocation: RuntimeStatus["languageLocation"],
+  privacyMode: RuntimeStatus["privacyMode"],
 ): void {
   const voiceCapability = capabilities.some((capability) => capability === "voice_session");
+  const languageModels = components.filter((component) => component.kind === "language_model");
   if (
-    components.some((component) => component.executionLocation !== "local")
-    || components.filter((component) => component.kind === "language_model").length !== 1
+    languageModels.length !== 1
+    || languageModels[0]!.executionLocation !== languageLocation
     || components.some((component) => component.kind === "telemetry")
   ) {
     throw new ProtocolError("runtime status components are incoherent");
   }
   if (voiceCapability) {
-    validateVoiceComponents(components);
+    validateVoiceComponents(components, privacyMode);
   } else if (components.some((component) =>
     component.kind === "speech_recognition"
     || component.kind === "speech_synthesis"
@@ -1541,14 +1579,39 @@ function validateRuntimeStatusComponents(
   }
 }
 
-function validateVoiceComponents(components: RuntimeComponentDescriptor[]): void {
+/**
+ * The profile is the status's truthful summary of where work runs: an offline
+ * runtime keeps every component local and reports local-only privacy, while an
+ * online runtime has to name what it moved off the device.
+ */
+function validateRuntimeProfile(
+  profile: RuntimeProfile,
+  privacyMode: RuntimeStatus["privacyMode"],
+  components: RuntimeComponentDescriptor[],
+): void {
+  const remote = components.filter((component) => component.executionLocation === "remote").length;
+  const coherent = profile === "offline"
+    ? privacyMode === "local_only" && remote === 0
+    : privacyMode !== "local_only" && remote > 0;
+  if (!coherent) {
+    throw new ProtocolError("runtime profile does not match the reported execution locations");
+  }
+}
+
+function validateVoiceComponents(
+  components: RuntimeComponentDescriptor[],
+  privacyMode: RuntimeStatus["privacyMode"],
+): void {
   for (const required of ["speech_recognition", "language_model", "speech_synthesis", "audio_io"] as const) {
     if (components.filter((component) => component.kind === required).length !== 1) {
       throw new ProtocolError("voice components are incoherent");
     }
   }
-  if (components.some((component) => component.executionLocation !== "local")) {
-    throw new ProtocolError("voice components must be local");
+  // A local-only session may not run any component remotely; a hybrid or cloud
+  // session has to name what it moved off the device.
+  const remote = components.filter((component) => component.executionLocation === "remote").length;
+  if (privacyMode === "local_only" ? remote > 0 : remote === 0) {
+    throw new ProtocolError("voice components do not match the reported privacy mode");
   }
 }
 

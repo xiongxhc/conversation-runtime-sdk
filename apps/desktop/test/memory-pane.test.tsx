@@ -19,6 +19,7 @@ import type { ConversationSessionState } from "../src/runtime/conversation-sessi
 afterEach(cleanup);
 
 const localMemoryStatus: RuntimeStatus = {
+  profile: "offline",
   transport: "stdio",
   privacyMode: "local_only",
   languageLocation: "local",

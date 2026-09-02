@@ -1,15 +1,18 @@
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use conversation_memory::{MemoryClock, MemoryStore, MemoryStoreErrorKind};
 use conversation_model_adapters::GenerationLanguageModel;
 use conversation_protocol::{
-    decode_client_command, encode_gateway_message_for_version, ClientCommand, ClientMemoryCursor,
-    ClientMemoryInspection, ClientMemorySummary, ClientPersonaState, ClientRuntimeError,
-    ClientRuntimeEvent, ClientVoiceSessionEvent, GatewayMessage, MemoryApproval,
-    RecoveryDisposition, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStatus, SessionId,
-    TurnId, VoiceSessionEvent, CLIENT_PROTOCOL_VERSION,
+    decode_client_command_with_version, encode_gateway_message_for_version, ClientCommand,
+    ClientMemoryCursor, ClientMemoryInspection, ClientMemorySummary, ClientPersonaState,
+    ClientRuntimeError, ClientRuntimeEvent, ClientVoiceSessionEvent, GatewayMessage,
+    MemoryApproval, RecoveryDisposition, RuntimeError, RuntimeErrorKind, RuntimeEvent,
+    RuntimeStatus, SessionId, TurnId, VoiceSessionEvent, CLIENT_PROTOCOL_VERSION,
+    CONTEXT_SEED_PROTOCOL_VERSION, LEGACY_CLIENT_PROTOCOL_VERSION,
+    RUNTIME_PROFILE_PROTOCOL_VERSION,
 };
 use conversation_runtime::{
     ConversationContext, TextTurnEventStream, TextTurnRuntime, VoiceSessionAdapters,
@@ -219,12 +222,19 @@ impl GatewaySession {
             .take()
             .map(|counts| tokio::spawn(forward_extracted_counts(counts, event_sender.clone())));
         let (terminal_written, mut terminal_written_receiver) = mpsc::unbounded_channel();
+        // The gateway announces its newest version in `ready` and then answers
+        // on whatever version the client actually speaks, so a client that stays
+        // on an older version never receives a field its parser rejects. It
+        // never drops below the lowest version its own status can be stated at.
+        let minimum_version = minimum_status_version(&self.status);
+        let negotiated_version = Arc::new(AtomicU64::new(CLIENT_PROTOCOL_VERSION));
         let mut writer_task = tokio::spawn(writer_loop(
             writer,
             urgent_receiver,
             normal_receiver,
             event_receiver,
             terminal_written,
+            Arc::clone(&negotiated_version),
         ));
         let mut active: Option<ActiveForwarder> = None;
         let mut voice = VoiceSessionState {
@@ -380,8 +390,12 @@ impl GatewaySession {
                         while terminal_written_receiver.try_recv().is_ok() {
                             voice.terminals_written = voice.terminals_written.saturating_add(1);
                         }
-                        let command = match decode_client_command(&payload) {
-                            Ok(command) => command,
+                        let command = match decode_client_command_with_version(&payload) {
+                            Ok((version, command)) => {
+                                negotiated_version
+                                    .store(version.max(minimum_version), Ordering::Relaxed);
+                                command
+                            }
                             Err(_) => {
                                 if let Err(error) = send_rejection(
                                     &normal_sender,
@@ -1431,6 +1445,7 @@ async fn writer_loop<W>(
     mut normal: mpsc::Receiver<GatewayMessage>,
     mut events: mpsc::Receiver<GatewayMessage>,
     terminal_written: mpsc::UnboundedSender<()>,
+    negotiated_version: Arc<AtomicU64>,
 ) -> Result<(), GatewaySessionError>
 where
     W: AsyncWrite + Unpin,
@@ -1496,12 +1511,43 @@ where
         };
         if drain_events_first {
             while let Ok(queued) = events.try_recv() {
-                write_gateway_message(&mut writer, queued, &terminal_written).await?;
+                write_gateway_message(
+                    &mut writer,
+                    queued,
+                    &terminal_written,
+                    negotiated_version.load(Ordering::Relaxed),
+                )
+                .await?;
             }
         }
-        write_gateway_message(&mut writer, message, &terminal_written).await?;
+        write_gateway_message(
+            &mut writer,
+            message,
+            &terminal_written,
+            negotiated_version.load(Ordering::Relaxed),
+        )
+        .await?;
     }
     Ok(())
+}
+
+/// The lowest protocol version this session's status can be stated at.
+///
+/// A gateway whose status names a capability an older version does not define
+/// cannot describe itself to that client truthfully, so it keeps answering at
+/// the lowest version its own status encodes cleanly.
+fn minimum_status_version(status: &RuntimeStatus) -> u64 {
+    let ready = GatewayMessage::Ready {
+        status: status.clone(),
+    };
+    [
+        LEGACY_CLIENT_PROTOCOL_VERSION,
+        CONTEXT_SEED_PROTOCOL_VERSION,
+        RUNTIME_PROFILE_PROTOCOL_VERSION,
+    ]
+    .into_iter()
+    .find(|version| encode_gateway_message_for_version(&ready, *version).is_ok())
+    .unwrap_or(CLIENT_PROTOCOL_VERSION)
 }
 
 fn is_terminal_voice_message(message: &GatewayMessage) -> bool {
@@ -1532,12 +1578,13 @@ async fn write_gateway_message<W>(
     writer: &mut FrameWriter<W>,
     message: GatewayMessage,
     terminal_written: &mpsc::UnboundedSender<()>,
+    protocol_version: u64,
 ) -> Result<(), GatewaySessionError>
 where
     W: AsyncWrite + Unpin,
 {
     let terminal = is_terminal_voice_message(&message);
-    let payload = encode_gateway_message_for_version(&message, CLIENT_PROTOCOL_VERSION)
+    let payload = encode_gateway_message_for_version(&message, protocol_version)
         .map_err(|_| GatewaySessionError::Encoding)?;
     if terminal {
         writer
@@ -3106,6 +3153,7 @@ mod tests {
             normal_receiver,
             event_receiver,
             terminal_written,
+            Arc::new(std::sync::atomic::AtomicU64::new(CLIENT_PROTOCOL_VERSION)),
         )
         .await
         .unwrap();
@@ -5180,6 +5228,7 @@ mod tests {
 
     fn status() -> RuntimeStatus {
         RuntimeStatus {
+            profile: "offline".to_owned(),
             transport: "stdio".to_owned(),
             privacy_mode: "local_only".to_owned(),
             language_location: "local".to_owned(),

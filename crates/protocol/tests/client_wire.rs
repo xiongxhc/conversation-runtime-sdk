@@ -14,9 +14,10 @@ use conversation_protocol::{
     ResponseControls, RetrievalTraceId, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage,
     RuntimeStatus, SessionId, SilencePolicy, SpeechPace, TurnId, UnixTimestampMillis,
     VoiceActivity, VoiceSessionEvent, VoiceTimingMilestone, CLIENT_PROTOCOL_VERSION,
-    LEGACY_CLIENT_PROTOCOL_VERSION, MAX_CLIENT_COMPONENT_DESCRIPTORS,
-    MAX_CLIENT_DEVICE_LABEL_BYTES, MAX_CLIENT_FRAME_BYTES, MAX_CLIENT_PROVIDER_LABEL_BYTES,
-    MAX_CONVERSATION_MESSAGE_BYTES, MAX_HISTORY_BYTES, MAX_MEMORY_PREVIEW_BYTES,
+    CONTEXT_SEED_PROTOCOL_VERSION, LEGACY_CLIENT_PROTOCOL_VERSION,
+    MAX_CLIENT_COMPONENT_DESCRIPTORS, MAX_CLIENT_DEVICE_LABEL_BYTES, MAX_CLIENT_FRAME_BYTES,
+    MAX_CLIENT_PROVIDER_LABEL_BYTES, MAX_CONVERSATION_MESSAGE_BYTES, MAX_HISTORY_BYTES,
+    MAX_MEMORY_PREVIEW_BYTES, RUNTIME_PROFILE_PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Deserializer};
 
@@ -30,6 +31,7 @@ fn gateway_value_for_version(message: &GatewayMessage, version: u64) -> serde_js
 
 fn status() -> RuntimeStatus {
     RuntimeStatus {
+        profile: "offline".to_owned(),
         transport: "stdio".to_owned(),
         privacy_mode: "local_only".to_owned(),
         language_location: "local".to_owned(),
@@ -311,7 +313,7 @@ fn gateway_status_encoding_is_strictly_version_specific() {
         &GatewayMessage::Ready {
             status: v2_status.clone(),
         },
-        CLIENT_PROTOCOL_VERSION,
+        CONTEXT_SEED_PROTOCOL_VERSION,
     );
     assert_eq!(
         v2_ready,
@@ -346,7 +348,7 @@ fn gateway_status_encoding_is_strictly_version_specific() {
             request_id: "request-1".to_owned(),
             status: v2_status_with_operation,
         },
-        CLIENT_PROTOCOL_VERSION,
+        CONTEXT_SEED_PROTOCOL_VERSION,
     );
     assert_eq!(
         correlated["status"]["last_context_seed_operation_id"],
@@ -1385,7 +1387,7 @@ fn version_one_fixtures_parse_and_invalid_cases_are_rejected() {
         .enumerate()
     {
         let value: serde_json::Value = serde_json::from_str(line).unwrap();
-        if value["protocol_version"] == CLIENT_PROTOCOL_VERSION
+        if value["protocol_version"] == CONTEXT_SEED_PROTOCOL_VERSION
             && matches!(
                 value["type"].as_str(),
                 Some("status" | "start_voice_session")
@@ -2779,4 +2781,366 @@ where
         .parse()
         .map(FixtureIdentifier)
         .map_err(|_| E::custom("identifier exceeds u64"))
+}
+
+fn remote_client_component(kind: &str, provider_label: &str) -> ClientComponentDescriptor {
+    ClientComponentDescriptor {
+        kind: kind.to_owned(),
+        execution_location: "remote".to_owned(),
+        provider_label: provider_label.to_owned(),
+    }
+}
+
+fn online_status() -> RuntimeStatus {
+    RuntimeStatus {
+        profile: "online".to_owned(),
+        privacy_mode: "cloud".to_owned(),
+        language_location: "remote".to_owned(),
+        components: vec![remote_client_component("language_model", "Cloud language")],
+        ..status()
+    }
+}
+
+#[test]
+fn legacy_status_payloads_omit_profile_and_report_offline_on_version_three() {
+    let message = GatewayMessage::Ready { status: status() };
+
+    for version in [
+        LEGACY_CLIENT_PROTOCOL_VERSION,
+        CONTEXT_SEED_PROTOCOL_VERSION,
+    ] {
+        let value = gateway_value_for_version(&message, version);
+        assert!(
+            !value["status"].as_object().unwrap().contains_key("profile"),
+            "protocol version {version} must not carry a profile field"
+        );
+    }
+
+    assert_eq!(
+        gateway_value_for_version(&message, LEGACY_CLIENT_PROTOCOL_VERSION),
+        serde_json::json!({
+            "protocol_version": 1,
+            "type": "ready",
+            "status": {
+                "transport": "stdio",
+                "privacy_mode": "local_only",
+                "language_location": "local",
+                "model_id": "local-model",
+                "memory_enabled": false,
+                "memory_location": serde_json::Value::Null,
+                "telemetry_enabled": false,
+                "capabilities": ["text"],
+                "components": [{
+                    "kind": "language_model",
+                    "execution_location": "local",
+                    "provider_label": "Local language",
+                }],
+            },
+        })
+    );
+
+    let v3 = gateway_value_for_version(&message, RUNTIME_PROFILE_PROTOCOL_VERSION);
+    assert_eq!(v3["protocol_version"], 3);
+    assert_eq!(v3["status"]["profile"], "offline");
+    assert_eq!(v3["status"]["privacy_mode"], "local_only");
+    assert_eq!(
+        v3["status"]["last_context_seed_operation_id"],
+        serde_json::Value::Null
+    );
+}
+
+#[test]
+fn online_profile_reports_remote_execution_truthfully() {
+    let value = gateway_value_for_version(
+        &GatewayMessage::Ready {
+            status: online_status(),
+        },
+        RUNTIME_PROFILE_PROTOCOL_VERSION,
+    );
+
+    assert_eq!(value["status"]["profile"], "online");
+    assert_eq!(value["status"]["privacy_mode"], "cloud");
+    assert_eq!(value["status"]["language_location"], "remote");
+    assert_eq!(
+        value["status"]["components"][0]["execution_location"],
+        "remote"
+    );
+}
+
+#[test]
+fn online_status_is_refused_on_versions_that_cannot_state_a_profile() {
+    for version in [
+        LEGACY_CLIENT_PROTOCOL_VERSION,
+        CONTEXT_SEED_PROTOCOL_VERSION,
+    ] {
+        assert!(
+            matches!(
+                encode_gateway_message_for_version(
+                    &GatewayMessage::Ready {
+                        status: online_status()
+                    },
+                    version,
+                ),
+                Err(ClientWireError::InvalidRuntimeStatus)
+            ),
+            "an online status must not be encodable at version {version}"
+        );
+    }
+}
+
+#[test]
+fn online_profile_rejects_local_only_privacy_mode() {
+    let status = RuntimeStatus {
+        privacy_mode: "local_only".to_owned(),
+        ..online_status()
+    };
+
+    assert!(matches!(
+        encode_gateway_message_for_version(
+            &GatewayMessage::Ready { status },
+            RUNTIME_PROFILE_PROTOCOL_VERSION,
+        ),
+        Err(ClientWireError::InvalidRuntimeStatus)
+    ));
+}
+
+#[test]
+fn online_profile_requires_at_least_one_remote_component() {
+    let status = RuntimeStatus {
+        language_location: "local".to_owned(),
+        components: vec![client_component("language_model", "Local language")],
+        ..online_status()
+    };
+
+    assert!(matches!(
+        encode_gateway_message_for_version(
+            &GatewayMessage::Ready { status },
+            RUNTIME_PROFILE_PROTOCOL_VERSION,
+        ),
+        Err(ClientWireError::InvalidRuntimeStatus)
+    ));
+}
+
+#[test]
+fn offline_profile_rejects_any_remote_component() {
+    let remote_tool = RuntimeStatus {
+        components: vec![
+            client_component("language_model", "Local language"),
+            remote_client_component("tool", "Cloud tool"),
+        ],
+        ..status()
+    };
+    assert!(matches!(
+        encode_gateway_message_for_version(
+            &GatewayMessage::Ready {
+                status: remote_tool
+            },
+            RUNTIME_PROFILE_PROTOCOL_VERSION,
+        ),
+        Err(ClientWireError::InvalidRuntimeStatus)
+    ));
+
+    let status = RuntimeStatus {
+        language_location: "remote".to_owned(),
+        components: vec![remote_client_component("language_model", "Cloud language")],
+        ..status()
+    };
+
+    for version in [
+        LEGACY_CLIENT_PROTOCOL_VERSION,
+        CONTEXT_SEED_PROTOCOL_VERSION,
+        RUNTIME_PROFILE_PROTOCOL_VERSION,
+    ] {
+        assert!(matches!(
+            encode_gateway_message_for_version(
+                &GatewayMessage::Ready {
+                    status: status.clone()
+                },
+                version,
+            ),
+            Err(ClientWireError::InvalidRuntimeStatus)
+        ));
+    }
+}
+
+#[test]
+fn offline_profile_rejects_non_local_privacy_modes() {
+    for privacy_mode in ["hybrid", "cloud"] {
+        let status = RuntimeStatus {
+            privacy_mode: privacy_mode.to_owned(),
+            ..status()
+        };
+        assert!(matches!(
+            encode_gateway_message_for_version(
+                &GatewayMessage::Ready { status },
+                RUNTIME_PROFILE_PROTOCOL_VERSION,
+            ),
+            Err(ClientWireError::InvalidRuntimeStatus)
+        ));
+    }
+}
+
+#[test]
+fn unknown_profiles_and_privacy_modes_are_rejected() {
+    for profile in ["", "meeting", "Offline", "online "] {
+        let status = RuntimeStatus {
+            profile: profile.to_owned(),
+            ..status()
+        };
+        assert!(
+            matches!(
+                encode_gateway_message_for_version(
+                    &GatewayMessage::Ready { status },
+                    RUNTIME_PROFILE_PROTOCOL_VERSION,
+                ),
+                Err(ClientWireError::InvalidRuntimeStatus)
+            ),
+            "profile {profile:?} must be rejected"
+        );
+    }
+
+    let status = RuntimeStatus {
+        privacy_mode: "public".to_owned(),
+        ..online_status()
+    };
+    assert!(matches!(
+        encode_gateway_message_for_version(
+            &GatewayMessage::Ready { status },
+            RUNTIME_PROFILE_PROTOCOL_VERSION,
+        ),
+        Err(ClientWireError::InvalidRuntimeStatus)
+    ));
+}
+
+#[test]
+fn language_location_must_match_the_language_model_component() {
+    let online_claiming_local = RuntimeStatus {
+        language_location: "local".to_owned(),
+        ..online_status()
+    };
+    assert!(matches!(
+        encode_gateway_message_for_version(
+            &GatewayMessage::Ready {
+                status: online_claiming_local
+            },
+            RUNTIME_PROFILE_PROTOCOL_VERSION,
+        ),
+        Err(ClientWireError::InvalidRuntimeStatus)
+    ));
+
+    let offline_claiming_remote = RuntimeStatus {
+        language_location: "remote".to_owned(),
+        ..status()
+    };
+    assert!(matches!(
+        encode_gateway_message_for_version(
+            &GatewayMessage::Ready {
+                status: offline_claiming_remote
+            },
+            RUNTIME_PROFILE_PROTOCOL_VERSION,
+        ),
+        Err(ClientWireError::InvalidRuntimeStatus)
+    ));
+}
+
+#[test]
+fn online_voice_status_may_report_remote_components() {
+    let status = RuntimeStatus {
+        capabilities: vec!["text".to_owned(), "voice_session".to_owned()],
+        components: vec![
+            remote_client_component("speech_recognition", "Cloud speech recognition"),
+            remote_client_component("language_model", "Cloud language"),
+            remote_client_component("speech_synthesis", "Cloud speech synthesis"),
+            client_component("audio_io", "Local audio"),
+        ],
+        ..online_status()
+    };
+
+    assert!(encode_gateway_message_for_version(
+        &GatewayMessage::Ready {
+            status: status.clone()
+        },
+        RUNTIME_PROFILE_PROTOCOL_VERSION,
+    )
+    .is_ok());
+
+    let local_only = RuntimeStatus {
+        profile: "offline".to_owned(),
+        privacy_mode: "local_only".to_owned(),
+        language_location: "local".to_owned(),
+        ..status
+    };
+    assert!(matches!(
+        encode_gateway_message_for_version(
+            &GatewayMessage::Ready { status: local_only },
+            RUNTIME_PROFILE_PROTOCOL_VERSION,
+        ),
+        Err(ClientWireError::InvalidRuntimeStatus)
+    ));
+}
+
+#[test]
+fn protocol_version_three_is_supported_and_higher_versions_are_rejected() {
+    let payload = format!(
+        r#"{{"protocol_version":{RUNTIME_PROFILE_PROTOCOL_VERSION},"type":"status","request_id":"req-1"}}"#
+    );
+    assert!(matches!(
+        decode_client_command(payload.as_bytes()).unwrap(),
+        ClientCommand::Status { .. }
+    ));
+
+    assert!(matches!(
+        decode_client_command(br#"{"protocol_version":4,"type":"status","request_id":"req-1"}"#),
+        Err(ClientWireError::UnsupportedProtocolVersion(4))
+    ));
+    assert!(matches!(
+        decode_client_command(br#"{"protocol_version":0,"type":"status","request_id":"req-1"}"#),
+        Err(ClientWireError::UnsupportedProtocolVersion(0))
+    ));
+}
+
+#[test]
+fn context_seeding_stays_available_from_version_two_onwards() {
+    for version in [
+        CONTEXT_SEED_PROTOCOL_VERSION,
+        RUNTIME_PROFILE_PROTOCOL_VERSION,
+    ] {
+        let payload = format!(
+            r#"{{"protocol_version":{version},"type":"seed_conversation_context","request_id":"request-1","operation_id":"continue-1","exchanges":[{{"user":"hello","assistant":"hi"}}]}}"#
+        );
+        assert!(matches!(
+            decode_client_command(payload.as_bytes()).unwrap(),
+            ClientCommand::SeedConversationContext { .. }
+        ));
+
+        let seeded = RuntimeStatus {
+            capabilities: vec!["text".to_owned(), "conversation_context_seed".to_owned()],
+            last_context_seed_operation_id: Some("continue-1".to_owned()),
+            ..status()
+        };
+        let value = gateway_value_for_version(&GatewayMessage::Ready { status: seeded }, version);
+        assert_eq!(
+            value["status"]["last_context_seed_operation_id"],
+            "continue-1"
+        );
+    }
+
+    assert!(matches!(
+        decode_client_command(
+            br#"{"protocol_version":1,"type":"seed_conversation_context","request_id":"request-1","operation_id":"continue-1","exchanges":[{"user":"hello","assistant":"hi"}]}"#,
+        ),
+        Err(ClientWireError::UnsupportedProtocolVersion(1))
+    ));
+
+    let seeded = RuntimeStatus {
+        capabilities: vec!["text".to_owned(), "conversation_context_seed".to_owned()],
+        ..status()
+    };
+    assert!(matches!(
+        encode_gateway_message_for_version(
+            &GatewayMessage::Ready { status: seeded },
+            LEGACY_CLIENT_PROTOCOL_VERSION,
+        ),
+        Err(ClientWireError::InvalidRuntimeStatus)
+    ));
 }

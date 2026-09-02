@@ -25,6 +25,7 @@ import type { ConversationSessionState } from "../src/runtime/conversation-sessi
 afterEach(cleanup);
 
 const localStatus: ConversationSessionState["status"] = {
+  profile: "offline",
   transport: "stdio",
   privacyMode: "local_only",
   languageLocation: "local",

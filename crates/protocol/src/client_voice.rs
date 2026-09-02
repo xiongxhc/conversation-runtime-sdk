@@ -300,11 +300,19 @@ pub(crate) fn validate_voice_components(
     components: &[ClientComponentDescriptor],
 ) -> Result<(), ClientWireError> {
     validate_component_descriptors(components)?;
-    if privacy_mode != "local_only"
-        || components
-            .iter()
-            .any(|component| component.execution_location != "local")
-    {
+    let privacy_mode =
+        PrivacyMode::parse(privacy_mode).ok_or(ClientWireError::InvalidRuntimeStatus)?;
+    // A local-only session may not run any component remotely; a hybrid or
+    // cloud session has to name what it moved off the device.
+    let remote_components = components
+        .iter()
+        .filter(|component| component.execution_location == "remote")
+        .count();
+    let privacy_matches_execution = match privacy_mode {
+        PrivacyMode::LocalOnly => remote_components == 0,
+        PrivacyMode::Hybrid | PrivacyMode::Cloud => remote_components > 0,
+    };
+    if !privacy_matches_execution {
         return Err(ClientWireError::InvalidRuntimeStatus);
     }
     for required in [

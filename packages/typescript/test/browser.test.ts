@@ -124,6 +124,7 @@ test("browser and root entries expose persona and memory extraction DTOs", () =>
 test("browser and root entries expose context seeding and status DTOs", () => {
   const exchange: ConversationContextExchange = { user: "hello", assistant: "hi" };
   const runtimeStatus: RuntimeStatus = {
+    profile: "offline",
     transport: "stdio",
     privacyMode: "local_only",
     languageLocation: "local",

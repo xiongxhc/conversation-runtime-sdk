@@ -6,15 +6,27 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::{
     ClientComponentDescriptor, ClientMemoryCursor, ClientMemoryInspection, ClientMemoryRecord,
     ClientMemoryRetention, ClientMemorySummary, ClientPersonaState, ClientVoiceSessionEvent,
-    ConversationMode, FollowUpPolicy, MemoryId, MemoryRetrievalTrace, QualityDecision,
-    ResponseControls, RetrievalTraceId, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage,
-    RuntimeTimingMilestone, SilencePolicy, SpeechPace, TurnId, MAX_CONVERSATION_MESSAGE_BYTES,
-    MAX_HISTORY_BYTES, MAX_MEMORY_CONTENT_BYTES, MAX_MEMORY_INSPECTION_HISTORY_ITEMS,
-    MAX_MEMORY_LIST_PAGE_ITEMS, MAX_MEMORY_PREVIEW_BYTES,
+    ConversationMode, ExecutionLocation, FollowUpPolicy, MemoryId, MemoryRetrievalTrace,
+    PrivacyMode, QualityDecision, ResponseControls, RetrievalTraceId, RuntimeError,
+    RuntimeErrorKind, RuntimeEvent, RuntimeProfile, RuntimeStage, RuntimeTimingMilestone,
+    SilencePolicy, SpeechPace, TurnId, MAX_CONVERSATION_MESSAGE_BYTES, MAX_HISTORY_BYTES,
+    MAX_MEMORY_CONTENT_BYTES, MAX_MEMORY_INSPECTION_HISTORY_ITEMS, MAX_MEMORY_LIST_PAGE_ITEMS,
+    MAX_MEMORY_PREVIEW_BYTES,
 };
 
+/// The oldest protocol version this build still speaks.
 pub const LEGACY_CLIENT_PROTOCOL_VERSION: u64 = 1;
-pub const CLIENT_PROTOCOL_VERSION: u64 = 2;
+/// The version that introduced `seed_conversation_context`, the
+/// `conversation_context_seed` capability, and `last_context_seed_operation_id`
+/// on the runtime status.
+pub const CONTEXT_SEED_PROTOCOL_VERSION: u64 = 2;
+/// The version that introduced the runtime `profile` field and, with it, status
+/// payloads that may report remote execution.
+pub const RUNTIME_PROFILE_PROTOCOL_VERSION: u64 = 3;
+/// The newest protocol version this build speaks. Feature gates name the
+/// version that introduced them instead of this alias, so bumping it never
+/// silently changes how an older client is served.
+pub const CLIENT_PROTOCOL_VERSION: u64 = RUNTIME_PROFILE_PROTOCOL_VERSION;
 pub const MAX_CLIENT_FRAME_BYTES: usize = 512 * 1024;
 const MAX_CONVERSATION_CONTEXT_EXCHANGES: usize = 16;
 
@@ -200,6 +212,7 @@ pub struct ClientRuntimeError {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RuntimeStatus {
+    pub profile: String,
     pub transport: String,
     pub privacy_mode: String,
     pub language_location: String,
@@ -470,10 +483,24 @@ impl ClientRuntimeEvent {
 }
 
 pub fn decode_client_command(payload: &[u8]) -> Result<ClientCommand, ClientWireError> {
+    decode_client_command_with_version(payload).map(|(_, command)| command)
+}
+
+/// Decodes a client command and reports the protocol version the client used,
+/// so a gateway can answer on the version its client actually speaks.
+pub fn decode_client_command_with_version(
+    payload: &[u8],
+) -> Result<(u64, ClientCommand), ClientWireError> {
     validate_payload_size(payload.len())?;
     let command: WireClientCommand =
         serde_json::from_slice(payload).map_err(ClientWireError::InvalidJson)?;
+    let protocol_version = command.protocol_version();
+    decode_wire_client_command(command).map(|command| (protocol_version, command))
+}
 
+fn decode_wire_client_command(
+    command: WireClientCommand,
+) -> Result<ClientCommand, ClientWireError> {
     match command {
         WireClientCommand::Status {
             protocol_version,
@@ -546,7 +573,8 @@ pub fn decode_client_command(payload: &[u8]) -> Result<ClientCommand, ClientWire
             operation_id,
             exchanges,
         } => {
-            if protocol_version != CLIENT_PROTOCOL_VERSION {
+            validate_protocol_version(protocol_version)?;
+            if protocol_version < CONTEXT_SEED_PROTOCOL_VERSION {
                 return Err(ClientWireError::UnsupportedProtocolVersion(
                     protocol_version,
                 ));
@@ -728,6 +756,55 @@ enum WireClientCommand {
         memory_id: DecimalIdentifier,
         expected_revision: DecimalIdentifier,
     },
+}
+
+impl WireClientCommand {
+    const fn protocol_version(&self) -> u64 {
+        match self {
+            Self::Status {
+                protocol_version, ..
+            }
+            | Self::StartTurn {
+                protocol_version, ..
+            }
+            | Self::InterruptTurn {
+                protocol_version, ..
+            }
+            | Self::StartVoiceSession {
+                protocol_version, ..
+            }
+            | Self::StopVoiceSession {
+                protocol_version, ..
+            }
+            | Self::PauseVoiceCapture {
+                protocol_version, ..
+            }
+            | Self::ResumeVoiceCapture {
+                protocol_version, ..
+            }
+            | Self::SeedConversationContext {
+                protocol_version, ..
+            }
+            | Self::MemoryList {
+                protocol_version, ..
+            }
+            | Self::MemoryInspect {
+                protocol_version, ..
+            }
+            | Self::PersonaGet {
+                protocol_version, ..
+            }
+            | Self::PersonaUpdate {
+                protocol_version, ..
+            }
+            | Self::MemoryApprove {
+                protocol_version, ..
+            }
+            | Self::MemoryDelete {
+                protocol_version, ..
+            } => *protocol_version,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -936,6 +1013,8 @@ impl From<&crate::ClientMemoryApproval> for WireClientMemoryApproval {
 #[derive(Serialize)]
 #[serde(deny_unknown_fields)]
 struct WireRuntimeStatus<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile: Option<&'a str>,
     transport: &'a str,
     privacy_mode: &'a str,
     language_location: &'a str,
@@ -952,6 +1031,11 @@ struct WireRuntimeStatus<'a> {
 impl<'a> WireRuntimeStatus<'a> {
     fn new(status: &'a RuntimeStatus, protocol_version: u64) -> Self {
         Self {
+            // `profile` has no null form, so a single `Option` is the whole gate:
+            // `None` omits the key entirely and keeps a v1 or v2 payload byte
+            // identical to what this build produced before version 3 existed.
+            profile: (protocol_version >= RUNTIME_PROFILE_PROTOCOL_VERSION)
+                .then_some(status.profile.as_str()),
             transport: &status.transport,
             privacy_mode: &status.privacy_mode,
             language_location: &status.language_location,
@@ -961,7 +1045,7 @@ impl<'a> WireRuntimeStatus<'a> {
             telemetry_enabled: status.telemetry_enabled,
             capabilities: &status.capabilities,
             components: &status.components,
-            last_context_seed_operation_id: (protocol_version == CLIENT_PROTOCOL_VERSION)
+            last_context_seed_operation_id: (protocol_version >= CONTEXT_SEED_PROTOCOL_VERSION)
                 .then_some(status.last_context_seed_operation_id.as_deref()),
         }
     }
@@ -1119,7 +1203,9 @@ impl<'a> GatewayMessageEnvelope<'a> {
 fn validate_protocol_version(version: u64) -> Result<(), ClientWireError> {
     if matches!(
         version,
-        LEGACY_CLIENT_PROTOCOL_VERSION | CLIENT_PROTOCOL_VERSION
+        LEGACY_CLIENT_PROTOCOL_VERSION
+            | CONTEXT_SEED_PROTOCOL_VERSION
+            | RUNTIME_PROFILE_PROTOCOL_VERSION
     ) {
         Ok(())
     } else {
@@ -1247,29 +1333,53 @@ fn validate_runtime_status(
     status: &RuntimeStatus,
     protocol_version: u64,
 ) -> Result<(), ClientWireError> {
-    if status.transport != "stdio"
-        || status.privacy_mode != "local_only"
-        || status.language_location != "local"
-        || status.model_id.trim().is_empty()
-        || status.telemetry_enabled
+    let profile =
+        RuntimeProfile::parse(&status.profile).ok_or(ClientWireError::InvalidRuntimeStatus)?;
+    let privacy_mode =
+        PrivacyMode::parse(&status.privacy_mode).ok_or(ClientWireError::InvalidRuntimeStatus)?;
+    let language_location = ExecutionLocation::parse(&status.language_location)
+        .ok_or(ClientWireError::InvalidRuntimeStatus)?;
+    if status.transport != "stdio" || status.model_id.trim().is_empty() || status.telemetry_enabled
     {
         return Err(ClientWireError::InvalidRuntimeStatus);
     }
     crate::client_voice::validate_component_descriptors(&status.components)?;
-    if status
+
+    let mut language_models = status
         .components
         .iter()
-        .any(|component| component.execution_location != "local")
-        || status
-            .components
-            .iter()
-            .filter(|component| component.kind == "language_model")
-            .count()
-            != 1
+        .filter(|component| component.kind == "language_model");
+    let language_model = language_models
+        .next()
+        .ok_or(ClientWireError::InvalidRuntimeStatus)?;
+    if language_models.next().is_some()
         || status
             .components
             .iter()
             .any(|component| component.kind == "telemetry")
+        || ExecutionLocation::parse(&language_model.execution_location) != Some(language_location)
+    {
+        return Err(ClientWireError::InvalidRuntimeStatus);
+    }
+
+    // The profile is the status's truthful summary of where work runs: an
+    // offline runtime keeps every component local and reports local-only
+    // privacy, while an online runtime has to name what it moved off the device.
+    let remote_components = status
+        .components
+        .iter()
+        .filter(|component| component.execution_location == "remote")
+        .count();
+    let profile_matches_execution = match profile {
+        RuntimeProfile::Offline => privacy_mode == PrivacyMode::LocalOnly && remote_components == 0,
+        RuntimeProfile::Online => privacy_mode != PrivacyMode::LocalOnly && remote_components > 0,
+    };
+    // A version older than the profile field cannot state that a session runs
+    // online, so an online status is refused rather than quietly stripped of the
+    // one field that names it.
+    if !profile_matches_execution
+        || (profile == RuntimeProfile::Online
+            && protocol_version < RUNTIME_PROFILE_PROTOCOL_VERSION)
     {
         return Err(ClientWireError::InvalidRuntimeStatus);
     }
@@ -1280,7 +1390,7 @@ fn validate_runtime_status(
 
     let capability_rank = |capability: &str| match capability {
         "text" => Some(0),
-        "conversation_context_seed" if protocol_version == CLIENT_PROTOCOL_VERSION => Some(1),
+        "conversation_context_seed" if protocol_version >= CONTEXT_SEED_PROTOCOL_VERSION => Some(1),
         "persona_control" => Some(2),
         "memory_inspection" => Some(3),
         "memory_mutation" => Some(4),
@@ -1727,6 +1837,7 @@ mod runtime_status_capability_tests {
             });
         }
         RuntimeStatus {
+            profile: "offline".to_owned(),
             transport: "stdio".to_owned(),
             privacy_mode: "local_only".to_owned(),
             language_location: "local".to_owned(),

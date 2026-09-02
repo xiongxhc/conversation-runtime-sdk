@@ -116,6 +116,7 @@ test("detects a v2 ready message and decodes its context-seed status", () => {
     message: {
       type: "ready",
       status: {
+        profile: "offline",
         transport: "stdio",
         privacyMode: "local_only",
         languageLocation: "local",
@@ -170,6 +171,7 @@ test("keeps v1 status exact and rejects v1 context seeding", () => {
     message: {
       type: "ready",
       status: {
+        profile: "offline",
         transport: "stdio",
         privacyMode: "local_only",
         languageLocation: "local",
@@ -1170,3 +1172,197 @@ function memoryInspectionWire(): {
     },
   };
 }
+
+function wireStatusV3(): Record<string, unknown> {
+  return { ...wireStatus(), last_context_seed_operation_id: null, profile: "offline" };
+}
+
+function onlineWireStatus(): Record<string, unknown> {
+  return {
+    ...wireStatusV3(),
+    profile: "online",
+    privacy_mode: "cloud",
+    language_location: "remote",
+    components: [
+      { kind: "language_model", execution_location: "remote", provider_label: "Cloud language" },
+    ],
+  };
+}
+
+test("decodes legacy status payloads as the offline profile", () => {
+  const v1 = parseReadyMessage({ protocol_version: 1, type: "ready", status: wireStatus() });
+  assert.equal(v1.version, 1);
+  assert.equal(v1.message.status.profile, "offline");
+
+  const v2 = parseReadyMessage({
+    protocol_version: 2,
+    type: "ready",
+    status: { ...wireStatus(), last_context_seed_operation_id: null },
+  });
+  assert.equal(v2.version, 2);
+  assert.equal(v2.message.status.profile, "offline");
+
+  for (const version of [1, 2] as const) {
+    assert.throws(
+      () => parseReadyMessage({
+        protocol_version: version,
+        type: "ready",
+        status: { ...wireStatus(), ...(version === 2 ? { last_context_seed_operation_id: null } : {}), profile: "offline" },
+      }),
+      /missing or unknown fields/,
+    );
+  }
+});
+
+test("decodes the v3 runtime profile and requires it on v3 payloads", () => {
+  const ready = parseReadyMessage({ protocol_version: 3, type: "ready", status: wireStatusV3() });
+  assert.equal(ready.version, 3);
+  assert.equal(ready.message.status.profile, "offline");
+  assert.equal(ready.message.status.privacyMode, "local_only");
+  assert.equal(ready.message.status.lastContextSeedOperationId, null);
+
+  assert.throws(
+    () => parseReadyMessage({
+      protocol_version: 3,
+      type: "ready",
+      status: { ...wireStatus(), last_context_seed_operation_id: null },
+    }),
+    /missing or unknown fields/,
+  );
+});
+
+test("decodes an online status that reports remote execution truthfully", () => {
+  const ready = parseReadyMessage({ protocol_version: 3, type: "ready", status: onlineWireStatus() });
+  assert.deepEqual(ready.message.status, {
+    profile: "online",
+    transport: "stdio",
+    privacyMode: "cloud",
+    languageLocation: "remote",
+    modelId: "local-model",
+    memoryEnabled: false,
+    memoryLocation: null,
+    telemetryEnabled: false,
+    capabilities: ["text"],
+    components: [{
+      kind: "language_model",
+      executionLocation: "remote",
+      providerLabel: "Cloud language",
+    }],
+    lastContextSeedOperationId: null,
+  });
+});
+
+test("rejects an online profile that claims local-only privacy", () => {
+  assert.throws(() => parseReadyMessage({
+    protocol_version: 3,
+    type: "ready",
+    status: { ...onlineWireStatus(), privacy_mode: "local_only" },
+  }), /runtime profile does not match/);
+});
+
+test("rejects an offline profile carrying any remote component", () => {
+  const withRemoteTool = (status: Record<string, unknown>): Record<string, unknown> => ({
+    ...status,
+    components: [
+      { kind: "language_model", execution_location: "local", provider_label: "Local language" },
+      { kind: "tool", execution_location: "remote", provider_label: "Cloud tool" },
+    ],
+  });
+
+  assert.throws(() => parseReadyMessage({
+    protocol_version: 3,
+    type: "ready",
+    status: withRemoteTool(wireStatusV3()),
+  }), /runtime profile does not match/);
+
+  assert.throws(() => parseGatewayMessage({
+    protocol_version: 1,
+    type: "ready",
+    status: withRemoteTool(wireStatus()),
+  }, 1), /runtime profile does not match/);
+
+  assert.throws(() => parseReadyMessage({
+    protocol_version: 3,
+    type: "ready",
+    status: {
+      ...wireStatusV3(),
+      language_location: "remote",
+      components: [
+        { kind: "language_model", execution_location: "remote", provider_label: "Cloud language" },
+      ],
+    },
+  }), /runtime profile does not match/);
+});
+
+test("rejects unknown runtime profiles and privacy modes", () => {
+  for (const profile of ["", "meeting", "Offline", "online "]) {
+    assert.throws(() => parseReadyMessage({
+      protocol_version: 3,
+      type: "ready",
+      status: { ...wireStatusV3(), profile },
+    }));
+  }
+  assert.throws(() => parseReadyMessage({
+    protocol_version: 3,
+    type: "ready",
+    status: { ...onlineWireStatus(), privacy_mode: "public" },
+  }));
+});
+
+test("requires an online profile to report at least one remote component", () => {
+  assert.throws(() => parseReadyMessage({
+    protocol_version: 3,
+    type: "ready",
+    status: {
+      ...onlineWireStatus(),
+      language_location: "local",
+      components: [
+        { kind: "language_model", execution_location: "local", provider_label: "Local language" },
+      ],
+    },
+  }), /runtime profile does not match/);
+});
+
+test("refuses a legacy payload that describes remote execution without a profile", () => {
+  for (const version of [1, 2] as const) {
+    assert.throws(() => parseGatewayMessage({
+      protocol_version: version,
+      type: "ready",
+      status: {
+        ...wireStatus(),
+        ...(version === 2 ? { last_context_seed_operation_id: null } : {}),
+        privacy_mode: "cloud",
+        language_location: "remote",
+        components: [
+          { kind: "language_model", execution_location: "remote", provider_label: "Cloud language" },
+        ],
+      },
+    }, version), /runtime profile does not match/);
+  }
+});
+
+test("accepts protocol version 3 commands and rejects version 4", () => {
+  assert.deepEqual(
+    parseClientCommand({ protocol_version: 3, type: "status", request_id: "req-1" }, 3),
+    { type: "status", requestId: "req-1" },
+  );
+  assert.deepEqual(
+    parseClientCommand({
+      protocol_version: 3,
+      type: "seed_conversation_context",
+      request_id: "request-1",
+      operation_id: "continue-1",
+      exchanges: [{ user: "hello", assistant: "hi" }],
+    }, 3),
+    {
+      type: "seed_conversation_context",
+      requestId: "request-1",
+      operationId: "continue-1",
+      exchanges: [{ user: "hello", assistant: "hi" }],
+    },
+  );
+  assert.throws(
+    () => parseClientCommand({ protocol_version: 4, type: "status", request_id: "req-1" }),
+    /unsupported protocol version/,
+  );
+});

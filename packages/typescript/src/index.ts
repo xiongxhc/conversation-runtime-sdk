@@ -2,6 +2,7 @@ export { CommandRejectedError, RuntimeClient, type RuntimeTransport, type Runtim
 export { FrameDecoder, FrameError, MAX_FRAME_BYTES, encodeFrame } from "./framing.js";
 export {
   CLIENT_PROTOCOL_VERSION,
+  CONTEXT_SEED_PROTOCOL_VERSION,
   LEGACY_CLIENT_PROTOCOL_VERSION,
   MAX_CONVERSATION_MESSAGE_BYTES,
   MAX_HISTORY_MESSAGE_COUNT,
@@ -11,6 +12,7 @@ export {
   MAX_MEMORY_PREVIEW_BYTES,
   MAX_U64,
   ProtocolError,
+  RUNTIME_PROFILE_PROTOCOL_VERSION,
   encodeClientCommand,
   parseClientCommand,
   parseGatewayMessage,
@@ -32,8 +34,10 @@ export {
   type RuntimeEvent,
   type RuntimeComponentDescriptor,
   type RuntimeFailure,
+  type RuntimeProfile,
   type RuntimeStatus,
   type VoiceActivity,
+  type VoiceResponseMode,
   type VoiceSessionEvent,
 } from "./protocol.js";
 export { StdioGatewayTransport } from "./stdio.js";

@@ -3,6 +3,37 @@ use crate::{RuntimeError, RuntimeErrorKind, RuntimeStage, SessionId};
 const SPEECH_START_MS: std::ops::RangeInclusive<u64> = 100..=1_000;
 const FINAL_SILENCE_MS: std::ops::RangeInclusive<u64> = 200..=3_000;
 
+/// Which execution posture the operator selected for a runtime.
+///
+/// `Offline` is the default whenever no profile is stated: every component runs
+/// locally and the runtime reports [`PrivacyMode::LocalOnly`]. `Online` is only
+/// ever set explicitly and requires the runtime to name each remote component
+/// truthfully through [`ExecutionLocation::Remote`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum RuntimeProfile {
+    #[default]
+    Offline,
+    Online,
+}
+
+impl RuntimeProfile {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Offline => "offline",
+            Self::Online => "online",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "offline" => Some(Self::Offline),
+            "online" => Some(Self::Online),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum PrivacyMode {
@@ -11,11 +42,32 @@ pub enum PrivacyMode {
     Cloud,
 }
 
+impl PrivacyMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "local_only" => Some(Self::LocalOnly),
+            "hybrid" => Some(Self::Hybrid),
+            "cloud" => Some(Self::Cloud),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ExecutionLocation {
     Local,
     Remote,
+}
+
+impl ExecutionLocation {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "local" => Some(Self::Local),
+            "remote" => Some(Self::Remote),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

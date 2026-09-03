@@ -14,11 +14,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use conversation_model_adapters::{
-    AdapterError, AdapterFuture, AudioFrame, CaptureEvent, GenerationLanguageModel,
-    GenerationLanguageRequest, GenerationTextDelta, MockContinuousAudioOutput,
-    MockVoiceCaptureControl, PcmFormat, PcmSampleFormat, RecognitionEvent, RecognitionHypothesis,
-    StreamingSpeechRequest, StreamingSpeechSynthesizer, VoiceInput, VoiceInputEvent,
-    VoiceIoFactory, VoiceIoSession,
+    AdapterError, AdapterFuture, AudioFrame, CaptureEvent, DiarizationResult,
+    GenerationLanguageModel, GenerationLanguageRequest, GenerationTextDelta, MeetingAudioWindows,
+    MockContinuousAudioOutput, MockVoiceCaptureControl, PcmFormat, PcmSampleFormat,
+    RecognitionEvent, RecognitionHypothesis, StreamingSpeechRequest, StreamingSpeechSynthesizer,
+    TranscriptionDiarizer, VoiceInput, VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
 };
 use conversation_protocol::{
     ComponentDescriptor, ComponentKind, ConversationMode, ExecutionLocation, GenerationId,
@@ -26,10 +26,11 @@ use conversation_protocol::{
     RuntimeStage, SessionId, TurnId, UtteranceId, VoiceSessionEvent, VoiceSessionPolicy,
 };
 use conversation_runtime::{
-    read_session_recording, resolve_recording_handle, ConversationContext,
-    ConversationQualityController, RecordedChunk, RecordingSettings, SessionRecorder,
-    VoiceSessionAdapters, VoiceSessionRuntime, MAX_RECORDING_GAPS,
+    read_session_recording, reconcile_recording, resolve_recording_handle, ConversationContext,
+    ConversationQualityController, RecordedChunk, RecordingSettings, RecordingSinkFault,
+    SessionRecorder, VoiceSessionAdapters, VoiceSessionRuntime, MAX_RECORDING_GAPS,
 };
+use conversation_runtime_gateway::GatewaySession;
 use tempfile::TempDir;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
@@ -41,6 +42,57 @@ const FAKE_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabb
 
 /// A byte pattern no encryption can leave intact. Every plaintext assertion searches for it.
 const PLAINTEXT_MARKER: &[u8] = b"PLAINTEXTMEETINGAUDIOMARKER01234";
+
+fn unused_text_runtime() -> conversation_runtime::TextTurnRuntime {
+    conversation_runtime::TextTurnRuntime::new(
+        ConversationContext::new(ConversationQualityController::new(
+            PersonaProfile::default(),
+            ResponseControls::default(),
+            ConversationMode::DirectAnswer,
+        )),
+        Arc::new(FailingLanguageModel),
+    )
+}
+
+fn gateway_status() -> conversation_protocol::RuntimeStatus {
+    conversation_protocol::RuntimeStatus {
+        profile: "test".to_owned(),
+        transport: "stdio".to_owned(),
+        privacy_mode: "local_only".to_owned(),
+        language_location: "local".to_owned(),
+        model_id: "test".to_owned(),
+        memory_enabled: false,
+        memory_location: None,
+        telemetry_enabled: false,
+        capabilities: vec!["text".to_owned()],
+        components: Vec::new(),
+        last_context_seed_operation_id: None,
+    }
+}
+
+fn finalized_recording(
+    settings: &RecordingSettings,
+    session_id: SessionId,
+    sequence: u64,
+) -> conversation_runtime::RecordingSummary {
+    let mut recorder = SessionRecorder::start(settings, session_id).expect("recorder starts");
+    recorder
+        .record_frame(&marker_frame(sequence))
+        .expect("frame is recorded");
+    recorder.finalize().expect("recording finalizes")
+}
+
+struct NeverCalledDiarizer;
+
+impl TranscriptionDiarizer for NeverCalledDiarizer {
+    fn diarize<'a>(
+        &'a self,
+        _windows: MeetingAudioWindows,
+        _cancellation: CancellationToken,
+    ) -> AdapterFuture<'a, DiarizationResult> {
+        Box::pin(async { Err(AdapterError::new("cross-session header must reject first")) })
+    }
+}
 
 #[test]
 fn capture_frames_are_appended_as_encrypted_chunks_with_a_per_session_nonce_sequence() {
@@ -436,6 +488,110 @@ async fn a_recording_format_failure_keeps_the_meeting_alive_and_marks_the_summar
             .any(|gap| gap.reason == "recording_failed"),
         "the final summary must state that capture stopped before the meeting did: {summary:?}"
     );
+}
+
+#[tokio::test]
+async fn a_recording_sink_write_or_flush_failure_keeps_capture_alive_and_marks_the_summary_incomplete(
+) {
+    for fault in [RecordingSinkFault::Write, RecordingSinkFault::Flush] {
+        let key_env = match fault {
+            RecordingSinkFault::Write => "CONVERSATION_TEST_RECORDING_KEY_SINK_WRITE",
+            RecordingSinkFault::Flush => "CONVERSATION_TEST_RECORDING_KEY_SINK_FLUSH",
+        };
+        set_fake_key(key_env);
+        let directory = TempDir::new().expect("temporary recording directory");
+        let settings = RecordingSettings::new(directory.path(), key_env)
+            .expect("recording settings")
+            .with_test_sink_fault(fault);
+        let recorder = Arc::new(Mutex::new(
+            SessionRecorder::start(&settings, SessionId::new(1)).expect("recorder starts"),
+        ));
+
+        // The first append reaches the real encrypted-sink write/flush boundary and fails there.
+        // The later capture events must still run until normal session shutdown, rather than
+        // turning this local recording loss into `NewSession`.
+        let events = run_voice_session(
+            vec![
+                Step::Emit(Ok(capture_frame(1))),
+                Step::Sleep(Duration::from_millis(60)),
+                Step::Emit(Ok(capture_frame(2))),
+                Step::Sleep(Duration::from_millis(180)),
+            ],
+            Arc::clone(&recorder),
+        )
+        .await;
+
+        assert!(
+            matches!(events.last(), Some(VoiceSessionEvent::SessionEnded { .. })),
+            "{fault:?} sink failure must leave capture running to normal shutdown: {events:?}"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            VoiceSessionEvent::SessionFailed {
+                recovery: RecoveryDisposition::ContinueSession,
+                ..
+            }
+        )));
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                VoiceSessionEvent::SessionFailed {
+                    recovery: RecoveryDisposition::NewSession,
+                    ..
+                }
+            )),
+            "{fault:?} sink failure must never replace the live session: {events:?}"
+        );
+
+        let summary = recorder
+            .lock()
+            .await
+            .finalize()
+            .expect("partial recording finalizes honestly");
+        assert!(
+            summary
+                .gaps
+                .iter()
+                .any(|gap| gap.reason == "recording_failed"),
+            "{fault:?} is retained in the final recording summary: {summary:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn production_allocated_gateway_sessions_reject_each_others_recording_handles() {
+    let key_env = "CONVERSATION_TEST_RECORDING_KEY_PRODUCTION_SESSION_IDS";
+    set_fake_key(key_env);
+    let directory = TempDir::new().expect("temporary recording directory");
+    let settings = RecordingSettings::new(directory.path(), key_env).expect("recording settings");
+
+    // This integration target links the gateway as a normal dependency, so these two ordinary
+    // constructors exercise the production OS-random allocator rather than a test-injected id.
+    let first = GatewaySession::new(unused_text_runtime(), gateway_status());
+    let second = GatewaySession::new(unused_text_runtime(), gateway_status());
+    assert_ne!(first.session_id(), second.session_id());
+    assert_ne!(first.session_id().get(), 0);
+    assert_ne!(second.session_id().get(), 0);
+
+    let first_summary = finalized_recording(&settings, first.session_id(), 1);
+    let second_summary = finalized_recording(&settings, second.session_id(), 2);
+    let diarizer: Arc<dyn TranscriptionDiarizer> = Arc::new(NeverCalledDiarizer);
+
+    for (owner, foreign) in [
+        (&first, &second_summary.recording_handle),
+        (&second, &first_summary.recording_handle),
+    ] {
+        let error = reconcile_recording(
+            &settings,
+            owner.session_id(),
+            foreign,
+            Arc::clone(&diarizer),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("a known handle from another live gateway session is rejected");
+        assert_eq!(error.kind(), RuntimeErrorKind::InvalidState);
+    }
 }
 
 #[tokio::test]

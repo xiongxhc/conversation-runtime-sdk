@@ -42,10 +42,14 @@ MAX_EMBEDDING_FRAMES = 2_048
 AMBIGUITY_RATIO = 0.8
 #: k-means is run to a fixed iteration count so one recording always clusters the same way.
 KMEANS_ITERATIONS = 50
-#: Mean absolute PCM amplitude below this level is treated as non-speech. This deliberately
-#: inexpensive VAD runs before the SpeechBrain encoder so silence and steady background noise
-#: cannot become speaker embeddings. Calibration against real meeting audio remains human-gated.
-SPEECH_ACTIVITY_THRESHOLD = 256
+#: The deterministic VAD is deliberately before the speaker embedder. It rejects an energetic
+#: signal unless it also has voice-like envelope variation and is neither DC nor a single steady
+#: spectral line. It is a conservative local guard, not identity inference or a model download.
+VAD_RMS_THRESHOLD = 256
+VAD_MIN_ACTIVE_BLOCK_RATIO = 0.6
+VAD_MIN_ENVELOPE_VARIATION = 0.08
+VAD_MAX_DC_RATIO = 0.35
+VAD_MAX_TONAL_PEAK_RATIO = 0.45
 
 Embedder = Callable[[list[bytes]], Sequence[Sequence[float]]]
 
@@ -139,7 +143,7 @@ class DiarizationPipeline:
         speech_frames = [
             (started_at_ms + index * frame_ms, frame)
             for index, frame in enumerate(frames)
-            if _contains_speech(frame)
+            if _contains_speech(frame, self._sample_rate_hz, self._channels)
         ]
         if not speech_frames:
             return
@@ -172,6 +176,49 @@ class DiarizationPipeline:
                 raise protocol.ProtocolError("audio_unsupported")
             self._frames = merged
             self._reduced = True
+
+
+def _contains_speech(frame: bytes, sample_rate_hz: int, channels: int) -> bool:
+    """Conservative deterministic VAD for the local embedding boundary.
+
+    Energy alone calls a DC offset, a sine tone, or stationary noise speech. This compact
+    classifier first rejects those non-speech shapes, then requires sustained active 20 ms
+    blocks with a changing envelope. It is deterministic and entirely local so tests do not
+    need SpeechBrain, torch, a checkpoint, or a network connection.
+    """
+    samples = numpy.frombuffer(frame, dtype="<i2").astype(numpy.float64)
+    if samples.size < channels:
+        return False
+    samples = samples[: samples.size - samples.size % channels].reshape(-1, channels).mean(axis=1)
+    absolute_mean = float(numpy.mean(numpy.abs(samples)))
+    if absolute_mean == 0.0:
+        return False
+    dc_ratio = abs(float(numpy.mean(samples))) / absolute_mean
+    if dc_ratio > VAD_MAX_DC_RATIO:
+        return False
+
+    centered = samples - numpy.mean(samples)
+    if float(numpy.sqrt(numpy.mean(centered * centered))) < VAD_RMS_THRESHOLD:
+        return False
+
+    block_samples = max(1, sample_rate_hz // 50)
+    blocks = centered[: centered.size - centered.size % block_samples].reshape(-1, block_samples)
+    if blocks.size == 0:
+        return False
+    envelope = numpy.sqrt(numpy.mean(blocks * blocks, axis=1))
+    if float(numpy.mean(envelope > VAD_RMS_THRESHOLD)) < VAD_MIN_ACTIVE_BLOCK_RATIO:
+        return False
+    envelope_mean = float(numpy.mean(envelope))
+    if envelope_mean == 0.0 or float(numpy.std(envelope)) / envelope_mean < VAD_MIN_ENVELOPE_VARIATION:
+        return False
+
+    windowed = centered * numpy.hanning(centered.size)
+    power = numpy.abs(numpy.fft.rfft(windowed)) ** 2
+    non_dc_power = power[1:]
+    total_power = float(numpy.sum(non_dc_power))
+    if total_power == 0.0:
+        return False
+    return float(numpy.max(non_dc_power)) / total_power < VAD_MAX_TONAL_PEAK_RATIO
 
 
 def cluster_embeddings(

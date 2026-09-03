@@ -101,6 +101,19 @@ const KEY_ID_DOMAIN: &[u8] = b"conversation-runtime/session-recording/key-id/v1\
 pub struct RecordingSettings {
     directory: PathBuf,
     key_env: String,
+    #[cfg(feature = "recording-test-support")]
+    sink_fault: Option<RecordingSinkFault>,
+}
+
+/// The encrypted sink operation an integration test can make fail once.
+///
+/// This exists behind `recording-test-support`, which the gateway enables only for its test
+/// target. It is intentionally not a runtime configuration option.
+#[cfg(feature = "recording-test-support")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecordingSinkFault {
+    Write,
+    Flush,
 }
 
 impl RecordingSettings {
@@ -118,7 +131,12 @@ impl RecordingSettings {
                 "recording key variable name is not a valid environment name",
             ));
         }
-        Ok(Self { directory, key_env })
+        Ok(Self {
+            directory,
+            key_env,
+            #[cfg(feature = "recording-test-support")]
+            sink_fault: None,
+        })
     }
 
     pub fn directory(&self) -> &Path {
@@ -127,6 +145,68 @@ impl RecordingSettings {
 
     pub fn key_env(&self) -> &str {
         &self.key_env
+    }
+
+    /// Makes the next encrypted chunk write or flush fail in an integration test.
+    #[cfg(feature = "recording-test-support")]
+    pub fn with_test_sink_fault(mut self, fault: RecordingSinkFault) -> Self {
+        self.sink_fault = Some(fault);
+        self
+    }
+}
+
+trait RecordingSink: Send {
+    fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()>;
+    fn flush(&mut self) -> std::io::Result<()>;
+    fn sync_all(&mut self) -> std::io::Result<()>;
+}
+
+impl RecordingSink for File {
+    fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        Write::write_all(self, bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Write::flush(self)
+    }
+
+    fn sync_all(&mut self) -> std::io::Result<()> {
+        File::sync_all(self)
+    }
+}
+
+#[cfg(feature = "recording-test-support")]
+struct FaultingRecordingSink {
+    file: File,
+    fault: RecordingSinkFault,
+    faulted: bool,
+}
+
+#[cfg(feature = "recording-test-support")]
+impl FaultingRecordingSink {
+    fn fail_once(&mut self, operation: RecordingSinkFault) -> std::io::Result<()> {
+        if !self.faulted && self.fault == operation {
+            self.faulted = true;
+            return Err(std::io::Error::other("test recording sink fault"));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "recording-test-support")]
+impl RecordingSink for FaultingRecordingSink {
+    fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.fail_once(RecordingSinkFault::Write)?;
+        Write::write_all(&mut self.file, bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.fail_once(RecordingSinkFault::Flush)?;
+        Write::flush(&mut self.file)
+    }
+
+    fn sync_all(&mut self) -> std::io::Result<()> {
+        self.file.sync_all()
     }
 }
 
@@ -275,7 +355,7 @@ pub struct SessionRecorder {
     path: PathBuf,
     key: RecordingKey,
     header: [u8; HEADER_LEN],
-    file: Option<File>,
+    file: Option<Box<dyn RecordingSink>>,
     counter: u32,
     started: Instant,
     format: Option<PcmFormat>,
@@ -344,9 +424,24 @@ impl SessionRecorder {
             .write(true)
             .open(&path)
             .map_err(|_| adapter_error("recording file could not be created"))?;
-        file.write_all(&header)
-            .and_then(|()| file.flush())
+        Write::write_all(&mut file, &header)
+            .and_then(|()| Write::flush(&mut file))
             .map_err(|_| adapter_error("recording header could not be written"))?;
+
+        let file: Box<dyn RecordingSink> = {
+            #[cfg(feature = "recording-test-support")]
+            if let Some(fault) = settings.sink_fault {
+                Box::new(FaultingRecordingSink {
+                    file,
+                    fault,
+                    faulted: false,
+                })
+            } else {
+                Box::new(file)
+            }
+            #[cfg(not(feature = "recording-test-support"))]
+            Box::new(file)
+        };
 
         Ok(Self {
             session_id,

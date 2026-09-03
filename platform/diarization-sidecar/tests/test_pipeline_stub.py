@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import inspect
 import math
+import struct
 import sys
 
 import pytest
@@ -56,7 +57,7 @@ def build(embeddings: list[list[float]], max_speakers: int = 12) -> tuple[pipeli
 
 
 def audio(seconds: int) -> bytes:
-    return b"\x01\x02" * (SAMPLE_RATE_HZ * seconds)
+    return speech(seconds)
 
 
 def silence(seconds: int) -> bytes:
@@ -64,11 +65,40 @@ def silence(seconds: int) -> bytes:
 
 
 def background(seconds: int) -> bytes:
-    return b"\x01\x00" * (SAMPLE_RATE_HZ * seconds)
+    # Loud, stationary seeded noise: above the RMS threshold but not speech.
+    state = 7
+    samples: list[int] = []
+    for _ in range(SAMPLE_RATE_HZ * seconds):
+        state = (state * 1_103_515_245 + 12_345) & 0x7FFFFFFF
+        samples.append((state % 12_001) - 6_000)
+    return struct.pack(f"<{len(samples)}h", *samples)
+
+
+def tone(seconds: int) -> bytes:
+    samples = [
+        int(8_000 * math.sin(2.0 * math.pi * 440 * index / SAMPLE_RATE_HZ))
+        for index in range(SAMPLE_RATE_HZ * seconds)
+    ]
+    return struct.pack(f"<{len(samples)}h", *samples)
+
+
+def dc(seconds: int) -> bytes:
+    return struct.pack("<h", 12_000) * (SAMPLE_RATE_HZ * seconds)
 
 
 def speech(seconds: int) -> bytes:
-    return b"\x00\x40" * (SAMPLE_RATE_HZ * seconds)
+    # Deterministic voiced/unvoiced-like modulation with changing pitch and envelope. This is
+    # intentionally unlike a constant DC fixture or a pure tone, so the test holds the VAD's
+    # speech-versus-background contract rather than an energy threshold.
+    samples = []
+    for index in range(SAMPLE_RATE_HZ * seconds):
+        block = index // (SAMPLE_RATE_HZ // 20)
+        frequency = 130 + (block % 5) * 37
+        envelope = 2_000 + (block % 7) * 1_200
+        carrier = math.sin(2.0 * math.pi * frequency * index / SAMPLE_RATE_HZ)
+        harmonic = 0.35 * math.sin(2.0 * math.pi * (frequency * 2.13) * index / SAMPLE_RATE_HZ)
+        samples.append(int(envelope * (carrier + harmonic)))
+    return struct.pack(f"<{len(samples)}h", *samples)
 
 
 def test_synthetic_embeddings_cluster_deterministically() -> None:
@@ -131,8 +161,9 @@ def test_a_window_that_does_not_continue_the_previous_one_starts_a_new_frame() -
 
 def test_a_partial_frame_is_carried_into_the_next_contiguous_window() -> None:
     diarization, embedder = build([VOICE_A, VOICE_A])
-    diarization.add_window(0, b"\x01\x02" * (SAMPLE_RATE_HZ * 3 // 2))
-    diarization.add_window(1_500, b"\x01\x02" * (SAMPLE_RATE_HZ // 2))
+    samples = audio(2)
+    diarization.add_window(0, samples[: SAMPLE_RATE_HZ * 3])
+    diarization.add_window(1_500, samples[SAMPLE_RATE_HZ * 3 :])
     segments = diarization.finish()
 
     assert embedder.frame_lengths == [FRAME_BYTES, FRAME_BYTES]
@@ -166,11 +197,12 @@ def test_silence_is_omitted_before_the_embedder_can_cluster_it() -> None:
 
 
 def test_background_only_audio_is_omitted_before_the_embedder_can_cluster_it() -> None:
-    diarization, embedder = build([VOICE_A])
-    diarization.add_window(0, background(1))
+    for non_speech in [background(1), tone(1), dc(1)]:
+        diarization, embedder = build([VOICE_A])
+        diarization.add_window(0, non_speech)
 
-    assert diarization.finish() == []
-    assert embedder.frame_lengths == []
+        assert diarization.finish() == []
+        assert embedder.frame_lengths == []
 
 
 def test_speech_separated_by_silence_keeps_its_real_timeline_gap() -> None:

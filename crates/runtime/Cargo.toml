@@ -3,6 +3,11 @@ name = "conversation-runtime"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Exposes a deterministic encrypted-sink fault only to integration tests. Production builds
+# always use the OS file sink directly.
+recording-test-support = []
+
 [dependencies]
 conversation-model-adapters.workspace = true
 conversation-memory.workspace = true

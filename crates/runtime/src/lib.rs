@@ -37,6 +37,8 @@ pub use conversation_quality::{ConversationQualityController, ResolvedConversati
 pub use phrase_chunker::PhraseChunkingConfig;
 pub use recording_reconciliation::{reconcile_recording, MAX_RECONCILIATION_WINDOW_BYTES};
 pub use session_clock::{SessionClock, TurnFinalizationDeadline};
+#[cfg(feature = "recording-test-support")]
+pub use session_recording::RecordingSinkFault;
 pub use session_recording::{
     open_session_recording, read_session_recording, resolve_recording_handle, RecordedChunk,
     RecordedChunks, RecordedSession, RecordingGap, RecordingSettings, RecordingSummary,

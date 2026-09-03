@@ -22,6 +22,8 @@ use conversation_runtime::{
     RecordingSummary, SessionRecorder, TextProcessingRequest, TextTurnEventStream, TextTurnRuntime,
     VoiceSessionAdapters, VoiceSessionEventStream, VoiceSessionRuntime,
 };
+#[cfg(not(test))]
+use ring::rand::{SecureRandom, SystemRandom};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio::task::{JoinError, JoinHandle};
@@ -38,16 +40,20 @@ const EVENT_WRITER_BUFFER_SIZE: usize = 1;
 const WRITER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 const INVALID_COMMAND_REQUEST_ID: &str = "invalid-command";
 #[cfg(not(test))]
-static NEXT_GATEWAY_SESSION_ID: AtomicU64 = AtomicU64::new(1);
-
-#[cfg(not(test))]
 fn next_gateway_session_id() -> SessionId {
-    let session_id = NEXT_GATEWAY_SESSION_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            current.checked_add(1)
-        })
-        .expect("gateway session identifier space exhausted");
-    SessionId::new(session_id)
+    // This provenance boundary also guards a recording handle. A process-local counter would
+    // repeat after a restart, so mint it from the operating system instead. Zero is not a valid
+    // session identity; retrying that one-in-2^64 draw preserves the existing wire type.
+    let random = SystemRandom::new();
+    loop {
+        let mut bytes = [0_u8; 8];
+        random
+            .fill(&mut bytes)
+            .expect("gateway session randomness was unavailable");
+        if let Some(session_id) = std::num::NonZeroU64::new(u64::from_be_bytes(bytes)) {
+            return SessionId::new(session_id.get());
+        }
+    }
 }
 
 // The internal command-suite fixtures predate per-connection identities and deliberately use
@@ -159,6 +165,11 @@ impl WriterLanes {
 impl GatewaySession {
     pub fn new(runtime: TextTurnRuntime, status: RuntimeStatus) -> Self {
         Self::with_session_id(runtime, status, next_gateway_session_id())
+    }
+
+    /// The live gateway-session identity stamped into its recording headers and commands.
+    pub const fn session_id(&self) -> SessionId {
+        self.session_id
     }
 
     fn with_session_id(

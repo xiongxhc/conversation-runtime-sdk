@@ -278,9 +278,12 @@ pub struct SessionRecorder {
     started: Instant,
     format: Option<PcmFormat>,
     gaps: Vec<RecordingGap>,
-    /// When the open gap started, in wall-clock terms, so closing it can extend the media
-    /// timeline by however long the bridge was actually silent.
-    open_gap: Option<Instant>,
+    /// The open gap's `at_ms`, the very value written into its chunk. Charging the timeline
+    /// with the difference of the two recorded timestamps — rather than with a separate
+    /// `Instant` measured a file write later — is what makes the file the single source of
+    /// truth for the media timeline: a reader that reconstructs the timeline from the chunks
+    /// gets exactly the timeline the summary reports, not one a millisecond beside it.
+    open_gap_at_ms: Option<u64>,
     /// The length of the media timeline: the audio recorded so far plus the gaps between it.
     /// The recorder's own lifetime is deliberately not part of it, so a client that waits
     /// before finalizing is not told the recording grew.
@@ -353,7 +356,7 @@ impl SessionRecorder {
             started: Instant::now(),
             format: None,
             gaps: Vec::new(),
-            open_gap: None,
+            open_gap_at_ms: None,
             media_ms: 0,
             ended: false,
             summary: None,
@@ -390,14 +393,16 @@ impl SessionRecorder {
             None => self.format = Some(format),
         }
         let at_ms = self.elapsed_ms();
-        if let Some(opened_at) = self.open_gap {
+        if let Some(opened_at_ms) = self.open_gap_at_ms {
             self.append(gap_ended_record(at_ms))?;
-            self.open_gap = None;
+            self.open_gap_at_ms = None;
             // A gap between two frames is media the recording does not have, so it occupies its
             // real length on the timeline. A gap before any frame extends nothing: the
             // recording simply had not started.
             if had_media {
-                self.media_ms = self.media_ms.saturating_add(instant_elapsed_ms(opened_at));
+                self.media_ms = self
+                    .media_ms
+                    .saturating_add(at_ms.saturating_sub(opened_at_ms));
             }
             let media_ms = self.media_ms;
             if let Some(gap) = self.gaps.last_mut() {
@@ -420,7 +425,7 @@ impl SessionRecorder {
     /// Records a break in the capture bridge as a gap. The next frame closes it, so the
     /// recording states the silence instead of manufacturing it.
     pub fn record_capture_gap(&mut self) -> Result<(), RuntimeError> {
-        if self.open_gap.is_some() {
+        if self.open_gap_at_ms.is_some() {
             return Ok(());
         }
         if self.gaps.len() >= MAX_RECORDING_GAPS {
@@ -434,7 +439,7 @@ impl SessionRecorder {
         record.push(u8::try_from(reason.len()).expect("gap reasons are short"));
         record.extend_from_slice(reason.as_bytes());
         self.append(record)?;
-        self.open_gap = Some(Instant::now());
+        self.open_gap_at_ms = Some(at_ms);
         self.gaps.push(RecordingGap {
             started_at_ms: self.media_ms,
             ended_at_ms: None,

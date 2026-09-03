@@ -325,6 +325,11 @@ async fn an_answer_larger_than_the_caller_allowed_is_refused() {
         "text processing output exceeded the requested limit"
     );
     assert_no_echo(&format!("{error:?}"));
+    assert_eq!(
+        server.request_count().await,
+        1,
+        "an output-limit failure is not a schema failure and must not retry"
+    );
 }
 
 #[tokio::test]
@@ -518,6 +523,108 @@ async fn process_text_answers_over_the_control_channel_at_version_three() {
 }
 
 #[tokio::test]
+async fn process_text_is_refused_while_a_turn_is_in_flight() {
+    // The first generation blocks, so a turn stays in flight; every later one answers at once,
+    // so without the guard the call would be served rather than merely stall.
+    let language = Arc::new(GatedLanguage::new(valid_output().to_string()));
+    let mut gateway = Gateway::start(GatewaySession::new(
+        TextTurnRuntime::new(test_context(), language.clone()),
+        status(),
+    ))
+    .await;
+
+    gateway
+        .write(
+            r#"{"protocol_version":3,"type":"start_turn","request_id":"turn-1","transcript":"a question"}"#,
+        )
+        .await;
+    gateway
+        .read_until(|message| message.contains(r#""type":"turn_started""#))
+        .await;
+
+    gateway
+        .write(&process_text_frame(3, "pt-turn", "1", 4096))
+        .await;
+    let rejection = gateway
+        .read_until(|message| message.contains(r#""request_id":"pt-turn""#))
+        .await;
+    assert!(
+        rejection.contains(r#""type":"command_rejected""#)
+            && rejection.contains("text processing cannot run while a turn is in flight"),
+        "a batch call must not queue behind a live turn on the control channel: {rejection}"
+    );
+    assert_eq!(
+        language.generations(),
+        1,
+        "the refused call never reached the language model"
+    );
+
+    // The refusal is a state guard: once the turn is done the same call is served. Releasing
+    // here also lets the blocked generation finish rather than leaking into the next test.
+    language.release();
+}
+
+/// A language model whose first generation waits for a release, and whose later generations
+/// answer immediately with one canned reply.
+struct GatedLanguage {
+    answer: String,
+    released: Arc<Notify>,
+    generations: std::sync::atomic::AtomicUsize,
+}
+
+impl GatedLanguage {
+    fn new(answer: String) -> Self {
+        Self {
+            answer,
+            released: Arc::new(Notify::new()),
+            generations: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn generations(&self) -> usize {
+        self.generations.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn release(&self) {
+        self.released.notify_waiters();
+    }
+}
+
+impl GenerationLanguageModel for GatedLanguage {
+    fn stream(
+        &self,
+        request: GenerationLanguageRequest,
+        _cancellation: CancellationToken,
+    ) -> tokio::sync::mpsc::Receiver<
+        Result<
+            conversation_model_adapters::GenerationTextDelta,
+            conversation_model_adapters::AdapterError,
+        >,
+    > {
+        let first = self
+            .generations
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            == 0;
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let released = Arc::clone(&self.released);
+        let answer = self.answer.clone();
+        tokio::spawn(async move {
+            if first {
+                released.notified().await;
+            }
+            let _ = sender
+                .send(Ok(conversation_model_adapters::GenerationTextDelta::new(
+                    request.turn_id(),
+                    request.generation_id(),
+                    answer,
+                )))
+                .await;
+        });
+        receiver
+    }
+}
+
+#[tokio::test]
 async fn a_call_naming_another_session_is_refused() {
     let server = OllamaServer::start([valid_output().to_string()]).await;
     let mut gateway = Gateway::start(session_for(server.endpoint())).await;
@@ -626,6 +733,17 @@ impl Gateway {
 
     async fn write(&mut self, payload: &str) {
         write_frame(&mut self.input, payload).await;
+    }
+
+    /// Reads frames until one satisfies `predicate`, and returns it. Event and control frames
+    /// arrive on separate lanes, so a control answer is not always the next frame.
+    async fn read_until(&mut self, predicate: impl Fn(&str) -> bool) -> String {
+        loop {
+            let message = self.read_message().await;
+            if predicate(&message) {
+                return message;
+            }
+        }
     }
 
     async fn read_message(&mut self) -> String {

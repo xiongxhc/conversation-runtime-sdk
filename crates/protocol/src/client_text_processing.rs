@@ -5,12 +5,13 @@
 //! must fit the frame, and the warnings must come from a closed list. A model's own account of
 //! why it failed is unbounded text that may quote the input, so it never reaches the wire.
 
-use crate::ClientWireError;
+use crate::{ClientWireError, MAX_CONVERSATION_MESSAGE_BYTES};
 
 /// The most instruction text one call may carry.
 pub const MAX_CLIENT_PROCESSING_INSTRUCTIONS_BYTES: usize = 4 * 1024;
-/// The most input text one call may carry.
-pub const MAX_CLIENT_PROCESSING_INPUT_BYTES: usize = 16 * 1024;
+/// The most input text one call may carry. The same constant the conversation layer bounds a
+/// single message by, aliased rather than restated so the two cannot drift apart.
+pub const MAX_CLIENT_PROCESSING_INPUT_BYTES: usize = MAX_CONVERSATION_MESSAGE_BYTES;
 /// The most schema text one call may carry, once canonicalised.
 pub const MAX_CLIENT_PROCESSING_SCHEMA_BYTES: usize = 8 * 1024;
 /// The most output one answer may carry. The output travels as a JSON value rather than as a

@@ -925,6 +925,28 @@ impl GatewaySession {
                     )
                     .map_err(CommandFailure::response);
                 }
+                // The call is answered inline on the control channel, so anything queued behind
+                // it waits — including an `interrupt_turn` that barge-in depends on. A batch
+                // call is two provider round trips at worst, which is far longer than the
+                // interrupt budget, so it is refused while anything live could need that
+                // channel. Post-meeting synthesis, which is what this contract is for, runs
+                // when neither is true.
+                if voice.active.is_some() {
+                    return send_rejection(
+                        normal,
+                        &request_id,
+                        command_error("text processing cannot run while a voice session is active"),
+                    )
+                    .map_err(CommandFailure::response);
+                }
+                if active.is_some() {
+                    return send_rejection(
+                        normal,
+                        &request_id,
+                        command_error("text processing cannot run while a turn is in flight"),
+                    )
+                    .map_err(CommandFailure::response);
+                }
                 let request = match TextProcessingRequest::new(
                     instructions,
                     input,
@@ -943,7 +965,8 @@ impl GatewaySession {
                 };
                 // The call runs on the session's own language model, so it runs in the profile
                 // the session pinned at start. It creates no turn and touches no conversation
-                // state, so it needs no interlock with an active turn or voice session.
+                // state; the guards above are about the control channel it occupies, not about
+                // state it could disturb.
                 let processed = process_text(
                     self.runtime.language_model(),
                     request,
@@ -6832,6 +6855,77 @@ mod tests {
                 )
             })
         }
+    }
+
+    /// The batch text-processing call is answered inline on the control channel, so it must not
+    /// run while a voice session could need that channel for an interrupt. This test lives here
+    /// rather than in `tests/text_processing.rs` because `GatewayVoiceAdapters` is crate-private.
+    #[tokio::test]
+    async fn process_text_is_refused_while_a_voice_session_is_active() {
+        let (input, input_receiver) = mpsc::channel(8);
+        let processing = Arc::new(MockGenerationLanguageModel::new([
+            r#"{"decisions":[]}"#.to_owned()
+        ]));
+        let session = session_with_voice_and_runtime(
+            conversation_runtime::TextTurnRuntime::new(test_context(), processing.clone()),
+            input_receiver,
+            Arc::new(MockGenerationLanguageModel::new(["fixture reply"])),
+            no_speech_frames(),
+        );
+        let mut gateway = InMemoryGateway::start(session).await;
+        let command = |request_id: &str| {
+            format!(
+                r#"{{"protocol_version":3,"type":"process_text","request_id":"{request_id}","session_id":"1","instructions":"summarise the meeting","input":"we agreed to ship","output_schema":{{"type":"object"}},"max_output_bytes":4096}}"#
+            )
+        };
+
+        gateway
+            .write(r#"{"protocol_version":3,"type":"start_voice_session","request_id":"voice-1"}"#)
+            .await;
+        assert_accepted_message(&gateway.read_message().await, "voice-1");
+        assert!(gateway
+            .read_message()
+            .await
+            .contains(r#""type":"voice_session_started""#));
+
+        gateway.write(&command("pt-voice")).await;
+        let refused = gateway
+            .read_until(|message| message.contains(r#""request_id":"pt-voice""#))
+            .await;
+        let rejection = refused
+            .last()
+            .expect("read_until returns the frame it matched");
+        assert_rejected_message(rejection, "pt-voice", "invalid_state");
+        assert!(
+            rejection.contains("text processing cannot run while a voice session is active"),
+            "the rejection names its own cause: {rejection}"
+        );
+        assert!(
+            processing.requests().is_empty(),
+            "a refused call never reaches the language model"
+        );
+
+        // A state guard, not a refusal: once the session has stopped the same call is served.
+        gateway
+            .write(r#"{"protocol_version":3,"type":"stop_voice_session","request_id":"stop-1"}"#)
+            .await;
+        gateway
+            .read_until(|message| message.contains(r#""request_id":"stop-1""#))
+            .await;
+        gateway.write(&command("pt-after")).await;
+        let served = gateway
+            .read_until(|message| message.contains(r#""type":"text_processed""#))
+            .await;
+        let processed: serde_json::Value =
+            serde_json::from_str(served.last().expect("read_until returns its match")).unwrap();
+        assert_eq!(processed["request_id"], "pt-after");
+        assert_eq!(
+            processed["processed"],
+            serde_json::json!({"output": {"decisions": []}, "warnings": []})
+        );
+        assert_eq!(processing.requests().len(), 1);
+
+        drop(input);
     }
 
     #[tokio::test]

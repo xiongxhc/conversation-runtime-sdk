@@ -36,7 +36,13 @@ use crate::diarization::{
 };
 use crate::{AdapterError, AdapterFuture, PcmFormat, PcmSampleFormat};
 
-const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+/// The largest answer that can still become a result.
+///
+/// The result budget is 1024 segments and 128 KiB of text; with the JSON a provider wraps them
+/// in, and its own speaker labels, an answer beyond this cannot produce a result the runtime
+/// would accept, so buffering more of it is work spent on the way to a refusal. It matches the
+/// client frame limit, which is the same reasoning applied one layer out.
+const MAX_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_MODEL_BYTES: usize = 256;
 const MAX_LANGUAGE_BYTES: usize = 64;
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -207,13 +213,13 @@ impl OpenAiTranscriptionDiarizer {
             return Err(response_limit());
         }
 
+        // One timeout over the whole body, and the cap applied as the chunks arrive. A
+        // declared length is only an early refusal: a chunked response declares none, so a
+        // provider that never sends one — or lies about the one it does — must not be able to
+        // make the runtime resident-buffer past the cap before it is refused.
         let body = self
-            .await_provider(response.bytes(), cancellation)
-            .await?
-            .map_err(|_| transport_failed())?;
-        if body.len() > MAX_RESPONSE_BYTES {
-            return Err(response_limit());
-        }
+            .await_provider(read_bounded_body(response), cancellation)
+            .await??;
         serde_json::from_slice::<ProviderAnswer>(&body).map_err(|_| unsupported_answer())
     }
 
@@ -292,6 +298,19 @@ impl Reconciliation {
         }
         DiarizationResult::new(self.segments, warnings)
     }
+}
+
+/// Reads a response body, refusing it the moment it passes the cap rather than once it has all
+/// arrived. The same shape the streaming adapters use.
+async fn read_bounded_body(mut response: reqwest::Response) -> Result<Vec<u8>, AdapterError> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| transport_failed())? {
+        if chunk.len() > MAX_RESPONSE_BYTES.saturating_sub(body.len()) {
+            return Err(response_limit());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 #[derive(Serialize)]

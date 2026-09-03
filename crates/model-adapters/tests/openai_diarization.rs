@@ -4,6 +4,7 @@
 //! provider is reached, and the credential is a fixed non-secret string.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use conversation_model_adapters::{
@@ -293,6 +294,34 @@ async fn a_dropped_provider_connection_fails_the_whole_reconciliation() {
 }
 
 #[tokio::test]
+async fn a_response_without_a_declared_length_is_capped_as_it_arrives() {
+    set_credential();
+    // Sixteen mebibytes against a half-mebibyte cap, chunk-encoded so no Content-Length is
+    // declared and the pre-check has nothing to look at.
+    const OFFERED_BYTES: usize = 16 * 1024 * 1024;
+    let server = DiarizationServer::start([Reply::Endless {
+        total_bytes: OFFERED_BYTES,
+    }])
+    .await;
+
+    let error = diarize(&server, [window(0)], CancellationToken::new())
+        .await
+        .expect_err("a response past the cap is not an answer");
+
+    assert_eq!(
+        error.message(),
+        "online diarization response exceeded the configured limit",
+        "the cap must fire, not the JSON parser after the whole body landed"
+    );
+    assert!(
+        server.written_bytes() < OFFERED_BYTES,
+        "the adapter must hang up mid-body rather than buffer all {OFFERED_BYTES} bytes; \
+         the provider wrote {}",
+        server.written_bytes()
+    );
+}
+
+#[tokio::test]
 async fn an_answer_larger_than_the_runtime_can_state_is_refused() {
     set_credential();
     let segments = (0..1_025)
@@ -392,7 +421,15 @@ where
 enum Reply {
     Body(String),
     Gated(String),
-    Failure { status: u16, body: String },
+    Failure {
+        status: u16,
+        body: String,
+    },
+    /// A chunked reply that declares no length and keeps sending. The adapter must refuse it
+    /// on the way in rather than after it has all arrived.
+    Endless {
+        total_bytes: usize,
+    },
     Reset,
 }
 
@@ -414,6 +451,8 @@ struct DiarizationServer {
     endpoint: String,
     requests: Arc<Mutex<Vec<RecordedRequest>>>,
     gate: Arc<Notify>,
+    /// How many body bytes the server managed to write before the adapter hung up.
+    written: Arc<AtomicUsize>,
     worker: JoinHandle<()>,
 }
 
@@ -426,8 +465,10 @@ impl DiarizationServer {
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
         let gate = Arc::new(Notify::new());
+        let written = Arc::new(AtomicUsize::new(0));
         let worker_requests = requests.clone();
         let worker_gate = gate.clone();
+        let worker_written = written.clone();
         let replies = Arc::new(Mutex::new(replies.into_iter().collect::<VecDeque<_>>()));
 
         let worker = tokio::spawn(async move {
@@ -437,13 +478,14 @@ impl DiarizationServer {
                 let requests = worker_requests.clone();
                 let replies = replies.clone();
                 let gate = worker_gate.clone();
+                let written = worker_written.clone();
                 connections.push(tokio::spawn(async move {
                     while let Some(request) = read_request(&mut stream).await {
                         requests.lock().await.push(request);
                         let reply = replies.lock().await.pop_front().unwrap_or_else(|| {
                             Reply::body(json!({ "segments": [], "warnings": [] }))
                         });
-                        if !write_reply(&mut stream, reply, &gate).await {
+                        if !write_reply(&mut stream, reply, &gate, &written).await {
                             break;
                         }
                     }
@@ -455,6 +497,7 @@ impl DiarizationServer {
             endpoint,
             requests,
             gate,
+            written,
             worker,
         }
     }
@@ -483,6 +526,10 @@ impl DiarizationServer {
         self.requests.lock().await[index].target.clone()
     }
 
+    fn written_bytes(&self) -> usize {
+        self.written.load(Ordering::SeqCst)
+    }
+
     async fn wait_for_request_count(&self, expected: usize) {
         timeout(Duration::from_secs(5), async {
             while self.request_count().await < expected {
@@ -501,7 +548,12 @@ impl Drop for DiarizationServer {
 }
 
 /// Returns false when the connection must be closed after this reply.
-async fn write_reply(stream: &mut TcpStream, reply: Reply, gate: &Notify) -> bool {
+async fn write_reply(
+    stream: &mut TcpStream,
+    reply: Reply,
+    gate: &Notify,
+    written: &AtomicUsize,
+) -> bool {
     match reply {
         Reply::Body(body) => {
             write_json(stream, 200, &body).await;
@@ -515,6 +567,31 @@ async fn write_reply(stream: &mut TcpStream, reply: Reply, gate: &Notify) -> boo
         Reply::Failure { status, body } => {
             write_json(stream, status, &body).await;
             true
+        }
+        Reply::Endless { total_bytes } => {
+            // No Content-Length at all, which is the case the declared-length pre-check
+            // cannot see.
+            if stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n",
+                )
+                .await
+                .is_err()
+            {
+                return false;
+            }
+            let payload = "x".repeat(64 * 1024);
+            let mut sent = 0;
+            while sent < total_bytes {
+                let frame = format!("{:x}\r\n{payload}\r\n", payload.len());
+                if stream.write_all(frame.as_bytes()).await.is_err() {
+                    break;
+                }
+                sent += payload.len();
+                written.store(sent, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+            }
+            false
         }
         Reply::Reset => false,
     }

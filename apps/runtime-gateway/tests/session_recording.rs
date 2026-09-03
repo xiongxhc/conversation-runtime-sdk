@@ -477,6 +477,83 @@ fn a_gap_before_the_first_frame_does_not_lengthen_the_recording() {
     );
 }
 
+/// The sink's media timeline and the timestamps it writes into the file must state the same
+/// gap, because a consumer can only reconstruct the timeline from the file.
+///
+/// The property is a pure function of the sink: whatever wall-clock length a gap happened to
+/// have, the span the summary charges it must equal the difference of the two `at_ms` values
+/// the chunks themselves carry. It holds by construction only while the summary is computed
+/// *from* those two values. A summary that times the gap separately — with its own `Instant`,
+/// say — agrees with the file whenever both measurements land inside one millisecond, and
+/// disagrees by exactly one when they straddle a tick, so one gap of an arbitrary length is a
+/// coin toss rather than a guard. Measured against a sink that times the gap separately, one
+/// gap after a 150 ms sleep catches it about one time in six: a sleep overshoots its target by
+/// a small, consistent amount, which biases the phase towards agreement.
+///
+/// So the gap's sub-millisecond phase is swept deliberately across the whole range. The
+/// separately timed sink survives gap `i` only if that gap's phase misses the tick, and the
+/// chance of surviving all forty is the product of those misses — below one in 10^15. Under a
+/// sink that reads its own two timestamps, every one of the forty is exact.
+#[test]
+fn a_gap_occupies_exactly_the_span_its_own_chunks_state() {
+    const GAPS: usize = 40;
+
+    let key_env = "CONVERSATION_TEST_RECORDING_KEY_GAP_SPAN";
+    set_fake_key(key_env);
+    let directory = TempDir::new().expect("temporary recording directory");
+    let settings = RecordingSettings::new(directory.path(), key_env).expect("recording settings");
+
+    let mut recorder =
+        SessionRecorder::start(&settings, SessionId::new(1)).expect("recorder starts");
+    recorder
+        .record_frame(&second_of_audio(1))
+        .expect("frame is recorded");
+    for index in 0..GAPS {
+        recorder.record_capture_gap().expect("gap is recorded");
+        spin_for(Duration::from_micros(2_000 + index as u64 * 25));
+        recorder
+            .record_frame(&second_of_audio(index as u64 + 2))
+            .expect("frame is recorded");
+    }
+    let summary = recorder.finalize().expect("recording finalizes");
+
+    let stated = read_session_recording(&summary.encrypted_path, key_env)
+        .expect("recording decrypts")
+        .chunks
+        .iter()
+        .filter_map(|chunk| match chunk {
+            RecordedChunk::GapStarted { at_ms, .. } | RecordedChunk::GapEnded { at_ms } => {
+                Some(*at_ms)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(stated.len(), GAPS * 2, "every gap is opened and closed");
+    assert_eq!(summary.gaps.len(), GAPS);
+
+    let mut stated_total = 0;
+    for (index, gap) in summary.gaps.iter().enumerate() {
+        let ended_at_ms = gap.ended_at_ms.expect("the next frame closed the gap");
+        let charged = ended_at_ms - gap.started_at_ms;
+        let written = stated[index * 2 + 1] - stated[index * 2];
+        assert_eq!(
+            charged, written,
+            "gap {index} is charged {charged} ms on the media timeline while the file states \
+             {written} ms between its own chunks; a consumer that reconstructs the timeline \
+             from the file cannot land where the summary says it will"
+        );
+        stated_total += written;
+    }
+
+    // The same statement about the whole timeline: the duration is the audio the recording
+    // holds plus exactly the spans the file describes, with nothing measured on the side.
+    assert_eq!(
+        summary.duration_ms,
+        (GAPS as u64 + 1) * 1_000 + stated_total,
+        "the recorded audio plus the gaps the file itself states"
+    );
+}
+
 #[test]
 fn a_superseded_or_malformed_header_is_refused_by_design() {
     let key_env = "CONVERSATION_TEST_RECORDING_KEY_HEADER";
@@ -899,6 +976,15 @@ fn capture_frame(sequence: u64) -> VoiceInputEvent {
 
 fn marker_capture_frame(sequence: u64) -> VoiceInputEvent {
     VoiceInputEvent::Capture(CaptureEvent::Frame(marker_frame(sequence)))
+}
+
+/// Busy-waits for `duration`. A sleep cannot do this job: the point is control over the
+/// sub-millisecond phase, and a sleep overshoots its target by an amount it does not report.
+fn spin_for(duration: Duration) {
+    let start = std::time::Instant::now();
+    while start.elapsed() < duration {
+        std::hint::spin_loop();
+    }
 }
 
 fn file_length(path: &Path) -> usize {

@@ -35,7 +35,7 @@ export interface RuntimeTurn {
   readonly events: AsyncIterable<RuntimeEvent>;
 }
 
-export interface VoiceSession<Version extends ClientProtocolVersion = 1 | 2> {
+export interface VoiceSession<Version extends ClientProtocolVersion = ClientProtocolVersion> {
   events(): AsyncIterable<VoiceSessionEventForVersion<Version>>;
   stop(): Promise<void>;
   pauseCapture(): Promise<void>;
@@ -58,7 +58,7 @@ export class CommandRejectedError extends Error {
   }
 }
 
-export class RuntimeClient<Version extends ClientProtocolVersion = 1 | 2> {
+export class RuntimeClient<Version extends ClientProtocolVersion = ClientProtocolVersion> {
   private readonly ready = new Deferred<void>();
   private readonly controls = new Map<string, PendingControl<Version>>();
   private readonly unexpectedFailureListeners = new Set<(error: Error) => void>();
@@ -76,12 +76,24 @@ export class RuntimeClient<Version extends ClientProtocolVersion = 1 | 2> {
 
   private constructor(private readonly transport: RuntimeTransport) {}
 
-  static async connect<Version extends ClientProtocolVersion = 1 | 2>(
+  static connect(transport: RuntimeTransport): Promise<RuntimeClient<ClientProtocolVersion>>;
+  static connect<Version extends ClientProtocolVersion>(
     transport: RuntimeTransport,
+    expectedProtocolVersion: Version,
+  ): Promise<RuntimeClient<Version>>;
+  static async connect<Version extends ClientProtocolVersion = ClientProtocolVersion>(
+    transport: RuntimeTransport,
+    expectedProtocolVersion?: Version,
   ): Promise<RuntimeClient<Version>> {
     const client = new RuntimeClient<Version>(transport);
     void client.consumeMessages();
     await client.ready.promise;
+    if (expectedProtocolVersion !== undefined && client.protocolVersion !== expectedProtocolVersion) {
+      await client.close();
+      throw new Error(
+        `gateway negotiated protocol version ${client.protocolVersion} but expected ${expectedProtocolVersion}`,
+      );
+    }
     return client;
   }
 

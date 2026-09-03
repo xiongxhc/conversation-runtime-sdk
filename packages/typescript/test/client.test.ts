@@ -186,6 +186,15 @@ test("voice transcript finals retain exact legacy and version-three event shapes
   await client.close();
 });
 
+test("rejects a requested protocol version that does not match ready", async () => {
+  const transport = new InMemoryTransport();
+  const connecting = RuntimeClient.connect(transport, 1);
+  transport.push(readyV3());
+
+  await assert.rejects(connecting, /gateway negotiated protocol version 3 but expected 1/);
+  assert.equal(transport.closed, true);
+});
+
 test("rejects a non-ready frame before the authoritative ready message", async () => {
   const transport = new InMemoryTransport();
   const connecting = RuntimeClient.connect(transport);
@@ -1266,7 +1275,7 @@ class AsyncChannel<T> implements AsyncIterable<T> {
 
 async function connectedClient(): Promise<{ client: RuntimeClient; transport: InMemoryTransport }> {
   const transport = new InMemoryTransport();
-  const connecting = RuntimeClient.connect(transport);
+  const connecting = RuntimeClient.connect(transport, 1);
   transport.push(ready());
   return { client: await connecting, transport };
 }
@@ -1275,7 +1284,7 @@ async function connectedV2Client(
   capabilities: RuntimeStatus["capabilities"] = ["text", "conversation_context_seed"],
 ): Promise<{ client: RuntimeClient; transport: InMemoryTransport }> {
   const transport = new InMemoryTransport();
-  const connecting = RuntimeClient.connect(transport);
+  const connecting = RuntimeClient.connect(transport, 2);
   transport.push(readyV2(capabilities));
   return { client: await connecting, transport };
 }
@@ -1633,7 +1642,7 @@ function readyV3(): unknown {
 
 async function connectedV3Client(): Promise<{ client: RuntimeClient; transport: InMemoryTransport }> {
   const transport = new InMemoryTransport();
-  const connecting = RuntimeClient.connect(transport);
+  const connecting = RuntimeClient.connect(transport, 3);
   transport.push(readyV3());
   return { client: await connecting, transport };
 }

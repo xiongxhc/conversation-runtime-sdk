@@ -8,7 +8,7 @@ function acceptsBigint(_value: bigint): void {}
 declare const transport: RuntimeTransport;
 
 async function legacyFinalTurnIdIsNonNull(): Promise<void> {
-  const session = await (await RuntimeClient.connect(transport)).startVoiceSession();
+  const session = await (await RuntimeClient.connect(transport, 1)).startVoiceSession();
   for await (const event of session.events()) {
     if (event.type === "voice_transcript_final") {
       acceptsBigint(event.turnId);
@@ -17,7 +17,7 @@ async function legacyFinalTurnIdIsNonNull(): Promise<void> {
 }
 
 async function versionThreeFinalTurnIdRequiresNullHandling(): Promise<void> {
-  const session = await (await RuntimeClient.connect<3>(transport)).startVoiceSession();
+  const session = await (await RuntimeClient.connect(transport, 3)).startVoiceSession();
   for await (const event of session.events()) {
     if (event.type === "voice_transcript_final") {
       // @ts-expect-error v3 external-gate finals may not have a turn yet.
@@ -29,7 +29,18 @@ async function versionThreeFinalTurnIdRequiresNullHandling(): Promise<void> {
   }
 }
 
+async function unpinnedFinalTurnIdRequiresNullHandling(): Promise<void> {
+  const session = await (await RuntimeClient.connect(transport)).startVoiceSession();
+  for await (const event of session.events()) {
+    if (event.type === "voice_transcript_final") {
+      // @ts-expect-error an unpinned client may negotiate v3.
+      acceptsBigint(event.turnId);
+    }
+  }
+}
+
 test("version-typed voice sessions retain final-turn nullability", () => {
   assert.ok(legacyFinalTurnIdIsNonNull);
   assert.ok(versionThreeFinalTurnIdRequiresNullHandling);
+  assert.ok(unpinnedFinalTurnIdRequiresNullHandling);
 });

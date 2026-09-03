@@ -42,6 +42,10 @@ MAX_EMBEDDING_FRAMES = 2_048
 AMBIGUITY_RATIO = 0.8
 #: k-means is run to a fixed iteration count so one recording always clusters the same way.
 KMEANS_ITERATIONS = 50
+#: Mean absolute PCM amplitude below this level is treated as non-speech. This deliberately
+#: inexpensive VAD runs before the SpeechBrain encoder so silence and steady background noise
+#: cannot become speaker embeddings. Calibration against real meeting audio remains human-gated.
+SPEECH_ACTIVITY_THRESHOLD = 256
 
 Embedder = Callable[[list[bytes]], Sequence[Sequence[float]]]
 
@@ -132,11 +136,17 @@ class DiarizationPipeline:
             self._append(started_at_ms, [remainder], duration_ms)
 
     def _append(self, started_at_ms: int, frames: list[bytes], frame_ms: int) -> None:
-        embeddings = self._embed(frames)
-        if len(embeddings) != len(frames):
+        speech_frames = [
+            (started_at_ms + index * frame_ms, frame)
+            for index, frame in enumerate(frames)
+            if _contains_speech(frame)
+        ]
+        if not speech_frames:
+            return
+        embeddings = self._embed([frame for _, frame in speech_frames])
+        if len(embeddings) != len(speech_frames):
             raise protocol.ProtocolError("internal_error")
-        for index, embedding in enumerate(embeddings):
-            start = started_at_ms + index * frame_ms
+        for (start, _), embedding in zip(speech_frames, embeddings):
             self._frames.append((start, start + frame_ms, embedding))
 
     def _reduce_to_budget(self) -> None:
@@ -293,6 +303,12 @@ def _kmeans(points: numpy.ndarray, count: int) -> numpy.ndarray:
             if len(members):
                 centroids[cluster] = members.mean(axis=0)
     return labels
+
+
+def _contains_speech(frame: bytes) -> bool:
+    """A deterministic PCM energy VAD for the bounded frames sent to the encoder."""
+    samples = numpy.frombuffer(frame, dtype="<i2").astype(numpy.int32)
+    return float(numpy.abs(samples).mean()) >= SPEECH_ACTIVITY_THRESHOLD
 
 
 def _farthest_first(points: numpy.ndarray, count: int) -> list[int]:

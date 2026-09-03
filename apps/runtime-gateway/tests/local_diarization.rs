@@ -462,6 +462,22 @@ fn an_online_profile_accepts_either_diarization_backend() {
 }
 
 #[test]
+fn diarization_requires_a_recording_it_can_reconcile() {
+    let fixture = ConfigFixture::new();
+    let config = fixture.online(SPEECHBRAIN_SECTION);
+    let without_recording = config.split("\n[recording]").next().unwrap();
+
+    let error = GatewayConfig::validate(&fixture.write(without_recording))
+        .expect_err("a diarizer without a recording can never reconcile a meeting");
+    assert!(
+        error
+            .to_string()
+            .contains("voice diarization requires a recording section"),
+        "{error}"
+    );
+}
+
+#[test]
 fn a_local_diarization_deployment_lists_the_component_as_local() {
     let fixture = ConfigFixture::new();
 
@@ -609,17 +625,19 @@ impl ConfigFixture {
 
     fn online(&self, diarization: &str) -> String {
         format!(
-            "{}\n{diarization}",
-            ONLINE_CONFIG.replace("SIDECAR", &self.voice_sidecar.display().to_string())
+            "{}\n{diarization}\n[recording]\ndirectory = \"{}\"\nkey_env = \"{RECORDING_KEY_ENV}\"\n",
+            ONLINE_CONFIG.replace("SIDECAR", &self.voice_sidecar.display().to_string()),
+            self.directory.path().join("recordings").display(),
         )
     }
 
     fn offline(&self, diarization: &str) -> String {
         format!(
-            "{}\n{diarization}",
+            "{}\n{diarization}\n[recording]\ndirectory = \"{}\"\nkey_env = \"{RECORDING_KEY_ENV}\"\n",
             OFFLINE_CONFIG
                 .replace("SIDECAR", &self.voice_sidecar.display().to_string())
-                .replace("ASR_MODEL", &self.asr_model_path.display().to_string())
+                .replace("ASR_MODEL", &self.asr_model_path.display().to_string()),
+            self.directory.path().join("recordings").display(),
         )
     }
 }

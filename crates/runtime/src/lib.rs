@@ -41,6 +41,7 @@ pub use session_recording::{
     open_session_recording, read_session_recording, resolve_recording_handle, RecordedChunk,
     RecordedChunks, RecordedSession, RecordingGap, RecordingSettings, RecordingSummary,
     SessionRecorder, CAPTURE_DISCONTINUITY_REASON, EMPTY_RECORDING_FORMAT, MAX_RECORDING_GAPS,
+    RECORDING_FAILURE_REASON,
 };
 pub use streaming_turn::{StartedStreamingTurn, StreamingTurnEventStream, StreamingTurnRuntime};
 pub use text_processing::{

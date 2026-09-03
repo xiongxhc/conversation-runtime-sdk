@@ -58,6 +58,8 @@ use ring::rand::{SecureRandom, SystemRandom};
 
 /// The reason recorded for a gap opened by a break in the capture bridge.
 pub const CAPTURE_DISCONTINUITY_REASON: &str = "capture_discontinuity";
+/// The recording stopped while the live session continued after its sink failed.
+pub const RECORDING_FAILURE_REASON: &str = "recording_failed";
 /// The reported format of a recording that captured no audio at all.
 pub const EMPTY_RECORDING_FORMAT: &str = "none";
 /// The most gaps one recording may carry. A recording that exceeds it fails closed rather
@@ -292,6 +294,7 @@ pub struct SessionRecorder {
     /// failing step instead of appending a second closing chunk or reporting a wrong error.
     ended: bool,
     summary: Option<RecordingSummary>,
+    recording_failed: bool,
 }
 
 impl fmt::Debug for SessionRecorder {
@@ -360,6 +363,7 @@ impl SessionRecorder {
             media_ms: 0,
             ended: false,
             summary: None,
+            recording_failed: false,
         })
     }
 
@@ -373,6 +377,27 @@ impl SessionRecorder {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Marks this recorder incomplete after a sink failure. The caller must stop feeding it;
+    /// the final summary retains this bounded fact even when the meeting stays live.
+    pub fn mark_incomplete(&mut self) {
+        if self.recording_failed {
+            return;
+        }
+        self.recording_failed = true;
+        let failure = RecordingGap {
+            started_at_ms: self.media_duration_ms(),
+            ended_at_ms: None,
+            reason: RECORDING_FAILURE_REASON.to_owned(),
+        };
+        if self.gaps.len() < MAX_RECORDING_GAPS {
+            self.gaps.push(failure);
+        } else if let Some(last) = self.gaps.last_mut() {
+            // The cap itself is a recording failure. Preserve a bounded, explicit failure
+            // marker rather than silently discarding the fact because the gap list is full.
+            *last = failure;
+        }
     }
 
     /// Records one capture frame. Called for every frame the bridge delivers, whatever the

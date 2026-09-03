@@ -448,6 +448,16 @@ impl GatewayConfig {
         let memory_component = memory.as_ref().map(|_| {
             ComponentDescriptor::new(ComponentKind::Memory, "sqlite", ExecutionLocation::Local)
         });
+        if self
+            .voice
+            .as_ref()
+            .is_some_and(|voice| voice.diarization.is_some())
+            && self.recording.is_none()
+        {
+            return Err(config_error(
+                "voice diarization requires a recording section",
+            ));
+        }
         let voice_configured = self.voice.is_some();
         let components = match self.voice.as_ref() {
             Some(voice) => voice.validate(

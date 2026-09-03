@@ -61,6 +61,21 @@ cargo test -p conversation-runtime-gateway --test text_processing -- --ignored -
 repository defined itself. No real vendor is known to speak it. Confirm the endpoint and
 body against the provider that will actually be configured before the first real meeting.
 
+The current adapter deliberately namespaces labels returned by separate bounded requests. Do
+not remove that isolation unless the selected provider proves that one request/session preserves
+speaker identity across every window.
+
+```bash
+cd /Users/cx/Workspace/conversation-runtime-sdk
+export OPENAI_API_KEY=...            # never commit; never echo
+cargo test -p conversation-model-adapters --test openai_diarization -- --ignored --nocapture
+```
+
+Expected evidence: the provider documentation or captured response identifies one explicit
+diarization session spanning all uploaded windows, or returns speaker embeddings suitable for
+one global clustering pass. If neither is true, leave labels window-scoped and keep final
+attribution anonymous across windows.
+
 ## 3. Feishu client, test tenant, and real meeting acceptance
 
 Not in scope for this repository. Conversation Runtime is exercised here with scripted
@@ -128,3 +143,8 @@ meeting rather than trusted:
   meeting beyond about 51 minutes is clustered at 3-second resolution and one beyond 102
   minutes at 6-second resolution. Confirm that is acceptable for real meeting lengths before
   raising the budget, which costs memory as the square of the frame count.
+- **The PCM energy VAD threshold** (`SPEECH_ACTIVITY_THRESHOLD = 256`) is exercised only with
+  deterministic synthetic PCM. Run the installed sidecar against a consented real recording
+  containing silence, steady room noise, separated speech, and overlap; expected evidence is
+  no segment for silence/background, separate timestamped turns across silence, and `null`
+  speaker labels for overlap. Do not change the threshold from a model-only or synthetic run.

@@ -846,7 +846,7 @@ const MAX_RECORDING_GAPS = 256;
 const MAX_RECORDING_HANDLE_BYTES = 128;
 const MAX_RECORDING_PATH_BYTES = 1024;
 const MAX_RECORDING_LABEL_BYTES = 64;
-const RECORDING_GAP_REASONS = ["capture_discontinuity"] as const;
+const RECORDING_GAP_REASONS = ["capture_discontinuity", "recording_failed"] as const;
 
 function parseRecordingSummary(value: unknown): RecordingSummary {
   const object = requireRecord(value, "recording summary");

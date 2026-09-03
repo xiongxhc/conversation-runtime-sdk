@@ -71,8 +71,8 @@ async fn clustered_segments_carry_anonymous_labels_on_the_media_timeline() {
     assert_eq!(segments[2].ended_at_ms(), 30_900);
     assert_eq!(
         segments[2].speaker_cluster(),
-        Some("cluster-1"),
-        "one provider label keeps one cluster across windows"
+        Some("cluster-3"),
+        "a label returned for another independent provider request is not meeting-wide evidence"
     );
     let identifiers = segments
         .iter()

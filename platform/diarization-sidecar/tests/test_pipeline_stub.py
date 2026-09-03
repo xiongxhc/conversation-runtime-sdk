@@ -59,6 +59,18 @@ def audio(seconds: int) -> bytes:
     return b"\x01\x02" * (SAMPLE_RATE_HZ * seconds)
 
 
+def silence(seconds: int) -> bytes:
+    return b"\x00\x00" * (SAMPLE_RATE_HZ * seconds)
+
+
+def background(seconds: int) -> bytes:
+    return b"\x01\x00" * (SAMPLE_RATE_HZ * seconds)
+
+
+def speech(seconds: int) -> bytes:
+    return b"\x00\x40" * (SAMPLE_RATE_HZ * seconds)
+
+
 def test_synthetic_embeddings_cluster_deterministically() -> None:
     first = pipeline.cluster_embeddings([VOICE_A, VOICE_A, VOICE_B, VOICE_B], max_speakers=12)
     again = pipeline.cluster_embeddings([VOICE_A, VOICE_A, VOICE_B, VOICE_B], max_speakers=12)
@@ -143,6 +155,35 @@ def test_the_frame_budget_bounds_a_long_recording() -> None:
 def test_a_recording_with_no_audio_produces_no_segments() -> None:
     diarization, _ = build([])
     assert diarization.finish() == []
+
+
+def test_silence_is_omitted_before_the_embedder_can_cluster_it() -> None:
+    diarization, embedder = build([VOICE_A])
+    diarization.add_window(0, silence(1))
+
+    assert diarization.finish() == []
+    assert embedder.frame_lengths == []
+
+
+def test_background_only_audio_is_omitted_before_the_embedder_can_cluster_it() -> None:
+    diarization, embedder = build([VOICE_A])
+    diarization.add_window(0, background(1))
+
+    assert diarization.finish() == []
+    assert embedder.frame_lengths == []
+
+
+def test_speech_separated_by_silence_keeps_its_real_timeline_gap() -> None:
+    diarization, embedder = build([VOICE_A, VOICE_A])
+    diarization.add_window(0, speech(1))
+    diarization.add_window(1_000, silence(1))
+    diarization.add_window(2_000, speech(1))
+
+    assert diarization.finish() == [
+        protocol.Segment(0, 1_000, "spk-1"),
+        protocol.Segment(2_000, 3_000, "spk-1"),
+    ]
+    assert embedder.frame_lengths == [FRAME_BYTES, FRAME_BYTES]
 
 
 def test_the_pipeline_accepts_no_identity_and_no_reference_embedding() -> None:

@@ -13,7 +13,7 @@ pub const MAX_CLIENT_RECORDING_PATH_BYTES: usize = 1024;
 pub const MAX_CLIENT_RECORDING_LABEL_BYTES: usize = 64;
 
 /// The only gap reason the media path can produce. A closed list keeps the wire fail-closed.
-const RECORDING_GAP_REASONS: [&str; 1] = ["capture_discontinuity"];
+const RECORDING_GAP_REASONS: [&str; 2] = ["capture_discontinuity", "recording_failed"];
 
 /// An interval during which the bridge delivered no media. `ended_at_ms` is absent when the
 /// recording ended while the gap was still open.

@@ -28,7 +28,7 @@ use conversation_protocol::{
 use conversation_runtime::{
     read_session_recording, resolve_recording_handle, ConversationContext,
     ConversationQualityController, RecordedChunk, RecordingSettings, SessionRecorder,
-    VoiceSessionAdapters, VoiceSessionRuntime,
+    VoiceSessionAdapters, VoiceSessionRuntime, MAX_RECORDING_GAPS,
 };
 use tempfile::TempDir;
 use tokio::sync::{mpsc, Mutex};
@@ -375,7 +375,7 @@ async fn a_recording_closed_under_a_running_session_does_not_end_the_meeting() {
 }
 
 #[tokio::test]
-async fn a_recording_that_cannot_be_written_still_ends_the_meeting() {
+async fn a_recording_format_failure_keeps_the_meeting_alive_and_marks_the_summary_incomplete() {
     let key_env = "CONVERSATION_TEST_RECORDING_KEY_WRITE_FAILURE";
     set_fake_key(key_env);
     let directory = TempDir::new().expect("temporary recording directory");
@@ -384,11 +384,8 @@ async fn a_recording_that_cannot_be_written_still_ends_the_meeting() {
         SessionRecorder::start(&settings, SessionId::new(1)).expect("recorder starts"),
     ));
 
-    // The other side of the same rule. Only an already-closed recording is survivable; a
-    // recording that cannot take the media it is given must still stop the meeting, because
-    // continuing would hand the operator a recording that is silently short. The second frame
-    // changes the capture format, which the sink refuses as an adapter failure rather than as
-    // the invalid state a closed recorder reports.
+    // A recording failure is not a live-session failure. The second frame changes format and
+    // the sink refuses it; capture must nevertheless run to its own terminal event.
     let mismatched = AudioFrame::new(
         TurnId::new(1),
         GenerationId::new(1),
@@ -409,19 +406,92 @@ async fn a_recording_that_cannot_be_written_still_ends_the_meeting() {
     let events = run_voice_session(script, Arc::clone(&recorder)).await;
 
     assert!(
-        matches!(
-            events.last(),
-            Some(VoiceSessionEvent::SessionFailed {
-                recovery: RecoveryDisposition::NewSession,
+        matches!(events.last(), Some(VoiceSessionEvent::SessionEnded { .. })),
+        "the capture session ends on its own shutdown, not on the recorder failure: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            VoiceSessionEvent::SessionFailed {
+                recovery: RecoveryDisposition::ContinueSession,
                 ..
-            })
-        ),
-        "a recording that cannot be written must end the session: {events:?}"
+            }
+        )),
+        "the bounded recorder failure is visible without replacing the meeting: {events:?}"
     );
     assert_eq!(
         recorded_frames_len(recorder.lock().await.path(), key_env),
         1,
         "the frame the sink accepted is on disk; the one it refused is not"
+    );
+    let summary = recorder
+        .lock()
+        .await
+        .finalize()
+        .expect("partial recording finalizes");
+    assert!(
+        summary
+            .gaps
+            .iter()
+            .any(|gap| gap.reason == "recording_failed"),
+        "the final summary must state that capture stopped before the meeting did: {summary:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_recording_gap_limit_keeps_the_meeting_alive_and_marks_the_summary_incomplete() {
+    let key_env = "CONVERSATION_TEST_RECORDING_KEY_GAP_LIMIT";
+    set_fake_key(key_env);
+    let directory = TempDir::new().expect("temporary recording directory");
+    let settings = RecordingSettings::new(directory.path(), key_env).expect("recording settings");
+    let recorder = Arc::new(Mutex::new(
+        SessionRecorder::start(&settings, SessionId::new(1)).expect("recorder starts"),
+    ));
+
+    {
+        let mut recorder = recorder.lock().await;
+        for sequence in 1..=MAX_RECORDING_GAPS as u64 {
+            recorder
+                .record_frame(&marker_frame(sequence))
+                .expect("frame closes the preceding gap");
+            recorder.record_capture_gap().expect("gap fits the cap");
+        }
+        recorder
+            .record_frame(&marker_frame(MAX_RECORDING_GAPS as u64 + 1))
+            .expect("the final capped gap closes");
+    }
+
+    let events = run_voice_session(
+        vec![
+            Step::Emit(Ok(VoiceInputEvent::Capture(CaptureEvent::Discontinuity {
+                at_ms: 0,
+            }))),
+            Step::Sleep(Duration::from_millis(80)),
+        ],
+        Arc::clone(&recorder),
+    )
+    .await;
+
+    assert!(
+        matches!(events.last(), Some(VoiceSessionEvent::SessionEnded { .. })),
+        "{events:?}"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        VoiceSessionEvent::SessionFailed {
+            recovery: RecoveryDisposition::ContinueSession,
+            ..
+        }
+    )));
+    let summary = recorder
+        .lock()
+        .await
+        .finalize()
+        .expect("partial recording finalizes");
+    assert_eq!(summary.gaps.len(), MAX_RECORDING_GAPS);
+    assert_eq!(
+        summary.gaps.last().map(|gap| gap.reason.as_str()),
+        Some("recording_failed")
     );
 }
 

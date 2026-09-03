@@ -245,6 +245,7 @@ struct Reconciliation {
     clusters: SpeakerClusters,
     text_bytes: usize,
     provider_warned: bool,
+    windows: u64,
 }
 
 impl Reconciliation {
@@ -253,6 +254,8 @@ impl Reconciliation {
         window: &MeetingAudioWindow,
         answer: ProviderAnswer,
     ) -> Result<(), AdapterError> {
+        let window_index = self.windows;
+        self.windows = self.windows.saturating_add(1);
         self.provider_warned |= !answer.warnings.is_empty();
         let limit = window.audio_ms().saturating_add(WINDOW_TIMING_TOLERANCE_MS);
 
@@ -274,7 +277,10 @@ impl Reconciliation {
             let cluster = segment
                 .speaker
                 .as_deref()
-                .map(|label| self.clusters.label_for(label))
+                .map(|label| {
+                    self.clusters
+                        .label_for(&format!("window-{window_index}:{label}"))
+                })
                 .transpose()?;
             let segment_id = format!("seg-{}", self.segments.len() + 1);
             self.segments.push(DiarizedSegment::new(

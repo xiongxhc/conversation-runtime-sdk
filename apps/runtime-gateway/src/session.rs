@@ -37,11 +37,28 @@ const NORMAL_WRITER_BUFFER_SIZE: usize = 4;
 const EVENT_WRITER_BUFFER_SIZE: usize = 1;
 const WRITER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 const INVALID_COMMAND_REQUEST_ID: &str = "invalid-command";
-/// The one session identifier this gateway serves. A connection is one session, so a command
-/// naming any other identifier is asking a session this process does not have.
-const GATEWAY_SESSION_ID: SessionId = SessionId::new(1);
+#[cfg(not(test))]
+static NEXT_GATEWAY_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(not(test))]
+fn next_gateway_session_id() -> SessionId {
+    let session_id = NEXT_GATEWAY_SESSION_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .expect("gateway session identifier space exhausted");
+    SessionId::new(session_id)
+}
+
+// The internal command-suite fixtures predate per-connection identities and deliberately use
+// literal session id 1. Integration and production builds exercise the live allocator above.
+#[cfg(test)]
+fn next_gateway_session_id() -> SessionId {
+    SessionId::new(1)
+}
 
 pub struct GatewaySession {
+    session_id: SessionId,
     runtime: TextTurnRuntime,
     status: RuntimeStatus,
     memory_inspection: Option<MemoryInspectionAdapters>,
@@ -141,7 +158,16 @@ impl WriterLanes {
 
 impl GatewaySession {
     pub fn new(runtime: TextTurnRuntime, status: RuntimeStatus) -> Self {
+        Self::with_session_id(runtime, status, next_gateway_session_id())
+    }
+
+    fn with_session_id(
+        runtime: TextTurnRuntime,
+        status: RuntimeStatus,
+        session_id: SessionId,
+    ) -> Self {
         Self {
+            session_id,
             runtime,
             status,
             memory_inspection: None,
@@ -153,6 +179,12 @@ impl GatewaySession {
             active_recording: None,
             reconciliation: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_test_session_id(mut self, session_id: SessionId) -> Self {
+        self.session_id = session_id;
+        self
     }
 
     /// Records every voice session's capture media under `settings`. Absent — which is what the
@@ -710,7 +742,7 @@ impl GatewaySession {
                     .map_err(CommandFailure::response);
                 }
 
-                let session_id = GATEWAY_SESSION_ID;
+                let session_id = self.session_id;
                 let policy = match lane.adapters.policy.for_session(session_id) {
                     Ok(policy) => policy,
                     Err(error) => {
@@ -851,6 +883,14 @@ impl GatewaySession {
                 session_id,
                 recording_handle,
             } => {
+                if session_id != self.session_id {
+                    return send_rejection(
+                        normal,
+                        &request_id,
+                        command_error("recording reconciliation was requested for another session"),
+                    )
+                    .map_err(CommandFailure::response);
+                }
                 let Some(settings) = self.recording.clone() else {
                     return send_rejection(
                         normal,
@@ -877,9 +917,9 @@ impl GatewaySession {
                     )
                     .map_err(CommandFailure::response);
                 }
-                // The recording is reached by handle alone: the handle binds to a per-recording
-                // identifier in the file header, which is what isolates one meeting's audio
-                // from another's when every session carries the same identifier.
+                // The handle's random per-recording binding prevents substitution inside a
+                // recording directory, and the live gateway-session identity in the header
+                // prevents a known handle from crossing between concurrent gateway sessions.
                 let reconciled = reconcile_recording(
                     &settings,
                     session_id,
@@ -917,7 +957,7 @@ impl GatewaySession {
                 output_schema,
                 max_output_bytes,
             } => {
-                if session_id != GATEWAY_SESSION_ID {
+                if session_id != self.session_id {
                     return send_rejection(
                         normal,
                         &request_id,
@@ -6828,6 +6868,23 @@ mod tests {
     /// unclustered one, which is enough to state the whole wire shape.
     struct FixtureDiarizer;
 
+    struct EmptyDiarizer;
+
+    impl TranscriptionDiarizer for EmptyDiarizer {
+        fn diarize<'a>(
+            &'a self,
+            mut windows: MeetingAudioWindows,
+            _cancellation: CancellationToken,
+        ) -> AdapterFuture<'a, DiarizationResult> {
+            Box::pin(async move {
+                while let Some(window) = windows.recv().await {
+                    let _ = window?;
+                }
+                DiarizationResult::new(Vec::new(), Vec::new())
+            })
+        }
+    }
+
     impl TranscriptionDiarizer for FixtureDiarizer {
         fn diarize<'a>(
             &'a self,
@@ -7040,6 +7097,75 @@ mod tests {
 
         drop(input);
         gateway.close().await;
+    }
+
+    #[tokio::test]
+    async fn two_gateway_sessions_sharing_a_key_reject_a_recording_handle_from_the_other_session() {
+        let key_env = "CONVERSATION_SESSION_RECORDING_KEY_CROSS_SESSION";
+        std::env::set_var(key_env, FAKE_RECORDING_KEY);
+        let directory = TempDir::new().unwrap();
+        let first_session_id = SessionId::new(41);
+        let second_session_id = SessionId::new(42);
+        let (first_input, first_receiver) = mpsc::channel(8);
+        let first = session_with_interactive_voice(
+            first_receiver,
+            Arc::new(MockGenerationLanguageModel::new(["fixture reply"])),
+            no_speech_frames(),
+        )
+        .with_recording(RecordingSettings::new(directory.path(), key_env).unwrap())
+        .with_reconciliation(Arc::new(FixtureDiarizer))
+        .with_test_session_id(first_session_id);
+        let mut first = InMemoryGateway::start(first).await;
+
+        first
+            .write(r#"{"protocol_version":3,"type":"start_voice_session","request_id":"voice-1"}"#)
+            .await;
+        assert_accepted_message(&first.read_message().await, "voice-1");
+        let started = first.read_message().await;
+        assert!(started.contains(r#""session_id":"41""#), "{started}");
+        send_voice_input(&first_input, recording_frame(1)).await;
+        wait_for_recording_bytes(directory.path(), 80).await;
+        first
+            .write(r#"{"protocol_version":3,"type":"stop_voice_session","request_id":"stop-1"}"#)
+            .await;
+        first
+            .read_until(|message| message.contains(r#""request_id":"stop-1""#))
+            .await;
+        first
+            .write(r#"{"protocol_version":3,"type":"finalize_recording","request_id":"fin-1","session_id":"41"}"#)
+            .await;
+        assert_accepted_message(&first.read_message().await, "fin-1");
+        let finalized: serde_json::Value =
+            serde_json::from_str(&first.read_message().await).unwrap();
+        let handle = finalized["recording"]["recording_handle"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let (_second_input, second_receiver) = mpsc::channel(8);
+        let second = session_with_interactive_voice(
+            second_receiver,
+            Arc::new(MockGenerationLanguageModel::new(["fixture reply"])),
+            no_speech_frames(),
+        )
+        .with_recording(RecordingSettings::new(directory.path(), key_env).unwrap())
+        .with_reconciliation(Arc::new(EmptyDiarizer))
+        .with_test_session_id(second_session_id);
+        let mut second = InMemoryGateway::start(second).await;
+        second
+            .write(&format!(
+                r#"{{"protocol_version":3,"type":"reconcile_recording","request_id":"cross","session_id":"42","recording_handle":"{handle}"}}"#
+            ))
+            .await;
+        let rejected = second.read_message().await;
+        assert_rejected_message(&rejected, "cross", "invalid_state");
+        assert!(
+            rejected.contains("runtime state rejected the operation"),
+            "the header session boundary rejects a known handle without exposing recording detail: {rejected}"
+        );
+
+        first.close().await;
+        second.close().await;
     }
 
     #[tokio::test]

@@ -336,6 +336,23 @@ export type VoiceActivity =
   | { type: "speech_ended"; atMs: number }
   | { type: "capture_discontinuity"; atMs: number };
 
+/** Exact `voice_transcript_final` shape sent to v1/v2 clients. */
+export type LegacyVoiceTranscriptFinalEvent = {
+  type: "voice_transcript_final";
+  sessionId: bigint;
+  turnId: bigint;
+  text: string;
+};
+
+/** v3 adds a recognition segment identity and permits pre-authorization finals. */
+export type VersionThreeVoiceTranscriptFinalEvent = {
+  type: "voice_transcript_final";
+  sessionId: bigint;
+  segmentId: string;
+  turnId: bigint | null;
+  text: string;
+};
+
 export type VoiceSessionEvent =
   | {
       type: "voice_session_started";
@@ -355,7 +372,8 @@ export type VoiceSessionEvent =
   | { type: "voice_capture_resumed"; sessionId: bigint }
   | { type: "voice_activity"; sessionId: bigint; activity: VoiceActivity }
   | { type: "voice_transcript_partial"; sessionId: bigint; segmentId: bigint; text: string }
-  | { type: "voice_transcript_final"; sessionId: bigint; segmentId: string; turnId: bigint | null; text: string }
+  | LegacyVoiceTranscriptFinalEvent
+  | VersionThreeVoiceTranscriptFinalEvent
   | { type: "response_authorized"; sessionId: bigint; segmentId: string; turnId: bigint }
   | { type: "response_skipped"; sessionId: bigint; segmentId: string; reason: string }
   | { type: "voice_barge_in"; sessionId: bigint; turnId: bigint; generationId: bigint }
@@ -1566,10 +1584,18 @@ function parseVoiceSessionEvent(
       requireExactKeys(object, version >= RUNTIME_PROFILE_PROTOCOL_VERSION
         ? ["type", "session_id", "segment_id", "turn_id", "text"]
         : ["type", "session_id", "turn_id", "text"]);
+      if (version < RUNTIME_PROFILE_PROTOCOL_VERSION) {
+        return {
+          type,
+          sessionId: sessionId(),
+          turnId: parseIdentifier(object.turn_id),
+          text: requireTranscript(object, "text"),
+        };
+      }
       return {
         type,
         sessionId: sessionId(),
-        segmentId: version >= RUNTIME_PROFILE_PROTOCOL_VERSION ? requireSegmentId(object.segment_id) : "",
+        segmentId: requireSegmentId(object.segment_id),
         turnId: object.turn_id === null ? null : parseIdentifier(object.turn_id),
         text: requireTranscript(object, "text"),
       };

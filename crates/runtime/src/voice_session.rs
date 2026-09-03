@@ -705,9 +705,10 @@ impl VoiceLoop {
         if let Some(PendingSegment::Authorized(turn_id)) = self.pending_segments.get(&segment_id) {
             return Ok(*turn_id);
         }
-        let Some(PendingSegment::Pending(text)) = self.pending_segments.remove(&segment_id) else {
+        let Some(PendingSegment::Pending(text)) = self.pending_segments.get(&segment_id) else {
             return Err(runtime_error("voice response segment is not pending"));
         };
+        let text = text.clone();
         self.context
             .seed_completed_history(
                 &format!("voice-authorize-{}-{segment_id}", self.session_id.get()),
@@ -720,7 +721,7 @@ impl VoiceLoop {
                 ConversationTurnSource::Voice {
                     session_id: self.session_id,
                 },
-                text,
+                text.clone(),
             )
             .await?;
         let identity = started.identity();
@@ -741,6 +742,8 @@ impl VoiceLoop {
                 .turn_runtime
                 .abort_turn(turn_id, generation_id, &mut turn_events)
                 .await;
+            self.pending_segments
+                .insert(segment_id, PendingSegment::Pending(text));
             return Err(runtime_error(
                 "voice session event stream closed during authorization",
             ));
@@ -2096,12 +2099,26 @@ mod tests {
             .authorize_segment(SessionId::new(2), 3, exchanges.clone())
             .await
             .is_err());
+        assert!(loop_
+            .authorize_segment(session_id, 3, exchanges.clone())
+            .await
+            .is_err());
+        assert!(matches!(
+            loop_.pending_segments.get(&3),
+            Some(PendingSegment::Pending(text)) if text == "segment 3"
+        ));
+        loop_.interrupt_current_turn().await.unwrap();
+        let retried_turn_id = loop_
+            .authorize_segment(session_id, 3, exchanges.clone())
+            .await
+            .unwrap();
+        assert_ne!(retried_turn_id, turn_id);
         loop_
-            .skip_segment(session_id, 3, "not addressed".to_owned())
+            .skip_segment(session_id, 4, "not addressed".to_owned())
             .await
             .unwrap();
         assert!(loop_
-            .authorize_segment(session_id, 3, exchanges)
+            .authorize_segment(session_id, 4, exchanges)
             .await
             .is_err());
         assert!(loop_

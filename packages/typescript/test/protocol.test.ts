@@ -473,6 +473,43 @@ test("parses a capture discontinuity without transcript state", () => {
   );
 });
 
+test("keeps legacy and version-three transcript finals structurally distinct", () => {
+  assert.deepEqual(
+    parseGatewayMessage({
+      protocol_version: 1,
+      type: "voice_event",
+      event: { type: "voice_transcript_final", session_id: "7", turn_id: "11", text: "legacy" },
+    }),
+    {
+      type: "voice_event",
+      event: { type: "voice_transcript_final", sessionId: 7n, turnId: 11n, text: "legacy" },
+    },
+  );
+  assert.deepEqual(
+    parseGatewayMessage({
+      protocol_version: 3,
+      type: "voice_event",
+      event: {
+        type: "voice_transcript_final",
+        session_id: "7",
+        segment_id: "9",
+        turn_id: null,
+        text: "external gate",
+      },
+    }, 3),
+    {
+      type: "voice_event",
+      event: {
+        type: "voice_transcript_final",
+        sessionId: 7n,
+        segmentId: "9",
+        turnId: null,
+        text: "external gate",
+      },
+    },
+  );
+});
+
 test("rejects unsupported inbound protocol versions", () => {
   assert.throws(() =>
     parseGatewayMessage({

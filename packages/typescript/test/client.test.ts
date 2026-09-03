@@ -135,6 +135,57 @@ test("external-gated voice responses use version-three scoped commands", async (
   await client.close();
 });
 
+test("voice transcript finals retain exact legacy and version-three event shapes", async () => {
+  const legacy = await connectedClient();
+  const legacyStarting = legacy.client.startVoiceSession();
+  const legacyStart = command(legacy.transport, "start_voice_session");
+  legacy.transport.push(acceptedControl(legacyStart.requestId));
+  const legacySession = await legacyStarting;
+  legacy.transport.push(voiceEvent({
+    type: "voice_session_started",
+    session_id: "7",
+    privacy: { privacy_mode: "local_only", components: wireVoiceComponents() },
+  }));
+  legacy.transport.push(voiceEvent({
+    type: "voice_transcript_final",
+    session_id: "7",
+    turn_id: "11",
+    text: "legacy agenda item",
+  }));
+  legacy.transport.push(voiceEvent({ type: "voice_session_ended", session_id: "7" }));
+  assert.deepEqual(await collect(legacySession.events()), [
+    { type: "voice_session_started", sessionId: 7n, privacy: { privacyMode: "local_only", components: parsedVoiceComponents() } },
+    { type: "voice_transcript_final", sessionId: 7n, turnId: 11n, text: "legacy agenda item" },
+    { type: "voice_session_ended", sessionId: 7n },
+  ]);
+  await legacy.client.close();
+
+  const { client, transport } = await connectedV3Client();
+  const starting = client.startVoiceSession({ responseMode: "external_gate" });
+  const start = command(transport, "start_voice_session");
+  transport.push(acceptedForVersion(start.requestId, 3));
+  const session = await starting;
+  transport.push(voiceEventForVersion({
+    type: "voice_session_started",
+    session_id: "7",
+    privacy: { privacy_mode: "local_only", components: wireVoiceComponents() },
+  }, 3));
+  transport.push(voiceEventForVersion({
+    type: "voice_transcript_final",
+    session_id: "7",
+    segment_id: "9",
+    turn_id: null,
+    text: "version three agenda item",
+  }, 3));
+  transport.push(voiceEventForVersion({ type: "voice_session_ended", session_id: "7" }, 3));
+  assert.deepEqual(await collect(session.events()), [
+    { type: "voice_session_started", sessionId: 7n, privacy: { privacyMode: "local_only", components: parsedVoiceComponents() } },
+    { type: "voice_transcript_final", sessionId: 7n, segmentId: "9", turnId: null, text: "version three agenda item" },
+    { type: "voice_session_ended", sessionId: 7n },
+  ]);
+  await client.close();
+});
+
 test("rejects a non-ready frame before the authoritative ready message", async () => {
   const transport = new InMemoryTransport();
   const connecting = RuntimeClient.connect(transport);

@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "conversation-diarization-sidecar"
+version = "0.1.0"
+description = "Local batch speaker diarization for Conversation Runtime, over JSON Lines on stdio."
+requires-python = ">=3.12"
+# The heavy stack. It is declared here and imported lazily by `pipeline`, so the protocol and
+# clustering tests run on an installation that carries neither torch nor a downloaded model.
+# SpeechBrain is pinned exactly because the recipe and the checkpoint layout are its own; the
+# torch stack follows the floor SpeechBrain itself states.
+dependencies = [
+    "speechbrain==1.1.1",
+    "torch>=2.1",
+    "torchaudio>=2.1",
+    "huggingface_hub>=0.23",
+    "numpy>=1.26,<3",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "numpy>=1.26,<3"]
+
+[project.scripts]
+diarization-sidecar = "diarization_sidecar.__main__:main"
+
+[tool.setuptools]
+packages = ["diarization_sidecar"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

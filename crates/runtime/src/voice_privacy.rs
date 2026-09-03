@@ -101,6 +101,7 @@ const fn component_kind_order(kind: ComponentKind) -> u8 {
         ComponentKind::Tool => 4,
         ComponentKind::Memory => 5,
         ComponentKind::Telemetry => 6,
+        ComponentKind::Diarization => 7,
         _ => u8::MAX,
     }
 }

@@ -155,10 +155,35 @@ label is discarded at the adapter boundary and the wire refuses anything that is
 not an anonymous label, so a provider that guesses a name cannot have that name
 reach a client by any route. Mapping a cluster onto a real participant is the
 Meeting Agent's work, from evidence this runtime does not have. A provider's
-warning text is counted rather than relayed, because it may quote speech. Like the
-other online adapters, the diarizer is wired explicitly by the runtime rather than
-constructed by the configuration loader; a deployment without one records meetings
-and says plainly that it does not reconcile them.
+warning text is counted rather than relayed, because it may quote speech. A deployment without a diarizer records
+meetings and says plainly that it does not reconcile them.
+
+Which backend reconciles a recording is an explicit configuration choice, never a
+fallback. `[voice.diarization]` names one: `openai`, which uploads each window, or
+`speechbrain-sidecar`, which spawns a local Python process and sends it the same
+windows as JSON Lines on a pipe. **An offline deployment may only choose the local
+one** — this is the only place that rule can live, and it is what keeps an offline
+profile offline through the one operation that happens after a meeting rather than
+during it. An online meeting may choose either, so a deployment can send its text
+and speech to a provider while its speakers are still clustered on the machine
+that recorded them; the status names the diarization component's execution
+location, so which of the two happened is a fact a client can read rather than a
+claim it has to trust. The local adapter is constructed by the configuration
+loader like every other offline adapter; the remote one is wired by the runtime,
+like the other online adapters.
+
+The local sidecar is handed bytes, never a path, so the plaintext window it
+clusters exists only in memory on both sides of the pipe. It loads its model from
+a configured local cache directory with the Hugging Face offline switch set, so a
+missing checkpoint fails closed instead of reaching the network in the middle of a
+meeting. It clusters voices and does not transcribe — speaker embeddings answer
+who sounds like whom, not what was said — so its segments carry timings and a
+cluster and an **empty text**, which is stated rather than filled with invented
+words. A frame that sits between two clusters, which is what overlapping speech
+becomes once it is one embedding, is reported with no cluster rather than assigned
+to whichever voice is nearer. The sidecar's own labels are discarded and replaced
+at the adapter boundary exactly as a provider's are, its stderr is discarded, and
+a failure it reports is one code from a closed list both sides hold.
 
 ### Batch Structured Text Processing
 

@@ -39,6 +39,7 @@ async fn run() -> Result<(), ()> {
         memory_extraction,
         provider_hosts,
         recording,
+        diarizer,
         status: _,
     } = adapters;
     let cancellation = CancellationToken::new();
@@ -64,6 +65,9 @@ async fn run() -> Result<(), ()> {
     }
     if let Some(recording) = recording {
         session = session.with_recording(recording);
+    }
+    if let Some(diarizer) = diarizer {
+        session = session.with_reconciliation(diarizer);
     }
     if let Some(store) = memory_store {
         let store: Arc<dyn MemoryStore> = Arc::new(store);

@@ -258,7 +258,8 @@ export type RuntimeComponentDescriptor = {
     | "audio_io"
     | "tool"
     | "memory"
-    | "telemetry";
+    | "telemetry"
+    | "diarization";
   executionLocation: "local" | "remote";
   providerLabel: string;
 };
@@ -1944,6 +1945,7 @@ function requireRuntimeComponents(
     tool: 4,
     memory: 5,
     telemetry: 6,
+    diarization: 7,
   };
   let previousRank = -1;
   return value.map((item) => {

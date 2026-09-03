@@ -86,3 +86,19 @@ follow_up_frequency = 25
 # provider = "local-audio"
 # sidecar_executable = "/absolute/path/to/conversation-voice-sidecar"
 # max_error_bytes = 65536
+#
+# Optional post-meeting speaker diarization, which also requires
+# schema_version = 3 and a [recording] section. An offline deployment may only
+# name the local backend: `backend = "openai"` is refused here, because sending a
+# recorded meeting to a provider is exactly what this profile does not do.
+# Installing the sidecar and fetching its model are human-gated steps; see
+# docs/HUMAN-CHECKLIST.md.
+#
+# [voice.diarization]
+# backend = "speechbrain-sidecar"
+# execution = "local"
+# provider = "speechbrain"
+# sidecar_executable = "/absolute/path/to/diarization-sidecar"
+# model = "speechbrain/spkrec-ecapa-voxceleb"
+# model_cache_dir = "/absolute/path/to/diarization-model-cache"
+# max_speakers = 12

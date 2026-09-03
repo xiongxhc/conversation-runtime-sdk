@@ -510,6 +510,7 @@ fn component_kind_rank(kind: &str) -> Option<u8> {
         "tool" => Some(4),
         "memory" => Some(5),
         "telemetry" => Some(6),
+        "diarization" => Some(7),
         _ => None,
     }
 }
@@ -523,6 +524,7 @@ fn component_kind_name(kind: ComponentKind) -> &'static str {
         ComponentKind::Tool => "tool",
         ComponentKind::Memory => "memory",
         ComponentKind::Telemetry => "telemetry",
+        ComponentKind::Diarization => "diarization",
     }
 }
 

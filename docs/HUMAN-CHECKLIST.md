@@ -66,3 +66,65 @@ body against the provider that will actually be configured before the first real
 Not in scope for this repository. Conversation Runtime is exercised here with scripted
 local servers and fake bridges only. The real-device acceptance run belongs to the
 Meeting Agent deployment plan.
+
+## 6. Install the local diarization sidecar and fetch its model
+
+`platform/diarization-sidecar/` holds the local diarization backend. Its clustering and its
+protocol are exercised by tests that import neither torch nor SpeechBrain, so an automated run
+installs neither and downloads no model. The steps below are the only ones that do, and the
+model download is the reason they are human-gated: it reaches Hugging Face, once, and everything
+after it runs offline.
+
+```bash
+cd /Users/cx/Workspace/conversation-runtime-sdk/platform/diarization-sidecar
+python3.12 -m venv .venv
+.venv/bin/pip install -e .                   # pulls SpeechBrain and the torch stack, ~2.5 GB
+
+# One-time model fetch, while online. The sidecar itself never downloads: it sets
+# HF_HUB_OFFLINE=1 before importing, so a missing checkpoint fails closed mid-meeting.
+mkdir -p ~/.cache/conversation-runtime/diarization
+.venv/bin/python - <<'PY'
+from speechbrain.inference.speaker import EncoderClassifier
+
+EncoderClassifier.from_hparams(
+    source="speechbrain/spkrec-ecapa-voxceleb",
+    savedir="/Users/cx/.cache/conversation-runtime/diarization",
+    run_opts={"device": "cpu"},
+)
+PY
+```
+
+Then point the gateway at the installed console script and that directory:
+
+```toml
+[voice.diarization]
+backend = "speechbrain-sidecar"
+execution = "local"
+provider = "speechbrain"
+sidecar_executable = "/Users/cx/Workspace/conversation-runtime-sdk/platform/diarization-sidecar/.venv/bin/diarization-sidecar"
+model = "speechbrain/spkrec-ecapa-voxceleb"
+model_cache_dir = "/Users/cx/.cache/conversation-runtime/diarization"
+max_speakers = 12
+```
+
+The test-only install, which is what an automated run does, deliberately skips the heavy stack:
+
+```bash
+cd /Users/cx/Workspace/conversation-runtime-sdk/platform/diarization-sidecar
+python3.12 -m venv .venv
+.venv/bin/pip install --no-deps -e .
+.venv/bin/pip install "pytest>=8" "numpy>=1.26,<3"
+.venv/bin/pytest
+```
+
+Two things in the pipeline have never met real audio and should be checked on the first real
+meeting rather than trusted:
+
+- **`AMBIGUITY_RATIO = 0.8`** decides when a frame is left unattributed instead of assigned to a
+  speaker. It is calibrated against synthetic embeddings, where a mixed frame sits exactly
+  between two voices. Real overlapped speech does not. If real meetings leave too much
+  unattributed, or attribute overlap to whoever is louder, this is the number to move.
+- **The frame budget** merges adjacent frames once a recording passes 2 048 of them, so a
+  meeting beyond about 51 minutes is clustered at 3-second resolution and one beyond 102
+  minutes at 6-second resolution. Confirm that is acceptable for real meeting lengths before
+  raising the budget, which costs memory as the square of the frame count.

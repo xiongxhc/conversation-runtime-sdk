@@ -20,6 +20,8 @@ mod openai_language;
 mod openai_speech_recognition;
 mod recognition;
 mod speech;
+#[cfg(unix)]
+mod speechbrain_diarization;
 mod streaming_speech;
 mod voice_capture_control;
 mod voice_input;
@@ -76,6 +78,8 @@ pub use openai_speech_recognition::{
 };
 pub use recognition::{RecognitionEvent, RecognitionHypothesis, SpeechRecognizer};
 pub use speech::{AudioFormat, SpeechRequest, SpeechSynthesizer, SynthesizedAudio};
+#[cfg(unix)]
+pub use speechbrain_diarization::{SpeechbrainDiarizationConfig, SpeechbrainTranscriptionDiarizer};
 pub use streaming_speech::{StreamingSpeechRequest, StreamingSpeechSynthesizer};
 pub use voice_capture_control::VoiceCaptureControl;
 pub use voice_input::{AudioDeviceStatus, VoiceInput, VoiceInputEvent};

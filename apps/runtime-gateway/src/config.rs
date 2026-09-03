@@ -12,7 +12,8 @@ use conversation_model_adapters::{
     MacOsVoiceSidecarConfig, OllamaConfig, OllamaLanguageModel, OpenAiCompatibleSpeechConfig,
     OpenAiCompatibleSpeechSynthesizer, OpenAiCompatibleStreamingSpeechConfig,
     OpenAiCompatibleStreamingSpeechSynthesizer, SidecarAsrBackend, SpeechSynthesizer,
-    StreamingSpeechSynthesizer, SystemDevice,
+    SpeechbrainDiarizationConfig, SpeechbrainTranscriptionDiarizer, StreamingSpeechSynthesizer,
+    SystemDevice, TranscriptionDiarizer,
 };
 use conversation_protocol::{
     ClientComponentDescriptor, ComponentDescriptor, ComponentKind, ConversationMode,
@@ -46,6 +47,10 @@ const MAX_REMOTE_ENDPOINT_BYTES: usize = 2_048;
 /// The longest legal DNS name, so a remote endpoint host stays bounded.
 const MAX_REMOTE_ENDPOINT_HOST_BYTES: usize = 253;
 const MAX_RECORDING_DIRECTORY_BYTES: usize = 1_024;
+/// The diarization port refuses a result carrying more clusters than this, so a larger
+/// configured maximum would configure a failure.
+const MAX_DIARIZATION_SPEAKERS: u16 = 64;
+const MIN_DIARIZATION_SPEAKERS: u16 = 2;
 
 #[derive(Debug)]
 pub struct GatewayConfigError(String);
@@ -95,6 +100,9 @@ pub struct GatewayAdapters {
     /// Where voice sessions write their encrypted recording, when `[recording]` is configured.
     /// Absent in the default configuration, which records nothing.
     pub recording: Option<RecordingSettings>,
+    /// What reconciles a finished recording, when `[voice.diarization]` is configured. Absent
+    /// in the default configuration, which reconciles nothing.
+    pub diarizer: Option<Arc<dyn TranscriptionDiarizer>>,
     pub status: RuntimeStatus,
 }
 
@@ -543,6 +551,12 @@ impl GatewayConfig {
             .as_ref()
             .map(RecordingConfig::settings)
             .transpose()?;
+        let diarizer = self
+            .voice
+            .as_ref()
+            .and_then(|voice| voice.diarization.as_ref())
+            .map(VoiceDiarizationConfig::diarizer)
+            .transpose()?;
 
         Ok(GatewayAdapters {
             context,
@@ -552,6 +566,7 @@ impl GatewayConfig {
             memory_extraction,
             provider_hosts,
             recording,
+            diarizer,
             status,
         })
     }
@@ -580,6 +595,7 @@ impl GatewayConfig {
     fn require_legacy_schema_keys_absent(&self) -> Result<(), GatewayConfigError> {
         let voice_keys = self.voice.as_ref().is_some_and(|voice| {
             voice.response_mode.is_some()
+                || voice.diarization.is_some()
                 || voice.asr.model.is_some()
                 || voice.asr.credential_env.is_some()
                 || voice.speech.credential_env.is_some()
@@ -868,6 +884,11 @@ impl VoiceConfig {
         )?;
         let mut components = vec![recognition, language, speech, audio];
         components.extend(memory);
+        // Diarization ranks after memory, so it is appended last and every existing component
+        // keeps the position the wire already expects.
+        if let Some(diarization) = self.diarization.as_ref() {
+            components.push(diarization.validate(profile_execution)?);
+        }
         Ok(components)
     }
 
@@ -1165,6 +1186,13 @@ const fn speech_execution(
     }
 }
 
+const fn diarization_execution(backend: VoiceDiarizationBackend) -> ExecutionConfig {
+    match backend {
+        VoiceDiarizationBackend::SpeechbrainSidecar => ExecutionConfig::Local,
+        VoiceDiarizationBackend::Openai => ExecutionConfig::Remote,
+    }
+}
+
 const fn execution_name(execution: ExecutionConfig) -> &'static str {
     match execution {
         ExecutionConfig::Local => "local",
@@ -1231,6 +1259,29 @@ fn validate_environment_reference(name: &str, component: &str) -> Result<(), Gat
     if !std::env::var(name).is_ok_and(|value| !value.trim().is_empty()) {
         return Err(config_error(format!(
             "{component} environment variable {name} is not set"
+        )));
+    }
+    Ok(())
+}
+
+/// An absolute path this machine owns: bounded, UTF-8, and free of parent traversal. Applied to
+/// the sidecar executable and the model cache alike; neither is required to exist at load time,
+/// exactly as the voice sidecar's own path is not.
+fn require_local_directory(path: &Path, component: &str) -> Result<(), GatewayConfigError> {
+    if !path.is_absolute() {
+        return Err(config_error(format!("{component} must be absolute")));
+    }
+    if path.as_os_str().len() > MAX_RECORDING_DIRECTORY_BYTES || path.to_str().is_none() {
+        return Err(config_error(format!(
+            "{component} must be bounded UTF-8 within 1024 bytes"
+        )));
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(config_error(format!(
+            "{component} must not traverse parent directories"
         )));
     }
     Ok(())
@@ -1509,6 +1560,10 @@ struct VoiceConfig {
     asr: VoiceAsrConfig,
     speech: VoiceSpeechConfig,
     audio: VoiceAudioConfig,
+    /// Post-meeting speaker diarization. Absent means the deployment records meetings but
+    /// does not reconcile them, which is what every configuration says today.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    diarization: Option<VoiceDiarizationConfig>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1617,6 +1672,146 @@ enum VoiceAudioBackend {
 enum ExecutionConfig {
     Local,
     Remote,
+}
+
+/// Post-meeting speaker diarization.
+///
+/// This is the one component an online deployment may deliberately keep local: a meeting whose
+/// text and speech go to a provider can still have its speakers clustered on the machine that
+/// recorded it. The reverse is refused — an offline deployment must not name a provider here.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct VoiceDiarizationConfig {
+    backend: VoiceDiarizationBackend,
+    execution: ExecutionConfig,
+    provider: String,
+    model: String,
+    /// The local sidecar's absolute path. Required by the sidecar backend, forbidden otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sidecar_executable: Option<PathBuf>,
+    /// Where the operator put the model. The sidecar loads from here and never downloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_cache_dir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_speakers: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    endpoint: Option<String>,
+    /// The NAME of an environment variable holding this provider's credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential_env: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum VoiceDiarizationBackend {
+    SpeechbrainSidecar,
+    Openai,
+}
+
+impl VoiceDiarizationConfig {
+    /// Validates the section and returns its component descriptor.
+    ///
+    /// `profile_execution` is where the *deployment* runs, not where this component must run:
+    /// diarization is exempt from `require_declared_execution` on purpose, because a local
+    /// diarizer inside an online meeting is the point of this backend. The one direction that
+    /// is refused is the other one.
+    fn validate(
+        &self,
+        profile_execution: ExecutionConfig,
+    ) -> Result<ComponentDescriptor, GatewayConfigError> {
+        require_execution(
+            self.execution,
+            diarization_execution(self.backend),
+            "voice diarization backend",
+        )?;
+        if profile_execution == ExecutionConfig::Local && self.execution == ExecutionConfig::Remote
+        {
+            return Err(config_error(
+                "offline gateway diarization backend must run locally",
+            ));
+        }
+        validate_identifier(&self.model, MAX_MODEL_ID_BYTES, "voice diarization model")?;
+
+        match self.backend {
+            VoiceDiarizationBackend::SpeechbrainSidecar => {
+                let executable = self.sidecar_executable.as_deref().ok_or_else(|| {
+                    config_error("local voice diarization requires a sidecar executable")
+                })?;
+                require_local_directory(executable, "voice diarization sidecar executable")?;
+                let cache = self.model_cache_dir.as_deref().ok_or_else(|| {
+                    config_error("local voice diarization requires a model cache directory")
+                })?;
+                require_local_directory(cache, "voice diarization model cache directory")?;
+                let max_speakers = self.max_speakers.ok_or_else(|| {
+                    config_error("local voice diarization requires a maximum speaker count")
+                })?;
+                if !(MIN_DIARIZATION_SPEAKERS..=MAX_DIARIZATION_SPEAKERS).contains(&max_speakers) {
+                    return Err(config_error(
+                        "voice diarization maximum speaker count is outside 2..=64",
+                    ));
+                }
+                if self.endpoint.is_some() {
+                    return Err(config_error(
+                        "local voice diarization must not name an endpoint",
+                    ));
+                }
+            }
+            VoiceDiarizationBackend::Openai => {
+                let endpoint = self
+                    .endpoint
+                    .as_deref()
+                    .ok_or_else(|| config_error("remote voice diarization requires an endpoint"))?;
+                validate_endpoint(endpoint, self.execution, "voice diarization")?;
+                if self.sidecar_executable.is_some()
+                    || self.model_cache_dir.is_some()
+                    || self.max_speakers.is_some()
+                {
+                    return Err(config_error(
+                        "remote voice diarization must not configure local sidecar material",
+                    ));
+                }
+            }
+        }
+        validate_credential_reference(
+            self.credential_env.as_deref(),
+            self.execution,
+            "voice diarization",
+        )?;
+
+        component_descriptor(
+            ComponentKind::Diarization,
+            &self.provider,
+            self.execution,
+            "voice diarization",
+        )
+    }
+
+    /// The adapter this section names. Only the local backend is constructed here, for the
+    /// reason the online profile is refused as a whole: an online adapter is wired by the
+    /// runtime, and building one from the loader would place a meeting somewhere the operator
+    /// did not ask for.
+    fn diarizer(&self) -> Result<Arc<dyn TranscriptionDiarizer>, GatewayConfigError> {
+        match self.backend {
+            VoiceDiarizationBackend::SpeechbrainSidecar => {
+                let (Some(executable), Some(cache), Some(max_speakers)) = (
+                    self.sidecar_executable.as_deref(),
+                    self.model_cache_dir.as_deref(),
+                    self.max_speakers,
+                ) else {
+                    return Err(config_error(
+                        "local voice diarization requires a sidecar executable",
+                    ));
+                };
+                Ok(Arc::new(SpeechbrainTranscriptionDiarizer::new(
+                    SpeechbrainDiarizationConfig::new(executable, &self.model, cache, max_speakers)
+                        .map_err(adapter_error)?,
+                )))
+            }
+            VoiceDiarizationBackend::Openai => Err(config_error(
+                "online profile adapters are not constructed by the configuration loader",
+            )),
+        }
+    }
 }
 
 /// Encrypted session recording. `key_env` names the environment variable that

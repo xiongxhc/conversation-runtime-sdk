@@ -80,6 +80,10 @@ pub enum ComponentKind {
     Tool,
     Memory,
     Telemetry,
+    /// Post-meeting speaker diarization. It runs after a recording has stopped rather than
+    /// inside a session, and it is listed so a status states where a meeting's audio was
+    /// clustered — which is the whole point of choosing the local backend.
+    Diarization,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

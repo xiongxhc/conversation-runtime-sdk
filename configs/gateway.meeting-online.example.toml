@@ -85,6 +85,36 @@ provider = "local-audio"
 sidecar_executable = "/absolute/path/to/conversation-voice-sidecar"
 max_error_bytes = 65536
 
+# Post-meeting speaker diarization. This is the one component an online meeting
+# may deliberately keep on the machine that recorded it: `speechbrain-sidecar`
+# clusters the speakers locally, so the recording is never sent anywhere, while
+# `openai` sends each window to the provider named below. An offline deployment
+# may only use the local backend.
+#
+# The sidecar is `platform/diarization-sidecar`. Installing it and fetching its
+# model are human-gated steps; see docs/HUMAN-CHECKLIST.md. It loads only from
+# `model_cache_dir` and never downloads. It clusters voices and does not
+# transcribe, so its segments carry timings and a cluster and no text.
+[voice.diarization]
+backend = "speechbrain-sidecar"
+execution = "local"
+provider = "speechbrain"
+sidecar_executable = "/absolute/path/to/diarization-sidecar/.venv/bin/diarization-sidecar"
+model = "speechbrain/spkrec-ecapa-voxceleb"
+model_cache_dir = "/absolute/path/to/diarization-model-cache"
+max_speakers = 12
+
+# The remote alternative, for a deployment that would rather a provider did the
+# clustering. It replaces the section above; the two are never both configured.
+#
+# [voice.diarization]
+# backend = "openai"
+# execution = "remote"
+# provider = "openai"
+# endpoint = "https://api.openai.com/v1"
+# model = "operator-supplied-diarization-model"
+# credential_env = "OPENAI_API_KEY"
+
 # Encrypted session recording. The directory holds ciphertext only and must be
 # private to the account running the gateway. `key_env` names the variable
 # holding the encryption key; the key is never written to this file, a status,

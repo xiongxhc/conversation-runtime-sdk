@@ -36,6 +36,31 @@ export OPENAI_API_KEY=...
 cargo test -p conversation-runtime-gateway --test online_latency -- --ignored --nocapture
 ```
 
+## 4. Confirm the structured-output directive shape against the real provider
+
+`processText` sends the caller's JSON Schema to the provider as a structured-output
+directive: `response_format.json_schema` with `strict: true` on the OpenAI-compatible
+endpoint, and `format` on Ollama. Neither shape has been exercised against a live
+provider; both were verified only against scripted local servers.
+
+OpenAI's `strict: true` mode requires every object in the schema to carry
+`additionalProperties: false` and to list every property in `required`. This runtime's
+validator neither requires nor rejects that, so a schema the runtime accepts can be one
+the provider refuses outright rather than degrades. Confirm before the first real note
+synthesis, and decide whether the runtime should reject such a schema up front.
+
+```bash
+cd /Users/cx/Workspace/conversation-runtime-sdk
+export OPENAI_API_KEY=...            # never commit; never echo
+cargo test -p conversation-runtime-gateway --test text_processing -- --ignored --nocapture
+```
+
+## 5. Confirm the batch diarization request shape against the real provider
+
+`reconcileRecording` posts to `{endpoint}/audio/diarizations` with a request body this
+repository defined itself. No real vendor is known to speak it. Confirm the endpoint and
+body against the provider that will actually be configured before the first real meeting.
+
 ## 3. Feishu client, test tenant, and real meeting acceptance
 
 Not in scope for this repository. Conversation Runtime is exercised here with scripted

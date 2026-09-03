@@ -13,9 +13,9 @@ use conversation_protocol::{
     ClientPersonaState, ClientProcessedText, ClientRecordingGap, ClientRecordingReconciliation,
     ClientRecordingSummary, ClientRuntimeError, ClientRuntimeEvent, ClientVoiceSessionEvent,
     GatewayMessage, MemoryApproval, RecoveryDisposition, RuntimeError, RuntimeErrorKind,
-    RuntimeEvent, RuntimeStatus, SessionId, TurnId, VoiceSessionEvent, CLIENT_PROTOCOL_VERSION,
-    CONTEXT_SEED_PROTOCOL_VERSION, LEGACY_CLIENT_PROTOCOL_VERSION,
-    RUNTIME_PROFILE_PROTOCOL_VERSION,
+    RuntimeEvent, RuntimeProfile, RuntimeStatus, SessionId, TurnId, VoiceResponseMode,
+    VoiceSessionEvent, CLIENT_PROTOCOL_VERSION, CONTEXT_SEED_PROTOCOL_VERSION,
+    LEGACY_CLIENT_PROTOCOL_VERSION, RUNTIME_PROFILE_PROTOCOL_VERSION,
 };
 use conversation_runtime::{
     process_text, reconcile_recording, ConversationContext, ProcessedText, RecordingSettings,
@@ -719,7 +719,11 @@ impl GatewaySession {
                     )
                 })
             }
-            ClientCommand::StartVoiceSession { request_id } => {
+            ClientCommand::StartVoiceSession {
+                request_id,
+                profile,
+                response_mode,
+            } => {
                 let Some(lane) = self.voice.as_ref() else {
                     return send_rejection(
                         normal,
@@ -751,6 +755,16 @@ impl GatewaySession {
                         command_error("the previous voice session is still finishing"),
                     )
                     .map_err(CommandFailure::response);
+                }
+                if let Some(profile) = profile {
+                    if RuntimeProfile::parse(&self.status.profile) != Some(profile) {
+                        return send_rejection(
+                            normal,
+                            &request_id,
+                            command_error("requested profile is unavailable"),
+                        )
+                        .map_err(CommandFailure::response);
+                    }
                 }
 
                 let session_id = self.session_id;
@@ -790,7 +804,13 @@ impl GatewaySession {
                     adapters = adapters.with_recorder(Arc::clone(recorder));
                 }
                 let runtime = VoiceSessionRuntime::new(lane.context.clone(), adapters);
-                let event_stream = match runtime.start(policy).await {
+                let event_stream = match runtime
+                    .start_with_response_mode(
+                        policy,
+                        response_mode.unwrap_or(VoiceResponseMode::Automatic),
+                    )
+                    .await
+                {
                     Ok(event_stream) => event_stream,
                     Err(error) => {
                         return send_rejection(
@@ -829,6 +849,59 @@ impl GatewaySession {
                     });
                 }
                 Ok(())
+            }
+            ClientCommand::AuthorizeVoiceResponse {
+                request_id,
+                session_id,
+                segment_id,
+                context_exchanges,
+            } => {
+                let Some(voice_session) = voice.active.as_ref() else {
+                    return send_rejection(
+                        normal,
+                        &request_id,
+                        command_error("no voice session is active"),
+                    )
+                    .map_err(CommandFailure::response);
+                };
+                match voice_session
+                    .runtime
+                    .authorize_response(session_id, segment_id, context_exchanges)
+                    .await
+                {
+                    Ok(turn_id) => send_normal(normal, accepted_turn_message(&request_id, turn_id))
+                        .map_err(CommandFailure::response),
+                    Err(error) => {
+                        send_rejection(normal, &request_id, ClientRuntimeError::from(error))
+                            .map_err(CommandFailure::response)
+                    }
+                }
+            }
+            ClientCommand::SkipVoiceResponse {
+                request_id,
+                session_id,
+                segment_id,
+                reason,
+            } => {
+                let Some(voice_session) = voice.active.as_ref() else {
+                    return send_rejection(
+                        normal,
+                        &request_id,
+                        command_error("no voice session is active"),
+                    )
+                    .map_err(CommandFailure::response);
+                };
+                match voice_session
+                    .runtime
+                    .skip_response(session_id, segment_id, reason)
+                    .await
+                {
+                    Ok(()) => send_accepted(normal, &request_id).map_err(CommandFailure::response),
+                    Err(error) => {
+                        send_rejection(normal, &request_id, ClientRuntimeError::from(error))
+                            .map_err(CommandFailure::response)
+                    }
+                }
             }
             ClientCommand::FinalizeRecording {
                 request_id,
@@ -1600,7 +1673,11 @@ async fn pump_voice_events(
                     event: RuntimeEvent::TranscriptFinal { turn_id, text },
                     ..
                 }
-                | VoiceSessionEvent::TranscriptFinal { turn_id, text, .. } => {
+                | VoiceSessionEvent::TranscriptFinal {
+                    turn_id: Some(turn_id),
+                    text,
+                    ..
+                } => {
                     exchange.recognized(*turn_id, text);
                 }
                 VoiceSessionEvent::Turn {

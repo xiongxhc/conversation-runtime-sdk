@@ -69,8 +69,19 @@ pub enum VoiceSessionEvent {
     },
     TranscriptFinal {
         session_id: SessionId,
-        turn_id: TurnId,
+        segment_id: u64,
+        turn_id: Option<TurnId>,
         text: String,
+    },
+    ResponseAuthorized {
+        session_id: SessionId,
+        segment_id: u64,
+        turn_id: TurnId,
+    },
+    ResponseSkipped {
+        session_id: SessionId,
+        segment_id: u64,
+        reason: String,
     },
     BargeIn {
         session_id: SessionId,

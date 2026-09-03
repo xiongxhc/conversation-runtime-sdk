@@ -18,6 +18,8 @@ import {
   type RuntimeEvent,
   type RuntimeFailure,
   type RuntimeStatus,
+  type RuntimeProfile,
+  type VoiceResponseMode,
   type VoiceSessionEvent,
 } from "./protocol.js";
 
@@ -339,7 +341,7 @@ export class RuntimeClient {
     return result.promise;
   }
 
-  startVoiceSession(): Promise<VoiceSession> {
+  startVoiceSession(options?: { profile?: RuntimeProfile; responseMode?: VoiceResponseMode }): Promise<VoiceSession> {
     const requestId = this.nextRequestId();
     const result = new Deferred<VoiceSession>();
     this.controls.set(requestId, {
@@ -348,7 +350,49 @@ export class RuntimeClient {
       result,
       fail: (error) => result.reject(error),
     });
-    this.send({ type: "start_voice_session", requestId });
+    this.send({ type: "start_voice_session", requestId, ...options });
+    return result.promise;
+  }
+
+  authorizeVoiceResponse({
+    sessionId,
+    segmentId,
+    contextExchanges,
+  }: {
+    sessionId: bigint;
+    segmentId: string;
+    contextExchanges: ConversationContextExchange[];
+  }): Promise<bigint> {
+    if (this.protocolVersion === undefined || this.protocolVersion < RUNTIME_PROFILE_PROTOCOL_VERSION) {
+      return Promise.reject(new Error("voice response authorization requires protocol version 3"));
+    }
+    const requestId = this.nextRequestId();
+    const command: ClientCommand = { type: "authorize_voice_response", requestId, sessionId, segmentId, contextExchanges };
+    try {
+      validateClientCommand(command, this.protocolVersion);
+    } catch (error) {
+      return Promise.reject(error as Error);
+    }
+    const result = new Deferred<bigint>();
+    this.controls.set(requestId, { kind: "authorize_voice_response", accepted: false, result, fail: (error) => result.reject(error) });
+    this.send(command);
+    return result.promise;
+  }
+
+  skipVoiceResponse({ sessionId, segmentId, reason }: { sessionId: bigint; segmentId: string; reason: string }): Promise<void> {
+    if (this.protocolVersion === undefined || this.protocolVersion < RUNTIME_PROFILE_PROTOCOL_VERSION) {
+      return Promise.reject(new Error("voice response authorization requires protocol version 3"));
+    }
+    const requestId = this.nextRequestId();
+    const command: ClientCommand = { type: "skip_voice_response", requestId, sessionId, segmentId, reason };
+    try {
+      validateClientCommand(command, this.protocolVersion);
+    } catch (error) {
+      return Promise.reject(error as Error);
+    }
+    const result = new Deferred<void>();
+    this.controls.set(requestId, { kind: "skip_voice_response", accepted: false, result, fail: (error) => result.reject(error) });
+    this.send(command);
     return result.promise;
   }
 
@@ -633,6 +677,14 @@ export class RuntimeClient {
         this.controls.delete(requestId);
         control.result.resolve();
         return;
+      case "authorize_voice_response":
+        this.controls.delete(requestId);
+        if (turnId === undefined) {
+          control.fail(new Error("gateway accepted a voice response authorization without a turn identifier"));
+        } else {
+          control.result.resolve(turnId);
+        }
+        return;
       case "start_voice_session": {
         this.controls.delete(requestId);
         if (this.activeVoiceSession) {
@@ -652,6 +704,7 @@ export class RuntimeClient {
       case "stop_voice_session":
       case "pause_voice_capture":
       case "resume_voice_capture":
+      case "skip_voice_response":
         this.controls.delete(requestId);
         control.result.resolve();
     }
@@ -752,6 +805,8 @@ type PendingControl =
   | { kind: "seed_conversation_context"; accepted: boolean; result: Deferred<void>; fail(error: Error): void }
   | { kind: "start_turn"; accepted: boolean; result: Deferred<RuntimeTurn>; fail(error: Error): void }
   | { kind: "interrupt_turn"; accepted: boolean; result: Deferred<void>; fail(error: Error): void }
+  | { kind: "authorize_voice_response"; accepted: boolean; result: Deferred<bigint>; fail(error: Error): void }
+  | { kind: "skip_voice_response"; accepted: boolean; result: Deferred<void>; fail(error: Error): void }
   | { kind: "start_voice_session"; accepted: boolean; result: Deferred<VoiceSession>; fail(error: Error): void }
   | { kind: "stop_voice_session"; accepted: boolean; result: Deferred<void>; fail(error: Error): void }
   | { kind: "pause_voice_capture"; accepted: boolean; result: Deferred<void>; fail(error: Error): void }

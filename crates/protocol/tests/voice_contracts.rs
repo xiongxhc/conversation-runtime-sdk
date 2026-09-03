@@ -161,7 +161,8 @@ fn public_voice_projection_rejects_zero_identifiers_in_every_position() {
     };
     let zero_turn = VoiceSessionEvent::TranscriptFinal {
         session_id: SessionId::new(1),
-        turn_id: TurnId::new(0),
+        segment_id: 1,
+        turn_id: Some(TurnId::new(0)),
         text: "final".to_owned(),
     };
     let zero_generation = VoiceSessionEvent::Turn {

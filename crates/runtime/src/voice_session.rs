@@ -10,9 +10,10 @@ use conversation_model_adapters::{
     VoiceIoFactory, VoiceIoSession,
 };
 use conversation_protocol::{
-    GenerationId, PlaybackState, PrivacySummary, RecoveryDisposition, RuntimeError,
-    RuntimeErrorKind, RuntimeEvent, RuntimeStage, RuntimeTimingMilestone, SessionId, TurnId,
-    VoiceActivity, VoiceSessionEvent, VoiceSessionPolicy, VoiceTimingMilestone,
+    ConversationContextExchange, GenerationId, PlaybackState, PrivacySummary, RecoveryDisposition,
+    RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage, RuntimeTimingMilestone, SessionId,
+    TurnId, VoiceActivity, VoiceResponseMode, VoiceSessionEvent, VoiceSessionPolicy,
+    VoiceTimingMilestone,
 };
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::{JoinError, JoinHandle};
@@ -32,6 +33,7 @@ const MAX_PENDING_RELIABLE_EVENTS: usize = SESSION_EVENT_BUFFER_SIZE;
 const MAX_PENDING_PARTIAL_SEGMENTS: usize = SESSION_EVENT_BUFFER_SIZE;
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const LATE_RECOGNITION_SETTLE_MS: u64 = 120;
+const MAX_PENDING_SEGMENTS: usize = 32;
 
 #[derive(Clone)]
 pub struct VoiceSessionAdapters {
@@ -90,6 +92,15 @@ impl VoiceSessionRuntime {
         &self,
         policy: VoiceSessionPolicy,
     ) -> Result<VoiceSessionEventStream, RuntimeError> {
+        self.start_with_response_mode(policy, VoiceResponseMode::Automatic)
+            .await
+    }
+
+    pub async fn start_with_response_mode(
+        &self,
+        policy: VoiceSessionPolicy,
+        response_mode: VoiceResponseMode,
+    ) -> Result<VoiceSessionEventStream, RuntimeError> {
         let privacy = validate_voice_policy(&policy)?;
         let session_id = policy.session_id();
         let mut active = self.active.lock().await;
@@ -123,6 +134,7 @@ impl VoiceSessionRuntime {
                 command_receiver,
                 event_sender,
                 task_cancellation,
+                response_mode,
             )
             .await;
 
@@ -175,6 +187,50 @@ impl VoiceSessionRuntime {
         completed
             .await
             .map_err(|_| runtime_error("voice session ended before shutdown completed"))
+    }
+
+    pub async fn authorize_response(
+        &self,
+        session_id: SessionId,
+        segment_id: u64,
+        context_exchanges: Vec<ConversationContextExchange>,
+    ) -> Result<TurnId, RuntimeError> {
+        let commands = self.active_commands().await?;
+        let (completion, completed) = oneshot::channel();
+        commands
+            .send(SessionCommand::AuthorizeResponse {
+                session_id,
+                segment_id,
+                context_exchanges,
+                completion,
+            })
+            .await
+            .map_err(|_| runtime_error("voice session command channel closed"))?;
+        completed
+            .await
+            .map_err(|_| runtime_error("voice session ended before authorization completed"))?
+    }
+
+    pub async fn skip_response(
+        &self,
+        session_id: SessionId,
+        segment_id: u64,
+        reason: String,
+    ) -> Result<(), RuntimeError> {
+        let commands = self.active_commands().await?;
+        let (completion, completed) = oneshot::channel();
+        commands
+            .send(SessionCommand::SkipResponse {
+                session_id,
+                segment_id,
+                reason,
+                completion,
+            })
+            .await
+            .map_err(|_| runtime_error("voice session command channel closed"))?;
+        completed
+            .await
+            .map_err(|_| runtime_error("voice session ended before skip completed"))?
     }
 
     pub async fn pause_capture(&self) -> Result<(), RuntimeError> {
@@ -260,6 +316,18 @@ enum SessionCommand {
     ResumeCapture {
         completion: oneshot::Sender<Result<(), RuntimeError>>,
     },
+    AuthorizeResponse {
+        session_id: SessionId,
+        segment_id: u64,
+        context_exchanges: Vec<ConversationContextExchange>,
+        completion: oneshot::Sender<Result<TurnId, RuntimeError>>,
+    },
+    SkipResponse {
+        session_id: SessionId,
+        segment_id: u64,
+        reason: String,
+        completion: oneshot::Sender<Result<(), RuntimeError>>,
+    },
     Shutdown {
         completion: oneshot::Sender<()>,
     },
@@ -273,6 +341,7 @@ async fn run_voice_session(
     mut commands: mpsc::Receiver<SessionCommand>,
     events: mpsc::Sender<VoiceSessionEvent>,
     cancellation: CancellationToken,
+    response_mode: VoiceResponseMode,
 ) -> VoiceSessionEvent {
     let session_id = policy.session_id();
     let VoiceIoSession {
@@ -332,7 +401,7 @@ async fn run_voice_session(
 
     let recorder = adapters.recorder;
     let turn_runtime = StreamingTurnRuntime::new(
-        context,
+        context.clone(),
         adapters.language_model,
         adapters.speech_synthesizer,
         output.clone(),
@@ -347,6 +416,8 @@ async fn run_voice_session(
         events,
         cancellation,
         recorder,
+        response_mode,
+        context,
     )
     .run()
     .await
@@ -421,6 +492,16 @@ struct VoiceLoop {
     partials: BTreeMap<u64, String>,
     playback: Option<PlaybackLifecycle>,
     recorder: Option<Arc<Mutex<SessionRecorder>>>,
+    response_mode: VoiceResponseMode,
+    pending_segments: BTreeMap<u64, PendingSegment>,
+    pending_order: VecDeque<u64>,
+    context: ConversationContext,
+}
+
+enum PendingSegment {
+    Pending(String),
+    Authorized(TurnId),
+    Skipped,
 }
 
 impl VoiceLoop {
@@ -435,6 +516,8 @@ impl VoiceLoop {
         events: mpsc::Sender<VoiceSessionEvent>,
         cancellation: CancellationToken,
         recorder: Option<Arc<Mutex<SessionRecorder>>>,
+        response_mode: VoiceResponseMode,
+        context: ConversationContext,
     ) -> Self {
         let final_silence_ms = policy.final_silence_ms();
         Self {
@@ -462,6 +545,10 @@ impl VoiceLoop {
             partials: BTreeMap::new(),
             playback: None,
             recorder,
+            response_mode,
+            pending_segments: BTreeMap::new(),
+            pending_order: VecDeque::new(),
+            context,
         }
     }
 
@@ -577,9 +664,128 @@ impl VoiceLoop {
                 self.start_capture_operation(CaptureOperationKind::Resume, completion);
                 None
             }
+            Some(SessionCommand::AuthorizeResponse {
+                session_id,
+                segment_id,
+                context_exchanges,
+                completion,
+            }) => {
+                let result = self
+                    .authorize_segment(session_id, segment_id, context_exchanges)
+                    .await;
+                let _ = completion.send(result);
+                None
+            }
+            Some(SessionCommand::SkipResponse {
+                session_id,
+                segment_id,
+                reason,
+                completion,
+            }) => {
+                let result = self.skip_segment(session_id, segment_id, reason).await;
+                let _ = completion.send(result);
+                None
+            }
             Some(SessionCommand::Shutdown { completion }) => Some(LoopExit::Shutdown(completion)),
             None => Some(LoopExit::Shutdown(closed_completion())),
         }
+    }
+
+    async fn authorize_segment(
+        &mut self,
+        session_id: SessionId,
+        segment_id: u64,
+        context_exchanges: Vec<ConversationContextExchange>,
+    ) -> Result<TurnId, RuntimeError> {
+        if self.response_mode != VoiceResponseMode::ExternalGate || session_id != self.session_id {
+            return Err(runtime_error(
+                "voice response authorization is not available for this session",
+            ));
+        }
+        if let Some(PendingSegment::Authorized(turn_id)) = self.pending_segments.get(&segment_id) {
+            return Ok(*turn_id);
+        }
+        let Some(PendingSegment::Pending(text)) = self.pending_segments.remove(&segment_id) else {
+            return Err(runtime_error("voice response segment is not pending"));
+        };
+        self.context
+            .seed_completed_history(
+                &format!("voice-authorize-{}-{segment_id}", self.session_id.get()),
+                &context_exchanges,
+            )
+            .await?;
+        let started = self
+            .turn_runtime
+            .start_turn(
+                ConversationTurnSource::Voice {
+                    session_id: self.session_id,
+                },
+                text,
+            )
+            .await?;
+        let identity = started.identity();
+        let turn_id = identity.turn_id();
+        let generation_id = identity.generation_id();
+        self.pending_segments
+            .insert(segment_id, PendingSegment::Authorized(turn_id));
+        let mut turn_events = started.into_events();
+        if !self
+            .publish_reliable(VoiceSessionEvent::ResponseAuthorized {
+                session_id: self.session_id,
+                segment_id,
+                turn_id,
+            })
+            .await
+        {
+            let _ = self
+                .turn_runtime
+                .abort_turn(turn_id, generation_id, &mut turn_events)
+                .await;
+            return Err(runtime_error(
+                "voice session event stream closed during authorization",
+            ));
+        }
+        self.turn_events = Some(turn_events);
+        self.state = VoiceLoopState::Responding {
+            turn_id,
+            generation_id,
+        };
+        self.playback = Some(PlaybackLifecycle::AwaitingAcceptance {
+            generation_id,
+            pending_rendered: None,
+        });
+        Ok(turn_id)
+    }
+
+    async fn skip_segment(
+        &mut self,
+        session_id: SessionId,
+        segment_id: u64,
+        reason: String,
+    ) -> Result<(), RuntimeError> {
+        if self.response_mode != VoiceResponseMode::ExternalGate || session_id != self.session_id {
+            return Err(runtime_error(
+                "voice response authorization is not available for this session",
+            ));
+        }
+        let Some(PendingSegment::Pending(_)) = self.pending_segments.get(&segment_id) else {
+            return Err(runtime_error("voice response segment is not pending"));
+        };
+        self.pending_segments
+            .insert(segment_id, PendingSegment::Skipped);
+        if !self
+            .publish_reliable(VoiceSessionEvent::ResponseSkipped {
+                session_id: self.session_id,
+                segment_id,
+                reason,
+            })
+            .await
+        {
+            return Err(runtime_error(
+                "voice session event stream closed during skip",
+            ));
+        }
+        Ok(())
     }
 
     fn start_capture_operation(
@@ -907,6 +1113,15 @@ impl VoiceLoop {
         let Some(finalized) = self.finalizer.finalize_ready(self.clock.now_ms()) else {
             return Ok(());
         };
+        let segment_id = self
+            .active_segment_id
+            .take()
+            .ok_or_else(|| runtime_error("finalized voice transcript has no segment identifier"))?;
+        if self.response_mode == VoiceResponseMode::ExternalGate {
+            self.register_pending_segment(segment_id, finalized.text.clone())
+                .await?;
+            return Ok(());
+        }
         let started = self
             .turn_runtime
             .start_turn(
@@ -924,7 +1139,8 @@ impl VoiceLoop {
         let published = self
             .publish_reliable(VoiceSessionEvent::TranscriptFinal {
                 session_id: self.session_id,
-                turn_id,
+                segment_id,
+                turn_id: Some(turn_id),
                 text: finalized.text.clone(),
             })
             .await
@@ -953,6 +1169,52 @@ impl VoiceLoop {
             generation_id,
             pending_rendered: None,
         });
+        Ok(())
+    }
+
+    async fn register_pending_segment(
+        &mut self,
+        segment_id: u64,
+        text: String,
+    ) -> Result<(), RuntimeError> {
+        while self.pending_order.len() >= MAX_PENDING_SEGMENTS {
+            let Some(expired) = self.pending_order.pop_front() else {
+                break;
+            };
+            if matches!(
+                self.pending_segments.remove(&expired),
+                Some(PendingSegment::Pending(_))
+            ) {
+                if !self
+                    .publish_reliable(VoiceSessionEvent::ResponseSkipped {
+                        session_id: self.session_id,
+                        segment_id: expired,
+                        reason: "pending_segment_expired".to_owned(),
+                    })
+                    .await
+                {
+                    return Err(runtime_error(
+                        "voice session event stream closed during segment expiry",
+                    ));
+                }
+            }
+        }
+        self.pending_order.push_back(segment_id);
+        self.pending_segments
+            .insert(segment_id, PendingSegment::Pending(text.clone()));
+        if !self
+            .publish_reliable(VoiceSessionEvent::TranscriptFinal {
+                session_id: self.session_id,
+                segment_id,
+                turn_id: None,
+                text,
+            })
+            .await
+        {
+            return Err(runtime_error(
+                "voice session event stream closed during finalization",
+            ));
+        }
         Ok(())
     }
 
@@ -1603,6 +1865,14 @@ async fn wait_for_startup_shutdown(
             Some(SessionCommand::ResumeCapture { completion }) => {
                 let _ = completion.send(Err(runtime_error("voice capture is not paused")));
             }
+            Some(SessionCommand::AuthorizeResponse { completion, .. }) => {
+                let _ =
+                    completion.send(Err(runtime_error("voice response segment is not pending")));
+            }
+            Some(SessionCommand::SkipResponse { completion, .. }) => {
+                let _ =
+                    completion.send(Err(runtime_error("voice response segment is not pending")));
+            }
             Some(SessionCommand::Shutdown { completion }) => return completion,
             None => return closed_completion(),
         }
@@ -1618,13 +1888,14 @@ fn closed_completion() -> oneshot::Sender<()> {
 #[cfg(test)]
 mod tests {
     use conversation_model_adapters::{
-        GenerationLanguageRequest, GenerationTextDelta, MockContinuousAudioOutput,
+        AdapterError, GenerationLanguageRequest, GenerationTextDelta, MockContinuousAudioOutput,
         MockStreamingSpeechSynthesizer, MockVoiceCaptureControl, RecognitionHypothesis,
     };
     use conversation_protocol::{
         ComponentDescriptor, ComponentKind, ConversationMode, ExecutionLocation, PersonaProfile,
-        PrivacyMode, ResponseControls,
+        PrivacyMode, ResponseControls, RuntimeStage,
     };
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Notify;
 
     use super::*;
@@ -1633,6 +1904,24 @@ mod tests {
     #[derive(Default)]
     struct BlockingLanguage {
         started: Arc<Notify>,
+    }
+
+    struct CountingLanguage(Arc<AtomicUsize>);
+
+    impl GenerationLanguageModel for CountingLanguage {
+        fn stream(
+            &self,
+            _request: GenerationLanguageRequest,
+            cancellation: CancellationToken,
+        ) -> mpsc::Receiver<Result<GenerationTextDelta, AdapterError>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            let (sender, receiver) = mpsc::channel(1);
+            tokio::spawn(async move {
+                cancellation.cancelled().await;
+                drop(sender);
+            });
+            receiver
+        }
     }
 
     impl GenerationLanguageModel for BlockingLanguage {
@@ -1692,10 +1981,13 @@ mod tests {
             event_sender,
             CancellationToken::new(),
             None,
+            VoiceResponseMode::Automatic,
+            context.clone(),
         );
         voice_loop
             .finalizer
             .observe_hypothesis(RecognitionHypothesis::engine_final(1, "hello"), 0);
+        voice_loop.active_segment_id = Some(1);
         voice_loop
             .finalizer
             .observe_activity(VoiceActivity::SpeechEnded { at_ms: 0 });
@@ -1714,5 +2006,116 @@ mod tests {
             .await
             .expect("aborted finalization must release the shared context");
         context.discard_turn(next.identity(), false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn external_gate_defers_ten_finalized_segments_until_one_is_authorized() {
+        let session_id = SessionId::new(1);
+        let policy = VoiceSessionPolicy::new(
+            session_id,
+            PrivacyMode::LocalOnly,
+            200,
+            600,
+            [ComponentDescriptor::new(
+                ComponentKind::SpeechRecognition,
+                "local-recognition",
+                ExecutionLocation::Local,
+            )],
+        )
+        .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let context = ConversationContext::new(ConversationQualityController::new(
+            PersonaProfile::default(),
+            ResponseControls::default(),
+            ConversationMode::DirectAnswer,
+        ));
+        let speech = Arc::new(MockStreamingSpeechSynthesizer::new([]));
+        let runtime = StreamingTurnRuntime::new(
+            context.clone(),
+            Arc::new(CountingLanguage(Arc::clone(&calls))),
+            speech.clone(),
+            Arc::new(MockContinuousAudioOutput::new()),
+        );
+        let (_input, input_receiver) = mpsc::channel(1);
+        let (_commands, command_receiver) = mpsc::channel(1);
+        let (event_sender, _events) = mpsc::channel(SESSION_EVENT_BUFFER_SIZE);
+        let mut loop_ = VoiceLoop::new(
+            policy,
+            input_receiver,
+            Arc::new(MockVoiceCaptureControl::new()),
+            tokio::spawn(async { Ok(()) }),
+            runtime,
+            command_receiver,
+            event_sender,
+            CancellationToken::new(),
+            None,
+            VoiceResponseMode::ExternalGate,
+            context.clone(),
+        );
+        for segment_id in 1..=10 {
+            loop_
+                .register_pending_segment(segment_id, format!("segment {segment_id}"))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no language or TTS work starts before authorization"
+        );
+        assert!(
+            speech.requests().is_empty(),
+            "no TTS request starts before authorization"
+        );
+        let exchanges = vec![ConversationContextExchange::new("earlier", "context").unwrap()];
+        for segment_id in 11..=33 {
+            loop_
+                .register_pending_segment(segment_id, format!("segment {segment_id}"))
+                .await
+                .unwrap();
+        }
+        assert_eq!(loop_.pending_segments.len(), MAX_PENDING_SEGMENTS);
+        assert!(loop_
+            .authorize_segment(session_id, 1, exchanges.clone())
+            .await
+            .is_err());
+        let turn_id = loop_
+            .authorize_segment(session_id, 2, exchanges.clone())
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            loop_
+                .authorize_segment(session_id, 2, exchanges.clone())
+                .await
+                .unwrap(),
+            turn_id
+        );
+        assert!(loop_
+            .authorize_segment(SessionId::new(2), 3, exchanges.clone())
+            .await
+            .is_err());
+        loop_
+            .skip_segment(session_id, 3, "not addressed".to_owned())
+            .await
+            .unwrap();
+        assert!(loop_
+            .authorize_segment(session_id, 3, exchanges)
+            .await
+            .is_err());
+        assert!(loop_
+            .handle_input(Some(Err(AdapterError::new("recognition unavailable")
+                .with_stage(RuntimeStage::SpeechRecognizer),)))
+            .await
+            .is_none());
+        loop_
+            .register_pending_segment(34, "after skip and provider recovery".to_owned())
+            .await
+            .unwrap();
+        assert!(matches!(
+            loop_.pending_segments.get(&34),
+            Some(PendingSegment::Pending(text)) if text == "after skip and provider recovery"
+        ));
     }
 }

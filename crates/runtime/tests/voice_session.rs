@@ -1973,11 +1973,15 @@ fn assert_final_and_completed(observed: &[VoiceSessionEvent], turn_id: TurnId, t
             .count(),
         1
     );
-    assert!(observed.contains(&VoiceSessionEvent::TranscriptFinal {
-        session_id: SESSION_ID,
-        turn_id,
-        text: text.to_owned(),
-    }));
+    assert!(observed.iter().any(|event| matches!(
+        event,
+        VoiceSessionEvent::TranscriptFinal {
+            session_id: SESSION_ID,
+            turn_id: Some(observed_turn_id),
+            text: observed_text,
+            ..
+        } if *observed_turn_id == turn_id && observed_text == text
+    )));
     assert!(observed.contains(&VoiceSessionEvent::Turn {
         session_id: SESSION_ID,
         generation_id: GenerationId::new(turn_id.get()),

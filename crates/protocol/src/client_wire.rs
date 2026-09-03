@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::fmt;
 
+use serde::ser::{Error as _, SerializeStruct};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::client_diarization::validate_client_recording_reconciliation;
@@ -14,9 +15,9 @@ use crate::{
     ConversationMode, ExecutionLocation, FollowUpPolicy, MemoryId, MemoryRetrievalTrace,
     PrivacyMode, QualityDecision, ResponseControls, RetrievalTraceId, RuntimeError,
     RuntimeErrorKind, RuntimeEvent, RuntimeProfile, RuntimeStage, RuntimeTimingMilestone,
-    SessionId, SilencePolicy, SpeechPace, TurnId, MAX_CONVERSATION_MESSAGE_BYTES,
-    MAX_HISTORY_BYTES, MAX_MEMORY_CONTENT_BYTES, MAX_MEMORY_INSPECTION_HISTORY_ITEMS,
-    MAX_MEMORY_LIST_PAGE_ITEMS, MAX_MEMORY_PREVIEW_BYTES,
+    SessionId, SilencePolicy, SpeechPace, TurnId, VoiceResponseMode,
+    MAX_CONVERSATION_MESSAGE_BYTES, MAX_HISTORY_BYTES, MAX_MEMORY_CONTENT_BYTES,
+    MAX_MEMORY_INSPECTION_HISTORY_ITEMS, MAX_MEMORY_LIST_PAGE_ITEMS, MAX_MEMORY_PREVIEW_BYTES,
 };
 
 /// The oldest protocol version this build still speaks.
@@ -77,6 +78,8 @@ pub enum ClientCommand {
     },
     StartVoiceSession {
         request_id: String,
+        profile: Option<RuntimeProfile>,
+        response_mode: Option<VoiceResponseMode>,
     },
     StopVoiceSession {
         request_id: String,
@@ -86,6 +89,18 @@ pub enum ClientCommand {
     },
     ResumeVoiceCapture {
         request_id: String,
+    },
+    AuthorizeVoiceResponse {
+        request_id: String,
+        session_id: SessionId,
+        segment_id: u64,
+        context_exchanges: Vec<ConversationContextExchange>,
+    },
+    SkipVoiceResponse {
+        request_id: String,
+        session_id: SessionId,
+        segment_id: u64,
+        reason: String,
     },
     SeedConversationContext {
         request_id: String,
@@ -596,10 +611,35 @@ fn decode_wire_client_command(
         WireClientCommand::StartVoiceSession {
             protocol_version,
             request_id,
+            profile,
+            response_mode,
         } => {
             validate_protocol_version(protocol_version)?;
+            if protocol_version < RUNTIME_PROFILE_PROTOCOL_VERSION
+                && (profile.is_some() || response_mode.is_some())
+            {
+                return Err(ClientWireError::UnsupportedProtocolVersion(
+                    protocol_version,
+                ));
+            }
             validate_request_id(&request_id)?;
-            Ok(ClientCommand::StartVoiceSession { request_id })
+            let profile = match profile {
+                Some(value) => Some(
+                    RuntimeProfile::parse(&value).ok_or(ClientWireError::InvalidRuntimeStatus)?,
+                ),
+                None => None,
+            };
+            let response_mode = match response_mode {
+                Some(value) => Some(
+                    VoiceResponseMode::parse(&value).ok_or(ClientWireError::InvalidTranscript)?,
+                ),
+                None => None,
+            };
+            Ok(ClientCommand::StartVoiceSession {
+                request_id,
+                profile,
+                response_mode,
+            })
         }
         WireClientCommand::StopVoiceSession {
             protocol_version,
@@ -624,6 +664,52 @@ fn decode_wire_client_command(
             validate_protocol_version(protocol_version)?;
             validate_request_id(&request_id)?;
             Ok(ClientCommand::ResumeVoiceCapture { request_id })
+        }
+        WireClientCommand::AuthorizeVoiceResponse {
+            protocol_version,
+            request_id,
+            session_id,
+            segment_id,
+            context_exchanges,
+        } => {
+            validate_protocol_version(protocol_version)?;
+            if protocol_version < RUNTIME_PROFILE_PROTOCOL_VERSION {
+                return Err(ClientWireError::UnsupportedProtocolVersion(
+                    protocol_version,
+                ));
+            }
+            validate_request_id(&request_id)?;
+            let context_exchanges = validate_context_exchanges(context_exchanges)?;
+            Ok(ClientCommand::AuthorizeVoiceResponse {
+                request_id,
+                session_id: SessionId::new(session_id.0),
+                segment_id: segment_id.0,
+                context_exchanges,
+            })
+        }
+        WireClientCommand::SkipVoiceResponse {
+            protocol_version,
+            request_id,
+            session_id,
+            segment_id,
+            reason,
+        } => {
+            validate_protocol_version(protocol_version)?;
+            if protocol_version < RUNTIME_PROFILE_PROTOCOL_VERSION {
+                return Err(ClientWireError::UnsupportedProtocolVersion(
+                    protocol_version,
+                ));
+            }
+            validate_request_id(&request_id)?;
+            if reason.is_empty() || reason.len() > 128 {
+                return Err(ClientWireError::InvalidTranscript);
+            }
+            Ok(ClientCommand::SkipVoiceResponse {
+                request_id,
+                session_id: SessionId::new(session_id.0),
+                segment_id: segment_id.0,
+                reason,
+            })
         }
         WireClientCommand::SeedConversationContext {
             protocol_version,
@@ -836,6 +922,10 @@ enum WireClientCommand {
     StartVoiceSession {
         protocol_version: u64,
         request_id: String,
+        #[serde(default)]
+        profile: Option<String>,
+        #[serde(default)]
+        response_mode: Option<String>,
     },
     StopVoiceSession {
         protocol_version: u64,
@@ -848,6 +938,20 @@ enum WireClientCommand {
     ResumeVoiceCapture {
         protocol_version: u64,
         request_id: String,
+    },
+    AuthorizeVoiceResponse {
+        protocol_version: u64,
+        request_id: String,
+        session_id: DecimalIdentifier,
+        segment_id: DecimalIdentifier,
+        context_exchanges: Vec<WireConversationContextExchange>,
+    },
+    SkipVoiceResponse {
+        protocol_version: u64,
+        request_id: String,
+        session_id: DecimalIdentifier,
+        segment_id: DecimalIdentifier,
+        reason: String,
     },
     SeedConversationContext {
         protocol_version: u64,
@@ -930,6 +1034,12 @@ impl WireClientCommand {
                 protocol_version, ..
             }
             | Self::ResumeVoiceCapture {
+                protocol_version, ..
+            }
+            | Self::AuthorizeVoiceResponse {
+                protocol_version, ..
+            }
+            | Self::SkipVoiceResponse {
                 protocol_version, ..
             }
             | Self::SeedConversationContext {
@@ -1307,6 +1417,40 @@ impl<'a> WireRuntimeStatus<'a> {
     }
 }
 
+struct WireClientVoiceSessionEvent<'a> {
+    event: &'a ClientVoiceSessionEvent,
+    protocol_version: u64,
+}
+
+impl Serialize for WireClientVoiceSessionEvent<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.protocol_version >= RUNTIME_PROFILE_PROTOCOL_VERSION {
+            return self.event.serialize(serializer);
+        }
+        match self.event {
+            ClientVoiceSessionEvent::VoiceTranscriptFinal {
+                session_id,
+                turn_id: Some(turn_id),
+                text,
+                ..
+            } => {
+                let mut object = serializer.serialize_struct("ClientVoiceSessionEvent", 4)?;
+                object.serialize_field("type", "voice_transcript_final")?;
+                object.serialize_field("session_id", &session_id.get().to_string())?;
+                object.serialize_field("turn_id", &turn_id.get().to_string())?;
+                object.serialize_field("text", text)?;
+                object.end()
+            }
+            ClientVoiceSessionEvent::ResponseAuthorized { .. }
+            | ClientVoiceSessionEvent::ResponseSkipped { .. }
+            | ClientVoiceSessionEvent::VoiceTranscriptFinal { turn_id: None, .. } => Err(
+                S::Error::custom("voice response authorization requires protocol version 3"),
+            ),
+            event => event.serialize(serializer),
+        }
+    }
+}
+
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum GatewayMessageEnvelope<'a> {
@@ -1347,7 +1491,7 @@ enum GatewayMessageEnvelope<'a> {
     },
     VoiceEvent {
         protocol_version: u64,
-        event: &'a ClientVoiceSessionEvent,
+        event: WireClientVoiceSessionEvent<'a>,
     },
     Fatal {
         protocol_version: u64,
@@ -1435,7 +1579,10 @@ impl<'a> GatewayMessageEnvelope<'a> {
             },
             GatewayMessage::VoiceEvent { event } => Self::VoiceEvent {
                 protocol_version,
-                event,
+                event: WireClientVoiceSessionEvent {
+                    event,
+                    protocol_version,
+                },
             },
             GatewayMessage::Fatal { error } => Self::Fatal {
                 protocol_version,
@@ -1609,6 +1756,18 @@ fn validate_gateway_message(
             Ok(())
         }
         GatewayMessage::VoiceEvent { event } => {
+            if protocol_version < RUNTIME_PROFILE_PROTOCOL_VERSION
+                && matches!(
+                    event,
+                    ClientVoiceSessionEvent::ResponseAuthorized { .. }
+                        | ClientVoiceSessionEvent::ResponseSkipped { .. }
+                        | ClientVoiceSessionEvent::VoiceTranscriptFinal { turn_id: None, .. }
+                )
+            {
+                return Err(ClientWireError::UnsupportedProtocolVersion(
+                    protocol_version,
+                ));
+            }
             crate::client_voice::validate_client_voice_event(event)
         }
         GatewayMessage::Ready { status } => validate_runtime_status(status, protocol_version),

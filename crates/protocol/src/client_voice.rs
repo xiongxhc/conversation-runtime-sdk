@@ -72,9 +72,26 @@ pub enum ClientVoiceSessionEvent {
     VoiceTranscriptFinal {
         #[serde(serialize_with = "serialize_session_id")]
         session_id: SessionId,
+        #[serde(serialize_with = "serialize_identifier")]
+        segment_id: u64,
+        #[serde(serialize_with = "serialize_optional_turn_id")]
+        turn_id: Option<TurnId>,
+        text: String,
+    },
+    ResponseAuthorized {
+        #[serde(serialize_with = "serialize_session_id")]
+        session_id: SessionId,
+        #[serde(serialize_with = "serialize_identifier")]
+        segment_id: u64,
         #[serde(serialize_with = "serialize_turn_id")]
         turn_id: TurnId,
-        text: String,
+    },
+    ResponseSkipped {
+        #[serde(serialize_with = "serialize_session_id")]
+        session_id: SessionId,
+        #[serde(serialize_with = "serialize_identifier")]
+        segment_id: u64,
+        reason: String,
     },
     VoiceBargeIn {
         #[serde(serialize_with = "serialize_session_id")]
@@ -190,12 +207,32 @@ impl TryFrom<VoiceSessionEvent> for ClientVoiceSessionEvent {
             },
             VoiceSessionEvent::TranscriptFinal {
                 session_id,
+                segment_id,
                 turn_id,
                 text,
             } => Self::VoiceTranscriptFinal {
                 session_id,
+                segment_id,
                 turn_id,
                 text,
+            },
+            VoiceSessionEvent::ResponseAuthorized {
+                session_id,
+                segment_id,
+                turn_id,
+            } => Self::ResponseAuthorized {
+                session_id,
+                segment_id,
+                turn_id,
+            },
+            VoiceSessionEvent::ResponseSkipped {
+                session_id,
+                segment_id,
+                reason,
+            } => Self::ResponseSkipped {
+                session_id,
+                segment_id,
+                reason,
             },
             VoiceSessionEvent::BargeIn {
                 session_id,
@@ -350,6 +387,8 @@ pub(crate) fn validate_client_voice_event(
         | ClientVoiceSessionEvent::VoiceActivity { session_id, .. }
         | ClientVoiceSessionEvent::VoiceTranscriptPartial { session_id, .. }
         | ClientVoiceSessionEvent::VoiceTranscriptFinal { session_id, .. }
+        | ClientVoiceSessionEvent::ResponseAuthorized { session_id, .. }
+        | ClientVoiceSessionEvent::ResponseSkipped { session_id, .. }
         | ClientVoiceSessionEvent::VoiceBargeIn { session_id, .. }
         | ClientVoiceSessionEvent::VoiceTurnEvent { session_id, .. }
         | ClientVoiceSessionEvent::VoiceTiming { session_id, .. }
@@ -374,9 +413,35 @@ pub(crate) fn validate_client_voice_event(
             validate_identifier(*segment_id)?;
             validate_voice_text(text)
         }
-        ClientVoiceSessionEvent::VoiceTranscriptFinal { turn_id, text, .. } => {
-            validate_identifier(turn_id.get())?;
+        ClientVoiceSessionEvent::VoiceTranscriptFinal {
+            segment_id,
+            turn_id,
+            text,
+            ..
+        } => {
+            validate_identifier(*segment_id)?;
+            turn_id
+                .map(|turn_id| validate_identifier(turn_id.get()))
+                .unwrap_or(Ok(()))?;
             validate_voice_text(text)
+        }
+        ClientVoiceSessionEvent::ResponseAuthorized {
+            segment_id,
+            turn_id,
+            ..
+        } => {
+            validate_identifier(*segment_id)?;
+            validate_identifier(turn_id.get())
+        }
+        ClientVoiceSessionEvent::ResponseSkipped {
+            segment_id, reason, ..
+        } => {
+            validate_identifier(*segment_id)?;
+            if reason.is_empty() || reason.len() > 128 {
+                Err(ClientWireError::InvalidVoiceEvent)
+            } else {
+                Ok(())
+            }
         }
         ClientVoiceSessionEvent::VoiceBargeIn {
             turn_id,

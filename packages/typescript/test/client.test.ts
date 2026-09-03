@@ -87,6 +87,54 @@ test("stores a version two ready and uses it for existing commands", async () =>
   await Promise.all(pending.map((operation) => assert.rejects(operation, /runtime client closed/)));
 });
 
+test("external-gated voice responses use version-three scoped commands", async () => {
+  const { client, transport } = await connectedV3Client();
+  const starting = client.startVoiceSession({ profile: "offline", responseMode: "external_gate" });
+  const start = command(transport, "start_voice_session");
+  assert.deepEqual(start, {
+    type: "start_voice_session",
+    requestId: start.requestId,
+    profile: "offline",
+    responseMode: "external_gate",
+  });
+  transport.push(acceptedForVersion(start.requestId, 3));
+  const session = await starting;
+  transport.push(voiceEventForVersion({
+    type: "voice_session_started",
+    session_id: "7",
+    privacy: { privacy_mode: "local_only", components: wireVoiceComponents() },
+  }, 3));
+  transport.push(voiceEventForVersion({
+    type: "voice_transcript_final",
+    session_id: "7",
+    segment_id: "9",
+    turn_id: null,
+    text: "agenda item",
+  }, 3));
+
+  const authorizing = client.authorizeVoiceResponse({
+    sessionId: 7n,
+    segmentId: "9",
+    contextExchanges: [{ user: "earlier", assistant: "context" }],
+  });
+  const authorize = command(transport, "authorize_voice_response");
+  assert.equal(authorize.sessionId, 7n);
+  assert.equal(authorize.segmentId, "9");
+  transport.push(acceptedForVersion(authorize.requestId, 3, 11n));
+  assert.equal(await authorizing, 11n);
+
+  const skipping = client.skipVoiceResponse({ sessionId: 7n, segmentId: "10", reason: "not addressed" });
+  const skip = command(transport, "skip_voice_response");
+  assert.equal(skip.sessionId, 7n);
+  assert.equal(skip.segmentId, "10");
+  assert.equal(skip.reason, "not addressed");
+  transport.push(acceptedForVersion(skip.requestId, 3));
+  await skipping;
+  transport.push(voiceEventForVersion({ type: "voice_session_ended", session_id: "7" }, 3));
+  await collect(session.events());
+  await client.close();
+});
+
 test("rejects a non-ready frame before the authoritative ready message", async () => {
   const transport = new InMemoryTransport();
   const connecting = RuntimeClient.connect(transport);

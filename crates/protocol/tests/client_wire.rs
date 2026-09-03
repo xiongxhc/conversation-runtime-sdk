@@ -549,7 +549,8 @@ fn voice_events_project_every_approved_lifecycle_variant() {
         },
         VoiceSessionEvent::TranscriptFinal {
             session_id,
-            turn_id,
+            segment_id: 1,
+            turn_id: Some(turn_id),
             text: "hello".to_owned(),
         },
         VoiceSessionEvent::BargeIn {
@@ -1498,7 +1499,8 @@ fn voice_transcript_and_response_fields_enforce_conversation_bounds() {
         },
         VoiceSessionEvent::TranscriptFinal {
             session_id: SessionId::new(1),
-            turn_id: TurnId::new(1),
+            segment_id: 1,
+            turn_id: Some(TurnId::new(1)),
             text: oversized.clone(),
         },
         VoiceSessionEvent::Turn {

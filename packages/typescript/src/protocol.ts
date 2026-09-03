@@ -31,10 +31,23 @@ export type ClientCommand =
   | { type: "status"; requestId: string }
   | { type: "start_turn"; requestId: string; transcript: string }
   | { type: "interrupt_turn"; requestId: string; turnId: bigint }
-  | { type: "start_voice_session"; requestId: string }
+  | {
+      type: "start_voice_session";
+      requestId: string;
+      profile?: RuntimeProfile;
+      responseMode?: VoiceResponseMode;
+    }
   | { type: "stop_voice_session"; requestId: string }
   | { type: "pause_voice_capture"; requestId: string }
   | { type: "resume_voice_capture"; requestId: string }
+  | {
+      type: "authorize_voice_response";
+      requestId: string;
+      sessionId: bigint;
+      segmentId: string;
+      contextExchanges: ConversationContextExchange[];
+    }
+  | { type: "skip_voice_response"; requestId: string; sessionId: bigint; segmentId: string; reason: string }
   | { type: "memory_list"; requestId: string; cursor: MemoryCursor | null }
   | { type: "memory_inspect"; requestId: string; memoryId: bigint }
   | {
@@ -342,7 +355,9 @@ export type VoiceSessionEvent =
   | { type: "voice_capture_resumed"; sessionId: bigint }
   | { type: "voice_activity"; sessionId: bigint; activity: VoiceActivity }
   | { type: "voice_transcript_partial"; sessionId: bigint; segmentId: bigint; text: string }
-  | { type: "voice_transcript_final"; sessionId: bigint; turnId: bigint; text: string }
+  | { type: "voice_transcript_final"; sessionId: bigint; segmentId: string; turnId: bigint | null; text: string }
+  | { type: "response_authorized"; sessionId: bigint; segmentId: string; turnId: bigint }
+  | { type: "response_skipped"; sessionId: bigint; segmentId: string; reason: string }
   | { type: "voice_barge_in"; sessionId: bigint; turnId: bigint; generationId: bigint }
   | { type: "voice_turn_event"; sessionId: bigint; generationId: bigint; event: RuntimeEvent }
   | {
@@ -425,12 +440,50 @@ export function parseClientCommand(value: unknown, expectedVersion?: ClientProto
     case "interrupt_turn":
       requireExactKeys(object, ["protocol_version", "type", "request_id", "turn_id"]);
       return { type, requestId: requireRequestId(object), turnId: parseIdentifier(object.turn_id) };
-    case "start_voice_session":
+    case "start_voice_session": {
+      const hasOptions = "profile" in object || "response_mode" in object;
+      requireExactKeys(object, hasOptions
+        ? ["protocol_version", "type", "request_id", ...("profile" in object ? ["profile"] : []), ...("response_mode" in object ? ["response_mode"] : [])]
+        : ["protocol_version", "type", "request_id"]);
+      if (version < RUNTIME_PROFILE_PROTOCOL_VERSION && hasOptions) {
+        throw new ProtocolError("voice session options require protocol version 3");
+      }
+      return {
+        type,
+        requestId: requireRequestId(object),
+        ...("profile" in object ? { profile: requireOneOf(object, "profile", ["offline", "online"] as const) } : {}),
+        ...("response_mode" in object ? { responseMode: requireOneOf(object, "response_mode", ["automatic", "external_gate"] as const) } : {}),
+      };
+    }
     case "stop_voice_session":
     case "pause_voice_capture":
     case "resume_voice_capture":
       requireExactKeys(object, ["protocol_version", "type", "request_id"]);
       return { type, requestId: requireRequestId(object) };
+    case "authorize_voice_response":
+      requireExactKeys(object, ["protocol_version", "type", "request_id", "session_id", "segment_id", "context_exchanges"]);
+      if (version < RUNTIME_PROFILE_PROTOCOL_VERSION) {
+        throw new ProtocolError("voice response authorization requires protocol version 3");
+      }
+      return {
+        type,
+        requestId: requireRequestId(object),
+        sessionId: parseIdentifier(object.session_id),
+        segmentId: requireSegmentId(object.segment_id),
+        contextExchanges: parseConversationContextExchanges(object.context_exchanges),
+      };
+    case "skip_voice_response":
+      requireExactKeys(object, ["protocol_version", "type", "request_id", "session_id", "segment_id", "reason"]);
+      if (version < RUNTIME_PROFILE_PROTOCOL_VERSION) {
+        throw new ProtocolError("voice response authorization requires protocol version 3");
+      }
+      return {
+        type,
+        requestId: requireRequestId(object),
+        sessionId: parseIdentifier(object.session_id),
+        segmentId: requireSegmentId(object.segment_id),
+        reason: requireBoundedResponseSkipReason(object),
+      };
     case "memory_list":
       requireExactKeys(object, ["protocol_version", "type", "request_id", "cursor"]);
       return { type, requestId: requireRequestId(object), cursor: parseMemoryCursor(object.cursor) };
@@ -673,6 +726,13 @@ export function encodeClientCommand(
           turn_id: command.turnId.toString(),
         };
       case "start_voice_session":
+        return {
+          protocol_version: version,
+          type: command.type,
+          request_id: command.requestId,
+          ...(command.profile === undefined ? {} : { profile: command.profile }),
+          ...(command.responseMode === undefined ? {} : { response_mode: command.responseMode }),
+        };
       case "stop_voice_session":
       case "pause_voice_capture":
       case "resume_voice_capture":
@@ -680,6 +740,17 @@ export function encodeClientCommand(
           protocol_version: version,
           type: command.type,
           request_id: command.requestId,
+        };
+      case "authorize_voice_response":
+        return {
+          protocol_version: version, type: command.type, request_id: command.requestId,
+          session_id: command.sessionId.toString(), segment_id: command.segmentId,
+          context_exchanges: command.contextExchanges.map((exchange) => ({ user: exchange.user, assistant: exchange.assistant })),
+        };
+      case "skip_voice_response":
+        return {
+          protocol_version: version, type: command.type, request_id: command.requestId,
+          session_id: command.sessionId.toString(), segment_id: command.segmentId, reason: command.reason,
         };
       case "memory_list":
         return {
@@ -771,6 +842,22 @@ export function validateClientCommand(
   }
   if (command.type === "start_turn") {
     validateTranscript(command.transcript);
+  }
+  if (command.type === "start_voice_session" && version < RUNTIME_PROFILE_PROTOCOL_VERSION
+    && (command.profile !== undefined || command.responseMode !== undefined)) {
+    throw new ProtocolError("voice session options require protocol version 3");
+  }
+  if (command.type === "authorize_voice_response") {
+    if (version < RUNTIME_PROFILE_PROTOCOL_VERSION) throw new ProtocolError("voice response authorization requires protocol version 3");
+    if (command.sessionId < 1n || command.sessionId > MAX_U64) throw new ProtocolError("session identifier is outside u64 range");
+    requireSegmentId(command.segmentId);
+    validateConversationContextExchanges(command.contextExchanges);
+  }
+  if (command.type === "skip_voice_response") {
+    if (version < RUNTIME_PROFILE_PROTOCOL_VERSION) throw new ProtocolError("voice response authorization requires protocol version 3");
+    if (command.sessionId < 1n || command.sessionId > MAX_U64) throw new ProtocolError("session identifier is outside u64 range");
+    requireSegmentId(command.segmentId);
+    requireNonEmptyMaximumUtf8Bytes(command.reason, 128, "response skip reason");
   }
   if (
     command.type === "interrupt_turn" && (command.turnId < 1n || command.turnId > MAX_U64)
@@ -907,6 +994,21 @@ function requireRecordingHandle(handle: string): string {
 }
 
 const PROCESSING_WARNINGS = ["schema_retry"] as const;
+
+/** Voice-recognition segment identities share the canonical u64 wire representation. */
+function requireSegmentId(value: unknown): string {
+  if (typeof value !== "string") {
+    throw new ProtocolError("voice segment identifier must be a string");
+  }
+  parseIdentifier(value);
+  return value;
+}
+
+function requireBoundedResponseSkipReason(object: Record<string, unknown>): string {
+  const reason = requireString(object, "reason");
+  requireNonEmptyMaximumUtf8Bytes(reason, 128, "response skip reason");
+  return reason;
+}
 
 /** A schema is a JSON object and fits its bound. Its keywords are the runtime's to enforce. */
 function requireOutputSchema(value: unknown): Record<string, unknown> {
@@ -1461,13 +1563,24 @@ function parseVoiceSessionEvent(
         text: requireTranscript(object, "text"),
       };
     case "voice_transcript_final":
-      requireExactKeys(object, ["type", "session_id", "turn_id", "text"]);
+      requireExactKeys(object, version >= RUNTIME_PROFILE_PROTOCOL_VERSION
+        ? ["type", "session_id", "segment_id", "turn_id", "text"]
+        : ["type", "session_id", "turn_id", "text"]);
       return {
         type,
         sessionId: sessionId(),
-        turnId: parseIdentifier(object.turn_id),
+        segmentId: version >= RUNTIME_PROFILE_PROTOCOL_VERSION ? requireSegmentId(object.segment_id) : "",
+        turnId: object.turn_id === null ? null : parseIdentifier(object.turn_id),
         text: requireTranscript(object, "text"),
       };
+    case "response_authorized":
+      if (version < RUNTIME_PROFILE_PROTOCOL_VERSION) throw new ProtocolError("voice response authorization requires protocol version 3");
+      requireExactKeys(object, ["type", "session_id", "segment_id", "turn_id"]);
+      return { type, sessionId: sessionId(), segmentId: requireSegmentId(object.segment_id), turnId: parseIdentifier(object.turn_id) };
+    case "response_skipped":
+      if (version < RUNTIME_PROFILE_PROTOCOL_VERSION) throw new ProtocolError("voice response authorization requires protocol version 3");
+      requireExactKeys(object, ["type", "session_id", "segment_id", "reason"]);
+      return { type, sessionId: sessionId(), segmentId: requireSegmentId(object.segment_id), reason: requireBoundedResponseSkipReason(object) };
     case "voice_barge_in": {
       requireExactKeys(object, ["type", "session_id", "turn_id", "generation_id"]);
       const turnId = parseIdentifier(object.turn_id);

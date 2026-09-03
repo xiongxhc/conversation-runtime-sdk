@@ -67,6 +67,7 @@ class DiarizationPipeline:
         self._buffer = bytearray()
         self._buffer_started_at_ms = 0
         self._frames: list[tuple[int, int, Sequence[float]]] = []
+        self._reduced = False
 
     def add_window(self, started_at_ms: int, audio: bytes) -> None:
         """Takes one window of decrypted audio at its media-timeline offset."""
@@ -92,6 +93,15 @@ class DiarizationPipeline:
 
     def frame_count(self) -> int:
         return len(self._frames)
+
+    def warnings(self) -> list[str]:
+        """What made this answer less than a full account of the recording.
+
+        A reduced recording was clustered at coarser frames than the configured resolution, so
+        a short turn may have been merged into a neighbour. The caller is told rather than left
+        to assume the resolution it configured is the one it got.
+        """
+        return ["frames_reduced"] if self._reduced else []
 
     def _buffer_end_ms(self) -> int:
         return self._buffer_started_at_ms + self._duration_ms(len(self._buffer))
@@ -151,6 +161,7 @@ class DiarizationPipeline:
                 # it is rather than clustered past the memory bound.
                 raise protocol.ProtocolError("audio_unsupported")
             self._frames = merged
+            self._reduced = True
 
 
 def cluster_embeddings(

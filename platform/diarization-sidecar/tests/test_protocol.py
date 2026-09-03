@@ -224,15 +224,23 @@ def test_a_failure_names_a_code_from_the_closed_list() -> None:
 class StubPipeline:
     """Stands in for the SpeechBrain pipeline. Records what it was handed."""
 
-    def __init__(self, segments: list[protocol.Segment] | None = None) -> None:
+    def __init__(
+        self,
+        segments: list[protocol.Segment] | None = None,
+        warnings: list[str] | None = None,
+    ) -> None:
         self.windows: list[tuple[int, int]] = []
         self.segments = segments or [protocol.Segment(0, 1_000, "spk-1")]
+        self.reported = warnings or []
 
     def add_window(self, started_at_ms: int, audio: bytes) -> None:
         self.windows.append((started_at_ms, len(audio)))
 
     def finish(self) -> list[protocol.Segment]:
         return self.segments
+
+    def warnings(self) -> list[str]:
+        return self.reported
 
 
 def session(lines: list[bytes], pipeline: StubPipeline | None = None) -> tuple[int, list[dict]]:
@@ -248,7 +256,10 @@ def session(lines: list[bytes], pipeline: StubPipeline | None = None) -> tuple[i
 
 
 def test_a_session_answers_one_result_for_the_whole_recording() -> None:
-    pipeline = StubPipeline([protocol.Segment(0, 2_000, "spk-1"), protocol.Segment(2_000, 3_000, None)])
+    pipeline = StubPipeline(
+        [protocol.Segment(0, 2_000, "spk-1"), protocol.Segment(2_000, 3_000, None)],
+        ["frames_reduced"],
+    )
     status, answers = session(
         [
             line(start_payload()),
@@ -263,6 +274,7 @@ def test_a_session_answers_one_result_for_the_whole_recording() -> None:
     assert answers[0] == {"type": "ready", "protocol_version": protocol.PROTOCOL_VERSION}
     assert answers[1]["type"] == "result"
     assert [segment["speaker"] for segment in answers[1]["segments"]] == ["spk-1", None]
+    assert answers[1]["warnings"] == ["frames_reduced"], "the pipeline's own warnings travel"
     assert pipeline.windows == [(0, 32), (33_000, 32)]
     assert len(answers) == 2, "one recording is answered exactly once"
 

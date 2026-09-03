@@ -40,6 +40,8 @@ const GATEWAY_SESSION: SessionId = SessionId::new(1);
 const ONE_SECOND_BYTES: usize = 32_000;
 /// A byte pattern encryption cannot leave intact. Every plaintext assertion searches for it.
 const PLAINTEXT_MARKER: &[u8] = b"PLAINTEXT-MEETING-AUDIO-MARKER-32";
+/// A provider credential variable this test process owns, set before a sidecar is spawned.
+const SPAWN_CREDENTIAL_ENV: &str = "CONVERSATION_TEST_DIARIZATION_SPAWN_CREDENTIAL";
 
 const THREE_SEGMENTS: &str = r#"{"type":"result","segments":[{"start_ms":0,"end_ms":1000,"speaker":"spk-1"},{"start_ms":1000,"end_ms":2000,"speaker":null},{"start_ms":2000,"end_ms":3000,"speaker":"spk-2"}],"warnings":[]}"#;
 
@@ -116,6 +118,48 @@ async fn a_local_sidecar_answers_a_recording_with_anonymous_clusters_and_is_reap
     // One window of three seconds, delivered as bytes on the pipe.
     assert_eq!(sidecar.request_kinds(), vec!["audio".to_owned()]);
     assert!(sidecar.exited(), "the sidecar process was reaped");
+}
+
+#[tokio::test]
+async fn the_sidecar_sees_neither_the_recording_key_nor_a_provider_credential() {
+    let fixture = Fixture::new("CONVERSATION_TEST_LOCAL_DIARIZATION_ENVIRONMENT_KEY");
+    // A provider credential of the shape an online deployment sets before the gateway starts.
+    std::env::set_var(SPAWN_CREDENTIAL_ENV, FAKE_CREDENTIAL);
+    let sidecar = fixture.sidecar(Script::answering(THREE_SEGMENTS));
+    let summary = fixture.record(3);
+
+    fixture
+        .reconcile(
+            &summary.recording_handle,
+            &sidecar,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the sidecar answered");
+
+    // What the child itself could see, reported by the child. The parent's environment holds
+    // both variables throughout, which is the whole point of asking the child instead.
+    let names = sidecar.environment_names();
+    assert!(
+        std::env::var(fixture.key_env).is_ok() && std::env::var(SPAWN_CREDENTIAL_ENV).is_ok(),
+        "the parent holds both variables while the child is asked"
+    );
+    assert!(
+        !names.iter().any(|name| name == fixture.key_env),
+        "the recording key variable reached the sidecar: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|name| name == SPAWN_CREDENTIAL_ENV),
+        "a provider credential variable reached the sidecar: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|name| name.starts_with("CONVERSATION_")),
+        "nothing this deployment named reached the sidecar: {names:?}"
+    );
+    assert!(
+        names.iter().any(|name| name == "PATH"),
+        "the sidecar keeps what a process needs to run: {names:?}"
+    );
 }
 
 #[tokio::test]
@@ -785,9 +829,10 @@ impl Fixture {
         let start_path = root.join("start-line");
         let log_path = root.join("requests");
         let pid_path = root.join("pid");
+        let environment_path = root.join("environment");
         std::fs::write(
             &executable,
-            script.render(&start_path, &log_path, &pid_path),
+            script.render(&start_path, &log_path, &pid_path, &environment_path),
         )
         .unwrap();
         let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
@@ -798,6 +843,7 @@ impl Fixture {
             start_path,
             log_path,
             pid_path,
+            environment_path,
         }
     }
 
@@ -866,10 +912,11 @@ impl Script {
     /// Only the *kind* of each request after the start line is written down, never its content:
     /// an audio line carries the meeting, and a test fixture that logged it would put the very
     /// plaintext this task forbids onto disk.
-    fn render(&self, start: &Path, log: &Path, pid: &Path) -> String {
+    fn render(&self, start: &Path, log: &Path, pid: &Path, environment: &Path) -> String {
         let start = start.display();
         let log = log.display();
         let pid = pid.display();
+        let environment = environment.display();
         let Self {
             after_start,
             on_finish,
@@ -877,6 +924,7 @@ impl Script {
         format!(
             r#"#!/bin/sh
 printf '%s' "$$" > '{pid}'
+/usr/bin/env | /usr/bin/cut -d= -f1 | /usr/bin/sort > '{environment}'
 IFS= read -r start_line || exit 4
 printf '%s' "$start_line" > '{start}'
 {after_start}
@@ -899,6 +947,7 @@ struct FakeSidecar {
     start_path: PathBuf,
     log_path: PathBuf,
     pid_path: PathBuf,
+    environment_path: PathBuf,
 }
 
 impl FakeSidecar {
@@ -912,6 +961,17 @@ impl FakeSidecar {
             .unwrap_or_default()
             .lines()
             .filter(|kind| *kind != "finish")
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The names of the variables the sidecar could see, as the sidecar itself reported them.
+    /// Names only: what matters is which variables reached the child, and writing their values
+    /// into a fixture file would put the very material this asserts the absence of onto disk.
+    fn environment_names(&self) -> Vec<String> {
+        std::fs::read_to_string(&self.environment_path)
+            .expect("the sidecar reported its environment")
+            .lines()
             .map(str::to_owned)
             .collect()
     }

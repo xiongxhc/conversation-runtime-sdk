@@ -31,6 +31,8 @@ class Pipeline(Protocol):
 
     def finish(self) -> list[protocol.Segment]: ...
 
+    def warnings(self) -> list[str]: ...
+
 
 PipelineFactory = Callable[[protocol.StartRequest], Pipeline]
 
@@ -67,7 +69,10 @@ def run(
                     raise protocol.ProtocolError("audio_unsupported")
                 pipeline.add_window(request.started_at_ms, request.audio)
             else:
-                _emit(stdout, protocol.encode_result(pipeline.finish(), []))
+                # The warnings are read after `finish`, because that is where the pipeline
+                # learns whether it had to coarsen the recording to cluster it at all.
+                segments = pipeline.finish()
+                _emit(stdout, protocol.encode_result(segments, pipeline.warnings()))
                 return 0
     except protocol.ProtocolError as error:
         _emit(stdout, protocol.encode_failure(error.code))

@@ -305,7 +305,8 @@ examples/node-chat/    Minimal persistent TypeScript chat client
 models/                Registry schema and local model instructions
 packages/typescript/   Public @conversation/runtime TypeScript SDK
 platform/macos/        Managed macOS voice sidecar package
-platform/diarization-sidecar/ Local post-meeting speaker diarization sidecar (Python)
+platform/diarization-sidecar/
+                       Local post-meeting speaker diarization sidecar (Python)
 tests/latency/         Runnable mock latency probe and metric definitions
 tests/memory/          Explicit local memory control probe
 tests/ollama/          Runnable local Ollama text probe

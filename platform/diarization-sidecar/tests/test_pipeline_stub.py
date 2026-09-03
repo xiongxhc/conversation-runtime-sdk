@@ -125,6 +125,7 @@ def test_a_partial_frame_is_carried_into_the_next_contiguous_window() -> None:
 
     assert embedder.frame_lengths == [FRAME_BYTES, FRAME_BYTES]
     assert segments == [protocol.Segment(0, 2_000, "spk-1")]
+    assert diarization.warnings() == [], "a recording within the budget warns about nothing"
 
 
 def test_the_frame_budget_bounds_a_long_recording() -> None:
@@ -136,6 +137,7 @@ def test_the_frame_budget_bounds_a_long_recording() -> None:
 
     assert segments == [protocol.Segment(0, frames * FRAME_MS, "spk-1")]
     assert diarization.frame_count() <= pipeline.MAX_EMBEDDING_FRAMES
+    assert diarization.warnings() == ["frames_reduced"], "coarsening is stated, not silent"
 
 
 def test_a_recording_with_no_audio_produces_no_segments() -> None:

@@ -69,6 +69,13 @@ const EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 /// timeline.
 const TIMING_TOLERANCE_MS: u64 = 1_000;
 
+/// The only variables the sidecar inherits, and only when the gateway itself has them.
+///
+/// `PYTHONPATH` is deliberately absent: forwarding it would let the surrounding environment
+/// decide which code the interpreter loads. So is every proxy and certificate variable, because
+/// this backend exists precisely so that nothing reaches the network.
+const INHERITED_ENVIRONMENT: [&str; 4] = ["HOME", "LANG", "PATH", "TMPDIR"];
+
 /// Every failure the sidecar may name. Kept in step with the sidecar's own `FAILURE_CODES`;
 /// a code outside it is not a diagnostic this runtime will repeat.
 const FAILURE_CODES: [&str; 6] = [
@@ -213,7 +220,19 @@ impl SpeechbrainTranscriptionDiarizer {
     }
 
     fn spawn(&self) -> Result<Child, AdapterError> {
-        Command::new(self.config.executable())
+        let mut command = Command::new(self.config.executable());
+        // The gateway's environment holds the recording key and every provider credential, and
+        // this child is a Python process whose dependency tree is torch, SpeechBrain and
+        // huggingface_hub. It needs none of that: its executable is an absolute path and its
+        // model cache arrives on the wire, so it starts from nothing and is given back only what
+        // a process needs to run at all.
+        command.env_clear();
+        for name in INHERITED_ENVIRONMENT {
+            if let Ok(value) = std::env::var(name) {
+                command.env(name, value);
+            }
+        }
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // The sidecar's prose is not a diagnostic this runtime relays: a traceback can quote

@@ -50,7 +50,7 @@ pub use generation_language::{
 };
 pub use language_model::{
     LanguageModel, LanguageModelInput, LanguageModelRequest, MAX_LANGUAGE_MODEL_INPUT_BYTES,
-    MAX_RUNTIME_GUIDANCE_BYTES,
+    MAX_RESPONSE_SCHEMA_BYTES, MAX_RUNTIME_GUIDANCE_BYTES,
 };
 pub use macos_afplay::{MacOsAfplayAudioOutput, MacOsAfplayConfig};
 pub use macos_system_speech::{MacOsSystemSpeechConfig, MacOsSystemSpeechSynthesizer};

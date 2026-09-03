@@ -2,6 +2,7 @@ mod client_diarization;
 mod client_memory;
 mod client_persona;
 mod client_recording;
+mod client_text_processing;
 mod client_voice;
 mod client_wire;
 mod command;
@@ -29,6 +30,10 @@ pub use client_recording::{
     ClientRecordingGap, ClientRecordingSummary, MAX_CLIENT_RECORDING_GAPS,
     MAX_CLIENT_RECORDING_HANDLE_BYTES, MAX_CLIENT_RECORDING_LABEL_BYTES,
     MAX_CLIENT_RECORDING_PATH_BYTES,
+};
+pub use client_text_processing::{
+    ClientProcessedText, MAX_CLIENT_PROCESSED_OUTPUT_BYTES, MAX_CLIENT_PROCESSING_INPUT_BYTES,
+    MAX_CLIENT_PROCESSING_INSTRUCTIONS_BYTES, MAX_CLIENT_PROCESSING_SCHEMA_BYTES,
 };
 pub use client_voice::{
     is_valid_device_label, ClientComponentDescriptor, ClientPrivacySummary, ClientVoiceActivity,

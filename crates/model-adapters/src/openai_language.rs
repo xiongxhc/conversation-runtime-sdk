@@ -431,6 +431,39 @@ struct ChatCompletionRequest<'a> {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_completion_tokens: Option<usize>,
+    /// Absent unless the request asked for one, so a request without a schema is byte
+    /// identical to what this adapter sent before schemas existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<ResponseFormat>,
+}
+
+/// The structured-output directive, in the shape an OpenAI-compatible chat endpoint takes.
+#[derive(Serialize)]
+struct ResponseFormat {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    json_schema: JsonSchemaDirective,
+}
+
+#[derive(Serialize)]
+struct JsonSchemaDirective {
+    name: &'static str,
+    strict: bool,
+    schema: serde_json::Value,
+}
+
+impl ResponseFormat {
+    fn new(schema: &str) -> Result<Self, AdapterError> {
+        Ok(Self {
+            kind: "json_schema",
+            json_schema: JsonSchemaDirective {
+                name: "structured_output",
+                strict: true,
+                schema: serde_json::from_str(schema)
+                    .map_err(|_| invalid_config("response schema must be JSON"))?,
+            },
+        })
+    }
 }
 
 impl<'a> ChatCompletionRequest<'a> {
@@ -478,6 +511,10 @@ impl<'a> ChatCompletionRequest<'a> {
             stream: true,
             temperature: config.temperature,
             max_completion_tokens: config.max_output_tokens,
+            response_format: input
+                .response_schema()
+                .map(ResponseFormat::new)
+                .transpose()?,
         })
     }
 }

@@ -609,6 +609,10 @@ struct ChatRequest<'a> {
     keep_alive: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     think: Option<OllamaThinking>,
+    /// Ollama's own structured-output field: the schema the answer must match. Absent unless
+    /// the request asked for one, so an ordinary turn's payload is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    format: Option<serde_json::Value>,
     options: ChatOptions,
 }
 
@@ -646,12 +650,21 @@ impl<'a> ChatRequest<'a> {
         }
         messages.push(ChatMessage::user(input.transcript()));
 
+        let format = match input.response_schema() {
+            Some(schema) => Some(
+                serde_json::from_str(schema)
+                    .map_err(|_| AdapterError::new("response schema must be JSON"))?,
+            ),
+            None => None,
+        };
+
         Ok(Self {
             model: &config.model,
             messages,
             stream: true,
             keep_alive: config.keep_alive.as_deref(),
             think: config.thinking,
+            format,
             options: ChatOptions {
                 temperature: config.temperature,
                 seed: config.seed,

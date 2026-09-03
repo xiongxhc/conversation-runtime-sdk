@@ -15,6 +15,10 @@ export const MAX_MEMORY_LIST_PAGE_ITEMS = 50;
 export const MAX_MEMORY_PREVIEW_BYTES = 192;
 export const MAX_MEMORY_INSPECTION_HISTORY_ITEMS = 32;
 export const MAX_MEMORY_CONTENT_BYTES = 4 * 1024;
+export const MAX_PROCESSING_INSTRUCTIONS_BYTES = 4 * 1024;
+export const MAX_PROCESSING_INPUT_BYTES = 16 * 1024;
+export const MAX_PROCESSING_SCHEMA_BYTES = 8 * 1024;
+export const MAX_PROCESSED_OUTPUT_BYTES = 64 * 1024;
 
 const MAX_U64_DECIMAL = "18446744073709551615";
 const MAX_I64_DECIMAL = "9223372036854775807";
@@ -49,6 +53,15 @@ export type ClientCommand =
       requestId: string;
       sessionId: bigint;
       recordingHandle: string;
+    }
+  | {
+      type: "process_text";
+      requestId: string;
+      sessionId: bigint;
+      instructions: string;
+      input: string;
+      outputSchema: Record<string, unknown>;
+      maxOutputBytes: number;
     };
 
 export type ConversationContextExchange = { user: string; assistant: string };
@@ -95,6 +108,17 @@ export type DiarizedSegment = {
 /** A whole meeting's reconciliation. */
 export type RecordingReconciliation = {
   segments: DiarizedSegment[];
+  warnings: string[];
+};
+
+/**
+ * One batch call's answer. `output` is whatever JSON the caller's schema allowed — the runtime
+ * validated it before stating it, so its shape is the caller's to assert, not this SDK's.
+ * `warnings` come from a closed list; `schema_retry` says the first answer did not match and
+ * the single retry did.
+ */
+export type ProcessedText = {
+  output: unknown;
   warnings: string[];
 };
 
@@ -370,7 +394,8 @@ export type GatewayMessage =
       type: "recording_reconciled";
       requestId: string;
       reconciliation: RecordingReconciliation;
-    };
+    }
+  | { type: "text_processed"; requestId: string; processed: ProcessedText };
 
 export class ProtocolError extends Error {
   constructor(message: string) {
@@ -466,6 +491,29 @@ export function parseClientCommand(value: unknown, expectedVersion?: ClientProto
         requestId: requireRequestId(object),
         sessionId: parseIdentifier(object.session_id),
         recordingHandle: requireRecordingHandle(requireString(object, "recording_handle")),
+      };
+    case "process_text":
+      requireExactKeys(object, [
+        "protocol_version",
+        "type",
+        "request_id",
+        "session_id",
+        "instructions",
+        "input",
+        "output_schema",
+        "max_output_bytes",
+      ]);
+      if (version < RUNTIME_PROFILE_PROTOCOL_VERSION) {
+        throw new ProtocolError("structured text processing requires protocol version 3");
+      }
+      return {
+        type,
+        requestId: requireRequestId(object),
+        sessionId: parseIdentifier(object.session_id),
+        instructions: requireString(object, "instructions"),
+        input: requireString(object, "input"),
+        outputSchema: requireOutputSchema(object.output_schema),
+        maxOutputBytes: requireNonNegativeInteger(object, "max_output_bytes"),
       };
     default:
       throw new ProtocolError("unsupported client command type");
@@ -582,6 +630,17 @@ export function parseGatewayMessage(
         requestId: requireRequestId(object),
         reconciliation: parseRecordingReconciliation(object.reconciliation),
       };
+    case "text_processed":
+      requireExactKeys(object, ["protocol_version", "type", "request_id", "processed"]);
+      validateProtocolVersion(object, version);
+      if (version < RUNTIME_PROFILE_PROTOCOL_VERSION) {
+        throw new ProtocolError("structured text processing requires protocol version 3");
+      }
+      return {
+        type,
+        requestId: requireRequestId(object),
+        processed: parseProcessedText(object.processed),
+      };
     default:
       throw new ProtocolError("unsupported gateway message type");
   }
@@ -668,6 +727,19 @@ export function encodeClientCommand(
           session_id: command.sessionId.toString(),
           recording_handle: command.recordingHandle,
         };
+      case "process_text":
+        return {
+          protocol_version: version,
+          type: command.type,
+          request_id: command.requestId,
+          session_id: command.sessionId.toString(),
+          instructions: command.instructions,
+          input: command.input,
+          // The schema travels as the object it is; `max_output_bytes` is a small bounded
+          // count, so it travels as a number like the other non-64-bit counts on this wire.
+          output_schema: command.outputSchema,
+          max_output_bytes: command.maxOutputBytes,
+        };
       case "seed_conversation_context":
         return {
           protocol_version: version,
@@ -736,6 +808,28 @@ export function validateClientCommand(
       throw new ProtocolError("session identifier is outside u64 range");
     }
     requireRecordingHandle(command.recordingHandle);
+  }
+  if (command.type === "process_text") {
+    if (version < RUNTIME_PROFILE_PROTOCOL_VERSION) {
+      throw new ProtocolError("structured text processing requires protocol version 3");
+    }
+    if (command.sessionId < 1n || command.sessionId > MAX_U64) {
+      throw new ProtocolError("session identifier is outside u64 range");
+    }
+    requireNonEmptyMaximumUtf8Bytes(
+      command.instructions,
+      MAX_PROCESSING_INSTRUCTIONS_BYTES,
+      "text processing instructions",
+    );
+    requireNonEmptyMaximumUtf8Bytes(command.input, MAX_PROCESSING_INPUT_BYTES, "text processing input");
+    requireOutputSchema(command.outputSchema);
+    if (
+      !Number.isSafeInteger(command.maxOutputBytes) ||
+      command.maxOutputBytes < 1 ||
+      command.maxOutputBytes > MAX_PROCESSED_OUTPUT_BYTES
+    ) {
+      throw new ProtocolError("output byte limit is outside the supported range");
+    }
   }
   if (command.type === "memory_approve" || command.type === "memory_delete") {
     if (command.memoryId < 1n || command.memoryId > MAX_U64) {
@@ -809,6 +903,40 @@ function requireRecordingHandle(handle: string): string {
   }
   requireNonEmptyMaximumUtf8Bytes(handle, MAX_RECORDING_HANDLE_BYTES, "recording handle");
   return handle;
+}
+
+const PROCESSING_WARNINGS = ["schema_retry"] as const;
+
+/** A schema is a JSON object and fits its bound. Its keywords are the runtime's to enforce. */
+function requireOutputSchema(value: unknown): Record<string, unknown> {
+  const schema = requireRecord(value, "output schema");
+  if (utf8Bytes(JSON.stringify(schema)) > MAX_PROCESSING_SCHEMA_BYTES) {
+    throw new ProtocolError("output schema exceeded its size limit");
+  }
+  return schema;
+}
+
+function parseProcessedText(value: unknown): ProcessedText {
+  const object = requireRecord(value, "processed text");
+  requireExactKeys(object, ["output", "warnings"]);
+  if (!("output" in object) || utf8Bytes(JSON.stringify(object.output)) > MAX_PROCESSED_OUTPUT_BYTES) {
+    throw new ProtocolError("processed output exceeded its size limit");
+  }
+  const warnings = parseBoundedArray(
+    object.warnings,
+    PROCESSING_WARNINGS.length,
+    "processing warnings",
+    (warning) => {
+      if (typeof warning !== "string" || !PROCESSING_WARNINGS.includes(warning as never)) {
+        throw new ProtocolError("processing warning is not a known warning");
+      }
+      return warning;
+    },
+  );
+  if (new Set(warnings).size !== warnings.length) {
+    throw new ProtocolError("a processing warning is stated once");
+  }
+  return { output: object.output, warnings };
 }
 
 function parseRecordingReconciliation(value: unknown): RecordingReconciliation {

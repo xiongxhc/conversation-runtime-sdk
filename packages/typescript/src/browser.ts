@@ -32,6 +32,7 @@ export {
   type PersonaState,
   type DiarizedSegment,
   type RecordingGap,
+  type ProcessedText,
   type RecordingReconciliation,
   type RecordingSummary,
   type RuntimeEvent,

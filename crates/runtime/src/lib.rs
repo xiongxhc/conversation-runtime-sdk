@@ -23,6 +23,7 @@ mod session_recording;
 mod speech_text;
 mod speech_worker;
 mod streaming_turn;
+mod text_processing;
 mod text_turn;
 mod turn_finalizer;
 mod utterance_assembler;
@@ -42,6 +43,12 @@ pub use session_recording::{
     SessionRecorder, CAPTURE_DISCONTINUITY_REASON, EMPTY_RECORDING_FORMAT, MAX_RECORDING_GAPS,
 };
 pub use streaming_turn::{StartedStreamingTurn, StreamingTurnEventStream, StreamingTurnRuntime};
+pub use text_processing::{
+    process_text, ProcessedText, TextProcessingRequest, TextProcessingWarning,
+    MAX_TEXT_PROCESSING_INPUT_BYTES, MAX_TEXT_PROCESSING_INSTRUCTIONS_BYTES,
+    MAX_TEXT_PROCESSING_OUTPUT_BYTES, MAX_TEXT_PROCESSING_SCHEMA_BYTES,
+    MIN_TEXT_PROCESSING_TURN_ID,
+};
 pub use text_turn::{TextTurnEventStream, TextTurnRuntime};
 pub use turn_finalizer::{FinalizedTranscript, TurnFinalizer};
 pub use utterance_assembler::UtteranceAssembler;

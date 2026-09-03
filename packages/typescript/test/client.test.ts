@@ -1871,3 +1871,175 @@ test("a reconciled recording requires protocol version 3 on the wire", () => {
     /recording reconciliation requires protocol version 3/,
   );
 });
+
+const OUTPUT_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["decisions"],
+  properties: { decisions: { type: "array", items: { type: "string" } } },
+};
+
+function textProcessed(requestId: string, processed: Record<string, unknown>): unknown {
+  return {
+    type: "text_processed",
+    protocol_version: 3,
+    request_id: requestId,
+    processed,
+  };
+}
+
+test("processText returns the validated output and its warnings", async () => {
+  const { client, transport } = await connectedV3Client();
+
+  const processing = client.processText({
+    sessionId: 1n,
+    instructions: "Summarise the meeting.",
+    input: "we agreed to ship the beta",
+    outputSchema: OUTPUT_SCHEMA,
+    maxOutputBytes: 4096,
+  });
+  await setImmediate();
+  const sent = command(transport, "process_text");
+  assert.equal(sent.sessionId, 1n);
+  assert.equal(sent.instructions, "Summarise the meeting.");
+  assert.equal(sent.input, "we agreed to ship the beta");
+  assert.deepEqual(sent.outputSchema, OUTPUT_SCHEMA);
+  assert.equal(sent.maxOutputBytes, 4096);
+  assert.deepEqual(transport.sentVersions, [3]);
+
+  transport.push(acceptedForVersion(sent.requestId, 3));
+  transport.push(
+    textProcessed(sent.requestId, {
+      output: { decisions: ["ship the beta"] },
+      warnings: ["schema_retry"],
+    }),
+  );
+
+  assert.deepEqual(await processing, {
+    output: { decisions: ["ship the beta"] },
+    warnings: ["schema_retry"],
+  });
+});
+
+test("processText carries any JSON the schema allowed, including a bare value", async () => {
+  const { client, transport } = await connectedV3Client();
+  const processing = client.processText({
+    sessionId: 1n,
+    instructions: "Count the decisions.",
+    input: "we agreed to ship the beta",
+    outputSchema: { type: "integer" },
+    maxOutputBytes: 64,
+  });
+  await setImmediate();
+  const sent = command(transport, "process_text");
+  transport.push(acceptedForVersion(sent.requestId, 3));
+  transport.push(textProcessed(sent.requestId, { output: 1, warnings: [] }));
+
+  assert.deepEqual(await processing, { output: 1, warnings: [] });
+});
+
+test("processText refuses a runtime that does not speak protocol version 3", async () => {
+  for (const connect of [connectedClient, connectedV2Client]) {
+    const { client } = await connect();
+    await assert.rejects(
+      () =>
+        client.processText({
+          sessionId: 1n,
+          instructions: "Summarise.",
+          input: "text",
+          outputSchema: OUTPUT_SCHEMA,
+          maxOutputBytes: 4096,
+        }),
+      /structured text processing requires protocol version 3/,
+    );
+  }
+});
+
+test("processText refuses a request the runtime could not serve", async () => {
+  const { client, transport } = await connectedV3Client();
+  const base = {
+    sessionId: 1n,
+    instructions: "Summarise.",
+    input: "text",
+    outputSchema: OUTPUT_SCHEMA,
+    maxOutputBytes: 4096,
+  };
+  for (const overrides of [
+    { sessionId: 0n },
+    { instructions: "" },
+    { input: "" },
+    { outputSchema: ["type", "object"] as unknown as Record<string, unknown> },
+    { outputSchema: null as unknown as Record<string, unknown> },
+    { maxOutputBytes: 0 },
+    { maxOutputBytes: 1.5 },
+    { maxOutputBytes: 2 ** 32 },
+  ]) {
+    await assert.rejects(() => client.processText({ ...base, ...overrides }), ProtocolError);
+  }
+  assert.equal(transport.sent.length, 0);
+});
+
+test("processText surfaces a gateway rejection to its caller", async () => {
+  const { client, transport } = await connectedV3Client();
+  const processing = client.processText({
+    sessionId: 1n,
+    instructions: "Summarise.",
+    input: "text",
+    outputSchema: OUTPUT_SCHEMA,
+    maxOutputBytes: 4096,
+  });
+  await setImmediate();
+  const sent = command(transport, "process_text");
+  transport.push(
+    rejectedForVersion(
+      sent.requestId,
+      {
+        code: "invalid_state",
+        kind: "invalid_state",
+        stage: "runtime",
+        message: "text processing output did not match the requested schema",
+      },
+      3,
+    ),
+  );
+  await assert.rejects(() => processing, CommandRejectedError);
+});
+
+test("a processed answer the runtime could not have produced is rejected", async () => {
+  for (const processed of [
+    { output: { decisions: [] }, warnings: ["the model was unhappy"] },
+    { output: { decisions: [] }, warnings: ["schema_retry", "schema_retry"] },
+    { output: { decisions: [] } },
+    { output: { decisions: [] }, warnings: [], unexpected: "field" },
+  ]) {
+    const { client, transport } = await connectedV3Client();
+    const processing = client.processText({
+      sessionId: 1n,
+      instructions: "Summarise.",
+      input: "text",
+      outputSchema: OUTPUT_SCHEMA,
+      maxOutputBytes: 4096,
+    });
+    await setImmediate();
+    const sent = command(transport, "process_text");
+    transport.push(acceptedForVersion(sent.requestId, 3));
+    transport.push(textProcessed(sent.requestId, processed));
+    await assert.rejects(() => processing);
+  }
+});
+
+test("processed text requires protocol version 3 on the wire", async () => {
+  assert.throws(
+    () =>
+      parseGatewayMessage(
+        {
+          type: "text_processed",
+          protocol_version: 2,
+          request_id: "request-1",
+          processed: { output: {}, warnings: [] },
+        },
+        2,
+      ),
+    /structured text processing requires protocol version 3/,
+  );
+});

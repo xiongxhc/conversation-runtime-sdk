@@ -272,6 +272,15 @@ impl TextTurnRuntime {
         self.context.clone()
     }
 
+    /// The language model this session's turns run on.
+    ///
+    /// Batch calls that create no turn — structured text processing — run on exactly this
+    /// model, which is what makes them run in the profile the session pinned at start rather
+    /// than in a profile of their own choosing.
+    pub fn language_model(&self) -> Arc<dyn GenerationLanguageModel> {
+        Arc::clone(&self.language_model)
+    }
+
     pub async fn interrupt(&self, turn_id: TurnId) -> Result<(), RuntimeError> {
         let state = self.state.lock().await;
         match state.active.as_ref() {

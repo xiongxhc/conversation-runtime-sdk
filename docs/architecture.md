@@ -160,6 +160,37 @@ other online adapters, the diarizer is wired explicitly by the runtime rather th
 constructed by the configuration loader; a deployment without one records meetings
 and says plainly that it does not reconcile them.
 
+### Batch Structured Text Processing
+
+`process_text` turns instructions plus text into JSON the runtime has validated
+against a schema the caller supplied. It runs on the same generation language
+model the session's turns run on, so it runs in the profile the session pinned at
+start and needs no selection of its own; the local model and the online adapter
+both serve it, which is why an offline deployment can call it while the diarizer
+is still wired explicitly.
+
+**The call creates no conversation turn.** It reads no history, writes none, and
+does not advance the turn sequence. The generation port tags every delta with a
+turn and a generation identifier, so the call mints synthetic ones from a reserved
+band at the top of the identifier space, descending, and refuses to run rather
+than descend out of that band. A conversation mints upwards from one and refuses
+to overflow, so the two spaces cannot meet.
+
+The instructions travel in the same slot a turn's runtime guidance uses — the
+system message — and the input as the only user message, so both adapters render
+them the way they already render a turn. The schema travels as the provider's own
+structured-output directive rather than as prose inside the prompt. That directive
+is not a guarantee, so the runtime validates the answer itself, over a closed set
+of JSON Schema keywords; a schema using anything outside that set is refused up
+front rather than accepted and silently under-checked.
+
+An answer that does not match is retried **exactly once**. If the retry does not
+match either, the call fails with a fixed reason that quotes neither the model's
+answer nor the caller's text. Input past the runtime's published bound is refused
+rather than chunked: a structured call answers one schema once, and splitting the
+input would mean merging several schema-valid answers into one, which no schema
+describes. The caller states its own output bound per call.
+
 ### Shared Conversation and Voice Activation
 
 Typed and finalized spoken input enter the same `ConversationContext`, use the

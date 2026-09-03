@@ -5,16 +5,18 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::client_diarization::validate_client_recording_reconciliation;
 use crate::client_recording::{is_client_recording_handle, validate_client_recording_summary};
+use crate::client_text_processing::{canonical_processing_schema, validate_client_processed_text};
 
 use crate::{
     ClientComponentDescriptor, ClientMemoryCursor, ClientMemoryInspection, ClientMemoryRecord,
-    ClientMemoryRetention, ClientMemorySummary, ClientPersonaState, ClientRecordingReconciliation,
-    ClientRecordingSummary, ClientVoiceSessionEvent, ConversationMode, ExecutionLocation,
-    FollowUpPolicy, MemoryId, MemoryRetrievalTrace, PrivacyMode, QualityDecision, ResponseControls,
-    RetrievalTraceId, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeProfile, RuntimeStage,
-    RuntimeTimingMilestone, SessionId, SilencePolicy, SpeechPace, TurnId,
-    MAX_CONVERSATION_MESSAGE_BYTES, MAX_HISTORY_BYTES, MAX_MEMORY_CONTENT_BYTES,
-    MAX_MEMORY_INSPECTION_HISTORY_ITEMS, MAX_MEMORY_LIST_PAGE_ITEMS, MAX_MEMORY_PREVIEW_BYTES,
+    ClientMemoryRetention, ClientMemorySummary, ClientPersonaState, ClientProcessedText,
+    ClientRecordingReconciliation, ClientRecordingSummary, ClientVoiceSessionEvent,
+    ConversationMode, ExecutionLocation, FollowUpPolicy, MemoryId, MemoryRetrievalTrace,
+    PrivacyMode, QualityDecision, ResponseControls, RetrievalTraceId, RuntimeError,
+    RuntimeErrorKind, RuntimeEvent, RuntimeProfile, RuntimeStage, RuntimeTimingMilestone,
+    SessionId, SilencePolicy, SpeechPace, TurnId, MAX_CONVERSATION_MESSAGE_BYTES,
+    MAX_HISTORY_BYTES, MAX_MEMORY_CONTENT_BYTES, MAX_MEMORY_INSPECTION_HISTORY_ITEMS,
+    MAX_MEMORY_LIST_PAGE_ITEMS, MAX_MEMORY_PREVIEW_BYTES,
 };
 
 /// The oldest protocol version this build still speaks.
@@ -125,6 +127,16 @@ pub enum ClientCommand {
         request_id: String,
         session_id: SessionId,
         recording_handle: String,
+    },
+    /// Turns instructions plus text into JSON the runtime validates against `output_schema`.
+    /// It creates no conversation turn. `output_schema` is canonical JSON text. Version 3 only.
+    ProcessText {
+        request_id: String,
+        session_id: SessionId,
+        instructions: String,
+        input: String,
+        output_schema: String,
+        max_output_bytes: usize,
     },
 }
 
@@ -298,6 +310,11 @@ pub enum GatewayMessage {
         request_id: String,
         reconciliation: ClientRecordingReconciliation,
     },
+    /// One batch call's schema-validated answer. Version 3 only.
+    TextProcessed {
+        request_id: String,
+        processed: ClientProcessedText,
+    },
 }
 
 #[derive(Debug)]
@@ -317,6 +334,8 @@ pub enum ClientWireError {
     InvalidRecordingSummary,
     InvalidRecordingHandle,
     InvalidRecordingReconciliation,
+    InvalidTextProcessingRequest,
+    InvalidProcessedText,
     PayloadTooLarge { actual: usize, maximum: usize },
     UnsupportedRuntimeEvent { event: &'static str },
 }
@@ -351,6 +370,10 @@ impl fmt::Display for ClientWireError {
             Self::InvalidRecordingReconciliation => {
                 formatter.write_str("invalid client recording reconciliation")
             }
+            Self::InvalidTextProcessingRequest => {
+                formatter.write_str("invalid client text processing request")
+            }
+            Self::InvalidProcessedText => formatter.write_str("invalid client processed text"),
             Self::PayloadTooLarge { actual, maximum } => {
                 write!(
                     formatter,
@@ -743,6 +766,37 @@ fn decode_wire_client_command(
                 recording_handle,
             })
         }
+        WireClientCommand::ProcessText {
+            protocol_version,
+            request_id,
+            session_id,
+            instructions,
+            input,
+            output_schema,
+            max_output_bytes,
+        } => {
+            validate_protocol_version(protocol_version)?;
+            if protocol_version < RUNTIME_PROFILE_PROTOCOL_VERSION {
+                return Err(ClientWireError::UnsupportedProtocolVersion(
+                    protocol_version,
+                ));
+            }
+            validate_request_id(&request_id)?;
+            let output_schema = canonical_processing_schema(
+                &instructions,
+                &input,
+                &output_schema,
+                max_output_bytes,
+            )?;
+            Ok(ClientCommand::ProcessText {
+                request_id,
+                session_id: SessionId::new(session_id.0),
+                instructions,
+                input,
+                output_schema,
+                max_output_bytes: max_output_bytes as usize,
+            })
+        }
     }
 }
 
@@ -843,6 +897,15 @@ enum WireClientCommand {
         session_id: DecimalIdentifier,
         recording_handle: String,
     },
+    ProcessText {
+        protocol_version: u64,
+        request_id: String,
+        session_id: DecimalIdentifier,
+        instructions: String,
+        input: String,
+        output_schema: serde_json::Value,
+        max_output_bytes: u32,
+    },
 }
 
 impl WireClientCommand {
@@ -894,6 +957,9 @@ impl WireClientCommand {
                 protocol_version, ..
             }
             | Self::ReconcileRecording {
+                protocol_version, ..
+            }
+            | Self::ProcessText {
                 protocol_version, ..
             } => *protocol_version,
         }
@@ -1031,6 +1097,25 @@ impl From<&ClientRecordingReconciliation> for WireClientRecordingReconciliation 
                 })
                 .collect(),
             warnings: reconciliation.warnings.clone(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct WireClientProcessedText {
+    /// The answer travels as the JSON value it is, not as a string holding JSON, so a client
+    /// reads it without a second parse.
+    output: serde_json::Value,
+    warnings: Vec<String>,
+}
+
+impl From<&ClientProcessedText> for WireClientProcessedText {
+    fn from(processed: &ClientProcessedText) -> Self {
+        Self {
+            output: serde_json::from_str(&processed.output)
+                .expect("processed output was validated as JSON"),
+            warnings: processed.warnings.clone(),
         }
     }
 }
@@ -1294,6 +1379,11 @@ enum GatewayMessageEnvelope<'a> {
         request_id: &'a str,
         reconciliation: WireClientRecordingReconciliation,
     },
+    TextProcessed {
+        protocol_version: u64,
+        request_id: &'a str,
+        processed: WireClientProcessedText,
+    },
 }
 
 impl<'a> GatewayMessageEnvelope<'a> {
@@ -1392,6 +1482,14 @@ impl<'a> GatewayMessageEnvelope<'a> {
                 protocol_version,
                 request_id,
                 reconciliation: WireClientRecordingReconciliation::from(reconciliation),
+            },
+            GatewayMessage::TextProcessed {
+                request_id,
+                processed,
+            } => Self::TextProcessed {
+                protocol_version,
+                request_id,
+                processed: WireClientProcessedText::from(processed),
             },
         }
     }
@@ -1548,6 +1646,19 @@ fn validate_gateway_message(
             }
             validate_request_id(request_id)?;
             validate_client_recording_reconciliation(reconciliation)
+        }
+        GatewayMessage::TextProcessed {
+            request_id,
+            processed,
+        } => {
+            // The answer only exists because a version 3 command asked for it.
+            if protocol_version < RUNTIME_PROFILE_PROTOCOL_VERSION {
+                return Err(ClientWireError::UnsupportedProtocolVersion(
+                    protocol_version,
+                ));
+            }
+            validate_request_id(request_id)?;
+            validate_client_processed_text(processed)
         }
         GatewayMessage::MemoryExtracted { .. } => Ok(()),
     }

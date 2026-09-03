@@ -483,6 +483,7 @@ dependencies = [
  "conversation-model-adapters",
  "conversation-protocol",
  "ring",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-util",

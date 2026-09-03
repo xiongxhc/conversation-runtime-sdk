@@ -12,6 +12,7 @@ import {
   type MemoryInspection,
   type MemoryPage,
   type PersonaState,
+  type ProcessedText,
   type RecordingReconciliation,
   type RecordingSummary,
   type RuntimeEvent,
@@ -275,6 +276,55 @@ export class RuntimeClient {
     return result.promise;
   }
 
+  /**
+   * Turns instructions plus text into JSON the runtime has validated against `outputSchema`.
+   *
+   * The call creates no conversation turn: it does not appear in the session's history, does
+   * not move its turn counters, and produces no speech. A schema-invalid answer is retried
+   * once inside the runtime and then refused. Version 3 runtimes only.
+   */
+  processText({
+    sessionId,
+    instructions,
+    input,
+    outputSchema,
+    maxOutputBytes,
+  }: {
+    sessionId: bigint;
+    instructions: string;
+    input: string;
+    outputSchema: Record<string, unknown>;
+    maxOutputBytes: number;
+  }): Promise<ProcessedText> {
+    if (this.protocolVersion === undefined || this.protocolVersion < RUNTIME_PROFILE_PROTOCOL_VERSION) {
+      return Promise.reject(new Error("structured text processing requires protocol version 3"));
+    }
+    const requestId = this.nextRequestId();
+    const command: ClientCommand = {
+      type: "process_text",
+      requestId,
+      sessionId,
+      instructions,
+      input,
+      outputSchema,
+      maxOutputBytes,
+    };
+    try {
+      validateClientCommand(command, this.protocolVersion);
+    } catch (error) {
+      return Promise.reject(error as Error);
+    }
+    const result = new Deferred<ProcessedText>();
+    this.controls.set(requestId, {
+      kind: "process_text",
+      accepted: false,
+      result,
+      fail: (error) => result.reject(error),
+    });
+    this.send(command);
+    return result.promise;
+  }
+
   startTurn(transcript: string): Promise<RuntimeTurn> {
     const requestId = this.nextRequestId();
     validateClientCommand({ type: "start_turn", requestId, transcript });
@@ -479,6 +529,16 @@ export class RuntimeClient {
       }
       this.controls.delete(message.requestId);
       control.result.resolve(message.reconciliation);
+      return;
+    }
+    if (message.type === "text_processed") {
+      const control = this.controls.get(message.requestId);
+      if (!control || control.kind !== "process_text" || !control.accepted) {
+        this.fail(new Error("gateway sent an uncorrelated text processing response"));
+        return;
+      }
+      this.controls.delete(message.requestId);
+      control.result.resolve(message.processed);
       return;
     }
     if (message.type === "memory_extracted") {
@@ -702,7 +762,8 @@ type PendingControl =
       accepted: boolean;
       result: Deferred<RecordingReconciliation>;
       fail(error: Error): void;
-    };
+    }
+  | { kind: "process_text"; accepted: boolean; result: Deferred<ProcessedText>; fail(error: Error): void };
 
 type TurnState = {
   events: AsyncQueue<RuntimeEvent>;

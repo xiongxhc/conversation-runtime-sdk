@@ -3,23 +3,25 @@ use conversation_protocol::{
     memory_preview, ClientCommand, ClientComponentDescriptor, ClientDiarizedSegment,
     ClientMemoryApproval, ClientMemoryCursor, ClientMemoryInspection, ClientMemoryProvenance,
     ClientMemoryRecord, ClientMemoryRetention, ClientMemorySummary, ClientMemoryTrace,
-    ClientPersonaState, ClientPrivacySummary, ClientQualityDecision, ClientRecordingGap,
-    ClientRecordingReconciliation, ClientRecordingSummary, ClientResponseControls,
-    ClientRuntimeError, ClientRuntimeEvent, ClientVoiceSessionEvent, ClientWireError,
-    ComponentDescriptor, ComponentKind, ContextSource, ConversationContextExchange,
-    ConversationMode, ConversationSignal, ExecutionLocation, FollowUpPolicy, GatewayMessage,
-    GenerationId, MemoryApproval, MemoryConfidence, MemoryDraft, MemoryId, MemoryInspection,
-    MemoryKind, MemoryProvenance, MemoryProvenanceKind, MemoryRecord, MemoryRetention,
-    MemoryRetrievalReason, MemoryRetrievalTrace, MemoryTraceExclusions, MemoryTraceItem,
-    PersonaLevel, PersonaProfile, PlaybackState, PrivacyMode, PrivacySummary, QualityDecision,
-    RecoveryDisposition, ResponseControls, RetrievalTraceId, RuntimeError, RuntimeErrorKind,
-    RuntimeEvent, RuntimeStage, RuntimeStatus, SessionId, SilencePolicy, SpeechPace, TurnId,
-    UnixTimestampMillis, VoiceActivity, VoiceSessionEvent, VoiceTimingMilestone,
-    CLIENT_PROTOCOL_VERSION, CONTEXT_SEED_PROTOCOL_VERSION, LEGACY_CLIENT_PROTOCOL_VERSION,
-    MAX_CLIENT_COMPONENT_DESCRIPTORS, MAX_CLIENT_DEVICE_LABEL_BYTES, MAX_CLIENT_DIARIZED_SEGMENTS,
+    ClientPersonaState, ClientPrivacySummary, ClientProcessedText, ClientQualityDecision,
+    ClientRecordingGap, ClientRecordingReconciliation, ClientRecordingSummary,
+    ClientResponseControls, ClientRuntimeError, ClientRuntimeEvent, ClientVoiceSessionEvent,
+    ClientWireError, ComponentDescriptor, ComponentKind, ContextSource,
+    ConversationContextExchange, ConversationMode, ConversationSignal, ExecutionLocation,
+    FollowUpPolicy, GatewayMessage, GenerationId, MemoryApproval, MemoryConfidence, MemoryDraft,
+    MemoryId, MemoryInspection, MemoryKind, MemoryProvenance, MemoryProvenanceKind, MemoryRecord,
+    MemoryRetention, MemoryRetrievalReason, MemoryRetrievalTrace, MemoryTraceExclusions,
+    MemoryTraceItem, PersonaLevel, PersonaProfile, PlaybackState, PrivacyMode, PrivacySummary,
+    QualityDecision, RecoveryDisposition, ResponseControls, RetrievalTraceId, RuntimeError,
+    RuntimeErrorKind, RuntimeEvent, RuntimeStage, RuntimeStatus, SessionId, SilencePolicy,
+    SpeechPace, TurnId, UnixTimestampMillis, VoiceActivity, VoiceSessionEvent,
+    VoiceTimingMilestone, CLIENT_PROTOCOL_VERSION, CONTEXT_SEED_PROTOCOL_VERSION,
+    LEGACY_CLIENT_PROTOCOL_VERSION, MAX_CLIENT_COMPONENT_DESCRIPTORS,
+    MAX_CLIENT_DEVICE_LABEL_BYTES, MAX_CLIENT_DIARIZED_SEGMENTS,
     MAX_CLIENT_DIARIZED_SEGMENT_TEXT_BYTES, MAX_CLIENT_FRAME_BYTES,
-    MAX_CLIENT_PROVIDER_LABEL_BYTES, MAX_CLIENT_RECORDING_GAPS, MAX_CONVERSATION_MESSAGE_BYTES,
-    MAX_HISTORY_BYTES, MAX_MEMORY_PREVIEW_BYTES, RUNTIME_PROFILE_PROTOCOL_VERSION,
+    MAX_CLIENT_PROCESSED_OUTPUT_BYTES, MAX_CLIENT_PROVIDER_LABEL_BYTES, MAX_CLIENT_RECORDING_GAPS,
+    MAX_CONVERSATION_MESSAGE_BYTES, MAX_HISTORY_BYTES, MAX_MEMORY_PREVIEW_BYTES,
+    RUNTIME_PROFILE_PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Deserializer};
 
@@ -3637,5 +3639,139 @@ fn reconciliation() -> ClientRecordingReconciliation {
             },
         ],
         warnings: vec!["recording_truncated".to_owned()],
+    }
+}
+
+#[test]
+fn process_text_is_a_version_three_command_only() {
+    let payload = |version: u64| {
+        format!(
+            r#"{{"protocol_version":{version},"type":"process_text","request_id":"p-1","session_id":"7","instructions":"summarise","input":"the meeting","output_schema":{{"type":"object"}},"max_output_bytes":4096}}"#
+        )
+    };
+
+    assert_eq!(
+        decode_client_command(payload(RUNTIME_PROFILE_PROTOCOL_VERSION).as_bytes()).unwrap(),
+        ClientCommand::ProcessText {
+            request_id: "p-1".to_owned(),
+            session_id: SessionId::new(7),
+            instructions: "summarise".to_owned(),
+            input: "the meeting".to_owned(),
+            output_schema: r#"{"type":"object"}"#.to_owned(),
+            max_output_bytes: 4096,
+        }
+    );
+    for version in [
+        LEGACY_CLIENT_PROTOCOL_VERSION,
+        CONTEXT_SEED_PROTOCOL_VERSION,
+    ] {
+        assert!(matches!(
+            decode_client_command(payload(version).as_bytes()),
+            Err(ClientWireError::UnsupportedProtocolVersion(_))
+        ));
+    }
+    assert!(matches!(
+        decode_client_command(payload(4).as_bytes()),
+        Err(ClientWireError::UnsupportedProtocolVersion(4))
+    ));
+}
+
+#[test]
+fn a_text_processing_command_the_runtime_cannot_serve_is_refused_at_decode() {
+    let command = |body: &str| {
+        format!(
+            r#"{{"protocol_version":3,"type":"process_text","request_id":"p-1","session_id":"7",{body}}}"#
+        )
+    };
+    for body in [
+        // An output schema must be an object; an array or a string is not a schema.
+        r#""instructions":"s","input":"i","output_schema":["type"],"max_output_bytes":4096"#,
+        r#""instructions":"s","input":"i","output_schema":"object","max_output_bytes":4096"#,
+        // Empty instructions or input cannot produce a structured answer.
+        r#""instructions":"","input":"i","output_schema":{"type":"object"},"max_output_bytes":4096"#,
+        r#""instructions":"s","input":"","output_schema":{"type":"object"},"max_output_bytes":4096"#,
+        // A zero or unbounded output limit is not a limit.
+        r#""instructions":"s","input":"i","output_schema":{"type":"object"},"max_output_bytes":0"#,
+        r#""instructions":"s","input":"i","output_schema":{"type":"object"},"max_output_bytes":4294967296"#,
+        // Every field is required.
+        r#""instructions":"s","input":"i","output_schema":{"type":"object"}"#,
+    ] {
+        assert!(
+            decode_client_command(command(body).as_bytes()).is_err(),
+            "a text-processing command with {body} must be refused at decode"
+        );
+    }
+}
+
+#[test]
+fn processed_text_is_stated_only_from_version_three() {
+    let message = GatewayMessage::TextProcessed {
+        request_id: "p-1".to_owned(),
+        processed: ClientProcessedText {
+            output: r#"{"decisions":[]}"#.to_owned(),
+            warnings: vec!["schema_retry".to_owned()],
+        },
+    };
+
+    let encoded =
+        encode_gateway_message_for_version(&message, RUNTIME_PROFILE_PROTOCOL_VERSION).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "protocol_version": 3,
+            "type": "text_processed",
+            "request_id": "p-1",
+            "processed": {
+                "output": {"decisions": []},
+                "warnings": ["schema_retry"],
+            },
+        })
+    );
+
+    for version in [
+        LEGACY_CLIENT_PROTOCOL_VERSION,
+        CONTEXT_SEED_PROTOCOL_VERSION,
+    ] {
+        assert!(matches!(
+            encode_gateway_message_for_version(&message, version),
+            Err(ClientWireError::UnsupportedProtocolVersion(_))
+        ));
+    }
+}
+
+#[test]
+fn processed_text_fails_closed_on_values_the_runtime_cannot_produce() {
+    for processed in [
+        // Output that is not JSON at all: the runtime only ever states validated JSON.
+        ClientProcessedText {
+            output: "not json".to_owned(),
+            warnings: Vec::new(),
+        },
+        // A warning outside the closed list, and a repeated one.
+        ClientProcessedText {
+            output: "{}".to_owned(),
+            warnings: vec!["the model was unhappy".to_owned()],
+        },
+        ClientProcessedText {
+            output: "{}".to_owned(),
+            warnings: vec!["schema_retry".to_owned(), "schema_retry".to_owned()],
+        },
+        // Output past the size a client frame can carry.
+        ClientProcessedText {
+            output: format!("\"{}\"", "x".repeat(MAX_CLIENT_PROCESSED_OUTPUT_BYTES)),
+            warnings: Vec::new(),
+        },
+    ] {
+        assert!(matches!(
+            encode_gateway_message_for_version(
+                &GatewayMessage::TextProcessed {
+                    request_id: "p-1".to_owned(),
+                    processed,
+                },
+                RUNTIME_PROFILE_PROTOCOL_VERSION,
+            ),
+            Err(ClientWireError::InvalidProcessedText)
+        ));
     }
 }

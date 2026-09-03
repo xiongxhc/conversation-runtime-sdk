@@ -10,17 +10,17 @@ use conversation_model_adapters::{
 use conversation_protocol::{
     decode_client_command_with_version, encode_gateway_message_for_version, ClientCommand,
     ClientDiarizedSegment, ClientMemoryCursor, ClientMemoryInspection, ClientMemorySummary,
-    ClientPersonaState, ClientRecordingGap, ClientRecordingReconciliation, ClientRecordingSummary,
-    ClientRuntimeError, ClientRuntimeEvent, ClientVoiceSessionEvent, GatewayMessage,
-    MemoryApproval, RecoveryDisposition, RuntimeError, RuntimeErrorKind, RuntimeEvent,
-    RuntimeStatus, SessionId, TurnId, VoiceSessionEvent, CLIENT_PROTOCOL_VERSION,
+    ClientPersonaState, ClientProcessedText, ClientRecordingGap, ClientRecordingReconciliation,
+    ClientRecordingSummary, ClientRuntimeError, ClientRuntimeEvent, ClientVoiceSessionEvent,
+    GatewayMessage, MemoryApproval, RecoveryDisposition, RuntimeError, RuntimeErrorKind,
+    RuntimeEvent, RuntimeStatus, SessionId, TurnId, VoiceSessionEvent, CLIENT_PROTOCOL_VERSION,
     CONTEXT_SEED_PROTOCOL_VERSION, LEGACY_CLIENT_PROTOCOL_VERSION,
     RUNTIME_PROFILE_PROTOCOL_VERSION,
 };
 use conversation_runtime::{
-    reconcile_recording, ConversationContext, RecordingSettings, RecordingSummary, SessionRecorder,
-    TextTurnEventStream, TextTurnRuntime, VoiceSessionAdapters, VoiceSessionEventStream,
-    VoiceSessionRuntime,
+    process_text, reconcile_recording, ConversationContext, ProcessedText, RecordingSettings,
+    RecordingSummary, SessionRecorder, TextProcessingRequest, TextTurnEventStream, TextTurnRuntime,
+    VoiceSessionAdapters, VoiceSessionEventStream, VoiceSessionRuntime,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
@@ -37,6 +37,9 @@ const NORMAL_WRITER_BUFFER_SIZE: usize = 4;
 const EVENT_WRITER_BUFFER_SIZE: usize = 1;
 const WRITER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 const INVALID_COMMAND_REQUEST_ID: &str = "invalid-command";
+/// The one session identifier this gateway serves. A connection is one session, so a command
+/// naming any other identifier is asking a session this process does not have.
+const GATEWAY_SESSION_ID: SessionId = SessionId::new(1);
 
 pub struct GatewaySession {
     runtime: TextTurnRuntime,
@@ -707,7 +710,7 @@ impl GatewaySession {
                     .map_err(CommandFailure::response);
                 }
 
-                let session_id = SessionId::new(1);
+                let session_id = GATEWAY_SESSION_ID;
                 let policy = match lane.adapters.policy.for_session(session_id) {
                     Ok(policy) => policy,
                     Err(error) => {
@@ -902,6 +905,68 @@ impl GatewaySession {
                     GatewayMessage::RecordingReconciled {
                         request_id,
                         reconciliation,
+                    },
+                )
+                .map_err(CommandFailure::response)
+            }
+            ClientCommand::ProcessText {
+                request_id,
+                session_id,
+                instructions,
+                input,
+                output_schema,
+                max_output_bytes,
+            } => {
+                if session_id != GATEWAY_SESSION_ID {
+                    return send_rejection(
+                        normal,
+                        &request_id,
+                        command_error("text processing was requested for another session"),
+                    )
+                    .map_err(CommandFailure::response);
+                }
+                let request = match TextProcessingRequest::new(
+                    instructions,
+                    input,
+                    output_schema,
+                    max_output_bytes,
+                ) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return send_rejection(
+                            normal,
+                            &request_id,
+                            ClientRuntimeError::from(error),
+                        )
+                        .map_err(CommandFailure::response);
+                    }
+                };
+                // The call runs on the session's own language model, so it runs in the profile
+                // the session pinned at start. It creates no turn and touches no conversation
+                // state, so it needs no interlock with an active turn or voice session.
+                let processed = process_text(
+                    self.runtime.language_model(),
+                    request,
+                    self.provider_failure.clone().unwrap_or_default(),
+                )
+                .await;
+                let processed = match processed {
+                    Ok(processed) => client_processed_text(&processed),
+                    Err(error) => {
+                        return send_rejection(
+                            normal,
+                            &request_id,
+                            ClientRuntimeError::from(error),
+                        )
+                        .map_err(CommandFailure::response);
+                    }
+                };
+                send_accepted(normal, &request_id).map_err(CommandFailure::response)?;
+                send_normal(
+                    normal,
+                    GatewayMessage::TextProcessed {
+                        request_id,
+                        processed,
                     },
                 )
                 .map_err(CommandFailure::response)
@@ -1981,6 +2046,19 @@ fn client_recording_summary(summary: &RecordingSummary) -> ClientRecordingSummar
                 ended_at_ms: gap.ended_at_ms,
                 reason: gap.reason.clone(),
             })
+            .collect(),
+    }
+}
+
+/// Projects one processed answer onto the wire. The output is already canonical JSON the
+/// runtime validated against the caller's schema, so this only renames the warnings.
+fn client_processed_text(processed: &ProcessedText) -> ClientProcessedText {
+    ClientProcessedText {
+        output: processed.output().to_owned(),
+        warnings: processed
+            .warnings()
+            .iter()
+            .map(|warning| warning.as_str().to_owned())
             .collect(),
     }
 }

@@ -109,7 +109,10 @@ async fn run() -> Result<i32, CliFailure> {
                     eprintln!("status=cancelled");
                     return Ok(130);
                 }
-                eprintln!("turn={} transcript=final", turn_id.get());
+                match turn_id {
+                    Some(turn_id) => eprintln!("turn={} transcript=final", turn_id.get()),
+                    None => eprintln!("transcript=final response=pending"),
+                }
             }
             VoiceSessionEvent::BargeIn {
                 turn_id,

@@ -1,3 +1,4 @@
+mod client_diarization;
 mod client_memory;
 mod client_persona;
 mod client_recording;
@@ -12,6 +13,11 @@ mod privacy;
 mod quality;
 mod voice_event;
 
+pub use client_diarization::{
+    ClientDiarizedSegment, ClientRecordingReconciliation, MAX_CLIENT_DIARIZED_SEGMENTS,
+    MAX_CLIENT_DIARIZED_SEGMENT_ID_BYTES, MAX_CLIENT_DIARIZED_SEGMENT_TEXT_BYTES,
+    MAX_CLIENT_DIARIZED_TEXT_BYTES,
+};
 pub use client_memory::{
     memory_preview, ClientMemoryApproval, ClientMemoryCursor, ClientMemoryInspection,
     ClientMemoryPage, ClientMemoryProvenance, ClientMemoryRecord, ClientMemoryRetention,

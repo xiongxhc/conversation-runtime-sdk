@@ -43,7 +43,13 @@ export type ClientCommand =
   | { type: "persona_update"; requestId: string; persona: PersonaState }
   | { type: "memory_approve"; requestId: string; memoryId: bigint; expectedRevision: bigint }
   | { type: "memory_delete"; requestId: string; memoryId: bigint; expectedRevision: bigint }
-  | { type: "finalize_recording"; requestId: string; sessionId: bigint };
+  | { type: "finalize_recording"; requestId: string; sessionId: bigint }
+  | {
+      type: "reconcile_recording";
+      requestId: string;
+      sessionId: bigint;
+      recordingHandle: string;
+    };
 
 export type ConversationContextExchange = { user: string; assistant: string };
 
@@ -67,6 +73,29 @@ export type RecordingSummary = {
   format: string;
   keyId: string;
   gaps: RecordingGap[];
+};
+
+/**
+ * One stretch of speech from a reconciled recording.
+ *
+ * `startedAtMs` and `endedAtMs` are on the media timeline: the same clock as a recording
+ * summary's `durationMs` and gap timestamps, which advances by the recorded audio plus the
+ * gaps between it. `speakerCluster` is an anonymous label such as `cluster-1` and never names
+ * a person; mapping a cluster onto a real participant happens elsewhere, from evidence the
+ * runtime does not have.
+ */
+export type DiarizedSegment = {
+  segmentId: string;
+  startedAtMs: bigint;
+  endedAtMs: bigint;
+  text: string;
+  speakerCluster: string | null;
+};
+
+/** A whole meeting's reconciliation. */
+export type RecordingReconciliation = {
+  segments: DiarizedSegment[];
+  warnings: string[];
 };
 
 export type PersonaState = {
@@ -336,7 +365,12 @@ export type GatewayMessage =
   | { type: "persona_state"; requestId: string; persona: PersonaState }
   | { type: "memory_deleted"; requestId: string; memoryId: bigint }
   | ({ type: "memory_extracted" } & MemoryExtractedSummary)
-  | { type: "recording_finalized"; requestId: string; recording: RecordingSummary };
+  | { type: "recording_finalized"; requestId: string; recording: RecordingSummary }
+  | {
+      type: "recording_reconciled";
+      requestId: string;
+      reconciliation: RecordingReconciliation;
+    };
 
 export class ProtocolError extends Error {
   constructor(message: string) {
@@ -416,6 +450,23 @@ export function parseClientCommand(value: unknown, expectedVersion?: ClientProto
         throw new ProtocolError("session recording requires protocol version 3");
       }
       return { type, requestId: requireRequestId(object), sessionId: parseIdentifier(object.session_id) };
+    case "reconcile_recording":
+      requireExactKeys(object, [
+        "protocol_version",
+        "type",
+        "request_id",
+        "session_id",
+        "recording_handle",
+      ]);
+      if (version < RUNTIME_PROFILE_PROTOCOL_VERSION) {
+        throw new ProtocolError("recording reconciliation requires protocol version 3");
+      }
+      return {
+        type,
+        requestId: requireRequestId(object),
+        sessionId: parseIdentifier(object.session_id),
+        recordingHandle: requireRecordingHandle(requireString(object, "recording_handle")),
+      };
     default:
       throw new ProtocolError("unsupported client command type");
   }
@@ -520,6 +571,17 @@ export function parseGatewayMessage(
         throw new ProtocolError("session recording requires protocol version 3");
       }
       return { type, requestId: requireRequestId(object), recording: parseRecordingSummary(object.recording) };
+    case "recording_reconciled":
+      requireExactKeys(object, ["protocol_version", "type", "request_id", "reconciliation"]);
+      validateProtocolVersion(object, version);
+      if (version < RUNTIME_PROFILE_PROTOCOL_VERSION) {
+        throw new ProtocolError("recording reconciliation requires protocol version 3");
+      }
+      return {
+        type,
+        requestId: requireRequestId(object),
+        reconciliation: parseRecordingReconciliation(object.reconciliation),
+      };
     default:
       throw new ProtocolError("unsupported gateway message type");
   }
@@ -598,6 +660,14 @@ export function encodeClientCommand(
           request_id: command.requestId,
           session_id: command.sessionId.toString(),
         };
+      case "reconcile_recording":
+        return {
+          protocol_version: version,
+          type: command.type,
+          request_id: command.requestId,
+          session_id: command.sessionId.toString(),
+          recording_handle: command.recordingHandle,
+        };
       case "seed_conversation_context":
         return {
           protocol_version: version,
@@ -658,6 +728,15 @@ export function validateClientCommand(
       throw new ProtocolError("session identifier is outside u64 range");
     }
   }
+  if (command.type === "reconcile_recording") {
+    if (version < RUNTIME_PROFILE_PROTOCOL_VERSION) {
+      throw new ProtocolError("recording reconciliation requires protocol version 3");
+    }
+    if (command.sessionId < 1n || command.sessionId > MAX_U64) {
+      throw new ProtocolError("session identifier is outside u64 range");
+    }
+    requireRecordingHandle(command.recordingHandle);
+  }
   if (command.type === "memory_approve" || command.type === "memory_delete") {
     if (command.memoryId < 1n || command.memoryId > MAX_U64) {
       throw new ProtocolError("memory identifier is outside u64 range");
@@ -711,6 +790,106 @@ function parseRecordingSummary(value: unknown): RecordingSummary {
     parseRecordingGap(gap, durationMs),
   );
   return { recordingHandle, encryptedPath, sha256, durationMs, format, keyId, gaps };
+}
+
+const MAX_DIARIZED_SEGMENTS = 1024;
+const MAX_DIARIZED_SEGMENT_TEXT_BYTES = 2048;
+const MAX_DIARIZED_TEXT_BYTES = 128 * 1024;
+const MAX_DIARIZED_SEGMENT_ID_BYTES = 64;
+const DIARIZATION_WARNINGS = [
+  "no_speech_detected",
+  "provider_reported_warnings",
+  "recording_truncated",
+] as const;
+
+/** The handle's charset and length is the runtime's path-traversal guard, mirrored here. */
+function requireRecordingHandle(handle: string): string {
+  if (!/^[a-z0-9]+$/.test(handle)) {
+    throw new ProtocolError("recording handle is not a valid handle");
+  }
+  requireNonEmptyMaximumUtf8Bytes(handle, MAX_RECORDING_HANDLE_BYTES, "recording handle");
+  return handle;
+}
+
+function parseRecordingReconciliation(value: unknown): RecordingReconciliation {
+  const object = requireRecord(value, "recording reconciliation");
+  requireExactKeys(object, ["segments", "warnings"]);
+  const segments = parseBoundedArray(
+    object.segments,
+    MAX_DIARIZED_SEGMENTS,
+    "reconciled segments",
+    parseDiarizedSegment,
+  );
+  let textBytes = 0;
+  const identifiers = new Set<string>();
+  for (const segment of segments) {
+    textBytes += utf8Bytes(segment.text);
+    if (textBytes > MAX_DIARIZED_TEXT_BYTES) {
+      throw new ProtocolError("reconciled text exceeded its size limit");
+    }
+    if (identifiers.has(segment.segmentId)) {
+      throw new ProtocolError("a segment identifier names one segment");
+    }
+    identifiers.add(segment.segmentId);
+  }
+  const warnings = parseBoundedArray(
+    object.warnings,
+    DIARIZATION_WARNINGS.length,
+    "reconciliation warnings",
+    (warning) => {
+      if (typeof warning !== "string" || !DIARIZATION_WARNINGS.includes(warning as never)) {
+        throw new ProtocolError("reconciliation warning is not a known warning");
+      }
+      return warning;
+    },
+  );
+  if (new Set(warnings).size !== warnings.length) {
+    throw new ProtocolError("a reconciliation warning is stated once");
+  }
+  return { segments, warnings };
+}
+
+function parseDiarizedSegment(value: unknown): DiarizedSegment {
+  const object = requireRecord(value, "diarized segment");
+  requireExactKeys(object, [
+    "segment_id",
+    "started_at_ms",
+    "ended_at_ms",
+    "text",
+    "speaker_cluster",
+  ]);
+  const segmentId = requireString(object, "segment_id");
+  if (!/^[a-z0-9-]+$/.test(segmentId)) {
+    throw new ProtocolError("segment identifier is not a bounded lowercase label");
+  }
+  requireNonEmptyMaximumUtf8Bytes(segmentId, MAX_DIARIZED_SEGMENT_ID_BYTES, "segment identifier");
+  const startedAtMs = parseTimestamp(object.started_at_ms);
+  const endedAtMs = parseTimestamp(object.ended_at_ms);
+  if (endedAtMs < startedAtMs) {
+    throw new ProtocolError("a segment cannot end before it starts");
+  }
+  const text = requireString(object, "text");
+  if (utf8Bytes(text) > MAX_DIARIZED_SEGMENT_TEXT_BYTES) {
+    throw new ProtocolError("segment text exceeded its size limit");
+  }
+  // A control character would be escaped six-fold on the wire, so the size bounds above only
+  // hold while none appears.
+  if (/[\u0000-\u001f\u007f]/.test(text)) {
+    throw new ProtocolError("segment text carries a control character");
+  }
+  const speakerCluster = object.speaker_cluster;
+  if (speakerCluster !== null && !isAnonymousClusterLabel(speakerCluster)) {
+    throw new ProtocolError("speaker cluster is not an anonymous label");
+  }
+  return { segmentId, startedAtMs, endedAtMs, text, speakerCluster };
+}
+
+/**
+ * `cluster-` and a positive decimal, and nothing else. This is the check that keeps a
+ * provider's guess at somebody's identity out of a client's hands.
+ */
+function isAnonymousClusterLabel(value: unknown): value is string {
+  return typeof value === "string" && /^cluster-[1-9][0-9]{0,3}$/.test(value);
 }
 
 function parseRecordingGap(value: unknown, durationMs: bigint): RecordingGap {
@@ -1739,6 +1918,10 @@ function requireMaximumUtf8Bytes(value: string, maximum: number, name: string): 
   if (new TextEncoder().encode(value).length > maximum) {
     throw new ProtocolError(`${name} exceeds ${maximum} bytes`);
   }
+}
+
+function utf8Bytes(value: string): number {
+  return new TextEncoder().encode(value).length;
 }
 
 function requireNonEmptyMaximumUtf8Bytes(value: string, maximum: number, name: string): void {

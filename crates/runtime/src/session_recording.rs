@@ -46,7 +46,7 @@
 
 use std::fmt;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -588,54 +588,132 @@ fn decode_handle(handle: &str) -> Option<[u8; BINDING_BYTES]> {
     Some(binding)
 }
 
-/// Decrypts a recording with the key named by `key_env`.
+/// Walks a recording's chunks one at a time, decrypting each as it is read.
 ///
-/// A partial trailing chunk — what a crash mid-write leaves — stops the read and is reported as
-/// `truncated`; every whole chunk before it is returned. A chunk that fails to open is not a
-/// crash but tampering, and fails the read.
-pub fn read_session_recording(path: &Path, key_env: &str) -> Result<RecordedSession, RuntimeError> {
-    let key = RecordingKey::from_environment(key_env)?;
-    let raw = std::fs::read(path).map_err(|_| adapter_error("recording could not be read"))?;
-    if raw.len() < HEADER_LEN {
-        return Err(adapter_error("recording header is incomplete"));
-    }
-    let mut header = [0_u8; HEADER_LEN];
-    header.copy_from_slice(&raw[..HEADER_LEN]);
-    let session_id = read_header(&header)?;
+/// This is the reader a post-meeting reconciliation uses. A two-hour meeting is roughly
+/// 230 MB, so holding the whole file — which is what [`read_session_recording`] does — is not
+/// an option there. Both readers validate the header through the one [`read_header`] function,
+/// so neither can accept a layout the other refuses.
+pub struct RecordedChunks {
+    reader: BufReader<File>,
+    key: RecordingKey,
+    header: [u8; HEADER_LEN],
+    session_id: SessionId,
+    counter: u32,
+    truncated: bool,
+    finished: bool,
+}
 
-    let mut chunks = Vec::new();
-    let mut offset = HEADER_LEN;
-    let mut counter = 0_u32;
-    let mut truncated = false;
-    while offset < raw.len() {
-        let Some(prefix) = raw.get(offset..offset + 4) else {
-            truncated = true;
-            break;
-        };
-        let length = usize::try_from(u32::from_be_bytes([
-            prefix[0], prefix[1], prefix[2], prefix[3],
-        ]))
-        .map_err(|_| adapter_error("recording chunk length is out of range"))?;
+/// Opens a recording and validates its header, without reading a single chunk.
+pub fn open_session_recording(path: &Path, key_env: &str) -> Result<RecordedChunks, RuntimeError> {
+    let key = RecordingKey::from_environment(key_env)?;
+    let mut file = File::open(path).map_err(|_| adapter_error("recording could not be opened"))?;
+    let mut header = [0_u8; HEADER_LEN];
+    file.read_exact(&mut header)
+        .map_err(|_| adapter_error("recording header is incomplete"))?;
+    let session_id = read_header(&header)?;
+    Ok(RecordedChunks {
+        reader: BufReader::new(file),
+        key,
+        header,
+        session_id,
+        counter: 0,
+        truncated: false,
+        finished: false,
+    })
+}
+
+impl RecordedChunks {
+    /// The session that made this recording, as the header states it. Provenance only: what
+    /// proves a file answers to a handle is the binding identifier, not this.
+    pub const fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    /// Whether the walk stopped on a partial trailing chunk. Only meaningful once the walk has
+    /// ended, which is what a `None` from [`Self::next_chunk`] reports.
+    pub const fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// The next whole chunk, or `None` at the end of the recording.
+    ///
+    /// A partial trailing chunk — what a crash mid-write leaves — ends the walk and sets
+    /// `truncated`. A *whole* chunk that fails to open is not a crash but tampering, and fails.
+    pub fn next_chunk(&mut self) -> Result<Option<RecordedChunk>, RuntimeError> {
+        if self.finished {
+            return Ok(None);
+        }
+        let mut prefix = [0_u8; 4];
+        match self.fill(&mut prefix)? {
+            0 => {
+                self.finished = true;
+                return Ok(None);
+            }
+            4 => {}
+            _ => return Ok(self.tear()),
+        }
+        let length = usize::try_from(u32::from_be_bytes(prefix))
+            .map_err(|_| adapter_error("recording chunk length is out of range"))?;
         if length > MAX_CHUNK_CIPHERTEXT_BYTES {
             return Err(adapter_error("recording chunk exceeded its size limit"));
         }
-        offset += 4;
-        let Some(ciphertext) = raw.get(offset..offset + length) else {
-            truncated = true;
-            break;
-        };
-        let mut buffer = ciphertext.to_vec();
-        let plaintext = key.open(nonce(&header, counter), &aad(&header, counter), &mut buffer)?;
-        chunks.push(decode_chunk(&buffer[..plaintext])?);
-        offset += length;
-        counter = counter
+        let mut buffer = vec![0_u8; length];
+        if self.fill(&mut buffer)? != length {
+            return Ok(self.tear());
+        }
+        let counter = self.counter;
+        let plaintext = self.key.open(
+            nonce(&self.header, counter),
+            &aad(&self.header, counter),
+            &mut buffer,
+        )?;
+        let chunk = decode_chunk(&buffer[..plaintext])?;
+        self.counter = counter
             .checked_add(1)
             .ok_or_else(|| adapter_error("recording exceeded its chunk limit"))?;
+        Ok(Some(chunk))
+    }
+
+    fn tear(&mut self) -> Option<RecordedChunk> {
+        self.finished = true;
+        self.truncated = true;
+        None
+    }
+
+    /// Reads until `buffer` is full or the file ends, reporting how many bytes arrived. A short
+    /// count is a tear rather than an error, which is what makes a crashed recording readable.
+    fn fill(&mut self, buffer: &mut [u8]) -> Result<usize, RuntimeError> {
+        let mut filled = 0;
+        while filled < buffer.len() {
+            let read = self
+                .reader
+                .read(&mut buffer[filled..])
+                .map_err(|_| adapter_error("recording could not be read"))?;
+            if read == 0 {
+                break;
+            }
+            filled += read;
+        }
+        Ok(filled)
+    }
+}
+
+/// Decrypts a whole recording with the key named by `key_env`.
+///
+/// Holds the entire decrypted recording in memory, so it suits a short session and a test, not
+/// a two-hour meeting; [`open_session_recording`] streams the same chunks instead. A partial
+/// trailing chunk is reported as `truncated`; every whole chunk before it is returned.
+pub fn read_session_recording(path: &Path, key_env: &str) -> Result<RecordedSession, RuntimeError> {
+    let mut walk = open_session_recording(path, key_env)?;
+    let mut chunks = Vec::new();
+    while let Some(chunk) = walk.next_chunk()? {
+        chunks.push(chunk);
     }
     Ok(RecordedSession {
-        session_id,
+        session_id: walk.session_id(),
         chunks,
-        truncated,
+        truncated: walk.truncated(),
     })
 }
 
@@ -756,14 +834,20 @@ fn instant_elapsed_ms(since: Instant) -> u64 {
 /// How much audio one frame carries, which is what makes the reported duration a media span
 /// rather than a wall-clock interval.
 fn frame_duration_ms(frame: &AudioFrame) -> u64 {
-    let format = frame.format();
+    pcm_duration_ms(frame.format(), frame.bytes().len())
+}
+
+/// How much audio a run of PCM carries. The reconciliation reader accumulates the media
+/// timeline the same way the sink did, one frame at a time, so the two agree exactly rather
+/// than to within a rounding step.
+pub(crate) fn pcm_duration_ms(format: PcmFormat, bytes: usize) -> u64 {
     let Ok(alignment) = format.frame_alignment_bytes() else {
         return 0;
     };
     if alignment == 0 {
         return 0;
     }
-    let samples = frame.bytes().len() / alignment;
+    let samples = bytes / alignment;
     u64::try_from(samples as u128 * 1000 / u128::from(format.sample_rate_hz())).unwrap_or(u64::MAX)
 }
 

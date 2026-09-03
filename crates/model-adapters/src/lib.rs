@@ -1,9 +1,11 @@
 mod audio_frame;
 mod audio_output;
+mod base64;
 mod buffered_streaming_speech;
 mod capture;
 mod continuous_audio_output;
 mod credential;
+mod diarization;
 mod generation_language;
 mod language_model;
 mod macos_afplay;
@@ -13,6 +15,7 @@ mod mock;
 mod ollama;
 mod openai_compatible_speech;
 mod openai_compatible_streaming_speech;
+mod openai_diarization;
 mod openai_language;
 mod openai_speech_recognition;
 mod recognition;
@@ -36,6 +39,12 @@ pub use audio_output::{AudioOutput, AudioOutputRequest, DiscardAudioOutput};
 pub use buffered_streaming_speech::BufferedStreamingSpeechSynthesizer;
 pub use capture::{AudioCapture, CaptureEvent};
 pub use continuous_audio_output::{ContinuousAudioOutput, PlaybackReceipt};
+pub use diarization::{
+    DiarizationResult, DiarizationWarning, DiarizedSegment, MeetingAudioWindow,
+    MeetingAudioWindows, TranscriptionDiarizer, MAX_DIARIZED_SEGMENTS,
+    MAX_DIARIZED_SEGMENT_ID_BYTES, MAX_DIARIZED_SEGMENT_TEXT_BYTES, MAX_DIARIZED_TEXT_BYTES,
+    MAX_SPEAKER_CLUSTERS,
+};
 pub use generation_language::{
     GenerationLanguageModel, GenerationLanguageRequest, GenerationTextDelta,
 };
@@ -60,6 +69,7 @@ pub use openai_compatible_speech::{
 pub use openai_compatible_streaming_speech::{
     OpenAiCompatibleStreamingSpeechConfig, OpenAiCompatibleStreamingSpeechSynthesizer,
 };
+pub use openai_diarization::{OpenAiDiarizationConfig, OpenAiTranscriptionDiarizer};
 pub use openai_language::{OpenAiLanguageConfig, OpenAiLanguageModel};
 pub use openai_speech_recognition::{
     OnlineRecognitionSegment, OpenAiSpeechRecognitionConfig, OpenAiSpeechRecognizer,

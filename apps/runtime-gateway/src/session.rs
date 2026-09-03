@@ -4,19 +4,23 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use conversation_memory::{MemoryClock, MemoryStore, MemoryStoreErrorKind};
-use conversation_model_adapters::GenerationLanguageModel;
+use conversation_model_adapters::{
+    DiarizationResult, GenerationLanguageModel, TranscriptionDiarizer,
+};
 use conversation_protocol::{
     decode_client_command_with_version, encode_gateway_message_for_version, ClientCommand,
-    ClientMemoryCursor, ClientMemoryInspection, ClientMemorySummary, ClientPersonaState,
-    ClientRecordingGap, ClientRecordingSummary, ClientRuntimeError, ClientRuntimeEvent,
-    ClientVoiceSessionEvent, GatewayMessage, MemoryApproval, RecoveryDisposition, RuntimeError,
-    RuntimeErrorKind, RuntimeEvent, RuntimeStatus, SessionId, TurnId, VoiceSessionEvent,
-    CLIENT_PROTOCOL_VERSION, CONTEXT_SEED_PROTOCOL_VERSION, LEGACY_CLIENT_PROTOCOL_VERSION,
+    ClientDiarizedSegment, ClientMemoryCursor, ClientMemoryInspection, ClientMemorySummary,
+    ClientPersonaState, ClientRecordingGap, ClientRecordingReconciliation, ClientRecordingSummary,
+    ClientRuntimeError, ClientRuntimeEvent, ClientVoiceSessionEvent, GatewayMessage,
+    MemoryApproval, RecoveryDisposition, RuntimeError, RuntimeErrorKind, RuntimeEvent,
+    RuntimeStatus, SessionId, TurnId, VoiceSessionEvent, CLIENT_PROTOCOL_VERSION,
+    CONTEXT_SEED_PROTOCOL_VERSION, LEGACY_CLIENT_PROTOCOL_VERSION,
     RUNTIME_PROFILE_PROTOCOL_VERSION,
 };
 use conversation_runtime::{
-    ConversationContext, RecordingSettings, RecordingSummary, SessionRecorder, TextTurnEventStream,
-    TextTurnRuntime, VoiceSessionAdapters, VoiceSessionEventStream, VoiceSessionRuntime,
+    reconcile_recording, ConversationContext, RecordingSettings, RecordingSummary, SessionRecorder,
+    TextTurnEventStream, TextTurnRuntime, VoiceSessionAdapters, VoiceSessionEventStream,
+    VoiceSessionRuntime,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
@@ -44,6 +48,10 @@ pub struct GatewaySession {
     provider_failure: Option<CancellationToken>,
     recording: Option<RecordingSettings>,
     active_recording: Option<ActiveRecording>,
+    /// The adapter that turns a finished recording into timed text and anonymous clusters.
+    /// Absent in every configuration the loader builds: like the other online adapters, it is
+    /// wired explicitly rather than constructed from a TOML file.
+    reconciliation: Option<Arc<dyn TranscriptionDiarizer>>,
 }
 
 /// The recorder for the voice session that is running, or was the last to run. It outlives the
@@ -140,6 +148,7 @@ impl GatewaySession {
             provider_failure: None,
             recording: None,
             active_recording: None,
+            reconciliation: None,
         }
     }
 
@@ -148,6 +157,13 @@ impl GatewaySession {
     /// it did before recordings existed.
     pub fn with_recording(mut self, settings: RecordingSettings) -> Self {
         self.recording = Some(settings);
+        self
+    }
+
+    /// Wires the batch transcription and diarization adapter. Without it a deployment records
+    /// meetings but cannot reconcile them, and says so.
+    pub fn with_reconciliation(mut self, diarizer: Arc<dyn TranscriptionDiarizer>) -> Self {
+        self.reconciliation = Some(diarizer);
         self
     }
 
@@ -823,6 +839,69 @@ impl GatewaySession {
                     GatewayMessage::RecordingFinalized {
                         request_id,
                         recording,
+                    },
+                )
+                .map_err(CommandFailure::response)
+            }
+            ClientCommand::ReconcileRecording {
+                request_id,
+                session_id,
+                recording_handle,
+            } => {
+                let Some(settings) = self.recording.clone() else {
+                    return send_rejection(
+                        normal,
+                        &request_id,
+                        command_error("this deployment does not record sessions"),
+                    )
+                    .map_err(CommandFailure::response);
+                };
+                let Some(diarizer) = self.reconciliation.clone() else {
+                    return send_rejection(
+                        normal,
+                        &request_id,
+                        command_error("this deployment does not reconcile recordings"),
+                    )
+                    .map_err(CommandFailure::response);
+                };
+                // Reconciliation is post-meeting work. Reading a file the sink is still
+                // appending to would answer for a prefix of the meeting and call it the whole.
+                if voice.active.is_some() {
+                    return send_rejection(
+                        normal,
+                        &request_id,
+                        command_error("the voice session is still recording"),
+                    )
+                    .map_err(CommandFailure::response);
+                }
+                // The recording is reached by handle alone: the handle binds to a per-recording
+                // identifier in the file header, which is what isolates one meeting's audio
+                // from another's when every session carries the same identifier.
+                let reconciled = reconcile_recording(
+                    &settings,
+                    session_id,
+                    &recording_handle,
+                    diarizer,
+                    self.provider_failure.clone().unwrap_or_default(),
+                )
+                .await;
+                let reconciliation = match reconciled {
+                    Ok(result) => client_reconciliation(&result),
+                    Err(error) => {
+                        return send_rejection(
+                            normal,
+                            &request_id,
+                            ClientRuntimeError::from(error),
+                        )
+                        .map_err(CommandFailure::response);
+                    }
+                };
+                send_accepted(normal, &request_id).map_err(CommandFailure::response)?;
+                send_normal(
+                    normal,
+                    GatewayMessage::RecordingReconciled {
+                        request_id,
+                        reconciliation,
                     },
                 )
                 .map_err(CommandFailure::response)
@@ -1906,6 +1985,30 @@ fn client_recording_summary(summary: &RecordingSummary) -> ClientRecordingSummar
     }
 }
 
+/// Projects a reconciliation onto the wire. Cluster labels arrive anonymous from the adapter
+/// and are carried through unchanged; the wire refuses anything that is not one, so a provider
+/// identity cannot reach a client even by a route this function does not know about.
+fn client_reconciliation(result: &DiarizationResult) -> ClientRecordingReconciliation {
+    ClientRecordingReconciliation {
+        segments: result
+            .segments()
+            .iter()
+            .map(|segment| ClientDiarizedSegment {
+                segment_id: segment.segment_id().to_owned(),
+                started_at_ms: segment.started_at_ms(),
+                ended_at_ms: segment.ended_at_ms(),
+                text: segment.text().to_owned(),
+                speaker_cluster: segment.speaker_cluster().map(str::to_owned),
+            })
+            .collect(),
+        warnings: result
+            .warnings()
+            .iter()
+            .map(|warning| warning.as_str().to_owned())
+            .collect(),
+    }
+}
+
 fn command_error(message: &'static str) -> ClientRuntimeError {
     ClientRuntimeError {
         code: "invalid_state".to_owned(),
@@ -2081,13 +2184,13 @@ mod tests {
         SqliteMemoryStore,
     };
     use conversation_model_adapters::{
-        AdapterError, AdapterFuture, AudioFrame, CaptureEvent, GenerationLanguageModel,
-        GenerationLanguageRequest, GenerationTextDelta, MockContinuousAudioOutput,
-        MockGenerationLanguageModel, MockStreamingSpeechSynthesizer, MockVoiceCaptureControl,
-        MockVoiceIoFactory, OllamaConfig, OllamaLanguageModel, PcmFormat, PcmSampleFormat,
-        RecognitionEvent, RecognitionHypothesis, StreamingSpeechRequest,
-        StreamingSpeechSynthesizer, VoiceCaptureControl, VoiceInput, VoiceInputEvent,
-        VoiceIoFactory, VoiceIoSession,
+        AdapterError, AdapterFuture, AudioFrame, CaptureEvent, DiarizationResult, DiarizedSegment,
+        GenerationLanguageModel, GenerationLanguageRequest, GenerationTextDelta,
+        MeetingAudioWindows, MockContinuousAudioOutput, MockGenerationLanguageModel,
+        MockStreamingSpeechSynthesizer, MockVoiceCaptureControl, MockVoiceIoFactory, OllamaConfig,
+        OllamaLanguageModel, PcmFormat, PcmSampleFormat, RecognitionEvent, RecognitionHypothesis,
+        StreamingSpeechRequest, StreamingSpeechSynthesizer, TranscriptionDiarizer,
+        VoiceCaptureControl, VoiceInput, VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
     };
     use conversation_protocol::{
         ClientRuntimeEvent, ComponentDescriptor, ComponentKind, ExecutionLocation, GatewayMessage,
@@ -6616,5 +6719,208 @@ mod tests {
         }
 
         gateway.close().await;
+    }
+
+    // --- post-meeting reconciliation -------------------------------------------------------
+
+    /// A local stand-in for the online diarizer. It answers with one clustered segment and one
+    /// unclustered one, which is enough to state the whole wire shape.
+    struct FixtureDiarizer;
+
+    impl TranscriptionDiarizer for FixtureDiarizer {
+        fn diarize<'a>(
+            &'a self,
+            mut windows: MeetingAudioWindows,
+            _cancellation: CancellationToken,
+        ) -> AdapterFuture<'a, DiarizationResult> {
+            Box::pin(async move {
+                let mut audio_bytes = 0_usize;
+                while let Some(window) = windows.recv().await {
+                    audio_bytes += window?.bytes().len();
+                }
+                assert!(audio_bytes > 0, "the reconciliation must be handed audio");
+                DiarizationResult::new(
+                    vec![
+                        DiarizedSegment::new(
+                            "seg-1",
+                            0,
+                            900,
+                            "good morning",
+                            Some("cluster-1".to_owned()),
+                        )?,
+                        DiarizedSegment::new("seg-2", 900, 1_400, "morning", None)?,
+                    ],
+                    Vec::new(),
+                )
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_recording_answers_with_anonymous_clusters_over_the_control_channel() {
+        let key_env = "CONVERSATION_SESSION_RECORDING_KEY_RECONCILE";
+        std::env::set_var(key_env, FAKE_RECORDING_KEY);
+        let directory = TempDir::new().unwrap();
+        let (input, input_receiver) = mpsc::channel(8);
+        let settings = RecordingSettings::new(directory.path(), key_env).unwrap();
+        let session = session_with_interactive_voice(
+            input_receiver,
+            Arc::new(MockGenerationLanguageModel::new(["fixture reply"])),
+            no_speech_frames(),
+        )
+        .with_recording(settings)
+        .with_reconciliation(Arc::new(FixtureDiarizer));
+        let mut gateway = InMemoryGateway::start(session).await;
+
+        gateway
+            .write(r#"{"protocol_version":3,"type":"start_voice_session","request_id":"voice-1"}"#)
+            .await;
+        assert_accepted_message(&gateway.read_message().await, "voice-1");
+        assert!(gateway
+            .read_message()
+            .await
+            .contains(r#""type":"voice_session_started""#));
+        send_voice_input(&input, recording_frame(1)).await;
+        send_voice_input(&input, recording_frame(2)).await;
+        wait_for_recording_bytes(directory.path(), 128).await;
+
+        // Reconciling under the running media path would answer for a prefix of the meeting.
+        gateway
+            .write(
+                r#"{"protocol_version":3,"type":"reconcile_recording","request_id":"early","session_id":"1","recording_handle":"0123456789abcdef0123456789abcdef"}"#,
+            )
+            .await;
+        let early = gateway.read_message().await;
+        assert_rejected_message(&early, "early", "invalid_state");
+        assert!(
+            early.contains("the voice session is still recording"),
+            "the rejection names its own cause: {early}"
+        );
+
+        gateway
+            .write(r#"{"protocol_version":3,"type":"stop_voice_session","request_id":"stop-1"}"#)
+            .await;
+        gateway
+            .read_until(|message| message.contains(r#""request_id":"stop-1""#))
+            .await;
+        gateway
+            .write(
+                r#"{"protocol_version":3,"type":"finalize_recording","request_id":"fin-1","session_id":"1"}"#,
+            )
+            .await;
+        assert_accepted_message(&gateway.read_message().await, "fin-1");
+        let finalized: serde_json::Value =
+            serde_json::from_str(&gateway.read_message().await).unwrap();
+        let handle = finalized["recording"]["recording_handle"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        gateway
+            .write(&format!(
+                r#"{{"protocol_version":3,"type":"reconcile_recording","request_id":"rec-1","session_id":"1","recording_handle":"{handle}"}}"#
+            ))
+            .await;
+        assert_accepted_message(&gateway.read_message().await, "rec-1");
+        let reconciled = gateway.read_message().await;
+        assert!(reconciled.contains(r#""type":"recording_reconciled""#));
+        assert!(
+            !reconciled.contains(FAKE_RECORDING_KEY) && !reconciled.contains(key_env),
+            "the control channel carries neither the key nor its variable: {reconciled}"
+        );
+
+        let value: serde_json::Value = serde_json::from_str(&reconciled).unwrap();
+        assert_eq!(
+            value["reconciliation"],
+            serde_json::json!({
+                "segments": [
+                    {
+                        "segment_id": "seg-1",
+                        "started_at_ms": "0",
+                        "ended_at_ms": "900",
+                        "text": "good morning",
+                        "speaker_cluster": "cluster-1",
+                    },
+                    {
+                        "segment_id": "seg-2",
+                        "started_at_ms": "900",
+                        "ended_at_ms": "1400",
+                        "text": "morning",
+                        "speaker_cluster": null,
+                    },
+                ],
+                "warnings": [],
+            }),
+            "timings travel as decimal strings and clusters stay anonymous"
+        );
+
+        // A handle this deployment never minted is refused, whatever session claims it.
+        gateway
+            .write(
+                r#"{"protocol_version":3,"type":"reconcile_recording","request_id":"rec-2","session_id":"1","recording_handle":"ffffffffffffffffffffffffffffffff"}"#,
+            )
+            .await;
+        let refused = gateway.read_message().await;
+        assert!(
+            refused.contains(r#""request_id":"rec-2""#) && refused.contains("command_rejected"),
+            "an unminted handle is refused request-scoped: {refused}"
+        );
+
+        drop(input);
+        gateway.close().await;
+    }
+
+    #[tokio::test]
+    async fn reconcile_recording_is_refused_without_an_adapter_and_below_version_three() {
+        let key_env = "CONVERSATION_SESSION_RECORDING_KEY_NO_ADAPTER";
+        std::env::set_var(key_env, FAKE_RECORDING_KEY);
+        let directory = TempDir::new().unwrap();
+        let handle = "0123456789abcdef0123456789abcdef";
+        let command = |request_id: &str, version: u64| {
+            format!(
+                r#"{{"protocol_version":{version},"type":"reconcile_recording","request_id":"{request_id}","session_id":"1","recording_handle":"{handle}"}}"#
+            )
+        };
+
+        // No `[recording]` section at all: the deployment records nothing to reconcile.
+        let (session, _guards) = session_with_voice();
+        let mut gateway = InMemoryGateway::start(session).await;
+        gateway.write(&command("rec-1", 3)).await;
+        let rejection = gateway.read_message().await;
+        assert_rejected_message(&rejection, "rec-1", "invalid_state");
+        assert!(rejection.contains("this deployment does not record sessions"));
+
+        for version in [1, 2] {
+            gateway.write(&command("rec-old", version)).await;
+            assert_rejected_message(
+                &gateway.read_message().await,
+                "invalid-command",
+                "invalid_state",
+            );
+        }
+        // A handle that could name a path outside the recording directory never decodes.
+        gateway
+            .write(
+                r#"{"protocol_version":3,"type":"reconcile_recording","request_id":"rec-2","session_id":"1","recording_handle":"../escape"}"#,
+            )
+            .await;
+        assert_rejected_message(
+            &gateway.read_message().await,
+            "invalid-command",
+            "invalid_state",
+        );
+        gateway.close().await;
+
+        // Recording configured, but no diarizer wired: a different cause, stated as such.
+        let (_input, input_receiver) = mpsc::channel(8);
+        let mut recorded = recorded_gateway(&directory, key_env, input_receiver).await;
+        recorded.write(&command("rec-3", 3)).await;
+        let rejection = recorded.read_message().await;
+        assert_rejected_message(&rejection, "rec-3", "invalid_state");
+        assert!(
+            rejection.contains("this deployment does not reconcile recordings"),
+            "the two causes must be distinguishable: {rejection}"
+        );
+        recorded.close().await;
     }
 }

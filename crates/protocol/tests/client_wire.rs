@@ -1,24 +1,25 @@
 use conversation_protocol::{
     decode_client_command, encode_gateway_message, encode_gateway_message_for_version,
-    memory_preview, ClientCommand, ClientComponentDescriptor, ClientMemoryApproval,
-    ClientMemoryCursor, ClientMemoryInspection, ClientMemoryProvenance, ClientMemoryRecord,
-    ClientMemoryRetention, ClientMemorySummary, ClientMemoryTrace, ClientPersonaState,
-    ClientPrivacySummary, ClientQualityDecision, ClientRecordingGap, ClientRecordingSummary,
-    ClientResponseControls, ClientRuntimeError, ClientRuntimeEvent, ClientVoiceSessionEvent,
-    ClientWireError, ComponentDescriptor, ComponentKind, ContextSource,
-    ConversationContextExchange, ConversationMode, ConversationSignal, ExecutionLocation,
-    FollowUpPolicy, GatewayMessage, GenerationId, MemoryApproval, MemoryConfidence, MemoryDraft,
-    MemoryId, MemoryInspection, MemoryKind, MemoryProvenance, MemoryProvenanceKind, MemoryRecord,
-    MemoryRetention, MemoryRetrievalReason, MemoryRetrievalTrace, MemoryTraceExclusions,
-    MemoryTraceItem, PersonaLevel, PersonaProfile, PlaybackState, PrivacyMode, PrivacySummary,
-    QualityDecision, RecoveryDisposition, ResponseControls, RetrievalTraceId, RuntimeError,
-    RuntimeErrorKind, RuntimeEvent, RuntimeStage, RuntimeStatus, SessionId, SilencePolicy,
-    SpeechPace, TurnId, UnixTimestampMillis, VoiceActivity, VoiceSessionEvent,
-    VoiceTimingMilestone, CLIENT_PROTOCOL_VERSION, CONTEXT_SEED_PROTOCOL_VERSION,
-    LEGACY_CLIENT_PROTOCOL_VERSION, MAX_CLIENT_COMPONENT_DESCRIPTORS,
-    MAX_CLIENT_DEVICE_LABEL_BYTES, MAX_CLIENT_FRAME_BYTES, MAX_CLIENT_PROVIDER_LABEL_BYTES,
-    MAX_CLIENT_RECORDING_GAPS, MAX_CONVERSATION_MESSAGE_BYTES, MAX_HISTORY_BYTES,
-    MAX_MEMORY_PREVIEW_BYTES, RUNTIME_PROFILE_PROTOCOL_VERSION,
+    memory_preview, ClientCommand, ClientComponentDescriptor, ClientDiarizedSegment,
+    ClientMemoryApproval, ClientMemoryCursor, ClientMemoryInspection, ClientMemoryProvenance,
+    ClientMemoryRecord, ClientMemoryRetention, ClientMemorySummary, ClientMemoryTrace,
+    ClientPersonaState, ClientPrivacySummary, ClientQualityDecision, ClientRecordingGap,
+    ClientRecordingReconciliation, ClientRecordingSummary, ClientResponseControls,
+    ClientRuntimeError, ClientRuntimeEvent, ClientVoiceSessionEvent, ClientWireError,
+    ComponentDescriptor, ComponentKind, ContextSource, ConversationContextExchange,
+    ConversationMode, ConversationSignal, ExecutionLocation, FollowUpPolicy, GatewayMessage,
+    GenerationId, MemoryApproval, MemoryConfidence, MemoryDraft, MemoryId, MemoryInspection,
+    MemoryKind, MemoryProvenance, MemoryProvenanceKind, MemoryRecord, MemoryRetention,
+    MemoryRetrievalReason, MemoryRetrievalTrace, MemoryTraceExclusions, MemoryTraceItem,
+    PersonaLevel, PersonaProfile, PlaybackState, PrivacyMode, PrivacySummary, QualityDecision,
+    RecoveryDisposition, ResponseControls, RetrievalTraceId, RuntimeError, RuntimeErrorKind,
+    RuntimeEvent, RuntimeStage, RuntimeStatus, SessionId, SilencePolicy, SpeechPace, TurnId,
+    UnixTimestampMillis, VoiceActivity, VoiceSessionEvent, VoiceTimingMilestone,
+    CLIENT_PROTOCOL_VERSION, CONTEXT_SEED_PROTOCOL_VERSION, LEGACY_CLIENT_PROTOCOL_VERSION,
+    MAX_CLIENT_COMPONENT_DESCRIPTORS, MAX_CLIENT_DEVICE_LABEL_BYTES, MAX_CLIENT_DIARIZED_SEGMENTS,
+    MAX_CLIENT_DIARIZED_SEGMENT_TEXT_BYTES, MAX_CLIENT_FRAME_BYTES,
+    MAX_CLIENT_PROVIDER_LABEL_BYTES, MAX_CLIENT_RECORDING_GAPS, MAX_CONVERSATION_MESSAGE_BYTES,
+    MAX_HISTORY_BYTES, MAX_MEMORY_PREVIEW_BYTES, RUNTIME_PROFILE_PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Deserializer};
 
@@ -3368,4 +3369,273 @@ fn recording_summaries_fail_closed_on_values_the_sink_cannot_produce() {
             .collect(),
         ..recording_summary()
     });
+}
+
+#[test]
+fn reconcile_recording_is_a_version_three_command_only() {
+    let payload = |version: u64| {
+        format!(
+            r#"{{"protocol_version":{version},"type":"reconcile_recording","request_id":"r-1","session_id":"7","recording_handle":"0123456789abcdef0123456789abcdef"}}"#
+        )
+    };
+
+    assert_eq!(
+        decode_client_command(payload(RUNTIME_PROFILE_PROTOCOL_VERSION).as_bytes()).unwrap(),
+        ClientCommand::ReconcileRecording {
+            request_id: "r-1".to_owned(),
+            session_id: SessionId::new(7),
+            recording_handle: "0123456789abcdef0123456789abcdef".to_owned(),
+        }
+    );
+    for version in [
+        LEGACY_CLIENT_PROTOCOL_VERSION,
+        CONTEXT_SEED_PROTOCOL_VERSION,
+    ] {
+        assert!(matches!(
+            decode_client_command(payload(version).as_bytes()),
+            Err(ClientWireError::UnsupportedProtocolVersion(_))
+        ));
+    }
+    assert!(matches!(
+        decode_client_command(payload(4).as_bytes()),
+        Err(ClientWireError::UnsupportedProtocolVersion(4))
+    ));
+    // A handle that is not a handle never reaches the runtime's resolver.
+    for handle in ["", "../escape", "A".repeat(32).as_str(), &"a".repeat(129)] {
+        assert!(
+            decode_client_command(
+                format!(
+                    r#"{{"protocol_version":3,"type":"reconcile_recording","request_id":"r-1","session_id":"7","recording_handle":"{handle}"}}"#
+                )
+                .as_bytes()
+            )
+            .is_err(),
+            "handle {handle:?} must be refused at decode"
+        );
+    }
+}
+
+#[test]
+fn a_reconciled_recording_states_anonymous_clusters_only_from_version_three() {
+    let message = GatewayMessage::RecordingReconciled {
+        request_id: "r-1".to_owned(),
+        reconciliation: reconciliation(),
+    };
+
+    let encoded =
+        encode_gateway_message_for_version(&message, RUNTIME_PROFILE_PROTOCOL_VERSION).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "protocol_version": 3,
+            "type": "recording_reconciled",
+            "request_id": "r-1",
+            "reconciliation": {
+                "segments": [
+                    {
+                        "segment_id": "seg-1",
+                        "started_at_ms": "0",
+                        "ended_at_ms": "1200",
+                        "text": "good morning",
+                        "speaker_cluster": "cluster-1",
+                    },
+                    {
+                        "segment_id": "seg-2",
+                        "started_at_ms": "1200",
+                        "ended_at_ms": "61000",
+                        "text": "and now the agenda",
+                        "speaker_cluster": null,
+                    },
+                ],
+                "warnings": ["recording_truncated"],
+            },
+        }),
+        "64-bit values travel as canonical decimal strings, never JSON numbers"
+    );
+
+    for version in [
+        LEGACY_CLIENT_PROTOCOL_VERSION,
+        CONTEXT_SEED_PROTOCOL_VERSION,
+    ] {
+        assert!(matches!(
+            encode_gateway_message_for_version(&message, version),
+            Err(ClientWireError::UnsupportedProtocolVersion(_))
+        ));
+    }
+}
+
+#[test]
+fn an_empty_reconciliation_is_expressible() {
+    let encoded = encode_gateway_message_for_version(
+        &GatewayMessage::RecordingReconciled {
+            request_id: "r-1".to_owned(),
+            reconciliation: ClientRecordingReconciliation {
+                segments: Vec::new(),
+                warnings: vec!["no_speech_detected".to_owned()],
+            },
+        },
+        RUNTIME_PROFILE_PROTOCOL_VERSION,
+    )
+    .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(
+        value["reconciliation"]["segments"],
+        serde_json::json!([]),
+        "a meeting nobody spoke in still has a shape"
+    );
+}
+
+#[test]
+fn reconciliations_fail_closed_on_values_the_runtime_cannot_produce() {
+    let refuse = |reconciliation: ClientRecordingReconciliation, why: &str| {
+        assert!(
+            matches!(
+                encode_gateway_message_for_version(
+                    &GatewayMessage::RecordingReconciled {
+                        request_id: "r-1".to_owned(),
+                        reconciliation,
+                    },
+                    RUNTIME_PROFILE_PROTOCOL_VERSION,
+                ),
+                Err(ClientWireError::InvalidRecordingReconciliation)
+            ),
+            "{why}"
+        );
+    };
+    let with = |segment: ClientDiarizedSegment| ClientRecordingReconciliation {
+        segments: vec![segment],
+        warnings: Vec::new(),
+    };
+
+    // A person's name is exactly what a cluster label must never be.
+    refuse(
+        with(ClientDiarizedSegment {
+            speaker_cluster: Some("Chris Xiong".to_owned()),
+            ..segment()
+        }),
+        "a provider identity is not an anonymous cluster",
+    );
+    refuse(
+        with(ClientDiarizedSegment {
+            speaker_cluster: Some("cluster-0".to_owned()),
+            ..segment()
+        }),
+        "cluster numbering starts at one",
+    );
+    refuse(
+        with(ClientDiarizedSegment {
+            speaker_cluster: Some(String::new()),
+            ..segment()
+        }),
+        "an empty cluster label is not absence of a cluster",
+    );
+    refuse(
+        with(ClientDiarizedSegment {
+            started_at_ms: 900,
+            ended_at_ms: 800,
+            ..segment()
+        }),
+        "a segment cannot end before it starts",
+    );
+    refuse(
+        with(ClientDiarizedSegment {
+            segment_id: String::new(),
+            ..segment()
+        }),
+        "a segment must be identifiable",
+    );
+    refuse(
+        with(ClientDiarizedSegment {
+            segment_id: "SEG-1".to_owned(),
+            ..segment()
+        }),
+        "identifiers are lowercase",
+    );
+    refuse(
+        with(ClientDiarizedSegment {
+            text: "line\nbreak".to_owned(),
+            ..segment()
+        }),
+        "a control character would multiply the encoded size",
+    );
+    refuse(
+        with(ClientDiarizedSegment {
+            text: "x".repeat(MAX_CLIENT_DIARIZED_SEGMENT_TEXT_BYTES + 1),
+            ..segment()
+        }),
+        "one segment cannot exceed the text bound",
+    );
+    refuse(
+        ClientRecordingReconciliation {
+            segments: vec![segment(), segment()],
+            warnings: Vec::new(),
+        },
+        "a segment identifier names one segment",
+    );
+    refuse(
+        ClientRecordingReconciliation {
+            segments: (0..=MAX_CLIENT_DIARIZED_SEGMENTS)
+                .map(|index| ClientDiarizedSegment {
+                    segment_id: format!("seg-{index}"),
+                    ..segment()
+                })
+                .collect(),
+            warnings: Vec::new(),
+        },
+        "the segment count is bounded",
+    );
+    refuse(
+        ClientRecordingReconciliation {
+            segments: (0..128)
+                .map(|index| ClientDiarizedSegment {
+                    segment_id: format!("seg-{index}"),
+                    text: "x".repeat(MAX_CLIENT_DIARIZED_SEGMENT_TEXT_BYTES),
+                    ..segment()
+                })
+                .collect(),
+            warnings: Vec::new(),
+        },
+        "the whole answer's text is bounded",
+    );
+    refuse(
+        ClientRecordingReconciliation {
+            segments: Vec::new(),
+            warnings: vec!["the provider was unhappy".to_owned()],
+        },
+        "warnings come from a closed list",
+    );
+    refuse(
+        ClientRecordingReconciliation {
+            segments: Vec::new(),
+            warnings: vec!["no_speech_detected".to_owned(); 2],
+        },
+        "a warning is stated once",
+    );
+}
+
+fn segment() -> ClientDiarizedSegment {
+    ClientDiarizedSegment {
+        segment_id: "seg-1".to_owned(),
+        started_at_ms: 0,
+        ended_at_ms: 1_200,
+        text: "good morning".to_owned(),
+        speaker_cluster: Some("cluster-1".to_owned()),
+    }
+}
+
+fn reconciliation() -> ClientRecordingReconciliation {
+    ClientRecordingReconciliation {
+        segments: vec![
+            segment(),
+            ClientDiarizedSegment {
+                segment_id: "seg-2".to_owned(),
+                started_at_ms: 1_200,
+                ended_at_ms: 61_000,
+                text: "and now the agenda".to_owned(),
+                speaker_cluster: None,
+            },
+        ],
+        warnings: vec!["recording_truncated".to_owned()],
+    }
 }

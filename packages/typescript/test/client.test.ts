@@ -13,7 +13,7 @@ import type {
   RuntimeFailure,
   RuntimeStatus,
 } from "../src/protocol.js";
-import { ProtocolError } from "../src/protocol.js";
+import { parseGatewayMessage, ProtocolError } from "../src/protocol.js";
 
 const status: RuntimeStatus = {
   profile: "offline",
@@ -1658,4 +1658,216 @@ test("a recording summary with numeric or unknown fields is rejected", async () 
     transport.push(recordingFinalized(sent.requestId, wireRecording(overrides)));
     await assert.rejects(() => finalizing);
   }
+});
+
+function wireReconciliation(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    segments: [
+      {
+        segment_id: "seg-1",
+        started_at_ms: "0",
+        ended_at_ms: "1200",
+        text: "good morning",
+        speaker_cluster: "cluster-1",
+      },
+      {
+        segment_id: "seg-2",
+        started_at_ms: "1200",
+        ended_at_ms: "61000",
+        text: "and now the agenda",
+        speaker_cluster: null,
+      },
+    ],
+    warnings: ["recording_truncated"],
+    ...overrides,
+  };
+}
+
+function recordingReconciled(requestId: string, reconciliation: Record<string, unknown>): unknown {
+  return {
+    type: "recording_reconciled",
+    protocol_version: 3,
+    request_id: requestId,
+    reconciliation,
+  };
+}
+
+const RECORDING_HANDLE = "0123456789abcdef0123456789abcdef";
+
+test("reconcileRecording returns anonymous clusters and bigint timings", async () => {
+  const { client, transport } = await connectedV3Client();
+
+  const reconciling = client.reconcileRecording({
+    sessionId: 1n,
+    recordingHandle: RECORDING_HANDLE,
+  });
+  await setImmediate();
+  const sent = command(transport, "reconcile_recording");
+  assert.equal(sent.sessionId, 1n);
+  assert.equal(sent.recordingHandle, RECORDING_HANDLE);
+  assert.deepEqual(transport.sentVersions, [3]);
+
+  transport.push(acceptedForVersion(sent.requestId, 3));
+  transport.push(recordingReconciled(sent.requestId, wireReconciliation()));
+
+  assert.deepEqual(await reconciling, {
+    segments: [
+      {
+        segmentId: "seg-1",
+        startedAtMs: 0n,
+        endedAtMs: 1200n,
+        text: "good morning",
+        speakerCluster: "cluster-1",
+      },
+      {
+        segmentId: "seg-2",
+        startedAtMs: 1200n,
+        endedAtMs: 61000n,
+        text: "and now the agenda",
+        speakerCluster: null,
+      },
+    ],
+    warnings: ["recording_truncated"],
+  });
+});
+
+test("reconcileRecording carries a meeting nobody spoke in", async () => {
+  const { client, transport } = await connectedV3Client();
+  const reconciling = client.reconcileRecording({
+    sessionId: 1n,
+    recordingHandle: RECORDING_HANDLE,
+  });
+  await setImmediate();
+  const sent = command(transport, "reconcile_recording");
+  transport.push(acceptedForVersion(sent.requestId, 3));
+  transport.push(
+    recordingReconciled(
+      sent.requestId,
+      wireReconciliation({ segments: [], warnings: ["no_speech_detected"] }),
+    ),
+  );
+
+  assert.deepEqual(await reconciling, { segments: [], warnings: ["no_speech_detected"] });
+});
+
+test("reconcileRecording refuses a runtime that does not speak protocol version 3", async () => {
+  for (const connect of [connectedClient, connectedV2Client]) {
+    const { client } = await connect();
+    await assert.rejects(
+      () => client.reconcileRecording({ sessionId: 1n, recordingHandle: RECORDING_HANDLE }),
+      /recording reconciliation requires protocol version 3/,
+    );
+  }
+});
+
+test("reconcileRecording refuses an identifier or a handle the runtime could not resolve", async () => {
+  const { client } = await connectedV3Client();
+  await assert.rejects(
+    () => client.reconcileRecording({ sessionId: 0n, recordingHandle: RECORDING_HANDLE }),
+    ProtocolError,
+  );
+  for (const recordingHandle of ["", "../escape", "A".repeat(32), "a".repeat(129)]) {
+    await assert.rejects(
+      () => client.reconcileRecording({ sessionId: 1n, recordingHandle }),
+      ProtocolError,
+    );
+  }
+});
+
+test("reconcileRecording surfaces a gateway rejection to its caller", async () => {
+  const { client, transport } = await connectedV3Client();
+  const reconciling = client.reconcileRecording({
+    sessionId: 1n,
+    recordingHandle: RECORDING_HANDLE,
+  });
+  await setImmediate();
+  const sent = command(transport, "reconcile_recording");
+  transport.push(
+    rejectedForVersion(
+      sent.requestId,
+      {
+        code: "invalid_state",
+        kind: "invalid_state",
+        stage: "runtime",
+        message: "this deployment does not reconcile recordings",
+      },
+      3,
+    ),
+  );
+  await assert.rejects(() => reconciling, CommandRejectedError);
+});
+
+test("a reconciliation that names a person or uses numbers is rejected", async () => {
+  for (const overrides of [
+    // The one thing a cluster label must never be.
+    {
+      segments: [
+        {
+          segment_id: "seg-1",
+          started_at_ms: "0",
+          ended_at_ms: "1200",
+          text: "good morning",
+          speaker_cluster: "Chris Xiong",
+        },
+      ],
+    },
+    {
+      segments: [
+        {
+          segment_id: "seg-1",
+          started_at_ms: 0,
+          ended_at_ms: "1200",
+          text: "good morning",
+          speaker_cluster: null,
+        },
+      ],
+    },
+    {
+      segments: [
+        {
+          segment_id: "seg-1",
+          started_at_ms: "1200",
+          ended_at_ms: "0",
+          text: "good morning",
+          speaker_cluster: null,
+        },
+      ],
+    },
+    {
+      segments: [
+        {
+          segment_id: "SEG-1",
+          started_at_ms: "0",
+          ended_at_ms: "1200",
+          text: "good morning",
+          speaker_cluster: null,
+        },
+      ],
+    },
+    { warnings: ["the provider was unhappy"] },
+    { warnings: ["no_speech_detected", "no_speech_detected"] },
+    { unexpected: "field" },
+  ]) {
+    const { client, transport } = await connectedV3Client();
+    const reconciling = client.reconcileRecording({
+      sessionId: 1n,
+      recordingHandle: RECORDING_HANDLE,
+    });
+    await setImmediate();
+    const sent = command(transport, "reconcile_recording");
+    transport.push(acceptedForVersion(sent.requestId, 3));
+    transport.push(recordingReconciled(sent.requestId, wireReconciliation(overrides)));
+    await assert.rejects(() => reconciling);
+  }
+});
+
+test("a reconciled recording requires protocol version 3 on the wire", () => {
+  assert.throws(
+    () =>
+      parseGatewayMessage(
+        { ...(recordingReconciled("r-1", wireReconciliation()) as object), protocol_version: 2 },
+        2,
+      ),
+    /recording reconciliation requires protocol version 3/,
+  );
 });

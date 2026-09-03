@@ -39,11 +39,7 @@ pub struct ClientRecordingSummary {
 pub(crate) fn validate_client_recording_summary(
     summary: &ClientRecordingSummary,
 ) -> Result<(), ClientWireError> {
-    if !is_bounded(
-        &summary.recording_handle,
-        MAX_CLIENT_RECORDING_HANDLE_BYTES,
-        |byte| byte.is_ascii_lowercase() || byte.is_ascii_digit(),
-    ) {
+    if !is_client_recording_handle(&summary.recording_handle) {
         return Err(ClientWireError::InvalidRecordingSummary);
     }
     if summary.encrypted_path.is_empty()
@@ -84,6 +80,15 @@ pub(crate) fn validate_client_recording_summary(
         }
     }
     Ok(())
+}
+
+/// The shape of a handle on the wire: bounded lowercase alphanumerics, which is also the
+/// path-traversal guard. Shared with the reconcile command, which addresses a recording by the
+/// same handle the summary published.
+pub(crate) fn is_client_recording_handle(handle: &str) -> bool {
+    is_bounded(handle, MAX_CLIENT_RECORDING_HANDLE_BYTES, |byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit()
+    })
 }
 
 fn is_bounded(value: &str, maximum_bytes: usize, permitted: impl Fn(u8) -> bool) -> bool {

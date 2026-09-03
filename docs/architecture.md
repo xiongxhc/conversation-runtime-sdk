@@ -119,6 +119,47 @@ A recording is closed only after the session feeding it has stopped. Without a
 `[recording]` section nothing is recorded, which is what the default
 configuration produces.
 
+### Post-Meeting Reconciliation
+
+`reconcile_recording` turns a finished recording into timed text and speaker
+clusters. The recording is reached by handle alone: the handle spells the binding
+identifier the file's header carries, so a file only answers to the handle it was
+minted with, and a copy filed under another recording's name is refused. The
+session identifier travels with the command and is checked against the header as
+provenance; it is deliberately not what provides the isolation, because a gateway
+runs every meeting under the same one. Reconciling is refused while the voice
+session that feeds a recording is still running, since reading a file the sink is
+still appending to would answer for a prefix of the meeting and call it the whole.
+
+Decryption happens only inside the runtime, in bounded in-memory windows of at
+most one mebibyte that are streamed straight to the provider adapter. **No
+plaintext file is created on any path** — not on success, not on failure, not on
+cancellation — because none is created at all; a two-hour meeting costs one
+window of resident audio rather than its 230 MB. A window never spans a gap, so a
+provider is never handed two discontiguous stretches of audio as one buffer. The
+key stays on the runtime host and reaches nothing but the reader.
+
+**A reconciled segment's timings are on the media timeline**, the same clock as
+the summary's `duration_ms` and gap timestamps. The reader accumulates that
+timeline exactly as the sink did — a frame contributes its own sample count, a gap
+between two frames contributes the wall-clock silence the file's timestamps state,
+and a gap before any audio contributes nothing. A provider states its segments
+relative to the window it was given, and the adapter rebases them by that window's
+own offset. Because the recording's duration is a media span rather than a count
+of decodable audio, sizing anything from it — a buffer, a progress estimate —
+would overstate what the file holds; the gaps list states the difference exactly.
+
+A speaker cluster is an anonymous label such as `cluster-1`, minted by the adapter
+in the order a provider first mentioned each of its own clusters. A provider's own
+label is discarded at the adapter boundary and the wire refuses anything that is
+not an anonymous label, so a provider that guesses a name cannot have that name
+reach a client by any route. Mapping a cluster onto a real participant is the
+Meeting Agent's work, from evidence this runtime does not have. A provider's
+warning text is counted rather than relayed, because it may quote speech. Like the
+other online adapters, the diarizer is wired explicitly by the runtime rather than
+constructed by the configuration loader; a deployment without one records meetings
+and says plainly that it does not reconcile them.
+
 ### Shared Conversation and Voice Activation
 
 Typed and finalized spoken input enter the same `ConversationContext`, use the

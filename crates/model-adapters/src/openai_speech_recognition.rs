@@ -448,7 +448,7 @@ impl RecognitionSession {
             channels: self.config.input_format.channels(),
             segment_id: &OpenAiSpeechRecognizer::segment_id(self.session_id, self.segment_index),
             sequence: self.request_sequence,
-            audio: base64(&audio),
+            audio: crate::base64::encode(&audio),
             language: self.config.language.as_deref(),
         };
         self.request_sequence = self.request_sequence.saturating_add(1);
@@ -690,25 +690,6 @@ fn trim_ascii(bytes: &[u8]) -> &[u8] {
     &bytes[start..end]
 }
 
-fn base64(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let mut group = [0_u8; 3];
-        group[..chunk.len()].copy_from_slice(chunk);
-        let packed = u32::from(group[0]) << 16 | u32::from(group[1]) << 8 | u32::from(group[2]);
-        for index in 0..4 {
-            if index <= chunk.len() {
-                let symbol = (packed >> (18 - 6 * index)) & 0x3F;
-                encoded.push(char::from(ALPHABET[symbol as usize]));
-            } else {
-                encoded.push('=');
-            }
-        }
-    }
-    encoded
-}
-
 fn invalid_config(detail: &str) -> AdapterError {
     AdapterError::new(format!(
         "invalid online speech recognition configuration: {detail}"
@@ -755,20 +736,8 @@ fn capture_ended() -> AdapterError {
 
 #[cfg(test)]
 mod tests {
-    use super::{base64, transcription_endpoint, OpenAiSpeechRecognitionConfig};
+    use super::{transcription_endpoint, OpenAiSpeechRecognitionConfig};
     use conversation_protocol::SessionId;
-
-    #[test]
-    fn base64_matches_the_standard_alphabet_and_padding() {
-        assert_eq!(base64(b""), "");
-        assert_eq!(base64(b"f"), "Zg==");
-        assert_eq!(base64(b"fo"), "Zm8=");
-        assert_eq!(base64(b"foo"), "Zm9v");
-        assert_eq!(base64(b"foob"), "Zm9vYg==");
-        assert_eq!(base64(b"fooba"), "Zm9vYmE=");
-        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
-        assert_eq!(base64(&[0xFF, 0xEF, 0xBF]), "/++/");
-    }
 
     #[test]
     fn the_transcription_path_is_appended_once() {

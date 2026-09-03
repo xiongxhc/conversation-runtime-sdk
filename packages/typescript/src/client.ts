@@ -12,6 +12,7 @@ import {
   type MemoryInspection,
   type MemoryPage,
   type PersonaState,
+  type RecordingReconciliation,
   type RecordingSummary,
   type RuntimeEvent,
   type RuntimeFailure,
@@ -235,6 +236,45 @@ export class RuntimeClient {
     return result.promise;
   }
 
+  /**
+   * Transcribes and diarizes a finished recording, addressed by the handle `finalizeRecording`
+   * returned. The recording is decrypted only inside the runtime, in bounded windows streamed
+   * to the provider; the key never leaves the runtime host. The answer carries anonymous
+   * speaker clusters and never claims a person's identity. Version 3 runtimes only.
+   */
+  reconcileRecording({
+    sessionId,
+    recordingHandle,
+  }: {
+    sessionId: bigint;
+    recordingHandle: string;
+  }): Promise<RecordingReconciliation> {
+    if (this.protocolVersion === undefined || this.protocolVersion < RUNTIME_PROFILE_PROTOCOL_VERSION) {
+      return Promise.reject(new Error("recording reconciliation requires protocol version 3"));
+    }
+    const requestId = this.nextRequestId();
+    const command: ClientCommand = {
+      type: "reconcile_recording",
+      requestId,
+      sessionId,
+      recordingHandle,
+    };
+    try {
+      validateClientCommand(command, this.protocolVersion);
+    } catch (error) {
+      return Promise.reject(error as Error);
+    }
+    const result = new Deferred<RecordingReconciliation>();
+    this.controls.set(requestId, {
+      kind: "reconcile_recording",
+      accepted: false,
+      result,
+      fail: (error) => result.reject(error),
+    });
+    this.send(command);
+    return result.promise;
+  }
+
   startTurn(transcript: string): Promise<RuntimeTurn> {
     const requestId = this.nextRequestId();
     validateClientCommand({ type: "start_turn", requestId, transcript });
@@ -429,6 +469,16 @@ export class RuntimeClient {
       }
       this.controls.delete(message.requestId);
       control.result.resolve(message.recording);
+      return;
+    }
+    if (message.type === "recording_reconciled") {
+      const control = this.controls.get(message.requestId);
+      if (!control || control.kind !== "reconcile_recording" || !control.accepted) {
+        this.fail(new Error("gateway sent an uncorrelated reconciliation response"));
+        return;
+      }
+      this.controls.delete(message.requestId);
+      control.result.resolve(message.reconciliation);
       return;
     }
     if (message.type === "memory_extracted") {
@@ -646,7 +696,13 @@ type PendingControl =
   | { kind: "stop_voice_session"; accepted: boolean; result: Deferred<void>; fail(error: Error): void }
   | { kind: "pause_voice_capture"; accepted: boolean; result: Deferred<void>; fail(error: Error): void }
   | { kind: "resume_voice_capture"; accepted: boolean; result: Deferred<void>; fail(error: Error): void }
-  | { kind: "finalize_recording"; accepted: boolean; result: Deferred<RecordingSummary>; fail(error: Error): void };
+  | { kind: "finalize_recording"; accepted: boolean; result: Deferred<RecordingSummary>; fail(error: Error): void }
+  | {
+      kind: "reconcile_recording";
+      accepted: boolean;
+      result: Deferred<RecordingReconciliation>;
+      fail(error: Error): void;
+    };
 
 type TurnState = {
   events: AsyncQueue<RuntimeEvent>;

@@ -3,14 +3,15 @@ use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::client_recording::validate_client_recording_summary;
+use crate::client_diarization::validate_client_recording_reconciliation;
+use crate::client_recording::{is_client_recording_handle, validate_client_recording_summary};
 
 use crate::{
     ClientComponentDescriptor, ClientMemoryCursor, ClientMemoryInspection, ClientMemoryRecord,
-    ClientMemoryRetention, ClientMemorySummary, ClientPersonaState, ClientRecordingSummary,
-    ClientVoiceSessionEvent, ConversationMode, ExecutionLocation, FollowUpPolicy, MemoryId,
-    MemoryRetrievalTrace, PrivacyMode, QualityDecision, ResponseControls, RetrievalTraceId,
-    RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeProfile, RuntimeStage,
+    ClientMemoryRetention, ClientMemorySummary, ClientPersonaState, ClientRecordingReconciliation,
+    ClientRecordingSummary, ClientVoiceSessionEvent, ConversationMode, ExecutionLocation,
+    FollowUpPolicy, MemoryId, MemoryRetrievalTrace, PrivacyMode, QualityDecision, ResponseControls,
+    RetrievalTraceId, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeProfile, RuntimeStage,
     RuntimeTimingMilestone, SessionId, SilencePolicy, SpeechPace, TurnId,
     MAX_CONVERSATION_MESSAGE_BYTES, MAX_HISTORY_BYTES, MAX_MEMORY_CONTENT_BYTES,
     MAX_MEMORY_INSPECTION_HISTORY_ITEMS, MAX_MEMORY_LIST_PAGE_ITEMS, MAX_MEMORY_PREVIEW_BYTES,
@@ -118,6 +119,12 @@ pub enum ClientCommand {
     FinalizeRecording {
         request_id: String,
         session_id: SessionId,
+    },
+    /// Transcribes and diarizes a finished recording, addressed by its handle. Version 3 only.
+    ReconcileRecording {
+        request_id: String,
+        session_id: SessionId,
+        recording_handle: String,
     },
 }
 
@@ -285,6 +292,12 @@ pub enum GatewayMessage {
         request_id: String,
         recording: ClientRecordingSummary,
     },
+    /// A reconciled recording: timed text and anonymous speaker clusters, never a person.
+    /// Version 3 only.
+    RecordingReconciled {
+        request_id: String,
+        reconciliation: ClientRecordingReconciliation,
+    },
 }
 
 #[derive(Debug)]
@@ -302,6 +315,8 @@ pub enum ClientWireError {
     InvalidMemoryResponse,
     InvalidPersonaState,
     InvalidRecordingSummary,
+    InvalidRecordingHandle,
+    InvalidRecordingReconciliation,
     PayloadTooLarge { actual: usize, maximum: usize },
     UnsupportedRuntimeEvent { event: &'static str },
 }
@@ -331,6 +346,10 @@ impl fmt::Display for ClientWireError {
             Self::InvalidPersonaState => formatter.write_str("invalid client persona state"),
             Self::InvalidRecordingSummary => {
                 formatter.write_str("invalid client recording summary")
+            }
+            Self::InvalidRecordingHandle => formatter.write_str("invalid client recording handle"),
+            Self::InvalidRecordingReconciliation => {
+                formatter.write_str("invalid client recording reconciliation")
             }
             Self::PayloadTooLarge { actual, maximum } => {
                 write!(
@@ -700,6 +719,30 @@ fn decode_wire_client_command(
                 session_id: SessionId::new(session_id.0),
             })
         }
+        WireClientCommand::ReconcileRecording {
+            protocol_version,
+            request_id,
+            session_id,
+            recording_handle,
+        } => {
+            validate_protocol_version(protocol_version)?;
+            if protocol_version < RUNTIME_PROFILE_PROTOCOL_VERSION {
+                return Err(ClientWireError::UnsupportedProtocolVersion(
+                    protocol_version,
+                ));
+            }
+            validate_request_id(&request_id)?;
+            // The handle's charset and length is also the traversal guard, so a handle that
+            // could name a path outside the recording directory never reaches the resolver.
+            if !is_client_recording_handle(&recording_handle) {
+                return Err(ClientWireError::InvalidRecordingHandle);
+            }
+            Ok(ClientCommand::ReconcileRecording {
+                request_id,
+                session_id: SessionId::new(session_id.0),
+                recording_handle,
+            })
+        }
     }
 }
 
@@ -794,6 +837,12 @@ enum WireClientCommand {
         request_id: String,
         session_id: DecimalIdentifier,
     },
+    ReconcileRecording {
+        protocol_version: u64,
+        request_id: String,
+        session_id: DecimalIdentifier,
+        recording_handle: String,
+    },
 }
 
 impl WireClientCommand {
@@ -842,6 +891,9 @@ impl WireClientCommand {
                 protocol_version, ..
             }
             | Self::FinalizeRecording {
+                protocol_version, ..
+            }
+            | Self::ReconcileRecording {
                 protocol_version, ..
             } => *protocol_version,
         }
@@ -943,6 +995,42 @@ impl From<&ClientRecordingSummary> for WireClientRecordingSummary {
                     reason: gap.reason.clone(),
                 })
                 .collect(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct WireClientDiarizedSegment {
+    segment_id: String,
+    started_at_ms: String,
+    ended_at_ms: String,
+    text: String,
+    speaker_cluster: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct WireClientRecordingReconciliation {
+    segments: Vec<WireClientDiarizedSegment>,
+    warnings: Vec<String>,
+}
+
+impl From<&ClientRecordingReconciliation> for WireClientRecordingReconciliation {
+    fn from(reconciliation: &ClientRecordingReconciliation) -> Self {
+        Self {
+            segments: reconciliation
+                .segments
+                .iter()
+                .map(|segment| WireClientDiarizedSegment {
+                    segment_id: segment.segment_id.clone(),
+                    started_at_ms: segment.started_at_ms.to_string(),
+                    ended_at_ms: segment.ended_at_ms.to_string(),
+                    text: segment.text.clone(),
+                    speaker_cluster: segment.speaker_cluster.clone(),
+                })
+                .collect(),
+            warnings: reconciliation.warnings.clone(),
         }
     }
 }
@@ -1201,6 +1289,11 @@ enum GatewayMessageEnvelope<'a> {
         request_id: &'a str,
         recording: WireClientRecordingSummary,
     },
+    RecordingReconciled {
+        protocol_version: u64,
+        request_id: &'a str,
+        reconciliation: WireClientRecordingReconciliation,
+    },
 }
 
 impl<'a> GatewayMessageEnvelope<'a> {
@@ -1291,6 +1384,14 @@ impl<'a> GatewayMessageEnvelope<'a> {
                 protocol_version,
                 request_id,
                 recording: WireClientRecordingSummary::from(recording),
+            },
+            GatewayMessage::RecordingReconciled {
+                request_id,
+                reconciliation,
+            } => Self::RecordingReconciled {
+                protocol_version,
+                request_id,
+                reconciliation: WireClientRecordingReconciliation::from(reconciliation),
             },
         }
     }
@@ -1434,6 +1535,19 @@ fn validate_gateway_message(
             }
             validate_request_id(request_id)?;
             validate_client_recording_summary(recording)
+        }
+        GatewayMessage::RecordingReconciled {
+            request_id,
+            reconciliation,
+        } => {
+            // The reconciliation only exists because a version 3 command asked for it.
+            if protocol_version < RUNTIME_PROFILE_PROTOCOL_VERSION {
+                return Err(ClientWireError::UnsupportedProtocolVersion(
+                    protocol_version,
+                ));
+            }
+            validate_request_id(request_id)?;
+            validate_client_recording_reconciliation(reconciliation)
         }
         GatewayMessage::MemoryExtracted { .. } => Ok(()),
     }

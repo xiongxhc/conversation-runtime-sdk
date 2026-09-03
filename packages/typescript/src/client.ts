@@ -21,6 +21,7 @@ import {
   type RuntimeProfile,
   type VoiceResponseMode,
   type VoiceSessionEvent,
+  type VoiceSessionEventForVersion,
 } from "./protocol.js";
 
 export interface RuntimeTransport {
@@ -34,8 +35,8 @@ export interface RuntimeTurn {
   readonly events: AsyncIterable<RuntimeEvent>;
 }
 
-export interface VoiceSession {
-  events(): AsyncIterable<VoiceSessionEvent>;
+export interface VoiceSession<Version extends ClientProtocolVersion = 1 | 2> {
+  events(): AsyncIterable<VoiceSessionEventForVersion<Version>>;
   stop(): Promise<void>;
   pauseCapture(): Promise<void>;
   resumeCapture(): Promise<void>;
@@ -57,9 +58,9 @@ export class CommandRejectedError extends Error {
   }
 }
 
-export class RuntimeClient {
+export class RuntimeClient<Version extends ClientProtocolVersion = 1 | 2> {
   private readonly ready = new Deferred<void>();
-  private readonly controls = new Map<string, PendingControl>();
+  private readonly controls = new Map<string, PendingControl<Version>>();
   private readonly unexpectedFailureListeners = new Set<(error: Error) => void>();
   private readonly memoryExtractedListeners = new Set<(summary: MemoryExtractedSummary) => void>();
   private readonly turns = new Map<bigint, TurnState>();
@@ -75,8 +76,10 @@ export class RuntimeClient {
 
   private constructor(private readonly transport: RuntimeTransport) {}
 
-  static async connect(transport: RuntimeTransport): Promise<RuntimeClient> {
-    const client = new RuntimeClient(transport);
+  static async connect<Version extends ClientProtocolVersion = 1 | 2>(
+    transport: RuntimeTransport,
+  ): Promise<RuntimeClient<Version>> {
+    const client = new RuntimeClient<Version>(transport);
     void client.consumeMessages();
     await client.ready.promise;
     return client;
@@ -341,9 +344,9 @@ export class RuntimeClient {
     return result.promise;
   }
 
-  startVoiceSession(options?: { profile?: RuntimeProfile; responseMode?: VoiceResponseMode }): Promise<VoiceSession> {
+  startVoiceSession(options?: { profile?: RuntimeProfile; responseMode?: VoiceResponseMode }): Promise<VoiceSession<Version>> {
     const requestId = this.nextRequestId();
-    const result = new Deferred<VoiceSession>();
+    const result = new Deferred<VoiceSession<Version>>();
     this.controls.set(requestId, {
       kind: "start_voice_session",
       accepted: false,
@@ -694,7 +697,7 @@ export class RuntimeClient {
         const session: VoiceSessionState = { events: new AsyncQueue<VoiceSessionEvent>(), started: false };
         this.activeVoiceSession = session;
         control.result.resolve({
-          events: () => session.events,
+          events: () => session.events as AsyncIterable<VoiceSessionEventForVersion<Version>>,
           stop: () => this.voiceControl("stop_voice_session", session),
           pauseCapture: () => this.voiceControl("pause_voice_capture", session),
           resumeCapture: () => this.voiceControl("resume_voice_capture", session),
@@ -794,7 +797,7 @@ export class RuntimeClient {
   }
 }
 
-type PendingControl =
+type PendingControl<Version extends ClientProtocolVersion> =
   | { kind: "status"; accepted: boolean; result: Deferred<RuntimeStatus>; fail(error: Error): void }
   | { kind: "memory_list"; accepted: boolean; result: Deferred<MemoryPage>; fail(error: Error): void }
   | { kind: "memory_inspect"; accepted: boolean; result: Deferred<MemoryInspection>; fail(error: Error): void }
@@ -807,7 +810,7 @@ type PendingControl =
   | { kind: "interrupt_turn"; accepted: boolean; result: Deferred<void>; fail(error: Error): void }
   | { kind: "authorize_voice_response"; accepted: boolean; result: Deferred<bigint>; fail(error: Error): void }
   | { kind: "skip_voice_response"; accepted: boolean; result: Deferred<void>; fail(error: Error): void }
-  | { kind: "start_voice_session"; accepted: boolean; result: Deferred<VoiceSession>; fail(error: Error): void }
+  | { kind: "start_voice_session"; accepted: boolean; result: Deferred<VoiceSession<Version>>; fail(error: Error): void }
   | { kind: "stop_voice_session"; accepted: boolean; result: Deferred<void>; fail(error: Error): void }
   | { kind: "pause_voice_capture"; accepted: boolean; result: Deferred<void>; fail(error: Error): void }
   | { kind: "resume_voice_capture"; accepted: boolean; result: Deferred<void>; fail(error: Error): void }

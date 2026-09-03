@@ -353,7 +353,7 @@ export type VersionThreeVoiceTranscriptFinalEvent = {
   text: string;
 };
 
-export type VoiceSessionEvent =
+type CommonVoiceSessionEvent =
   | {
       type: "voice_session_started";
       sessionId: bigint;
@@ -372,10 +372,6 @@ export type VoiceSessionEvent =
   | { type: "voice_capture_resumed"; sessionId: bigint }
   | { type: "voice_activity"; sessionId: bigint; activity: VoiceActivity }
   | { type: "voice_transcript_partial"; sessionId: bigint; segmentId: bigint; text: string }
-  | LegacyVoiceTranscriptFinalEvent
-  | VersionThreeVoiceTranscriptFinalEvent
-  | { type: "response_authorized"; sessionId: bigint; segmentId: string; turnId: bigint }
-  | { type: "response_skipped"; sessionId: bigint; segmentId: string; reason: string }
   | { type: "voice_barge_in"; sessionId: bigint; turnId: bigint; generationId: bigint }
   | { type: "voice_turn_event"; sessionId: bigint; generationId: bigint; event: RuntimeEvent }
   | {
@@ -409,6 +405,21 @@ export type VoiceSessionEvent =
       recovery: "continue_session" | "new_session";
     }
   | { type: "voice_session_ended"; sessionId: bigint };
+
+export type LegacyVoiceSessionEvent =
+  | CommonVoiceSessionEvent
+  | LegacyVoiceTranscriptFinalEvent;
+
+export type VersionThreeVoiceSessionEvent =
+  | CommonVoiceSessionEvent
+  | VersionThreeVoiceTranscriptFinalEvent
+  | { type: "response_authorized"; sessionId: bigint; segmentId: string; turnId: bigint }
+  | { type: "response_skipped"; sessionId: bigint; segmentId: string; reason: string };
+
+export type VoiceSessionEvent = LegacyVoiceSessionEvent | VersionThreeVoiceSessionEvent;
+
+export type VoiceSessionEventForVersion<Version extends ClientProtocolVersion> =
+  Version extends 3 ? VersionThreeVoiceSessionEvent : LegacyVoiceSessionEvent;
 
 export type GatewayMessage =
   | { type: "ready"; status: RuntimeStatus }

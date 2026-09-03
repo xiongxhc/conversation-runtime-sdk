@@ -89,6 +89,13 @@ max_error_bytes = 65536
 # private to the account running the gateway. `key_env` names the variable
 # holding the encryption key; the key is never written to this file, a status,
 # a log line, or an error.
+#
+# The variable must hold a 256-bit key written as 64 hexadecimal characters.
+# Generate one with `openssl rand -hex 32`, keep it out of shell history, and
+# give the gateway process the variable through your service manager. A
+# passphrase or any other short value is refused when a session starts: the
+# recording's published key identifier is an unsalted digest of this value, so
+# anything guessable would let a holder of the summary test candidates offline.
 [recording]
 directory = "/absolute/private/path/recordings"
 key_env = "MEETING_RECORDING_KEY"

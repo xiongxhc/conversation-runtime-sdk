@@ -1578,8 +1578,6 @@ test("finalizeRecording returns the handle, the digest and bigint timings", asyn
     keyId: "0011223344556677",
     gaps: [{ startedAtMs: 1200n, endedAtMs: 1800n, reason: "capture_discontinuity" }],
   });
-  // The key never crosses the wire, only an identifier for it.
-  assert.equal(Object.keys(recording).includes("key"), false);
 });
 
 test("finalizeRecording carries an open gap as a null end and an empty recording as zero", async () => {

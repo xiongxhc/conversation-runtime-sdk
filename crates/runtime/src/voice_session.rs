@@ -804,12 +804,14 @@ impl VoiceLoop {
     /// keeps its media whatever the recognizer, language model or synthesizer are doing.
     async fn record_frame(&mut self, frame: &AudioFrame) -> Option<RuntimeError> {
         let recorder = self.recorder.as_ref()?;
-        recorder.lock().await.record_frame(frame).err()
+        let error = recorder.lock().await.record_frame(frame).err()?;
+        fatal_recording_error(error)
     }
 
     async fn record_capture_gap(&mut self) -> Option<RuntimeError> {
         let recorder = self.recorder.as_ref()?;
-        recorder.lock().await.record_capture_gap().err()
+        let error = recorder.lock().await.record_capture_gap().err()?;
+        fatal_recording_error(error)
     }
 
     async fn handle_activity(&mut self, activity: VoiceActivity) -> Option<LoopExit> {
@@ -1522,6 +1524,16 @@ fn completion_failure(completion: Result<Result<(), AdapterError>, JoinError>) -
 fn voice_io_error(error: AdapterError) -> RuntimeError {
     let stage = error.stage().unwrap_or(RuntimeStage::VoiceSidecar);
     adapter_runtime_error(stage, error)
+}
+
+/// Whether a recording failure should end the session.
+///
+/// A failure to *write* is fatal: continuing would leave the operator with a recording that is
+/// silently short. A recording that is simply already closed is not — the client finalized it
+/// while media was still arriving, and losing the tail of a recording the client has already
+/// been handed must not also lose the meeting.
+fn fatal_recording_error(error: RuntimeError) -> Option<RuntimeError> {
+    (error.kind() != RuntimeErrorKind::InvalidState).then_some(error)
 }
 
 fn is_recognition_failure(error: &AdapterError) -> bool {

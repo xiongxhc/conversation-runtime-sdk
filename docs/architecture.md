@@ -91,12 +91,19 @@ sequence, so plaintext audio never reaches disk and a process that dies
 mid-write leaves a file that decrypts up to its last whole chunk.
 
 The key is named by an environment variable on the runtime host and read once,
-when a session starts; a variable that is absent refuses the session rather than
-starting an unprotected recording. `finalize_recording` answers with an opaque
-handle, the encrypted file's path and digest, its duration, format, gaps, and an
-identifier for the key — never the key. The handle addresses the file, and the
-file's header names the session that made it, so a handle minted by one session
-cannot be resolved against another and a copier needs no key at all. Without a
+when a session starts. It must hold a 256-bit key written as 64 hexadecimal
+characters; a variable that is absent, blank, or differently encoded refuses the
+session rather than starting a recording whose published key identifier would be
+an offline oracle for a guessable value. `finalize_recording` answers with an
+opaque handle, the encrypted file's path and digest, its duration, format, gaps,
+and an identifier for the key — never the key. The reported duration is the
+media span, the recorded audio plus the gaps between it, so a client that waits
+before finalizing is not told the recording grew. The handle is the hexadecimal
+spelling of a random binding identifier the header carries, so a file only
+answers to the handle it was minted with and a copier needs no key at all. The
+session identifier sits beside it as provenance and is deliberately not what
+resolution checks, because a gateway runs every meeting under the same one.
+A recording is closed only after the session feeding it has stopped. Without a
 `[recording]` section nothing is recorded, which is what the default
 configuration produces.
 

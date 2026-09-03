@@ -691,7 +691,8 @@ impl GatewaySession {
                     .map_err(CommandFailure::response);
                 }
 
-                let policy = match lane.adapters.policy.for_session(SessionId::new(1)) {
+                let session_id = SessionId::new(1);
+                let policy = match lane.adapters.policy.for_session(session_id) {
                     Ok(policy) => policy,
                     Err(error) => {
                         return send_rejection(
@@ -702,7 +703,6 @@ impl GatewaySession {
                         .map_err(CommandFailure::response);
                     }
                 };
-                let session_id = SessionId::new(1);
                 // The key is resolved here, before any media flows. A recording that cannot be
                 // protected refuses the session rather than starting an unprotected one.
                 let recorder = match self.recording.as_ref() {
@@ -772,6 +772,27 @@ impl GatewaySession {
                 request_id,
                 session_id,
             } => {
+                // Three different things used to share one diagnostic. A client cannot act on
+                // "no recording available" without knowing which of them it hit.
+                if self.recording.is_none() {
+                    return send_rejection(
+                        normal,
+                        &request_id,
+                        command_error("this deployment does not record sessions"),
+                    )
+                    .map_err(CommandFailure::response);
+                }
+                // Finalizing mid-session would close the sink under the running media path and
+                // strand the rest of the meeting's audio, so the recording is closed only once
+                // the session that feeds it has stopped.
+                if voice.active.is_some() {
+                    return send_rejection(
+                        normal,
+                        &request_id,
+                        command_error("the voice session is still recording"),
+                    )
+                    .map_err(CommandFailure::response);
+                }
                 let Some(active) = self
                     .active_recording
                     .as_ref()
@@ -780,7 +801,7 @@ impl GatewaySession {
                     return send_rejection(
                         normal,
                         &request_id,
-                        command_error("no recording is available for that session"),
+                        command_error("no recording exists for that session"),
                     )
                     .map_err(CommandFailure::response);
                 };
@@ -6344,8 +6365,10 @@ mod tests {
 
     // --- session recording over the control channel ---------------------------------------
 
-    /// A fake value on a variable this test process owns. No real key exists anywhere here.
-    const FAKE_RECORDING_KEY: &str = "fake-not-a-real-recording-key-0000";
+    /// A fixed fake 256-bit key on a variable this test process owns, hexadecimal as the sink
+    /// requires. No real key exists anywhere here.
+    const FAKE_RECORDING_KEY: &str =
+        "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
     fn recording_frame(sequence: u64) -> VoiceInputEvent {
         VoiceInputEvent::Capture(CaptureEvent::Frame(
@@ -6421,6 +6444,20 @@ mod tests {
         send_voice_input(&input, recording_frame(2)).await;
         let path = wait_for_recording_bytes(directory.path(), 128).await;
 
+        // Finalizing under the running media path would close the sink and strand the rest of
+        // the meeting, so it is refused while the session is live.
+        gateway
+            .write(
+                r#"{"protocol_version":3,"type":"finalize_recording","request_id":"early","session_id":"1"}"#,
+            )
+            .await;
+        let early = gateway.read_message().await;
+        assert_rejected_message(&early, "early", "invalid_state");
+        assert!(
+            early.contains("the voice session is still recording"),
+            "the rejection names its own cause: {early}"
+        );
+
         gateway
             .write(r#"{"protocol_version":3,"type":"stop_voice_session","request_id":"stop-1"}"#)
             .await;
@@ -6456,7 +6493,7 @@ mod tests {
             path.to_str().unwrap()
         );
         assert_eq!(
-            resolve_recording_handle(directory.path(), handle, SessionId::new(1)).unwrap(),
+            resolve_recording_handle(directory.path(), handle).unwrap(),
             path
         );
         // The Meeting Agent copies by handle; the key stays on the runtime host.
@@ -6484,6 +6521,14 @@ mod tests {
             .contains(r#""type":"voice_session_started""#));
         send_voice_input(&input, recording_frame(1)).await;
         wait_for_recording_bytes(directory.path(), 80).await;
+
+        // A recording is closed only after the session that fed it has stopped.
+        gateway
+            .write(r#"{"protocol_version":3,"type":"stop_voice_session","request_id":"stop-1"}"#)
+            .await;
+        gateway
+            .read_until(|message| message.contains(r#""request_id":"stop-1""#))
+            .await;
 
         let finalize = |request_id: &str, session_id: &str| {
             format!(
@@ -6514,7 +6559,6 @@ mod tests {
         assert!(gateway.read_message().await.contains(r#""type":"status""#));
 
         drop(input);
-        gateway.read_until(is_voice_terminal).await;
         gateway.close().await;
     }
 

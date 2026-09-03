@@ -22,8 +22,8 @@ use conversation_model_adapters::{
 };
 use conversation_protocol::{
     ComponentDescriptor, ComponentKind, ConversationMode, ExecutionLocation, GenerationId,
-    PersonaProfile, PrivacyMode, RecoveryDisposition, ResponseControls, RuntimeStage, SessionId,
-    TurnId, UtteranceId, VoiceSessionEvent, VoiceSessionPolicy,
+    PersonaProfile, PrivacyMode, RecoveryDisposition, ResponseControls, RuntimeErrorKind,
+    RuntimeStage, SessionId, TurnId, UtteranceId, VoiceSessionEvent, VoiceSessionPolicy,
 };
 use conversation_runtime::{
     read_session_recording, resolve_recording_handle, ConversationContext,
@@ -34,9 +34,10 @@ use tempfile::TempDir;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
-/// The only key material anywhere in this file. It is a fake value on a variable this test
-/// process owns; nothing reads a real key and nothing writes one to disk.
-const FAKE_KEY: &str = "fake-not-a-real-recording-key-0000";
+/// The only key material anywhere in this file: a fixed fake 256-bit key, hexadecimal as the
+/// sink requires, on a variable this test process owns. Nothing reads a real key and nothing
+/// writes one to disk.
+const FAKE_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
 /// A byte pattern no encryption can leave intact. Every plaintext assertion searches for it.
 const PLAINTEXT_MARKER: &[u8] = b"PLAINTEXTMEETINGAUDIOMARKER01234";
@@ -90,28 +91,52 @@ fn capture_frames_are_appended_as_encrypted_chunks_with_a_per_session_nonce_sequ
     assert_eq!(appended[0], appended[1]);
     assert_eq!(appended[1], appended[2]);
 
-    let first = chunk_ciphertexts(&raw);
+    // The property, stated so it can actually fail: every chunk opens at its own counter and at
+    // no other. An implementation whose nonce or additional data ignored the counter would open
+    // chunk 2 at counter 0, and this sweep would catch it.
+    let sealed = Sealed::open(&path);
     assert_eq!(
-        first.iter().collect::<BTreeSet<_>>().len(),
-        first.len(),
-        "identical frames must encrypt differently: the nonce advances per chunk"
+        sealed.chunks.len(),
+        4,
+        "three frames plus the closing chunk"
+    );
+    for position in 0..sealed.chunks.len() {
+        assert!(
+            sealed.decrypt(position, position as u32).is_some(),
+            "chunk {position} must open at its own counter"
+        );
+        for counter in 0..u32::try_from(sealed.chunks.len()).unwrap() + 2 {
+            if counter as usize == position {
+                continue;
+            }
+            assert!(
+                sealed.decrypt(position, counter).is_none(),
+                "chunk {position} must not open at counter {counter}"
+            );
+        }
+    }
+
+    // And the counter reaches the nonce, not only the additional data: holding the additional
+    // data fixed, two counters must still seal one plaintext to two different ciphertexts.
+    assert_ne!(
+        sealed.seal_with_fixed_aad(b"identical plaintext", 0),
+        sealed.seal_with_fixed_aad(b"identical plaintext", 1),
+        "the counter must advance the nonce, so identical plaintext never seals identically"
     );
 
+    // Two recordings under one key start from different nonce prefixes.
     let mut second_recorder =
         SessionRecorder::start(&settings, SessionId::new(7)).expect("second recorder starts");
-    for frame in &frames {
-        second_recorder
-            .record_frame(frame)
-            .expect("frame is recorded");
-    }
+    second_recorder
+        .record_frame(&marker_frame(1))
+        .expect("frame is recorded");
     let second = second_recorder
         .finalize()
         .expect("second recording finalizes");
-    let second_raw = fs::read(&second.encrypted_path).expect("second recording is readable");
     assert_ne!(
-        first,
-        chunk_ciphertexts(&second_raw),
-        "two sessions sharing a key must not reuse the same nonce sequence"
+        sealed.nonce_prefix,
+        Sealed::open(&second.encrypted_path).nonce_prefix,
+        "two recordings sharing a key must not share a nonce sequence"
     );
     assert_ne!(summary.recording_handle, second.recording_handle);
     assert_eq!(summary.key_id, second.key_id, "one key, one key id");
@@ -260,23 +285,34 @@ fn a_crash_mid_write_leaves_a_decryptable_prefix() {
     drop(recorder);
 
     let whole = fs::read(&path).expect("recording is readable");
-    let torn = boundaries[2] + 5;
-    assert!(
-        torn < whole.len(),
-        "the tear must fall inside the last chunk"
-    );
-    fs::write(&path, &whole[..torn]).expect("recording is truncated");
 
-    let decrypted = read_session_recording(&path, key_env).expect("the prefix still decrypts");
-    assert!(decrypted.truncated);
-    assert_eq!(
-        recorded_frames(&decrypted.chunks)
-            .into_iter()
-            .map(|(sequence, _)| sequence)
-            .collect::<Vec<_>>(),
-        vec![1, 2, 3],
-        "every chunk before the tear decrypts"
-    );
+    // Sweep both truncation branches: inside a chunk's ciphertext, and inside the four-byte
+    // length prefix that precedes it.
+    for (torn, expected) in [
+        (boundaries[2] + 1, vec![1, 2, 3]),
+        (boundaries[2] + 5, vec![1, 2, 3]),
+        (whole.len() - 1, vec![1, 2, 3]),
+        (boundaries[1] + 1, vec![1, 2]),
+        (boundaries[1] + 2, vec![1, 2]),
+        (boundaries[1] + 3, vec![1, 2]),
+        (boundaries[1] + 4, vec![1, 2]),
+    ] {
+        assert!(torn < whole.len(), "the tear must fall inside the file");
+        fs::write(&path, &whole[..torn]).expect("recording is truncated");
+        let decrypted = read_session_recording(&path, key_env).expect("the prefix still decrypts");
+        assert!(
+            decrypted.truncated,
+            "a tear at {torn} bytes leaves a partial trailing chunk"
+        );
+        assert_eq!(
+            recorded_frames(&decrypted.chunks)
+                .into_iter()
+                .map(|(sequence, _)| sequence)
+                .collect::<Vec<_>>(),
+            expected,
+            "every chunk before a tear at {torn} bytes decrypts"
+        );
+    }
 
     // A tear at an exact chunk boundary loses nothing at all.
     fs::write(&path, &whole[..boundaries[1]]).expect("recording is truncated");
@@ -296,6 +332,204 @@ fn a_crash_mid_write_leaves_a_decryptable_prefix() {
     tampered[last] ^= 0xff;
     fs::write(&path, &tampered).expect("recording is rewritten");
     assert!(read_session_recording(&path, key_env).is_err());
+}
+
+#[tokio::test]
+async fn a_recording_closed_under_a_running_session_does_not_end_the_meeting() {
+    let key_env = "CONVERSATION_TEST_RECORDING_KEY_CLOSED_EARLY";
+    set_fake_key(key_env);
+    let directory = TempDir::new().expect("temporary recording directory");
+    let settings = RecordingSettings::new(directory.path(), key_env).expect("recording settings");
+    let recorder = Arc::new(Mutex::new(
+        SessionRecorder::start(&settings, SessionId::new(1)).expect("recorder starts"),
+    ));
+
+    // The gateway refuses a mid-session finalize, but the media path must not depend on that
+    // being the only caller: losing the tail of a recording must never lose the meeting too.
+    let closed = Arc::clone(&recorder);
+    let script = vec![
+        Step::Emit(Ok(capture_frame(1))),
+        Step::Sleep(Duration::from_millis(80)),
+        Step::Emit(Ok(capture_frame(2))),
+        Step::Sleep(Duration::from_millis(80)),
+    ];
+
+    let summary = {
+        let mut guard = closed.lock().await;
+        // Nothing recorded yet; the sink is closed before a single frame arrives.
+        guard.finalize().expect("recording finalizes")
+    };
+    let events = run_voice_session(script, Arc::clone(&recorder)).await;
+
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            VoiceSessionEvent::SessionEnded { .. }
+                | VoiceSessionEvent::SessionFailed {
+                    recovery: RecoveryDisposition::NewSession,
+                    ..
+                }
+        )),
+        "the session reached its own terminal rather than dying on a closed recording: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            VoiceSessionEvent::SessionFailed {
+                recovery: RecoveryDisposition::ContinueSession,
+                ..
+            }
+        )),
+        "a closed recording is not reported to the client as a session failure: {events:?}"
+    );
+    assert_eq!(summary.duration_ms, 0);
+    assert_eq!(
+        recorded_frames_len(&summary.encrypted_path, key_env),
+        0,
+        "frames after the close are dropped, not appended to a closed recording"
+    );
+}
+
+#[test]
+fn a_recording_key_must_be_a_two_hundred_and_fifty_six_bit_hexadecimal_key() {
+    let key_env = "CONVERSATION_TEST_RECORDING_KEY_ENCODING";
+    let directory = TempDir::new().expect("temporary recording directory");
+    let settings = RecordingSettings::new(directory.path(), key_env).expect("recording settings");
+
+    // `key_id` is an unsalted digest of this value and is published to every client, so a value
+    // an attacker could enumerate would be an offline oracle for the key.
+    for refused in [
+        "correct horse battery staple",
+        "hunter2",
+        "",
+        "   ",
+        &"a".repeat(63),
+        &"a".repeat(65),
+        &format!("{}g", "a".repeat(63)),
+        &format!("0x{}", "a".repeat(62)),
+    ] {
+        std::env::set_var(key_env, refused);
+        let error = SessionRecorder::start(&settings, SessionId::new(1))
+            .expect_err("a weak or misencoded recording key must not start a recording");
+        let message = error.message().to_owned();
+        assert!(
+            message.contains(key_env),
+            "the diagnostic names the variable: {message}"
+        );
+        assert!(
+            !message.contains(refused) || refused.trim().is_empty(),
+            "the diagnostic never quotes the value: {message}"
+        );
+        assert!(message.len() <= 160, "diagnostics stay bounded: {message}");
+    }
+    assert_eq!(
+        fs::read_dir(directory.path())
+            .expect("directory is readable")
+            .count(),
+        0,
+        "a refused key must not leave a file behind"
+    );
+
+    // 64 hexadecimal characters are accepted in either case, and both spellings of one key are
+    // the same key, so `key_id` does not silently fork.
+    std::env::set_var(key_env, FAKE_KEY);
+    let mut lower = SessionRecorder::start(&settings, SessionId::new(1)).expect("recorder starts");
+    let lower = lower.finalize().expect("recording finalizes");
+    std::env::set_var(key_env, FAKE_KEY.to_uppercase());
+    let mut upper = SessionRecorder::start(&settings, SessionId::new(1)).expect("recorder starts");
+    let upper = upper.finalize().expect("recording finalizes");
+    assert_eq!(lower.key_id, upper.key_id);
+    std::env::remove_var(key_env);
+}
+
+#[test]
+fn a_recording_reports_its_media_span_and_not_the_time_before_finalize() {
+    let key_env = "CONVERSATION_TEST_RECORDING_KEY_DURATION";
+    set_fake_key(key_env);
+    let directory = TempDir::new().expect("temporary recording directory");
+    let settings = RecordingSettings::new(directory.path(), key_env).expect("recording settings");
+
+    // Frames of 16000 samples at 16 kHz: 1000 ms of audio each.
+    let second_of_audio = |sequence: u64| {
+        AudioFrame::new(
+            TurnId::new(1),
+            GenerationId::new(1),
+            UtteranceId::new(1),
+            sequence,
+            pcm_format(),
+            vec![0x11; 32_000],
+        )
+        .expect("audio frame")
+    };
+
+    let mut recorder =
+        SessionRecorder::start(&settings, SessionId::new(1)).expect("recorder starts");
+    recorder
+        .record_frame(&second_of_audio(1))
+        .expect("frame is recorded");
+    recorder
+        .record_frame(&second_of_audio(2))
+        .expect("frame is recorded");
+    let immediate = {
+        let mut probe =
+            SessionRecorder::start(&settings, SessionId::new(1)).expect("probe recorder starts");
+        probe
+            .record_frame(&second_of_audio(1))
+            .expect("frame is recorded");
+        probe
+            .record_frame(&second_of_audio(2))
+            .expect("frame is recorded");
+        probe.finalize().expect("recording finalizes").duration_ms
+    };
+
+    // The client takes its time before asking for the handle. The recording did not get longer.
+    std::thread::sleep(Duration::from_millis(400));
+    let summary = recorder.finalize().expect("recording finalizes");
+    assert_eq!(
+        summary.duration_ms, immediate,
+        "the reported duration is the media span, not the recorder's lifetime"
+    );
+    assert_eq!(
+        summary.duration_ms, 2_000,
+        "two frames of one second each are two seconds of media, however fast they arrived"
+    );
+
+    // A recording that captured nothing runs for zero milliseconds however long it was open.
+    let mut empty = SessionRecorder::start(&settings, SessionId::new(1)).expect("recorder starts");
+    std::thread::sleep(Duration::from_millis(120));
+    let empty = empty.finalize().expect("recording finalizes");
+    assert_eq!(empty.duration_ms, 0);
+    assert_eq!(empty.format, "none");
+}
+
+#[test]
+fn a_failed_finalize_reports_the_real_failure_when_it_is_retried() {
+    let key_env = "CONVERSATION_TEST_RECORDING_KEY_RETRY";
+    set_fake_key(key_env);
+    let directory = TempDir::new().expect("temporary recording directory");
+    let settings = RecordingSettings::new(directory.path(), key_env).expect("recording settings");
+
+    let mut recorder =
+        SessionRecorder::start(&settings, SessionId::new(1)).expect("recorder starts");
+    let path = recorder.path().to_path_buf();
+    recorder
+        .record_frame(&marker_frame(1))
+        .expect("frame is recorded");
+
+    // The recording disappears underneath the recorder: the writes still land on the open
+    // descriptor, but reading the file back for its digest cannot succeed.
+    fs::remove_file(&path).expect("recording is removed");
+    let first = recorder
+        .finalize()
+        .expect_err("finalize cannot digest a file that is gone");
+    let second = recorder
+        .finalize()
+        .expect_err("a retry reports the same failure");
+    assert_eq!(
+        first, second,
+        "a retry must report the real failure, not that the recorder is already closed"
+    );
+    assert_ne!(second.kind(), RuntimeErrorKind::InvalidState);
 }
 
 #[test]
@@ -324,49 +558,54 @@ fn finalizing_a_recording_twice_returns_the_same_summary() {
 }
 
 #[test]
-fn a_recording_handle_from_another_session_is_rejected() {
+fn a_recording_handle_from_another_recording_is_rejected() {
     let key_env = "CONVERSATION_TEST_RECORDING_KEY_HANDLE";
     set_fake_key(key_env);
     let directory = TempDir::new().expect("temporary recording directory");
     let settings = RecordingSettings::new(directory.path(), key_env).expect("recording settings");
 
-    let mut first = SessionRecorder::start(&settings, SessionId::new(11)).expect("first recorder");
+    // Both recordings carry the session identifier the real gateway stamps on every voice
+    // session, so nothing here relies on ids the shipped path never produces.
+    let gateway_session = SessionId::new(1);
+    let mut first = SessionRecorder::start(&settings, gateway_session).expect("first recorder");
     first
         .record_frame(&marker_frame(1))
         .expect("frame is recorded");
     let first = first.finalize().expect("recording finalizes");
 
-    let mut second =
-        SessionRecorder::start(&settings, SessionId::new(12)).expect("second recorder");
+    let mut second = SessionRecorder::start(&settings, gateway_session).expect("second recorder");
     second
         .record_frame(&marker_frame(1))
         .expect("frame is recorded");
     let second = second.finalize().expect("recording finalizes");
 
+    assert_ne!(first.recording_handle, second.recording_handle);
     assert_eq!(
-        resolve_recording_handle(
-            directory.path(),
-            &first.recording_handle,
-            SessionId::new(11)
-        )
-        .expect("the owning session resolves its own handle"),
+        resolve_recording_handle(directory.path(), &first.recording_handle)
+            .expect("a recording resolves its own handle"),
         first.encrypted_path
     );
-    assert!(
-        resolve_recording_handle(
-            directory.path(),
-            &second.recording_handle,
-            SessionId::new(11)
-        )
-        .is_err(),
-        "a handle minted by another session must be rejected"
+    assert_eq!(
+        resolve_recording_handle(directory.path(), &second.recording_handle)
+            .expect("a recording resolves its own handle"),
+        second.encrypted_path
     );
-    assert!(resolve_recording_handle(
-        directory.path(),
-        &first.recording_handle,
-        SessionId::new(12)
+
+    // The substantive property: one recording's bytes filed under another's handle are refused,
+    // even though both were made by the same gateway under the same session identifier.
+    let stolen = directory
+        .path()
+        .join(format!("{}.crsr", first.recording_handle));
+    fs::write(
+        &stolen,
+        fs::read(&second.encrypted_path).expect("recording is readable"),
     )
-    .is_err());
+    .expect("recording is replaced");
+    assert!(
+        resolve_recording_handle(directory.path(), &first.recording_handle).is_err(),
+        "a file that answers to another handle must be refused"
+    );
+
     for hostile in [
         "../escape",
         "..",
@@ -374,9 +613,11 @@ fn a_recording_handle_from_another_session_is_rejected() {
         "a/b",
         "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        &"0".repeat(31),
+        &"0".repeat(33),
     ] {
         assert!(
-            resolve_recording_handle(directory.path(), hostile, SessionId::new(11)).is_err(),
+            resolve_recording_handle(directory.path(), hostile).is_err(),
             "handle {hostile:?} must be rejected"
         );
     }
@@ -535,27 +776,102 @@ fn lowercase_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// Splits the on-disk file into its length-prefixed ciphertexts without decrypting anything,
-/// so the tests can reason about chunk framing and nonce reuse from the outside.
-fn chunk_ciphertexts(raw: &[u8]) -> Vec<Vec<u8>> {
-    let mut chunks = Vec::new();
-    let mut offset = 32;
-    while offset + 4 <= raw.len() {
-        let length = usize::try_from(u32::from_be_bytes([
-            raw[offset],
-            raw[offset + 1],
-            raw[offset + 2],
-            raw[offset + 3],
-        ]))
-        .expect("chunk length fits in usize");
-        offset += 4;
-        if offset + length > raw.len() {
-            break;
+/// A reader for the published `CRSREC01` layout, written against the documented format rather
+/// than against the sink's internals — the same job Task 4b and the Meeting Agent will do. It
+/// exists so the tests can assert the nonce and additional-data binding directly instead of
+/// inferring it from ciphertext that happens to differ.
+struct Sealed {
+    header: Vec<u8>,
+    nonce_prefix: [u8; 8],
+    chunks: Vec<Vec<u8>>,
+    key: ring::aead::LessSafeKey,
+}
+
+impl Sealed {
+    const HEADER_LEN: usize = 48;
+
+    fn open(path: &Path) -> Self {
+        let raw = fs::read(path).expect("recording is readable");
+        assert!(raw.len() >= Self::HEADER_LEN);
+        assert_eq!(&raw[..8], b"CRSREC01");
+        let header = raw[..Self::HEADER_LEN].to_vec();
+        let mut nonce_prefix = [0_u8; 8];
+        nonce_prefix.copy_from_slice(&header[20..28]);
+
+        let mut chunks = Vec::new();
+        let mut offset = Self::HEADER_LEN;
+        while offset + 4 <= raw.len() {
+            let length = usize::try_from(u32::from_be_bytes(
+                raw[offset..offset + 4].try_into().expect("four bytes"),
+            ))
+            .expect("chunk length fits in usize");
+            offset += 4;
+            if offset + length > raw.len() {
+                break;
+            }
+            chunks.push(raw[offset..offset + length].to_vec());
+            offset += length;
         }
-        chunks.push(raw[offset..offset + length].to_vec());
-        offset += length;
+
+        // The published key derivation: SHA-256 over a domain separator and the key material.
+        let mut material = b"conversation-runtime/session-recording/key/v1\0".to_vec();
+        material.extend_from_slice(FAKE_KEY.as_bytes());
+        let derived = ring::digest::digest(&ring::digest::SHA256, &material);
+        let key = ring::aead::LessSafeKey::new(
+            ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, derived.as_ref())
+                .expect("a 256-bit key"),
+        );
+        Self {
+            header,
+            nonce_prefix,
+            chunks,
+            key,
+        }
     }
-    chunks
+
+    fn nonce(&self, counter: u32) -> ring::aead::Nonce {
+        let mut nonce = [0_u8; 12];
+        nonce[..8].copy_from_slice(&self.nonce_prefix);
+        nonce[8..].copy_from_slice(&counter.to_be_bytes());
+        ring::aead::Nonce::assume_unique_for_key(nonce)
+    }
+
+    fn aad(&self, counter: u32) -> Vec<u8> {
+        let mut aad = self.header.clone();
+        aad.extend_from_slice(&counter.to_be_bytes());
+        aad
+    }
+
+    /// The plaintext of `position` when opened as if it were chunk `counter`, or `None` when
+    /// the binding refuses it.
+    fn decrypt(&self, position: usize, counter: u32) -> Option<Vec<u8>> {
+        let mut buffer = self.chunks[position].clone();
+        let length = self
+            .key
+            .open_in_place(
+                self.nonce(counter),
+                ring::aead::Aad::from(self.aad(counter)),
+                &mut buffer,
+            )
+            .ok()?
+            .len();
+        buffer.truncate(length);
+        Some(buffer)
+    }
+
+    /// Seals `plaintext` at `counter` while holding the additional data fixed, which isolates
+    /// the nonce's contribution from the additional data's.
+    fn seal_with_fixed_aad(&self, plaintext: &[u8], counter: u32) -> Vec<u8> {
+        let mut buffer = plaintext.to_vec();
+        self.key
+            .seal_in_place_append_tag(
+                self.nonce(counter),
+                ring::aead::Aad::from(self.aad(0)),
+                &mut buffer,
+            )
+            .expect("sealing succeeds");
+        buffer
+    }
 }
 
 fn chunk_name(chunk: &RecordedChunk) -> &'static str {

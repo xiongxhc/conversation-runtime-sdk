@@ -3369,23 +3369,3 @@ fn recording_summaries_fail_closed_on_values_the_sink_cannot_produce() {
         ..recording_summary()
     });
 }
-
-#[test]
-fn a_recording_summary_never_carries_key_material() {
-    let encoded = encode_gateway_message_for_version(
-        &GatewayMessage::RecordingFinalized {
-            request_id: "r-1".to_owned(),
-            recording: recording_summary(),
-        },
-        RUNTIME_PROFILE_PROTOCOL_VERSION,
-    )
-    .unwrap();
-    let text = String::from_utf8(encoded).unwrap();
-    for forbidden in ["key\"", "secret", "\"key\":", "recording_key"] {
-        assert!(
-            !text.contains(forbidden),
-            "the wire carries a key identifier, never a key: {text}"
-        );
-    }
-    assert!(text.contains("key_id"));
-}

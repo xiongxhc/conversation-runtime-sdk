@@ -7,13 +7,14 @@
 //! # On-disk format (`CRSREC01`)
 //!
 //! ```text
-//! header (32 bytes, plaintext, carries no secret)
+//! header (48 bytes, plaintext, carries no secret)
 //!   0..8    magic  b"CRSREC01"
 //!   8       AEAD identifier (1 = AES-256-GCM)
 //!   9..12   reserved, zero
-//!   12..20  session identifier, u64 big endian
+//!   12..20  session identifier, u64 big endian (provenance only)
 //!   20..28  nonce prefix, 8 random bytes drawn once per recording
-//!   28..32  reserved, zero
+//!   28..44  binding identifier, 16 random bytes drawn once per recording
+//!   44..48  reserved, zero
 //! chunk (repeated)
 //!   0..4    ciphertext length, u32 big endian
 //!   4..     ciphertext = sealed record plus its 16-byte tag
@@ -25,8 +26,16 @@
 //! its position: a reordered, spliced or edited chunk fails to open. Truncation at a chunk
 //! boundary is therefore lossless, and truncation inside a chunk loses only that chunk.
 //!
-//! The key is read from an environment variable named by the configuration, once per recording.
-//! It is never stored in a summary, an event, an error, a path or a log line.
+//! The binding identifier is what the handle names: the handle is its lowercase hexadecimal
+//! spelling, so a file only answers to the handle it was minted with. The session identifier is
+//! recorded beside it as provenance and is deliberately *not* the thing resolution checks — a
+//! gateway may run every meeting under the same session identifier.
+//!
+//! The key is read from an environment variable named by the configuration, once per recording,
+//! and must be a 256-bit key written as 64 hexadecimal characters. Requiring the encoding is
+//! what makes the published `key_id` safe: it is an unsalted digest, so a low-entropy value
+//! there would be an offline oracle for the key. The key is never stored in a summary, an
+//! event, an error, a path or a log line.
 
 use std::fmt;
 use std::fs::{File, OpenOptions};
@@ -49,11 +58,15 @@ pub const EMPTY_RECORDING_FORMAT: &str = "none";
 pub const MAX_RECORDING_GAPS: usize = 256;
 
 const MAGIC: &[u8; 8] = b"CRSREC01";
-const HEADER_LEN: usize = 32;
+const HEADER_LEN: usize = 48;
 const AEAD_AES_256_GCM: u8 = 1;
-const HANDLE_BYTES: usize = 16;
-const HANDLE_LEN: usize = HANDLE_BYTES * 2;
+/// The per-recording random identifier. The handle is its hexadecimal spelling, and the header
+/// carries the bytes, so resolution can prove a file answers to the handle it is filed under.
+const BINDING_BYTES: usize = 16;
+const HANDLE_LEN: usize = BINDING_BYTES * 2;
 const NONCE_PREFIX_LEN: usize = 8;
+/// A recording key is 256 bits written as hexadecimal.
+const RECORDING_KEY_HEX_LEN: usize = 64;
 const RECORDING_EXTENSION: &str = "crsr";
 const MAX_CHUNK_CIPHERTEXT_BYTES: usize = 128 * 1024;
 const MAX_KEY_ENV_BYTES: usize = 128;
@@ -174,8 +187,15 @@ impl fmt::Debug for RecordingKey {
 }
 
 impl RecordingKey {
-    /// Reads the named variable and derives the key from it. The value is never bound to a
-    /// name that outlives this function, never stored, and never formatted into an error.
+    /// Reads the named variable and derives the key from it.
+    ///
+    /// The variable must hold a 256-bit key written as 64 hexadecimal characters. That is not
+    /// housekeeping: `key_id` is an unsalted digest of this value and is published to every
+    /// client, so a guessable value there would be an offline oracle for the key. Requiring the
+    /// encoding removes the guessable case rather than trying to detect it.
+    ///
+    /// The value is never bound to a name that outlives this function, never stored, and never
+    /// formatted into a diagnostic — only the variable's name and the expected encoding are.
     fn from_environment(key_env: &str) -> Result<Self, RuntimeError> {
         if !is_environment_name(key_env) {
             return Err(configuration_error(
@@ -190,6 +210,12 @@ impl RecordingKey {
                     "recording key environment variable {key_env} is not set"
                 ))
             })?;
+        let material = material.trim().to_ascii_lowercase();
+        if material.len() != RECORDING_KEY_HEX_LEN || !material.bytes().all(is_lowercase_hex_byte) {
+            return Err(configuration_error(format!(
+                "recording key environment variable {key_env} must hold a 256-bit key as 64 hexadecimal characters"
+            )));
+        }
         let derived = derive(KEY_DOMAIN, material.as_bytes());
         let key_id = lowercase_hex(&derive(KEY_ID_DOMAIN, material.as_bytes())[..8]);
         let key = UnboundKey::new(&AES_256_GCM, &derived)
@@ -242,7 +268,16 @@ pub struct SessionRecorder {
     started: Instant,
     format: Option<PcmFormat>,
     gaps: Vec<RecordingGap>,
-    open_gap: bool,
+    /// When the open gap started, in wall-clock terms, so closing it can extend the media
+    /// timeline by however long the bridge was actually silent.
+    open_gap: Option<Instant>,
+    /// The length of the media timeline: the audio recorded so far plus the gaps between it.
+    /// The recorder's own lifetime is deliberately not part of it, so a client that waits
+    /// before finalizing is not told the recording grew.
+    media_ms: u64,
+    /// Set once the closing chunk is on disk, so a finalize that fails afterwards retries the
+    /// failing step instead of appending a second closing chunk or reporting a wrong error.
+    ended: bool,
     summary: Option<RecordingSummary>,
 }
 
@@ -268,19 +303,20 @@ impl SessionRecorder {
     ) -> Result<Self, RuntimeError> {
         let key = RecordingKey::from_environment(&settings.key_env)?;
         let random = SystemRandom::new();
-        let mut handle_bytes = [0_u8; HANDLE_BYTES];
+        let mut binding = [0_u8; BINDING_BYTES];
         let mut nonce_prefix = [0_u8; NONCE_PREFIX_LEN];
         random
-            .fill(&mut handle_bytes)
+            .fill(&mut binding)
             .and_then(|()| random.fill(&mut nonce_prefix))
             .map_err(|_| adapter_error("recording randomness was unavailable"))?;
-        let handle = lowercase_hex(&handle_bytes);
+        let handle = lowercase_hex(&binding);
 
         let mut header = [0_u8; HEADER_LEN];
         header[..8].copy_from_slice(MAGIC);
         header[8] = AEAD_AES_256_GCM;
         header[12..20].copy_from_slice(&session_id.get().to_be_bytes());
         header[20..28].copy_from_slice(&nonce_prefix);
+        header[28..44].copy_from_slice(&binding);
 
         std::fs::create_dir_all(&settings.directory)
             .map_err(|_| adapter_error("recording directory could not be created"))?;
@@ -307,7 +343,9 @@ impl SessionRecorder {
             started: Instant::now(),
             format: None,
             gaps: Vec::new(),
-            open_gap: false,
+            open_gap: None,
+            media_ms: 0,
+            ended: false,
             summary: None,
         })
     }
@@ -338,11 +376,17 @@ impl SessionRecorder {
             None => self.format = Some(format),
         }
         let at_ms = self.elapsed_ms();
-        if self.open_gap {
+        if let Some(opened_at) = self.open_gap {
             self.append(gap_ended_record(at_ms))?;
-            self.open_gap = false;
+            self.open_gap = None;
+            // A gap between two frames is media the recording does not have, so it occupies its
+            // real length on the timeline. A gap before any frame extends nothing.
+            if self.format.is_some() {
+                self.media_ms = self.media_ms.saturating_add(instant_elapsed_ms(opened_at));
+            }
+            let media_ms = self.media_ms;
             if let Some(gap) = self.gaps.last_mut() {
-                gap.ended_at_ms = Some(at_ms);
+                gap.ended_at_ms = Some(media_ms);
             }
         }
         let mut record = Vec::with_capacity(24 + frame.bytes().len());
@@ -353,13 +397,15 @@ impl SessionRecorder {
         record.extend_from_slice(&format.channels().to_be_bytes());
         record.push(sample_format_code(format.sample_format())?);
         record.extend_from_slice(frame.bytes());
-        self.append(record)
+        self.append(record)?;
+        self.media_ms = self.media_ms.saturating_add(frame_duration_ms(frame));
+        Ok(())
     }
 
     /// Records a break in the capture bridge as a gap. The next frame closes it, so the
     /// recording states the silence instead of manufacturing it.
     pub fn record_capture_gap(&mut self) -> Result<(), RuntimeError> {
-        if self.open_gap {
+        if self.open_gap.is_some() {
             return Ok(());
         }
         if self.gaps.len() >= MAX_RECORDING_GAPS {
@@ -373,33 +419,40 @@ impl SessionRecorder {
         record.push(u8::try_from(reason.len()).expect("gap reasons are short"));
         record.extend_from_slice(reason.as_bytes());
         self.append(record)?;
-        self.open_gap = true;
+        self.open_gap = Some(Instant::now());
         self.gaps.push(RecordingGap {
-            started_at_ms: at_ms,
+            started_at_ms: self.media_ms,
             ended_at_ms: None,
             reason: reason.to_owned(),
         });
         Ok(())
     }
 
-    /// Closes the recording and states what it is. Idempotent: a second call returns the same
-    /// summary and appends nothing.
+    /// Closes the recording and states what it is.
+    ///
+    /// Idempotent in both directions: a second call after success returns the same summary and
+    /// appends nothing, and a second call after a failure retries the step that failed rather
+    /// than reporting the recorder as already closed. Nothing is torn down until every step has
+    /// succeeded, so a caller that retries always sees the real error.
     pub fn finalize(&mut self) -> Result<RecordingSummary, RuntimeError> {
         if let Some(summary) = self.summary.as_ref() {
             return Ok(summary.clone());
         }
-        let at_ms = self.elapsed_ms();
-        self.append(ended_record(at_ms))?;
-        if let Some(mut file) = self.file.take() {
+        if !self.ended {
+            self.append(ended_record(self.elapsed_ms()))?;
+            self.ended = true;
+        }
+        if let Some(file) = self.file.as_mut() {
             file.flush()
                 .and_then(|()| file.sync_all())
                 .map_err(|_| adapter_error("recording file could not be flushed"))?;
         }
+        let sha256 = file_digest(&self.path)?;
         let summary = RecordingSummary {
             recording_handle: self.handle.clone(),
             encrypted_path: self.path.clone(),
-            sha256: file_digest(&self.path)?,
-            duration_ms: at_ms,
+            sha256,
+            duration_ms: self.media_duration_ms(),
             format: self.format.map_or_else(
                 || EMPTY_RECORDING_FORMAT.to_owned(),
                 |format| {
@@ -412,14 +465,41 @@ impl SessionRecorder {
                 },
             ),
             key_id: self.key.key_id.clone(),
-            gaps: self.gaps.clone(),
+            gaps: self.reported_gaps(),
         };
+        self.file = None;
         self.summary = Some(summary.clone());
         Ok(summary)
     }
 
+    /// The recording's length: the audio it holds plus the gaps between that audio. Zero when
+    /// no frame was ever recorded, whatever the session cost in wall-clock time.
+    fn media_duration_ms(&self) -> u64 {
+        if self.format.is_some() {
+            self.media_ms
+        } else {
+            0
+        }
+    }
+
+    /// The gaps as the summary states them. They already sit on the media timeline; the clamp
+    /// only catches the degenerate case of a recording that captured no audio at all, where the
+    /// timeline has no length for a gap to occupy. The file keeps the recorder-relative
+    /// timestamps for a consumer that wants arrival times.
+    fn reported_gaps(&self) -> Vec<RecordingGap> {
+        let duration = self.media_duration_ms();
+        self.gaps
+            .iter()
+            .map(|gap| RecordingGap {
+                started_at_ms: gap.started_at_ms.min(duration),
+                ended_at_ms: gap.ended_at_ms.map(|ended| ended.min(duration)),
+                reason: gap.reason.clone(),
+            })
+            .collect()
+    }
+
     fn elapsed_ms(&self) -> u64 {
-        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+        instant_elapsed_ms(self.started)
     }
 
     fn append(&mut self, mut record: Vec<u8>) -> Result<(), RuntimeError> {
@@ -446,37 +526,46 @@ impl SessionRecorder {
     }
 }
 
-/// Resolves a recording handle to its file, refusing a handle that another session minted.
+/// Resolves a recording handle to its file, refusing a file that answers to a different handle.
 ///
-/// The handle is opaque and carries no session identity of its own; the file's header does,
-/// and that is what this checks. Nothing here needs the key, which is why the Meeting Agent can
+/// The check is the header's per-recording binding identifier, of which the handle is the
+/// hexadecimal spelling. It is deliberately *not* the session identifier: a gateway may run
+/// every meeting under the same one, so a session check would let any recording resolve any
+/// other recording's handle. Nothing here needs the key, which is why the Meeting Agent can
 /// copy a recording by handle without ever holding one.
-pub fn resolve_recording_handle(
-    directory: &Path,
-    handle: &str,
-    session_id: SessionId,
-) -> Result<PathBuf, RuntimeError> {
-    if handle.len() != HANDLE_LEN
-        || !handle
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-    {
+pub fn resolve_recording_handle(directory: &Path, handle: &str) -> Result<PathBuf, RuntimeError> {
+    let Some(binding) = decode_handle(handle) else {
         return Err(configuration_error(
             "recording handle is not a valid handle",
         ));
-    }
+    };
     let path = directory.join(format!("{handle}.{RECORDING_EXTENSION}"));
     let mut file = File::open(&path).map_err(|_| adapter_error("recording could not be opened"))?;
     let mut header = [0_u8; HEADER_LEN];
     file.read_exact(&mut header)
         .map_err(|_| adapter_error("recording header could not be read"))?;
-    let recorded = read_header(&header)?;
-    if recorded != session_id {
+    read_header(&header)?;
+    if header[28..44] != binding {
         return Err(invalid_state_error(
-            "recording handle belongs to another session",
+            "recording does not answer to that handle",
         ));
     }
     Ok(path)
+}
+
+/// The 16 binding bytes a handle spells, or `None` when it is not a handle at all. The charset
+/// and length check is also the path-traversal guard.
+fn decode_handle(handle: &str) -> Option<[u8; BINDING_BYTES]> {
+    if handle.len() != HANDLE_LEN || !handle.bytes().all(is_lowercase_hex_byte) {
+        return None;
+    }
+    let mut binding = [0_u8; BINDING_BYTES];
+    for (byte, pair) in binding.iter_mut().zip(handle.as_bytes().chunks_exact(2)) {
+        let high = char::from(pair[0]).to_digit(16)?;
+        let low = char::from(pair[1]).to_digit(16)?;
+        *byte = u8::try_from(high * 16 + low).ok()?;
+    }
+    Some(binding)
 }
 
 /// Decrypts a recording with the key named by `key_env`.
@@ -632,6 +721,28 @@ fn derive(domain: &[u8], material: &[u8]) -> [u8; 32] {
     let mut derived = [0_u8; 32];
     derived.copy_from_slice(digest(&SHA256, &input).as_ref());
     derived
+}
+
+fn instant_elapsed_ms(since: Instant) -> u64 {
+    u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// How much audio one frame carries, which is what makes the reported duration a media span
+/// rather than a wall-clock interval.
+fn frame_duration_ms(frame: &AudioFrame) -> u64 {
+    let format = frame.format();
+    let Ok(alignment) = format.frame_alignment_bytes() else {
+        return 0;
+    };
+    if alignment == 0 {
+        return 0;
+    }
+    let samples = frame.bytes().len() / alignment;
+    u64::try_from(samples as u128 * 1000 / u128::from(format.sample_rate_hz())).unwrap_or(u64::MAX)
+}
+
+fn is_lowercase_hex_byte(byte: u8) -> bool {
+    byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')
 }
 
 fn lowercase_hex(bytes: &[u8]) -> String {

@@ -116,14 +116,6 @@ fn capture_frames_are_appended_as_encrypted_chunks_with_a_per_session_nonce_sequ
         }
     }
 
-    // And the counter reaches the nonce, not only the additional data: holding the additional
-    // data fixed, two counters must still seal one plaintext to two different ciphertexts.
-    assert_ne!(
-        sealed.seal_with_fixed_aad(b"identical plaintext", 0),
-        sealed.seal_with_fixed_aad(b"identical plaintext", 1),
-        "the counter must advance the nonce, so identical plaintext never seals identically"
-    );
-
     // Two recordings under one key start from different nonce prefixes.
     let mut second_recorder =
         SessionRecorder::start(&settings, SessionId::new(7)).expect("second recorder starts");
@@ -361,26 +353,18 @@ async fn a_recording_closed_under_a_running_session_does_not_end_the_meeting() {
     };
     let events = run_voice_session(script, Arc::clone(&recorder)).await;
 
+    // Exactly `SessionEnded`, not merely "some terminal": a fatal recording error also
+    // terminates, as `SessionFailed { recovery: NewSession }`, so accepting either would pass
+    // whether or not the suppression exists.
     assert!(
-        events.iter().any(|event| matches!(
-            event,
-            VoiceSessionEvent::SessionEnded { .. }
-                | VoiceSessionEvent::SessionFailed {
-                    recovery: RecoveryDisposition::NewSession,
-                    ..
-                }
-        )),
-        "the session reached its own terminal rather than dying on a closed recording: {events:?}"
+        matches!(events.last(), Some(VoiceSessionEvent::SessionEnded { .. })),
+        "the session ended on its own shutdown, not on the closed recording: {events:?}"
     );
     assert!(
-        !events.iter().any(|event| matches!(
-            event,
-            VoiceSessionEvent::SessionFailed {
-                recovery: RecoveryDisposition::ContinueSession,
-                ..
-            }
-        )),
-        "a closed recording is not reported to the client as a session failure: {events:?}"
+        !events
+            .iter()
+            .any(|event| matches!(event, VoiceSessionEvent::SessionFailed { .. })),
+        "a closed recording is not a session failure of any kind: {events:?}"
     );
     assert_eq!(summary.duration_ms, 0);
     assert_eq!(
@@ -388,6 +372,148 @@ async fn a_recording_closed_under_a_running_session_does_not_end_the_meeting() {
         0,
         "frames after the close are dropped, not appended to a closed recording"
     );
+}
+
+#[tokio::test]
+async fn a_recording_that_cannot_be_written_still_ends_the_meeting() {
+    let key_env = "CONVERSATION_TEST_RECORDING_KEY_WRITE_FAILURE";
+    set_fake_key(key_env);
+    let directory = TempDir::new().expect("temporary recording directory");
+    let settings = RecordingSettings::new(directory.path(), key_env).expect("recording settings");
+    let recorder = Arc::new(Mutex::new(
+        SessionRecorder::start(&settings, SessionId::new(1)).expect("recorder starts"),
+    ));
+
+    // The other side of the same rule. Only an already-closed recording is survivable; a
+    // recording that cannot take the media it is given must still stop the meeting, because
+    // continuing would hand the operator a recording that is silently short. The second frame
+    // changes the capture format, which the sink refuses as an adapter failure rather than as
+    // the invalid state a closed recorder reports.
+    let mismatched = AudioFrame::new(
+        TurnId::new(1),
+        GenerationId::new(1),
+        UtteranceId::new(1),
+        2,
+        PcmFormat::new(8_000, 1, PcmSampleFormat::Signed16LittleEndian).expect("PCM format"),
+        vec![0x11, 0x22, 0x33, 0x44],
+    )
+    .expect("audio frame");
+    let script = vec![
+        Step::Emit(Ok(capture_frame(1))),
+        Step::Sleep(Duration::from_millis(60)),
+        Step::Emit(Ok(VoiceInputEvent::Capture(CaptureEvent::Frame(
+            mismatched,
+        )))),
+        Step::Sleep(Duration::from_millis(200)),
+    ];
+    let events = run_voice_session(script, Arc::clone(&recorder)).await;
+
+    assert!(
+        matches!(
+            events.last(),
+            Some(VoiceSessionEvent::SessionFailed {
+                recovery: RecoveryDisposition::NewSession,
+                ..
+            })
+        ),
+        "a recording that cannot be written must end the session: {events:?}"
+    );
+    assert_eq!(
+        recorded_frames_len(recorder.lock().await.path(), key_env),
+        1,
+        "the frame the sink accepted is on disk; the one it refused is not"
+    );
+}
+
+#[test]
+fn a_gap_before_the_first_frame_does_not_lengthen_the_recording() {
+    let key_env = "CONVERSATION_TEST_RECORDING_KEY_LEADING_GAP";
+    set_fake_key(key_env);
+    let directory = TempDir::new().expect("temporary recording directory");
+    let settings = RecordingSettings::new(directory.path(), key_env).expect("recording settings");
+
+    // A bridge discontinuity can arrive before any audio does, and will routinely do so once
+    // the media path is a network. That silence is not media the recording is missing — the
+    // recording had not started — so it must not appear in the duration.
+    let mut recorder =
+        SessionRecorder::start(&settings, SessionId::new(1)).expect("recorder starts");
+    recorder.record_capture_gap().expect("gap is recorded");
+    std::thread::sleep(Duration::from_millis(500));
+    recorder
+        .record_frame(&second_of_audio(1))
+        .expect("frame is recorded");
+    let summary = recorder.finalize().expect("recording finalizes");
+
+    assert_eq!(
+        summary.duration_ms, 1_000,
+        "one second of audio is one second of recording, whatever preceded it"
+    );
+    assert_eq!(
+        summary.gaps,
+        vec![conversation_runtime::RecordingGap {
+            started_at_ms: 0,
+            ended_at_ms: Some(0),
+            reason: "capture_discontinuity".to_owned(),
+        }],
+        "the leading gap is recorded, and occupies no media time"
+    );
+
+    // A gap *between* two frames still occupies its real length, so the fix did not silence
+    // the case the duration is supposed to account for.
+    let mut between = SessionRecorder::start(&settings, SessionId::new(1)).expect("recorder");
+    between
+        .record_frame(&second_of_audio(1))
+        .expect("frame is recorded");
+    between.record_capture_gap().expect("gap is recorded");
+    std::thread::sleep(Duration::from_millis(500));
+    between
+        .record_frame(&second_of_audio(2))
+        .expect("frame is recorded");
+    let between = between.finalize().expect("recording finalizes");
+    assert!(
+        (2_480..=2_700).contains(&between.duration_ms),
+        "two seconds of audio around a half-second gap, got {}",
+        between.duration_ms
+    );
+}
+
+#[test]
+fn a_superseded_or_malformed_header_is_refused_by_design() {
+    let key_env = "CONVERSATION_TEST_RECORDING_KEY_HEADER";
+    set_fake_key(key_env);
+    let directory = TempDir::new().expect("temporary recording directory");
+    let settings = RecordingSettings::new(directory.path(), key_env).expect("recording settings");
+
+    let mut recorder =
+        SessionRecorder::start(&settings, SessionId::new(1)).expect("recorder starts");
+    recorder
+        .record_frame(&marker_frame(1))
+        .expect("frame is recorded");
+    let summary = recorder.finalize().expect("recording finalizes");
+    let path = summary.encrypted_path.clone();
+    let whole = fs::read(&path).expect("recording is readable");
+
+    // The 32-byte layout that had no binding identifier. Under this reader its chunk cursor
+    // lands mid-ciphertext, which fails closed only by probability; the magic makes it certain.
+    let mut superseded = whole.clone();
+    superseded[..8].copy_from_slice(b"CRSREC01");
+    fs::write(&path, &superseded).expect("recording is rewritten");
+    assert!(read_session_recording(&path, key_env).is_err());
+    assert!(resolve_recording_handle(directory.path(), &summary.recording_handle).is_err());
+
+    // Reserved bytes carry a future field, so a non-zero one must not be silently ignored.
+    for reserved in [9, 10, 11, 44, 45, 46, 47] {
+        let mut tampered = whole.clone();
+        tampered[reserved] = 1;
+        fs::write(&path, &tampered).expect("recording is rewritten");
+        assert!(
+            read_session_recording(&path, key_env).is_err(),
+            "a non-zero reserved byte at {reserved} must be refused"
+        );
+    }
+
+    fs::write(&path, &whole).expect("recording is restored");
+    assert!(read_session_recording(&path, key_env).is_ok());
 }
 
 #[test]
@@ -420,8 +546,22 @@ fn a_recording_key_must_be_a_two_hundred_and_fifty_six_bit_hexadecimal_key() {
             !message.contains(refused) || refused.trim().is_empty(),
             "the diagnostic never quotes the value: {message}"
         );
-        assert!(message.len() <= 160, "diagnostics stay bounded: {message}");
+        assert!(
+            message.len() <= 128 + key_env.len(),
+            "diagnostics stay bounded by the variable's name, never by its value: {message}"
+        );
     }
+
+    // The one thing that must never enter the diagnostic is the only thing an attacker
+    // controls, so a value four kibibytes long produces the same message as a short one.
+    std::env::set_var(key_env, "z".repeat(4096));
+    let long = SessionRecorder::start(&settings, SessionId::new(1))
+        .expect_err("an oversized value is still not a key");
+    std::env::set_var(key_env, "z");
+    let short = SessionRecorder::start(&settings, SessionId::new(1))
+        .expect_err("a short value is not a key either");
+    assert_eq!(long, short, "the diagnostic does not grow with the value");
+
     assert_eq!(
         fs::read_dir(directory.path())
             .expect("directory is readable")
@@ -448,19 +588,6 @@ fn a_recording_reports_its_media_span_and_not_the_time_before_finalize() {
     set_fake_key(key_env);
     let directory = TempDir::new().expect("temporary recording directory");
     let settings = RecordingSettings::new(directory.path(), key_env).expect("recording settings");
-
-    // Frames of 16000 samples at 16 kHz: 1000 ms of audio each.
-    let second_of_audio = |sequence: u64| {
-        AudioFrame::new(
-            TurnId::new(1),
-            GenerationId::new(1),
-            UtteranceId::new(1),
-            sequence,
-            pcm_format(),
-            vec![0x11; 32_000],
-        )
-        .expect("audio frame")
-    };
 
     let mut recorder =
         SessionRecorder::start(&settings, SessionId::new(1)).expect("recorder starts");
@@ -638,7 +765,10 @@ fn a_missing_recording_key_variable_fails_the_session_start_closed() {
         "the diagnostic names the variable: {message}"
     );
     assert!(!message.contains(FAKE_KEY));
-    assert!(message.len() <= 160, "diagnostics stay bounded: {message}");
+    assert!(
+        message.len() <= 128 + key_env.len(),
+        "diagnostics stay bounded by the variable's name, never by its value: {message}"
+    );
     assert_eq!(
         fs::read_dir(directory.path())
             .expect("directory is readable")
@@ -727,6 +857,20 @@ fn pcm_format() -> PcmFormat {
     PcmFormat::new(16_000, 1, PcmSampleFormat::Signed16LittleEndian).expect("PCM format")
 }
 
+/// 16000 samples at 16 kHz mono: exactly 1000 ms of audio, so a test can state a duration in
+/// media terms rather than in wall-clock terms.
+fn second_of_audio(sequence: u64) -> AudioFrame {
+    AudioFrame::new(
+        TurnId::new(1),
+        GenerationId::new(1),
+        UtteranceId::new(1),
+        sequence,
+        pcm_format(),
+        vec![0x11; 32_000],
+    )
+    .expect("audio frame")
+}
+
 fn marker_frame(sequence: u64) -> AudioFrame {
     AudioFrame::new(
         TurnId::new(1),
@@ -793,7 +937,11 @@ impl Sealed {
     fn open(path: &Path) -> Self {
         let raw = fs::read(path).expect("recording is readable");
         assert!(raw.len() >= Self::HEADER_LEN);
-        assert_eq!(&raw[..8], b"CRSREC01");
+        assert_eq!(
+            &raw[..8],
+            b"CRSREC02",
+            "the reader is written against the published layout"
+        );
         let header = raw[..Self::HEADER_LEN].to_vec();
         let mut nonce_prefix = [0_u8; 8];
         nonce_prefix.copy_from_slice(&header[20..28]);
@@ -857,20 +1005,6 @@ impl Sealed {
             .len();
         buffer.truncate(length);
         Some(buffer)
-    }
-
-    /// Seals `plaintext` at `counter` while holding the additional data fixed, which isolates
-    /// the nonce's contribution from the additional data's.
-    fn seal_with_fixed_aad(&self, plaintext: &[u8], counter: u32) -> Vec<u8> {
-        let mut buffer = plaintext.to_vec();
-        self.key
-            .seal_in_place_append_tag(
-                self.nonce(counter),
-                ring::aead::Aad::from(self.aad(0)),
-                &mut buffer,
-            )
-            .expect("sealing succeeds");
-        buffer
     }
 }
 

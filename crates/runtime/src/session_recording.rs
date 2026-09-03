@@ -8,13 +8,20 @@
 //!
 //! ```text
 //! header (48 bytes, plaintext, carries no secret)
-//!   0..8    magic  b"CRSREC01"
+//!   0..8    magic  b"CRSREC02"
 //!   8       AEAD identifier (1 = AES-256-GCM)
 //!   9..12   reserved, zero
 //!   12..20  session identifier, u64 big endian (provenance only)
 //!   20..28  nonce prefix, 8 random bytes drawn once per recording
 //!   28..44  binding identifier, 16 random bytes drawn once per recording
 //!   44..48  reserved, zero
+//! ```
+//!
+//! The magic names the layout, not the product: `CRSREC01` was the 32-byte header without a
+//! binding identifier and is refused by name rather than left to fail on a mis-seeked chunk
+//! cursor. Reserved bytes must be zero, so a future field cannot be silently ignored.
+//!
+//! ```text
 //! chunk (repeated)
 //!   0..4    ciphertext length, u32 big endian
 //!   4..     ciphertext = sealed record plus its 16-byte tag
@@ -57,7 +64,10 @@ pub const EMPTY_RECORDING_FORMAT: &str = "none";
 /// than reporting a truncated gap list.
 pub const MAX_RECORDING_GAPS: usize = 256;
 
-const MAGIC: &[u8; 8] = b"CRSREC01";
+const MAGIC: &[u8; 8] = b"CRSREC02";
+/// The 32-byte layout that had no binding identifier. Refused explicitly: its chunk cursor
+/// lands mid-ciphertext under this reader, which fails closed only by probability.
+const SUPERSEDED_MAGIC: &[u8; 8] = b"CRSREC01";
 const HEADER_LEN: usize = 48;
 const AEAD_AES_256_GCM: u8 = 1;
 /// The per-recording random identifier. The handle is its hexadecimal spelling, and the header
@@ -366,6 +376,10 @@ impl SessionRecorder {
     /// speech, language and synthesis providers happen to be doing.
     pub fn record_frame(&mut self, frame: &AudioFrame) -> Result<(), RuntimeError> {
         let format = frame.format();
+        // Read before the assignment below, or the gap guard can never be false: a gap that
+        // opened before any audio arrived would be charged to the timeline as if it sat between
+        // two frames.
+        let had_media = self.format.is_some();
         match self.format {
             Some(existing) if existing != format => {
                 return Err(adapter_error(
@@ -380,8 +394,9 @@ impl SessionRecorder {
             self.append(gap_ended_record(at_ms))?;
             self.open_gap = None;
             // A gap between two frames is media the recording does not have, so it occupies its
-            // real length on the timeline. A gap before any frame extends nothing.
-            if self.format.is_some() {
+            // real length on the timeline. A gap before any frame extends nothing: the
+            // recording simply had not started.
+            if had_media {
                 self.media_ms = self.media_ms.saturating_add(instant_elapsed_ms(opened_at));
             }
             let media_ms = self.media_ms;
@@ -620,8 +635,14 @@ pub fn read_session_recording(path: &Path, key_env: &str) -> Result<RecordedSess
 }
 
 fn read_header(header: &[u8; HEADER_LEN]) -> Result<SessionId, RuntimeError> {
+    if &header[..8] == SUPERSEDED_MAGIC {
+        return Err(adapter_error("recording uses a superseded header layout"));
+    }
     if &header[..8] != MAGIC || header[8] != AEAD_AES_256_GCM {
         return Err(adapter_error("recording header is not recognised"));
+    }
+    if header[9..12] != [0; 3] || header[44..48] != [0; 4] {
+        return Err(adapter_error("recording header reserves are not zero"));
     }
     let mut session = [0_u8; 8];
     session.copy_from_slice(&header[12..20]);

@@ -98,7 +98,19 @@ an offline oracle for a guessable value. `finalize_recording` answers with an
 opaque handle, the encrypted file's path and digest, its duration, format, gaps,
 and an identifier for the key — never the key. The reported duration is the
 media span, the recorded audio plus the gaps between it, so a client that waits
-before finalizing is not told the recording grew. The handle is the hexadecimal
+before finalizing is not told the recording grew. A gap that opened before any
+audio arrived is recorded but occupies no media time; the recording had not
+started.
+
+**Two clocks describe one recording, and a consumer must not mix them.** The
+summary's durations and gap timestamps are on the media timeline, whose origin
+is the start of the recorded audio and which advances only by recorded audio and
+by the gaps between it. Every `at_ms` inside the encrypted file is on the
+recorder's wall clock instead, measured from the moment the recording opened, so
+a consumer can still see when media actually arrived. The two agree only for a
+recording whose media began immediately and ran without a gap. Correlate frames
+by their order and by the gap records around them, never by assuming one clock's
+value is meaningful on the other. The handle is the hexadecimal
 spelling of a random binding identifier the header carries, so a file only
 answers to the handle it was minted with and a copier needs no key at all. The
 session identifier sits beside it as provenance and is deliberately not what

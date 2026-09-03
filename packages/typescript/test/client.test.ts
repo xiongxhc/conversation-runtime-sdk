@@ -13,6 +13,7 @@ import type {
   RuntimeFailure,
   RuntimeStatus,
 } from "../src/protocol.js";
+import { ProtocolError } from "../src/protocol.js";
 
 const status: RuntimeStatus = {
   profile: "offline",
@@ -1520,3 +1521,143 @@ function parsedVoiceComponents(): RuntimeComponentDescriptor[] {
     { kind: "audio_io", executionLocation: "local", providerLabel: "Local audio io" },
   ];
 }
+
+// --- session recording ----------------------------------------------------------------------
+
+function readyV3(): unknown {
+  return {
+    type: "ready",
+    protocol_version: 3,
+    status: { ...wireStatus(), profile: "offline", last_context_seed_operation_id: null },
+  };
+}
+
+async function connectedV3Client(): Promise<{ client: RuntimeClient; transport: InMemoryTransport }> {
+  const transport = new InMemoryTransport();
+  const connecting = RuntimeClient.connect(transport);
+  transport.push(readyV3());
+  return { client: await connecting, transport };
+}
+
+function wireRecording(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    recording_handle: "0123456789abcdef0123456789abcdef",
+    encrypted_path: "/var/recordings/0123456789abcdef0123456789abcdef.crsr",
+    sha256: "a".repeat(64),
+    duration_ms: "61000",
+    format: "pcm_s16le/16000/1",
+    key_id: "0011223344556677",
+    gaps: [{ started_at_ms: "1200", ended_at_ms: "1800", reason: "capture_discontinuity" }],
+    ...overrides,
+  };
+}
+
+function recordingFinalized(requestId: string, recording: Record<string, unknown>): unknown {
+  return { type: "recording_finalized", protocol_version: 3, request_id: requestId, recording };
+}
+
+test("finalizeRecording returns the handle, the digest and bigint timings", async () => {
+  const { client, transport } = await connectedV3Client();
+
+  const finalizing = client.finalizeRecording({ sessionId: 1n });
+  await setImmediate();
+  const sent = command(transport, "finalize_recording");
+  assert.equal(sent.sessionId, 1n);
+  assert.deepEqual(transport.sentVersions, [3]);
+
+  transport.push(acceptedForVersion(sent.requestId, 3));
+  transport.push(recordingFinalized(sent.requestId, wireRecording()));
+  const recording = await finalizing;
+
+  assert.deepEqual(recording, {
+    recordingHandle: "0123456789abcdef0123456789abcdef",
+    encryptedPath: "/var/recordings/0123456789abcdef0123456789abcdef.crsr",
+    sha256: "a".repeat(64),
+    durationMs: 61000n,
+    format: "pcm_s16le/16000/1",
+    keyId: "0011223344556677",
+    gaps: [{ startedAtMs: 1200n, endedAtMs: 1800n, reason: "capture_discontinuity" }],
+  });
+  // The key never crosses the wire, only an identifier for it.
+  assert.equal(Object.keys(recording).includes("key"), false);
+});
+
+test("finalizeRecording carries an open gap as a null end and an empty recording as zero", async () => {
+  const { client, transport } = await connectedV3Client();
+
+  const finalizing = client.finalizeRecording({ sessionId: 4n });
+  await setImmediate();
+  const sent = command(transport, "finalize_recording");
+  transport.push(acceptedForVersion(sent.requestId, 3));
+  transport.push(
+    recordingFinalized(
+      sent.requestId,
+      wireRecording({
+        duration_ms: "0",
+        format: "none",
+        gaps: [{ started_at_ms: "0", ended_at_ms: null, reason: "capture_discontinuity" }],
+      }),
+    ),
+  );
+
+  const recording = await finalizing;
+  assert.equal(recording.durationMs, 0n);
+  assert.deepEqual(recording.gaps, [
+    { startedAtMs: 0n, endedAtMs: null, reason: "capture_discontinuity" },
+  ]);
+});
+
+test("finalizeRecording refuses a runtime that does not speak protocol version 3", async () => {
+  for (const connect of [connectedClient, connectedV2Client]) {
+    const { client } = await connect();
+    await assert.rejects(
+      () => client.finalizeRecording({ sessionId: 1n }),
+      /session recording requires protocol version 3/,
+    );
+  }
+});
+
+test("finalizeRecording refuses a session identifier outside u64", async () => {
+  const { client } = await connectedV3Client();
+  await assert.rejects(() => client.finalizeRecording({ sessionId: 0n }), ProtocolError);
+  await assert.rejects(() => client.finalizeRecording({ sessionId: -1n }), ProtocolError);
+});
+
+test("finalizeRecording surfaces a gateway rejection to its caller", async () => {
+  const { client, transport } = await connectedV3Client();
+  const finalizing = client.finalizeRecording({ sessionId: 9n });
+  await setImmediate();
+  const sent = command(transport, "finalize_recording");
+  transport.push(
+    rejectedForVersion(
+      sent.requestId,
+      {
+        code: "invalid_state",
+        kind: "invalid_state",
+        stage: "runtime",
+        message: "no recording is available for that session",
+      },
+      3,
+    ),
+  );
+  await assert.rejects(() => finalizing, CommandRejectedError);
+});
+
+test("a recording summary with numeric or unknown fields is rejected", async () => {
+  for (const overrides of [
+    { duration_ms: 61000 },
+    { gaps: [{ started_at_ms: 1200, ended_at_ms: null, reason: "capture_discontinuity" }] },
+    { gaps: [{ started_at_ms: "1200", ended_at_ms: "1800", reason: "muted" }] },
+    { sha256: "A".repeat(64) },
+    { recording_handle: "../escape" },
+    { unexpected: "field" },
+  ]) {
+    const { client, transport } = await connectedV3Client();
+    const finalizing = client.finalizeRecording({ sessionId: 1n });
+    await setImmediate();
+    const sent = command(transport, "finalize_recording");
+    transport.push(acceptedForVersion(sent.requestId, 3));
+    transport.push(recordingFinalized(sent.requestId, wireRecording(overrides)));
+    await assert.rejects(() => finalizing);
+  }
+});

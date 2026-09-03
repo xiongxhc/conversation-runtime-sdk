@@ -8,18 +8,18 @@ use conversation_model_adapters::GenerationLanguageModel;
 use conversation_protocol::{
     decode_client_command_with_version, encode_gateway_message_for_version, ClientCommand,
     ClientMemoryCursor, ClientMemoryInspection, ClientMemorySummary, ClientPersonaState,
-    ClientRuntimeError, ClientRuntimeEvent, ClientVoiceSessionEvent, GatewayMessage,
-    MemoryApproval, RecoveryDisposition, RuntimeError, RuntimeErrorKind, RuntimeEvent,
-    RuntimeStatus, SessionId, TurnId, VoiceSessionEvent, CLIENT_PROTOCOL_VERSION,
-    CONTEXT_SEED_PROTOCOL_VERSION, LEGACY_CLIENT_PROTOCOL_VERSION,
+    ClientRecordingGap, ClientRecordingSummary, ClientRuntimeError, ClientRuntimeEvent,
+    ClientVoiceSessionEvent, GatewayMessage, MemoryApproval, RecoveryDisposition, RuntimeError,
+    RuntimeErrorKind, RuntimeEvent, RuntimeStatus, SessionId, TurnId, VoiceSessionEvent,
+    CLIENT_PROTOCOL_VERSION, CONTEXT_SEED_PROTOCOL_VERSION, LEGACY_CLIENT_PROTOCOL_VERSION,
     RUNTIME_PROFILE_PROTOCOL_VERSION,
 };
 use conversation_runtime::{
-    ConversationContext, TextTurnEventStream, TextTurnRuntime, VoiceSessionAdapters,
-    VoiceSessionEventStream, VoiceSessionRuntime,
+    ConversationContext, RecordingSettings, RecordingSummary, SessionRecorder, TextTurnEventStream,
+    TextTurnRuntime, VoiceSessionAdapters, VoiceSessionEventStream, VoiceSessionRuntime,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio::task::{JoinError, JoinHandle};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -42,6 +42,15 @@ pub struct GatewaySession {
     extracted_counts: Option<mpsc::UnboundedReceiver<MemoryExtractedCounts>>,
     voice: Option<VoiceLane>,
     provider_failure: Option<CancellationToken>,
+    recording: Option<RecordingSettings>,
+    active_recording: Option<ActiveRecording>,
+}
+
+/// The recorder for the voice session that is running, or was the last to run. It outlives the
+/// session so a recording can still be finalized after the session has ended.
+struct ActiveRecording {
+    session_id: SessionId,
+    recorder: Arc<Mutex<SessionRecorder>>,
 }
 
 struct MemoryInspectionAdapters {
@@ -129,7 +138,17 @@ impl GatewaySession {
             extracted_counts: None,
             voice: None,
             provider_failure: None,
+            recording: None,
+            active_recording: None,
         }
+    }
+
+    /// Records every voice session's capture media under `settings`. Absent — which is what the
+    /// default configuration produces — nothing is recorded and the session behaves exactly as
+    /// it did before recordings existed.
+    pub fn with_recording(mut self, settings: RecordingSettings) -> Self {
+        self.recording = Some(settings);
+        self
     }
 
     /// When `provider_failure` is cancelled the session tells the client that a
@@ -683,14 +702,32 @@ impl GatewaySession {
                         .map_err(CommandFailure::response);
                     }
                 };
-                let runtime = VoiceSessionRuntime::new(
-                    lane.context.clone(),
-                    VoiceSessionAdapters::new(
-                        lane.adapters.io.clone(),
-                        lane.language.clone(),
-                        lane.adapters.speech.clone(),
-                    ),
+                let session_id = SessionId::new(1);
+                // The key is resolved here, before any media flows. A recording that cannot be
+                // protected refuses the session rather than starting an unprotected one.
+                let recorder = match self.recording.as_ref() {
+                    Some(settings) => match SessionRecorder::start(settings, session_id) {
+                        Ok(recorder) => Some(Arc::new(Mutex::new(recorder))),
+                        Err(error) => {
+                            return send_rejection(
+                                normal,
+                                &request_id,
+                                ClientRuntimeError::from(error),
+                            )
+                            .map_err(CommandFailure::response);
+                        }
+                    },
+                    None => None,
+                };
+                let mut adapters = VoiceSessionAdapters::new(
+                    lane.adapters.io.clone(),
+                    lane.language.clone(),
+                    lane.adapters.speech.clone(),
                 );
+                if let Some(recorder) = recorder.as_ref() {
+                    adapters = adapters.with_recorder(Arc::clone(recorder));
+                }
+                let runtime = VoiceSessionRuntime::new(lane.context.clone(), adapters);
                 let event_stream = match runtime.start(policy).await {
                     Ok(event_stream) => event_stream,
                     Err(error) => {
@@ -723,7 +760,51 @@ impl GatewaySession {
                     control_pending,
                     capture: VoiceCaptureState::Active,
                 });
+                if let Some(recorder) = recorder {
+                    self.active_recording = Some(ActiveRecording {
+                        session_id,
+                        recorder,
+                    });
+                }
                 Ok(())
+            }
+            ClientCommand::FinalizeRecording {
+                request_id,
+                session_id,
+            } => {
+                let Some(active) = self
+                    .active_recording
+                    .as_ref()
+                    .filter(|active| active.session_id == session_id)
+                else {
+                    return send_rejection(
+                        normal,
+                        &request_id,
+                        command_error("no recording is available for that session"),
+                    )
+                    .map_err(CommandFailure::response);
+                };
+                let finalized = active.recorder.lock().await.finalize();
+                let recording = match finalized {
+                    Ok(summary) => client_recording_summary(&summary),
+                    Err(error) => {
+                        return send_rejection(
+                            normal,
+                            &request_id,
+                            ClientRuntimeError::from(error),
+                        )
+                        .map_err(CommandFailure::response);
+                    }
+                };
+                send_accepted(normal, &request_id).map_err(CommandFailure::response)?;
+                send_normal(
+                    normal,
+                    GatewayMessage::RecordingFinalized {
+                        request_id,
+                        recording,
+                    },
+                )
+                .map_err(CommandFailure::response)
             }
             ClientCommand::StopVoiceSession { request_id } => {
                 if voice.active.is_none() {
@@ -1781,6 +1862,29 @@ fn fatal_message(message: &'static str) -> GatewayMessage {
     }
 }
 
+/// Projects a finalized recording onto the wire. The path comes from the TOML configuration
+/// and is therefore already UTF-8; the lossy conversion is the unreachable branch, not the
+/// intended one. The key appears in neither form — only `key_id`, a digest of it.
+fn client_recording_summary(summary: &RecordingSummary) -> ClientRecordingSummary {
+    ClientRecordingSummary {
+        recording_handle: summary.recording_handle.clone(),
+        encrypted_path: summary.encrypted_path.to_string_lossy().into_owned(),
+        sha256: summary.sha256.clone(),
+        duration_ms: summary.duration_ms,
+        format: summary.format.clone(),
+        key_id: summary.key_id.clone(),
+        gaps: summary
+            .gaps
+            .iter()
+            .map(|gap| ClientRecordingGap {
+                started_at_ms: gap.started_at_ms,
+                ended_at_ms: gap.ended_at_ms,
+                reason: gap.reason.clone(),
+            })
+            .collect(),
+    }
+}
+
 fn command_error(message: &'static str) -> ClientRuntimeError {
     ClientRuntimeError {
         code: "invalid_state".to_owned(),
@@ -1956,7 +2060,7 @@ mod tests {
         SqliteMemoryStore,
     };
     use conversation_model_adapters::{
-        AdapterError, AdapterFuture, AudioFrame, GenerationLanguageModel,
+        AdapterError, AdapterFuture, AudioFrame, CaptureEvent, GenerationLanguageModel,
         GenerationLanguageRequest, GenerationTextDelta, MockContinuousAudioOutput,
         MockGenerationLanguageModel, MockStreamingSpeechSynthesizer, MockVoiceCaptureControl,
         MockVoiceIoFactory, OllamaConfig, OllamaLanguageModel, PcmFormat, PcmSampleFormat,
@@ -1966,10 +2070,11 @@ mod tests {
     };
     use conversation_protocol::{
         ClientRuntimeEvent, ComponentDescriptor, ComponentKind, ExecutionLocation, GatewayMessage,
-        MemoryConfidence, MemoryDraft, MemoryKind, MemoryPatch, MemoryProvenance,
+        GenerationId, MemoryConfidence, MemoryDraft, MemoryKind, MemoryPatch, MemoryProvenance,
         MemoryProvenanceKind, MemoryRetention, PrivacyMode, RecoveryDisposition, RuntimeError,
         RuntimeErrorKind, RuntimeStage, RuntimeStatus, SessionId, TurnId, UnixTimestampMillis,
-        VoiceActivity, CLIENT_PROTOCOL_VERSION, MAX_CLIENT_FRAME_BYTES, MAX_MEMORY_CONTENT_BYTES,
+        UtteranceId, VoiceActivity, CLIENT_PROTOCOL_VERSION, MAX_CLIENT_FRAME_BYTES,
+        MAX_MEMORY_CONTENT_BYTES,
     };
     use tempfile::TempDir;
     use tokio::io::{duplex, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
@@ -1977,6 +2082,10 @@ mod tests {
     use tokio::sync::{mpsc, Notify};
     use tokio::time::timeout;
     use tokio_util::sync::CancellationToken;
+
+    use conversation_runtime::{
+        read_session_recording, resolve_recording_handle, RecordingSettings,
+    };
 
     use crate::voice_adapters::{GatewayVoiceAdapters, VoicePolicyTemplate};
     use crate::FrameReader;
@@ -6231,5 +6340,237 @@ mod tests {
         message.contains(r#""type":"turn_completed""#)
             || message.contains(r#""type":"turn_cancelled""#)
             || message.contains(r#""type":"turn_failed""#)
+    }
+
+    // --- session recording over the control channel ---------------------------------------
+
+    /// A fake value on a variable this test process owns. No real key exists anywhere here.
+    const FAKE_RECORDING_KEY: &str = "fake-not-a-real-recording-key-0000";
+
+    fn recording_frame(sequence: u64) -> VoiceInputEvent {
+        VoiceInputEvent::Capture(CaptureEvent::Frame(
+            AudioFrame::new(
+                TurnId::new(1),
+                GenerationId::new(1),
+                UtteranceId::new(1),
+                sequence,
+                PcmFormat::new(16_000, 1, PcmSampleFormat::Signed16LittleEndian).unwrap(),
+                vec![0x21, 0x43, 0x65, 0x87],
+            )
+            .unwrap(),
+        ))
+    }
+
+    /// Waits until the recording on disk has grown past `minimum` bytes, so a test never
+    /// stops a session before the media path has written what it was given.
+    async fn wait_for_recording_bytes(
+        directory: &std::path::Path,
+        minimum: u64,
+    ) -> std::path::PathBuf {
+        timeout(TEST_TIMEOUT, async {
+            loop {
+                if let Some(entry) = std::fs::read_dir(directory)
+                    .ok()
+                    .and_then(|mut entries| entries.next())
+                    .and_then(Result::ok)
+                {
+                    if entry.metadata().map(|metadata| metadata.len()).unwrap_or(0) >= minimum {
+                        return entry.path();
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the recording never reached the expected size")
+    }
+
+    async fn recorded_gateway(
+        directory: &TempDir,
+        key_env: &str,
+        input_receiver: mpsc::Receiver<Result<VoiceInputEvent, AdapterError>>,
+    ) -> InMemoryGateway {
+        let settings = RecordingSettings::new(directory.path(), key_env).unwrap();
+        let session = session_with_interactive_voice(
+            input_receiver,
+            Arc::new(MockGenerationLanguageModel::new(["fixture reply"])),
+            no_speech_frames(),
+        )
+        .with_recording(settings);
+        InMemoryGateway::start(session).await
+    }
+
+    #[tokio::test]
+    async fn finalize_recording_returns_the_handle_over_the_control_channel() {
+        let key_env = "CONVERSATION_SESSION_RECORDING_KEY_HANDLE";
+        std::env::set_var(key_env, FAKE_RECORDING_KEY);
+        let directory = TempDir::new().unwrap();
+        let (input, input_receiver) = mpsc::channel(8);
+        let mut gateway = recorded_gateway(&directory, key_env, input_receiver).await;
+
+        gateway
+            .write(r#"{"protocol_version":3,"type":"start_voice_session","request_id":"voice-1"}"#)
+            .await;
+        assert_accepted_message(&gateway.read_message().await, "voice-1");
+        assert!(gateway
+            .read_message()
+            .await
+            .contains(r#""type":"voice_session_started""#));
+
+        send_voice_input(&input, recording_frame(1)).await;
+        send_voice_input(&input, recording_frame(2)).await;
+        let path = wait_for_recording_bytes(directory.path(), 128).await;
+
+        gateway
+            .write(r#"{"protocol_version":3,"type":"stop_voice_session","request_id":"stop-1"}"#)
+            .await;
+        let messages = gateway
+            .read_until(|message| message.contains(r#""request_id":"stop-1""#))
+            .await;
+        assert!(messages.iter().any(|message| is_voice_terminal(message)));
+
+        gateway
+            .write(
+                r#"{"protocol_version":3,"type":"finalize_recording","request_id":"fin-1","session_id":"1"}"#,
+            )
+            .await;
+        assert_accepted_message(&gateway.read_message().await, "fin-1");
+        let finalized = gateway.read_message().await;
+        assert!(finalized.contains(r#""type":"recording_finalized""#));
+        assert!(finalized.contains(r#""request_id":"fin-1""#));
+        assert!(finalized.contains(r#""key_id":"#));
+        assert!(
+            !finalized.contains(FAKE_RECORDING_KEY),
+            "the control channel must never carry the key: {finalized}"
+        );
+        assert!(
+            !finalized.contains(key_env),
+            "the control channel must not even name the key variable: {finalized}"
+        );
+
+        let recording: serde_json::Value = serde_json::from_str(&finalized).unwrap();
+        let handle = recording["recording"]["recording_handle"].as_str().unwrap();
+        assert_eq!(handle.len(), 32);
+        assert_eq!(
+            recording["recording"]["encrypted_path"].as_str().unwrap(),
+            path.to_str().unwrap()
+        );
+        assert_eq!(
+            resolve_recording_handle(directory.path(), handle, SessionId::new(1)).unwrap(),
+            path
+        );
+        // The Meeting Agent copies by handle; the key stays on the runtime host.
+        let decrypted = read_session_recording(&path, key_env).unwrap();
+        assert_eq!(decrypted.session_id, SessionId::new(1));
+
+        gateway.close().await;
+    }
+
+    #[tokio::test]
+    async fn finalize_recording_is_idempotent_and_refuses_another_session() {
+        let key_env = "CONVERSATION_SESSION_RECORDING_KEY_IDEMPOTENT";
+        std::env::set_var(key_env, FAKE_RECORDING_KEY);
+        let directory = TempDir::new().unwrap();
+        let (input, input_receiver) = mpsc::channel(8);
+        let mut gateway = recorded_gateway(&directory, key_env, input_receiver).await;
+
+        gateway
+            .write(r#"{"protocol_version":3,"type":"start_voice_session","request_id":"voice-1"}"#)
+            .await;
+        assert_accepted_message(&gateway.read_message().await, "voice-1");
+        assert!(gateway
+            .read_message()
+            .await
+            .contains(r#""type":"voice_session_started""#));
+        send_voice_input(&input, recording_frame(1)).await;
+        wait_for_recording_bytes(directory.path(), 80).await;
+
+        let finalize = |request_id: &str, session_id: &str| {
+            format!(
+                r#"{{"protocol_version":3,"type":"finalize_recording","request_id":"{request_id}","session_id":"{session_id}"}}"#
+            )
+        };
+        gateway.write(&finalize("fin-1", "1")).await;
+        assert_accepted_message(&gateway.read_message().await, "fin-1");
+        let first = gateway.read_message().await;
+
+        gateway.write(&finalize("fin-2", "1")).await;
+        assert_accepted_message(&gateway.read_message().await, "fin-2");
+        let second = gateway.read_message().await;
+        assert_eq!(
+            first.replace("fin-1", "fin"),
+            second.replace("fin-2", "fin"),
+            "a repeated finalize restates the same recording"
+        );
+
+        gateway.write(&finalize("fin-3", "9")).await;
+        assert_rejected_message(&gateway.read_message().await, "fin-3", "invalid_state");
+
+        // The session is unharmed by the rejection.
+        gateway
+            .write(r#"{"protocol_version":3,"type":"status","request_id":"after"}"#)
+            .await;
+        assert_accepted_message(&gateway.read_message().await, "after");
+        assert!(gateway.read_message().await.contains(r#""type":"status""#));
+
+        drop(input);
+        gateway.read_until(is_voice_terminal).await;
+        gateway.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_voice_session_without_its_recording_key_is_refused_request_scoped() {
+        let key_env = "CONVERSATION_SESSION_RECORDING_KEY_MISSING";
+        std::env::remove_var(key_env);
+        let directory = TempDir::new().unwrap();
+        let (_input, input_receiver) = mpsc::channel(8);
+        let mut gateway = recorded_gateway(&directory, key_env, input_receiver).await;
+
+        gateway
+            .write(r#"{"protocol_version":3,"type":"start_voice_session","request_id":"voice-1"}"#)
+            .await;
+        let rejection = gateway.read_message().await;
+        assert_rejected_message(&rejection, "voice-1", "configuration_invalid");
+        assert!(
+            !rejection.contains(key_env),
+            "the client is told nothing about the key variable: {rejection}"
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+
+        // The gateway session survives a refused recording.
+        gateway
+            .write(r#"{"protocol_version":3,"type":"status","request_id":"after"}"#)
+            .await;
+        assert_accepted_message(&gateway.read_message().await, "after");
+        assert!(gateway.read_message().await.contains(r#""type":"status""#));
+        gateway.close().await;
+    }
+
+    #[tokio::test]
+    async fn finalize_recording_is_refused_without_a_recording_and_below_version_three() {
+        let (session, _guards) = session_with_voice();
+        let mut gateway = InMemoryGateway::start(session).await;
+
+        gateway
+            .write(
+                r#"{"protocol_version":3,"type":"finalize_recording","request_id":"fin-1","session_id":"1"}"#,
+            )
+            .await;
+        assert_rejected_message(&gateway.read_message().await, "fin-1", "invalid_state");
+
+        for version in [1, 2] {
+            gateway
+                .write(&format!(
+                    r#"{{"protocol_version":{version},"type":"finalize_recording","request_id":"fin-old","session_id":"1"}}"#
+                ))
+                .await;
+            assert_rejected_message(
+                &gateway.read_message().await,
+                "invalid-command",
+                "invalid_state",
+            );
+        }
+
+        gateway.close().await;
     }
 }

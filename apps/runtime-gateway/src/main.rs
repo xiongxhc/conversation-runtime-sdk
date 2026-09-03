@@ -38,6 +38,7 @@ async fn run() -> Result<(), ()> {
         memory_store,
         memory_extraction,
         provider_hosts,
+        recording,
         status: _,
     } = adapters;
     let cancellation = CancellationToken::new();
@@ -60,6 +61,9 @@ async fn run() -> Result<(), ()> {
         GatewaySession::new(runtime, status).with_provider_failure(provider_failure.clone());
     if let Some(voice_adapters) = voice {
         session = session.with_voice(voice_adapters, language);
+    }
+    if let Some(recording) = recording {
+        session = session.with_recording(recording);
     }
     if let Some(store) = memory_store {
         let store: Arc<dyn MemoryStore> = Arc::new(store);

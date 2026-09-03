@@ -3,15 +3,17 @@ use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::client_recording::validate_client_recording_summary;
+
 use crate::{
     ClientComponentDescriptor, ClientMemoryCursor, ClientMemoryInspection, ClientMemoryRecord,
-    ClientMemoryRetention, ClientMemorySummary, ClientPersonaState, ClientVoiceSessionEvent,
-    ConversationMode, ExecutionLocation, FollowUpPolicy, MemoryId, MemoryRetrievalTrace,
-    PrivacyMode, QualityDecision, ResponseControls, RetrievalTraceId, RuntimeError,
-    RuntimeErrorKind, RuntimeEvent, RuntimeProfile, RuntimeStage, RuntimeTimingMilestone,
-    SilencePolicy, SpeechPace, TurnId, MAX_CONVERSATION_MESSAGE_BYTES, MAX_HISTORY_BYTES,
-    MAX_MEMORY_CONTENT_BYTES, MAX_MEMORY_INSPECTION_HISTORY_ITEMS, MAX_MEMORY_LIST_PAGE_ITEMS,
-    MAX_MEMORY_PREVIEW_BYTES,
+    ClientMemoryRetention, ClientMemorySummary, ClientPersonaState, ClientRecordingSummary,
+    ClientVoiceSessionEvent, ConversationMode, ExecutionLocation, FollowUpPolicy, MemoryId,
+    MemoryRetrievalTrace, PrivacyMode, QualityDecision, ResponseControls, RetrievalTraceId,
+    RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeProfile, RuntimeStage,
+    RuntimeTimingMilestone, SessionId, SilencePolicy, SpeechPace, TurnId,
+    MAX_CONVERSATION_MESSAGE_BYTES, MAX_HISTORY_BYTES, MAX_MEMORY_CONTENT_BYTES,
+    MAX_MEMORY_INSPECTION_HISTORY_ITEMS, MAX_MEMORY_LIST_PAGE_ITEMS, MAX_MEMORY_PREVIEW_BYTES,
 };
 
 /// The oldest protocol version this build still speaks.
@@ -111,6 +113,11 @@ pub enum ClientCommand {
         request_id: String,
         memory_id: MemoryId,
         expected_revision: u64,
+    },
+    /// Closes the session recording and answers with its handle. Version 3 only.
+    FinalizeRecording {
+        request_id: String,
+        session_id: SessionId,
     },
 }
 
@@ -273,6 +280,11 @@ pub enum GatewayMessage {
         activated: u32,
         pending_approval: u32,
     },
+    /// The finalized recording, stated without any key material. Version 3 only.
+    RecordingFinalized {
+        request_id: String,
+        recording: ClientRecordingSummary,
+    },
 }
 
 #[derive(Debug)]
@@ -289,6 +301,7 @@ pub enum ClientWireError {
     MismatchedVoiceIdentity,
     InvalidMemoryResponse,
     InvalidPersonaState,
+    InvalidRecordingSummary,
     PayloadTooLarge { actual: usize, maximum: usize },
     UnsupportedRuntimeEvent { event: &'static str },
 }
@@ -316,6 +329,9 @@ impl fmt::Display for ClientWireError {
             }
             Self::InvalidMemoryResponse => formatter.write_str("invalid client memory response"),
             Self::InvalidPersonaState => formatter.write_str("invalid client persona state"),
+            Self::InvalidRecordingSummary => {
+                formatter.write_str("invalid client recording summary")
+            }
             Self::PayloadTooLarge { actual, maximum } => {
                 write!(
                     formatter,
@@ -667,6 +683,23 @@ fn decode_wire_client_command(
                 expected_revision: expected_revision.0,
             })
         }
+        WireClientCommand::FinalizeRecording {
+            protocol_version,
+            request_id,
+            session_id,
+        } => {
+            validate_protocol_version(protocol_version)?;
+            if protocol_version < RUNTIME_PROFILE_PROTOCOL_VERSION {
+                return Err(ClientWireError::UnsupportedProtocolVersion(
+                    protocol_version,
+                ));
+            }
+            validate_request_id(&request_id)?;
+            Ok(ClientCommand::FinalizeRecording {
+                request_id,
+                session_id: SessionId::new(session_id.0),
+            })
+        }
     }
 }
 
@@ -756,6 +789,11 @@ enum WireClientCommand {
         memory_id: DecimalIdentifier,
         expected_revision: DecimalIdentifier,
     },
+    FinalizeRecording {
+        protocol_version: u64,
+        request_id: String,
+        session_id: DecimalIdentifier,
+    },
 }
 
 impl WireClientCommand {
@@ -801,6 +839,9 @@ impl WireClientCommand {
                 protocol_version, ..
             }
             | Self::MemoryDelete {
+                protocol_version, ..
+            }
+            | Self::FinalizeRecording {
                 protocol_version, ..
             } => *protocol_version,
         }
@@ -860,6 +901,48 @@ impl From<&ClientMemorySummary> for WireClientMemorySummary {
             state: summary.state.clone(),
             pinned: summary.pinned,
             updated_at_ms: summary.updated_at_ms.clone(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct WireClientRecordingGap {
+    started_at_ms: String,
+    ended_at_ms: Option<String>,
+    reason: String,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct WireClientRecordingSummary {
+    recording_handle: String,
+    encrypted_path: String,
+    sha256: String,
+    duration_ms: String,
+    format: String,
+    key_id: String,
+    gaps: Vec<WireClientRecordingGap>,
+}
+
+impl From<&ClientRecordingSummary> for WireClientRecordingSummary {
+    fn from(recording: &ClientRecordingSummary) -> Self {
+        Self {
+            recording_handle: recording.recording_handle.clone(),
+            encrypted_path: recording.encrypted_path.clone(),
+            sha256: recording.sha256.clone(),
+            duration_ms: recording.duration_ms.to_string(),
+            format: recording.format.clone(),
+            key_id: recording.key_id.clone(),
+            gaps: recording
+                .gaps
+                .iter()
+                .map(|gap| WireClientRecordingGap {
+                    started_at_ms: gap.started_at_ms.to_string(),
+                    ended_at_ms: gap.ended_at_ms.map(|value| value.to_string()),
+                    reason: gap.reason.clone(),
+                })
+                .collect(),
         }
     }
 }
@@ -1113,6 +1196,11 @@ enum GatewayMessageEnvelope<'a> {
         activated: u32,
         pending_approval: u32,
     },
+    RecordingFinalized {
+        protocol_version: u64,
+        request_id: &'a str,
+        recording: WireClientRecordingSummary,
+    },
 }
 
 impl<'a> GatewayMessageEnvelope<'a> {
@@ -1195,6 +1283,14 @@ impl<'a> GatewayMessageEnvelope<'a> {
                 created: *created,
                 activated: *activated,
                 pending_approval: *pending_approval,
+            },
+            GatewayMessage::RecordingFinalized {
+                request_id,
+                recording,
+            } => Self::RecordingFinalized {
+                protocol_version,
+                request_id,
+                recording: WireClientRecordingSummary::from(recording),
             },
         }
     }
@@ -1325,6 +1421,20 @@ fn validate_gateway_message(
             crate::client_persona::validate_client_persona_state(persona)
         }
         GatewayMessage::MemoryDeleted { request_id, .. } => validate_request_id(request_id),
+        GatewayMessage::RecordingFinalized {
+            request_id,
+            recording,
+        } => {
+            // The summary only exists because a version 3 command asked for it, so a frame
+            // that cannot name a version 3 message must not carry one.
+            if protocol_version < RUNTIME_PROFILE_PROTOCOL_VERSION {
+                return Err(ClientWireError::UnsupportedProtocolVersion(
+                    protocol_version,
+                ));
+            }
+            validate_request_id(request_id)?;
+            validate_client_recording_summary(recording)
+        }
         GatewayMessage::MemoryExtracted { .. } => Ok(()),
     }
 }

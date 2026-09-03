@@ -3,20 +3,21 @@ use conversation_protocol::{
     memory_preview, ClientCommand, ClientComponentDescriptor, ClientMemoryApproval,
     ClientMemoryCursor, ClientMemoryInspection, ClientMemoryProvenance, ClientMemoryRecord,
     ClientMemoryRetention, ClientMemorySummary, ClientMemoryTrace, ClientPersonaState,
-    ClientPrivacySummary, ClientQualityDecision, ClientResponseControls, ClientRuntimeError,
-    ClientRuntimeEvent, ClientVoiceSessionEvent, ClientWireError, ComponentDescriptor,
-    ComponentKind, ContextSource, ConversationContextExchange, ConversationMode,
-    ConversationSignal, ExecutionLocation, FollowUpPolicy, GatewayMessage, GenerationId,
-    MemoryApproval, MemoryConfidence, MemoryDraft, MemoryId, MemoryInspection, MemoryKind,
-    MemoryProvenance, MemoryProvenanceKind, MemoryRecord, MemoryRetention, MemoryRetrievalReason,
-    MemoryRetrievalTrace, MemoryTraceExclusions, MemoryTraceItem, PersonaLevel, PersonaProfile,
-    PlaybackState, PrivacyMode, PrivacySummary, QualityDecision, RecoveryDisposition,
-    ResponseControls, RetrievalTraceId, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage,
-    RuntimeStatus, SessionId, SilencePolicy, SpeechPace, TurnId, UnixTimestampMillis,
-    VoiceActivity, VoiceSessionEvent, VoiceTimingMilestone, CLIENT_PROTOCOL_VERSION,
-    CONTEXT_SEED_PROTOCOL_VERSION, LEGACY_CLIENT_PROTOCOL_VERSION,
-    MAX_CLIENT_COMPONENT_DESCRIPTORS, MAX_CLIENT_DEVICE_LABEL_BYTES, MAX_CLIENT_FRAME_BYTES,
-    MAX_CLIENT_PROVIDER_LABEL_BYTES, MAX_CONVERSATION_MESSAGE_BYTES, MAX_HISTORY_BYTES,
+    ClientPrivacySummary, ClientQualityDecision, ClientRecordingGap, ClientRecordingSummary,
+    ClientResponseControls, ClientRuntimeError, ClientRuntimeEvent, ClientVoiceSessionEvent,
+    ClientWireError, ComponentDescriptor, ComponentKind, ContextSource,
+    ConversationContextExchange, ConversationMode, ConversationSignal, ExecutionLocation,
+    FollowUpPolicy, GatewayMessage, GenerationId, MemoryApproval, MemoryConfidence, MemoryDraft,
+    MemoryId, MemoryInspection, MemoryKind, MemoryProvenance, MemoryProvenanceKind, MemoryRecord,
+    MemoryRetention, MemoryRetrievalReason, MemoryRetrievalTrace, MemoryTraceExclusions,
+    MemoryTraceItem, PersonaLevel, PersonaProfile, PlaybackState, PrivacyMode, PrivacySummary,
+    QualityDecision, RecoveryDisposition, ResponseControls, RetrievalTraceId, RuntimeError,
+    RuntimeErrorKind, RuntimeEvent, RuntimeStage, RuntimeStatus, SessionId, SilencePolicy,
+    SpeechPace, TurnId, UnixTimestampMillis, VoiceActivity, VoiceSessionEvent,
+    VoiceTimingMilestone, CLIENT_PROTOCOL_VERSION, CONTEXT_SEED_PROTOCOL_VERSION,
+    LEGACY_CLIENT_PROTOCOL_VERSION, MAX_CLIENT_COMPONENT_DESCRIPTORS,
+    MAX_CLIENT_DEVICE_LABEL_BYTES, MAX_CLIENT_FRAME_BYTES, MAX_CLIENT_PROVIDER_LABEL_BYTES,
+    MAX_CLIENT_RECORDING_GAPS, MAX_CONVERSATION_MESSAGE_BYTES, MAX_HISTORY_BYTES,
     MAX_MEMORY_PREVIEW_BYTES, RUNTIME_PROFILE_PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Deserializer};
@@ -3143,4 +3144,248 @@ fn context_seeding_stays_available_from_version_two_onwards() {
         ),
         Err(ClientWireError::InvalidRuntimeStatus)
     ));
+}
+
+fn recording_summary() -> ClientRecordingSummary {
+    ClientRecordingSummary {
+        recording_handle: "0123456789abcdef0123456789abcdef".to_owned(),
+        encrypted_path: "/var/recordings/0123456789abcdef0123456789abcdef.crsr".to_owned(),
+        sha256: "a".repeat(64),
+        duration_ms: 61_000,
+        format: "pcm_s16le/16000/1".to_owned(),
+        key_id: "0011223344556677".to_owned(),
+        gaps: vec![ClientRecordingGap {
+            started_at_ms: 1_200,
+            ended_at_ms: Some(1_800),
+            reason: "capture_discontinuity".to_owned(),
+        }],
+    }
+}
+
+#[test]
+fn finalize_recording_is_a_version_three_command_only() {
+    let payload = |version: u64| {
+        format!(
+            r#"{{"protocol_version":{version},"type":"finalize_recording","request_id":"r-1","session_id":"7"}}"#
+        )
+    };
+
+    assert_eq!(
+        decode_client_command(payload(RUNTIME_PROFILE_PROTOCOL_VERSION).as_bytes()).unwrap(),
+        ClientCommand::FinalizeRecording {
+            request_id: "r-1".to_owned(),
+            session_id: SessionId::new(7),
+        }
+    );
+    for version in [
+        LEGACY_CLIENT_PROTOCOL_VERSION,
+        CONTEXT_SEED_PROTOCOL_VERSION,
+    ] {
+        assert!(matches!(
+            decode_client_command(payload(version).as_bytes()),
+            Err(ClientWireError::UnsupportedProtocolVersion(_))
+        ));
+    }
+    // Unsupported versions stay unsupported rather than becoming a recording command.
+    assert!(matches!(
+        decode_client_command(payload(4).as_bytes()),
+        Err(ClientWireError::UnsupportedProtocolVersion(4))
+    ));
+    // A zero session identifier is not canonical and never reaches the gateway.
+    assert!(decode_client_command(
+        br#"{"protocol_version":3,"type":"finalize_recording","request_id":"r-1","session_id":"0"}"#
+    )
+    .is_err());
+}
+
+#[test]
+fn a_finalized_recording_states_its_handle_only_from_version_three() {
+    let message = GatewayMessage::RecordingFinalized {
+        request_id: "r-1".to_owned(),
+        recording: recording_summary(),
+    };
+
+    let encoded =
+        encode_gateway_message_for_version(&message, RUNTIME_PROFILE_PROTOCOL_VERSION).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "protocol_version": 3,
+            "type": "recording_finalized",
+            "request_id": "r-1",
+            "recording": {
+                "recording_handle": "0123456789abcdef0123456789abcdef",
+                "encrypted_path": "/var/recordings/0123456789abcdef0123456789abcdef.crsr",
+                "sha256": "a".repeat(64),
+                "duration_ms": "61000",
+                "format": "pcm_s16le/16000/1",
+                "key_id": "0011223344556677",
+                "gaps": [{
+                    "started_at_ms": "1200",
+                    "ended_at_ms": "1800",
+                    "reason": "capture_discontinuity",
+                }],
+            },
+        }),
+        "64-bit values travel as canonical decimal strings, never JSON numbers"
+    );
+
+    for version in [
+        LEGACY_CLIENT_PROTOCOL_VERSION,
+        CONTEXT_SEED_PROTOCOL_VERSION,
+    ] {
+        assert!(matches!(
+            encode_gateway_message_for_version(&message, version),
+            Err(ClientWireError::UnsupportedProtocolVersion(_))
+        ));
+    }
+}
+
+#[test]
+fn an_open_gap_and_an_empty_recording_are_expressible() {
+    let message = GatewayMessage::RecordingFinalized {
+        request_id: "r-1".to_owned(),
+        recording: ClientRecordingSummary {
+            duration_ms: 0,
+            format: "none".to_owned(),
+            gaps: vec![ClientRecordingGap {
+                started_at_ms: 0,
+                ended_at_ms: None,
+                reason: "capture_discontinuity".to_owned(),
+            }],
+            ..recording_summary()
+        },
+    };
+    let encoded =
+        encode_gateway_message_for_version(&message, RUNTIME_PROFILE_PROTOCOL_VERSION).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(value["recording"]["duration_ms"], "0");
+    assert_eq!(value["recording"]["gaps"][0]["started_at_ms"], "0");
+    assert_eq!(
+        value["recording"]["gaps"][0]["ended_at_ms"],
+        serde_json::Value::Null
+    );
+}
+
+#[test]
+fn recording_summaries_fail_closed_on_values_the_sink_cannot_produce() {
+    let refuse = |recording: ClientRecordingSummary| {
+        assert!(
+            matches!(
+                encode_gateway_message_for_version(
+                    &GatewayMessage::RecordingFinalized {
+                        request_id: "r-1".to_owned(),
+                        recording,
+                    },
+                    RUNTIME_PROFILE_PROTOCOL_VERSION,
+                ),
+                Err(ClientWireError::InvalidRecordingSummary)
+            ),
+            "an invalid recording summary must fail closed"
+        );
+    };
+
+    refuse(ClientRecordingSummary {
+        recording_handle: String::new(),
+        ..recording_summary()
+    });
+    refuse(ClientRecordingSummary {
+        recording_handle: "../escape".to_owned(),
+        ..recording_summary()
+    });
+    refuse(ClientRecordingSummary {
+        recording_handle: "A".repeat(32),
+        ..recording_summary()
+    });
+    refuse(ClientRecordingSummary {
+        encrypted_path: String::new(),
+        ..recording_summary()
+    });
+    refuse(ClientRecordingSummary {
+        encrypted_path: "/tmp/\u{0}.crsr".to_owned(),
+        ..recording_summary()
+    });
+    refuse(ClientRecordingSummary {
+        encrypted_path: format!("/{}", "p".repeat(1024)),
+        ..recording_summary()
+    });
+    refuse(ClientRecordingSummary {
+        sha256: "a".repeat(63),
+        ..recording_summary()
+    });
+    refuse(ClientRecordingSummary {
+        sha256: "A".repeat(64),
+        ..recording_summary()
+    });
+    refuse(ClientRecordingSummary {
+        format: String::new(),
+        ..recording_summary()
+    });
+    refuse(ClientRecordingSummary {
+        format: "PCM".to_owned(),
+        ..recording_summary()
+    });
+    refuse(ClientRecordingSummary {
+        key_id: String::new(),
+        ..recording_summary()
+    });
+    refuse(ClientRecordingSummary {
+        key_id: "not-hex".to_owned(),
+        ..recording_summary()
+    });
+    refuse(ClientRecordingSummary {
+        gaps: vec![ClientRecordingGap {
+            started_at_ms: 10,
+            ended_at_ms: Some(9),
+            reason: "capture_discontinuity".to_owned(),
+        }],
+        ..recording_summary()
+    });
+    refuse(ClientRecordingSummary {
+        gaps: vec![ClientRecordingGap {
+            started_at_ms: 10,
+            ended_at_ms: Some(20),
+            reason: "muted".to_owned(),
+        }],
+        ..recording_summary()
+    });
+    refuse(ClientRecordingSummary {
+        gaps: vec![ClientRecordingGap {
+            started_at_ms: 99_000,
+            ended_at_ms: None,
+            reason: "capture_discontinuity".to_owned(),
+        }],
+        ..recording_summary()
+    });
+    refuse(ClientRecordingSummary {
+        gaps: (0..=MAX_CLIENT_RECORDING_GAPS)
+            .map(|index| ClientRecordingGap {
+                started_at_ms: index as u64,
+                ended_at_ms: None,
+                reason: "capture_discontinuity".to_owned(),
+            })
+            .collect(),
+        ..recording_summary()
+    });
+}
+
+#[test]
+fn a_recording_summary_never_carries_key_material() {
+    let encoded = encode_gateway_message_for_version(
+        &GatewayMessage::RecordingFinalized {
+            request_id: "r-1".to_owned(),
+            recording: recording_summary(),
+        },
+        RUNTIME_PROFILE_PROTOCOL_VERSION,
+    )
+    .unwrap();
+    let text = String::from_utf8(encoded).unwrap();
+    for forbidden in ["key\"", "secret", "\"key\":", "recording_key"] {
+        assert!(
+            !text.contains(forbidden),
+            "the wire carries a key identifier, never a key: {text}"
+        );
+    }
+    assert!(text.contains("key_id"));
 }

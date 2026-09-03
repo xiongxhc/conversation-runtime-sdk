@@ -31,6 +31,8 @@ export {
   type MemoryRetention,
   type MemorySummary,
   type PersonaState,
+  type RecordingGap,
+  type RecordingSummary,
   type RuntimeEvent,
   type RuntimeComponentDescriptor,
   type RuntimeFailure,

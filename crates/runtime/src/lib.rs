@@ -18,6 +18,7 @@ mod conversation_quality;
 mod generation;
 mod phrase_chunker;
 mod session_clock;
+mod session_recording;
 mod speech_text;
 mod speech_worker;
 mod streaming_turn;
@@ -33,6 +34,11 @@ pub use conversation_context::{
 pub use conversation_quality::{ConversationQualityController, ResolvedConversationQuality};
 pub use phrase_chunker::PhraseChunkingConfig;
 pub use session_clock::{SessionClock, TurnFinalizationDeadline};
+pub use session_recording::{
+    read_session_recording, resolve_recording_handle, RecordedChunk, RecordedSession, RecordingGap,
+    RecordingSettings, RecordingSummary, SessionRecorder, CAPTURE_DISCONTINUITY_REASON,
+    EMPTY_RECORDING_FORMAT, MAX_RECORDING_GAPS,
+};
 pub use streaming_turn::{StartedStreamingTurn, StreamingTurnEventStream, StreamingTurnRuntime};
 pub use text_turn::{TextTurnEventStream, TextTurnRuntime};
 pub use turn_finalizer::{FinalizedTranscript, TurnFinalizer};

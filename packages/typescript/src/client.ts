@@ -2,6 +2,7 @@ import {
   parseGatewayMessage,
   parseReadyMessage,
   validateClientCommand,
+  RUNTIME_PROFILE_PROTOCOL_VERSION,
   type ClientCommand,
   type ClientProtocolVersion,
   type ConversationContextExchange,
@@ -11,6 +12,7 @@ import {
   type MemoryInspection,
   type MemoryPage,
   type PersonaState,
+  type RecordingSummary,
   type RuntimeEvent,
   type RuntimeFailure,
   type RuntimeStatus,
@@ -206,6 +208,33 @@ export class RuntimeClient {
     return result.promise;
   }
 
+  /**
+   * Closes the session recording and answers with its handle. The handle addresses the
+   * encrypted file; the key that sealed it stays on the runtime host and never reaches a
+   * client. Version 3 runtimes only.
+   */
+  finalizeRecording({ sessionId }: { sessionId: bigint }): Promise<RecordingSummary> {
+    if (this.protocolVersion === undefined || this.protocolVersion < RUNTIME_PROFILE_PROTOCOL_VERSION) {
+      return Promise.reject(new Error("session recording requires protocol version 3"));
+    }
+    const requestId = this.nextRequestId();
+    const command: ClientCommand = { type: "finalize_recording", requestId, sessionId };
+    try {
+      validateClientCommand(command, this.protocolVersion);
+    } catch (error) {
+      return Promise.reject(error as Error);
+    }
+    const result = new Deferred<RecordingSummary>();
+    this.controls.set(requestId, {
+      kind: "finalize_recording",
+      accepted: false,
+      result,
+      fail: (error) => result.reject(error),
+    });
+    this.send(command);
+    return result.promise;
+  }
+
   startTurn(transcript: string): Promise<RuntimeTurn> {
     const requestId = this.nextRequestId();
     validateClientCommand({ type: "start_turn", requestId, transcript });
@@ -390,6 +419,16 @@ export class RuntimeClient {
       }
       this.controls.delete(message.requestId);
       control.result.resolve(message.memoryId);
+      return;
+    }
+    if (message.type === "recording_finalized") {
+      const control = this.controls.get(message.requestId);
+      if (!control || control.kind !== "finalize_recording" || !control.accepted) {
+        this.fail(new Error("gateway sent an uncorrelated recording response"));
+        return;
+      }
+      this.controls.delete(message.requestId);
+      control.result.resolve(message.recording);
       return;
     }
     if (message.type === "memory_extracted") {
@@ -606,7 +645,8 @@ type PendingControl =
   | { kind: "start_voice_session"; accepted: boolean; result: Deferred<VoiceSession>; fail(error: Error): void }
   | { kind: "stop_voice_session"; accepted: boolean; result: Deferred<void>; fail(error: Error): void }
   | { kind: "pause_voice_capture"; accepted: boolean; result: Deferred<void>; fail(error: Error): void }
-  | { kind: "resume_voice_capture"; accepted: boolean; result: Deferred<void>; fail(error: Error): void };
+  | { kind: "resume_voice_capture"; accepted: boolean; result: Deferred<void>; fail(error: Error): void }
+  | { kind: "finalize_recording"; accepted: boolean; result: Deferred<RecordingSummary>; fail(error: Error): void };
 
 type TurnState = {
   events: AsyncQueue<RuntimeEvent>;

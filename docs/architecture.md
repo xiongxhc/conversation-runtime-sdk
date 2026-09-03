@@ -66,8 +66,10 @@ voice-session restart.
 
 Public protocol v2 adds bounded structured context seeding on top of v1, and
 public protocol v3 adds the runtime profile that states whether a session runs
-offline or online. A status without a profile is offline, so every v1 and v2
-payload keeps its exact shape. The gateway advertises its version in Ready and
+offline or online, together with `finalize_recording` and the
+`recording_finalized` response that carries a session recording's handle. A
+status without a profile is offline, so every v1 and v2 payload keeps its exact
+shape, and a v1 or v2 client that sends a v3 command is refused. The gateway advertises its version in Ready and
 then answers each client on the version that client speaks, never below the
 lowest version its own status can be stated at. The TypeScript client selects
 the matching strict codec and keeps status, text, voice, persona, and memory
@@ -76,6 +78,27 @@ connect to a v2 gateway. The public protocol version is independent from the
 gateway configuration schema version and the private managed-sidecar protocol
 version. Version disagreement fails explicitly; there is no compatibility guess
 or silent fallback.
+
+### Encrypted Session Recording
+
+A gateway configured with a `[recording]` section records every capture frame a
+voice session receives, in either profile. The sink sits on the media path
+before any provider is consulted, so a recording keeps its audio while the
+recognizer, language model or synthesizer are failing, and a break in the
+capture bridge is written as a gap rather than as manufactured silence. Frames
+are sealed one chunk at a time under AES-256-GCM with a per-session nonce
+sequence, so plaintext audio never reaches disk and a process that dies
+mid-write leaves a file that decrypts up to its last whole chunk.
+
+The key is named by an environment variable on the runtime host and read once,
+when a session starts; a variable that is absent refuses the session rather than
+starting an unprotected recording. `finalize_recording` answers with an opaque
+handle, the encrypted file's path and digest, its duration, format, gaps, and an
+identifier for the key — never the key. The handle addresses the file, and the
+file's header names the session that made it, so a handle minted by one session
+cannot be resolved against another and a copier needs no key at all. Without a
+`[recording]` section nothing is recorded, which is what the default
+configuration produces.
 
 ### Shared Conversation and Voice Activation
 

@@ -20,7 +20,7 @@ use conversation_protocol::{
     PrivacyMode as ProtocolPrivacyMode, ResponseControls, RuntimeProfile, RuntimeStatus,
     SilencePolicy, SpeechPace, VoiceResponseMode, MAX_CLIENT_PROVIDER_LABEL_BYTES,
 };
-use conversation_runtime::{ConversationContext, ConversationQualityController};
+use conversation_runtime::{ConversationContext, ConversationQualityController, RecordingSettings};
 use serde::{Deserialize, Serialize};
 
 use crate::memory_extraction::MemoryExtractionSettings;
@@ -92,6 +92,9 @@ pub struct GatewayAdapters {
     pub memory_extraction: Option<GatewayMemoryExtraction>,
     /// Provider processes the gateway supervises for this deployment, sorted by id.
     pub provider_hosts: Vec<ProviderHost>,
+    /// Where voice sessions write their encrypted recording, when `[recording]` is configured.
+    /// Absent in the default configuration, which records nothing.
+    pub recording: Option<RecordingSettings>,
     pub status: RuntimeStatus,
 }
 
@@ -535,6 +538,12 @@ impl GatewayConfig {
             .map(|voice| voice.build(self.privacy_mode.into(), components))
             .transpose()?;
 
+        let recording = self
+            .recording
+            .as_ref()
+            .map(RecordingConfig::settings)
+            .transpose()?;
+
         Ok(GatewayAdapters {
             context,
             language,
@@ -542,6 +551,7 @@ impl GatewayConfig {
             memory_store,
             memory_extraction,
             provider_hosts,
+            recording,
             status,
         })
     }
@@ -1637,6 +1647,14 @@ impl RecordingConfig {
             ));
         }
         validate_environment_reference(&self.key_env, "recording key")
+    }
+
+    /// The runtime's view of this section. The key is not read here — the sink resolves it when
+    /// a session starts, so a variable removed after load still fails the session, not the
+    /// process.
+    fn settings(&self) -> Result<RecordingSettings, GatewayConfigError> {
+        RecordingSettings::new(self.directory.clone(), self.key_env.clone())
+            .map_err(|error| config_error(error.message().to_owned()))
     }
 }
 

@@ -5,9 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use conversation_model_adapters::{
-    AdapterError, CaptureEvent, GenerationLanguageModel, PlaybackReceipt, RecognitionEvent,
-    StreamingSpeechSynthesizer, VoiceCaptureControl, VoiceInputEvent, VoiceIoFactory,
-    VoiceIoSession,
+    AdapterError, AudioFrame, CaptureEvent, GenerationLanguageModel, PlaybackReceipt,
+    RecognitionEvent, StreamingSpeechSynthesizer, VoiceCaptureControl, VoiceInputEvent,
+    VoiceIoFactory, VoiceIoSession,
 };
 use conversation_protocol::{
     GenerationId, PlaybackState, PrivacySummary, RecoveryDisposition, RuntimeError,
@@ -17,6 +17,8 @@ use conversation_protocol::{
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::{JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
+
+use crate::session_recording::SessionRecorder;
 
 use crate::{
     validate_voice_policy, ConversationContext, ConversationTurnSource, SessionClock,
@@ -36,6 +38,7 @@ pub struct VoiceSessionAdapters {
     voice_io: Arc<dyn VoiceIoFactory>,
     language_model: Arc<dyn GenerationLanguageModel>,
     speech_synthesizer: Arc<dyn StreamingSpeechSynthesizer>,
+    recorder: Option<Arc<Mutex<SessionRecorder>>>,
 }
 
 impl VoiceSessionAdapters {
@@ -48,7 +51,16 @@ impl VoiceSessionAdapters {
             voice_io,
             language_model,
             speech_synthesizer,
+            recorder: None,
         }
+    }
+
+    /// Records this session's capture media. The recorder is created before the session starts
+    /// — that is where a missing key refuses the session — and is shared with whoever finalizes
+    /// it, so a recording outlives the loop that fed it.
+    pub fn with_recorder(mut self, recorder: Arc<Mutex<SessionRecorder>>) -> Self {
+        self.recorder = Some(recorder);
+        self
     }
 }
 
@@ -318,6 +330,7 @@ async fn run_voice_session(
         return VoiceSessionEvent::SessionEnded { session_id };
     }
 
+    let recorder = adapters.recorder;
     let turn_runtime = StreamingTurnRuntime::new(
         context,
         adapters.language_model,
@@ -333,6 +346,7 @@ async fn run_voice_session(
         commands,
         events,
         cancellation,
+        recorder,
     )
     .run()
     .await
@@ -406,6 +420,7 @@ struct VoiceLoop {
     reliable_events: VecDeque<VoiceSessionEvent>,
     partials: BTreeMap<u64, String>,
     playback: Option<PlaybackLifecycle>,
+    recorder: Option<Arc<Mutex<SessionRecorder>>>,
 }
 
 impl VoiceLoop {
@@ -419,6 +434,7 @@ impl VoiceLoop {
         commands: mpsc::Receiver<SessionCommand>,
         events: mpsc::Sender<VoiceSessionEvent>,
         cancellation: CancellationToken,
+        recorder: Option<Arc<Mutex<SessionRecorder>>>,
     ) -> Self {
         let final_silence_ms = policy.final_silence_ms();
         Self {
@@ -445,6 +461,7 @@ impl VoiceLoop {
             reliable_events: VecDeque::new(),
             partials: BTreeMap::new(),
             playback: None,
+            recorder,
         }
     }
 
@@ -737,11 +754,17 @@ impl VoiceLoop {
                 "voice input playback state is unsupported",
             ))),
             Some(Ok(VoiceInputEvent::Capture(CaptureEvent::Discontinuity { .. }))) => {
+                if let Some(error) = self.record_capture_gap().await {
+                    return Some(LoopExit::Fatal(error));
+                }
                 self.deadline.disarm();
                 self.finalization_due = false;
                 self.active_segment_id = None;
                 self.finalizer.observe_discontinuity();
                 None
+            }
+            Some(Ok(VoiceInputEvent::Capture(CaptureEvent::Frame(frame)))) => {
+                self.record_frame(&frame).await.map(LoopExit::Fatal)
             }
             Some(Ok(VoiceInputEvent::Capture(_))) => None,
             Some(Ok(_)) => Some(LoopExit::Fatal(adapter_message(
@@ -775,6 +798,18 @@ impl VoiceLoop {
                 "voice input event stream ended unexpectedly",
             ))),
         }
+    }
+
+    /// Records one capture frame. This runs before any provider is consulted, so a recording
+    /// keeps its media whatever the recognizer, language model or synthesizer are doing.
+    async fn record_frame(&mut self, frame: &AudioFrame) -> Option<RuntimeError> {
+        let recorder = self.recorder.as_ref()?;
+        recorder.lock().await.record_frame(frame).err()
+    }
+
+    async fn record_capture_gap(&mut self) -> Option<RuntimeError> {
+        let recorder = self.recorder.as_ref()?;
+        recorder.lock().await.record_capture_gap().err()
     }
 
     async fn handle_activity(&mut self, activity: VoiceActivity) -> Option<LoopExit> {
@@ -1625,6 +1660,7 @@ mod tests {
             command_receiver,
             event_sender,
             CancellationToken::new(),
+            None,
         );
         voice_loop
             .finalizer

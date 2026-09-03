@@ -42,9 +42,32 @@ export type ClientCommand =
   | { type: "persona_get"; requestId: string }
   | { type: "persona_update"; requestId: string; persona: PersonaState }
   | { type: "memory_approve"; requestId: string; memoryId: bigint; expectedRevision: bigint }
-  | { type: "memory_delete"; requestId: string; memoryId: bigint; expectedRevision: bigint };
+  | { type: "memory_delete"; requestId: string; memoryId: bigint; expectedRevision: bigint }
+  | { type: "finalize_recording"; requestId: string; sessionId: bigint };
 
 export type ConversationContextExchange = { user: string; assistant: string };
+
+/** An interval during which the capture bridge delivered no media. */
+export type RecordingGap = {
+  startedAtMs: bigint;
+  /** Absent end: the recording finished while the gap was still open. */
+  endedAtMs: bigint | null;
+  reason: string;
+};
+
+/**
+ * A finalized session recording. `keyId` identifies the key that sealed the file; the key
+ * itself never leaves the runtime host.
+ */
+export type RecordingSummary = {
+  recordingHandle: string;
+  encryptedPath: string;
+  sha256: string;
+  durationMs: bigint;
+  format: string;
+  keyId: string;
+  gaps: RecordingGap[];
+};
 
 export type PersonaState = {
   mode: "direct_answer" | "companionship" | "brainstorming" | "reflective";
@@ -312,7 +335,8 @@ export type GatewayMessage =
   | { type: "fatal"; error: RuntimeFailure }
   | { type: "persona_state"; requestId: string; persona: PersonaState }
   | { type: "memory_deleted"; requestId: string; memoryId: bigint }
-  | ({ type: "memory_extracted" } & MemoryExtractedSummary);
+  | ({ type: "memory_extracted" } & MemoryExtractedSummary)
+  | { type: "recording_finalized"; requestId: string; recording: RecordingSummary };
 
 export class ProtocolError extends Error {
   constructor(message: string) {
@@ -386,6 +410,12 @@ export function parseClientCommand(value: unknown, expectedVersion?: ClientProto
         memoryId: parseIdentifier(object.memory_id),
         expectedRevision: parseIdentifier(object.expected_revision),
       };
+    case "finalize_recording":
+      requireExactKeys(object, ["protocol_version", "type", "request_id", "session_id"]);
+      if (version < RUNTIME_PROFILE_PROTOCOL_VERSION) {
+        throw new ProtocolError("session recording requires protocol version 3");
+      }
+      return { type, requestId: requireRequestId(object), sessionId: parseIdentifier(object.session_id) };
     default:
       throw new ProtocolError("unsupported client command type");
   }
@@ -483,6 +513,13 @@ export function parseGatewayMessage(
         activated: requireNonNegativeInteger(object, "activated"),
         pendingApproval: requireNonNegativeInteger(object, "pending_approval"),
       };
+    case "recording_finalized":
+      requireExactKeys(object, ["protocol_version", "type", "request_id", "recording"]);
+      validateProtocolVersion(object, version);
+      if (version < RUNTIME_PROFILE_PROTOCOL_VERSION) {
+        throw new ProtocolError("session recording requires protocol version 3");
+      }
+      return { type, requestId: requireRequestId(object), recording: parseRecordingSummary(object.recording) };
     default:
       throw new ProtocolError("unsupported gateway message type");
   }
@@ -554,6 +591,13 @@ export function encodeClientCommand(
           memory_id: command.memoryId.toString(),
           expected_revision: command.expectedRevision.toString(),
         };
+      case "finalize_recording":
+        return {
+          protocol_version: version,
+          type: command.type,
+          request_id: command.requestId,
+          session_id: command.sessionId.toString(),
+        };
       case "seed_conversation_context":
         return {
           protocol_version: version,
@@ -606,6 +650,14 @@ export function validateClientCommand(
   if (command.type === "persona_update") {
     validatePersonaState(command.persona);
   }
+  if (command.type === "finalize_recording") {
+    if (version < RUNTIME_PROFILE_PROTOCOL_VERSION) {
+      throw new ProtocolError("session recording requires protocol version 3");
+    }
+    if (command.sessionId < 1n || command.sessionId > MAX_U64) {
+      throw new ProtocolError("session identifier is outside u64 range");
+    }
+  }
   if (command.type === "memory_approve" || command.type === "memory_delete") {
     if (command.memoryId < 1n || command.memoryId > MAX_U64) {
       throw new ProtocolError("memory identifier is outside u64 range");
@@ -614,6 +666,66 @@ export function validateClientCommand(
       throw new ProtocolError("expected revision is outside u64 range");
     }
   }
+}
+
+const MAX_RECORDING_GAPS = 256;
+const MAX_RECORDING_HANDLE_BYTES = 128;
+const MAX_RECORDING_PATH_BYTES = 1024;
+const MAX_RECORDING_LABEL_BYTES = 64;
+const RECORDING_GAP_REASONS = ["capture_discontinuity"] as const;
+
+function parseRecordingSummary(value: unknown): RecordingSummary {
+  const object = requireRecord(value, "recording summary");
+  requireExactKeys(object, [
+    "recording_handle",
+    "encrypted_path",
+    "sha256",
+    "duration_ms",
+    "format",
+    "key_id",
+    "gaps",
+  ]);
+  const recordingHandle = requireString(object, "recording_handle");
+  if (!/^[a-z0-9]+$/.test(recordingHandle)) {
+    throw new ProtocolError("recording handle is not a valid handle");
+  }
+  requireNonEmptyMaximumUtf8Bytes(recordingHandle, MAX_RECORDING_HANDLE_BYTES, "recording handle");
+  const encryptedPath = requireString(object, "encrypted_path");
+  requireNonEmptyMaximumUtf8Bytes(encryptedPath, MAX_RECORDING_PATH_BYTES, "recording path");
+  const sha256 = requireString(object, "sha256");
+  if (!/^[0-9a-f]{64}$/.test(sha256)) {
+    throw new ProtocolError("recording digest is not a lowercase sha256");
+  }
+  const format = requireString(object, "format");
+  if (!/^[a-z0-9_/]+$/.test(format)) {
+    throw new ProtocolError("recording format is not a valid label");
+  }
+  requireNonEmptyMaximumUtf8Bytes(format, MAX_RECORDING_LABEL_BYTES, "recording format");
+  const keyId = requireString(object, "key_id");
+  if (!/^[0-9a-f]+$/.test(keyId)) {
+    throw new ProtocolError("recording key identifier is not a valid label");
+  }
+  requireNonEmptyMaximumUtf8Bytes(keyId, MAX_RECORDING_LABEL_BYTES, "recording key identifier");
+  const durationMs = parseTimestamp(object.duration_ms);
+  const gaps = parseBoundedArray(object.gaps, MAX_RECORDING_GAPS, "recording gaps", (gap) =>
+    parseRecordingGap(gap, durationMs),
+  );
+  return { recordingHandle, encryptedPath, sha256, durationMs, format, keyId, gaps };
+}
+
+function parseRecordingGap(value: unknown, durationMs: bigint): RecordingGap {
+  const object = requireRecord(value, "recording gap");
+  requireExactKeys(object, ["started_at_ms", "ended_at_ms", "reason"]);
+  const startedAtMs = parseTimestamp(object.started_at_ms);
+  const endedAtMs = object.ended_at_ms === null ? null : parseTimestamp(object.ended_at_ms);
+  const reason = requireOneOf(object, "reason", RECORDING_GAP_REASONS);
+  if (startedAtMs > durationMs) {
+    throw new ProtocolError("recording gap starts after the recording ends");
+  }
+  if (endedAtMs !== null && (endedAtMs < startedAtMs || endedAtMs > durationMs)) {
+    throw new ProtocolError("recording gap ends outside the recording");
+  }
+  return { startedAtMs, endedAtMs, reason };
 }
 
 function parsePersonaState(value: unknown): PersonaState {

@@ -1,5 +1,6 @@
 mod client_memory;
 mod client_persona;
+mod client_recording;
 mod client_voice;
 mod client_wire;
 mod command;
@@ -18,6 +19,11 @@ pub use client_memory::{
     MAX_MEMORY_PREVIEW_BYTES,
 };
 pub use client_persona::ClientPersonaState;
+pub use client_recording::{
+    ClientRecordingGap, ClientRecordingSummary, MAX_CLIENT_RECORDING_GAPS,
+    MAX_CLIENT_RECORDING_HANDLE_BYTES, MAX_CLIENT_RECORDING_LABEL_BYTES,
+    MAX_CLIENT_RECORDING_PATH_BYTES,
+};
 pub use client_voice::{
     is_valid_device_label, ClientComponentDescriptor, ClientPrivacySummary, ClientVoiceActivity,
     ClientVoiceSessionEvent, MAX_CLIENT_COMPONENT_DESCRIPTORS, MAX_CLIENT_DEVICE_LABEL_BYTES,

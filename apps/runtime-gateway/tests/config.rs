@@ -1983,6 +1983,26 @@ fn the_recording_section_requires_an_absolute_directory_and_a_present_key() {
     let path = write_config(fixture.path(), &accepted);
     assert!(GatewayConfig::validate(&path).is_ok());
 
+    // The loader hands the sink the directory and the variable name, never a key.
+    let recording_directory = tempfile::tempdir().unwrap();
+    let loadable = format!(
+        "{base}\n[recording]\ndirectory = \"{}\"\nkey_env = \"{RECORDING_KEY_ENV}\"\n",
+        recording_directory.path().display()
+    );
+    let path = write_config(fixture.path(), &loadable);
+    let adapters = GatewayConfig::load(&path).unwrap();
+    let settings = adapters
+        .recording
+        .as_ref()
+        .expect("recording is configured");
+    assert_eq!(settings.directory(), recording_directory.path());
+    assert_eq!(settings.key_env(), RECORDING_KEY_ENV);
+    assert!(!format!("{settings:?}").contains(ONLINE_CREDENTIAL_VALUE));
+
+    // The default configuration has no recording section and records nothing.
+    let path = write_config(fixture.path(), &base);
+    assert!(GatewayConfig::load(&path).unwrap().recording.is_none());
+
     for (directory, key_env) in [
         ("relative/recordings", RECORDING_KEY_ENV),
         ("/absolute/../escaping/recordings", RECORDING_KEY_ENV),

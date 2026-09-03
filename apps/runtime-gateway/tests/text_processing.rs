@@ -489,10 +489,12 @@ async fn conversation_trace(process: bool) -> ConversationTrace {
 #[tokio::test]
 async fn process_text_answers_over_the_control_channel_at_version_three() {
     let server = OllamaServer::start([valid_output().to_string(), "the answer".to_owned()]).await;
-    let mut gateway = Gateway::start(session_for(server.endpoint())).await;
+    let session = session_for(server.endpoint());
+    let session_id = session.session_id().get().to_string();
+    let mut gateway = Gateway::start(session).await;
 
     gateway
-        .write(&process_text_frame(3, "pt-1", "1", 4096))
+        .write(&process_text_frame(3, "pt-1", &session_id, 4096))
         .await;
     assert!(gateway
         .read_message()
@@ -527,11 +529,12 @@ async fn process_text_is_refused_while_a_turn_is_in_flight() {
     // The first generation blocks, so a turn stays in flight; every later one answers at once,
     // so without the guard the call would be served rather than merely stall.
     let language = Arc::new(GatedLanguage::new(valid_output().to_string()));
-    let mut gateway = Gateway::start(GatewaySession::new(
+    let session = GatewaySession::new(
         TextTurnRuntime::new(test_context(), language.clone()),
         status(),
-    ))
-    .await;
+    );
+    let session_id = session.session_id().get().to_string();
+    let mut gateway = Gateway::start(session).await;
 
     gateway
         .write(
@@ -543,7 +546,7 @@ async fn process_text_is_refused_while_a_turn_is_in_flight() {
         .await;
 
     gateway
-        .write(&process_text_frame(3, "pt-turn", "1", 4096))
+        .write(&process_text_frame(3, "pt-turn", &session_id, 4096))
         .await;
     let rejection = gateway
         .read_until(|message| message.contains(r#""request_id":"pt-turn""#))

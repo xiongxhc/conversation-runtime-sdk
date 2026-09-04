@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use conversation_memory::{MemoryClock, MemoryStore, MemoryStoreErrorKind};
 use conversation_model_adapters::{
-    DiarizationResult, GenerationLanguageModel, NetworkVoiceIoFactory, TranscriptionDiarizer,
+    AudioCapture, DiarizationResult, GenerationLanguageModel, NetworkVoiceIoFactory,
+    TranscriptionDiarizer, VoiceIoFactory,
 };
 use conversation_protocol::{
     decode_client_command_with_version, encode_gateway_message_for_version, ClientCommand,
@@ -75,6 +76,7 @@ pub struct GatewaySession {
     recording: Option<RecordingSettings>,
     active_recording: Option<ActiveRecording>,
     media_server: Option<Arc<MediaServer>>,
+    media_capture_handoff: Option<mpsc::Sender<Arc<dyn AudioCapture>>>,
     /// The adapter that turns a finished recording into timed text and anonymous clusters.
     /// Absent in every configuration the loader builds: like the other online adapters, it is
     /// wired explicitly rather than constructed from a TOML file.
@@ -112,6 +114,7 @@ struct ActiveVoiceSession {
 struct ActiveMediaLease {
     server: Arc<MediaServer>,
     session_id: SessionId,
+    _recognition_capture: Arc<dyn AudioCapture>,
 }
 
 struct ActiveVoiceControl {
@@ -201,6 +204,7 @@ impl GatewaySession {
             recording: None,
             active_recording: None,
             media_server: None,
+            media_capture_handoff: None,
             reconciliation: None,
         }
     }
@@ -286,6 +290,17 @@ impl GatewaySession {
     /// keeps the owning handle and is responsible for its final shutdown.
     pub fn with_media_server(mut self, media_server: Arc<MediaServer>) -> Self {
         self.media_server = Some(media_server);
+        self
+    }
+
+    /// Supplies the production-owned recognizer capture to the later online recognizer wiring.
+    /// The gateway attaches it before accepting the lease, while Task 7 remains responsible for
+    /// selecting and starting a provider against this exact receiver.
+    pub fn with_media_capture_handoff(
+        mut self,
+        handoff: mpsc::Sender<Arc<dyn AudioCapture>>,
+    ) -> Self {
+        self.media_capture_handoff = Some(handoff);
         self
     }
 
@@ -825,7 +840,7 @@ impl GatewaySession {
                     },
                     None => None,
                 };
-                let (media_lease, lease_descriptor) = match self.media_server.as_ref() {
+                let (media_lease, lease_descriptor, io) = match self.media_server.as_ref() {
                     Some(media_server) => {
                         if protocol_version < RUNTIME_PROFILE_PROTOCOL_VERSION {
                             return send_rejection(
@@ -858,21 +873,47 @@ impl GatewaySession {
                                 .map_err(CommandFailure::response);
                             }
                         };
+                        let network_factory =
+                            Arc::new(NetworkVoiceIoFactory::new(media_server.hub(), session_id));
+                        let recognition_capture =
+                            match network_factory.attach_recognition_capture().await {
+                                Ok(capture) => capture,
+                                Err(_) => {
+                                    media_server.revoke(session_id).await;
+                                    return send_rejection(
+                                        normal,
+                                        &request_id,
+                                        command_error(
+                                            "media recognition capture could not be attached",
+                                        ),
+                                    )
+                                    .map_err(CommandFailure::response);
+                                }
+                            };
+                        if let Some(handoff) = self.media_capture_handoff.as_ref() {
+                            if handoff.try_send(Arc::clone(&recognition_capture)).is_err() {
+                                media_server.revoke(session_id).await;
+                                return send_rejection(
+                                    normal,
+                                    &request_id,
+                                    command_error(
+                                        "media recognition capture could not be handed off",
+                                    ),
+                                )
+                                .map_err(CommandFailure::response);
+                            }
+                        }
                         (
                             Some(ActiveMediaLease {
                                 server: Arc::clone(media_server),
                                 session_id,
+                                _recognition_capture: recognition_capture,
                             }),
                             Some(descriptor),
+                            network_factory as Arc<dyn VoiceIoFactory>,
                         )
                     }
-                    None => (None, None),
-                };
-                let io = match media_lease.as_ref() {
-                    Some(lease) => {
-                        Arc::new(NetworkVoiceIoFactory::new(lease.server.hub(), session_id))
-                    }
-                    None => lane.adapters.io.clone(),
+                    None => (None, None, lane.adapters.io.clone()),
                 };
                 let mut adapters = VoiceSessionAdapters::new(
                     io,
@@ -883,7 +924,7 @@ impl GatewaySession {
                     adapters = adapters.with_recorder(Arc::clone(recorder));
                 }
                 let runtime = VoiceSessionRuntime::new(lane.context.clone(), adapters);
-                let event_stream = match runtime
+                let mut event_stream = match runtime
                     .start_with_response_mode(
                         policy,
                         response_mode.unwrap_or(VoiceResponseMode::Automatic),
@@ -901,6 +942,18 @@ impl GatewaySession {
                         .map_err(CommandFailure::response);
                     }
                 };
+                if media_lease.is_some()
+                    && event_stream.wait_until_started(session_id).await.is_err()
+                {
+                    let _ = runtime.shutdown().await;
+                    revoke_media_lease(media_lease).await;
+                    return send_rejection(
+                        normal,
+                        &request_id,
+                        command_error("media voice session could not be started"),
+                    )
+                    .map_err(CommandFailure::response);
+                }
 
                 let accepted = GatewayMessage::CommandAccepted {
                     request_id: request_id.clone(),
@@ -2534,11 +2587,10 @@ mod tests {
         AdapterError, AdapterFuture, AudioFrame, CaptureEvent, DiarizationResult, DiarizedSegment,
         GenerationLanguageModel, GenerationLanguageRequest, GenerationTextDelta,
         MeetingAudioWindows, MockContinuousAudioOutput, MockGenerationLanguageModel,
-        MockStreamingSpeechSynthesizer, MockVoiceCaptureControl, MockVoiceIoFactory,
-        NetworkVoiceIoFactory, OllamaConfig, OllamaLanguageModel, PcmFormat, PcmSampleFormat,
-        RecognitionEvent, RecognitionHypothesis, StreamingSpeechRequest,
-        StreamingSpeechSynthesizer, TranscriptionDiarizer, VoiceCaptureControl, VoiceInput,
-        VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
+        MockStreamingSpeechSynthesizer, MockVoiceCaptureControl, MockVoiceIoFactory, OllamaConfig,
+        OllamaLanguageModel, PcmFormat, PcmSampleFormat, RecognitionEvent, RecognitionHypothesis,
+        StreamingSpeechRequest, StreamingSpeechSynthesizer, TranscriptionDiarizer,
+        VoiceCaptureControl, VoiceInput, VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
     };
     use conversation_protocol::{
         ClientRuntimeEvent, ComponentDescriptor, ComponentKind, ExecutionLocation, GatewayMessage,
@@ -2614,10 +2666,12 @@ mod tests {
         );
         let (voice, _guards) = test_voice_adapters();
         let session_id = SessionId::new(701);
+        let (recognition_handoff, mut recognition_handoffs) = mpsc::channel(1);
         let session = GatewaySession::new(unused_runtime(), status_with_voice())
             .with_voice(voice, test_language())
             .with_recording(RecordingSettings::new(directory.path(), key_env).unwrap())
             .with_media_server(Arc::clone(&media))
+            .with_media_capture_handoff(recognition_handoff)
             .with_test_session_id(session_id);
         let mut gateway = InMemoryGateway::start(session).await;
 
@@ -2653,9 +2707,11 @@ mod tests {
         gateway
             .read_until(|message| message.contains(r#""type":"voice_session_started""#))
             .await;
-        let network_factory = NetworkVoiceIoFactory::new(media.hub(), session_id);
-        let mut recognition = network_factory
-            .recognition_capture()
+        let recognition = timeout(TEST_TIMEOUT, recognition_handoffs.recv())
+            .await
+            .expect("gateway did not hand off its production recognition capture")
+            .expect("gateway dropped its production recognition capture");
+        let mut recognition = recognition
             .start(session_id, CancellationToken::new())
             .await
             .unwrap();

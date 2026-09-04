@@ -101,6 +101,36 @@ async fn each_accepted_capture_frame_reaches_recording_and_recognition_without_c
     server.shutdown().await;
 }
 
+/// Catches `reserve` replacing a live hub entry before reporting the duplicate. The first lease's
+/// already-attached capture consumers must stay operational after the second reservation fails.
+#[tokio::test]
+async fn duplicate_reservation_keeps_the_original_live_capture_session_operational() {
+    let server = MediaServer::bind(MediaServerConfig::loopback())
+        .await
+        .unwrap();
+    let lease = server.reserve(SessionId::new(43)).await.unwrap();
+    let cancellation = CancellationToken::new();
+    let (_factory, mut recording, mut recognition) =
+        attached_ports(&server, &lease, cancellation.clone()).await;
+    assert!(server.reserve(lease.session_id()).await.is_err());
+
+    let mut bridge = authenticated_bridge(&lease).await;
+    send_capture(
+        &mut bridge,
+        lease.session_id(),
+        1,
+        1_000,
+        PcmFormat::new(16_000, 1, PcmSampleFormat::Signed16LittleEndian).unwrap(),
+        b"still-live",
+    )
+    .await;
+    assert_recording_capture_payload(recording.recv().await.unwrap().unwrap(), b"still-live", 1);
+    assert_capture_payload(recognition.recv().await.unwrap().unwrap(), b"still-live", 1);
+
+    cancellation.cancel();
+    server.shutdown().await;
+}
+
 /// Catches an unbounded bridge sender: a single session cannot turn a short burst into an
 /// unbounded resident queue or exceed the explicitly configured ingress rate.
 #[tokio::test]
@@ -143,6 +173,74 @@ async fn capture_ingress_refuses_a_second_frame_above_the_configured_rate() {
             .unwrap(),
         1_000,
     );
+    cancellation.cancel();
+    server.shutdown().await;
+}
+
+/// Catches sequential fan-out: when either bounded consumer is full, the other must not receive
+/// an extra frame. The protocol closes the overflowing bridge rather than publishing one-sided
+/// capture or fabricated silence.
+#[tokio::test]
+async fn full_capture_consumer_prevents_partial_fanout() {
+    let server = MediaServer::bind(
+        MediaServerConfig::loopback()
+            .with_lifetimes(Duration::from_secs(1), Duration::from_secs(1))
+            .with_max_playback_queue_duration(Duration::from_millis(50)),
+    )
+    .await
+    .unwrap();
+    let lease = server.reserve(SessionId::new(53)).await.unwrap();
+    let cancellation = CancellationToken::new();
+    let (_factory, mut recording, mut recognition) =
+        attached_ports(&server, &lease, cancellation.clone()).await;
+    let format = PcmFormat::new(16_000, 1, PcmSampleFormat::Signed16LittleEndian).unwrap();
+    let mut bridge = authenticated_bridge(&lease).await;
+    for sequence in 1..=17 {
+        send_capture(
+            &mut bridge,
+            lease.session_id(),
+            sequence,
+            1_000 + sequence,
+            format,
+            b"fill",
+        )
+        .await;
+    }
+    let mut byte = [0_u8; 1];
+    assert_eq!(
+        timeout(RECEIVE_TIMEOUT, bridge.read(&mut byte))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    for sequence in 1..=16 {
+        assert_recording_capture_payload(
+            timeout(RECEIVE_TIMEOUT, recording.recv())
+                .await
+                .expect("recording fan-out stalled")
+                .unwrap()
+                .unwrap(),
+            b"fill",
+            sequence,
+        );
+        assert_capture_payload(
+            timeout(RECEIVE_TIMEOUT, recognition.recv())
+                .await
+                .expect("recognition fan-out stalled")
+                .unwrap()
+                .unwrap(),
+            b"fill",
+            sequence,
+        );
+    }
+    assert!(timeout(Duration::from_millis(30), recording.recv())
+        .await
+        .is_err());
+    assert!(timeout(Duration::from_millis(30), recognition.recv())
+        .await
+        .is_err());
+
     cancellation.cancel();
     server.shutdown().await;
 }
@@ -486,6 +584,134 @@ async fn malformed_authentication_and_frame_headers_fail_closed_without_delivery
     server.shutdown().await;
 }
 
+/// Catches a parser that advances capture authority or leaks to either consumer after a malformed
+/// authenticated frame. Every packet below is written as bridge bytes, not through a production
+/// test API; a later valid reconnect proves the authoritative session remained usable.
+#[tokio::test]
+async fn authenticated_capture_validation_rejects_bad_versions_codecs_lengths_and_authority_edges()
+{
+    let server = MediaServer::bind(MediaServerConfig::loopback().with_max_payload_bytes(4))
+        .await
+        .unwrap();
+    let lease = server.reserve(SessionId::new(103)).await.unwrap();
+    let cancellation = CancellationToken::new();
+    let (_factory, mut recording, mut recognition) =
+        attached_ports(&server, &lease, cancellation.clone()).await;
+
+    let mut packets = vec![
+        b"MED1\x02\x02".to_vec(), // unsupported frame protocol version
+        raw_capture_header(lease.session_id(), 1, 1_000, 9, 4), // invalid codec
+        raw_capture_header(lease.session_id(), 1, 1_000, 1, 0), // zero length
+        raw_capture_header(lease.session_id(), 1, 1_000, 1, 5), // configured maximum
+    ];
+    let mut wrong_session = raw_capture_header(SessionId::new(104), 1, 1_000, 1, 4);
+    wrong_session.extend_from_slice(b"nope");
+    packets.push(wrong_session); // header session mismatch
+    for packet in packets {
+        let mut bridge = authenticated_bridge(&lease).await;
+        bridge.write_all(&packet).await.unwrap();
+        bridge.flush().await.unwrap();
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            timeout(RECEIVE_TIMEOUT, bridge.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        assert!(timeout(Duration::from_millis(30), recording.recv())
+            .await
+            .is_err());
+        assert!(timeout(Duration::from_millis(30), recognition.recv())
+            .await
+            .is_err());
+    }
+    let mut truncated = authenticated_bridge(&lease).await;
+    truncated.write_all(b"MED1\x01\x02\x01").await.unwrap();
+    truncated.flush().await.unwrap();
+    drop(truncated);
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(timeout(Duration::from_millis(30), recording.recv())
+        .await
+        .is_err());
+    assert!(timeout(Duration::from_millis(30), recognition.recv())
+        .await
+        .is_err());
+
+    let mut bridge = authenticated_bridge(&lease).await;
+    send_capture(
+        &mut bridge,
+        lease.session_id(),
+        1,
+        1_000,
+        PcmFormat::new(16_000, 1, PcmSampleFormat::Signed16LittleEndian).unwrap(),
+        b"good",
+    )
+    .await;
+    assert_recording_capture_payload(recording.recv().await.unwrap().unwrap(), b"good", 1);
+    assert_capture_payload(recognition.recv().await.unwrap().unwrap(), b"good", 1);
+
+    // A forward gap is explicit on the capture timeline, then the accepted frame reaches both
+    // ports. `u64::MAX` must fail before it can reset sequence authority to None.
+    send_capture(
+        &mut bridge,
+        lease.session_id(),
+        3,
+        1_300,
+        PcmFormat::new(16_000, 1, PcmSampleFormat::Signed16LittleEndian).unwrap(),
+        b"next",
+    )
+    .await;
+    assert_discontinuity(recording.recv().await.unwrap().unwrap(), 1_300);
+    assert_capture_discontinuity(recognition.recv().await.unwrap().unwrap(), 1_300);
+    assert_recording_capture_payload(recording.recv().await.unwrap().unwrap(), b"next", 3);
+    assert_capture_payload(recognition.recv().await.unwrap().unwrap(), b"next", 3);
+    bridge
+        .write_all(&raw_capture_header(
+            lease.session_id(),
+            u64::MAX,
+            2_000,
+            1,
+            4,
+        ))
+        .await
+        .unwrap();
+    bridge.write_all(b"last").await.unwrap();
+    bridge.flush().await.unwrap();
+    let mut byte = [0_u8; 1];
+    assert_eq!(
+        timeout(RECEIVE_TIMEOUT, bridge.read(&mut byte))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    assert_discontinuity(recording.recv().await.unwrap().unwrap(), 1_300);
+    assert_capture_discontinuity(recognition.recv().await.unwrap().unwrap(), 1_300);
+    assert!(timeout(Duration::from_millis(30), recording.recv())
+        .await
+        .is_err());
+    assert!(timeout(Duration::from_millis(30), recognition.recv())
+        .await
+        .is_err());
+
+    let mut reconnect = authenticated_bridge(&lease).await;
+    send_capture(
+        &mut reconnect,
+        lease.session_id(),
+        4,
+        1_400,
+        PcmFormat::new(16_000, 1, PcmSampleFormat::Signed16LittleEndian).unwrap(),
+        b"kept",
+    )
+    .await;
+    assert_recording_capture_payload(recording.recv().await.unwrap().unwrap(), b"kept", 4);
+    assert_capture_payload(recognition.recv().await.unwrap().unwrap(), b"kept", 4);
+
+    cancellation.cancel();
+    server.shutdown().await;
+}
+
 /// Catches a bridge path that treats a successful TCP write as audible playback or echoes capture
 /// ingress back as output. The output must remain pending until this exact authenticated socket
 /// accepts the exact outbound sequence, and only its later rendered acknowledgement may enter the
@@ -759,6 +985,87 @@ async fn flush_receipt_requires_an_authenticated_exact_bridge_acknowledgement() 
         .unwrap();
     assert_eq!(flushed.generation_id(), GenerationId::new(51));
     assert_eq!(flushed.state(), PlaybackState::Flushed);
+
+    cancellation.cancel();
+    server.shutdown().await;
+}
+
+/// Catches a connected-but-stalled bridge permanently occupying playback or flush bookkeeping.
+/// The same configured queue-time budget bounds both truthful ACK waits; late ACKs cannot revive
+/// a timed-out operation or publish an event.
+#[tokio::test]
+async fn connected_playback_and_flush_acknowledgements_obey_the_configured_time_bound() {
+    let server = MediaServer::bind(
+        MediaServerConfig::loopback()
+            .with_lifetimes(Duration::from_secs(1), Duration::from_millis(50)),
+    )
+    .await
+    .unwrap();
+    let lease = server.reserve(SessionId::new(145)).await.unwrap();
+    let cancellation = CancellationToken::new();
+    let (factory, mut recording, _recognition) =
+        attached_ports(&server, &lease, cancellation.clone()).await;
+    let io = factory
+        .start(lease.session_id(), cancellation.child_token())
+        .await
+        .unwrap();
+    let output = Arc::clone(&io.output);
+    let flush_output = Arc::clone(&io.output);
+    let mut bridge = authenticated_bridge(&lease).await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let enqueue_cancellation = cancellation.child_token();
+    let pending = tokio::spawn(async move {
+        output
+            .enqueue(
+                AudioFrame::new(
+                    TurnId::new(31),
+                    GenerationId::new(71),
+                    UtteranceId::new(51),
+                    61,
+                    PcmFormat::new(16_000, 1, PcmSampleFormat::Signed16LittleEndian).unwrap(),
+                    b"wait".to_vec(),
+                )
+                .unwrap(),
+                enqueue_cancellation,
+            )
+            .await
+    });
+    let sequence = timeout(
+        RECEIVE_TIMEOUT,
+        read_playback_frame(
+            &mut bridge,
+            lease.session_id(),
+            TurnId::new(31),
+            GenerationId::new(71),
+            UtteranceId::new(51),
+            61,
+            b"wait",
+        ),
+    )
+    .await
+    .expect("bridge did not receive bounded playback");
+    assert!(timeout(RECEIVE_TIMEOUT, pending)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_err());
+    send_playback_ack(&mut bridge, lease.session_id(), sequence, 1).await;
+    assert!(timeout(Duration::from_millis(30), recording.recv())
+        .await
+        .is_err());
+
+    let pending_flush = tokio::spawn(async move {
+        flush_output
+            .flush(SessionId::new(145), GenerationId::new(72))
+            .await
+    });
+    read_flush_request(&mut bridge, lease.session_id(), GenerationId::new(72)).await;
+    assert!(timeout(RECEIVE_TIMEOUT, pending_flush)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_err());
+    send_flush_ack(&mut bridge, lease.session_id(), GenerationId::new(72)).await;
 
     cancellation.cancel();
     server.shutdown().await;
@@ -1761,6 +2068,24 @@ async fn send_capture(
         .unwrap();
     stream.write_all(payload).await.unwrap();
     stream.flush().await.unwrap();
+}
+
+fn raw_capture_header(
+    session_id: SessionId,
+    sequence: u64,
+    captured_at_ms: u64,
+    sample_format: u8,
+    payload_length: u32,
+) -> Vec<u8> {
+    let mut bytes = b"MED1\x01\x02\x01".to_vec();
+    bytes.extend_from_slice(&session_id.get().to_be_bytes());
+    bytes.extend_from_slice(&sequence.to_be_bytes());
+    bytes.extend_from_slice(&captured_at_ms.to_be_bytes());
+    bytes.push(sample_format);
+    bytes.extend_from_slice(&16_000_u32.to_be_bytes());
+    bytes.extend_from_slice(&1_u16.to_be_bytes());
+    bytes.extend_from_slice(&payload_length.to_be_bytes());
+    bytes
 }
 
 async fn read_playback_frame(

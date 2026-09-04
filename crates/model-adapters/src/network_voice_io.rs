@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use conversation_protocol::{GenerationId, PlaybackState, SessionId, TurnId, UtteranceId};
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -63,6 +63,7 @@ impl NetworkPlaybackRequest {
 pub struct NetworkMediaHub {
     sessions: Arc<Mutex<HashMap<u64, NetworkSession>>>,
     max_playback_queue_bytes: usize,
+    operation_timeout: Duration,
 }
 
 impl Default for NetworkMediaHub {
@@ -125,22 +126,25 @@ struct PendingFlush {
 
 impl NetworkMediaHub {
     pub fn with_max_playback_queue_bytes(max_playback_queue_bytes: usize) -> Self {
+        Self::with_limits(max_playback_queue_bytes, Duration::from_secs(10))
+    }
+
+    pub fn with_limits(max_playback_queue_bytes: usize, operation_timeout: Duration) -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             max_playback_queue_bytes,
+            operation_timeout,
         }
     }
 
     pub async fn reserve(&self, session_id: SessionId) -> Result<(), AdapterError> {
         let mut sessions = self.sessions.lock().await;
-        if sessions
-            .insert(session_id.get(), NetworkSession::default())
-            .is_some()
-        {
+        if sessions.contains_key(&session_id.get()) {
             return Err(AdapterError::new(
                 "network media session is already reserved",
             ));
         }
+        sessions.insert(session_id.get(), NetworkSession::default());
         Ok(())
     }
 
@@ -203,16 +207,18 @@ impl NetworkMediaHub {
                 })?,
             )
         };
-        voice
-            .send(Ok(VoiceInputEvent::Capture(CaptureEvent::Frame(
-                frame.clone(),
-            ))))
+        let (voice_permit, recognition_permit) =
+            tokio::time::timeout(self.operation_timeout, async {
+                tokio::try_join!(voice.reserve(), recognition.reserve())
+            })
             .await
-            .map_err(|_| AdapterError::new("network media voice input closed"))?;
-        recognition
-            .send(Ok(CaptureEvent::Frame(frame)))
-            .await
-            .map_err(|_| AdapterError::new("network media recognition input closed"))
+            .map_err(|_| AdapterError::new("network media capture fan-out timed out"))?
+            .map_err(|_| AdapterError::new("network media capture input closed"))?;
+        voice_permit.send(Ok(VoiceInputEvent::Capture(CaptureEvent::Frame(
+            frame.clone(),
+        ))));
+        recognition_permit.send(Ok(CaptureEvent::Frame(frame)));
+        Ok(())
     }
 
     pub async fn deliver_discontinuity(
@@ -234,16 +240,18 @@ impl NetworkMediaHub {
                 })?,
             )
         };
-        voice
-            .send(Ok(VoiceInputEvent::Capture(CaptureEvent::Discontinuity {
-                at_ms,
-            })))
+        let (voice_permit, recognition_permit) =
+            tokio::time::timeout(self.operation_timeout, async {
+                tokio::try_join!(voice.reserve(), recognition.reserve())
+            })
             .await
-            .map_err(|_| AdapterError::new("network media voice input closed"))?;
-        recognition
-            .send(Ok(CaptureEvent::Discontinuity { at_ms }))
-            .await
-            .map_err(|_| AdapterError::new("network media recognition input closed"))
+            .map_err(|_| AdapterError::new("network media discontinuity fan-out timed out"))?
+            .map_err(|_| AdapterError::new("network media capture input closed"))?;
+        voice_permit.send(Ok(VoiceInputEvent::Capture(CaptureEvent::Discontinuity {
+            at_ms,
+        })));
+        recognition_permit.send(Ok(CaptureEvent::Discontinuity { at_ms }));
+        Ok(())
     }
 
     pub async fn attach_playback_transport(
@@ -386,13 +394,16 @@ impl NetworkMediaHub {
             let voice = voice
                 .ok_or_else(|| AdapterError::new("network media voice input is not attached"))?;
             for generation_id in flushed_generations {
-                voice
-                    .send(Ok(VoiceInputEvent::Playback(PlaybackReceipt::new(
+                tokio::time::timeout(
+                    self.operation_timeout,
+                    voice.send(Ok(VoiceInputEvent::Playback(PlaybackReceipt::new(
                         generation_id,
                         PlaybackState::Flushed,
-                    ))))
-                    .await
-                    .map_err(|_| AdapterError::new("network media voice input closed"))?;
+                    )))),
+                )
+                .await
+                .map_err(|_| AdapterError::new("network media playback event timed out"))?
+                .map_err(|_| AdapterError::new("network media voice input closed"))?;
             }
         }
         let hub = self.clone();
@@ -519,6 +530,7 @@ impl NetworkMediaHub {
         let result = tokio::select! {
             biased;
             _ = cancellation.cancelled() => Err(AdapterError::new("network media playback was cancelled")),
+            _ = tokio::time::sleep(self.operation_timeout) => Err(AdapterError::new("network media playback acknowledgement timed out")),
             result = completion => result.unwrap_or_else(|_| Err(AdapterError::new("network media playback acknowledgement closed"))),
         };
         if result.is_err() {
@@ -601,10 +613,13 @@ impl NetworkMediaHub {
             let _ = completion.send(Ok(receipt));
         }
         if let Some((voice, receipt)) = rendered {
-            voice
-                .send(Ok(VoiceInputEvent::Playback(receipt)))
-                .await
-                .map_err(|_| AdapterError::new("network media voice input closed"))?;
+            tokio::time::timeout(
+                self.operation_timeout,
+                voice.send(Ok(VoiceInputEvent::Playback(receipt))),
+            )
+            .await
+            .map_err(|_| AdapterError::new("network media playback event timed out"))?
+            .map_err(|_| AdapterError::new("network media voice input closed"))?;
         }
         Ok(())
     }
@@ -652,11 +667,19 @@ impl NetworkMediaHub {
                 "network media flush queue is unavailable",
             ));
         }
-        completion.await.unwrap_or_else(|_| {
-            Err(AdapterError::new(
-                "network media flush acknowledgement closed",
-            ))
-        })
+        match tokio::time::timeout(self.operation_timeout, completion).await {
+            Ok(result) => result.unwrap_or_else(|_| {
+                Err(AdapterError::new(
+                    "network media flush acknowledgement closed",
+                ))
+            }),
+            Err(_) => {
+                self.cancel_pending_flush(session_id, generation_id).await;
+                Err(AdapterError::new(
+                    "network media flush acknowledgement timed out",
+                ))
+            }
+        }
     }
 
     pub async fn acknowledge_flush(
@@ -740,7 +763,20 @@ impl NetworkVoiceIoFactory {
         Arc::new(NetworkRecognitionCapture {
             hub: self.hub.clone(),
             session_id: self.session_id,
+            receiver: Mutex::new(None),
         })
+    }
+
+    /// Attaches the recognizer branch before a lease is disclosed. The returned capture is
+    /// retained by the gateway until the later provider wiring takes ownership of this exact
+    /// bounded receiver; it must not be recreated after bridge ingress begins.
+    pub async fn attach_recognition_capture(&self) -> Result<Arc<dyn AudioCapture>, AdapterError> {
+        let receiver = self.hub.attach_recognition(self.session_id).await?;
+        Ok(Arc::new(NetworkRecognitionCapture {
+            hub: self.hub.clone(),
+            session_id: self.session_id,
+            receiver: Mutex::new(Some(receiver)),
+        }))
     }
 }
 
@@ -800,6 +836,7 @@ impl VoiceInput for NetworkVoiceInput {
 struct NetworkRecognitionCapture {
     hub: NetworkMediaHub,
     session_id: SessionId,
+    receiver: Mutex<Option<mpsc::Receiver<Result<CaptureEvent, AdapterError>>>>,
 }
 
 impl AudioCapture for NetworkRecognitionCapture {
@@ -814,7 +851,14 @@ impl AudioCapture for NetworkRecognitionCapture {
                     "network media session identity did not match",
                 ));
             }
-            self.hub.attach_recognition(session_id).await
+            let mut receiver = self.receiver.lock().await;
+            match receiver.take() {
+                Some(receiver) => Ok(receiver),
+                None => {
+                    drop(receiver);
+                    self.hub.attach_recognition(session_id).await
+                }
+            }
         })
     }
 }

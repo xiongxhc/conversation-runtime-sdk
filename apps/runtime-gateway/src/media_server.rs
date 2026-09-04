@@ -15,7 +15,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use rustls::ServerConfig;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
@@ -32,6 +32,9 @@ const TOKEN_BYTES: usize = 32;
 const MAX_TOKEN_BYTES: usize = 128;
 const FRAME_HEADER_BYTES: usize = 42;
 const PLAYBACK_FRAME_HEADER_BYTES: usize = 66;
+const MAX_MEDIA_CONNECTIONS: usize = 64;
+const MEDIA_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+const MEDIA_CONNECTION_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub const MAX_MEDIA_ENDPOINT_BYTES: usize = 256;
 pub const MAX_MEDIA_PATH_BYTES: usize = 1_024;
@@ -149,6 +152,16 @@ impl MediaServerConfig {
         self
     }
 
+    pub fn with_max_playback_queue_duration(mut self, value: Duration) -> Self {
+        self.max_playback_queue_duration = value;
+        self
+    }
+
+    pub fn with_max_payload_bytes(mut self, value: usize) -> Self {
+        self.max_payload_bytes = value;
+        self
+    }
+
     fn validate(&self) -> Result<(), AdapterError> {
         if !is_private_address(self.bind.ip()) {
             return Err(AdapterError::new(
@@ -252,6 +265,7 @@ struct MediaServerInner {
     max_playback_queue_duration: Duration,
     sessions: Mutex<HashMap<u64, MediaSession>>,
     connections: Mutex<Vec<JoinHandle<()>>>,
+    connection_permits: Arc<Semaphore>,
     cancellation: CancellationToken,
 }
 
@@ -284,7 +298,10 @@ impl MediaServer {
             .local_addr()
             .map_err(|_| AdapterError::new("media listener has no local address"))?;
         let inner = Arc::new(MediaServerInner {
-            hub: NetworkMediaHub::with_max_playback_queue_bytes(config.max_playback_queue_bytes),
+            hub: NetworkMediaHub::with_limits(
+                config.max_playback_queue_bytes,
+                config.max_playback_queue_duration,
+            ),
             endpoint,
             advertised_endpoint: bound_advertised_endpoint(
                 &config.advertised_endpoint,
@@ -297,6 +314,7 @@ impl MediaServer {
             max_playback_queue_duration: config.max_playback_queue_duration,
             sessions: Mutex::new(HashMap::new()),
             connections: Mutex::new(Vec::new()),
+            connection_permits: Arc::new(Semaphore::new(MAX_MEDIA_CONNECTIONS)),
             cancellation: CancellationToken::new(),
         });
         let worker = Arc::clone(&inner);
@@ -372,8 +390,14 @@ impl MediaServer {
             let _ = task.await;
         }
         let connections = std::mem::take(&mut *self.inner.connections.lock().await);
-        for connection in connections {
-            let _ = connection.await;
+        for mut connection in connections {
+            if tokio::time::timeout(MEDIA_CONNECTION_REAP_TIMEOUT, &mut connection)
+                .await
+                .is_err()
+            {
+                connection.abort();
+                let _ = connection.await;
+            }
         }
     }
 }
@@ -396,9 +420,17 @@ async fn accept_loop(
                 Ok((stream, _)) => {
                     let worker = Arc::clone(&inner);
                     let tls = tls.clone();
+                    let Ok(permit) = Arc::clone(&inner.connection_permits).try_acquire_owned() else {
+                        continue;
+                    };
                     let task = tokio::spawn(async move {
+                        let _permit = permit;
                         if let Some(acceptor) = tls {
-                            if let Ok(stream) = acceptor.accept(stream).await {
+                            let handshake = tokio::select! {
+                                _ = worker.cancellation.cancelled() => return,
+                                result = tokio::time::timeout(MEDIA_HANDSHAKE_TIMEOUT, acceptor.accept(stream)) => result,
+                            };
+                            if let Ok(Ok(stream)) = handshake {
                                 let _ = serve_connection(stream, worker).await;
                             }
                         } else {
@@ -424,7 +456,10 @@ where
 {
     let (session_id, credential) = tokio::select! {
         _ = inner.cancellation.cancelled() => return Ok(()),
-        authentication = read_authentication(&mut stream) => authentication?,
+        authentication = tokio::time::timeout(MEDIA_HANDSHAKE_TIMEOUT, read_authentication(&mut stream)) => {
+            authentication
+                .map_err(|_| AdapterError::new("media bridge authentication timed out"))??
+        },
     };
     let connection_id = inner.authenticate(session_id, &credential).await?;
     let mut playback = inner
@@ -453,6 +488,9 @@ where
                             }
                             let frame = frame_for_network_capture(sequence, format, payload)?;
                             inner.hub.deliver_capture(session_id, frame).await?;
+                            inner
+                                .commit_capture_metadata(session_id, sequence, captured_at_ms)
+                                .await?;
                         }
                         MediaMessage::PlaybackAck { session_id: acknowledgement_session_id, sequence, acknowledgement } => {
                             if acknowledgement_session_id != session_id {
@@ -473,11 +511,21 @@ where
                     match request {
                         NetworkBridgeRequest::Playback(request) => {
                             let sequence = request.sequence();
-                            write_playback_frame(&mut writer, session_id, request).await?;
+                            tokio::time::timeout(
+                                inner.max_playback_queue_duration,
+                                write_playback_frame(&mut writer, session_id, request),
+                            )
+                            .await
+                            .map_err(|_| AdapterError::new("media playback frame write timed out"))??;
                             inner.hub.mark_playback_written(session_id, connection_id, sequence).await?;
                         }
                         NetworkBridgeRequest::Flush(request) => {
-                            write_flush_request(&mut writer, session_id, request.generation_id()).await?;
+                            tokio::time::timeout(
+                                inner.max_playback_queue_duration,
+                                write_flush_request(&mut writer, session_id, request.generation_id()),
+                            )
+                            .await
+                            .map_err(|_| AdapterError::new("media flush request write timed out"))??;
                         }
                     }
                 }
@@ -531,17 +579,62 @@ impl MediaServerInner {
         sequence: u64,
         captured_at_ms: u64,
     ) -> Result<Option<u64>, AdapterError> {
-        let mut sessions = self.sessions.lock().await;
+        let sessions = self.sessions.lock().await;
         let session = sessions
-            .get_mut(&session_id.get())
+            .get(&session_id.get())
             .ok_or_else(|| AdapterError::new("media session was revoked"))?;
         let gap = match session.expected_sequence {
             Some(expected) if sequence < expected => {
                 return Err(AdapterError::new("media sequence was replayed"))
             }
-            Some(expected) if sequence > expected => Some(expected),
+            Some(expected) if sequence > expected => Some(captured_at_ms),
             _ => None,
         };
+        sequence
+            .checked_add(1)
+            .ok_or_else(|| AdapterError::new("media sequence overflowed"))?;
+        let now = Instant::now();
+        let frames_in_window =
+            if now.duration_since(session.rate_window_started) >= Duration::from_secs(1) {
+                0
+            } else {
+                session.frames_in_window
+            };
+        if frames_in_window >= self.max_frames_per_second {
+            return Err(AdapterError::new(
+                "media frame rate exceeded its configured bound",
+            ));
+        }
+        if session
+            .last_capture_timestamp_ms
+            .is_some_and(|previous| captured_at_ms <= previous)
+        {
+            return Err(AdapterError::new(
+                "media capture timestamp was not monotonic",
+            ));
+        }
+        Ok(gap)
+    }
+
+    async fn commit_capture_metadata(
+        &self,
+        session_id: SessionId,
+        sequence: u64,
+        captured_at_ms: u64,
+    ) -> Result<(), AdapterError> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id.get())
+            .ok_or_else(|| AdapterError::new("media session was revoked"))?;
+        if session
+            .expected_sequence
+            .is_some_and(|expected| sequence < expected)
+        {
+            return Err(AdapterError::new("media sequence was replayed"));
+        }
+        let next_sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| AdapterError::new("media sequence overflowed"))?;
         let now = Instant::now();
         if now.duration_since(session.rate_window_started) >= Duration::from_secs(1) {
             session.rate_window_started = now;
@@ -561,9 +654,9 @@ impl MediaServerInner {
             ));
         }
         session.frames_in_window += 1;
-        session.expected_sequence = sequence.checked_add(1);
+        session.expected_sequence = Some(next_sequence);
         session.last_capture_timestamp_ms = Some(captured_at_ms);
-        Ok(gap)
+        Ok(())
     }
 
     async fn disconnect(

@@ -152,6 +152,7 @@ impl VoiceSessionRuntime {
         Ok(VoiceSessionEventStream {
             events: event_receiver,
             terminal: Some(terminal_receiver),
+            prefetched: None,
             events_closed: false,
             cancellation,
         })
@@ -271,12 +272,16 @@ impl VoiceSessionRuntime {
 pub struct VoiceSessionEventStream {
     events: mpsc::Receiver<VoiceSessionEvent>,
     terminal: Option<oneshot::Receiver<VoiceSessionEvent>>,
+    prefetched: Option<VoiceSessionEvent>,
     events_closed: bool,
     cancellation: CancellationToken,
 }
 
 impl VoiceSessionEventStream {
     pub async fn recv(&mut self) -> Option<VoiceSessionEvent> {
+        if let Some(event) = self.prefetched.take() {
+            return Some(event);
+        }
         if !self.events_closed {
             if let Some(event) = self.events.recv().await {
                 return Some(event);
@@ -287,6 +292,24 @@ impl VoiceSessionEventStream {
         let terminal = self.terminal.as_mut()?.await.ok();
         self.terminal = None;
         terminal
+    }
+
+    /// Waits until the voice I/O and input path have actually started, while preserving the
+    /// startup event for the normal event consumer. A caller can therefore avoid disclosing a
+    /// credential for an asynchronously failed startup without changing event ordering.
+    pub async fn wait_until_started(&mut self, session_id: SessionId) -> Result<(), RuntimeError> {
+        match self.recv().await {
+            Some(
+                event @ VoiceSessionEvent::SessionStarted {
+                    session_id: started_session_id,
+                    ..
+                },
+            ) if started_session_id == session_id => {
+                self.prefetched = Some(event);
+                Ok(())
+            }
+            _ => Err(runtime_error("voice session did not complete startup")),
+        }
     }
 }
 

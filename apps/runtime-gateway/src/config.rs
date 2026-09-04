@@ -543,6 +543,11 @@ impl GatewayConfig {
         if let Some(recording) = self.recording.as_ref() {
             recording.validate()?;
         }
+        if profile == RuntimeProfile::Online && voice_configured && self.media.is_none() {
+            return Err(config_error(
+                "online voice requires a media bridge configuration",
+            ));
+        }
         let media = self
             .media
             .as_ref()
@@ -615,6 +620,8 @@ impl GatewayConfig {
                 .with_temperature(self.language.temperature)
                 .map_err(adapter_error)?
                 .with_max_output_tokens(self.language.num_predict)
+                .map_err(adapter_error)?
+                .with_max_output_bytes(self.language.max_assistant_content_bytes)
                 .map_err(adapter_error)?;
                 if let Some(system_prompt) = self.language.system_prompt.as_deref() {
                     config = config

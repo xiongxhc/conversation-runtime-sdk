@@ -1,0 +1,42 @@
+{
+  "protocol_version": 3,
+  "type": "ready",
+  "status": {
+    "profile": "online",
+    "transport": "stdio",
+    "privacy_mode": "cloud",
+    "language_location": "remote",
+    "model_id": "operator-supplied-text-model",
+    "memory_enabled": false,
+    "telemetry_enabled": false,
+    "capabilities": [
+      "text",
+      "conversation_context_seed",
+      "persona_control",
+      "voice_session"
+    ],
+    "components": [
+      {
+        "kind": "speech_recognition",
+        "provider_label": "openai-streaming",
+        "execution_location": "remote"
+      },
+      {
+        "kind": "language_model",
+        "provider_label": "openai",
+        "execution_location": "remote"
+      },
+      {
+        "kind": "speech_synthesis",
+        "provider_label": "openai-compatible-streaming",
+        "execution_location": "remote"
+      },
+      {
+        "kind": "audio_io",
+        "provider_label": "local-audio",
+        "execution_location": "local"
+      }
+    ],
+    "last_context_seed_operation_id": null
+  }
+}

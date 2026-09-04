@@ -56,6 +56,7 @@ final_silence_ms = 600
 backend = "openai-streaming"
 execution = "remote"
 provider = "openai-streaming"
+endpoint = "https://api.openai.com/v1"
 model = "operator-supplied-transcription-model"
 credential_env = "OPENAI_API_KEY"
 

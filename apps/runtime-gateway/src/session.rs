@@ -903,6 +903,28 @@ impl GatewaySession {
                                 .map_err(CommandFailure::response);
                             }
                         }
+                        let media_io = network_factory.clone() as Arc<dyn VoiceIoFactory>;
+                        let io = if lane.adapters.online_recognition.is_some() {
+                            match lane
+                                .adapters
+                                .online_media_io(media_io.clone(), Arc::clone(&recognition_capture))
+                            {
+                                Some(io) => io,
+                                None => {
+                                    media_server.revoke(session_id).await;
+                                    return send_rejection(
+                                        normal,
+                                        &request_id,
+                                        command_error(
+                                            "online speech recognition could not be configured",
+                                        ),
+                                    )
+                                    .map_err(CommandFailure::response);
+                                }
+                            }
+                        } else {
+                            media_io
+                        };
                         (
                             Some(ActiveMediaLease {
                                 server: Arc::clone(media_server),
@@ -910,7 +932,7 @@ impl GatewaySession {
                                 _recognition_capture: recognition_capture,
                             }),
                             Some(descriptor),
-                            network_factory as Arc<dyn VoiceIoFactory>,
+                            io,
                         )
                     }
                     None => (None, None, lane.adapters.io.clone()),
@@ -2588,9 +2610,10 @@ mod tests {
         GenerationLanguageModel, GenerationLanguageRequest, GenerationTextDelta,
         MeetingAudioWindows, MockContinuousAudioOutput, MockGenerationLanguageModel,
         MockStreamingSpeechSynthesizer, MockVoiceCaptureControl, MockVoiceIoFactory, OllamaConfig,
-        OllamaLanguageModel, PcmFormat, PcmSampleFormat, RecognitionEvent, RecognitionHypothesis,
-        StreamingSpeechRequest, StreamingSpeechSynthesizer, TranscriptionDiarizer,
-        VoiceCaptureControl, VoiceInput, VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
+        OllamaLanguageModel, OpenAiSpeechRecognitionConfig, PcmFormat, PcmSampleFormat,
+        RecognitionEvent, RecognitionHypothesis, StreamingSpeechRequest,
+        StreamingSpeechSynthesizer, TranscriptionDiarizer, VoiceCaptureControl, VoiceInput,
+        VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
     };
     use conversation_protocol::{
         ClientRuntimeEvent, ComponentDescriptor, ComponentKind, ExecutionLocation, GatewayMessage,
@@ -2797,6 +2820,351 @@ mod tests {
         assert_eq!(replay.read(&mut byte).await.unwrap(), 0);
 
         gateway.close().await;
+        media.shutdown().await;
+    }
+
+    /// Catches a Task 7 regression where the online recognizer is built against a fresh capture
+    /// (or an offline sidecar) instead of the exact Task 6 capture already attached to this
+    /// session's network factory. The bridge frame must reach the scripted recognizer while the
+    /// externally-gated session remains able to skip it without generating a response.
+    #[tokio::test]
+    async fn online_media_capture_reaches_the_selected_recognizer_and_skip_keeps_the_bridge_alive()
+    {
+        const ONLINE_CREDENTIAL: &str = "CONVERSATION_ONLINE_MEDIA_TEST_CREDENTIAL";
+        const RECORDING_KEY: &str = "CONVERSATION_ONLINE_MEDIA_RECORDING_KEY";
+        std::env::set_var(ONLINE_CREDENTIAL, "fake-not-a-real-credential-0000");
+        std::env::set_var(RECORDING_KEY, FAKE_RECORDING_KEY);
+        let recognizer = ScriptedRecognizerServer::start().await;
+        let directory = TempDir::new().unwrap();
+        let media = Arc::new(
+            MediaServer::bind(MediaServerConfig::loopback())
+                .await
+                .unwrap(),
+        );
+        let session_id = SessionId::new(705);
+        let recognition = OpenAiSpeechRecognitionConfig::new(
+            recognizer.endpoint(),
+            "scripted-asr-model",
+            ONLINE_CREDENTIAL,
+        )
+        .unwrap()
+        .with_chunk_bytes(b"online".len())
+        .unwrap();
+        let language = Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new()));
+        let speech = Arc::new(PerRequestSpeech::default());
+        let voice = GatewayVoiceAdapters {
+            io: GatewayVoiceAdapters::unavailable_online_io(),
+            speech: speech.clone(),
+            policy: voice_policy(),
+            online_recognition: Some(recognition),
+        };
+        let session = GatewaySession::new(unused_runtime(), status_with_voice())
+            .with_voice(voice, language.clone())
+            .with_recording(RecordingSettings::new(directory.path(), RECORDING_KEY).unwrap())
+            .with_media_server(Arc::clone(&media))
+            .with_test_session_id(session_id);
+        let mut gateway = InMemoryGateway::start(session).await;
+
+        gateway
+            .write(r#"{"protocol_version":3,"type":"start_voice_session","request_id":"online-start","response_mode":"external_gate"}"#)
+            .await;
+        let accepted: serde_json::Value =
+            serde_json::from_str(&gateway.read_message().await).unwrap();
+        let lease = accepted.get("media_lease").unwrap();
+        let endpoint: std::net::SocketAddr = lease["connect_endpoint"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("tcp://")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let credential = lease["credential"].as_str().unwrap().to_owned();
+        gateway
+            .read_until(|message| message.contains(r#""type":"voice_session_started""#))
+            .await;
+
+        let mut bridge = TcpStream::connect(endpoint).await.unwrap();
+        bridge
+            .write_all(&media_authentication(session_id, &credential))
+            .await
+            .unwrap();
+        bridge
+            .write_all(&media_capture(session_id, 1, 1_000, b"online"))
+            .await
+            .unwrap();
+        recognizer.wait_for_request().await;
+
+        let final_transcript = gateway
+            .read_until(|message| message.contains(r#""type":"voice_transcript_final""#))
+            .await;
+        assert!(final_transcript
+            .iter()
+            .any(|message| message.contains(r#""text":"agenda item""#)));
+        tokio::time::sleep(Duration::from_millis(850)).await;
+        gateway
+            .write(r#"{"protocol_version":3,"type":"skip_voice_response","request_id":"online-skip","session_id":"705","segment_id":"1","reason":"meeting policy"}"#)
+            .await;
+        let skipped = gateway
+            .read_until(|message| message.contains(r#""type":"response_skipped""#))
+            .await;
+        assert!(skipped
+            .iter()
+            .any(|message| message.contains("meeting policy")));
+        assert!(skipped.iter().any(|message| {
+            message_type(message) == "command_accepted"
+                && message.contains(r#""request_id":"online-skip""#)
+        }));
+        assert!(
+            language.requests().is_empty(),
+            "skip started text generation"
+        );
+        assert!(
+            speech.requests().is_empty(),
+            "skip started speech synthesis"
+        );
+
+        let encrypted_path = wait_for_recording_bytes(directory.path(), 80).await;
+        gateway
+            .write(
+                r#"{"protocol_version":3,"type":"stop_voice_session","request_id":"online-stop"}"#,
+            )
+            .await;
+        gateway
+            .read_until(|message| {
+                message_type(message) == "command_accepted"
+                    && message.contains(r#""request_id":"online-stop""#)
+            })
+            .await;
+        gateway
+            .write(r#"{"protocol_version":3,"type":"finalize_recording","request_id":"online-finalize","session_id":"705"}"#)
+            .await;
+        assert_accepted_message(&gateway.read_message().await, "online-finalize");
+        let finalized: serde_json::Value =
+            serde_json::from_str(&gateway.read_message().await).unwrap();
+        let handle = finalized["recording"]["recording_handle"].as_str().unwrap();
+        assert_eq!(
+            resolve_recording_handle(directory.path(), handle).unwrap(),
+            encrypted_path
+        );
+        let recording = read_session_recording(&encrypted_path, RECORDING_KEY).unwrap();
+        assert!(recording.chunks.iter().any(|chunk| {
+            matches!(chunk, RecordedChunk::Frame { sequence: 1, bytes, .. } if bytes == b"online")
+        }));
+
+        gateway.close().await;
+        recognizer.finish().await;
+        media.shutdown().await;
+    }
+
+    /// The online bridge must also enter the existing external authorization flow: a scripted
+    /// final transcript is inert until the meeting host explicitly authorizes that segment.
+    #[tokio::test]
+    async fn online_media_recognizer_authorizes_only_the_host_approved_response() {
+        const ONLINE_CREDENTIAL: &str = "CONVERSATION_ONLINE_AUTHORIZE_TEST_CREDENTIAL";
+        std::env::set_var(ONLINE_CREDENTIAL, "fake-not-a-real-credential-0000");
+        let recognizer = ScriptedRecognizerServer::start().await;
+        let media = Arc::new(
+            MediaServer::bind(MediaServerConfig::loopback())
+                .await
+                .unwrap(),
+        );
+        let session_id = SessionId::new(706);
+        let recognition = OpenAiSpeechRecognitionConfig::new(
+            recognizer.endpoint(),
+            "scripted-asr-model",
+            ONLINE_CREDENTIAL,
+        )
+        .unwrap()
+        .with_chunk_bytes(b"online".len())
+        .unwrap();
+        let speech = Arc::new(PerRequestSpeech::default());
+        let voice = GatewayVoiceAdapters {
+            io: GatewayVoiceAdapters::unavailable_online_io(),
+            speech: speech.clone(),
+            policy: voice_policy(),
+            online_recognition: Some(recognition),
+        };
+        let language = Arc::new(MockGenerationLanguageModel::new(["approved reply"]));
+        let session = GatewaySession::new(unused_runtime(), status_with_voice())
+            .with_voice(voice, language.clone())
+            .with_media_server(Arc::clone(&media))
+            .with_test_session_id(session_id);
+        let mut gateway = InMemoryGateway::start(session).await;
+
+        gateway
+            .write(r#"{"protocol_version":3,"type":"start_voice_session","request_id":"authorize-start","response_mode":"external_gate"}"#)
+            .await;
+        let lease: serde_json::Value = serde_json::from_str(&gateway.read_message().await).unwrap();
+        let endpoint: std::net::SocketAddr = lease["media_lease"]["connect_endpoint"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("tcp://")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let credential = lease["media_lease"]["credential"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        gateway
+            .read_until(|message| message.contains(r#""type":"voice_session_started""#))
+            .await;
+        let mut bridge = TcpStream::connect(endpoint).await.unwrap();
+        bridge
+            .write_all(&media_authentication(session_id, &credential))
+            .await
+            .unwrap();
+        bridge
+            .write_all(&media_capture(session_id, 1, 1_000, b"online"))
+            .await
+            .unwrap();
+        recognizer.wait_for_request().await;
+        gateway
+            .read_until(|message| message.contains(r#""type":"voice_transcript_final""#))
+            .await;
+        tokio::time::sleep(Duration::from_millis(850)).await;
+        gateway
+            .write(r#"{"protocol_version":3,"type":"authorize_voice_response","request_id":"online-authorize","session_id":"706","segment_id":"1","context_exchanges":[{"user":"prior","assistant":"context"}]}"#)
+            .await;
+        let authorized = gateway
+            .read_until(|message| message.contains(r#""type":"response_authorized""#))
+            .await;
+        assert!(authorized.iter().any(|message| {
+            message_type(message) == "command_accepted"
+                && message.contains(r#""request_id":"online-authorize""#)
+        }));
+        assert!(authorized
+            .iter()
+            .any(|message| message.contains(r#""type":"response_authorized""#)));
+        timeout(TEST_TIMEOUT, async {
+            loop {
+                if language.requests().len() == 1 && speech.requests().len() == 1 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("authorization did not reach text generation and speech synthesis");
+        assert_eq!(language.requests()[0].transcript(), "agenda item");
+        assert_eq!(speech.requests()[0].text(), "approved reply");
+
+        gateway
+            .write(r#"{"protocol_version":3,"type":"stop_voice_session","request_id":"authorize-stop"}"#)
+            .await;
+        gateway
+            .read_until(|message| {
+                message_type(message) == "command_accepted"
+                    && message.contains(r#""request_id":"authorize-stop""#)
+            })
+            .await;
+        gateway.close().await;
+        recognizer.finish().await;
+        media.shutdown().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the explicit provider-loss lifecycle seam"]
+    async fn online_recognizer_loss_reports_its_stage_without_losing_capture_or_cloud_status() {
+        const CREDENTIAL: &str = "CONVERSATION_ONLINE_LOSS_CREDENTIAL";
+        const RECORDING_KEY: &str = "CONVERSATION_ONLINE_LOSS_RECORDING_KEY";
+        std::env::set_var(CREDENTIAL, "fake-not-a-real-credential-0000");
+        std::env::set_var(RECORDING_KEY, FAKE_RECORDING_KEY);
+        let recognizer = ScriptedRecognizerServer::failing().await;
+        let directory = TempDir::new().unwrap();
+        let media = Arc::new(
+            MediaServer::bind(MediaServerConfig::loopback())
+                .await
+                .unwrap(),
+        );
+        let session_id = SessionId::new(708);
+        let recognition = OpenAiSpeechRecognitionConfig::new(
+            recognizer.endpoint(),
+            "scripted-asr-model",
+            CREDENTIAL,
+        )
+        .unwrap()
+        .with_chunk_bytes(b"lost".len())
+        .unwrap();
+        let language = Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new()));
+        let speech = Arc::new(PerRequestSpeech::default());
+        let voice = GatewayVoiceAdapters {
+            io: GatewayVoiceAdapters::unavailable_online_io(),
+            speech: speech.clone(),
+            policy: voice_policy(),
+            online_recognition: Some(recognition),
+        };
+        let mut status = status_with_voice();
+        status.profile = "online".to_owned();
+        status.privacy_mode = "cloud".to_owned();
+        status.language_location = "remote".to_owned();
+        let session = GatewaySession::new(unused_runtime(), status)
+            .with_voice(voice, language.clone())
+            .with_recording(RecordingSettings::new(directory.path(), RECORDING_KEY).unwrap())
+            .with_media_server(Arc::clone(&media))
+            .with_test_session_id(session_id);
+        let mut gateway = InMemoryGateway::start(session).await;
+        gateway.write(r#"{"protocol_version":3,"type":"start_voice_session","request_id":"loss-start","response_mode":"external_gate"}"#).await;
+        let lease: serde_json::Value = serde_json::from_str(&gateway.read_message().await).unwrap();
+        let endpoint: std::net::SocketAddr = lease["media_lease"]["connect_endpoint"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("tcp://")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let credential = lease["media_lease"]["credential"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        gateway
+            .read_until(|m| m.contains(r#""type":"voice_session_started""#))
+            .await;
+        let mut bridge = TcpStream::connect(endpoint).await.unwrap();
+        bridge
+            .write_all(&media_authentication(session_id, &credential))
+            .await
+            .unwrap();
+        bridge
+            .write_all(&media_capture(session_id, 1, 1_000, b"lost"))
+            .await
+            .unwrap();
+        recognizer.wait_for_request().await;
+        let failed = gateway
+            .read_until(|m| m.contains(r#""type":"voice_session_failed""#))
+            .await;
+        assert!(
+            failed
+                .iter()
+                .any(|m| m.contains(r#""stage":"speech_recognizer""#)),
+            "{failed:?}"
+        );
+        assert!(language.requests().is_empty() && speech.requests().is_empty());
+        gateway
+            .write(r#"{"protocol_version":3,"type":"status","request_id":"loss-status"}"#)
+            .await;
+        gateway
+            .read_until(|m| {
+                m.contains(r#""profile":"online""#) && m.contains(r#""privacy_mode":"cloud""#)
+            })
+            .await;
+        bridge
+            .write_all(&media_capture(session_id, 2, 1_001, b"still"))
+            .await
+            .unwrap();
+        let path = wait_for_recording_bytes(directory.path(), 100).await;
+        gateway
+            .write(r#"{"protocol_version":3,"type":"stop_voice_session","request_id":"loss-stop"}"#)
+            .await;
+        gateway
+            .read_until(|m| message_type(m) == "command_accepted" && m.contains("loss-stop"))
+            .await;
+        let recording = read_session_recording(&path, RECORDING_KEY).unwrap();
+        assert!(recording.chunks.iter().any(
+            |c| matches!(c, RecordedChunk::Frame { sequence: 2, bytes, .. } if bytes == b"still")
+        ));
+        gateway.close().await;
+        recognizer.finish().await;
         media.shutdown().await;
     }
 
@@ -3224,6 +3592,7 @@ mod tests {
             io: factory.clone(),
             speech: no_speech_frames(),
             policy: voice_policy(),
+            online_recognition: None,
         };
         let session = GatewaySession::new(runtime, status_with_voice()).with_voice(
             adapters,
@@ -3304,6 +3673,7 @@ mod tests {
             )),
             speech: no_speech_frames(),
             policy: voice_policy(),
+            online_recognition: None,
         };
         let session = GatewaySession::new(runtime, status_with_voice()).with_voice(
             adapters,
@@ -3415,6 +3785,7 @@ mod tests {
             )),
             speech: no_speech_frames(),
             policy: voice_policy(),
+            online_recognition: None,
         };
         let session =
             GatewaySession::new(runtime, status_with_voice()).with_voice(adapters, language);
@@ -5407,8 +5778,9 @@ mod tests {
                 input_receiver,
                 Arc::new(MockVoiceCaptureControl::new()),
             )),
-            speech: Arc::new(PerRequestSpeech),
+            speech: Arc::new(PerRequestSpeech::default()),
             policy: voice_policy(),
+            online_recognition: None,
         };
         let session = GatewaySession::new(unused_runtime(), status_with_voice())
             .with_voice(adapters, turn_language)
@@ -5472,7 +5844,16 @@ mod tests {
     /// Answers every synthesis request with one silent frame carrying that request's own
     /// identities, so a voice turn reaches its completed terminal (and therefore emits
     /// `TextCompleted`) instead of failing in synthesis the way `no_speech_frames` does.
-    struct PerRequestSpeech;
+    #[derive(Default)]
+    struct PerRequestSpeech {
+        requests: StdMutex<Vec<StreamingSpeechRequest>>,
+    }
+
+    impl PerRequestSpeech {
+        fn requests(&self) -> Vec<StreamingSpeechRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
 
     impl StreamingSpeechSynthesizer for PerRequestSpeech {
         fn stream(
@@ -5480,6 +5861,7 @@ mod tests {
             request: StreamingSpeechRequest,
             _cancellation: CancellationToken,
         ) -> mpsc::Receiver<Result<AudioFrame, AdapterError>> {
+            self.requests.lock().unwrap().push(request.clone());
             let frame = AudioFrame::new(
                 request.turn_id(),
                 request.generation_id(),
@@ -6331,6 +6713,7 @@ mod tests {
             io: io_factory.clone(),
             speech: speech.clone(),
             policy: voice_policy(),
+            online_recognition: None,
         };
         (adapters, VoiceTestGuards { io_factory, speech })
     }
@@ -6543,6 +6926,7 @@ mod tests {
             io: Arc::new(TestVoiceIoFactory::with_capture(input_receiver, capture)),
             speech,
             policy: voice_policy(),
+            online_recognition: None,
         };
         GatewaySession::new(unused_runtime(), status_with_voice()).with_voice(adapters, language)
     }
@@ -6565,6 +6949,7 @@ mod tests {
             io: factory,
             speech,
             policy: voice_policy(),
+            online_recognition: None,
         };
         let session = GatewaySession::new(unused_runtime(), status_with_voice())
             .with_voice(adapters, language);
@@ -6587,6 +6972,7 @@ mod tests {
             )),
             speech,
             policy: voice_policy(),
+            online_recognition: None,
         };
         GatewaySession::new(runtime, status_with_voice()).with_voice(adapters, language)
     }
@@ -7004,6 +7390,61 @@ mod tests {
                 }
                 notified.await;
             }
+        }
+    }
+
+    struct ScriptedRecognizerServer {
+        endpoint: String,
+        request_seen: Arc<Condition>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl ScriptedRecognizerServer {
+        async fn start() -> Self {
+            Self::responding(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n{\"type\":\"final\",\"text\":\"agenda item\",\"start_ms\":0,\"end_ms\":1}\n",
+            )
+            .await
+        }
+
+        async fn failing() -> Self {
+            Self::responding(
+                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+        }
+
+        async fn responding(response: &'static [u8]) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let request_seen = Arc::new(Condition::default());
+            let observed = Arc::clone(&request_seen);
+            let task = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                read_request(&mut stream).await;
+                observed.set();
+                stream.write_all(response).await.unwrap();
+                stream.flush().await.unwrap();
+            });
+            Self {
+                endpoint,
+                request_seen,
+                task,
+            }
+        }
+
+        fn endpoint(&self) -> &str {
+            &self.endpoint
+        }
+
+        async fn wait_for_request(&self) {
+            timeout(TEST_TIMEOUT, self.request_seen.wait())
+                .await
+                .expect("online recognizer never received the bridge capture");
+        }
+
+        async fn finish(self) {
+            self.task.await.unwrap();
         }
     }
 

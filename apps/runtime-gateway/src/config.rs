@@ -11,9 +11,11 @@ use conversation_model_adapters::{
     BufferedStreamingSpeechSynthesizer, GenerationLanguageModel, MacOsVoiceSidecar,
     MacOsVoiceSidecarConfig, OllamaConfig, OllamaLanguageModel, OpenAiCompatibleSpeechConfig,
     OpenAiCompatibleSpeechSynthesizer, OpenAiCompatibleStreamingSpeechConfig,
-    OpenAiCompatibleStreamingSpeechSynthesizer, SidecarAsrBackend, SpeechSynthesizer,
-    SpeechbrainDiarizationConfig, SpeechbrainTranscriptionDiarizer, StreamingSpeechSynthesizer,
-    SystemDevice, TranscriptionDiarizer,
+    OpenAiCompatibleStreamingSpeechSynthesizer, OpenAiDiarizationConfig, OpenAiLanguageConfig,
+    OpenAiLanguageModel, OpenAiSpeechRecognitionConfig, OpenAiTranscriptionDiarizer,
+    SidecarAsrBackend, SpeechSynthesizer, SpeechbrainDiarizationConfig,
+    SpeechbrainTranscriptionDiarizer, StreamingSpeechSynthesizer, SystemDevice,
+    TranscriptionDiarizer, VoiceIoFactory,
 };
 use conversation_protocol::{
     ClientComponentDescriptor, ComponentDescriptor, ComponentKind, ConversationMode,
@@ -596,17 +598,32 @@ impl GatewayConfig {
             media,
             status,
         } = self.deployment_plan()?;
-        if !matches!(self.profile(), RuntimeProfile::Offline) {
-            // Online provider adapters are wired explicitly by the runtime.
-            // Constructing a local adapter here would silently downgrade a
-            // meeting the operator deliberately placed online.
-            return Err(config_error(
-                "online profile adapters are not constructed by the configuration loader",
-            ));
-        }
-
-        let language: Arc<dyn GenerationLanguageModel> =
-            Arc::new(OllamaLanguageModel::new_direct(self.language_config()?));
+        let language: Arc<dyn GenerationLanguageModel> = match self.language.backend {
+            LanguageBackend::OllamaCompatible => {
+                Arc::new(OllamaLanguageModel::new_direct(self.language_config()?))
+            }
+            LanguageBackend::OpenaiCompatible => {
+                let credential = self.language.credential_env.as_deref().ok_or_else(|| {
+                    config_error("remote language requires a credential environment variable")
+                })?;
+                let mut config = OpenAiLanguageConfig::new(
+                    &self.language.endpoint,
+                    &self.language.model,
+                    credential,
+                )
+                .map_err(adapter_error)?
+                .with_temperature(self.language.temperature)
+                .map_err(adapter_error)?
+                .with_max_output_tokens(self.language.num_predict)
+                .map_err(adapter_error)?;
+                if let Some(system_prompt) = self.language.system_prompt.as_deref() {
+                    config = config
+                        .with_system_prompt(system_prompt)
+                        .map_err(adapter_error)?;
+                }
+                Arc::new(OpenAiLanguageModel::new(config))
+            }
+        };
         let (memory_provider, memory_store) = match memory {
             Some((provider, store)) => (Some(provider), Some(store)),
             None => (None, None),
@@ -682,6 +699,7 @@ impl GatewayConfig {
             voice.response_mode.is_some()
                 || voice.diarization.is_some()
                 || voice.asr.model.is_some()
+                || voice.asr.endpoint.is_some()
                 || voice.asr.credential_env.is_some()
                 || voice.speech.credential_env.is_some()
         });
@@ -891,6 +909,9 @@ impl VoiceConfig {
 
         match self.asr.execution {
             ExecutionConfig::Local => {
+                if self.asr.endpoint.is_some() {
+                    return Err(config_error("local voice ASR must not name an endpoint"));
+                }
                 if self.asr.model.is_some() {
                     return Err(config_error(
                         "local voice ASR must not name a remote transcription model",
@@ -928,6 +949,10 @@ impl VoiceConfig {
                         config_error("streaming online voice ASR requires a model")
                     })?;
                 validate_identifier(model, MAX_MODEL_ID_BYTES, "voice ASR model")?;
+                let endpoint = self.asr.endpoint.as_deref().ok_or_else(|| {
+                    config_error("streaming online voice ASR requires an endpoint")
+                })?;
+                validate_endpoint(endpoint, self.asr.execution, "voice ASR")?;
             }
         }
         validate_credential_reference(
@@ -942,6 +967,11 @@ impl VoiceConfig {
             self.speech.execution,
             "voice speech",
         )?;
+        if self.speech.execution == ExecutionConfig::Remote
+            && self.speech.mode != VoiceSpeechMode::Streaming
+        {
+            return Err(config_error("remote voice speech requires streaming mode"));
+        }
         validate_identifier(&self.speech.model, MAX_MODEL_ID_BYTES, "voice speech model")?;
         validate_identifier(&self.speech.voice, MAX_VOICE_ID_BYTES, "voice speech voice")?;
         if !self.audio.sidecar_executable.is_absolute() {
@@ -983,15 +1013,6 @@ impl VoiceConfig {
         privacy_mode: ProtocolPrivacyMode,
         components: Vec<ComponentDescriptor>,
     ) -> Result<GatewayVoiceAdapters, GatewayConfigError> {
-        let model_path = self
-            .asr
-            .model_path
-            .as_deref()
-            .ok_or_else(|| config_error("local voice ASR requires a model path"))?;
-        let download = self
-            .asr
-            .download
-            .ok_or_else(|| config_error("local voice ASR requires a download flag"))?;
         let policy = VoicePolicyTemplate::new(
             privacy_mode,
             self.turn.speech_start_ms,
@@ -1000,28 +1021,68 @@ impl VoiceConfig {
         )
         .map_err(runtime_error)?;
 
-        let mut sidecar = MacOsVoiceSidecarConfig::new(
-            &self.audio.sidecar_executable,
-            model_path,
-            SystemDevice::SystemDefault,
-            download,
-            self.turn.speech_start_ms,
-            self.turn.final_silence_ms,
-        )
-        .map_err(adapter_error)?
-        .with_max_stderr_bytes(self.audio.max_error_bytes)
-        .map_err(adapter_error)?;
-        if let Some(language) = &self.asr.language {
-            sidecar = sidecar.with_language(language).map_err(adapter_error)?;
-        }
-        if matches!(self.asr.backend, VoiceAsrBackend::Sensevoice) {
-            sidecar = sidecar.with_asr_backend(SidecarAsrBackend::Sensevoice);
-        }
+        let (io, online_recognition) = match self.asr.backend {
+            VoiceAsrBackend::Whisperkit | VoiceAsrBackend::Sensevoice => {
+                let model_path = self
+                    .asr
+                    .model_path
+                    .as_deref()
+                    .ok_or_else(|| config_error("local voice ASR requires a model path"))?;
+                let download = self
+                    .asr
+                    .download
+                    .ok_or_else(|| config_error("local voice ASR requires a download flag"))?;
+                let mut sidecar = MacOsVoiceSidecarConfig::new(
+                    &self.audio.sidecar_executable,
+                    model_path,
+                    SystemDevice::SystemDefault,
+                    download,
+                    self.turn.speech_start_ms,
+                    self.turn.final_silence_ms,
+                )
+                .map_err(adapter_error)?
+                .with_max_stderr_bytes(self.audio.max_error_bytes)
+                .map_err(adapter_error)?;
+                if let Some(language) = &self.asr.language {
+                    sidecar = sidecar.with_language(language).map_err(adapter_error)?;
+                }
+                if matches!(self.asr.backend, VoiceAsrBackend::Sensevoice) {
+                    sidecar = sidecar.with_asr_backend(SidecarAsrBackend::Sensevoice);
+                }
+                (
+                    Arc::new(MacOsVoiceSidecar::new(sidecar)) as Arc<dyn VoiceIoFactory>,
+                    None,
+                )
+            }
+            VoiceAsrBackend::OpenaiStreaming => {
+                let endpoint = self.asr.endpoint.as_deref().ok_or_else(|| {
+                    config_error("streaming online voice ASR requires an endpoint")
+                })?;
+                let model =
+                    self.asr.model.as_deref().ok_or_else(|| {
+                        config_error("streaming online voice ASR requires a model")
+                    })?;
+                let credential = self.asr.credential_env.as_deref().ok_or_else(|| {
+                    config_error("remote voice ASR requires a credential environment variable")
+                })?;
+                let mut recognition =
+                    OpenAiSpeechRecognitionConfig::new(endpoint, model, credential)
+                        .map_err(adapter_error)?;
+                if let Some(language) = self.asr.language.as_deref() {
+                    recognition = recognition.with_language(language).map_err(adapter_error)?;
+                }
+                (
+                    GatewayVoiceAdapters::unavailable_online_io(),
+                    Some(recognition),
+                )
+            }
+        };
 
         Ok(GatewayVoiceAdapters {
-            io: Arc::new(MacOsVoiceSidecar::new(sidecar)),
+            io,
             speech: self.speech.synthesizer()?,
             policy,
+            online_recognition,
         })
     }
 }
@@ -1062,8 +1123,13 @@ impl VoiceSpeechConfig {
                 "voice streaming speech requires streaming_interval",
             )),
             (VoiceSpeechMode::Streaming, Some(interval)) => {
-                let streaming = OpenAiCompatibleStreamingSpeechConfig::new(speech, interval)
+                let mut streaming = OpenAiCompatibleStreamingSpeechConfig::new(speech, interval)
                     .map_err(adapter_error)?;
+                if let Some(credential) = self.credential_env.as_deref() {
+                    streaming = streaming
+                        .with_credential_env(credential)
+                        .map_err(adapter_error)?;
+                }
                 Ok(Arc::new(OpenAiCompatibleStreamingSpeechSynthesizer::new(
                     streaming,
                 )))
@@ -1684,6 +1750,9 @@ struct VoiceAsrConfig {
     /// The NAME of an environment variable holding this provider's credential.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     credential_env: Option<String>,
+    /// The remote streaming recognizer endpoint. Local sidecars never receive one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    endpoint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model_path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1730,7 +1799,7 @@ enum VoiceSpeechBackend {
     OpenaiCompatible,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum VoiceSpeechMode {
     Buffered,
@@ -1893,9 +1962,21 @@ impl VoiceDiarizationConfig {
                         .map_err(adapter_error)?,
                 )))
             }
-            VoiceDiarizationBackend::Openai => Err(config_error(
-                "online profile adapters are not constructed by the configuration loader",
-            )),
+            VoiceDiarizationBackend::Openai => {
+                let endpoint = self
+                    .endpoint
+                    .as_deref()
+                    .ok_or_else(|| config_error("remote voice diarization requires an endpoint"))?;
+                let credential = self.credential_env.as_deref().ok_or_else(|| {
+                    config_error(
+                        "remote voice diarization requires a credential environment variable",
+                    )
+                })?;
+                Ok(Arc::new(OpenAiTranscriptionDiarizer::new(
+                    OpenAiDiarizationConfig::new(endpoint, &self.model, credential)
+                        .map_err(adapter_error)?,
+                )))
+            }
         }
     }
 }

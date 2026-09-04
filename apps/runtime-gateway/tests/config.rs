@@ -1478,6 +1478,7 @@ final_silence_ms = 600
 backend = "openai-streaming"
 execution = "remote"
 provider = "openai-streaming"
+endpoint = "https://api.example.invalid/v1"
 model = "operator-supplied-transcription-model"
 credential_env = "CONVERSATION_TEST_ONLINE_CREDENTIAL"
 
@@ -1906,7 +1907,33 @@ fn an_online_configuration_rejects_endpoints_that_are_not_remote_https() {
             GatewayConfig::validate(&path).is_err(),
             "accepted speech endpoint {endpoint}"
         );
+
+        let contents = ONLINE_CONFIG.replacen(
+            "endpoint = \"https://api.example.invalid/v1\"\nmodel = \"operator-supplied-transcription-model\"",
+            &format!(
+                "endpoint = \"{endpoint}\"\nmodel = \"operator-supplied-transcription-model\""
+            ),
+            1,
+        );
+        let path = write_config(fixture.path(), &contents);
+
+        assert!(
+            GatewayConfig::validate(&path).is_err(),
+            "accepted ASR endpoint {endpoint}"
+        );
     }
+
+    let fixture = tempfile::tempdir().unwrap();
+    let contents = ONLINE_CONFIG.replacen(
+        "endpoint = \"https://api.example.invalid/v1\"\nmodel = \"operator-supplied-transcription-model\"\n",
+        "",
+        1,
+    );
+    let path = write_config(fixture.path(), &contents);
+    assert!(
+        GatewayConfig::validate(&path).is_err(),
+        "accepted missing ASR endpoint"
+    );
 }
 
 #[test]
@@ -2280,16 +2307,19 @@ fn the_published_offline_example_configuration_stays_offline() {
 }
 
 #[test]
-fn the_online_profile_does_not_silently_build_offline_adapters() {
+fn the_online_profile_constructs_remote_adapters_without_a_local_fallback() {
     set_online_credential();
     let fixture = tempfile::tempdir().unwrap();
     let path = write_config(fixture.path(), ONLINE_CONFIG);
 
-    // Validation succeeds; adapter construction is wired separately and must
-    // never fall back to a local provider.
-    GatewayConfig::validate(&path).unwrap();
-    let error = GatewayConfig::load(&path).unwrap_err().to_string();
+    let adapters = GatewayConfig::load(&path).unwrap();
 
-    assert!(error.contains("online"), "{error}");
-    assert!(!error.contains(ONLINE_CREDENTIAL_VALUE));
+    assert_eq!(adapters.status.profile, "online");
+    assert!(adapters.voice.is_some());
+    assert!(adapters
+        .status
+        .components
+        .iter()
+        .any(|component| component.kind == "language_model"
+            && component.execution_location == "remote"));
 }

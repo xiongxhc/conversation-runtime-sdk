@@ -14,7 +14,7 @@ use conversation_protocol::{
     ClientMemorySummary, ClientPersonaState, ClientProcessedText, ClientRecordingGap,
     ClientRecordingReconciliation, ClientRecordingSummary, ClientRuntimeError, ClientRuntimeEvent,
     ClientVoiceSessionEvent, GatewayMessage, MemoryApproval, RecoveryDisposition, RuntimeError,
-    RuntimeErrorKind, RuntimeEvent, RuntimeProfile, RuntimeStatus, SessionId, TurnId,
+    RuntimeErrorKind, RuntimeEvent, RuntimeProfile, RuntimeStage, RuntimeStatus, SessionId, TurnId,
     VoiceResponseMode, VoiceSessionEvent, CLIENT_PROTOCOL_VERSION, CONTEXT_SEED_PROTOCOL_VERSION,
     LEGACY_CLIENT_PROTOCOL_VERSION, MEDIA_PROTOCOL_VERSION, RUNTIME_PROFILE_PROTOCOL_VERSION,
 };
@@ -904,7 +904,9 @@ impl GatewaySession {
                             }
                         }
                         let media_io = network_factory.clone() as Arc<dyn VoiceIoFactory>;
-                        let io = if lane.adapters.online_recognition.is_some() {
+                        let online_profile = RuntimeProfile::parse(&self.status.profile)
+                            == Some(RuntimeProfile::Online);
+                        let io = if online_profile {
                             match lane
                                 .adapters
                                 .online_media_io(media_io.clone(), Arc::clone(&recognition_capture))
@@ -915,9 +917,11 @@ impl GatewaySession {
                                     return send_rejection(
                                         normal,
                                         &request_id,
-                                        command_error(
+                                        ClientRuntimeError::from(RuntimeError::new(
+                                            RuntimeErrorKind::Adapter,
+                                            RuntimeStage::SpeechRecognizer,
                                             "online speech recognition could not be configured",
-                                        ),
+                                        )),
                                     )
                                     .map_err(CommandFailure::response);
                                 }
@@ -2858,7 +2862,7 @@ mod tests {
             policy: voice_policy(),
             online_recognition: Some(recognition),
         };
-        let session = GatewaySession::new(unused_runtime(), status_with_voice())
+        let session = GatewaySession::new(unused_runtime(), online_status_with_voice())
             .with_voice(voice, language.clone())
             .with_recording(RecordingSettings::new(directory.path(), RECORDING_KEY).unwrap())
             .with_media_server(Arc::clone(&media))
@@ -2985,7 +2989,7 @@ mod tests {
             online_recognition: Some(recognition),
         };
         let language = Arc::new(MockGenerationLanguageModel::new(["approved reply"]));
-        let session = GatewaySession::new(unused_runtime(), status_with_voice())
+        let session = GatewaySession::new(unused_runtime(), online_status_with_voice())
             .with_voice(voice, language.clone())
             .with_media_server(Arc::clone(&media))
             .with_test_session_id(session_id);
@@ -3064,7 +3068,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires the explicit provider-loss lifecycle seam"]
     async fn online_recognizer_loss_reports_its_stage_without_losing_capture_or_cloud_status() {
         const CREDENTIAL: &str = "CONVERSATION_ONLINE_LOSS_CREDENTIAL";
         const RECORDING_KEY: &str = "CONVERSATION_ONLINE_LOSS_RECORDING_KEY";
@@ -3094,11 +3097,7 @@ mod tests {
             policy: voice_policy(),
             online_recognition: Some(recognition),
         };
-        let mut status = status_with_voice();
-        status.profile = "online".to_owned();
-        status.privacy_mode = "cloud".to_owned();
-        status.language_location = "remote".to_owned();
-        let session = GatewaySession::new(unused_runtime(), status)
+        let session = GatewaySession::new(unused_runtime(), online_status_with_voice())
             .with_voice(voice, language.clone())
             .with_recording(RecordingSettings::new(directory.path(), RECORDING_KEY).unwrap())
             .with_media_server(Arc::clone(&media))
@@ -3140,6 +3139,7 @@ mod tests {
             "{failed:?}"
         );
         assert!(language.requests().is_empty() && speech.requests().is_empty());
+        let path = wait_for_recording_bytes(directory.path(), 80).await;
         gateway
             .write(r#"{"protocol_version":3,"type":"status","request_id":"loss-status"}"#)
             .await;
@@ -3149,10 +3149,11 @@ mod tests {
             })
             .await;
         bridge
-            .write_all(&media_capture(session_id, 2, 1_001, b"still"))
+            .write_all(&media_capture(session_id, 2, 1_001, b"still!"))
             .await
             .unwrap();
-        let path = wait_for_recording_bytes(directory.path(), 100).await;
+        wait_for_recording_growth(&path).await;
+        assert!(language.requests().is_empty() && speech.requests().is_empty());
         gateway
             .write(r#"{"protocol_version":3,"type":"stop_voice_session","request_id":"loss-stop"}"#)
             .await;
@@ -3160,11 +3161,77 @@ mod tests {
             .read_until(|m| message_type(m) == "command_accepted" && m.contains("loss-stop"))
             .await;
         let recording = read_session_recording(&path, RECORDING_KEY).unwrap();
-        assert!(recording.chunks.iter().any(
-            |c| matches!(c, RecordedChunk::Frame { sequence: 2, bytes, .. } if bytes == b"still")
-        ));
+        assert!(
+            recording.chunks.iter().any(
+                |c| matches!(c, RecordedChunk::Frame { sequence: 2, bytes, .. } if bytes == b"still!")
+            ),
+            "post-failure bridge frame was not recorded: {recording:?}"
+        );
         gateway.close().await;
         recognizer.finish().await;
+        media.shutdown().await;
+    }
+
+    /// Catches a fail-open regression where an explicit online meeting could start a local
+    /// voice factory after its selected remote recognizer was absent at startup.
+    #[tokio::test]
+    async fn online_voice_start_without_recognizer_fails_closed_at_speech_recognizer_without_offline_io(
+    ) {
+        let media = Arc::new(
+            MediaServer::bind(MediaServerConfig::loopback())
+                .await
+                .unwrap(),
+        );
+        let session_id = SessionId::new(709);
+        let offline_io = Arc::new(MockVoiceIoFactory::new(Vec::new()));
+        let voice = GatewayVoiceAdapters {
+            io: offline_io.clone(),
+            speech: no_speech_frames(),
+            policy: voice_policy(),
+            online_recognition: None,
+        };
+        let session = GatewaySession::new(unused_runtime(), online_status_with_voice())
+            .with_voice(voice, test_language())
+            .with_media_server(Arc::clone(&media))
+            .with_test_session_id(session_id);
+        let mut gateway = InMemoryGateway::start(session).await;
+
+        gateway
+            .write(r#"{"protocol_version":3,"type":"start_voice_session","request_id":"missing-online-recognizer"}"#)
+            .await;
+        let rejected = gateway.read_message().await;
+        assert!(
+            rejected.contains(r#""type":"command_rejected""#),
+            "{rejected}"
+        );
+        assert!(rejected.contains(r#""request_id":"missing-online-recognizer""#));
+        assert!(
+            rejected.contains(r#""code":"adapter_failure""#),
+            "{rejected}"
+        );
+        assert!(
+            rejected.contains(r#""stage":"speech_recognizer""#),
+            "{rejected}"
+        );
+        assert!(!rejected.contains("media_lease"));
+        assert_eq!(
+            offline_io.start_count(),
+            0,
+            "online startup used offline I/O"
+        );
+
+        gateway
+            .write(r#"{"protocol_version":3,"type":"status","request_id":"missing-online-status"}"#)
+            .await;
+        gateway
+            .read_until(|message| {
+                message.contains(r#""profile":"online""#)
+                    && message.contains(r#""privacy_mode":"cloud""#)
+            })
+            .await;
+        let lease = media.reserve(session_id).await.unwrap();
+        media.revoke(lease.session_id()).await;
+        gateway.close().await;
         media.shutdown().await;
     }
 
@@ -6647,6 +6714,19 @@ mod tests {
         }
     }
 
+    fn online_status_with_voice() -> RuntimeStatus {
+        let mut status = status_with_voice();
+        status.profile = "online".to_owned();
+        status.privacy_mode = "cloud".to_owned();
+        status.language_location = "remote".to_owned();
+        for component in &mut status.components {
+            if component.kind != "audio_io" {
+                component.execution_location = "remote".to_owned();
+            }
+        }
+        status
+    }
+
     fn test_context() -> conversation_runtime::ConversationContext {
         conversation_runtime::ConversationContext::new(
             conversation_runtime::ConversationQualityController::new(
@@ -7637,6 +7717,23 @@ mod tests {
         })
         .await
         .expect("the recording never reached the expected size")
+    }
+
+    async fn wait_for_recording_growth(path: &std::path::Path) {
+        let initial = std::fs::metadata(path).unwrap().len();
+        timeout(TEST_TIMEOUT, async {
+            loop {
+                if std::fs::metadata(path)
+                    .map(|metadata| metadata.len() > initial)
+                    .unwrap_or(false)
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("recording did not receive the post-failure media frame before timeout");
     }
 
     async fn recorded_gateway(

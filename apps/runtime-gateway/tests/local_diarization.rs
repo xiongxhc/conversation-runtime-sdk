@@ -686,6 +686,7 @@ execution = "remote"
 provider = "openai-streaming"
 model = "operator-supplied-transcription-model"
 credential_env = "CONVERSATION_TEST_DIARIZATION_CREDENTIAL"
+endpoint = "https://api.example.invalid/v1"
 
 [voice.speech]
 backend = "openai-compatible"

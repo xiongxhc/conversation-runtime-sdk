@@ -5,17 +5,17 @@ use std::time::Duration;
 
 use conversation_memory::{MemoryClock, MemoryStore, MemoryStoreErrorKind};
 use conversation_model_adapters::{
-    DiarizationResult, GenerationLanguageModel, TranscriptionDiarizer,
+    DiarizationResult, GenerationLanguageModel, NetworkVoiceIoFactory, TranscriptionDiarizer,
 };
 use conversation_protocol::{
     decode_client_command_with_version, encode_gateway_message_for_version, ClientCommand,
-    ClientDiarizedSegment, ClientMemoryCursor, ClientMemoryInspection, ClientMemorySummary,
-    ClientPersonaState, ClientProcessedText, ClientRecordingGap, ClientRecordingReconciliation,
-    ClientRecordingSummary, ClientRuntimeError, ClientRuntimeEvent, ClientVoiceSessionEvent,
-    GatewayMessage, MemoryApproval, RecoveryDisposition, RuntimeError, RuntimeErrorKind,
-    RuntimeEvent, RuntimeProfile, RuntimeStatus, SessionId, TurnId, VoiceResponseMode,
-    VoiceSessionEvent, CLIENT_PROTOCOL_VERSION, CONTEXT_SEED_PROTOCOL_VERSION,
-    LEGACY_CLIENT_PROTOCOL_VERSION, RUNTIME_PROFILE_PROTOCOL_VERSION,
+    ClientDiarizedSegment, ClientMediaLeaseDescriptor, ClientMemoryCursor, ClientMemoryInspection,
+    ClientMemorySummary, ClientPersonaState, ClientProcessedText, ClientRecordingGap,
+    ClientRecordingReconciliation, ClientRecordingSummary, ClientRuntimeError, ClientRuntimeEvent,
+    ClientVoiceSessionEvent, GatewayMessage, MemoryApproval, RecoveryDisposition, RuntimeError,
+    RuntimeErrorKind, RuntimeEvent, RuntimeProfile, RuntimeStatus, SessionId, TurnId,
+    VoiceResponseMode, VoiceSessionEvent, CLIENT_PROTOCOL_VERSION, CONTEXT_SEED_PROTOCOL_VERSION,
+    LEGACY_CLIENT_PROTOCOL_VERSION, MEDIA_PROTOCOL_VERSION, RUNTIME_PROFILE_PROTOCOL_VERSION,
 };
 use conversation_runtime::{
     process_text, reconcile_recording, ConversationContext, ProcessedText, RecordingSettings,
@@ -32,7 +32,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::memory_extraction::{MemoryExtractedCounts, MemoryExtractionSettings, MemoryExtractor};
 use crate::voice_adapters::GatewayVoiceAdapters;
-use crate::{FrameError, FrameReader, FrameWriter};
+use crate::{FrameError, FrameReader, FrameWriter, MediaLease, MediaServer};
 
 const URGENT_WRITER_BUFFER_SIZE: usize = 2;
 const NORMAL_WRITER_BUFFER_SIZE: usize = 4;
@@ -74,6 +74,7 @@ pub struct GatewaySession {
     provider_failure: Option<CancellationToken>,
     recording: Option<RecordingSettings>,
     active_recording: Option<ActiveRecording>,
+    media_server: Option<Arc<MediaServer>>,
     /// The adapter that turns a finished recording into timed text and anonymous clusters.
     /// Absent in every configuration the loader builds: like the other online adapters, it is
     /// wired explicitly rather than constructed from a TOML file.
@@ -105,6 +106,12 @@ struct ActiveVoiceSession {
     control_events: mpsc::Sender<VoiceCaptureControlKind>,
     control_pending: watch::Sender<bool>,
     capture: VoiceCaptureState,
+    media_lease: Option<ActiveMediaLease>,
+}
+
+struct ActiveMediaLease {
+    server: Arc<MediaServer>,
+    session_id: SessionId,
 }
 
 struct ActiveVoiceControl {
@@ -129,6 +136,11 @@ struct VoiceSessionState {
     active: Option<ActiveVoiceSession>,
     terminals_enqueued: u64,
     terminals_written: u64,
+}
+
+struct VersionedClientCommand {
+    protocol_version: u64,
+    command: ClientCommand,
 }
 
 impl VoiceSessionState {
@@ -188,6 +200,7 @@ impl GatewaySession {
             provider_failure: None,
             recording: None,
             active_recording: None,
+            media_server: None,
             reconciliation: None,
         }
     }
@@ -266,6 +279,13 @@ impl GatewaySession {
             context,
             language,
         });
+        self
+    }
+
+    /// Gives this control session the gateway-owned media capability. The caller
+    /// keeps the owning handle and is responsible for its final shutdown.
+    pub fn with_media_server(mut self, media_server: Arc<MediaServer>) -> Self {
+        self.media_server = Some(media_server);
         self
     }
 
@@ -422,8 +442,10 @@ impl GatewaySession {
                         )
                         .await
                         {
+                            revoke_media_lease(voice_session.media_lease).await;
                             break SessionExit::failure(error);
                         }
+                        revoke_media_lease(voice_session.media_lease).await;
                         voice.terminals_enqueued = voice.terminals_enqueued.saturating_add(1);
                         if let Err(error) = forwarder_result(result) {
                             break SessionExit::fatal(
@@ -471,11 +493,12 @@ impl GatewaySession {
                         while terminal_written_receiver.try_recv().is_ok() {
                             voice.terminals_written = voice.terminals_written.saturating_add(1);
                         }
-                        let command = match decode_client_command_with_version(&payload) {
+                        let (version, command) = match decode_client_command_with_version(&payload)
+                        {
                             Ok((version, command)) => {
                                 negotiated_version
                                     .store(version.max(minimum_version), Ordering::Relaxed);
-                                command
+                                (version, command)
                             }
                             Err(_) => {
                                 if let Err(error) = send_rejection(
@@ -490,7 +513,10 @@ impl GatewaySession {
                         };
                         if let Err(failure) = self
                             .handle_command(
-                                command,
+                                VersionedClientCommand {
+                                    protocol_version: version,
+                                    command,
+                                },
                                 &urgent_sender,
                                 &normal_sender,
                                 &event_sender,
@@ -556,13 +582,17 @@ impl GatewaySession {
 
     async fn handle_command(
         &mut self,
-        command: ClientCommand,
+        versioned_command: VersionedClientCommand,
         urgent: &mpsc::Sender<GatewayMessage>,
         normal: &mpsc::Sender<GatewayMessage>,
         events: &mpsc::Sender<GatewayMessage>,
         active: &mut Option<ActiveForwarder>,
         voice: &mut VoiceSessionState,
     ) -> Result<(), CommandFailure> {
+        let VersionedClientCommand {
+            protocol_version,
+            command,
+        } = versioned_command;
         match command {
             ClientCommand::Status { request_id } => {
                 send_accepted(normal, &request_id).map_err(CommandFailure::response)?;
@@ -795,8 +825,57 @@ impl GatewaySession {
                     },
                     None => None,
                 };
+                let (media_lease, lease_descriptor) = match self.media_server.as_ref() {
+                    Some(media_server) => {
+                        if protocol_version < RUNTIME_PROFILE_PROTOCOL_VERSION {
+                            return send_rejection(
+                                normal,
+                                &request_id,
+                                command_error("configured media requires protocol version 3"),
+                            )
+                            .map_err(CommandFailure::response);
+                        }
+                        let lease = match media_server.reserve(session_id).await {
+                            Ok(lease) => lease,
+                            Err(_) => {
+                                return send_rejection(
+                                    normal,
+                                    &request_id,
+                                    command_error("media session could not be reserved"),
+                                )
+                                .map_err(CommandFailure::response)
+                            }
+                        };
+                        let descriptor = match media_lease_descriptor(media_server, &lease) {
+                            Ok(descriptor) => descriptor,
+                            Err(()) => {
+                                media_server.revoke(session_id).await;
+                                return send_rejection(
+                                    normal,
+                                    &request_id,
+                                    command_error("media lease could not be prepared"),
+                                )
+                                .map_err(CommandFailure::response);
+                            }
+                        };
+                        (
+                            Some(ActiveMediaLease {
+                                server: Arc::clone(media_server),
+                                session_id,
+                            }),
+                            Some(descriptor),
+                        )
+                    }
+                    None => (None, None),
+                };
+                let io = match media_lease.as_ref() {
+                    Some(lease) => {
+                        Arc::new(NetworkVoiceIoFactory::new(lease.server.hub(), session_id))
+                    }
+                    None => lane.adapters.io.clone(),
+                };
                 let mut adapters = VoiceSessionAdapters::new(
-                    lane.adapters.io.clone(),
+                    io,
                     lane.language.clone(),
                     lane.adapters.speech.clone(),
                 );
@@ -813,6 +892,7 @@ impl GatewaySession {
                 {
                     Ok(event_stream) => event_stream,
                     Err(error) => {
+                        revoke_media_lease(media_lease).await;
                         return send_rejection(
                             normal,
                             &request_id,
@@ -822,8 +902,16 @@ impl GatewaySession {
                     }
                 };
 
-                send_urgent(urgent, accepted_message(&request_id))
-                    .map_err(CommandFailure::response)?;
+                let accepted = GatewayMessage::CommandAccepted {
+                    request_id: request_id.clone(),
+                    turn_id: None,
+                    media_lease: lease_descriptor,
+                };
+                if let Err(error) = send_urgent(urgent, accepted) {
+                    let _ = runtime.shutdown().await;
+                    revoke_media_lease(media_lease).await;
+                    return Err(CommandFailure::response(error));
+                }
                 let (control_events, control_event_receiver) = mpsc::channel(1);
                 let (control_pending, control_pending_receiver) = watch::channel(false);
                 let task = tokio::spawn(pump_voice_events(
@@ -841,6 +929,7 @@ impl GatewaySession {
                     control_events,
                     control_pending,
                     capture: VoiceCaptureState::Active,
+                    media_lease,
                 });
                 if let Some(recorder) = recorder {
                     self.active_recording = Some(ActiveRecording {
@@ -1146,11 +1235,14 @@ impl GatewaySession {
                     .active
                     .take()
                     .expect("validated active voice session remains available");
-                shutdown_voice_pump(voice_session.task)
+                let media_lease = voice_session.media_lease;
+                let shutdown = shutdown_voice_pump(voice_session.task)
                     .await
                     .map_err(|error| {
                         CommandFailure::fatal(error, "gateway voice session shutdown failed")
-                    })?;
+                    });
+                revoke_media_lease(media_lease).await;
+                shutdown?;
                 voice.terminals_enqueued = voice.terminals_enqueued.saturating_add(1);
                 send_accepted(normal, &request_id).map_err(CommandFailure::response)
             }
@@ -1834,6 +1926,13 @@ async fn shutdown_active_voice(active_voice: &mut Option<ActiveVoiceSession>) {
     )
     .await;
     let _ = shutdown_voice_pump(voice_session.task).await;
+    revoke_media_lease(voice_session.media_lease).await;
+}
+
+async fn revoke_media_lease(lease: Option<ActiveMediaLease>) {
+    if let Some(lease) = lease {
+        lease.server.revoke(lease.session_id).await;
+    }
 }
 
 async fn writer_loop<W>(
@@ -2122,6 +2221,7 @@ fn accepted_message(request_id: &str) -> GatewayMessage {
     GatewayMessage::CommandAccepted {
         request_id: request_id.to_owned(),
         turn_id: None,
+        media_lease: None,
     }
 }
 
@@ -2129,7 +2229,25 @@ fn accepted_turn_message(request_id: &str, turn_id: TurnId) -> GatewayMessage {
     GatewayMessage::CommandAccepted {
         request_id: request_id.to_owned(),
         turn_id: Some(turn_id),
+        media_lease: None,
     }
+}
+
+fn media_lease_descriptor(
+    server: &MediaServer,
+    lease: &MediaLease,
+) -> Result<ClientMediaLeaseDescriptor, ()> {
+    let reconnect_window_ms =
+        u64::try_from(lease.reconnect_window().as_millis()).map_err(|_| ())?;
+    ClientMediaLeaseDescriptor::new(
+        MEDIA_PROTOCOL_VERSION,
+        lease.session_id(),
+        server.advertised_endpoint().to_owned(),
+        lease.credential().to_owned(),
+        lease.expires_at_ms(),
+        reconnect_window_ms,
+    )
+    .map_err(|_| ())
 }
 
 fn send_normal(
@@ -2416,10 +2534,11 @@ mod tests {
         AdapterError, AdapterFuture, AudioFrame, CaptureEvent, DiarizationResult, DiarizedSegment,
         GenerationLanguageModel, GenerationLanguageRequest, GenerationTextDelta,
         MeetingAudioWindows, MockContinuousAudioOutput, MockGenerationLanguageModel,
-        MockStreamingSpeechSynthesizer, MockVoiceCaptureControl, MockVoiceIoFactory, OllamaConfig,
-        OllamaLanguageModel, PcmFormat, PcmSampleFormat, RecognitionEvent, RecognitionHypothesis,
-        StreamingSpeechRequest, StreamingSpeechSynthesizer, TranscriptionDiarizer,
-        VoiceCaptureControl, VoiceInput, VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
+        MockStreamingSpeechSynthesizer, MockVoiceCaptureControl, MockVoiceIoFactory,
+        NetworkVoiceIoFactory, OllamaConfig, OllamaLanguageModel, PcmFormat, PcmSampleFormat,
+        RecognitionEvent, RecognitionHypothesis, StreamingSpeechRequest,
+        StreamingSpeechSynthesizer, TranscriptionDiarizer, VoiceCaptureControl, VoiceInput,
+        VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
     };
     use conversation_protocol::{
         ClientRuntimeEvent, ComponentDescriptor, ComponentKind, ExecutionLocation, GatewayMessage,
@@ -2437,11 +2556,11 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use conversation_runtime::{
-        read_session_recording, resolve_recording_handle, RecordingSettings,
+        read_session_recording, resolve_recording_handle, RecordedChunk, RecordingSettings,
     };
 
     use crate::voice_adapters::{GatewayVoiceAdapters, VoicePolicyTemplate};
-    use crate::FrameReader;
+    use crate::{FrameReader, MediaServer, MediaServerConfig};
 
     use super::{voice_failure_diagnostic, GatewaySession, GatewaySessionError, VoiceExchange};
 
@@ -2478,6 +2597,252 @@ mod tests {
         assert!(response.contains(&format!(r#""id":"{}""#, record.id().get())));
         assert!(response.contains(r#""content_preview":"gateway list fixture""#));
         gateway.close().await;
+    }
+
+    /// Catches the production break where a v3 media lease is accepted before its
+    /// session-specific network voice I/O is attached, where a bridge frame reaches only one
+    /// capture consumer, or where the stop path leaves that credential usable by a bridge.
+    #[tokio::test]
+    async fn media_v3_start_correlates_a_live_lease_and_stop_revokes_its_bridge_token() {
+        let key_env = "CONVERSATION_SESSION_RECORDING_KEY_MEDIA_FANOUT";
+        std::env::set_var(key_env, FAKE_RECORDING_KEY);
+        let directory = TempDir::new().unwrap();
+        let media = Arc::new(
+            MediaServer::bind(MediaServerConfig::loopback())
+                .await
+                .unwrap(),
+        );
+        let (voice, _guards) = test_voice_adapters();
+        let session_id = SessionId::new(701);
+        let session = GatewaySession::new(unused_runtime(), status_with_voice())
+            .with_voice(voice, test_language())
+            .with_recording(RecordingSettings::new(directory.path(), key_env).unwrap())
+            .with_media_server(Arc::clone(&media))
+            .with_test_session_id(session_id);
+        let mut gateway = InMemoryGateway::start(session).await;
+
+        gateway
+            .write(r#"{"protocol_version":3,"type":"status","request_id":"media-status"}"#)
+            .await;
+        let status_accepted = gateway.read_message().await;
+        assert_accepted_message(&status_accepted, "media-status");
+        assert!(!status_accepted.contains("media_lease"));
+        let _ = gateway.read_message().await;
+
+        gateway
+            .write(
+                r#"{"protocol_version":3,"type":"start_voice_session","request_id":"media-start"}"#,
+            )
+            .await;
+        let accepted = gateway.read_message().await;
+        let accepted: serde_json::Value = serde_json::from_str(&accepted).unwrap();
+        let lease = accepted
+            .get("media_lease")
+            .expect("v3 media start did not return a correlated lease");
+        assert_eq!(lease["session_id"], "701");
+        assert_eq!(lease["connect_endpoint"], media.advertised_endpoint());
+        let credential = lease["credential"].as_str().unwrap();
+        let endpoint: std::net::SocketAddr = lease["connect_endpoint"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("tcp://")
+            .unwrap()
+            .parse()
+            .unwrap();
+
+        gateway
+            .read_until(|message| message.contains(r#""type":"voice_session_started""#))
+            .await;
+        let network_factory = NetworkVoiceIoFactory::new(media.hub(), session_id);
+        let mut recognition = network_factory
+            .recognition_capture()
+            .start(session_id, CancellationToken::new())
+            .await
+            .unwrap();
+
+        let mut bridge = TcpStream::connect(endpoint).await.unwrap();
+        bridge
+            .write_all(&media_authentication(session_id, credential))
+            .await
+            .unwrap();
+        bridge
+            .write_all(&media_capture(session_id, 1, 1_000, b"live"))
+            .await
+            .unwrap();
+        let capture = timeout(TEST_TIMEOUT, recognition.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        match capture {
+            CaptureEvent::Frame(frame) => {
+                assert_eq!(frame.sequence(), 1);
+                assert_eq!(frame.bytes(), b"live");
+            }
+            event => panic!("expected capture frame, received {event:?}"),
+        }
+        let encrypted_path = wait_for_recording_bytes(directory.path(), 80).await;
+
+        gateway
+            .write(r#"{"protocol_version":3,"type":"start_voice_session","request_id":"media-second"}"#)
+            .await;
+        let second = gateway.read_message().await;
+        assert_rejected_message(&second, "media-second", "invalid_state");
+        assert!(!second.contains("media_lease"));
+
+        gateway
+            .write(
+                r#"{"protocol_version":3,"type":"stop_voice_session","request_id":"media-stop"}"#,
+            )
+            .await;
+        gateway
+            .read_until(|message| {
+                message_type(message) == "command_accepted"
+                    && message.contains(r#""request_id":"media-stop""#)
+            })
+            .await;
+        gateway
+            .write(
+                r#"{"protocol_version":3,"type":"finalize_recording","request_id":"media-finalize","session_id":"701"}"#,
+            )
+            .await;
+        assert_accepted_message(&gateway.read_message().await, "media-finalize");
+        let finalized: serde_json::Value =
+            serde_json::from_str(&gateway.read_message().await).unwrap();
+        let handle = finalized["recording"]["recording_handle"]
+            .as_str()
+            .expect("recording finalization did not publish a handle");
+        assert_eq!(
+            resolve_recording_handle(directory.path(), handle).unwrap(),
+            encrypted_path
+        );
+        let decrypted = read_session_recording(&encrypted_path, key_env).unwrap();
+        assert_eq!(decrypted.session_id, session_id);
+        assert!(!decrypted.truncated);
+        let recorded = decrypted
+            .chunks
+            .iter()
+            .filter_map(|chunk| match chunk {
+                RecordedChunk::Frame {
+                    sequence, bytes, ..
+                } => Some((*sequence, bytes.as_slice())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(recorded, vec![(1, b"live".as_slice())]);
+        let mut byte = [0_u8; 1];
+        assert_eq!(bridge.read(&mut byte).await.unwrap(), 0);
+
+        let mut replay = TcpStream::connect(endpoint).await.unwrap();
+        replay
+            .write_all(&media_authentication(session_id, credential))
+            .await
+            .unwrap();
+        assert_eq!(replay.read(&mut byte).await.unwrap(), 0);
+
+        gateway.close().await;
+        media.shutdown().await;
+    }
+
+    /// Catches the production break where a legacy client receives or can mint a
+    /// bearer credential it has no protocol field to carry.
+    #[tokio::test]
+    async fn media_configured_legacy_voice_start_is_request_scoped_and_reserves_nothing() {
+        let media = Arc::new(
+            MediaServer::bind(MediaServerConfig::loopback())
+                .await
+                .unwrap(),
+        );
+        let session_id = SessionId::new(702);
+        let mut gateway = InMemoryGateway::start(media_voice_session(&media, session_id)).await;
+
+        gateway
+            .write(r#"{"protocol_version":2,"type":"start_voice_session","request_id":"legacy-media"}"#)
+            .await;
+        let rejection = gateway.read_message().await;
+        assert_rejected_message(&rejection, "legacy-media", "invalid_state");
+        assert!(!rejection.contains("media_lease"));
+
+        let lease = media.reserve(session_id).await.unwrap();
+        media.revoke(lease.session_id()).await;
+        gateway.close().await;
+        media.shutdown().await;
+    }
+
+    /// Catches the production break where a failed reservation produces an
+    /// accepted response or replaces the already-authoritative registry entry.
+    #[tokio::test]
+    async fn media_reservation_failure_rejects_without_disclosing_a_replacement_lease() {
+        let media = Arc::new(
+            MediaServer::bind(MediaServerConfig::loopback())
+                .await
+                .unwrap(),
+        );
+        let session_id = SessionId::new(703);
+        let original = media.reserve(session_id).await.unwrap();
+        let mut gateway = InMemoryGateway::start(media_voice_session(&media, session_id)).await;
+
+        gateway
+            .write(r#"{"protocol_version":3,"type":"start_voice_session","request_id":"reserve-fail"}"#)
+            .await;
+        let rejection = gateway.read_message().await;
+        assert_rejected_message(&rejection, "reserve-fail", "invalid_state");
+        assert!(!rejection.contains("media_lease"));
+
+        let mut bridge = TcpStream::connect(original.endpoint()).await.unwrap();
+        bridge
+            .write_all(&media_authentication(session_id, original.credential()))
+            .await
+            .unwrap();
+        let mut byte = [0_u8; 1];
+        assert!(timeout(Duration::from_millis(100), bridge.read(&mut byte))
+            .await
+            .is_err());
+
+        media.revoke(session_id).await;
+        gateway.close().await;
+        media.shutdown().await;
+    }
+
+    /// Catches the production break where control-channel EOF reaps the voice
+    /// runtime but leaves the bridge credential live in MediaServer.
+    #[tokio::test]
+    async fn media_v3_client_eof_revokes_the_disclosed_bridge_token() {
+        let media = Arc::new(
+            MediaServer::bind(MediaServerConfig::loopback())
+                .await
+                .unwrap(),
+        );
+        let session_id = SessionId::new(704);
+        let mut gateway = InMemoryGateway::start(media_voice_session(&media, session_id)).await;
+
+        gateway
+            .write(
+                r#"{"protocol_version":3,"type":"start_voice_session","request_id":"eof-media"}"#,
+            )
+            .await;
+        let accepted: serde_json::Value =
+            serde_json::from_str(&gateway.read_message().await).unwrap();
+        let lease = accepted.get("media_lease").unwrap();
+        let endpoint: std::net::SocketAddr = lease["connect_endpoint"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("tcp://")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let credential = lease["credential"].as_str().unwrap().to_owned();
+
+        gateway.close().await;
+
+        let mut bridge = TcpStream::connect(endpoint).await.unwrap();
+        bridge
+            .write_all(&media_authentication(session_id, &credential))
+            .await
+            .unwrap();
+        let mut byte = [0_u8; 1];
+        assert_eq!(bridge.read(&mut byte).await.unwrap(), 0);
+        media.shutdown().await;
     }
 
     #[tokio::test]
@@ -3658,6 +4023,7 @@ mod tests {
             .send(GatewayMessage::CommandAccepted {
                 request_id: "status-0".to_owned(),
                 turn_id: None,
+                media_lease: None,
             })
             .await
             .unwrap();
@@ -3675,6 +4041,7 @@ mod tests {
                     .send(GatewayMessage::CommandAccepted {
                         request_id: format!("status-{index}"),
                         turn_id: None,
+                        media_lease: None,
                     })
                     .await
                     .unwrap();
@@ -5919,6 +6286,14 @@ mod tests {
         (session, guards)
     }
 
+    fn media_voice_session(media: &Arc<MediaServer>, session_id: SessionId) -> GatewaySession {
+        let (voice, _guards) = test_voice_adapters();
+        GatewaySession::new(unused_runtime(), status_with_voice())
+            .with_voice(voice, test_language())
+            .with_media_server(Arc::clone(media))
+            .with_test_session_id(session_id)
+    }
+
     /// A voice I/O double driven interactively by a test through `input`, unlike
     /// `MockVoiceIoFactory`'s fixed scripted list. Tests that need to interleave voice
     /// input events with mocked-time advancement (e.g. waiting out the finalization
@@ -6234,6 +6609,33 @@ mod tests {
             .unwrap();
         writer.write_all(payload.as_bytes()).await.unwrap();
         writer.flush().await.unwrap();
+    }
+
+    fn media_authentication(session_id: SessionId, credential: &str) -> Vec<u8> {
+        let mut bytes = vec![b'M', b'E', b'D', b'1', 1, 1];
+        bytes.extend_from_slice(&session_id.get().to_be_bytes());
+        bytes.push(credential.len().try_into().unwrap());
+        bytes.extend_from_slice(credential.as_bytes());
+        bytes
+    }
+
+    fn media_capture(
+        session_id: SessionId,
+        sequence: u64,
+        captured_at_ms: u64,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(42 + payload.len());
+        bytes.extend_from_slice(b"MED1\x01\x02\x01");
+        bytes.extend_from_slice(&session_id.get().to_be_bytes());
+        bytes.extend_from_slice(&sequence.to_be_bytes());
+        bytes.extend_from_slice(&captured_at_ms.to_be_bytes());
+        bytes.push(1);
+        bytes.extend_from_slice(&16_000_u32.to_be_bytes());
+        bytes.extend_from_slice(&1_u16.to_be_bytes());
+        bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(payload);
+        bytes
     }
 
     async fn wait_for_queued_start_acceptance_and_turn_started(

@@ -148,3 +148,74 @@ meeting rather than trusted:
   containing silence, steady room noise, separated speech, and overlap; expected evidence is
   no segment for silence/background, separate timestamped turns across silence, and `null`
   speaker labels for overlap. Do not change the threshold from a model-only or synthetic run.
+
+## 7. Validate the private TLS media bridge, client token, and dual capture fan-out
+
+This is deliberately unexecuted by automated tests. The tests use only plaintext loopback fake
+bridges. Run this once on the authorised agent-box and again with a consented real meeting device;
+do not run it from CI, a developer laptop on a public network, or an untrusted bridge.
+
+1. Have the agent-box operator install a server certificate and private key at the service-owned
+   paths selected for the deployment. The key must be readable only by the gateway service
+   account; do not place certificate contents, key contents, lease credentials, or audio in shell
+   history, tickets, logs, packet captures, or the configuration repository. Confirm the
+   certificate's subject/SAN matches the private address the bridge will use and that the
+   agent-box firewall allows the media port only from the bridge network.
+
+2. In the already-valid schema-v3 gateway configuration, add a bounded non-loopback `[media]`
+   section using the actual private address and the two installed file references. The following
+   is a shape-only example, not a deployable endpoint or filesystem location:
+
+   ```toml
+   [media]
+   bind = "10.0.0.25:9443"
+   advertised_endpoint = "tls://10.0.0.25:9443"
+   credential_lifetime_ms = 60000
+   reconnect_window_ms = 10000
+   max_frames_per_second = 100
+   max_payload_bytes = 32768
+   max_outbound_queue_bytes = 262144
+   max_outbound_queue_ms = 10000
+   tls_certificate_path = "/service-managed/certificates/media-server.pem"
+   tls_private_key_path = "/service-managed/certificates/media-server-key.pem"
+   ```
+
+   Keep the reconnect window no greater than the credential lifetime and the queue time no
+   greater than the reconnect window. Confirm that removing either TLS file reference makes
+   startup fail, and that the listener does not start before the configuration is valid.
+
+3. Start the gateway under the normal service manager, then use a protocol-v3 control client to
+   start exactly one voice session. Retain the returned `connect_endpoint`, authoritative session
+   id, and opaque credential only in the bridge process's volatile memory. Verify that a v1/v2
+   start is request-scoped rejected for this media-configured deployment, and that no status or
+   error line displays the credential.
+
+4. From the authorised bridge, verify the TLS certificate chain and private endpoint before
+   sending any media bytes. Only after that TLS handshake completes, authenticate the bridge with
+   the exact session id and short-lived credential returned by its own v3 acceptance. A plaintext
+   connection, a token before TLS, a token from another session, an expired token, and a replay
+   after stop must each be refused without media delivery. This token is the required client
+   authentication mechanism; do not add or depend on mTLS unless the deployment separately adopts
+   it.
+
+5. With a consented real input device, send a small sequence of known capture frames, then induce
+   one controlled disconnect and reconnect within the lease window. Retain only metadata evidence:
+   TLS connection/packet counts and timing, session id, frame sequence range, timestamps, byte
+   counts, and a bridge-computed checksum for each test frame. Do not capture or retain raw packet
+   payloads. The expected result is monotonic capture sequence, one explicit recording gap at the
+   disconnect, no fabricated silence, no duplicated pre-disconnect frame after reconnect, and
+   refusal after the reconnect window expires.
+
+6. Stop the voice session and finalize its recording through the v3 control client. On the
+   authorised agent-box, use the runtime's normal encrypted-recording reader with the service key
+   available only to that host; confirm its decrypted frame sequence and checksums equal the
+   bridge metadata from step 5. Confirm the recording directory contains the encrypted artifact
+   only and that no plaintext capture bytes were written to temporary storage.
+
+7. For the same frames, confirm the recognizer's `AudioCapture` consumer receives the matching
+   sequence/byte-count/checksum evidence and, once the separately-authorised online recognizer is
+   configured, produces the expected transcript from the consented device. The recorder check in
+   step 6 and this recognizer check must both pass for the same session: a successful transcript
+   alone is not evidence that encrypted recording received capture, and a finalized recording
+   alone is not evidence that recognition received capture. Record only aggregate checksums and
+   transcript approval evidence, never raw audio or a bearer credential.

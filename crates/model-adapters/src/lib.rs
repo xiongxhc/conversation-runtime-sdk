@@ -12,6 +12,7 @@ mod macos_afplay;
 mod macos_system_speech;
 mod macos_voice_sidecar;
 mod mock;
+mod network_voice_io;
 mod ollama;
 mod openai_compatible_speech;
 mod openai_compatible_streaming_speech;
@@ -62,6 +63,10 @@ pub use macos_voice_sidecar::{
     SystemDevice,
 };
 pub use mock::{MockAudioOutput, MockLanguageModel, MockSpeechSynthesizer};
+pub use network_voice_io::{
+    frame_for_network_capture, NetworkBridgeRequest, NetworkFlushRequest, NetworkMediaHub,
+    NetworkPlaybackAck, NetworkPlaybackRequest, NetworkVoiceIoFactory,
+};
 pub use ollama::{
     OllamaChatMetrics, OllamaChatStream, OllamaConfig, OllamaLanguageModel, OllamaThinkingLevel,
 };

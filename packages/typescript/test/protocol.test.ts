@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -100,6 +101,56 @@ test("keeps v1 and v2 typed-start decoding version-specific", () => {
     request_id: "request-1",
     turn_id: "9",
   }, 2), { type: "command_accepted", requestId: "request-1", turnId: 9n });
+});
+
+// Production break caught: a lease-bearing v3 acceptance could be decoded by a legacy client,
+// or a malformed lease could escape the bounded control-plane parser.
+test("parses only a valid version-three media lease acceptance", () => {
+  const credential = randomUUID().replaceAll("-", "");
+  const lease = {
+    media_protocol_version: 1,
+    session_id: "17",
+    connect_endpoint: "tcp://127.0.0.1:41000",
+    credential,
+    expires_at_ms: (BigInt(Date.now()) + 60_000n).toString(),
+    reconnect_window_ms: "10000",
+  };
+  assert.deepEqual(parseGatewayMessage({
+    protocol_version: 3,
+    type: "command_accepted",
+    request_id: "start-lease",
+    media_lease: lease,
+  }, 3), {
+    type: "command_accepted",
+    requestId: "start-lease",
+    mediaLease: {
+      mediaProtocolVersion: 1,
+      sessionId: 17n,
+      connectEndpoint: "tcp://127.0.0.1:41000",
+      credential,
+      expiresAtMs: BigInt(lease.expires_at_ms),
+      reconnectWindowMs: 10_000n,
+    },
+  });
+
+  for (const version of [1, 2] as const) {
+    assert.throws(() => parseGatewayMessage({
+      protocol_version: version,
+      type: "command_accepted",
+      request_id: "start-lease",
+      media_lease: lease,
+    }, version));
+  }
+  const malformed = { ...lease, session_id: "0" };
+  assert.throws(
+    () => parseGatewayMessage({
+      protocol_version: 3,
+      type: "command_accepted",
+      request_id: "start-lease",
+      media_lease: malformed,
+    }, 3),
+    (error: unknown) => !String(error).includes(credential),
+  );
 });
 
 test("detects a v2 ready message and decodes its context-seed status", () => {

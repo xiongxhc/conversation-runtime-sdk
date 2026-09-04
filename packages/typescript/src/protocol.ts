@@ -19,6 +19,11 @@ export const MAX_PROCESSING_INSTRUCTIONS_BYTES = 4 * 1024;
 export const MAX_PROCESSING_INPUT_BYTES = 16 * 1024;
 export const MAX_PROCESSING_SCHEMA_BYTES = 8 * 1024;
 export const MAX_PROCESSED_OUTPUT_BYTES = 64 * 1024;
+export const MEDIA_PROTOCOL_VERSION = 1;
+export const MAX_MEDIA_CONNECT_ENDPOINT_BYTES = 256;
+export const MAX_MEDIA_CREDENTIAL_BYTES = 128;
+export const MAX_MEDIA_LEASE_LIFETIME_MS = 5n * 60n * 1_000n;
+export const MAX_MEDIA_RECONNECT_WINDOW_MS = 60_000n;
 
 const MAX_U64_DECIMAL = "18446744073709551615";
 const MAX_I64_DECIMAL = "9223372036854775807";
@@ -421,9 +426,19 @@ export type VoiceSessionEvent = LegacyVoiceSessionEvent | VersionThreeVoiceSessi
 export type VoiceSessionEventForVersion<Version extends ClientProtocolVersion> =
   Version extends 3 ? VersionThreeVoiceSessionEvent : LegacyVoiceSessionEvent;
 
+/** Opaque control-plane bridge connection data. It never contains media frames. */
+export type MediaLease = {
+  mediaProtocolVersion: number;
+  sessionId: bigint;
+  connectEndpoint: string;
+  credential: string;
+  expiresAtMs: bigint;
+  reconnectWindowMs: bigint;
+};
+
 export type GatewayMessage =
   | { type: "ready"; status: RuntimeStatus }
-  | { type: "command_accepted"; requestId: string; turnId?: bigint }
+  | { type: "command_accepted"; requestId: string; turnId?: bigint; mediaLease?: MediaLease }
   | { type: "command_rejected"; requestId: string; error: RuntimeFailure }
   | { type: "status"; requestId: string; status: RuntimeStatus }
   | { type: "memory_list"; requestId: string; records: MemorySummary[]; nextCursor: MemoryCursor | null }
@@ -638,18 +653,30 @@ export function parseGatewayMessage(
       validateProtocolVersion(object, version);
       return { type, status: parseRuntimeStatus(object.status, version) };
     case "command_accepted":
+      {
+        const hasTurnId = "turn_id" in object;
+        const hasMediaLease = "media_lease" in object;
       requireExactKeys(
         object,
-        "turn_id" in object
-          ? ["protocol_version", "type", "request_id", "turn_id"]
-          : ["protocol_version", "type", "request_id"],
+        [
+          "protocol_version",
+          "type",
+          "request_id",
+          ...(hasTurnId ? ["turn_id"] : []),
+          ...(hasMediaLease ? ["media_lease"] : []),
+        ],
       );
       validateProtocolVersion(object, version);
+      if (hasMediaLease && version < RUNTIME_PROFILE_PROTOCOL_VERSION) {
+        throw new ProtocolError("media lease requires protocol version 3");
+      }
       return {
         type,
         requestId: requireRequestId(object),
-        ...("turn_id" in object ? { turnId: parseIdentifier(object.turn_id) } : {}),
+        ...(hasTurnId ? { turnId: parseIdentifier(object.turn_id) } : {}),
+        ...(hasMediaLease ? { mediaLease: parseMediaLease(object.media_lease) } : {}),
       };
+      }
     case "command_rejected":
       requireExactKeys(object, ["protocol_version", "type", "request_id", "error"]);
       validateProtocolVersion(object, version);
@@ -1815,6 +1842,80 @@ function requireMemoryLocation(value: unknown): "local" | null {
     return value;
   }
   throw new ProtocolError("runtime status memory_location has an unsupported value");
+}
+
+function parseMediaLease(value: unknown): MediaLease {
+  const object = requireRecord(value, "media lease");
+  requireExactKeys(object, [
+    "media_protocol_version",
+    "session_id",
+    "connect_endpoint",
+    "credential",
+    "expires_at_ms",
+    "reconnect_window_ms",
+  ]);
+  if (object.media_protocol_version !== MEDIA_PROTOCOL_VERSION) {
+    throw new ProtocolError("invalid media lease");
+  }
+  const connectEndpoint = requireString(object, "connect_endpoint");
+  const credential = requireString(object, "credential");
+  const expiresAtMs = parseBoundedDecimal(object.expires_at_ms, "media lease expiry", MAX_U64.toString(), "invalid media lease");
+  const reconnectWindowMs = parseBoundedDecimal(
+    object.reconnect_window_ms,
+    "media lease reconnect window",
+    MAX_U64.toString(),
+    "invalid media lease",
+  );
+  const now = BigInt(Date.now());
+  const lifetimeMs = expiresAtMs - now;
+  if (
+    !isValidMediaEndpoint(connectEndpoint)
+    || !isValidMediaCredential(credential)
+    || lifetimeMs <= 0n
+    || lifetimeMs > MAX_MEDIA_LEASE_LIFETIME_MS
+    || reconnectWindowMs <= 0n
+    || reconnectWindowMs > MAX_MEDIA_RECONNECT_WINDOW_MS
+    || reconnectWindowMs > lifetimeMs
+  ) {
+    throw new ProtocolError("invalid media lease");
+  }
+  return {
+    mediaProtocolVersion: MEDIA_PROTOCOL_VERSION,
+    sessionId: parseIdentifier(object.session_id),
+    connectEndpoint,
+    credential,
+    expiresAtMs,
+    reconnectWindowMs,
+  };
+}
+
+function isValidMediaEndpoint(value: string): boolean {
+  if (new TextEncoder().encode(value).length === 0 || new TextEncoder().encode(value).length > MAX_MEDIA_CONNECT_ENDPOINT_BYTES) {
+    return false;
+  }
+  const match = /^(tcp|tls):\/\/(.+)$/.exec(value);
+  if (!match || /[/?#@]/.test(match[2])) {
+    return false;
+  }
+  const address = match[2];
+  const ipv4 = /^(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})$/.exec(address);
+  const ipv6 = /^\[([0-9a-fA-F:]+)\]:(\d{1,5})$/.exec(address);
+  if (ipv4) {
+    return ipv4[1].split(".").every((part) => Number(part) <= 255) && validMediaPort(ipv4[2]);
+  }
+  return Boolean(ipv6 && ipv6[1].includes(":") && validMediaPort(ipv6[2]));
+}
+
+function validMediaPort(value: string): boolean {
+  const port = Number(value);
+  return Number.isInteger(port) && port >= 1 && port <= 65_535;
+}
+
+function isValidMediaCredential(value: string): boolean {
+  const bytes = new TextEncoder().encode(value);
+  return bytes.length >= 16
+    && bytes.length <= MAX_MEDIA_CREDENTIAL_BYTES
+    && /^[A-Za-z0-9_-]+$/.test(value);
 }
 
 function parseIdentifier(value: unknown): bigint {

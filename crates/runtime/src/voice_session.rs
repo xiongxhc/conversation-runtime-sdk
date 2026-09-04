@@ -126,16 +126,16 @@ impl VoiceSessionRuntime {
         let adapters = self.adapters.clone();
         let task_cancellation = cancellation.clone();
         tokio::spawn(async move {
-            let terminal = run_voice_session(
+            let terminal = run_voice_session(VoiceSessionRun {
                 policy,
                 privacy,
                 context,
                 adapters,
-                command_receiver,
-                event_sender,
-                task_cancellation,
+                commands: command_receiver,
+                events: event_sender,
+                cancellation: task_cancellation,
                 response_mode,
-            )
+            })
             .await;
 
             let mut active = active_sessions.lock().await;
@@ -333,16 +333,28 @@ enum SessionCommand {
     },
 }
 
-async fn run_voice_session(
+struct VoiceSessionRun {
     policy: VoiceSessionPolicy,
     privacy: PrivacySummary,
     context: ConversationContext,
     adapters: VoiceSessionAdapters,
-    mut commands: mpsc::Receiver<SessionCommand>,
+    commands: mpsc::Receiver<SessionCommand>,
     events: mpsc::Sender<VoiceSessionEvent>,
     cancellation: CancellationToken,
     response_mode: VoiceResponseMode,
-) -> VoiceSessionEvent {
+}
+
+async fn run_voice_session(run: VoiceSessionRun) -> VoiceSessionEvent {
+    let VoiceSessionRun {
+        policy,
+        privacy,
+        context,
+        adapters,
+        mut commands,
+        events,
+        cancellation,
+        response_mode,
+    } = run;
     let session_id = policy.session_id();
     let VoiceIoSession {
         input,
@@ -408,16 +420,18 @@ async fn run_voice_session(
     );
     VoiceLoop::new(
         policy,
-        input_events,
-        capture,
-        completion,
-        turn_runtime,
-        commands,
-        events,
-        cancellation,
-        recorder,
-        response_mode,
-        context,
+        VoiceLoopDependencies {
+            input_events,
+            capture,
+            completion,
+            turn_runtime,
+            commands,
+            events,
+            cancellation,
+            recorder,
+            response_mode,
+            context,
+        },
     )
     .run()
     .await
@@ -498,6 +512,19 @@ struct VoiceLoop {
     context: ConversationContext,
 }
 
+struct VoiceLoopDependencies {
+    input_events: mpsc::Receiver<Result<VoiceInputEvent, AdapterError>>,
+    capture: Arc<dyn VoiceCaptureControl>,
+    completion: JoinHandle<Result<(), AdapterError>>,
+    turn_runtime: StreamingTurnRuntime,
+    commands: mpsc::Receiver<SessionCommand>,
+    events: mpsc::Sender<VoiceSessionEvent>,
+    cancellation: CancellationToken,
+    recorder: Option<Arc<Mutex<SessionRecorder>>>,
+    response_mode: VoiceResponseMode,
+    context: ConversationContext,
+}
+
 enum PendingSegment {
     Pending(String),
     Authorized(TurnId),
@@ -505,20 +532,19 @@ enum PendingSegment {
 }
 
 impl VoiceLoop {
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        policy: VoiceSessionPolicy,
-        input: mpsc::Receiver<Result<VoiceInputEvent, AdapterError>>,
-        capture: Arc<dyn VoiceCaptureControl>,
-        completion: JoinHandle<Result<(), AdapterError>>,
-        turn_runtime: StreamingTurnRuntime,
-        commands: mpsc::Receiver<SessionCommand>,
-        events: mpsc::Sender<VoiceSessionEvent>,
-        cancellation: CancellationToken,
-        recorder: Option<Arc<Mutex<SessionRecorder>>>,
-        response_mode: VoiceResponseMode,
-        context: ConversationContext,
-    ) -> Self {
+    fn new(policy: VoiceSessionPolicy, dependencies: VoiceLoopDependencies) -> Self {
+        let VoiceLoopDependencies {
+            input_events: input,
+            capture,
+            completion,
+            turn_runtime,
+            commands,
+            events,
+            cancellation,
+            recorder,
+            response_mode,
+            context,
+        } = dependencies;
         let final_silence_ms = policy.final_silence_ms();
         Self {
             session_id: policy.session_id(),
@@ -1187,19 +1213,17 @@ impl VoiceLoop {
             if matches!(
                 self.pending_segments.remove(&expired),
                 Some(PendingSegment::Pending(_))
-            ) {
-                if !self
-                    .publish_reliable(VoiceSessionEvent::ResponseSkipped {
-                        session_id: self.session_id,
-                        segment_id: expired,
-                        reason: "pending_segment_expired".to_owned(),
-                    })
-                    .await
-                {
-                    return Err(runtime_error(
-                        "voice session event stream closed during segment expiry",
-                    ));
-                }
+            ) && !self
+                .publish_reliable(VoiceSessionEvent::ResponseSkipped {
+                    session_id: self.session_id,
+                    segment_id: expired,
+                    reason: "pending_segment_expired".to_owned(),
+                })
+                .await
+            {
+                return Err(runtime_error(
+                    "voice session event stream closed during segment expiry",
+                ));
             }
         }
         self.pending_order.push_back(segment_id);
@@ -1976,16 +2000,18 @@ mod tests {
         drop(event_receiver);
         let mut voice_loop = VoiceLoop::new(
             policy,
-            input_receiver,
-            Arc::new(MockVoiceCaptureControl::new()),
-            tokio::spawn(async { Ok(()) }),
-            turn_runtime,
-            command_receiver,
-            event_sender,
-            CancellationToken::new(),
-            None,
-            VoiceResponseMode::Automatic,
-            context.clone(),
+            VoiceLoopDependencies {
+                input_events: input_receiver,
+                capture: Arc::new(MockVoiceCaptureControl::new()),
+                completion: tokio::spawn(async { Ok(()) }),
+                turn_runtime,
+                commands: command_receiver,
+                events: event_sender,
+                cancellation: CancellationToken::new(),
+                recorder: None,
+                response_mode: VoiceResponseMode::Automatic,
+                context: context.clone(),
+            },
         );
         voice_loop
             .finalizer
@@ -2044,16 +2070,18 @@ mod tests {
         let (event_sender, _events) = mpsc::channel(SESSION_EVENT_BUFFER_SIZE);
         let mut loop_ = VoiceLoop::new(
             policy,
-            input_receiver,
-            Arc::new(MockVoiceCaptureControl::new()),
-            tokio::spawn(async { Ok(()) }),
-            runtime,
-            command_receiver,
-            event_sender,
-            CancellationToken::new(),
-            None,
-            VoiceResponseMode::ExternalGate,
-            context.clone(),
+            VoiceLoopDependencies {
+                input_events: input_receiver,
+                capture: Arc::new(MockVoiceCaptureControl::new()),
+                completion: tokio::spawn(async { Ok(()) }),
+                turn_runtime: runtime,
+                commands: command_receiver,
+                events: event_sender,
+                cancellation: CancellationToken::new(),
+                recorder: None,
+                response_mode: VoiceResponseMode::ExternalGate,
+                context: context.clone(),
+            },
         );
         for segment_id in 1..=10 {
             loop_

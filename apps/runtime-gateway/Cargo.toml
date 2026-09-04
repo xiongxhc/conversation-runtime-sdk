@@ -11,10 +11,13 @@ conversation-protocol.workspace = true
 conversation-runtime.workspace = true
 reqwest.workspace = true
 ring.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+tokio-rustls.workspace = true
 toml.workspace = true
 
 [target.'cfg(unix)'.dependencies]

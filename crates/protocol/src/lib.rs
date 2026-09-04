@@ -42,11 +42,13 @@ pub use client_voice::{
 };
 pub use client_wire::{
     decode_client_command, decode_client_command_with_version, encode_gateway_message,
-    encode_gateway_message_for_version, ClientCommand, ClientMemoryTrace, ClientQualityDecision,
-    ClientResponseControls, ClientRuntimeError, ClientRuntimeEvent, ClientWireError,
-    ConversationContextExchange, GatewayMessage, RuntimeStatus, CLIENT_PROTOCOL_VERSION,
-    CONTEXT_SEED_PROTOCOL_VERSION, LEGACY_CLIENT_PROTOCOL_VERSION, MAX_CLIENT_FRAME_BYTES,
-    RUNTIME_PROFILE_PROTOCOL_VERSION,
+    encode_gateway_message_for_version, ClientCommand, ClientMediaLeaseDescriptor,
+    ClientMemoryTrace, ClientQualityDecision, ClientResponseControls, ClientRuntimeError,
+    ClientRuntimeEvent, ClientWireError, ConversationContextExchange, GatewayMessage,
+    RuntimeStatus, CLIENT_PROTOCOL_VERSION, CONTEXT_SEED_PROTOCOL_VERSION,
+    LEGACY_CLIENT_PROTOCOL_VERSION, MAX_CLIENT_FRAME_BYTES, MAX_MEDIA_CONNECT_ENDPOINT_BYTES,
+    MAX_MEDIA_CREDENTIAL_BYTES, MAX_MEDIA_LEASE_LIFETIME_MS, MAX_MEDIA_RECONNECT_WINDOW_MS,
+    MEDIA_PROTOCOL_VERSION, RUNTIME_PROFILE_PROTOCOL_VERSION,
 };
 pub use command::RuntimeCommand;
 pub use error::{RuntimeError, RuntimeErrorKind, RuntimeStage};

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import test from "node:test";
 import { setImmediate } from "node:timers/promises";
 
@@ -934,6 +935,62 @@ test("startVoiceSession resolves on acceptance and streams events to terminal", 
     { type: "voice_session_ended", sessionId: 1n },
   ]);
   await connected.client.close();
+});
+
+// Production break caught: a v3 lease accepted for one start request could be dropped,
+// mis-correlated, or surface its opaque credential in a malformed-lease failure.
+test("startVoiceSession exposes only its correlated version-three media lease", async () => {
+  const { client, transport } = await connectedV3Client();
+  const starting = client.startVoiceSession({ profile: "offline" });
+  const start = command(transport, "start_voice_session");
+  const credential = randomUUID().replaceAll("-", "");
+  const expiresAtMs = BigInt(Date.now()) + 60_000n;
+  transport.push({
+    type: "command_accepted",
+    protocol_version: 3,
+    request_id: start.requestId,
+    media_lease: {
+      media_protocol_version: 1,
+      session_id: "29",
+      connect_endpoint: "tcp://127.0.0.1:41000",
+      credential,
+      expires_at_ms: expiresAtMs.toString(),
+      reconnect_window_ms: "10000",
+    },
+  });
+
+  const session = await starting;
+  assert.deepEqual(session.mediaLease, {
+    mediaProtocolVersion: 1,
+    sessionId: 29n,
+    connectEndpoint: "tcp://127.0.0.1:41000",
+    credential,
+    expiresAtMs,
+    reconnectWindowMs: 10_000n,
+  });
+  await client.close();
+});
+
+test("malformed version-three media lease fails closed without credential echo", async () => {
+  const { client, transport } = await connectedV3Client();
+  const starting = client.startVoiceSession({ profile: "offline" });
+  const start = command(transport, "start_voice_session");
+  const credential = randomUUID().replaceAll("-", "");
+  transport.push({
+    type: "command_accepted",
+    protocol_version: 3,
+    request_id: start.requestId,
+    media_lease: {
+      media_protocol_version: 1,
+      session_id: "0",
+      connect_endpoint: "tcp://127.0.0.1:41000",
+      credential,
+      expires_at_ms: (BigInt(Date.now()) + 60_000n).toString(),
+      reconnect_window_ms: "10000",
+    },
+  });
+  await assert.rejects(starting, (error: unknown) => !String(error).includes(credential));
+  await client.close();
 });
 
 test("a rejected startVoiceSession rejects only that request and leaves the client usable", async () => {

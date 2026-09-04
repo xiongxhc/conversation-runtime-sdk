@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::io::Read;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -24,6 +24,7 @@ use conversation_protocol::{
 use conversation_runtime::{ConversationContext, ConversationQualityController, RecordingSettings};
 use serde::{Deserialize, Serialize};
 
+use crate::media_server::{MediaServerConfig, MediaTlsConfig};
 use crate::memory_extraction::MemoryExtractionSettings;
 use crate::voice_adapters::{GatewayVoiceAdapters, VoicePolicyTemplate};
 
@@ -87,6 +88,8 @@ pub struct GatewayConfig {
     voice: Option<VoiceConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     recording: Option<RecordingConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    media: Option<MediaConfig>,
 }
 
 pub struct GatewayAdapters {
@@ -103,7 +106,61 @@ pub struct GatewayAdapters {
     /// What reconciles a finished recording, when `[voice.diarization]` is configured. Absent
     /// in the default configuration, which reconciles nothing.
     pub diarizer: Option<Arc<dyn TranscriptionDiarizer>>,
+    /// Optional transport listener configuration. `main` owns the resulting server;
+    /// configuration loading never binds a socket.
+    pub media: Option<MediaServerConfig>,
     pub status: RuntimeStatus,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct MediaConfig {
+    bind: SocketAddr,
+    advertised_endpoint: String,
+    credential_lifetime_ms: u64,
+    reconnect_window_ms: u64,
+    max_frames_per_second: u32,
+    max_payload_bytes: usize,
+    max_outbound_queue_bytes: usize,
+    max_outbound_queue_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tls_certificate_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tls_private_key_path: Option<PathBuf>,
+}
+
+impl MediaConfig {
+    fn server_config(&self) -> Result<MediaServerConfig, GatewayConfigError> {
+        if self.reconnect_window_ms > self.credential_lifetime_ms {
+            return Err(config_error(
+                "media reconnect window must not exceed credential lifetime",
+            ));
+        }
+        let tls = match (&self.tls_certificate_path, &self.tls_private_key_path) {
+            (Some(certificate), Some(private_key)) => Some(
+                MediaTlsConfig::new(certificate.clone(), private_key.clone())
+                    .map_err(adapter_error)?,
+            ),
+            (None, None) => None,
+            _ => {
+                return Err(config_error(
+                    "media TLS certificate and private key must be configured together",
+                ))
+            }
+        };
+        MediaServerConfig::new(
+            self.bind,
+            self.advertised_endpoint.clone(),
+            std::time::Duration::from_millis(self.credential_lifetime_ms),
+            std::time::Duration::from_millis(self.reconnect_window_ms),
+            self.max_frames_per_second,
+            self.max_payload_bytes,
+            self.max_outbound_queue_bytes,
+            std::time::Duration::from_millis(self.max_outbound_queue_ms),
+            tls,
+        )
+        .map_err(adapter_error)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -322,6 +379,7 @@ impl GatewayDeploymentConfig {
             memory: None,
             voice: None,
             recording: None,
+            media: None,
         };
         config
             .provider_hosts
@@ -474,6 +532,11 @@ impl GatewayConfig {
         if let Some(recording) = self.recording.as_ref() {
             recording.validate()?;
         }
+        let media = self
+            .media
+            .as_ref()
+            .map(MediaConfig::server_config)
+            .transpose()?;
 
         let memory_enabled = memory.is_some();
         let mut capabilities = vec![
@@ -510,6 +573,7 @@ impl GatewayConfig {
             components,
             memory,
             quality,
+            media,
             status,
         })
     }
@@ -520,6 +584,7 @@ impl GatewayConfig {
             components,
             memory,
             quality,
+            media,
             status,
         } = self.deployment_plan()?;
         if !matches!(self.profile(), RuntimeProfile::Offline) {
@@ -577,6 +642,7 @@ impl GatewayConfig {
             provider_hosts,
             recording,
             diarizer,
+            media,
             status,
         })
     }
@@ -613,10 +679,11 @@ impl GatewayConfig {
         if self.profile.is_some()
             || self.language.credential_env.is_some()
             || self.recording.is_some()
+            || self.media.is_some()
             || voice_keys
         {
             return Err(config_error(
-                "profile, credential_env, response_mode, and recording require schema_version 3",
+                "profile, credential_env, response_mode, recording, and media require schema_version 3",
             ));
         }
         Ok(())
@@ -1869,6 +1936,7 @@ struct DeploymentPlan {
     components: Vec<ComponentDescriptor>,
     memory: Option<(SqliteMemoryContextProvider, SqliteMemoryStore)>,
     quality: ConversationQualityController,
+    media: Option<MediaServerConfig>,
     status: RuntimeStatus,
 }
 

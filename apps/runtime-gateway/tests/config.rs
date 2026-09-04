@@ -1547,6 +1547,122 @@ fn an_omitted_profile_selects_offline_on_every_schema_version() {
     }
 }
 
+/// Catches the production break where merely adding `[media]` to the decoder
+/// silently started a listener for the established offline configuration, or
+/// let legacy schema versions opt into an unnegotiated transport.
+#[test]
+fn schema_v3_media_is_optional_and_legacy_schemas_reject_it() {
+    let fixture = tempfile::tempdir().unwrap();
+    let omitted = write_config(fixture.path(), &schema_v3_offline_config());
+    assert!(GatewayConfig::load(&omitted).unwrap().media.is_none());
+
+    let media = r#"
+[media]
+bind = "127.0.0.1:0"
+advertised_endpoint = "tcp://127.0.0.1:0"
+credential_lifetime_ms = 60000
+reconnect_window_ms = 10000
+max_frames_per_second = 100
+max_payload_bytes = 16384
+max_outbound_queue_bytes = 262144
+max_outbound_queue_ms = 10000
+"#;
+    let configured = write_config(
+        fixture.path(),
+        &format!("{}{}", schema_v3_offline_config(), media),
+    );
+    assert_eq!(
+        GatewayConfig::load(&configured)
+            .unwrap()
+            .media
+            .unwrap()
+            .advertised_endpoint(),
+        "tcp://127.0.0.1:0"
+    );
+
+    // This validates references only. It deliberately never binds a private
+    // address or reads certificate material in an automated test.
+    let tls_private = media
+        .replace("127.0.0.1:0", "192.168.50.10:9443")
+        .replace("tcp://", "tls://")
+        + "tls_certificate_path = \"/var/lib/gateway/media-cert.pem\"\n"
+        + "tls_private_key_path = \"/var/lib/gateway/media-key.pem\"\n";
+    let tls_configured = write_config(
+        fixture.path(),
+        &format!("{}{}", schema_v3_offline_config(), tls_private),
+    );
+    assert!(GatewayConfig::validate(&tls_configured).is_ok());
+
+    for legacy in [
+        VALID_CONFIG.to_owned(),
+        schema_v2_config(EXTERNAL_HOST, "language-host"),
+    ] {
+        let path = write_config(fixture.path(), &format!("{legacy}{media}"));
+        let error = GatewayConfig::validate(&path).unwrap_err().to_string();
+        assert!(error.contains("schema_version 3"), "{error}");
+    }
+}
+
+/// Catches the production break where an Internet-reachable plaintext media
+/// listener is accepted because only the TCP bind succeeds at runtime.
+#[test]
+fn media_configuration_rejects_unbounded_or_unprotected_endpoints() {
+    let fixture = tempfile::tempdir().unwrap();
+    let base = schema_v3_offline_config();
+    for media in [
+        r#"
+[media]
+bind = "0.0.0.0:9000"
+advertised_endpoint = "tcp://0.0.0.0:9000"
+credential_lifetime_ms = 60000
+reconnect_window_ms = 10000
+max_frames_per_second = 100
+max_payload_bytes = 16384
+max_outbound_queue_bytes = 262144
+max_outbound_queue_ms = 10000
+"#,
+        r#"
+[media]
+bind = "127.0.0.1:9000"
+advertised_endpoint = "tcp://127.0.0.1:9000"
+credential_lifetime_ms = 0
+reconnect_window_ms = 10000
+max_frames_per_second = 100
+max_payload_bytes = 16384
+max_outbound_queue_bytes = 262144
+max_outbound_queue_ms = 10000
+"#,
+        r#"
+[media]
+bind = "127.0.0.1:9000"
+advertised_endpoint = "tls://127.0.0.1:9000"
+credential_lifetime_ms = 60000
+reconnect_window_ms = 10000
+max_frames_per_second = 100
+max_payload_bytes = 16384
+max_outbound_queue_bytes = 262144
+max_outbound_queue_ms = 10000
+"#,
+        r#"
+[media]
+bind = "127.0.0.1:9000"
+advertised_endpoint = "tcp://127.0.0.1:9000"
+credential_lifetime_ms = 10000
+reconnect_window_ms = 20000
+max_frames_per_second = 100
+max_payload_bytes = 16384
+max_outbound_queue_bytes = 262144
+max_outbound_queue_ms = 10000
+"#,
+    ] {
+        let path = write_config(fixture.path(), &format!("{base}{media}"));
+        assert!(
+            GatewayConfig::validate(&path).is_err(),
+            "accepted:\n{media}"
+        );
+    }
+}
+
 #[test]
 fn an_explicit_offline_profile_is_accepted_only_from_schema_version_three() {
     let online_key = "profile = \"online\"";

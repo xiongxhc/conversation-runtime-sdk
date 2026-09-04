@@ -1,6 +1,7 @@
 mod config;
 mod framing;
 mod input_relay;
+mod media_server;
 mod memory_extraction;
 mod provider_supervisor;
 mod session;
@@ -13,6 +14,7 @@ pub use config::{
 };
 pub use framing::{FrameError, FrameReader, FrameWriter};
 pub use input_relay::{input_relay, InputRelay};
+pub use media_server::{MediaLease, MediaServer, MediaServerConfig};
 pub use memory_extraction::MemoryExtractionSettings;
 pub use provider_supervisor::{ProviderSupervisor, ProviderSupervisorError};
 pub use session::{GatewaySession, GatewaySessionError};

@@ -1,12 +1,12 @@
 use conversation_protocol::{
     decode_client_command, encode_gateway_message, encode_gateway_message_for_version,
     memory_preview, ClientCommand, ClientComponentDescriptor, ClientDiarizedSegment,
-    ClientMemoryApproval, ClientMemoryCursor, ClientMemoryInspection, ClientMemoryProvenance,
-    ClientMemoryRecord, ClientMemoryRetention, ClientMemorySummary, ClientMemoryTrace,
-    ClientPersonaState, ClientPrivacySummary, ClientProcessedText, ClientQualityDecision,
-    ClientRecordingGap, ClientRecordingReconciliation, ClientRecordingSummary,
-    ClientResponseControls, ClientRuntimeError, ClientRuntimeEvent, ClientVoiceSessionEvent,
-    ClientWireError, ComponentDescriptor, ComponentKind, ContextSource,
+    ClientMediaLeaseDescriptor, ClientMemoryApproval, ClientMemoryCursor, ClientMemoryInspection,
+    ClientMemoryProvenance, ClientMemoryRecord, ClientMemoryRetention, ClientMemorySummary,
+    ClientMemoryTrace, ClientPersonaState, ClientPrivacySummary, ClientProcessedText,
+    ClientQualityDecision, ClientRecordingGap, ClientRecordingReconciliation,
+    ClientRecordingSummary, ClientResponseControls, ClientRuntimeError, ClientRuntimeEvent,
+    ClientVoiceSessionEvent, ClientWireError, ComponentDescriptor, ComponentKind, ContextSource,
     ConversationContextExchange, ConversationMode, ConversationSignal, ExecutionLocation,
     FollowUpPolicy, GatewayMessage, GenerationId, MemoryApproval, MemoryConfidence, MemoryDraft,
     MemoryId, MemoryInspection, MemoryKind, MemoryProvenance, MemoryProvenanceKind, MemoryRecord,
@@ -31,6 +31,19 @@ fn gateway_value(message: &GatewayMessage) -> serde_json::Value {
 
 fn gateway_value_for_version(message: &GatewayMessage, version: u64) -> serde_json::Value {
     serde_json::from_slice(&encode_gateway_message_for_version(message, version).unwrap()).unwrap()
+}
+
+fn unix_now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap()
+}
+
+fn ephemeral_test_media_credential() -> String {
+    format!("lease{}{}", std::process::id(), unix_now_millis())
 }
 
 fn status() -> RuntimeStatus {
@@ -447,12 +460,108 @@ fn accepted_start_turns_carry_the_gateway_allocated_identifier() {
     let value = gateway_value(&GatewayMessage::CommandAccepted {
         request_id: "req-1".to_owned(),
         turn_id: Some(TurnId::new(9)),
+        media_lease: None,
     });
 
     assert_eq!(value["type"], "command_accepted");
     assert_eq!(value["protocol_version"], 1);
     assert_eq!(value["request_id"], "req-1");
     assert_eq!(value["turn_id"], "9");
+}
+
+// Production break caught: a version-three start acceptance could disclose a lease on a legacy
+// wire shape, or serialize an unbounded/unvalidated credential-bearing descriptor.
+#[test]
+fn version_three_start_acceptance_carries_a_redacted_bounded_media_lease() {
+    let credential = ephemeral_test_media_credential();
+    let lease = ClientMediaLeaseDescriptor::new(
+        1,
+        SessionId::new(17),
+        "tcp://127.0.0.1:41000".to_owned(),
+        credential.clone(),
+        unix_now_millis() + 60_000,
+        10_000,
+    )
+    .unwrap();
+    let message = GatewayMessage::CommandAccepted {
+        request_id: "start-lease".to_owned(),
+        turn_id: None,
+        media_lease: Some(lease.clone()),
+    };
+
+    let v3 = gateway_value_for_version(&message, RUNTIME_PROFILE_PROTOCOL_VERSION);
+    assert_eq!(v3["type"], "command_accepted");
+    assert_eq!(v3["protocol_version"], RUNTIME_PROFILE_PROTOCOL_VERSION);
+    assert_eq!(v3["request_id"], "start-lease");
+    assert_eq!(v3["media_lease"]["media_protocol_version"], 1);
+    assert_eq!(v3["media_lease"]["session_id"], "17");
+    assert_eq!(
+        v3["media_lease"]["connect_endpoint"],
+        "tcp://127.0.0.1:41000"
+    );
+    assert_eq!(v3["media_lease"]["credential"], credential);
+    assert_eq!(v3["media_lease"]["reconnect_window_ms"], "10000");
+
+    for version in [
+        LEGACY_CLIENT_PROTOCOL_VERSION,
+        CONTEXT_SEED_PROTOCOL_VERSION,
+    ] {
+        assert_eq!(
+            encode_gateway_message_for_version(&message, version).unwrap(),
+            format!(
+                r#"{{"type":"command_accepted","protocol_version":{version},"request_id":"start-lease"}}"#
+            )
+            .into_bytes(),
+        );
+    }
+    assert!(!format!("{lease:?}").contains(&credential));
+
+    let endpoint = "tcp://127.0.0.1:41000".to_owned();
+    let future = unix_now_millis() + 60_000;
+    for invalid in [
+        ClientMediaLeaseDescriptor::new(
+            2,
+            SessionId::new(17),
+            endpoint.clone(),
+            ephemeral_test_media_credential(),
+            future,
+            10_000,
+        ),
+        ClientMediaLeaseDescriptor::new(
+            1,
+            SessionId::new(0),
+            endpoint.clone(),
+            ephemeral_test_media_credential(),
+            future,
+            10_000,
+        ),
+        ClientMediaLeaseDescriptor::new(
+            1,
+            SessionId::new(17),
+            "https://127.0.0.1:41000".to_owned(),
+            ephemeral_test_media_credential(),
+            future,
+            10_000,
+        ),
+        ClientMediaLeaseDescriptor::new(
+            1,
+            SessionId::new(17),
+            endpoint.clone(),
+            String::new(),
+            future,
+            10_000,
+        ),
+        ClientMediaLeaseDescriptor::new(
+            1,
+            SessionId::new(17),
+            endpoint,
+            ephemeral_test_media_credential(),
+            unix_now_millis().saturating_sub(1),
+            10_000,
+        ),
+    ] {
+        assert!(matches!(invalid, Err(ClientWireError::InvalidMediaLease)));
+    }
 }
 
 #[test]
@@ -1551,6 +1660,7 @@ fn outgoing_response_messages_reject_invalid_request_ids() {
             GatewayMessage::CommandAccepted {
                 request_id: request_id.clone(),
                 turn_id: None,
+                media_lease: None,
             },
             GatewayMessage::CommandRejected {
                 request_id: request_id.clone(),

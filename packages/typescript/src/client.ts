@@ -11,6 +11,7 @@ import {
   type MemoryExtractedSummary,
   type MemoryInspection,
   type MemoryPage,
+  type MediaLease,
   type PersonaState,
   type ProcessedText,
   type RecordingReconciliation,
@@ -36,6 +37,8 @@ export interface RuntimeTurn {
 }
 
 export interface VoiceSession<Version extends ClientProtocolVersion = ClientProtocolVersion> {
+  /** Present only when a v3 start acceptance grants a media bridge lease. */
+  readonly mediaLease: Version extends 3 ? MediaLease | undefined : undefined;
   events(): AsyncIterable<VoiceSessionEventForVersion<Version>>;
   stop(): Promise<void>;
   pauseCapture(): Promise<void>;
@@ -513,7 +516,7 @@ export class RuntimeClient<Version extends ClientProtocolVersion = ClientProtoco
       return;
     }
     if (message.type === "command_accepted") {
-      this.accept(message.requestId, message.turnId);
+      this.accept(message.requestId, message.turnId, message.mediaLease);
       return;
     }
     if (message.type === "command_rejected") {
@@ -656,10 +659,14 @@ export class RuntimeClient<Version extends ClientProtocolVersion = ClientProtoco
     }
   }
 
-  private accept(requestId: string, turnId: bigint | undefined): void {
+  private accept(requestId: string, turnId: bigint | undefined, mediaLease: MediaLease | undefined): void {
     const control = this.controls.get(requestId);
     if (!control || control.accepted) {
       this.fail(new Error("gateway accepted an unknown command"));
+      return;
+    }
+    if (mediaLease !== undefined && control.kind !== "start_voice_session") {
+      this.fail(new Error("gateway attached a media lease to a non-start command"));
       return;
     }
     control.accepted = true;
@@ -709,6 +716,7 @@ export class RuntimeClient<Version extends ClientProtocolVersion = ClientProtoco
         const session: VoiceSessionState = { events: new AsyncQueue<VoiceSessionEvent>(), started: false };
         this.activeVoiceSession = session;
         control.result.resolve({
+          mediaLease: mediaLease as Version extends 3 ? MediaLease | undefined : undefined,
           events: () => session.events as AsyncIterable<VoiceSessionEventForVersion<Version>>,
           stop: () => this.voiceControl("stop_voice_session", session),
           pauseCapture: () => this.voiceControl("pause_voice_capture", session),

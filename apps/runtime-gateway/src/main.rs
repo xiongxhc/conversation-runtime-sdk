@@ -6,7 +6,7 @@ use std::sync::Arc;
 use conversation_memory::{MemoryClock, MemoryStore, SystemMemoryClock};
 use conversation_runtime::TextTurnRuntime;
 use conversation_runtime_gateway::{
-    input_relay, GatewayAdapters, GatewayConfig, GatewaySession, ProviderSupervisor,
+    input_relay, GatewayAdapters, GatewayConfig, GatewaySession, MediaServer, ProviderSupervisor,
     ProviderSupervisorError,
 };
 use tokio_util::sync::CancellationToken;
@@ -40,15 +40,33 @@ async fn run() -> Result<(), ()> {
         provider_hosts,
         recording,
         diarizer,
+        media,
         status: _,
     } = adapters;
+    // The configuration loader validates this before any runtime component is
+    // started. Keep the owning handle here while each GatewaySession receives
+    // only a shared capability, so every gateway exit can join the listener.
+    let media_server = match media {
+        Some(config) => Some(Arc::new(MediaServer::bind(config).await.map_err(|_| {
+            eprintln!("gateway media server failed");
+        })?)),
+        None => None,
+    };
     let cancellation = CancellationToken::new();
     let relay = input_relay(std::io::stdin(), cancellation.clone());
     let mut providers = match ProviderSupervisor::start(provider_hosts, relay.ended.clone()).await {
         Ok(providers) => providers,
         // The client left before the providers were ready: nothing failed.
-        Err(error) if error.is_startup_cancelled() => return Ok(()),
+        Err(error) if error.is_startup_cancelled() => {
+            if let Some(server) = media_server.as_ref() {
+                server.shutdown().await;
+            }
+            return Ok(());
+        }
         Err(error) => {
+            if let Some(server) = media_server.as_ref() {
+                server.shutdown().await;
+            }
             eprintln!(
                 "gateway provider supervision failed: {}",
                 error.diagnostic_code()
@@ -62,6 +80,9 @@ async fn run() -> Result<(), ()> {
         GatewaySession::new(runtime, status).with_provider_failure(provider_failure.clone());
     if let Some(voice_adapters) = voice {
         session = session.with_voice(voice_adapters, language);
+    }
+    if let Some(media_server) = media_server.as_ref() {
+        session = session.with_media_server(Arc::clone(media_server));
     }
     if let Some(recording) = recording {
         session = session.with_recording(recording);
@@ -95,6 +116,9 @@ async fn run() -> Result<(), ()> {
     cancellation.cancel();
     let input_result = relay.task.await;
     let shutdown = providers.shutdown().await;
+    if let Some(server) = media_server.as_ref() {
+        server.shutdown().await;
+    }
     let failure = provider_error
         .map(supervision_failure)
         .or_else(|| {

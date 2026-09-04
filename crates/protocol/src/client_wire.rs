@@ -1,5 +1,7 @@
 use std::error::Error;
 use std::fmt;
+use std::net::SocketAddr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::ser::{Error as _, SerializeStruct};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -34,6 +36,11 @@ pub const RUNTIME_PROFILE_PROTOCOL_VERSION: u64 = 3;
 /// silently changes how an older client is served.
 pub const CLIENT_PROTOCOL_VERSION: u64 = RUNTIME_PROFILE_PROTOCOL_VERSION;
 pub const MAX_CLIENT_FRAME_BYTES: usize = 512 * 1024;
+pub const MEDIA_PROTOCOL_VERSION: u8 = 1;
+pub const MAX_MEDIA_CONNECT_ENDPOINT_BYTES: usize = 256;
+pub const MAX_MEDIA_CREDENTIAL_BYTES: usize = 128;
+pub const MAX_MEDIA_LEASE_LIFETIME_MS: u64 = 5 * 60 * 1_000;
+pub const MAX_MEDIA_RECONNECT_WINDOW_MS: u64 = 60 * 1_000;
 const MAX_CONVERSATION_CONTEXT_EXCHANGES: usize = 16;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -266,6 +273,117 @@ pub struct RuntimeStatus {
     pub last_context_seed_operation_id: Option<String>,
 }
 
+/// Version-three control-plane data required for a bridge to connect to one media session.
+/// The opaque credential deliberately has no `Debug` representation that reveals its value.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ClientMediaLeaseDescriptor {
+    media_protocol_version: u8,
+    session_id: SessionId,
+    connect_endpoint: String,
+    credential: String,
+    expires_at_ms: u64,
+    reconnect_window_ms: u64,
+}
+
+impl ClientMediaLeaseDescriptor {
+    pub fn new(
+        media_protocol_version: u8,
+        session_id: SessionId,
+        connect_endpoint: String,
+        credential: String,
+        expires_at_ms: u64,
+        reconnect_window_ms: u64,
+    ) -> Result<Self, ClientWireError> {
+        let descriptor = Self {
+            media_protocol_version,
+            session_id,
+            connect_endpoint,
+            credential,
+            expires_at_ms,
+            reconnect_window_ms,
+        };
+        descriptor.validate()?;
+        Ok(descriptor)
+    }
+
+    pub const fn media_protocol_version(&self) -> u8 {
+        self.media_protocol_version
+    }
+
+    pub const fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub fn connect_endpoint(&self) -> &str {
+        &self.connect_endpoint
+    }
+
+    pub fn credential(&self) -> &str {
+        &self.credential
+    }
+
+    pub const fn expires_at_ms(&self) -> u64 {
+        self.expires_at_ms
+    }
+
+    pub const fn reconnect_window_ms(&self) -> u64 {
+        self.reconnect_window_ms
+    }
+
+    fn validate(&self) -> Result<(), ClientWireError> {
+        if self.media_protocol_version != MEDIA_PROTOCOL_VERSION
+            || self.session_id.get() == 0
+            || !is_valid_media_endpoint(&self.connect_endpoint)
+            || !is_valid_media_credential(&self.credential)
+        {
+            return Err(ClientWireError::InvalidMediaLease);
+        }
+        let now = unix_now_millis().ok_or(ClientWireError::InvalidMediaLease)?;
+        let Some(lifetime_ms) = self.expires_at_ms.checked_sub(now) else {
+            return Err(ClientWireError::InvalidMediaLease);
+        };
+        if lifetime_ms == 0
+            || lifetime_ms > MAX_MEDIA_LEASE_LIFETIME_MS
+            || self.reconnect_window_ms == 0
+            || self.reconnect_window_ms > MAX_MEDIA_RECONNECT_WINDOW_MS
+            || self.reconnect_window_ms > lifetime_ms
+        {
+            return Err(ClientWireError::InvalidMediaLease);
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for ClientMediaLeaseDescriptor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClientMediaLeaseDescriptor")
+            .field("media_protocol_version", &self.media_protocol_version)
+            .field("session_id", &self.session_id)
+            .field("connect_endpoint", &self.connect_endpoint)
+            .field("credential", &"<redacted>")
+            .field("expires_at_ms", &self.expires_at_ms)
+            .field("reconnect_window_ms", &self.reconnect_window_ms)
+            .finish()
+    }
+}
+
+impl Serialize for ClientMediaLeaseDescriptor {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut object = serializer.serialize_struct("ClientMediaLeaseDescriptor", 6)?;
+        object.serialize_field("media_protocol_version", &self.media_protocol_version)?;
+        object.serialize_field("session_id", &self.session_id.get().to_string())?;
+        object.serialize_field("connect_endpoint", &self.connect_endpoint)?;
+        object.serialize_field("credential", &self.credential)?;
+        object.serialize_field("expires_at_ms", &self.expires_at_ms.to_string())?;
+        object.serialize_field("reconnect_window_ms", &self.reconnect_window_ms.to_string())?;
+        object.end()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GatewayMessage {
     Ready {
@@ -274,6 +392,7 @@ pub enum GatewayMessage {
     CommandAccepted {
         request_id: String,
         turn_id: Option<TurnId>,
+        media_lease: Option<ClientMediaLeaseDescriptor>,
     },
     CommandRejected {
         request_id: String,
@@ -351,6 +470,7 @@ pub enum ClientWireError {
     InvalidRecordingReconciliation,
     InvalidTextProcessingRequest,
     InvalidProcessedText,
+    InvalidMediaLease,
     PayloadTooLarge { actual: usize, maximum: usize },
     UnsupportedRuntimeEvent { event: &'static str },
 }
@@ -389,6 +509,7 @@ impl fmt::Display for ClientWireError {
                 formatter.write_str("invalid client text processing request")
             }
             Self::InvalidProcessedText => formatter.write_str("invalid client processed text"),
+            Self::InvalidMediaLease => formatter.write_str("invalid client media lease"),
             Self::PayloadTooLarge { actual, maximum } => {
                 write!(
                     formatter,
@@ -1463,6 +1584,8 @@ enum GatewayMessageEnvelope<'a> {
         request_id: &'a str,
         #[serde(skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        media_lease: Option<&'a ClientMediaLeaseDescriptor>,
     },
     CommandRejected {
         protocol_version: u64,
@@ -1540,10 +1663,14 @@ impl<'a> GatewayMessageEnvelope<'a> {
             GatewayMessage::CommandAccepted {
                 request_id,
                 turn_id,
+                media_lease,
             } => Self::CommandAccepted {
                 protocol_version,
                 request_id,
                 turn_id: turn_id.map(|turn_id| turn_id.get().to_string()),
+                media_lease: (protocol_version >= RUNTIME_PROFILE_PROTOCOL_VERSION)
+                    .then_some(media_lease.as_ref())
+                    .flatten(),
             },
             GatewayMessage::CommandRejected { request_id, error } => Self::CommandRejected {
                 protocol_version,
@@ -1704,9 +1831,15 @@ fn validate_gateway_message(
         GatewayMessage::CommandAccepted {
             request_id,
             turn_id,
+            media_lease,
+            ..
         } => {
             validate_request_id(request_id)?;
-            turn_id.map_or(Ok(()), validate_turn_id)
+            turn_id.map_or(Ok(()), validate_turn_id)?;
+            if let Some(media_lease) = media_lease {
+                media_lease.validate()?;
+            }
+            Ok(())
         }
         GatewayMessage::Status { request_id, status } => {
             validate_request_id(request_id)?;
@@ -2220,6 +2353,36 @@ fn is_canonical_identifier(value: &str) -> bool {
         && value != "0"
         && !value.starts_with('0')
         && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn is_valid_media_endpoint(value: &str) -> bool {
+    if value.is_empty() || value.len() > MAX_MEDIA_CONNECT_ENDPOINT_BYTES || !value.is_ascii() {
+        return false;
+    }
+    let Some((scheme, address)) = value.split_once("://") else {
+        return false;
+    };
+    matches!(scheme, "tcp" | "tls")
+        && !address.contains(['/', '?', '#', '@'])
+        && address
+            .parse::<SocketAddr>()
+            .is_ok_and(|address| address.port() != 0)
+}
+
+fn is_valid_media_credential(value: &str) -> bool {
+    (16..=MAX_MEDIA_CREDENTIAL_BYTES).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn unix_now_millis() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis()
+        .try_into()
+        .ok()
 }
 
 fn serialize_turn_id<S>(turn_id: &TurnId, serializer: S) -> Result<S::Ok, S::Error>

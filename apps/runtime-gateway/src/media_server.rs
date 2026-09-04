@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -42,6 +43,8 @@ pub const MAX_MEDIA_LIFETIME_MS: u64 = 300_000;
 pub const MAX_MEDIA_RECONNECT_MS: u64 = 60_000;
 pub const MAX_MEDIA_FRAME_RATE: u32 = 1_000;
 pub const MAX_MEDIA_QUEUE_BYTES: usize = 1_048_576;
+pub const DEFAULT_MEDIA_PACKET_READ_TIMEOUT_MS: u64 = 5_000;
+pub const MAX_MEDIA_PACKET_READ_TIMEOUT_MS: u64 = 60_000;
 
 #[derive(Clone, Debug)]
 pub struct MediaTlsConfig {
@@ -70,6 +73,7 @@ pub struct MediaServerConfig {
     max_payload_bytes: usize,
     max_playback_queue_bytes: usize,
     max_playback_queue_duration: Duration,
+    packet_read_timeout: Duration,
     tls: Option<MediaTlsConfig>,
 }
 
@@ -84,6 +88,7 @@ impl MediaServerConfig {
             max_payload_bytes: MAX_PCM_FRAME_BYTES,
             max_playback_queue_bytes: 16 * MAX_PCM_FRAME_BYTES,
             max_playback_queue_duration: Duration::from_secs(10),
+            packet_read_timeout: Duration::from_millis(DEFAULT_MEDIA_PACKET_READ_TIMEOUT_MS),
             tls: None,
         }
     }
@@ -98,6 +103,7 @@ impl MediaServerConfig {
         max_payload_bytes: usize,
         max_playback_queue_bytes: usize,
         max_playback_queue_duration: Duration,
+        packet_read_timeout: Duration,
         tls: Option<MediaTlsConfig>,
     ) -> Result<Self, AdapterError> {
         let config = Self {
@@ -109,6 +115,7 @@ impl MediaServerConfig {
             max_payload_bytes,
             max_playback_queue_bytes,
             max_playback_queue_duration,
+            packet_read_timeout,
             tls,
         };
         config.validate()?;
@@ -129,6 +136,10 @@ impl MediaServerConfig {
 
     pub fn reconnect_window(&self) -> Duration {
         self.reconnect_window
+    }
+
+    pub fn packet_read_timeout(&self) -> Duration {
+        self.packet_read_timeout
     }
 
     pub fn with_max_frames_per_second(mut self, value: u32) -> Self {
@@ -157,6 +168,11 @@ impl MediaServerConfig {
         self
     }
 
+    pub fn with_packet_read_timeout(mut self, value: Duration) -> Self {
+        self.packet_read_timeout = value;
+        self
+    }
+
     pub fn with_max_payload_bytes(mut self, value: usize) -> Self {
         self.max_payload_bytes = value;
         self
@@ -180,6 +196,8 @@ impl MediaServerConfig {
             || self.max_playback_queue_bytes > MAX_MEDIA_QUEUE_BYTES
             || self.max_playback_queue_duration.is_zero()
             || self.max_playback_queue_duration > self.reconnect_window
+            || self.packet_read_timeout.is_zero()
+            || self.packet_read_timeout > Duration::from_millis(MAX_MEDIA_PACKET_READ_TIMEOUT_MS)
         {
             return Err(AdapterError::new(
                 "media configuration was outside its bounded limits",
@@ -263,13 +281,16 @@ struct MediaServerInner {
     max_frames_per_second: u32,
     max_payload_bytes: usize,
     max_playback_queue_duration: Duration,
+    packet_read_timeout: Duration,
     sessions: Mutex<HashMap<u64, MediaSession>>,
     connections: Mutex<Vec<JoinHandle<()>>>,
     connection_permits: Arc<Semaphore>,
     cancellation: CancellationToken,
+    next_reservation_epoch: AtomicU64,
 }
 
 struct MediaSession {
+    reservation_epoch: u64,
     credential: String,
     expires_at: Instant,
     reconnect_deadline: Instant,
@@ -285,6 +306,12 @@ struct MediaSession {
 struct MediaDisconnect {
     capture_at_ms: Option<u64>,
     reconnect_deadline: Instant,
+}
+
+#[derive(Clone, Copy)]
+struct MediaConnection {
+    reservation_epoch: u64,
+    connection_id: u64,
 }
 
 impl MediaServer {
@@ -312,10 +339,12 @@ impl MediaServer {
             max_frames_per_second: config.max_frames_per_second,
             max_payload_bytes: config.max_payload_bytes,
             max_playback_queue_duration: config.max_playback_queue_duration,
+            packet_read_timeout: config.packet_read_timeout,
             sessions: Mutex::new(HashMap::new()),
             connections: Mutex::new(Vec::new()),
             connection_permits: Arc::new(Semaphore::new(MAX_MEDIA_CONNECTIONS)),
             cancellation: CancellationToken::new(),
+            next_reservation_epoch: AtomicU64::new(1),
         });
         let worker = Arc::clone(&inner);
         let task = tokio::spawn(async move { accept_loop(listener, tls, worker).await });
@@ -337,7 +366,17 @@ impl MediaServer {
     }
 
     pub async fn reserve(&self, session_id: SessionId) -> Result<MediaLease, AdapterError> {
-        self.inner.hub.reserve(session_id).await?;
+        let reservation_epoch = self
+            .inner
+            .next_reservation_epoch
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |epoch| {
+                epoch.checked_add(1)
+            })
+            .map_err(|_| AdapterError::new("media reservation identity overflowed"))?;
+        self.inner
+            .hub
+            .reserve(session_id, reservation_epoch)
+            .await?;
         let credential = random_credential()?;
         let now = Instant::now();
         let expires_at = now + self.inner.credential_lifetime;
@@ -351,6 +390,7 @@ impl MediaServer {
         let previous = self.inner.sessions.lock().await.insert(
             session_id.get(),
             MediaSession {
+                reservation_epoch,
                 credential: credential.clone(),
                 expires_at,
                 reconnect_deadline: now + reconnect_window,
@@ -386,6 +426,7 @@ impl MediaServer {
 
     pub async fn shutdown(&self) {
         self.inner.cancellation.cancel();
+        self.inner.hub.cancel_expiry_workers();
         if let Some(task) = self.task.lock().await.take() {
             let _ = task.await;
         }
@@ -399,12 +440,14 @@ impl MediaServer {
                 let _ = connection.await;
             }
         }
+        self.inner.hub.shutdown().await;
     }
 }
 
 impl Drop for MediaServer {
     fn drop(&mut self) {
         self.inner.cancellation.cancel();
+        self.inner.hub.cancel_expiry_workers();
     }
 }
 
@@ -461,22 +504,22 @@ where
                 .map_err(|_| AdapterError::new("media bridge authentication timed out"))??
         },
     };
-    let connection_id = inner.authenticate(session_id, &credential).await?;
+    let connection = inner.authenticate(session_id, &credential).await?;
     let mut playback = inner
         .hub
-        .attach_playback_transport(session_id, connection_id)
+        .attach_playback_transport(session_id, connection.connection_id)
         .await?;
     let (mut reader, mut writer) = tokio::io::split(stream);
     let result = async {
         loop {
             tokio::select! {
                 _ = inner.cancellation.cancelled() => break Ok(()),
-                message = tokio::time::timeout(
-                    inner.max_playback_queue_duration,
-                    read_media_message(&mut reader, inner.max_payload_bytes),
+                message = read_media_message(
+                    &mut reader,
+                    inner.max_payload_bytes,
+                    inner.packet_read_timeout,
                 ) => {
-                    match message
-                        .map_err(|_| AdapterError::new("media bridge packet read timed out"))?? {
+                    match message? {
                         MediaMessage::Frame { direction, session_id: frame_session_id, sequence, captured_at_ms, format, payload } => {
                             if frame_session_id != session_id {
                                 return Err(AdapterError::new("media frame session identity did not match"));
@@ -500,13 +543,13 @@ where
                             if acknowledgement_session_id != session_id {
                                 continue;
                             }
-                            let _ = inner.hub.acknowledge_playback(session_id, connection_id, sequence, acknowledgement).await;
+                            let _ = inner.hub.acknowledge_playback(session_id, connection.connection_id, sequence, acknowledgement).await;
                         }
                         MediaMessage::FlushAck { session_id: acknowledgement_session_id, generation_id } => {
                             if acknowledgement_session_id != session_id {
                                 continue;
                             }
-                            let _ = inner.hub.acknowledge_flush(session_id, connection_id, generation_id).await;
+                            let _ = inner.hub.acknowledge_flush(session_id, connection.connection_id, generation_id).await;
                         }
                     }
                 }
@@ -521,7 +564,7 @@ where
                             )
                             .await
                             .map_err(|_| AdapterError::new("media playback frame write timed out"))??;
-                            inner.hub.mark_playback_written(session_id, connection_id, sequence).await?;
+                            inner.hub.mark_playback_written(session_id, connection.connection_id, sequence).await?;
                         }
                         NetworkBridgeRequest::Flush(request) => {
                             tokio::time::timeout(
@@ -537,11 +580,15 @@ where
         }
     }
     .await;
-    let disconnect = inner.disconnect(session_id, connection_id).await;
+    let disconnect = inner.disconnect(session_id, connection).await;
     if let Some(disconnect) = disconnect.as_ref() {
         let _ = inner
             .hub
-            .disconnect_playback_transport(session_id, connection_id, disconnect.reconnect_deadline)
+            .disconnect_playback_transport(
+                session_id,
+                connection.connection_id,
+                disconnect.reconnect_deadline,
+            )
             .await;
     }
     if let Some(Some(at_ms)) = disconnect.map(|disconnect| disconnect.capture_at_ms) {
@@ -555,7 +602,7 @@ impl MediaServerInner {
         &self,
         session_id: SessionId,
         credential: &str,
-    ) -> Result<u64, AdapterError> {
+    ) -> Result<MediaConnection, AdapterError> {
         let mut sessions = self.sessions.lock().await;
         let session = sessions
             .get_mut(&session_id.get())
@@ -574,7 +621,10 @@ impl MediaServerInner {
             .ok_or_else(|| AdapterError::new("media connection identity overflowed"))?;
         session.active = true;
         session.active_connection_id = Some(connection_id);
-        Ok(connection_id)
+        Ok(MediaConnection {
+            reservation_epoch: session.reservation_epoch,
+            connection_id,
+        })
     }
 
     async fn validate_capture_metadata(
@@ -666,10 +716,12 @@ impl MediaServerInner {
     async fn disconnect(
         &self,
         session_id: SessionId,
-        connection_id: u64,
+        connection: MediaConnection,
     ) -> Option<MediaDisconnect> {
         if let Some(session) = self.sessions.lock().await.get_mut(&session_id.get()) {
-            if session.active_connection_id != Some(connection_id) {
+            if session.reservation_epoch != connection.reservation_epoch
+                || session.active_connection_id != Some(connection.connection_id)
+            {
                 return None;
             }
             session.active = false;
@@ -749,13 +801,34 @@ enum MediaMessage {
 async fn read_media_message<R>(
     stream: &mut R,
     max_payload_bytes: usize,
+    packet_read_timeout: Duration,
 ) -> Result<MediaMessage, AdapterError>
 where
     R: AsyncRead + Unpin,
 {
     let mut header = [0_u8; FRAME_HEADER_BYTES];
     stream
-        .read_exact(&mut header[..6])
+        .read_exact(&mut header[..1])
+        .await
+        .map_err(|_| AdapterError::new("media frame was malformed"))?;
+    tokio::time::timeout(
+        packet_read_timeout,
+        read_media_message_after_first_byte(stream, header, max_payload_bytes),
+    )
+    .await
+    .map_err(|_| AdapterError::new("media bridge packet read timed out"))?
+}
+
+async fn read_media_message_after_first_byte<R>(
+    stream: &mut R,
+    mut header: [u8; FRAME_HEADER_BYTES],
+    max_payload_bytes: usize,
+) -> Result<MediaMessage, AdapterError>
+where
+    R: AsyncRead + Unpin,
+{
+    stream
+        .read_exact(&mut header[1..6])
         .await
         .map_err(|_| AdapterError::new("media frame was malformed"))?;
     if header[..5] != [b'M', b'E', b'D', b'1', MEDIA_PROTOCOL_VERSION] {

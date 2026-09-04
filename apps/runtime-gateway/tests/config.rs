@@ -1579,6 +1579,32 @@ max_outbound_queue_ms = 10000
             .advertised_endpoint(),
         "tcp://127.0.0.1:0"
     );
+    assert_eq!(
+        GatewayConfig::load(&configured)
+            .unwrap()
+            .media
+            .unwrap()
+            .packet_read_timeout(),
+        std::time::Duration::from_millis(5_000),
+        "omitting the inbound packet bound selects its safe default"
+    );
+
+    let configured_timeout = media.replace(
+        "max_outbound_queue_ms = 10000",
+        "max_outbound_queue_ms = 10000\npacket_read_timeout_ms = 2500",
+    );
+    let configured_timeout = write_config(
+        fixture.path(),
+        &format!("{}{}", schema_v3_offline_config(), configured_timeout),
+    );
+    assert_eq!(
+        GatewayConfig::load(&configured_timeout)
+            .unwrap()
+            .media
+            .unwrap()
+            .packet_read_timeout(),
+        std::time::Duration::from_millis(2_500)
+    );
 
     // This validates references only. It deliberately never binds a private
     // address or reads certificate material in an automated test.
@@ -1653,6 +1679,30 @@ max_frames_per_second = 100
 max_payload_bytes = 16384
 max_outbound_queue_bytes = 262144
 max_outbound_queue_ms = 10000
+"#,
+        r#"
+[media]
+bind = "127.0.0.1:9000"
+advertised_endpoint = "tcp://127.0.0.1:9000"
+credential_lifetime_ms = 60000
+reconnect_window_ms = 10000
+max_frames_per_second = 100
+max_payload_bytes = 16384
+max_outbound_queue_bytes = 262144
+max_outbound_queue_ms = 10000
+packet_read_timeout_ms = 0
+"#,
+        r#"
+[media]
+bind = "127.0.0.1:9000"
+advertised_endpoint = "tcp://127.0.0.1:9000"
+credential_lifetime_ms = 60000
+reconnect_window_ms = 10000
+max_frames_per_second = 100
+max_payload_bytes = 16384
+max_outbound_queue_bytes = 262144
+max_outbound_queue_ms = 10000
+packet_read_timeout_ms = 60001
 "#,
     ] {
         let path = write_config(fixture.path(), &format!("{base}{media}"));

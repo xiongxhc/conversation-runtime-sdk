@@ -185,7 +185,8 @@ async fn full_capture_consumer_prevents_partial_fanout() {
     let server = MediaServer::bind(
         MediaServerConfig::loopback()
             .with_lifetimes(Duration::from_secs(1), Duration::from_secs(1))
-            .with_max_playback_queue_duration(Duration::from_millis(50)),
+            .with_max_playback_queue_duration(Duration::from_millis(50))
+            .with_packet_read_timeout(Duration::from_millis(50)),
     )
     .await
     .unwrap();
@@ -720,7 +721,8 @@ async fn authenticated_partial_capture_payload_times_out_without_advancing_autho
     let server = MediaServer::bind(
         MediaServerConfig::loopback()
             .with_lifetimes(Duration::from_secs(1), Duration::from_secs(1))
-            .with_max_playback_queue_duration(Duration::from_millis(50)),
+            .with_max_playback_queue_duration(Duration::from_secs(1))
+            .with_packet_read_timeout(Duration::from_millis(50)),
     )
     .await
     .unwrap();
@@ -757,6 +759,75 @@ async fn authenticated_partial_capture_payload_times_out_without_advancing_autho
     assert_eq!(closed.unwrap().unwrap(), 0);
     assert_recording_capture_payload(recovered_recording.unwrap().unwrap().unwrap(), b"kept", 1);
     assert_capture_payload(recovered_recognition.unwrap().unwrap().unwrap(), b"kept", 1);
+}
+
+/// An authenticated bridge may intentionally be capture-idle or playback-only. The packet
+/// completion deadline begins with a packet byte, not when the connection becomes idle.
+#[tokio::test]
+async fn authenticated_idle_bridge_survives_packet_timeout_then_plays_and_acknowledges() {
+    let server = MediaServer::bind(
+        MediaServerConfig::loopback()
+            .with_lifetimes(Duration::from_secs(1), Duration::from_secs(1))
+            .with_max_playback_queue_duration(Duration::from_secs(1))
+            .with_packet_read_timeout(Duration::from_millis(50)),
+    )
+    .await
+    .unwrap();
+    let lease = server.reserve(SessionId::new(106)).await.unwrap();
+    let cancellation = CancellationToken::new();
+    let (factory, mut recording, _recognition) =
+        attached_ports(&server, &lease, cancellation.clone()).await;
+    let output = Arc::clone(
+        &factory
+            .start(lease.session_id(), cancellation.child_token())
+            .await
+            .unwrap()
+            .output,
+    );
+    let mut bridge = authenticated_bridge(&lease).await;
+
+    // The legacy outbound queue timer currently closes this idle authenticated peer here.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let enqueue = tokio::spawn({
+        let cancellation = cancellation.child_token();
+        async move {
+            output
+                .enqueue(playback_test_frame(31, 31), cancellation)
+                .await
+        }
+    });
+    let sequence = timeout(
+        Duration::from_millis(250),
+        read_playback_frame(
+            &mut bridge,
+            lease.session_id(),
+            TurnId::new(62),
+            GenerationId::new(31),
+            UtteranceId::new(52),
+            31,
+            b"accepted-only!",
+        ),
+    )
+    .await;
+
+    let sequence = sequence.expect("an idle authenticated bridge was closed before later playback");
+    send_playback_ack(&mut bridge, lease.session_id(), sequence, 1).await;
+    let accepted = timeout(RECEIVE_TIMEOUT, enqueue)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    send_playback_ack(&mut bridge, lease.session_id(), sequence, 2).await;
+    let rendered = timeout(RECEIVE_TIMEOUT, recording.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    cancellation.cancel();
+    server.shutdown().await;
+
+    assert_eq!(accepted.state(), PlaybackState::Accepted);
+    assert_playback_rendered(rendered, GenerationId::new(31));
 }
 
 /// Catches a bridge path that treats a successful TCP write as audible playback or echoes capture
@@ -1149,13 +1220,13 @@ async fn accepted_only_playback_expires_as_flushed_and_frees_capacity() {
     tokio::time::sleep(Duration::from_millis(10)).await;
     let mut sequences = Vec::new();
 
-    for generation in 1..=16 {
+    for source_sequence in 1..=16 {
         let enqueue = tokio::spawn({
             let output = Arc::clone(&output);
             let cancellation = cancellation.child_token();
             async move {
                 output
-                    .enqueue(playback_test_frame(generation), cancellation)
+                    .enqueue(playback_test_frame(1, source_sequence), cancellation)
                     .await
             }
         });
@@ -1165,9 +1236,9 @@ async fn accepted_only_playback_expires_as_flushed_and_frees_capacity() {
                 &mut bridge,
                 lease.session_id(),
                 TurnId::new(62),
-                GenerationId::new(generation),
+                GenerationId::new(1),
                 UtteranceId::new(52),
-                generation,
+                source_sequence,
                 b"accepted-only!",
             ),
         )
@@ -1192,7 +1263,11 @@ async fn accepted_only_playback_expires_as_flushed_and_frees_capacity() {
     let recovered = tokio::spawn({
         let output = Arc::clone(&output);
         let cancellation = cancellation.child_token();
-        async move { output.enqueue(playback_test_frame(17), cancellation).await }
+        async move {
+            output
+                .enqueue(playback_test_frame(17, 17), cancellation)
+                .await
+        }
     });
     let recovered_frame = timeout(
         Duration::from_millis(250),
@@ -1207,10 +1282,8 @@ async fn accepted_only_playback_expires_as_flushed_and_frees_capacity() {
         ),
     )
     .await;
-    let mut expiry_events = Vec::new();
-    for _ in 1..=16 {
-        expiry_events.push(timeout(Duration::from_millis(30), recording.recv()).await);
-    }
+    let expired = timeout(Duration::from_millis(30), recording.recv()).await;
+    let duplicate_expiry = timeout(Duration::from_millis(30), recording.recv()).await;
     send_playback_ack(&mut bridge, lease.session_id(), sequences[0], 2).await;
     let late_rendered = timeout(Duration::from_millis(30), recording.recv()).await;
 
@@ -1221,23 +1294,241 @@ async fn accepted_only_playback_expires_as_flushed_and_frees_capacity() {
         recovered_frame.is_ok(),
         "expired playback did not free capacity"
     );
-    let mut flushed = Vec::new();
-    for event in expiry_events {
-        match event.unwrap().unwrap().unwrap() {
-            VoiceInputEvent::Playback(receipt) => {
-                assert_eq!(receipt.state(), PlaybackState::Flushed);
-                flushed.push(receipt.generation_id().get());
-            }
-            _ => panic!("expected an expired playback receipt"),
-        }
-    }
-    flushed.sort_unstable();
-    assert_eq!(flushed, (1..=16).collect::<Vec<_>>());
+    assert_playback_flushed(expired.unwrap().unwrap().unwrap(), GenerationId::new(1));
+    assert!(
+        duplicate_expiry.is_err(),
+        "expiry flushed a generation twice"
+    );
     assert!(
         late_rendered.is_err(),
         "late Rendered published after expiry"
     );
     assert!(recovered.await.unwrap().is_err());
+}
+
+/// Rapid Accepted -> Rendered generations must leave no delayed expiry behind. This exercises
+/// more than the pending-map capacity without exposing an implementation-only task counter.
+#[tokio::test]
+async fn rapid_rendered_playback_cycles_leave_no_delayed_flush_or_capacity_loss() {
+    let server = MediaServer::bind(
+        MediaServerConfig::loopback()
+            .with_lifetimes(Duration::from_secs(1), Duration::from_secs(1))
+            .with_max_playback_queue_duration(Duration::from_millis(50)),
+    )
+    .await
+    .unwrap();
+    let lease = server.reserve(SessionId::new(148)).await.unwrap();
+    let cancellation = CancellationToken::new();
+    let (factory, mut recording, _recognition) =
+        attached_ports(&server, &lease, cancellation.clone()).await;
+    let output = Arc::clone(
+        &factory
+            .start(lease.session_id(), cancellation.child_token())
+            .await
+            .unwrap()
+            .output,
+    );
+    let mut bridge = authenticated_bridge(&lease).await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    for generation in 1..=20 {
+        let enqueue = tokio::spawn({
+            let output = Arc::clone(&output);
+            let cancellation = cancellation.child_token();
+            async move {
+                output
+                    .enqueue(playback_test_frame(generation, generation), cancellation)
+                    .await
+            }
+        });
+        let sequence = read_playback_frame(
+            &mut bridge,
+            lease.session_id(),
+            TurnId::new(62),
+            GenerationId::new(generation),
+            UtteranceId::new(52),
+            generation,
+            b"accepted-only!",
+        )
+        .await;
+        send_playback_ack(&mut bridge, lease.session_id(), sequence, 1).await;
+        assert_eq!(
+            timeout(RECEIVE_TIMEOUT, enqueue)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .state(),
+            PlaybackState::Accepted
+        );
+        send_playback_ack(&mut bridge, lease.session_id(), sequence, 2).await;
+        assert_playback_rendered(
+            timeout(RECEIVE_TIMEOUT, recording.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            GenerationId::new(generation),
+        );
+    }
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        timeout(Duration::from_millis(30), recording.recv())
+            .await
+            .is_err(),
+        "a completed generation emitted a delayed expiry flush"
+    );
+
+    let enqueue = tokio::spawn({
+        let cancellation = cancellation.child_token();
+        async move {
+            output
+                .enqueue(playback_test_frame(21, 21), cancellation)
+                .await
+        }
+    });
+    let sequence = read_playback_frame(
+        &mut bridge,
+        lease.session_id(),
+        TurnId::new(62),
+        GenerationId::new(21),
+        UtteranceId::new(52),
+        21,
+        b"accepted-only!",
+    )
+    .await;
+    send_playback_ack(&mut bridge, lease.session_id(), sequence, 1).await;
+    let accepted = timeout(RECEIVE_TIMEOUT, enqueue)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    send_playback_ack(&mut bridge, lease.session_id(), sequence, 2).await;
+    let rendered = timeout(RECEIVE_TIMEOUT, recording.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+    cancellation.cancel();
+    server.shutdown().await;
+
+    assert_eq!(accepted.state(), PlaybackState::Accepted);
+    assert_playback_rendered(rendered, GenerationId::new(21));
+}
+
+/// Catches a retired reservation's expiry matching a newly reserved session after every visible
+/// counter restarts. The old Accepted deadline must not flush the new reservation's sequence one.
+#[tokio::test]
+async fn revoked_reservation_expiry_cannot_flush_a_matching_rereservation() {
+    let server = MediaServer::bind(
+        MediaServerConfig::loopback()
+            .with_lifetimes(Duration::from_secs(2), Duration::from_millis(200)),
+    )
+    .await
+    .unwrap();
+    let session_id = SessionId::new(147);
+    let old_lease = server.reserve(session_id).await.unwrap();
+    let old_cancellation = CancellationToken::new();
+    let (old_factory, _old_recording, _old_recognition) =
+        attached_ports(&server, &old_lease, old_cancellation.clone()).await;
+    let old_output = Arc::clone(
+        &old_factory
+            .start(session_id, old_cancellation.child_token())
+            .await
+            .unwrap()
+            .output,
+    );
+    let mut old_bridge = authenticated_bridge(&old_lease).await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let old_enqueue = tokio::spawn({
+        let cancellation = old_cancellation.child_token();
+        async move {
+            old_output
+                .enqueue(playback_test_frame(9, 1), cancellation)
+                .await
+        }
+    });
+    let old_sequence = read_playback_frame(
+        &mut old_bridge,
+        session_id,
+        TurnId::new(62),
+        GenerationId::new(9),
+        UtteranceId::new(52),
+        1,
+        b"accepted-only!",
+    )
+    .await;
+    send_playback_ack(&mut old_bridge, session_id, old_sequence, 1).await;
+    assert_eq!(
+        timeout(RECEIVE_TIMEOUT, old_enqueue)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .state(),
+        PlaybackState::Accepted
+    );
+
+    tokio::time::sleep(Duration::from_millis(130)).await;
+    server.revoke(session_id).await;
+    let new_lease = server.reserve(session_id).await.unwrap();
+    let new_cancellation = CancellationToken::new();
+    let (new_factory, mut new_recording, _new_recognition) =
+        attached_ports(&server, &new_lease, new_cancellation.clone()).await;
+    let new_output = Arc::clone(
+        &new_factory
+            .start(session_id, new_cancellation.child_token())
+            .await
+            .unwrap()
+            .output,
+    );
+    let mut new_bridge = authenticated_bridge(&new_lease).await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let new_enqueue = tokio::spawn({
+        let cancellation = new_cancellation.child_token();
+        async move {
+            new_output
+                .enqueue(playback_test_frame(9, 1), cancellation)
+                .await
+        }
+    });
+    let new_sequence = read_playback_frame(
+        &mut new_bridge,
+        session_id,
+        TurnId::new(62),
+        GenerationId::new(9),
+        UtteranceId::new(52),
+        1,
+        b"accepted-only!",
+    )
+    .await;
+    assert_eq!(new_sequence, 1);
+    send_playback_ack(&mut new_bridge, session_id, new_sequence, 1).await;
+    assert_eq!(
+        timeout(RECEIVE_TIMEOUT, new_enqueue)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .state(),
+        PlaybackState::Accepted
+    );
+
+    let old_deadline_event = timeout(Duration::from_millis(100), new_recording.recv()).await;
+    send_playback_ack(&mut new_bridge, session_id, new_sequence, 2).await;
+    let rendered = timeout(RECEIVE_TIMEOUT, new_recording.recv()).await;
+
+    old_cancellation.cancel();
+    new_cancellation.cancel();
+    server.shutdown().await;
+
+    assert!(
+        old_deadline_event.is_err(),
+        "an old reservation expiry affected the new reservation"
+    );
+    assert_playback_rendered(rendered.unwrap().unwrap().unwrap(), GenerationId::new(9));
 }
 
 /// Catches reconnect code that replays uncertain audio or leaves its caller blocked forever.
@@ -2197,12 +2488,12 @@ async fn attached_ports(
     (factory, recording, recognition)
 }
 
-fn playback_test_frame(generation: u64) -> AudioFrame {
+fn playback_test_frame(generation: u64, source_sequence: u64) -> AudioFrame {
     AudioFrame::new(
         TurnId::new(62),
         GenerationId::new(generation),
         UtteranceId::new(52),
-        generation,
+        source_sequence,
         PcmFormat::new(16_000, 1, PcmSampleFormat::Signed16LittleEndian).unwrap(),
         b"accepted-only!".to_vec(),
     )

@@ -9,7 +9,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use conversation_protocol::{GenerationId, PlaybackState, SessionId, TurnId, UtteranceId};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex, Notify};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -64,6 +65,7 @@ pub struct NetworkMediaHub {
     sessions: Arc<Mutex<HashMap<u64, NetworkSession>>>,
     max_playback_queue_bytes: usize,
     operation_timeout: Duration,
+    shutdown: CancellationToken,
 }
 
 impl Default for NetworkMediaHub {
@@ -73,6 +75,10 @@ impl Default for NetworkMediaHub {
 }
 
 struct NetworkSession {
+    reservation_epoch: u64,
+    expiry_cancellation: CancellationToken,
+    expiry_changed: Arc<Notify>,
+    expiry_task: Option<JoinHandle<()>>,
     voice: Option<mpsc::Sender<Result<VoiceInputEvent, AdapterError>>>,
     recognition: Option<mpsc::Sender<Result<CaptureEvent, AdapterError>>>,
     playback: Option<NetworkPlaybackTransport>,
@@ -84,9 +90,17 @@ struct NetworkSession {
     waiting_playback_bytes: usize,
 }
 
-impl Default for NetworkSession {
-    fn default() -> Self {
+impl NetworkSession {
+    fn new(
+        reservation_epoch: u64,
+        expiry_cancellation: CancellationToken,
+        expiry_changed: Arc<Notify>,
+    ) -> Self {
         Self {
+            reservation_epoch,
+            expiry_cancellation,
+            expiry_changed,
+            expiry_task: None,
             voice: None,
             recognition: None,
             playback: None,
@@ -111,6 +125,7 @@ struct PendingPlayback {
     generation_id: GenerationId,
     completion: Option<oneshot::Sender<Result<PlaybackReceipt, AdapterError>>>,
     accepted: bool,
+    accepted_deadline: Option<Instant>,
     written: bool,
 }
 
@@ -134,22 +149,76 @@ impl NetworkMediaHub {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             max_playback_queue_bytes,
             operation_timeout,
+            shutdown: CancellationToken::new(),
         }
     }
 
-    pub async fn reserve(&self, session_id: SessionId) -> Result<(), AdapterError> {
+    pub async fn reserve(
+        &self,
+        session_id: SessionId,
+        reservation_epoch: u64,
+    ) -> Result<(), AdapterError> {
         let mut sessions = self.sessions.lock().await;
         if sessions.contains_key(&session_id.get()) {
             return Err(AdapterError::new(
                 "network media session is already reserved",
             ));
         }
-        sessions.insert(session_id.get(), NetworkSession::default());
+        let expiry_cancellation = CancellationToken::new();
+        let expiry_changed = Arc::new(Notify::new());
+        let worker = tokio::spawn(accepted_expiry_worker(
+            self.clone(),
+            session_id,
+            reservation_epoch,
+            expiry_cancellation.clone(),
+            self.shutdown.clone(),
+            Arc::clone(&expiry_changed),
+        ));
+        let mut session =
+            NetworkSession::new(reservation_epoch, expiry_cancellation, expiry_changed);
+        session.expiry_task = Some(worker);
+        sessions.insert(session_id.get(), session);
         Ok(())
     }
 
     pub async fn revoke(&self, session_id: SessionId) {
-        self.sessions.lock().await.remove(&session_id.get());
+        let task = self
+            .sessions
+            .lock()
+            .await
+            .remove(&session_id.get())
+            .and_then(|mut session| {
+                session.expiry_cancellation.cancel();
+                session.expiry_changed.notify_waiters();
+                session.expiry_task.take()
+            });
+        if let Some(task) = task {
+            let _ = task.await;
+        }
+    }
+
+    /// Wakes reservation-scoped expiry workers synchronously so dropping the server cannot leave
+    /// a self-retaining timer behind. `shutdown` awaits their reaping after transports exit.
+    pub fn cancel_expiry_workers(&self) {
+        self.shutdown.cancel();
+    }
+
+    pub async fn shutdown(&self) {
+        self.cancel_expiry_workers();
+        let tasks = self
+            .sessions
+            .lock()
+            .await
+            .drain()
+            .filter_map(|(_, mut session)| {
+                session.expiry_cancellation.cancel();
+                session.expiry_changed.notify_waiters();
+                session.expiry_task.take()
+            })
+            .collect::<Vec<_>>();
+        for task in tasks {
+            let _ = task.await;
+        }
     }
 
     async fn attach_voice(
@@ -274,6 +343,7 @@ impl NetworkMediaHub {
             sender: sender.clone(),
         });
         session.reconnect_deadline = None;
+        session.expiry_changed.notify_one();
         while let Some(waiting) = session.waiting_playback.pop_front() {
             session.waiting_playback_bytes = session
                 .waiting_playback_bytes
@@ -334,7 +404,7 @@ impl NetworkMediaHub {
         connection_id: u64,
         reconnect_deadline: Instant,
     ) -> Result<(), AdapterError> {
-        let (voice, completions, flushed_generations) = {
+        let (voice, completions, flushed_generations, expiry_changed) = {
             let mut sessions = self.sessions.lock().await;
             let session = sessions
                 .get_mut(&session_id.get())
@@ -383,6 +453,7 @@ impl NetworkMediaHub {
                 session.voice.clone(),
                 completions,
                 flushed_generations.into_iter().collect::<Vec<_>>(),
+                Arc::clone(&session.expiry_changed),
             )
         };
         for completion in completions {
@@ -406,12 +477,7 @@ impl NetworkMediaHub {
                 .map_err(|_| AdapterError::new("network media voice input closed"))?;
             }
         }
-        let hub = self.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep_until(tokio::time::Instant::from_std(reconnect_deadline)).await;
-            hub.expire_waiting_playback(session_id, reconnect_deadline)
-                .await;
-        });
+        expiry_changed.notify_one();
         Ok(())
     }
 
@@ -497,6 +563,7 @@ impl NetworkMediaHub {
                     generation_id: frame.generation_id(),
                     completion: Some(completion_sender),
                     accepted: false,
+                    accepted_deadline: None,
                     written: false,
                 },
             );
@@ -546,7 +613,7 @@ impl NetworkMediaHub {
         sequence: u64,
         acknowledgement: NetworkPlaybackAck,
     ) -> Result<(), AdapterError> {
-        let (accepted_completion, rendered, accepted_expiry) = {
+        let (accepted_completion, rendered, _) = {
             let mut sessions = self.sessions.lock().await;
             let session = sessions
                 .get_mut(&session_id.get())
@@ -576,6 +643,7 @@ impl NetworkMediaHub {
                 }
                 NetworkPlaybackAck::Accepted => {
                     pending.accepted = true;
+                    pending.accepted_deadline = Some(Instant::now() + self.operation_timeout);
                     let receipt =
                         PlaybackReceipt::new(pending.generation_id, PlaybackState::Accepted);
                     (
@@ -584,7 +652,7 @@ impl NetworkMediaHub {
                             .take()
                             .map(|completion| (completion, receipt)),
                         None,
-                        Some((session_id, connection_id, sequence)),
+                        None::<()>,
                     )
                 }
                 NetworkPlaybackAck::Rendered if !pending.accepted => {
@@ -611,6 +679,7 @@ impl NetworkMediaHub {
                 }
             }
         };
+        let accepted = accepted_completion.is_some();
         if let Some((completion, receipt)) = accepted_completion {
             let _ = completion.send(Ok(receipt));
         }
@@ -623,59 +692,10 @@ impl NetworkMediaHub {
             .map_err(|_| AdapterError::new("network media playback event timed out"))?
             .map_err(|_| AdapterError::new("network media voice input closed"))?;
         }
-        if let Some((session_id, connection_id, sequence)) = accepted_expiry {
-            let hub = self.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(hub.operation_timeout).await;
-                let _ = hub
-                    .expire_accepted_playback(session_id, connection_id, sequence)
-                    .await;
-            });
-        }
-        Ok(())
-    }
-
-    async fn expire_accepted_playback(
-        &self,
-        session_id: SessionId,
-        connection_id: u64,
-        sequence: u64,
-    ) -> Result<(), AdapterError> {
-        let (voice, receipt) = {
-            let mut sessions = self.sessions.lock().await;
-            let Some(session) = sessions.get_mut(&session_id.get()) else {
-                return Ok(());
-            };
-            if session
-                .playback
-                .as_ref()
-                .is_none_or(|transport| transport.connection_id != connection_id)
-            {
-                return Ok(());
+        if accepted {
+            if let Some(session) = self.sessions.lock().await.get(&session_id.get()) {
+                session.expiry_changed.notify_one();
             }
-            let Some(pending) = session.pending_playback.get(&sequence) else {
-                return Ok(());
-            };
-            if !pending.accepted || pending.connection_id != Some(connection_id) {
-                return Ok(());
-            }
-            let pending = session
-                .pending_playback
-                .remove(&sequence)
-                .expect("accepted playback remains pending until expiry");
-            (
-                session.voice.clone(),
-                PlaybackReceipt::new(pending.generation_id, PlaybackState::Flushed),
-            )
-        };
-        if let Some(voice) = voice {
-            tokio::time::timeout(
-                self.operation_timeout,
-                voice.send(Ok(VoiceInputEvent::Playback(receipt))),
-            )
-            .await
-            .map_err(|_| AdapterError::new("network media playback expiry event timed out"))?
-            .map_err(|_| AdapterError::new("network media voice input closed"))?;
         }
         Ok(())
     }
@@ -801,6 +821,123 @@ impl NetworkMediaHub {
         if let Some(session) = self.sessions.lock().await.get_mut(&session_id.get()) {
             session.pending_flush.remove(&generation_id.get());
         }
+    }
+}
+
+async fn accepted_expiry_worker(
+    hub: NetworkMediaHub,
+    session_id: SessionId,
+    reservation_epoch: u64,
+    cancellation: CancellationToken,
+    shutdown: CancellationToken,
+    changed: Arc<Notify>,
+) {
+    loop {
+        let notified = changed.notified();
+        let (deadline, expires_reconnect) = {
+            let sessions = hub.sessions.lock().await;
+            let Some(session) = sessions.get(&session_id.get()) else {
+                return;
+            };
+            if session.reservation_epoch != reservation_epoch {
+                return;
+            }
+            let accepted = session
+                .pending_playback
+                .values()
+                .filter_map(|pending| pending.accepted_deadline)
+                .min();
+            let deadline = accepted.into_iter().chain(session.reconnect_deadline).min();
+            let expires_reconnect =
+                deadline.is_some_and(|deadline| session.reconnect_deadline == Some(deadline));
+            (deadline, expires_reconnect)
+        };
+        match deadline {
+            Some(deadline) => tokio::select! {
+                _ = cancellation.cancelled() => return,
+                _ = shutdown.cancelled() => return,
+                _ = notified => continue,
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                    let _ = hub.expire_accepted_generations(session_id, reservation_epoch, &cancellation).await;
+                    if expires_reconnect {
+                        hub.expire_waiting_playback(session_id, deadline).await;
+                    }
+                }
+            },
+            None => tokio::select! {
+                _ = cancellation.cancelled() => return,
+                _ = shutdown.cancelled() => return,
+                _ = notified => continue,
+            },
+        }
+    }
+}
+
+impl NetworkMediaHub {
+    async fn expire_accepted_generations(
+        &self,
+        session_id: SessionId,
+        reservation_epoch: u64,
+        cancellation: &CancellationToken,
+    ) -> Result<(), AdapterError> {
+        let (voice, completions, generations) = {
+            let mut sessions = self.sessions.lock().await;
+            let Some(session) = sessions.get_mut(&session_id.get()) else {
+                return Ok(());
+            };
+            if session.reservation_epoch != reservation_epoch {
+                return Ok(());
+            }
+            let now = Instant::now();
+            let generations = session
+                .pending_playback
+                .values()
+                .filter_map(|pending| {
+                    pending
+                        .accepted_deadline
+                        .filter(|deadline| *deadline <= now)
+                        .map(|_| pending.generation_id)
+                })
+                .collect::<HashSet<_>>();
+            if generations.is_empty() {
+                return Ok(());
+            }
+            let sequences = session
+                .pending_playback
+                .iter()
+                .filter_map(|(sequence, pending)| {
+                    generations
+                        .contains(&pending.generation_id)
+                        .then_some(*sequence)
+                })
+                .collect::<Vec<_>>();
+            let mut completions = Vec::new();
+            for sequence in sequences {
+                if let Some(mut pending) = session.pending_playback.remove(&sequence) {
+                    if let Some(completion) = pending.completion.take() {
+                        completions.push(completion);
+                    }
+                }
+            }
+            (session.voice.clone(), completions, generations)
+        };
+        for completion in completions {
+            let _ = completion.send(Err(AdapterError::new(
+                "network media playback rendering timed out",
+            )));
+        }
+        if let Some(voice) = voice {
+            for generation_id in generations {
+                tokio::select! {
+                    _ = cancellation.cancelled() => return Ok(()),
+                    result = tokio::time::timeout(self.operation_timeout, voice.send(Ok(VoiceInputEvent::Playback(PlaybackReceipt::new(generation_id, PlaybackState::Flushed))))) => {
+                        result.map_err(|_| AdapterError::new("network media playback expiry event timed out"))?
+                            .map_err(|_| AdapterError::new("network media voice input closed"))?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 

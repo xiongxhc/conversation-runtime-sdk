@@ -24,7 +24,9 @@ use conversation_protocol::{
 use conversation_runtime::{ConversationContext, ConversationQualityController, RecordingSettings};
 use serde::{Deserialize, Serialize};
 
-use crate::media_server::{MediaServerConfig, MediaTlsConfig};
+use crate::media_server::{
+    MediaServerConfig, MediaTlsConfig, DEFAULT_MEDIA_PACKET_READ_TIMEOUT_MS,
+};
 use crate::memory_extraction::MemoryExtractionSettings;
 use crate::voice_adapters::{GatewayVoiceAdapters, VoicePolicyTemplate};
 
@@ -123,6 +125,8 @@ struct MediaConfig {
     max_payload_bytes: usize,
     max_outbound_queue_bytes: usize,
     max_outbound_queue_ms: u64,
+    #[serde(default = "default_packet_read_timeout_ms")]
+    packet_read_timeout_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tls_certificate_path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -157,10 +161,15 @@ impl MediaConfig {
             self.max_payload_bytes,
             self.max_outbound_queue_bytes,
             std::time::Duration::from_millis(self.max_outbound_queue_ms),
+            std::time::Duration::from_millis(self.packet_read_timeout_ms),
             tls,
         )
         .map_err(adapter_error)
     }
+}
+
+const fn default_packet_read_timeout_ms() -> u64 {
+    DEFAULT_MEDIA_PACKET_READ_TIMEOUT_MS
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

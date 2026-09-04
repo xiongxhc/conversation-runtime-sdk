@@ -176,13 +176,17 @@ do not run it from CI, a developer laptop on a public network, or an untrusted b
    max_payload_bytes = 32768
    max_outbound_queue_bytes = 262144
    max_outbound_queue_ms = 10000
+   packet_read_timeout_ms = 5000
    tls_certificate_path = "/service-managed/certificates/media-server.pem"
    tls_private_key_path = "/service-managed/certificates/media-server-key.pem"
    ```
 
    Keep the reconnect window no greater than the credential lifetime and the queue time no
-   greater than the reconnect window. Confirm that removing either TLS file reference makes
-   startup fail, and that the listener does not start before the configuration is valid.
+   greater than the reconnect window. `packet_read_timeout_ms` bounds only completion of an
+   already-started authenticated media packet; an idle authenticated bridge remains connected
+   until normal cancellation, disconnect, or lease expiry. Confirm that removing either TLS file
+   reference makes startup fail, and that the listener does not start before the configuration is
+   valid.
 
 3. Start the gateway under the normal service manager, then use a protocol-v3 control client to
    start exactly one voice session. Retain the returned `connect_endpoint`, authoritative session

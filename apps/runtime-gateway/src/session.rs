@@ -2614,10 +2614,12 @@ mod tests {
         GenerationLanguageModel, GenerationLanguageRequest, GenerationTextDelta,
         MeetingAudioWindows, MockContinuousAudioOutput, MockGenerationLanguageModel,
         MockStreamingSpeechSynthesizer, MockVoiceCaptureControl, MockVoiceIoFactory, OllamaConfig,
-        OllamaLanguageModel, OpenAiSpeechRecognitionConfig, PcmFormat, PcmSampleFormat,
-        RecognitionEvent, RecognitionHypothesis, StreamingSpeechRequest,
-        StreamingSpeechSynthesizer, TranscriptionDiarizer, VoiceCaptureControl, VoiceInput,
-        VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
+        OllamaLanguageModel, OpenAiCompatibleSpeechConfig, OpenAiCompatibleStreamingSpeechConfig,
+        OpenAiCompatibleStreamingSpeechSynthesizer, OpenAiLanguageConfig, OpenAiLanguageModel,
+        OpenAiSpeechRecognitionConfig, PcmFormat, PcmSampleFormat, RecognitionEvent,
+        RecognitionHypothesis, StreamingSpeechRequest, StreamingSpeechSynthesizer,
+        TranscriptionDiarizer, VoiceCaptureControl, VoiceInput, VoiceInputEvent, VoiceIoFactory,
+        VoiceIoSession,
     };
     use conversation_protocol::{
         ClientRuntimeEvent, ComponentDescriptor, ComponentKind, ExecutionLocation, GatewayMessage,
@@ -2630,7 +2632,7 @@ mod tests {
     use tempfile::TempDir;
     use tokio::io::{duplex, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
     use tokio::net::{TcpListener, TcpStream};
-    use tokio::sync::{mpsc, Notify};
+    use tokio::sync::{mpsc, Mutex, Notify};
     use tokio::time::timeout;
     use tokio_util::sync::CancellationToken;
 
@@ -3064,6 +3066,278 @@ mod tests {
             .await;
         gateway.close().await;
         recognizer.finish().await;
+        media.shutdown().await;
+    }
+
+    /// Catches a Task 7 regression where an externally gated online meeting reaches only a
+    /// mock language or speech boundary after the real recognizer finalizes a bridge capture.
+    /// All three production adapters must traverse their own scripted loopback HTTP contract,
+    /// and the returned streaming WAV must become a playable media-bridge frame.
+    #[tokio::test]
+    async fn online_external_gate_runs_production_asr_language_and_streaming_speech_over_loopback()
+    {
+        const CREDENTIAL: &str = "CONVERSATION_ONLINE_CHAIN_CREDENTIAL";
+        std::env::set_var(CREDENTIAL, "fake-not-a-real-credential-0000");
+        let recognizer = ScriptedHttpProvider::start(recognizer_final_response()).await;
+        let language = ScriptedHttpProvider::start(language_sse_response("approved reply.")).await;
+        let speech_pcm = pcm16_wav(16_000, 1, 160, 0x1234);
+        let speech = ScriptedHttpProvider::start(http_response(&speech_pcm)).await;
+        let media = Arc::new(
+            MediaServer::bind(MediaServerConfig::loopback())
+                .await
+                .unwrap(),
+        );
+        let session_id = SessionId::new(709);
+        let voice = GatewayVoiceAdapters {
+            io: GatewayVoiceAdapters::unavailable_online_io(),
+            speech: Arc::new(production_streaming_speech(speech.endpoint(), CREDENTIAL)),
+            policy: voice_policy(),
+            online_recognition: Some(production_recognition(recognizer.endpoint(), CREDENTIAL)),
+        };
+        let session = GatewaySession::new(unused_runtime(), online_status_with_voice())
+            .with_voice(
+                voice,
+                Arc::new(production_language(language.endpoint(), CREDENTIAL)),
+            )
+            .with_media_server(Arc::clone(&media))
+            .with_test_session_id(session_id);
+        let mut gateway = InMemoryGateway::start(session).await;
+
+        gateway
+            .write(r#"{"protocol_version":3,"type":"start_voice_session","request_id":"chain-start","response_mode":"external_gate"}"#)
+            .await;
+        let lease: serde_json::Value = serde_json::from_str(&gateway.read_message().await).unwrap();
+        let endpoint: std::net::SocketAddr = lease["media_lease"]["connect_endpoint"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("tcp://")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let credential = lease["media_lease"]["credential"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        gateway
+            .read_until(|message| message.contains(r#""type":"voice_session_started""#))
+            .await;
+        let mut bridge = TcpStream::connect(endpoint).await.unwrap();
+        bridge
+            .write_all(&media_authentication(session_id, &credential))
+            .await
+            .unwrap();
+        bridge
+            .write_all(&media_capture(session_id, 1, 1_000, b"online"))
+            .await
+            .unwrap();
+
+        recognizer.wait_for_request().await;
+        let final_transcript = gateway
+            .read_until(|message| message.contains(r#""type":"voice_transcript_final""#))
+            .await;
+        assert!(final_transcript
+            .iter()
+            .any(|message| message.contains(r#""text":"agenda item""#)));
+        assert_eq!(recognizer.request_count().await, 1);
+        assert_eq!(language.request_count().await, 0);
+        assert_eq!(speech.request_count().await, 0);
+
+        tokio::time::sleep(Duration::from_millis(850)).await;
+        gateway
+            .write(r#"{"protocol_version":3,"type":"authorize_voice_response","request_id":"chain-authorize","session_id":"709","segment_id":"1","context_exchanges":[{"user":"prior","assistant":"context"}]}"#)
+            .await;
+        gateway
+            .read_until(|message| message.contains(r#""type":"response_authorized""#))
+            .await;
+        language.wait_for_request().await;
+        speech.wait_for_request().await;
+
+        let recognition_request = recognizer.request(0).await;
+        assert_eq!(recognition_request.target, "/v1/audio/transcriptions");
+        assert_eq!(
+            recognition_request.authorization.as_deref(),
+            Some("Bearer fake-not-a-real-credential-0000")
+        );
+        let mut recognition_keys = recognition_request
+            .payload
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        recognition_keys.sort();
+        assert_eq!(
+            recognition_keys,
+            [
+                "audio",
+                "channels",
+                "encoding",
+                "model",
+                "sample_rate_hz",
+                "segment_id",
+                "sequence",
+                "stream",
+            ]
+        );
+        assert_eq!(recognition_request.payload["model"], "scripted-asr-model");
+        assert_eq!(recognition_request.payload["encoding"], "pcm_s16le");
+        assert_eq!(recognition_request.payload["sample_rate_hz"], 16_000);
+        assert_eq!(recognition_request.payload["channels"], 1);
+        assert_eq!(recognition_request.payload["segment_id"], "s709-seg1");
+        assert_eq!(recognition_request.payload["sequence"], 0);
+        assert_eq!(recognition_request.payload["stream"], true);
+        assert_eq!(recognition_request.payload["audio"], "b25saW5l");
+        let language_request = language.request(0).await;
+        assert_eq!(language_request.target, "/v1/chat/completions");
+        assert_eq!(
+            language_request.authorization.as_deref(),
+            Some("Bearer fake-not-a-real-credential-0000")
+        );
+        assert_eq!(language_request.payload["model"], "scripted-language-model");
+        assert_eq!(language_request.payload["stream"], true);
+        let messages = language_request.payload["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0]["role"], "system");
+        let context_start = messages.len() - 3;
+        assert_eq!(messages[context_start]["role"], "user");
+        assert_eq!(messages[context_start]["content"], "prior");
+        assert_eq!(messages[context_start + 1]["role"], "assistant");
+        assert_eq!(messages[context_start + 1]["content"], "context");
+        assert_eq!(messages[context_start + 2]["role"], "user");
+        assert_eq!(messages[context_start + 2]["content"], "agenda item");
+        let speech_request = speech.request(0).await;
+        assert_eq!(speech_request.target, "/v1/audio/speech");
+        assert_eq!(
+            speech_request.authorization.as_deref(),
+            Some("Bearer fake-not-a-real-credential-0000")
+        );
+        assert_eq!(
+            speech_request.payload,
+            serde_json::json!({
+                "model": "scripted-speech-model",
+                "input": "approved reply.",
+                "voice": "scripted-voice",
+                "speed": 1.0,
+                "lang_code": "auto",
+                "instruct": "Speak clearly.",
+                "max_tokens": 128,
+                "repetition_penalty": 1.0,
+                "response_format": "wav",
+                "stream": true,
+                "streaming_interval": 0.2,
+            })
+        );
+
+        let playback_sequence = read_loopback_playback(&mut bridge, session_id, &speech_pcm).await;
+        send_loopback_playback_ack(&mut bridge, session_id, playback_sequence).await;
+        let accepted_playback = gateway
+            .read_until(|message| {
+                message.contains(r#""type":"voice_playback""#)
+                    && message.contains(r#""state":"accepted""#)
+            })
+            .await;
+        assert!(accepted_playback.iter().any(|message| {
+            message.contains(r#""type":"voice_playback""#)
+                && message.contains(r#""state":"accepted""#)
+        }));
+
+        gateway
+            .write(
+                r#"{"protocol_version":3,"type":"stop_voice_session","request_id":"chain-stop"}"#,
+            )
+            .await;
+        gateway
+            .read_until(|message| {
+                message_type(message) == "command_accepted" && message.contains("chain-stop")
+            })
+            .await;
+        gateway.close().await;
+        media.shutdown().await;
+    }
+
+    /// A final transcript is still inert under an external gate when every adapter is the
+    /// production loopback adapter set; skipping it must not open either remote generation
+    /// boundary.
+    #[tokio::test]
+    async fn online_external_gate_skip_leaves_production_language_and_speech_unstarted() {
+        const CREDENTIAL: &str = "CONVERSATION_ONLINE_CHAIN_SKIP_CREDENTIAL";
+        std::env::set_var(CREDENTIAL, "fake-not-a-real-credential-0000");
+        let recognizer = ScriptedHttpProvider::start(recognizer_final_response()).await;
+        let language = ScriptedHttpProvider::start(language_sse_response("unreachable")).await;
+        let speech =
+            ScriptedHttpProvider::start(http_response(&pcm16_wav(16_000, 1, 160, 1))).await;
+        let media = Arc::new(
+            MediaServer::bind(MediaServerConfig::loopback())
+                .await
+                .unwrap(),
+        );
+        let session_id = SessionId::new(710);
+        let voice = GatewayVoiceAdapters {
+            io: GatewayVoiceAdapters::unavailable_online_io(),
+            speech: Arc::new(production_streaming_speech(speech.endpoint(), CREDENTIAL)),
+            policy: voice_policy(),
+            online_recognition: Some(production_recognition(recognizer.endpoint(), CREDENTIAL)),
+        };
+        let session = GatewaySession::new(unused_runtime(), online_status_with_voice())
+            .with_voice(
+                voice,
+                Arc::new(production_language(language.endpoint(), CREDENTIAL)),
+            )
+            .with_media_server(Arc::clone(&media))
+            .with_test_session_id(session_id);
+        let mut gateway = InMemoryGateway::start(session).await;
+
+        gateway
+            .write(r#"{"protocol_version":3,"type":"start_voice_session","request_id":"chain-skip-start","response_mode":"external_gate"}"#)
+            .await;
+        let lease: serde_json::Value = serde_json::from_str(&gateway.read_message().await).unwrap();
+        let endpoint: std::net::SocketAddr = lease["media_lease"]["connect_endpoint"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("tcp://")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let credential = lease["media_lease"]["credential"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        gateway
+            .read_until(|message| message.contains(r#""type":"voice_session_started""#))
+            .await;
+        let mut bridge = TcpStream::connect(endpoint).await.unwrap();
+        bridge
+            .write_all(&media_authentication(session_id, &credential))
+            .await
+            .unwrap();
+        bridge
+            .write_all(&media_capture(session_id, 1, 1_000, b"online"))
+            .await
+            .unwrap();
+        recognizer.wait_for_request().await;
+        gateway
+            .read_until(|message| message.contains(r#""type":"voice_transcript_final""#))
+            .await;
+        tokio::time::sleep(Duration::from_millis(850)).await;
+        gateway
+            .write(r#"{"protocol_version":3,"type":"skip_voice_response","request_id":"chain-skip","session_id":"710","segment_id":"1","reason":"meeting policy"}"#)
+            .await;
+        gateway
+            .read_until(|message| message.contains(r#""type":"response_skipped""#))
+            .await;
+        assert_eq!(recognizer.request_count().await, 1);
+        assert_eq!(language.request_count().await, 0);
+        assert_eq!(speech.request_count().await, 0);
+
+        gateway
+            .write(r#"{"protocol_version":3,"type":"stop_voice_session","request_id":"chain-skip-stop"}"#)
+            .await;
+        gateway
+            .read_until(|message| {
+                message_type(message) == "command_accepted" && message.contains("chain-skip-stop")
+            })
+            .await;
+        gateway.close().await;
         media.shutdown().await;
     }
 
@@ -7471,6 +7745,312 @@ mod tests {
                 notified.await;
             }
         }
+    }
+
+    struct ProviderRequest {
+        target: String,
+        payload: serde_json::Value,
+        authorization: Option<String>,
+    }
+
+    /// A single-process HTTP boundary for the production online adapters. It deliberately
+    /// records complete JSON requests while the gateway keeps the adapters themselves real.
+    struct ScriptedHttpProvider {
+        endpoint: String,
+        requests: Arc<Mutex<Vec<ProviderRequest>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl ScriptedHttpProvider {
+        async fn start(response: Vec<u8>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let worker_requests = Arc::clone(&requests);
+            let task = tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let Ok(request) = read_provider_request(&mut stream).await else {
+                        continue;
+                    };
+                    worker_requests.lock().await.push(request);
+                    if stream.write_all(&response).await.is_err() {
+                        continue;
+                    }
+                    let _ = stream.flush().await;
+                }
+            });
+            Self {
+                endpoint,
+                requests,
+                task,
+            }
+        }
+
+        fn endpoint(&self) -> &str {
+            &self.endpoint
+        }
+
+        async fn request_count(&self) -> usize {
+            self.requests.lock().await.len()
+        }
+
+        async fn request(&self, index: usize) -> ProviderRequest {
+            let requests = self.requests.lock().await;
+            ProviderRequest {
+                target: requests[index].target.clone(),
+                payload: requests[index].payload.clone(),
+                authorization: requests[index].authorization.clone(),
+            }
+        }
+
+        async fn wait_for_request(&self) {
+            timeout(TEST_TIMEOUT, async {
+                loop {
+                    if self.request_count().await > 0 {
+                        return;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("scripted online provider did not receive a request");
+        }
+    }
+
+    impl Drop for ScriptedHttpProvider {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn read_provider_request(stream: &mut TcpStream) -> Result<ProviderRequest, ()> {
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        let header_end = loop {
+            let read = stream.read(&mut buffer).await.map_err(|_| ())?;
+            if read == 0 {
+                return Err(());
+            }
+            bytes.extend_from_slice(&buffer[..read]);
+            if let Some(position) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                break position + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&bytes[..header_end]).into_owned();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .ok_or(())?;
+        while bytes.len() < header_end + content_length {
+            let read = stream.read(&mut buffer).await.map_err(|_| ())?;
+            if read == 0 {
+                return Err(());
+            }
+            bytes.extend_from_slice(&buffer[..read]);
+        }
+        let target = headers
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .ok_or(())?
+            .to_owned();
+        let authorization = headers.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("authorization")
+                .then(|| value.trim().to_owned())
+        });
+        let payload = serde_json::from_slice(&bytes[header_end..header_end + content_length])
+            .map_err(|_| ())?;
+        Ok(ProviderRequest {
+            target,
+            payload,
+            authorization,
+        })
+    }
+
+    fn production_recognition(
+        endpoint: &str,
+        credential_env: &str,
+    ) -> OpenAiSpeechRecognitionConfig {
+        OpenAiSpeechRecognitionConfig::new(
+            format!("{endpoint}/v1"),
+            "scripted-asr-model",
+            credential_env,
+        )
+        .unwrap()
+        .with_chunk_bytes(b"online".len())
+        .unwrap()
+    }
+
+    fn production_language(endpoint: &str, credential_env: &str) -> OpenAiLanguageModel {
+        OpenAiLanguageModel::new(
+            OpenAiLanguageConfig::new(
+                format!("{endpoint}/v1"),
+                "scripted-language-model",
+                credential_env,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn production_streaming_speech(
+        endpoint: &str,
+        credential_env: &str,
+    ) -> OpenAiCompatibleStreamingSpeechSynthesizer {
+        let speech = OpenAiCompatibleSpeechConfig::new("scripted-speech-model")
+            .unwrap()
+            .with_endpoint(format!("{endpoint}/v1"))
+            .unwrap()
+            .with_voice("scripted-voice")
+            .unwrap()
+            .with_speed(1.0)
+            .unwrap()
+            .with_language("auto")
+            .unwrap()
+            .with_instructions("Speak clearly.")
+            .unwrap()
+            .with_max_tokens(128)
+            .unwrap()
+            .with_repetition_penalty(1.0)
+            .unwrap()
+            .with_max_text_bytes(4_096)
+            .unwrap()
+            .with_max_audio_bytes(8 * 1024 * 1024)
+            .unwrap();
+        OpenAiCompatibleStreamingSpeechSynthesizer::new(
+            OpenAiCompatibleStreamingSpeechConfig::new(speech, 0.2)
+                .unwrap()
+                .with_credential_env(credential_env)
+                .unwrap(),
+        )
+    }
+
+    fn recognizer_final_response() -> Vec<u8> {
+        let body = b"{\"type\":\"final\",\"text\":\"agenda item\",\"start_ms\":0,\"end_ms\":1}\n";
+        http_response_with_content_type(body, "application/x-ndjson")
+    }
+
+    fn language_sse_response(text: &str) -> Vec<u8> {
+        let first = format!(
+            "data: {}\n\n",
+            serde_json::json!({"choices":[{"delta":{"content":text},"finish_reason":null}]})
+        );
+        let done = "data: [DONE]\n\n";
+        let mut response = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec();
+        for chunk in [first.as_bytes(), done.as_bytes()] {
+            response.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            response.extend_from_slice(chunk);
+            response.extend_from_slice(b"\r\n");
+        }
+        response.extend_from_slice(b"0\r\n\r\n");
+        response
+    }
+
+    fn http_response(body: &[u8]) -> Vec<u8> {
+        http_response_with_content_type(body, "application/octet-stream")
+    }
+
+    fn http_response_with_content_type(body: &[u8], content_type: &str) -> Vec<u8> {
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    fn pcm16_wav(sample_rate_hz: u32, channels: u16, sample_count: usize, sample: i16) -> Vec<u8> {
+        let mut pcm = Vec::with_capacity(sample_count * usize::from(channels) * 2);
+        for _ in 0..sample_count * usize::from(channels) {
+            pcm.extend_from_slice(&sample.to_le_bytes());
+        }
+        let data_bytes = u32::try_from(pcm.len()).unwrap();
+        let block_align = channels * 2;
+        let byte_rate = sample_rate_hz * u32::from(block_align);
+        let mut wav = Vec::with_capacity(44 + pcm.len());
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16_u32.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&channels.to_le_bytes());
+        wav.extend_from_slice(&sample_rate_hz.to_le_bytes());
+        wav.extend_from_slice(&byte_rate.to_le_bytes());
+        wav.extend_from_slice(&block_align.to_le_bytes());
+        wav.extend_from_slice(&16_u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_bytes.to_le_bytes());
+        wav.extend_from_slice(&pcm);
+        wav
+    }
+
+    async fn read_loopback_playback(
+        stream: &mut TcpStream,
+        session_id: SessionId,
+        expected_pcm: &[u8],
+    ) -> u64 {
+        let mut header = [0_u8; 66];
+        timeout(TEST_TIMEOUT, stream.read_exact(&mut header))
+            .await
+            .expect("the production streaming speech never reached the media bridge")
+            .unwrap();
+        assert_eq!(&header[..7], b"MED1\x01\x02\x02");
+        assert_eq!(
+            u64::from_be_bytes(header[7..15].try_into().unwrap()),
+            session_id.get()
+        );
+        assert_ne!(u64::from_be_bytes(header[23..31].try_into().unwrap()), 0);
+        assert_ne!(u64::from_be_bytes(header[31..39].try_into().unwrap()), 0);
+        assert_ne!(u64::from_be_bytes(header[39..47].try_into().unwrap()), 0);
+        assert_eq!(u64::from_be_bytes(header[47..55].try_into().unwrap()), 0);
+        assert_eq!(header[55], 1);
+        assert_eq!(
+            u32::from_be_bytes(header[56..60].try_into().unwrap()),
+            16_000
+        );
+        assert_eq!(u16::from_be_bytes(header[60..62].try_into().unwrap()), 1);
+        let byte_length = u32::from_be_bytes(header[62..66].try_into().unwrap()) as usize;
+        assert_eq!(byte_length, expected_pcm.len() - 44);
+        let mut actual_pcm = vec![0_u8; byte_length];
+        stream.read_exact(&mut actual_pcm).await.unwrap();
+        assert_eq!(actual_pcm, expected_pcm[44..]);
+        u64::from_be_bytes(header[15..23].try_into().unwrap())
+    }
+
+    async fn send_loopback_playback_ack(
+        stream: &mut TcpStream,
+        session_id: SessionId,
+        playback_sequence: u64,
+    ) {
+        send_loopback_playback_state(stream, session_id, playback_sequence, 1).await;
+    }
+
+    async fn send_loopback_playback_state(
+        stream: &mut TcpStream,
+        session_id: SessionId,
+        playback_sequence: u64,
+        state: u8,
+    ) {
+        stream.write_all(b"MED1\x01\x03").await.unwrap();
+        stream
+            .write_all(&session_id.get().to_be_bytes())
+            .await
+            .unwrap();
+        stream
+            .write_all(&playback_sequence.to_be_bytes())
+            .await
+            .unwrap();
+        stream.write_u8(state).await.unwrap();
+        stream.flush().await.unwrap();
     }
 
     struct ScriptedRecognizerServer {

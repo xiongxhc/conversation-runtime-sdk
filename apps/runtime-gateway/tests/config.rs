@@ -1799,6 +1799,52 @@ fn a_valid_online_configuration_reports_cloud_privacy_and_remote_components() {
     .unwrap();
 }
 
+/// Catches a Task 7 regression where an online configuration advertised a voice session even
+/// though the only available I/O factory was the intentionally unavailable placeholder.
+#[test]
+fn an_online_voice_configuration_requires_a_media_bridge() {
+    set_online_credential();
+    let fixture = tempfile::tempdir().unwrap();
+    let media_start = ONLINE_CONFIG.find("[media]").unwrap();
+    let capture_start = ONLINE_CONFIG.find("[voice.capture]").unwrap();
+    let without_media = format!(
+        "{}{}",
+        &ONLINE_CONFIG[..media_start],
+        &ONLINE_CONFIG[capture_start..]
+    );
+    let path = write_config(fixture.path(), &without_media);
+
+    let error = GatewayConfig::validate(&path).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("online voice requires a media bridge configuration"),
+        "unexpected configuration result: {error}"
+    );
+}
+
+/// Catches the online-builder regression that used the adapter's default output limit instead
+/// of validating the configured limit when constructing remote language adapters.
+#[test]
+fn an_online_language_configuration_rejects_a_zero_output_byte_limit() {
+    set_online_credential();
+    let fixture = tempfile::tempdir().unwrap();
+    let path = write_config(
+        fixture.path(),
+        &ONLINE_CONFIG.replacen(
+            "max_assistant_content_bytes = 65536",
+            "max_assistant_content_bytes = 0",
+            1,
+        ),
+    );
+
+    assert!(
+        GatewayConfig::load(&path).is_err(),
+        "a zero configured output limit must not be replaced by the adapter default"
+    );
+}
+
 #[test]
 fn an_online_text_only_configuration_reports_a_remote_language_model() {
     set_online_credential();

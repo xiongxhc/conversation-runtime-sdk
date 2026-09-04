@@ -673,6 +673,16 @@ follow_up_frequency = 25
 
 [voice]
 
+[media]
+bind = "127.0.0.1:0"
+advertised_endpoint = "tcp://127.0.0.1:0"
+credential_lifetime_ms = 60000
+reconnect_window_ms = 10000
+max_frames_per_second = 100
+max_payload_bytes = 16384
+max_outbound_queue_bytes = 262144
+max_outbound_queue_ms = 10000
+
 [voice.capture]
 device = "system-default"
 

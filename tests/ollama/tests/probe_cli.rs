@@ -31,6 +31,23 @@ fn exits_non_zero_with_structured_first_delta_timeout() {
 }
 
 #[test]
+fn stalled_server_keeps_its_listener_available_until_the_probe_connects() {
+    let server = StalledOllamaServer::start();
+    thread::sleep(Duration::from_millis(1_100));
+
+    let address = server
+        .endpoint()
+        .strip_prefix("http://")
+        .expect("stalled server endpoint uses HTTP");
+    let mut stream = TcpStream::connect(address).expect("stalled server accepts a delayed probe");
+    stream
+        .write_all(b"POST /api/chat HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
+        .unwrap();
+
+    server.finish();
+}
+
+#[test]
 fn reports_an_overflowing_timeout_as_a_structured_configuration_failure() {
     let output = run_probe(
         Command::new(env!("CARGO_BIN_EXE_conversation-ollama-probe"))
@@ -136,7 +153,6 @@ impl RespondingOllamaServer {
 impl StalledOllamaServer {
     fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let (completed_sender, completed) = mpsc::channel();
         let worker = thread::spawn(move || {
@@ -189,22 +205,7 @@ fn run_probe_with_stdout(command: &mut Command, stdout: Stdio) -> Output {
 }
 
 fn accept_and_stall(listener: TcpListener) -> std::io::Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(1);
-    let mut stream = loop {
-        match listener.accept() {
-            Ok((stream, _)) => break stream,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "probe never connected to stalled server",
-                    ));
-                }
-                thread::sleep(Duration::from_millis(5));
-            }
-            Err(error) => return Err(error),
-        }
-    };
+    let (mut stream, _) = listener.accept()?;
     stream.set_read_timeout(Some(Duration::from_secs(1)))?;
     stream.set_write_timeout(Some(Duration::from_secs(1)))?;
     read_request(&mut stream)?;

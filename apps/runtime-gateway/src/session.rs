@@ -2614,12 +2614,10 @@ mod tests {
         GenerationLanguageModel, GenerationLanguageRequest, GenerationTextDelta,
         MeetingAudioWindows, MockContinuousAudioOutput, MockGenerationLanguageModel,
         MockStreamingSpeechSynthesizer, MockVoiceCaptureControl, MockVoiceIoFactory, OllamaConfig,
-        OllamaLanguageModel, OpenAiCompatibleSpeechConfig, OpenAiCompatibleStreamingSpeechConfig,
-        OpenAiCompatibleStreamingSpeechSynthesizer, OpenAiLanguageConfig, OpenAiLanguageModel,
-        OpenAiSpeechRecognitionConfig, PcmFormat, PcmSampleFormat, RecognitionEvent,
-        RecognitionHypothesis, StreamingSpeechRequest, StreamingSpeechSynthesizer,
-        TranscriptionDiarizer, VoiceCaptureControl, VoiceInput, VoiceInputEvent, VoiceIoFactory,
-        VoiceIoSession,
+        OllamaLanguageModel, OpenAiSpeechRecognitionConfig, PcmFormat, PcmSampleFormat,
+        RecognitionEvent, RecognitionHypothesis, StreamingSpeechRequest,
+        StreamingSpeechSynthesizer, TranscriptionDiarizer, VoiceCaptureControl, VoiceInput,
+        VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
     };
     use conversation_protocol::{
         ClientRuntimeEvent, ComponentDescriptor, ComponentKind, ExecutionLocation, GatewayMessage,
@@ -3082,23 +3080,25 @@ mod tests {
         let language = ScriptedHttpProvider::start(language_sse_response("approved reply.")).await;
         let speech_pcm = pcm16_wav(16_000, 1, 160, 0x1234);
         let speech = ScriptedHttpProvider::start(http_response(&speech_pcm)).await;
+        let recognition_audio = vec![b'o'; 32_000];
+        let session_id = SessionId::new(709);
+        let mut adapters = loader_built_online_adapters(
+            recognizer.endpoint(),
+            language.endpoint(),
+            speech.endpoint(),
+            CREDENTIAL,
+        );
         let media = Arc::new(
-            MediaServer::bind(MediaServerConfig::loopback())
+            MediaServer::bind(adapters.media.take().unwrap())
                 .await
                 .unwrap(),
         );
-        let session_id = SessionId::new(709);
-        let voice = GatewayVoiceAdapters {
-            io: GatewayVoiceAdapters::unavailable_online_io(),
-            speech: Arc::new(production_streaming_speech(speech.endpoint(), CREDENTIAL)),
-            policy: voice_policy(),
-            online_recognition: Some(production_recognition(recognizer.endpoint(), CREDENTIAL)),
-        };
-        let session = GatewaySession::new(unused_runtime(), online_status_with_voice())
-            .with_voice(
-                voice,
-                Arc::new(production_language(language.endpoint(), CREDENTIAL)),
-            )
+        let runtime = conversation_runtime::TextTurnRuntime::new(
+            adapters.context,
+            Arc::clone(&adapters.language),
+        );
+        let session = GatewaySession::new(runtime, adapters.status)
+            .with_voice(adapters.voice.take().unwrap(), adapters.language)
             .with_media_server(Arc::clone(&media))
             .with_test_session_id(session_id);
         let mut gateway = InMemoryGateway::start(session).await;
@@ -3127,7 +3127,21 @@ mod tests {
             .await
             .unwrap();
         bridge
-            .write_all(&media_capture(session_id, 1, 1_000, b"online"))
+            .write_all(&media_capture(
+                session_id,
+                1,
+                1_000,
+                &recognition_audio[..16_000],
+            ))
+            .await
+            .unwrap();
+        bridge
+            .write_all(&media_capture(
+                session_id,
+                2,
+                1_001,
+                &recognition_audio[16_000..],
+            ))
             .await
             .unwrap();
 
@@ -3186,7 +3200,10 @@ mod tests {
         assert_eq!(recognition_request.payload["segment_id"], "s709-seg1");
         assert_eq!(recognition_request.payload["sequence"], 0);
         assert_eq!(recognition_request.payload["stream"], true);
-        assert_eq!(recognition_request.payload["audio"], "b25saW5l");
+        let audio = recognition_request.payload["audio"].as_str().unwrap();
+        assert_eq!(audio.len(), 42_668);
+        assert!(audio.starts_with("b29vb29v"));
+        assert!(audio.ends_with("b28="));
         let language_request = language.request(0).await;
         assert_eq!(language_request.target, "/v1/chat/completions");
         assert_eq!(
@@ -3266,23 +3283,25 @@ mod tests {
         let language = ScriptedHttpProvider::start(language_sse_response("unreachable")).await;
         let speech =
             ScriptedHttpProvider::start(http_response(&pcm16_wav(16_000, 1, 160, 1))).await;
+        let recognition_audio = vec![b'o'; 32_000];
+        let session_id = SessionId::new(710);
+        let mut adapters = loader_built_online_adapters(
+            recognizer.endpoint(),
+            language.endpoint(),
+            speech.endpoint(),
+            CREDENTIAL,
+        );
         let media = Arc::new(
-            MediaServer::bind(MediaServerConfig::loopback())
+            MediaServer::bind(adapters.media.take().unwrap())
                 .await
                 .unwrap(),
         );
-        let session_id = SessionId::new(710);
-        let voice = GatewayVoiceAdapters {
-            io: GatewayVoiceAdapters::unavailable_online_io(),
-            speech: Arc::new(production_streaming_speech(speech.endpoint(), CREDENTIAL)),
-            policy: voice_policy(),
-            online_recognition: Some(production_recognition(recognizer.endpoint(), CREDENTIAL)),
-        };
-        let session = GatewaySession::new(unused_runtime(), online_status_with_voice())
-            .with_voice(
-                voice,
-                Arc::new(production_language(language.endpoint(), CREDENTIAL)),
-            )
+        let runtime = conversation_runtime::TextTurnRuntime::new(
+            adapters.context,
+            Arc::clone(&adapters.language),
+        );
+        let session = GatewaySession::new(runtime, adapters.status)
+            .with_voice(adapters.voice.take().unwrap(), adapters.language)
             .with_media_server(Arc::clone(&media))
             .with_test_session_id(session_id);
         let mut gateway = InMemoryGateway::start(session).await;
@@ -3311,7 +3330,21 @@ mod tests {
             .await
             .unwrap();
         bridge
-            .write_all(&media_capture(session_id, 1, 1_000, b"online"))
+            .write_all(&media_capture(
+                session_id,
+                1,
+                1_000,
+                &recognition_audio[..16_000],
+            ))
+            .await
+            .unwrap();
+        bridge
+            .write_all(&media_capture(
+                session_id,
+                2,
+                1_001,
+                &recognition_audio[16_000..],
+            ))
             .await
             .unwrap();
         recognizer.wait_for_request().await;
@@ -7876,61 +7909,118 @@ mod tests {
         })
     }
 
-    fn production_recognition(
-        endpoint: &str,
+    /// Builds the exact online adapter set from the gateway configuration path. The TOML keeps
+    /// its deployable HTTPS endpoints; only the test-only builder seam replaces the already
+    /// validated adapter transport targets with isolated loopback providers.
+    fn loader_built_online_adapters(
+        recognition_endpoint: &str,
+        language_endpoint: &str,
+        speech_endpoint: &str,
         credential_env: &str,
-    ) -> OpenAiSpeechRecognitionConfig {
-        OpenAiSpeechRecognitionConfig::new(
-            format!("{endpoint}/v1"),
-            "scripted-asr-model",
-            credential_env,
+    ) -> crate::GatewayAdapters {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("online-loader-chain.toml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"schema_version = 3
+profile = "online"
+privacy_mode = "cloud"
+
+[language]
+backend = "openai-compatible"
+execution = "remote"
+provider = "scripted-online-language"
+endpoint = "https://provider.example.invalid/v1"
+model = "scripted-language-model"
+credential_env = "{credential_env}"
+thinking = false
+temperature = 0.7
+seed = 42
+num_predict = 128
+num_ctx = 8192
+max_assistant_content_bytes = 65536
+
+[persona]
+mode = "direct-answer"
+warmth = 80
+humor = 60
+teasing = 40
+initiative = 35
+directness = 80
+intimacy = 30
+verbosity = 20
+follow_up_frequency = 25
+
+[voice]
+response_mode = "external_gate"
+
+[media]
+bind = "127.0.0.1:0"
+advertised_endpoint = "tcp://127.0.0.1:0"
+credential_lifetime_ms = 60000
+reconnect_window_ms = 10000
+max_frames_per_second = 100
+max_payload_bytes = 16384
+max_outbound_queue_bytes = 262144
+max_outbound_queue_ms = 10000
+
+[voice.capture]
+device = "system-default"
+
+[voice.turn]
+speech_start_ms = 200
+final_silence_ms = 600
+
+[voice.asr]
+backend = "openai-streaming"
+execution = "remote"
+provider = "scripted-online-asr"
+endpoint = "https://provider.example.invalid/v1"
+model = "scripted-asr-model"
+credential_env = "{credential_env}"
+
+[voice.speech]
+backend = "openai-compatible"
+execution = "remote"
+provider = "scripted-online-speech"
+mode = "streaming"
+streaming_interval = 0.2
+endpoint = "https://provider.example.invalid/v1"
+model = "scripted-speech-model"
+voice = "scripted-voice"
+credential_env = "{credential_env}"
+speed = 1.0
+language = "auto"
+instructions = "Speak clearly."
+max_tokens = 128
+repetition_penalty = 1.0
+max_text_bytes = 4096
+max_audio_bytes = 8388608
+
+[voice.audio]
+backend = "managed-sidecar"
+execution = "local"
+provider = "scripted-local-audio"
+sidecar_executable = "/absolute/path/to/unused-sidecar"
+max_error_bytes = 65536
+"#,
+            ),
+        )
+        .unwrap();
+        let normal = crate::GatewayConfig::load(&path).unwrap();
+        assert_eq!(normal.status.profile, "online");
+        assert_eq!(normal.status.privacy_mode, "cloud");
+        assert!(normal.voice.is_some());
+        crate::GatewayConfig::load_with_test_provider_endpoints(
+            &path,
+            crate::config::GatewayTestProviderEndpoints::new(
+                format!("{language_endpoint}/v1"),
+                format!("{recognition_endpoint}/v1"),
+                format!("{speech_endpoint}/v1"),
+            ),
         )
         .unwrap()
-        .with_chunk_bytes(b"online".len())
-        .unwrap()
-    }
-
-    fn production_language(endpoint: &str, credential_env: &str) -> OpenAiLanguageModel {
-        OpenAiLanguageModel::new(
-            OpenAiLanguageConfig::new(
-                format!("{endpoint}/v1"),
-                "scripted-language-model",
-                credential_env,
-            )
-            .unwrap(),
-        )
-    }
-
-    fn production_streaming_speech(
-        endpoint: &str,
-        credential_env: &str,
-    ) -> OpenAiCompatibleStreamingSpeechSynthesizer {
-        let speech = OpenAiCompatibleSpeechConfig::new("scripted-speech-model")
-            .unwrap()
-            .with_endpoint(format!("{endpoint}/v1"))
-            .unwrap()
-            .with_voice("scripted-voice")
-            .unwrap()
-            .with_speed(1.0)
-            .unwrap()
-            .with_language("auto")
-            .unwrap()
-            .with_instructions("Speak clearly.")
-            .unwrap()
-            .with_max_tokens(128)
-            .unwrap()
-            .with_repetition_penalty(1.0)
-            .unwrap()
-            .with_max_text_bytes(4_096)
-            .unwrap()
-            .with_max_audio_bytes(8 * 1024 * 1024)
-            .unwrap();
-        OpenAiCompatibleStreamingSpeechSynthesizer::new(
-            OpenAiCompatibleStreamingSpeechConfig::new(speech, 0.2)
-                .unwrap()
-                .with_credential_env(credential_env)
-                .unwrap(),
-        )
     }
 
     fn recognizer_final_response() -> Vec<u8> {

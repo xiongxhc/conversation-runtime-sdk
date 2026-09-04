@@ -116,6 +116,36 @@ pub struct GatewayAdapters {
     pub status: RuntimeStatus,
 }
 
+/// The three remote transports that are replaced only while a crate unit test assembles real
+/// adapters against deterministic loopback providers. Deployment TOML is still parsed and
+/// validated with its configured endpoints before this is used.
+#[derive(Clone, Copy)]
+struct ProviderEndpointOverrides<'a> {
+    language: &'a str,
+    recognition: &'a str,
+    speech: &'a str,
+}
+
+/// Loopback transport targets for a loader-built adapter set. This exists only in the lib-test
+/// build, so normal gateway binaries and integration-test library artifacts cannot select it.
+#[cfg(test)]
+pub(crate) struct GatewayTestProviderEndpoints {
+    language: String,
+    recognition: String,
+    speech: String,
+}
+
+#[cfg(test)]
+impl GatewayTestProviderEndpoints {
+    pub(crate) fn new(language: String, recognition: String, speech: String) -> Self {
+        Self {
+            language,
+            recognition,
+            speech,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct MediaConfig {
@@ -454,6 +484,19 @@ impl GatewayConfig {
         load_toml(path)?.build_adapters()
     }
 
+    #[cfg(test)]
+    pub(crate) fn load_with_test_provider_endpoints(
+        path: &Path,
+        endpoints: GatewayTestProviderEndpoints,
+    ) -> Result<GatewayAdapters, GatewayConfigError> {
+        let parsed = load_toml(path)?;
+        parsed.build_adapters_with_provider_endpoints(Some(ProviderEndpointOverrides {
+            language: &endpoints.language,
+            recognition: &endpoints.recognition,
+            speech: &endpoints.speech,
+        }))
+    }
+
     /// Parse and fully validate a configuration file, returning the runtime
     /// status the deployment will report. Adapters are deliberately not
     /// constructed: an online deployment names remote providers whose adapters
@@ -595,6 +638,13 @@ impl GatewayConfig {
     }
 
     fn build_adapters(&self) -> Result<GatewayAdapters, GatewayConfigError> {
+        self.build_adapters_with_provider_endpoints(None)
+    }
+
+    fn build_adapters_with_provider_endpoints(
+        &self,
+        provider_endpoints: Option<ProviderEndpointOverrides<'_>>,
+    ) -> Result<GatewayAdapters, GatewayConfigError> {
         let DeploymentPlan {
             provider_hosts,
             components,
@@ -612,7 +662,9 @@ impl GatewayConfig {
                     config_error("remote language requires a credential environment variable")
                 })?;
                 let mut config = OpenAiLanguageConfig::new(
-                    &self.language.endpoint,
+                    provider_endpoints.map_or(self.language.endpoint.as_str(), |endpoints| {
+                        endpoints.language
+                    }),
                     &self.language.model,
                     credential,
                 )
@@ -651,7 +703,7 @@ impl GatewayConfig {
         let voice = self
             .voice
             .as_ref()
-            .map(|voice| voice.build(self.privacy_mode.into(), components))
+            .map(|voice| voice.build(self.privacy_mode.into(), components, provider_endpoints))
             .transpose()?;
 
         let recording = self
@@ -1019,6 +1071,7 @@ impl VoiceConfig {
         &self,
         privacy_mode: ProtocolPrivacyMode,
         components: Vec<ComponentDescriptor>,
+        provider_endpoints: Option<ProviderEndpointOverrides<'_>>,
     ) -> Result<GatewayVoiceAdapters, GatewayConfigError> {
         let policy = VoicePolicyTemplate::new(
             privacy_mode,
@@ -1062,9 +1115,12 @@ impl VoiceConfig {
                 )
             }
             VoiceAsrBackend::OpenaiStreaming => {
-                let endpoint = self.asr.endpoint.as_deref().ok_or_else(|| {
-                    config_error("streaming online voice ASR requires an endpoint")
-                })?;
+                let endpoint = provider_endpoints
+                    .map(|endpoints| endpoints.recognition)
+                    .or(self.asr.endpoint.as_deref())
+                    .ok_or_else(|| {
+                        config_error("streaming online voice ASR requires an endpoint")
+                    })?;
                 let model =
                     self.asr.model.as_deref().ok_or_else(|| {
                         config_error("streaming online voice ASR requires a model")
@@ -1087,7 +1143,10 @@ impl VoiceConfig {
 
         Ok(GatewayVoiceAdapters {
             io,
-            speech: self.speech.synthesizer()?,
+            speech: self.speech.synthesizer(
+                provider_endpoints
+                    .map_or(self.speech.endpoint.as_str(), |endpoints| endpoints.speech),
+            )?,
             policy,
             online_recognition,
         })
@@ -1095,10 +1154,13 @@ impl VoiceConfig {
 }
 
 impl VoiceSpeechConfig {
-    fn synthesizer(&self) -> Result<Arc<dyn StreamingSpeechSynthesizer>, GatewayConfigError> {
+    fn synthesizer(
+        &self,
+        endpoint: &str,
+    ) -> Result<Arc<dyn StreamingSpeechSynthesizer>, GatewayConfigError> {
         let speech = OpenAiCompatibleSpeechConfig::new(&self.model)
             .map_err(adapter_error)?
-            .with_endpoint(&self.endpoint)
+            .with_endpoint(endpoint)
             .map_err(adapter_error)?
             .with_voice(&self.voice)
             .map_err(adapter_error)?

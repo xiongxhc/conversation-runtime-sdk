@@ -505,7 +505,9 @@ export class ConversationSession {
           visual: "thinking",
           error: undefined,
         };
-        this.beginTurn(event.turnId, event.text);
+        if (event.turnId !== null) {
+          this.beginTurn(event.turnId, event.text);
+        }
         break;
       case "voice_barge_in":
         this.voice = { ...this.voice, visual: "interrupted" };

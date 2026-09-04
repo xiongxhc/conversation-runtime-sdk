@@ -43,12 +43,12 @@ What the repository contains today:
   revision-checked mutation, approval-gated identity and relationship records,
   bounded retrieval, optional extraction of memory candidates from completed
   exchanges, and content-free traces.
-- **Local gateway**: a persistent Rust host speaking bounded framed JSON over
-  child-process stdin and stdout, with no network listener. It can optionally
-  supervise a configured local provider process with an explicit executable,
-  readiness URL, startup timeout, and cleanup.
+- **Gateway reference host**: a persistent Rust host speaking bounded framed
+  JSON over child-process stdin and stdout. Its configured media endpoint is
+  loopback-only in deterministic tests and requires TLS plus a session
+  credential when non-loopback; provider and sidecar ownership stay explicit.
 - **Public TypeScript SDK** (`@conversation/runtime`) with a Node stdio
-  transport and a browser-safe entry, speaking public protocol v2.
+  transport and a browser-safe entry, speaking public protocol v3.
 - **Reference clients**: a minimal Node chat example and a macOS Tauri desktop
   app.
 
@@ -67,7 +67,7 @@ lives in the evaluations under [docs/](docs/):
 ```mermaid
 flowchart LR
     App["Tauri reference app"] <-->|"browser-safe API"| SDK["@conversation/runtime SDK"]
-    SDK <-->|"bounded protocol v2 frames"| Gateway["Local gateway reference host"]
+    SDK <-->|"bounded protocol v3 frames"| Gateway["Gateway reference host"]
     Gateway --> Context["Shared ConversationContext"]
     Context --> LLM["Replaceable local LLM"]
     Context --> Voice["Voice session runtime"]
@@ -79,12 +79,14 @@ flowchart LR
 The SDK owns transport-neutral commands, events, validation, and lifecycle
 handles. The runtime owns turn identifiers, arbitration, completed context,
 persona and quality decisions, optional memory, and cancellation across typed
-and spoken turns. The gateway is the local reference host: it loads private
+and spoken turns. The gateway is the reference host: it loads private
 configuration, composes adapters, and owns child-process cleanup. The desktop
 is a reference application: it owns presentation, explicit microphone intent,
 Focus preferences, and its own transcript history. Entering Voice Focus never
 starts capture; only `Start voice` does. No layer silently falls back to a
-remote provider.
+remote provider. A meeting session that explicitly selects `online` stays online
+if a provider fails; it stops response work and, where configured, keeps local
+encrypted capture rather than silently selecting an offline substitute.
 
 Rust finalizes a spoken turn after roughly `600 ms` of silence and cancels
 generation, synthesis, queued audio, and playback after roughly `200 ms` of
@@ -159,6 +161,30 @@ settings, and protocol compatibility are documented in
 [the native acceptance checklist](docs/r6-desktop-voice-session-native-check.md).
 
 ## Configuration Notes
+
+### Meeting online profile
+
+Omitting `profile` selects `offline`; Meeting Agent explicitly requests the
+pinned `online` profile per session. Online status uses the existing `cloud`
+privacy mode and `remote` component locations. Configuration stores only
+environment-variable names for credentials, never values in TOML, status,
+events, commands, or diagnostics.
+
+TypeScript is control-plane only: media goes bridge-to-Rust and Rust-to-adapter,
+with no plaintext meeting audio on disk. Loopback plaintext is only for local
+tests; non-loopback media needs TLS and the session credential. An external-gated
+segment starts no language or TTS work until the caller authorizes that segment.
+Recording is opt-in and encrypted before provider work with a runtime-host key.
+`reconcileRecording` and `processText` are profile-neutral post-meeting batch
+contracts; local SpeechBrain and online diarization stay explicit choices.
+
+The monotonic timing events cover first audio, final transcript, authorization,
+first text/synthesis/validated PCM, and output flush acknowledgement. First
+playable PCM and flush acknowledgement are internal handoffs, not audible claims.
+Real provider, latency, device/Feishu, non-loopback TLS, and agent-box evidence
+remain human-gated in [docs/HUMAN-CHECKLIST.md](docs/HUMAN-CHECKLIST.md). The
+2,000 ms transcript, 2,500 ms first-audible, 300 ms audible-stop, one-hour
+capture, provider-shape, and deployment claims are not verified locally.
 
 Schema-v1 session configuration accepts optional `[persona]`, `[response]`,
 and `[quality_metrics]` sections with explicit defaults:

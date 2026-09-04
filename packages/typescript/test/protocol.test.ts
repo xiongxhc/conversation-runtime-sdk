@@ -18,6 +18,10 @@ const fixtureDirectory = new URL(
   "../../../../tests/fixtures/client-wire-v1/",
   import.meta.url,
 );
+const meetingOnlineFixture = new URL(
+  "../../../../apps/runtime-gateway/tests/fixtures/meeting-agent-online-v1.json",
+  import.meta.url,
+);
 
 async function fixtureLines(name: string): Promise<unknown[]> {
   const contents = await readFile(fileURLToPath(new URL(name, fixtureDirectory)), "utf8");
@@ -32,6 +36,25 @@ async function fixtureLines(name: string): Promise<unknown[]> {
       }
     });
 }
+
+// Production break caught: a schema-v3 Meeting Agent ready message could be accepted only by a
+// hand-built test lookalike, or could lose the explicit online/cloud/remote status on decode.
+test("decodes the literal Meeting Agent online fixture with the built v3 control-plane codec", async () => {
+  const wire = JSON.parse(await readFile(fileURLToPath(meetingOnlineFixture), "utf8")) as unknown;
+  const parsed = parseGatewayMessage(wire, 3);
+
+  assert.equal(parsed.type, "ready");
+  if (parsed.type !== "ready") throw new Error("expected ready message");
+  assert.equal(parsed.status.profile, "online");
+  assert.equal(parsed.status.privacyMode, "cloud");
+  assert.equal(parsed.status.languageLocation, "remote");
+  assert.ok(parsed.status.capabilities.includes("voice_session"));
+  assert.ok(parsed.status.components.some((component) =>
+    component.kind === "language_model"
+      && component.providerLabel === "openai"
+      && component.executionLocation === "remote",
+  ));
+});
 
 test("parses every shared v1 command fixture with bigint identifiers", async () => {
   const commands = await fixtureLines("commands.jsonl");

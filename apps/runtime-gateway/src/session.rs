@@ -2769,9 +2769,14 @@ mod tests {
         gateway
             .write(r#"{"protocol_version":3,"type":"start_voice_session","request_id":"media-second"}"#)
             .await;
-        let second = gateway.read_message().await;
-        assert_rejected_message(&second, "media-second", "invalid_state");
-        assert!(!second.contains("media_lease"));
+        let second = gateway
+            .read_until(|message| message.contains(r#""request_id":"media-second""#))
+            .await;
+        let rejection = second
+            .last()
+            .expect("read_until returns the frame it matched");
+        assert_rejected_message(rejection, "media-second", "invalid_state");
+        assert!(!rejection.contains("media_lease"));
 
         gateway
             .write(
@@ -8449,11 +8454,16 @@ max_error_bytes = 65536
                 r#"{"protocol_version":3,"type":"finalize_recording","request_id":"early","session_id":"1"}"#,
             )
             .await;
-        let early = gateway.read_message().await;
-        assert_rejected_message(&early, "early", "invalid_state");
+        let early = gateway
+            .read_until(|message| message.contains(r#""request_id":"early""#))
+            .await;
+        let rejection = early
+            .last()
+            .expect("read_until returns the frame it matched");
+        assert_rejected_message(rejection, "early", "invalid_state");
         assert!(
-            early.contains("the voice session is still recording"),
-            "the rejection names its own cause: {early}"
+            rejection.contains("the voice session is still recording"),
+            "the rejection names its own cause: {rejection}"
         );
 
         gateway
@@ -8773,11 +8783,16 @@ max_error_bytes = 65536
                 r#"{"protocol_version":3,"type":"reconcile_recording","request_id":"early","session_id":"1","recording_handle":"0123456789abcdef0123456789abcdef"}"#,
             )
             .await;
-        let early = gateway.read_message().await;
-        assert_rejected_message(&early, "early", "invalid_state");
+        let early = gateway
+            .read_until(|message| message.contains(r#""request_id":"early""#))
+            .await;
+        let rejection = early
+            .last()
+            .expect("read_until returns the frame it matched");
+        assert_rejected_message(rejection, "early", "invalid_state");
         assert!(
-            early.contains("the voice session is still recording"),
-            "the rejection names its own cause: {early}"
+            rejection.contains("the voice session is still recording"),
+            "the rejection names its own cause: {rejection}"
         );
 
         gateway

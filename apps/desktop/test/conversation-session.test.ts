@@ -264,6 +264,30 @@ describe("ConversationSession", () => {
     ]);
   });
 
+  it("keeps a v3 pre-authorization transcript out of the active-turn history", async () => {
+    const transport = connectedVersionThreeVoiceTransport();
+    const session = await ConversationSession.connect(transport);
+    await session.startVoice();
+    transport.voiceEvent({
+      type: "voice_session_started",
+      session_id: "1",
+      privacy: { privacy_mode: "local_only", components: localVoiceStatus.components },
+    });
+    transport.voiceEvent({
+      type: "voice_transcript_final",
+      session_id: "1",
+      segment_id: "1",
+      turn_id: null,
+      text: "waiting for host approval",
+    });
+
+    await eventually(() => expect(session.state.voice.visual).toBe("thinking"));
+    expect(session.state.voice.partialTranscript).toBe("");
+    expect(session.state.turns).toHaveLength(0);
+    expect(session.state.activeTurn).toBeUndefined();
+    expect(session.state.phase).toBe("ready");
+  });
+
   it("surfaces active audio devices without persisting transcript state", async () => {
     const transport = connectedVoiceTransport();
     const session = await ConversationSession.connect(transport);
@@ -1038,6 +1062,16 @@ function connectedVoiceTransport(): InMemoryTransport {
   return transport;
 }
 
+function connectedVersionThreeVoiceTransport(): InMemoryTransport {
+  const transport = new InMemoryTransport({
+    ...localVoiceStatus,
+    profile: "offline",
+    last_context_seed_operation_id: null,
+  }, 3);
+  transport.ready();
+  return transport;
+}
+
 function connectedSeedTransport(): InMemoryTransport {
   const transport = new InMemoryTransport(localSeedStatus, 2);
   transport.ready();
@@ -1290,7 +1324,7 @@ class InMemoryTransport implements RuntimeTransport {
   }
 
   voiceEvent(event: Record<string, unknown>): void {
-    if (event.type === "voice_transcript_final") {
+    if (event.type === "voice_transcript_final" && event.turn_id !== null) {
       const turnId = BigInt(String(event.turn_id));
       if (turnId > this.turnCounter) {
         this.turnCounter = turnId;

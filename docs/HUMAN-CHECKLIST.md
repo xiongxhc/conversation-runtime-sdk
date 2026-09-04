@@ -33,8 +33,18 @@ a paid provider and report distributions rather than a pass/fail from one sample
 ```bash
 cd /Users/cx/Workspace/conversation-runtime-sdk
 export OPENAI_API_KEY=...
+export GATEWAY_ONLINE_LATENCY_REAL_PROVIDER=1
+export GATEWAY_ONLINE_LATENCY_CONFIG=/absolute/path/to/private/online-gateway.toml
+export GATEWAY_ONLINE_LATENCY_SAMPLES=5 # must be at least 2
 cargo test -p conversation-runtime-gateway --test online_latency -- --ignored --nocapture
 ```
+
+The private configuration must report the explicit `online`/`cloud`/remote profile. For each
+sample, speak once, approve the external-gated reply, then speak over playback to produce the
+barge-in and flush boundary. The output contains only count, p50, p95, and max for the internal
+handoffs. `first_synthesis_request→first_playable_audio` ends at validated PCM ready for output,
+not audibility; `barge_in_onset→playback_flush_acknowledged` ends at an internal output-path
+flush acknowledgement, not the 300 ms audible-stop claim.
 
 ## 4. Confirm the structured-output directive shape against the real provider
 

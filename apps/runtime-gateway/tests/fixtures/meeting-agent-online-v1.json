@@ -8,6 +8,7 @@
     "language_location": "remote",
     "model_id": "operator-supplied-text-model",
     "memory_enabled": false,
+    "memory_location": null,
     "telemetry_enabled": false,
     "capabilities": [
       "text",

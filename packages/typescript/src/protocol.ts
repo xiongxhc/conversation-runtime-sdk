@@ -384,8 +384,10 @@ type CommonVoiceSessionEvent =
       sessionId: bigint;
       turnId: bigint | null;
       milestone:
+        | "audio_received"
         | "speech_end"
         | "transcript_final"
+        | "response_authorized"
         | "first_text_delta"
         | "first_synthesis_request"
         | "first_playable_audio"
@@ -1669,8 +1671,10 @@ function parseVoiceSessionEvent(
           object,
           "milestone",
           [
+            "audio_received",
             "speech_end",
             "transcript_final",
+            "response_authorized",
             "first_text_delta",
             "first_synthesis_request",
             "first_playable_audio",

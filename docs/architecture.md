@@ -26,7 +26,7 @@ separate ownership boundaries:
 flowchart LR
     Desktop["Tauri reference app"] <-->|"browser-safe RuntimeClient"| SDK["@conversation/runtime"]
     Node["Node example"] <-->|"Node stdio transport"| SDK
-    SDK <-->|"bounded public protocol v1"| Gateway["conversation-runtime-gateway"]
+    SDK <-->|"bounded public protocol v3"| Gateway["conversation-runtime-gateway"]
     Gateway --> Context["Shared ConversationContext"]
     Context --> Text["TextTurnRuntime"]
     Context --> Voice["VoiceSessionRuntime"]
@@ -49,9 +49,11 @@ flowchart LR
   optional memory retrieval, cancellation, backpressure, and exactly one
   terminal lifecycle event across typed and spoken input.
 - **Gateway reference host:** loads one explicit private configuration, composes
-  local adapters, owns the shared runtime/context, exposes bounded framed stdio,
-  and reaps gateway/provider/sidecar work on Stop, EOF, failure, or close. It
-  opens no TCP, HTTP, WebSocket, Unix-domain, or LAN listener.
+  the selected offline or online adapters, owns the shared runtime/context,
+  exposes bounded framed stdio, and reaps gateway/provider/sidecar work on Stop,
+  EOF, failure, or close. A configured media endpoint is its only listener;
+  loopback plaintext is test-only and non-loopback requires TLS plus the
+  session-scoped credential.
 - **Desktop reference app:** owns setup presentation, explicit microphone
   intent, Voice Focus preferences, accessibility behavior, and app transcript
   history. It consumes only the browser-safe SDK and does not import runtime,
@@ -78,6 +80,31 @@ connect to a v2 gateway. The public protocol version is independent from the
 gateway configuration schema version and the private managed-sidecar protocol
 version. Version disagreement fails explicitly; there is no compatibility guess
 or silent fallback.
+
+### Online meeting profile and timing evidence
+
+`offline` is the exact default when no profile is supplied. `online` is explicit
+and pinned per session: status uses the existing `cloud` privacy mode and
+`remote` component locations. A provider failure keeps the profile online,
+stops response work, and preserves encrypted capture where possible; it never
+silently falls back to an offline adapter. Credentials and recording keys are
+environment references only and never appear in configuration, status, events,
+commands, or errors.
+
+External-gated recognition has no internal authorization deadline. The runtime
+reports `transcript_final` and later `response_authorized`, but the interval is
+caller policy and starts no model or TTS work. One session-relative monotonic
+clock reports first capture, finalization, authorization, first text/synthesis/
+validated PCM, and output flush acknowledgement. First playable PCM is not
+audible onset; flush acknowledgement is not the acoustic 300 ms stop claim.
+TypeScript remains control-plane only; media goes bridge-to-Rust and Rust-to-
+adapter. Recording is opt-in before provider work and encrypted on the runtime
+host. `reconcileRecording` and `processText` are profile-neutral post-meeting
+batch contracts, while online and local SpeechBrain diarization are explicit
+alternatives. Provider-shape, latency, Feishu/device, non-loopback TLS, and
+agent-box evidence remain human-gated. In particular, the 2,000 ms transcript,
+2,500 ms first-audible, 300 ms audible-stop, and one-hour no-gap targets are
+not verified by local deterministic tests.
 
 ### Encrypted Session Recording
 
@@ -114,7 +141,7 @@ value is meaningful on the other. The handle is the hexadecimal
 spelling of a random binding identifier the header carries, so a file only
 answers to the handle it was minted with and a copier needs no key at all. The
 session identifier sits beside it as provenance and is deliberately not what
-resolution checks, because a gateway runs every meeting under the same one.
+resolution checks; each meeting session has its own authoritative identifier.
 A recording is closed only after the session feeding it has stopped. Without a
 `[recording]` section nothing is recorded, which is what the default
 configuration produces.
@@ -126,8 +153,8 @@ clusters. The recording is reached by handle alone: the handle spells the bindin
 identifier the file's header carries, so a file only answers to the handle it was
 minted with, and a copy filed under another recording's name is refused. The
 session identifier travels with the command and is checked against the header as
-provenance; it is deliberately not what provides the isolation, because a gateway
-runs every meeting under the same one. Reconciling is refused while the voice
+provenance; it is deliberately not what provides the isolation. Reconciling is
+refused while the voice
 session that feeds a recording is still running, since reading a file the sink is
 still appending to would answer for a prefix of the meeting and call it the whole.
 
@@ -488,7 +515,7 @@ language deltas
 
 `AudioOutput` resolves only after playback completes or after all output-owned process and temporary-file cleanup completes. The runtime can therefore coordinate generation, synthesis, queued phrases, and active output through one cancellation path without coupling public lifecycle types to audio bytes or a platform player.
 
-Runtime timing events share one monotonic origin captured at `TurnStarted`:
+Runtime timing events share one session-relative monotonic origin:
 
 - `FirstTextDelta` is observed immediately before the first text delta;
 - `FirstSynthesisRequest` is observed immediately before the first speech-adapter call;

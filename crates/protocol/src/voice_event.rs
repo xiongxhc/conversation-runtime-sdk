@@ -12,8 +12,10 @@ pub enum VoiceActivity {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum VoiceTimingMilestone {
+    AudioReceived,
     SpeechEnd,
     TranscriptFinal,
+    ResponseAuthorized,
     FirstTextDelta,
     FirstSynthesisRequest,
     FirstPlayableAudio,

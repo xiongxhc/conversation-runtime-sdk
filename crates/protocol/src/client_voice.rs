@@ -610,8 +610,10 @@ fn privacy_mode_name(mode: PrivacyMode) -> &'static str {
 
 fn voice_timing_milestone_name(milestone: VoiceTimingMilestone) -> &'static str {
     match milestone {
+        VoiceTimingMilestone::AudioReceived => "audio_received",
         VoiceTimingMilestone::SpeechEnd => "speech_end",
         VoiceTimingMilestone::TranscriptFinal => "transcript_final",
+        VoiceTimingMilestone::ResponseAuthorized => "response_authorized",
         VoiceTimingMilestone::FirstTextDelta => "first_text_delta",
         VoiceTimingMilestone::FirstSynthesisRequest => "first_synthesis_request",
         VoiceTimingMilestone::FirstPlayableAudio => "first_playable_audio",
@@ -627,7 +629,9 @@ fn voice_timing_milestone_name(milestone: VoiceTimingMilestone) -> &'static str 
 fn is_voice_timing_milestone(milestone: &str) -> bool {
     matches!(
         milestone,
-        "speech_end"
+        "audio_received"
+            | "response_authorized"
+            | "speech_end"
             | "transcript_final"
             | "first_text_delta"
             | "first_synthesis_request"

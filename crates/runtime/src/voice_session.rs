@@ -530,6 +530,7 @@ struct VoiceLoop {
     playback: Option<PlaybackLifecycle>,
     recorder: Option<Arc<Mutex<SessionRecorder>>>,
     response_mode: VoiceResponseMode,
+    first_audio_received: bool,
     pending_segments: BTreeMap<u64, PendingSegment>,
     pending_order: VecDeque<u64>,
     context: ConversationContext,
@@ -595,6 +596,7 @@ impl VoiceLoop {
             playback: None,
             recorder,
             response_mode,
+            first_audio_received: false,
             pending_segments: BTreeMap::new(),
             pending_order: VecDeque::new(),
             context,
@@ -795,6 +797,16 @@ impl VoiceLoop {
                 .insert(segment_id, PendingSegment::Pending(text));
             return Err(runtime_error(
                 "voice session event stream closed during authorization",
+            ));
+        }
+        if !self.publish_best_effort(VoiceSessionEvent::Timing {
+            session_id: self.session_id,
+            turn_id: Some(turn_id),
+            milestone: VoiceTimingMilestone::ResponseAuthorized,
+            elapsed_ms: self.clock.now_ms(),
+        }) {
+            return Err(runtime_error(
+                "voice session event stream closed during authorization timing",
             ));
         }
         self.turn_events = Some(turn_events);
@@ -1061,6 +1073,17 @@ impl VoiceLoop {
     /// Records one capture frame. This runs before any provider is consulted, so a recording
     /// keeps its media whatever the recognizer, language model or synthesizer are doing.
     async fn record_frame(&mut self, frame: &AudioFrame) -> Option<LoopExit> {
+        if !self.first_audio_received {
+            self.first_audio_received = true;
+            if !self.publish_best_effort(VoiceSessionEvent::Timing {
+                session_id: self.session_id,
+                turn_id: None,
+                milestone: VoiceTimingMilestone::AudioReceived,
+                elapsed_ms: self.clock.now_ms(),
+            }) {
+                return Some(LoopExit::ConsumerDropped);
+            }
+        }
         let recorder = self.recorder.clone()?;
         let error = recorder.lock().await.record_frame(frame).err()?;
         if error.kind() == RuntimeErrorKind::InvalidState {
@@ -1265,6 +1288,16 @@ impl VoiceLoop {
                 "voice session event stream closed during finalization",
             ));
         }
+        if !self.publish_best_effort(VoiceSessionEvent::Timing {
+            session_id: self.session_id,
+            turn_id: None,
+            milestone: VoiceTimingMilestone::TranscriptFinal,
+            elapsed_ms: self.clock.now_ms(),
+        }) {
+            return Err(runtime_error(
+                "voice session event stream closed during finalization timing",
+            ));
+        }
         Ok(())
     }
 
@@ -1361,7 +1394,18 @@ impl VoiceLoop {
         )
         .await;
         match interrupt_result {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => {
+                if !self.publish_best_effort(VoiceSessionEvent::Timing {
+                    session_id: self.session_id,
+                    turn_id: Some(turn_id),
+                    milestone: VoiceTimingMilestone::PlaybackFlushAcknowledged,
+                    elapsed_ms: self.clock.now_ms(),
+                }) {
+                    return Err(runtime_error(
+                        "voice session event stream closed during playback flush timing",
+                    ));
+                }
+            }
             Ok(Err(error)) => {
                 let drain_result = cleanup_with_timeout(
                     "streaming turn drain",
@@ -1938,12 +1982,14 @@ fn closed_completion() -> oneshot::Sender<()> {
 #[cfg(test)]
 mod tests {
     use conversation_model_adapters::{
-        AdapterError, GenerationLanguageRequest, GenerationTextDelta, MockContinuousAudioOutput,
-        MockStreamingSpeechSynthesizer, MockVoiceCaptureControl, RecognitionHypothesis,
+        AdapterError, AdapterFuture, AudioFrame, CaptureEvent, ContinuousAudioOutput,
+        GenerationLanguageRequest, GenerationTextDelta, MockContinuousAudioOutput,
+        MockStreamingSpeechSynthesizer, MockVoiceCaptureControl, PcmFormat, PcmSampleFormat,
+        PlaybackReceipt, RecognitionHypothesis,
     };
     use conversation_protocol::{
         ComponentDescriptor, ComponentKind, ConversationMode, ExecutionLocation, PersonaProfile,
-        PrivacyMode, ResponseControls, RuntimeStage,
+        PrivacyMode, ResponseControls, RuntimeStage, UtteranceId,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Notify;
@@ -1957,6 +2003,34 @@ mod tests {
     }
 
     struct CountingLanguage(Arc<AtomicUsize>);
+
+    #[derive(Default)]
+    struct DelayedFlushOutput {
+        flush_started: Notify,
+        release_flush: Notify,
+    }
+
+    impl ContinuousAudioOutput for DelayedFlushOutput {
+        fn enqueue<'a>(
+            &'a self,
+            _frame: AudioFrame,
+            _cancellation: CancellationToken,
+        ) -> AdapterFuture<'a, PlaybackReceipt> {
+            Box::pin(async { Err(AdapterError::new("test does not enqueue audio")) })
+        }
+
+        fn flush<'a>(
+            &'a self,
+            _session_id: SessionId,
+            generation_id: GenerationId,
+        ) -> AdapterFuture<'a, PlaybackReceipt> {
+            Box::pin(async move {
+                self.flush_started.notify_one();
+                self.release_flush.notified().await;
+                Ok(PlaybackReceipt::new(generation_id, PlaybackState::Flushed))
+            })
+        }
+    }
 
     impl GenerationLanguageModel for CountingLanguage {
         fn stream(
@@ -2058,6 +2132,233 @@ mod tests {
             .await
             .expect("aborted finalization must release the shared context");
         context.discard_turn(next.identity(), false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn interrupt_timing_waits_for_the_output_flush_acknowledgement() {
+        let session_id = SessionId::new(1);
+        let policy = VoiceSessionPolicy::new(
+            session_id,
+            PrivacyMode::Cloud,
+            200,
+            600,
+            [ComponentDescriptor::new(
+                ComponentKind::SpeechRecognition,
+                "remote-recognition",
+                ExecutionLocation::Remote,
+            )],
+        )
+        .unwrap();
+        let context = ConversationContext::new(ConversationQualityController::new(
+            PersonaProfile::default(),
+            ResponseControls::default(),
+            ConversationMode::DirectAnswer,
+        ));
+        let output = Arc::new(DelayedFlushOutput::default());
+        let turn_runtime = StreamingTurnRuntime::new(
+            context.clone(),
+            Arc::new(BlockingLanguage::default()),
+            Arc::new(MockStreamingSpeechSynthesizer::new([])),
+            output.clone(),
+        );
+        let (_input, input_receiver) = mpsc::channel(1);
+        let (_commands, command_receiver) = mpsc::channel(1);
+        let (event_sender, mut events) = mpsc::channel(SESSION_EVENT_BUFFER_SIZE);
+        let mut loop_ = VoiceLoop::new(
+            policy,
+            VoiceLoopDependencies {
+                input_events: input_receiver,
+                capture: Arc::new(MockVoiceCaptureControl::new()),
+                completion: tokio::spawn(async { Ok(()) }),
+                turn_runtime,
+                commands: command_receiver,
+                events: event_sender,
+                cancellation: CancellationToken::new(),
+                recorder: None,
+                response_mode: VoiceResponseMode::ExternalGate,
+                context,
+            },
+        );
+        loop_
+            .register_pending_segment(9, "agenda".to_owned())
+            .await
+            .unwrap();
+        let turn_id = loop_
+            .authorize_segment(
+                session_id,
+                9,
+                vec![ConversationContextExchange::new("prior", "context").unwrap()],
+            )
+            .await
+            .unwrap();
+        for _ in 0..4 {
+            events.try_recv().expect("setup lifecycle event is queued");
+        }
+
+        let interrupt = loop_.interrupt_current_turn();
+        tokio::pin!(interrupt);
+        tokio::select! {
+            _ = output.flush_started.notified() => {}
+            result = &mut interrupt => panic!("interrupt completed before flush acknowledgement: {result:?}"),
+        }
+        assert!(
+            events.try_recv().is_err(),
+            "flush timing must not be reported before the selected output acknowledges the generation"
+        );
+
+        output.release_flush.notify_one();
+        interrupt.await.unwrap();
+        let observed = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+        assert!(observed.iter().any(|event| matches!(
+            event,
+            VoiceSessionEvent::Timing {
+                session_id: observed_session,
+                turn_id: Some(observed_turn),
+                milestone: VoiceTimingMilestone::PlaybackFlushAcknowledged,
+                ..
+            } if *observed_session == session_id && *observed_turn == turn_id
+        )));
+    }
+
+    #[tokio::test]
+    async fn external_gate_records_capture_final_and_authorization_before_response_work() {
+        let session_id = SessionId::new(1);
+        let policy = VoiceSessionPolicy::new(
+            session_id,
+            PrivacyMode::Cloud,
+            200,
+            600,
+            [ComponentDescriptor::new(
+                ComponentKind::SpeechRecognition,
+                "remote-recognition",
+                ExecutionLocation::Remote,
+            )],
+        )
+        .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let context = ConversationContext::new(ConversationQualityController::new(
+            PersonaProfile::default(),
+            ResponseControls::default(),
+            ConversationMode::DirectAnswer,
+        ));
+        let turn_runtime = StreamingTurnRuntime::new(
+            context.clone(),
+            Arc::new(CountingLanguage(Arc::clone(&calls))),
+            Arc::new(MockStreamingSpeechSynthesizer::new([])),
+            Arc::new(MockContinuousAudioOutput::new()),
+        );
+        let (_input, input_receiver) = mpsc::channel(1);
+        let (_commands, command_receiver) = mpsc::channel(1);
+        let (event_sender, mut events) = mpsc::channel(SESSION_EVENT_BUFFER_SIZE);
+        let mut loop_ = VoiceLoop::new(
+            policy,
+            VoiceLoopDependencies {
+                input_events: input_receiver,
+                capture: Arc::new(MockVoiceCaptureControl::new()),
+                completion: tokio::spawn(async { Ok(()) }),
+                turn_runtime,
+                commands: command_receiver,
+                events: event_sender,
+                cancellation: CancellationToken::new(),
+                recorder: None,
+                response_mode: VoiceResponseMode::ExternalGate,
+                context,
+            },
+        );
+        let frame = AudioFrame::new(
+            TurnId::new(1),
+            GenerationId::new(1),
+            UtteranceId::new(1),
+            0,
+            PcmFormat::new(16_000, 1, PcmSampleFormat::Signed16LittleEndian).unwrap(),
+            vec![0; 320],
+        )
+        .unwrap();
+
+        loop_
+            .handle_input(Some(Ok(VoiceInputEvent::Capture(CaptureEvent::Frame(
+                frame.clone(),
+            )))))
+            .await;
+        loop_
+            .handle_input(Some(Ok(VoiceInputEvent::Capture(CaptureEvent::Frame(
+                frame,
+            )))))
+            .await;
+        loop_
+            .register_pending_segment(9, "agenda".to_owned())
+            .await
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "authorization is caller policy"
+        );
+        let turn_id = loop_
+            .authorize_segment(
+                session_id,
+                9,
+                vec![ConversationContextExchange::new("prior", "context").unwrap()],
+            )
+            .await
+            .unwrap();
+
+        let observed = (0..5)
+            .map(|_| {
+                events
+                    .try_recv()
+                    .expect("timing and lifecycle event is queued")
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            observed[0],
+            VoiceSessionEvent::Timing {
+                session_id: observed_session,
+                turn_id: None,
+                milestone: VoiceTimingMilestone::AudioReceived,
+                ..
+            } if observed_session == session_id
+        ));
+        assert!(matches!(
+            observed[1],
+            VoiceSessionEvent::TranscriptFinal {
+                session_id: observed_session,
+                segment_id: 9,
+                turn_id: None,
+                ..
+            } if observed_session == session_id
+        ));
+        assert!(matches!(
+            observed[2],
+            VoiceSessionEvent::Timing {
+                session_id: observed_session,
+                turn_id: None,
+                milestone: VoiceTimingMilestone::TranscriptFinal,
+                ..
+            } if observed_session == session_id
+        ));
+        assert!(matches!(
+            observed[3],
+            VoiceSessionEvent::ResponseAuthorized {
+                session_id: observed_session,
+                segment_id: 9,
+                turn_id: observed_turn,
+            } if observed_session == session_id && observed_turn == turn_id
+        ));
+        assert!(matches!(
+            observed[4],
+            VoiceSessionEvent::Timing {
+                session_id: observed_session,
+                turn_id: Some(observed_turn),
+                milestone: VoiceTimingMilestone::ResponseAuthorized,
+                ..
+            } if observed_session == session_id && observed_turn == turn_id
+        ));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "starting a turn is not its first delta"
+        );
     }
 
     #[tokio::test]

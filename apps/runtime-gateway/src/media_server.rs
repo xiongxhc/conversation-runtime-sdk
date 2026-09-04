@@ -471,8 +471,12 @@ where
         loop {
             tokio::select! {
                 _ = inner.cancellation.cancelled() => break Ok(()),
-                message = read_media_message(&mut reader, inner.max_payload_bytes) => {
-                    match message? {
+                message = tokio::time::timeout(
+                    inner.max_playback_queue_duration,
+                    read_media_message(&mut reader, inner.max_payload_bytes),
+                ) => {
+                    match message
+                        .map_err(|_| AdapterError::new("media bridge packet read timed out"))?? {
                         MediaMessage::Frame { direction, session_id: frame_session_id, sequence, captured_at_ms, format, payload } => {
                             if frame_session_id != session_id {
                                 return Err(AdapterError::new("media frame session identity did not match"));

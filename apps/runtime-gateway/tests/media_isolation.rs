@@ -712,6 +712,53 @@ async fn authenticated_capture_validation_rejects_bad_versions_codecs_lengths_an
     server.shutdown().await;
 }
 
+/// Catches a peer holding an authenticated connection permit with a complete capture header and
+/// incomplete payload. The timed-out packet must not publish, advance capture authority, or block
+/// the next authorized bridge from starting at its original sequence.
+#[tokio::test]
+async fn authenticated_partial_capture_payload_times_out_without_advancing_authority() {
+    let server = MediaServer::bind(
+        MediaServerConfig::loopback()
+            .with_lifetimes(Duration::from_secs(1), Duration::from_secs(1))
+            .with_max_playback_queue_duration(Duration::from_millis(50)),
+    )
+    .await
+    .unwrap();
+    let lease = server.reserve(SessionId::new(105)).await.unwrap();
+    let cancellation = CancellationToken::new();
+    let (_factory, mut recording, mut recognition) =
+        attached_ports(&server, &lease, cancellation.clone()).await;
+
+    let mut truncated = authenticated_bridge(&lease).await;
+    let mut packet = raw_capture_header(lease.session_id(), 1, 1_000, 1, 4);
+    packet.extend_from_slice(b"sh");
+    truncated.write_all(&packet).await.unwrap();
+    truncated.flush().await.unwrap();
+    let mut byte = [0_u8; 1];
+    let closed = timeout(Duration::from_millis(250), truncated.read(&mut byte)).await;
+    drop(truncated);
+
+    let mut reconnect = authenticated_bridge(&lease).await;
+    send_capture(
+        &mut reconnect,
+        lease.session_id(),
+        1,
+        1_000,
+        PcmFormat::new(16_000, 1, PcmSampleFormat::Signed16LittleEndian).unwrap(),
+        b"kept",
+    )
+    .await;
+    let recovered_recording = timeout(RECEIVE_TIMEOUT, recording.recv()).await;
+    let recovered_recognition = timeout(RECEIVE_TIMEOUT, recognition.recv()).await;
+
+    cancellation.cancel();
+    server.shutdown().await;
+
+    assert_eq!(closed.unwrap().unwrap(), 0);
+    assert_recording_capture_payload(recovered_recording.unwrap().unwrap().unwrap(), b"kept", 1);
+    assert_capture_payload(recovered_recognition.unwrap().unwrap().unwrap(), b"kept", 1);
+}
+
 /// Catches a bridge path that treats a successful TCP write as audible playback or echoes capture
 /// ingress back as output. The output must remain pending until this exact authenticated socket
 /// accepts the exact outbound sequence, and only its later rendered acknowledgement may enter the
@@ -1044,6 +1091,10 @@ async fn connected_playback_and_flush_acknowledgements_obey_the_configured_time_
     )
     .await
     .expect("bridge did not receive bounded playback");
+    for _ in 0..2 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        send_playback_ack(&mut bridge, lease.session_id(), sequence + 1, 1).await;
+    }
     assert!(timeout(RECEIVE_TIMEOUT, pending)
         .await
         .unwrap()
@@ -1060,6 +1111,10 @@ async fn connected_playback_and_flush_acknowledgements_obey_the_configured_time_
             .await
     });
     read_flush_request(&mut bridge, lease.session_id(), GenerationId::new(72)).await;
+    for _ in 0..2 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        send_playback_ack(&mut bridge, lease.session_id(), sequence + 1, 1).await;
+    }
     assert!(timeout(RECEIVE_TIMEOUT, pending_flush)
         .await
         .unwrap()
@@ -1069,6 +1124,120 @@ async fn connected_playback_and_flush_acknowledgements_obey_the_configured_time_
 
     cancellation.cancel();
     server.shutdown().await;
+}
+
+/// Catches Accepted-only playback permanently retaining every bounded pending slot. Each expired
+/// generation must produce one truthful Flushed event, free its slot, and reject a late Rendered.
+#[tokio::test]
+async fn accepted_only_playback_expires_as_flushed_and_frees_capacity() {
+    let server = MediaServer::bind(
+        MediaServerConfig::loopback()
+            .with_lifetimes(Duration::from_secs(1), Duration::from_millis(50)),
+    )
+    .await
+    .unwrap();
+    let lease = server.reserve(SessionId::new(146)).await.unwrap();
+    let cancellation = CancellationToken::new();
+    let (factory, mut recording, _recognition) =
+        attached_ports(&server, &lease, cancellation.clone()).await;
+    let io = factory
+        .start(lease.session_id(), cancellation.child_token())
+        .await
+        .unwrap();
+    let output = Arc::clone(&io.output);
+    let mut bridge = authenticated_bridge(&lease).await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let mut sequences = Vec::new();
+
+    for generation in 1..=16 {
+        let enqueue = tokio::spawn({
+            let output = Arc::clone(&output);
+            let cancellation = cancellation.child_token();
+            async move {
+                output
+                    .enqueue(playback_test_frame(generation), cancellation)
+                    .await
+            }
+        });
+        let sequence = timeout(
+            RECEIVE_TIMEOUT,
+            read_playback_frame(
+                &mut bridge,
+                lease.session_id(),
+                TurnId::new(62),
+                GenerationId::new(generation),
+                UtteranceId::new(52),
+                generation,
+                b"accepted-only!",
+            ),
+        )
+        .await
+        .expect("bridge did not receive accepted-only playback");
+        send_playback_ack(&mut bridge, lease.session_id(), sequence, 1).await;
+        let accepted = timeout(RECEIVE_TIMEOUT, enqueue)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(accepted.state(), PlaybackState::Accepted);
+        sequences.push(sequence);
+    }
+
+    for _ in 0..4 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // A legal packet keeps the authenticated bridge alive while its Accepted entries expire;
+        // the duplicate state itself remains rejected by the hub.
+        send_playback_ack(&mut bridge, lease.session_id(), sequences[0], 1).await;
+    }
+    let recovered = tokio::spawn({
+        let output = Arc::clone(&output);
+        let cancellation = cancellation.child_token();
+        async move { output.enqueue(playback_test_frame(17), cancellation).await }
+    });
+    let recovered_frame = timeout(
+        Duration::from_millis(250),
+        read_playback_frame(
+            &mut bridge,
+            lease.session_id(),
+            TurnId::new(62),
+            GenerationId::new(17),
+            UtteranceId::new(52),
+            17,
+            b"accepted-only!",
+        ),
+    )
+    .await;
+    let mut expiry_events = Vec::new();
+    for _ in 1..=16 {
+        expiry_events.push(timeout(Duration::from_millis(30), recording.recv()).await);
+    }
+    send_playback_ack(&mut bridge, lease.session_id(), sequences[0], 2).await;
+    let late_rendered = timeout(Duration::from_millis(30), recording.recv()).await;
+
+    cancellation.cancel();
+    server.shutdown().await;
+
+    assert!(
+        recovered_frame.is_ok(),
+        "expired playback did not free capacity"
+    );
+    let mut flushed = Vec::new();
+    for event in expiry_events {
+        match event.unwrap().unwrap().unwrap() {
+            VoiceInputEvent::Playback(receipt) => {
+                assert_eq!(receipt.state(), PlaybackState::Flushed);
+                flushed.push(receipt.generation_id().get());
+            }
+            _ => panic!("expected an expired playback receipt"),
+        }
+    }
+    flushed.sort_unstable();
+    assert_eq!(flushed, (1..=16).collect::<Vec<_>>());
+    assert!(
+        late_rendered.is_err(),
+        "late Rendered published after expiry"
+    );
+    assert!(recovered.await.unwrap().is_err());
 }
 
 /// Catches reconnect code that replays uncertain audio or leaves its caller blocked forever.
@@ -2026,6 +2195,18 @@ async fn attached_ports(
         .await
         .unwrap();
     (factory, recording, recognition)
+}
+
+fn playback_test_frame(generation: u64) -> AudioFrame {
+    AudioFrame::new(
+        TurnId::new(62),
+        GenerationId::new(generation),
+        UtteranceId::new(52),
+        generation,
+        PcmFormat::new(16_000, 1, PcmSampleFormat::Signed16LittleEndian).unwrap(),
+        b"accepted-only!".to_vec(),
+    )
+    .unwrap()
 }
 
 async fn send_capture(

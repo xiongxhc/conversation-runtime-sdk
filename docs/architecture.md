@@ -36,7 +36,7 @@ flowchart LR
     Voice --> TTS["Replaceable speech adapter"]
     Voice <-->|"private acknowledged sidecar protocol"| Sidecar["Managed macOS voice sidecar"]
     Sidecar --> Devices["System-default microphone and speaker"]
-    NoListener["Gateway opens no listener"] -.-> Gateway
+    GatewayIo["Gateway control is stdio; configured media is its only listener"] -.-> Gateway
 ```
 
 ### Ownership

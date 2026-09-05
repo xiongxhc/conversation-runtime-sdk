@@ -35,16 +35,20 @@ cd /Users/cx/Workspace/conversation-runtime-sdk
 export OPENAI_API_KEY=...
 export GATEWAY_ONLINE_LATENCY_REAL_PROVIDER=1
 export GATEWAY_ONLINE_LATENCY_CONFIG=/absolute/path/to/private/online-gateway.toml
+export GATEWAY_ONLINE_LATENCY_CAPTURE_COMMAND=/absolute/path/to/private/capture-s16le-pcm
 export GATEWAY_ONLINE_LATENCY_SAMPLES=5 # must be at least 2
 cargo test -p conversation-runtime-gateway --test online_latency -- --ignored --nocapture
 ```
 
-The private configuration must report the explicit `online`/`cloud`/remote profile. For each
-sample, speak once, approve the external-gated reply, then speak over playback to produce the
-barge-in and flush boundary. The output contains only count, p50, p95, and max for the internal
-handoffs. `first_synthesis_request→first_playable_audio` ends at validated PCM ready for output,
-not audibility; `barge_in_onset→playback_flush_acknowledged` ends at an internal output-path
-flush acknowledgement, not the 300 ms audible-stop claim.
+The private configuration must report the explicit `online`/`cloud`/remote profile and advertise
+a loopback TCP media endpoint. `GATEWAY_ONLINE_LATENCY_CAPTURE_COMMAND` is a human-gated private
+helper: every invocation must write one non-empty, at-most-1,048,576-byte raw signed-16-bit
+little-endian mono 16 kHz PCM capture to stdout, then exit successfully. The harness invokes it
+once for initial speech and once for barge-in speech; it passes no lease credential, discards its
+stderr, and never prints or persists its path or PCM. The output contains only count, p50, p95,
+and max for the internal handoffs. `first_synthesis_request→first_playable_audio` ends at
+validated PCM ready for output, not audibility; `barge_in_onset→playback_flush_acknowledged` ends
+at an internal output-path flush acknowledgement, not the 300 ms audible-stop claim.
 
 ## 4. Confirm the structured-output directive shape against the real provider
 

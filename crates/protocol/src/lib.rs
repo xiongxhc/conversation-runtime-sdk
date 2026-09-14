@@ -3,6 +3,7 @@ mod client_memory;
 mod client_persona;
 mod client_recording;
 mod client_text_processing;
+mod client_timing;
 mod client_voice;
 mod client_wire;
 mod command;
@@ -34,6 +35,13 @@ pub use client_recording::{
 pub use client_text_processing::{
     ClientProcessedText, MAX_CLIENT_PROCESSED_OUTPUT_BYTES, MAX_CLIENT_PROCESSING_INPUT_BYTES,
     MAX_CLIENT_PROCESSING_INSTRUCTIONS_BYTES, MAX_CLIENT_PROCESSING_SCHEMA_BYTES,
+};
+pub use client_timing::{
+    validate_capture_format, validate_capture_identity, validate_reasons, ClientAlignmentEntry,
+    ClientAlignmentPolicy, ClientCaptureClockPair, ClientCaptureEpoch, ClientFrameProvenance,
+    ClientNominalCaptureSpan, ClientRecordingAlignmentComplete, ClientRecordingAlignmentPage,
+    ClientRecordingIdentity, ClientWallEstimate, MAX_ALIGNMENT_PAGE_BYTES,
+    MAX_ALIGNMENT_PAGE_ENTRIES,
 };
 pub use client_voice::{
     is_valid_device_label, ClientComponentDescriptor, ClientPrivacySummary, ClientVoiceActivity,

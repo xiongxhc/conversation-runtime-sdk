@@ -2,7 +2,9 @@ use conversation_protocol::{is_valid_device_label, SessionId, VoiceActivity};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::{AdapterError, AdapterFuture, CaptureEvent, PlaybackReceipt, RecognitionEvent};
+use crate::{
+    AdapterError, AdapterFuture, CaptureEvent, CaptureMetadata, PlaybackReceipt, RecognitionEvent,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AudioDeviceStatus {
@@ -41,6 +43,8 @@ pub enum VoiceInputEvent {
     DeviceStatus(AudioDeviceStatus),
     Activity(VoiceActivity),
     Capture(CaptureEvent),
+    /// Recorder-only evidence; never submitted to a speech recognizer or activity gate.
+    CaptureMetadata(CaptureMetadata),
     Recognition(RecognitionEvent),
     Playback(PlaybackReceipt),
 }

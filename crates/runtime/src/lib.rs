@@ -17,6 +17,7 @@ mod conversation_context;
 mod conversation_quality;
 mod generation;
 mod phrase_chunker;
+mod recording_alignment;
 mod recording_reconciliation;
 mod session_clock;
 mod session_recording;
@@ -35,6 +36,7 @@ pub use conversation_context::{
 };
 pub use conversation_quality::{ConversationQualityController, ResolvedConversationQuality};
 pub use phrase_chunker::PhraseChunkingConfig;
+pub use recording_alignment::{read_recording_alignment, RecordingAlignmentItem};
 pub use recording_reconciliation::{
     reconcile_finalized_recording, reconcile_recording, MAX_RECONCILIATION_WINDOW_BYTES,
 };

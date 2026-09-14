@@ -3,6 +3,7 @@ mod audio_output;
 mod base64;
 mod buffered_streaming_speech;
 mod capture;
+mod capture_timing;
 mod continuous_audio_output;
 mod credential;
 mod diarization;
@@ -41,6 +42,14 @@ pub use audio_frame::{AudioFrame, PcmFormat, PcmSampleFormat, MAX_PCM_FRAME_BYTE
 pub use audio_output::{AudioOutput, AudioOutputRequest, DiscardAudioOutput};
 pub use buffered_streaming_speech::BufferedStreamingSpeechSynthesizer;
 pub use capture::{AudioCapture, CaptureEvent};
+pub use capture_timing::{
+    validate_capture_identifier, CaptureClockPair, CaptureDiscontinuityReason,
+    CaptureDomainHistory, CaptureEpoch, CaptureMappingQuality, CaptureMetadata, FrameProvenance,
+    NominalCaptureSpan, TimedCapture, CAPTURE_TIMING_BYTES, CLOCK_PAIR_CADENCE_NS,
+    MAX_CAPTURE_CLOCK_DOMAINS, MAX_CAPTURE_IDENTIFIER_BYTES, MAX_CAPTURE_TIMING_BYTES,
+    MAX_CLOCK_BRACKET_NS, MAX_CLOCK_PAIR_GAP_NS, MAX_CLOCK_RESIDUAL_NS, MAX_RECORDING_TIMING_BYTES,
+    MAX_RECORDING_TIMING_RECORDS,
+};
 pub use continuous_audio_output::{ContinuousAudioOutput, PlaybackReceipt};
 pub use diarization::{
     DiarizationResult, DiarizationWarning, DiarizedSegment, MeetingAudioWindow,

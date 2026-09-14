@@ -4,11 +4,11 @@
 //! own AEAD chunk, so plaintext meeting audio is never written anywhere and a process that dies
 //! mid-write still leaves a file that decrypts up to its last whole chunk.
 //!
-//! # On-disk format (`CRSREC01`)
+//! # On-disk format (`CRSREC02`, opt-in timed `CRSREC03`)
 //!
 //! ```text
 //! header (48 bytes, plaintext, carries no secret)
-//!   0..8    magic  b"CRSREC02"
+//!   0..8    magic  b"CRSREC02" or explicitly timed b"CRSREC03"
 //!   8       AEAD identifier (1 = AES-256-GCM)
 //!   9..12   reserved, zero
 //!   12..20  session identifier, u64 big endian (provenance only)
@@ -48,9 +48,15 @@ use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
-use conversation_model_adapters::{AudioFrame, PcmFormat, PcmSampleFormat};
+use conversation_model_adapters::{
+    AudioFrame, CaptureClockPair, CaptureDiscontinuityReason, CaptureDomainHistory, CaptureEpoch,
+    CaptureMetadata, FrameProvenance, PcmFormat, PcmSampleFormat, CAPTURE_TIMING_BYTES,
+    CLOCK_PAIR_CADENCE_NS, MAX_CLOCK_BRACKET_NS, MAX_CLOCK_PAIR_GAP_NS, MAX_CLOCK_RESIDUAL_NS,
+    MAX_RECORDING_TIMING_BYTES, MAX_RECORDING_TIMING_RECORDS,
+};
 use conversation_protocol::{
     FinalizedRecordingCapability, RuntimeError, RuntimeErrorKind, RuntimeStage, SessionId,
 };
@@ -71,6 +77,7 @@ pub const EMPTY_RECORDING_FORMAT: &str = "none";
 pub const MAX_RECORDING_GAPS: usize = 256;
 
 const MAGIC: &[u8; 8] = b"CRSREC02";
+const TIMED_MAGIC: &[u8; 8] = b"CRSREC03";
 /// The 32-byte layout that had no binding identifier. Refused explicitly: its chunk cursor
 /// lands mid-ciphertext under this reader, which fails closed only by probability.
 const SUPERSEDED_MAGIC: &[u8; 8] = b"CRSREC01";
@@ -91,6 +98,12 @@ const CHUNK_FRAME: u8 = 1;
 const CHUNK_GAP_STARTED: u8 = 2;
 const CHUNK_GAP_ENDED: u8 = 3;
 const CHUNK_ENDED: u8 = 4;
+const CHUNK_POLICY: u8 = 9;
+const CHUNK_TIMED_FRAME: u8 = 10;
+const CHUNK_EPOCH: u8 = 11;
+const CHUNK_CLOCK_PAIR: u8 = 12;
+const CHUNK_TIMING_DISCONTINUITY: u8 = 13;
+const CHUNK_ALIGNMENT_LIMIT: u8 = 14;
 
 const SAMPLE_FORMAT_S16LE: u8 = 1;
 const SAMPLE_FORMAT_F32LE: u8 = 2;
@@ -241,6 +254,15 @@ pub struct RecordingSummary {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum RecordedChunk {
+    TimedFrame {
+        at_ms: u64,
+        format: PcmFormat,
+        timing: Option<FrameProvenance>,
+        bytes: Vec<u8>,
+    },
+    TimingPolicy,
+    CaptureMetadata(CaptureMetadata),
+    AlignmentLimit,
     Frame {
         at_ms: u64,
         sequence: u64,
@@ -419,6 +441,29 @@ pub struct SessionRecorder {
     /// behind the writer or a retry after a partial encrypted write. Legacy salvage is unchanged.
     sealed_digest: DigestContext,
     capability_poisoned: bool,
+    timing_budget: Option<TimingBudget>,
+    timed_samples: u64,
+    timed_gap_ms: u64,
+    timed_validation: Option<TimedValidation>,
+}
+
+struct TimingBudget {
+    records: u64,
+    bytes: u64,
+    maximum_records: u64,
+    maximum_bytes: u64,
+    exhausted: bool,
+}
+impl Default for TimingBudget {
+    fn default() -> Self {
+        Self {
+            records: 0,
+            bytes: 0,
+            maximum_records: MAX_RECORDING_TIMING_RECORDS,
+            maximum_bytes: MAX_RECORDING_TIMING_BYTES,
+            exhausted: false,
+        }
+    }
 }
 
 impl fmt::Debug for SessionRecorder {
@@ -441,6 +486,23 @@ impl SessionRecorder {
         settings: &RecordingSettings,
         session_id: SessionId,
     ) -> Result<Self, RuntimeError> {
+        Self::start_format(settings, session_id, false)
+    }
+
+    pub fn start_timed(
+        settings: &RecordingSettings,
+        session_id: SessionId,
+    ) -> Result<Self, RuntimeError> {
+        let mut recorder = Self::start_format(settings, session_id, true)?;
+        recorder.append(policy_record())?;
+        Ok(recorder)
+    }
+
+    fn start_format(
+        settings: &RecordingSettings,
+        session_id: SessionId,
+        timed: bool,
+    ) -> Result<Self, RuntimeError> {
         let key = RecordingKey::from_environment(&settings.key_env)?;
         let random = SystemRandom::new();
         let mut binding = [0_u8; BINDING_BYTES];
@@ -452,7 +514,7 @@ impl SessionRecorder {
         let handle = lowercase_hex(&binding);
 
         let mut header = [0_u8; HEADER_LEN];
-        header[..8].copy_from_slice(MAGIC);
+        header[..8].copy_from_slice(if timed { TIMED_MAGIC } else { MAGIC });
         header[8] = AEAD_AES_256_GCM;
         header[12..20].copy_from_slice(&session_id.get().to_be_bytes());
         header[20..28].copy_from_slice(&nonce_prefix);
@@ -507,6 +569,10 @@ impl SessionRecorder {
             recording_failed: false,
             sealed_digest,
             capability_poisoned: false,
+            timing_budget: timed.then(TimingBudget::default),
+            timed_samples: 0,
+            timed_gap_ms: 0,
+            timed_validation: timed.then(TimedValidation::default),
         })
     }
 
@@ -568,6 +634,12 @@ impl SessionRecorder {
             // real length on the timeline. A gap before any frame extends nothing: the
             // recording simply had not started.
             if had_media {
+                if self.timing_budget.is_some() {
+                    self.timed_gap_ms = self
+                        .timed_gap_ms
+                        .checked_add(at_ms.saturating_sub(opened_at_ms))
+                        .ok_or_else(recovery_error)?;
+                }
                 self.media_ms = self
                     .media_ms
                     .saturating_add(at_ms.saturating_sub(opened_at_ms));
@@ -576,6 +648,9 @@ impl SessionRecorder {
             if let Some(gap) = self.gaps.last_mut() {
                 gap.ended_at_ms = Some(media_ms);
             }
+        }
+        if self.timing_budget.is_some() {
+            return self.record_timed_frame(frame, at_ms);
         }
         let mut record = Vec::with_capacity(24 + frame.bytes().len());
         record.push(CHUNK_FRAME);
@@ -587,6 +662,86 @@ impl SessionRecorder {
         record.extend_from_slice(frame.bytes());
         self.append(record)?;
         self.media_ms = self.media_ms.saturating_add(frame_duration_ms(frame));
+        Ok(())
+    }
+
+    fn admit_timing(&mut self, bytes: usize) -> Result<bool, RuntimeError> {
+        let Some(budget) = self.timing_budget.as_mut() else {
+            return Ok(false);
+        };
+        if budget.exhausted {
+            return Ok(false);
+        }
+        let bytes = u64::try_from(bytes).map_err(|_| recovery_error())?;
+        if budget.records >= budget.maximum_records
+            || budget
+                .bytes
+                .checked_add(bytes)
+                .is_none_or(|total| total > budget.maximum_bytes)
+        {
+            budget.exhausted = true;
+            self.append(vec![CHUNK_ALIGNMENT_LIMIT])?;
+            return Ok(false);
+        }
+        budget.records += 1;
+        budget.bytes += bytes;
+        Ok(true)
+    }
+
+    pub fn record_capture_metadata(
+        &mut self,
+        metadata: &CaptureMetadata,
+    ) -> Result<(), RuntimeError> {
+        if self.timing_budget.is_none() {
+            return Err(invalid_state_error(
+                "legacy recording does not accept timing",
+            ));
+        }
+        let record = metadata_record(metadata)?;
+        if self.admit_timing(record.len() - 1)? {
+            self.append(record)?;
+        }
+        Ok(())
+    }
+
+    fn record_timed_frame(&mut self, frame: &AudioFrame, at_ms: u64) -> Result<(), RuntimeError> {
+        let timing = frame
+            .capture_timing()
+            .map(|timing| timing.frame.encode())
+            .transpose()
+            .map_err(|_| recovery_error())?;
+        let timing = if timing.is_some() && self.admit_timing(CAPTURE_TIMING_BYTES)? {
+            timing
+        } else {
+            None
+        };
+        let format = frame.format();
+        let mut record = Vec::with_capacity(17 + CAPTURE_TIMING_BYTES + frame.bytes().len());
+        record.push(CHUNK_TIMED_FRAME);
+        record.extend_from_slice(&at_ms.to_be_bytes());
+        record.push(sample_format_code(format.sample_format())?);
+        record.extend_from_slice(&format.sample_rate_hz().to_be_bytes());
+        record.extend_from_slice(&format.channels().to_be_bytes());
+        record.push(u8::from(timing.is_some()));
+        if let Some(timing) = timing {
+            record.extend_from_slice(&timing);
+        }
+        record.extend_from_slice(frame.bytes());
+        let samples = u64::try_from(
+            frame.bytes().len()
+                / format
+                    .frame_alignment_bytes()
+                    .map_err(|_| recovery_error())?,
+        )
+        .map_err(|_| recovery_error())?;
+        let total = self
+            .timed_samples
+            .checked_add(samples)
+            .ok_or_else(recovery_error)?;
+        let duration = exact_media_ms(total, format.sample_rate_hz(), self.timed_gap_ms)?;
+        self.append(record)?;
+        self.timed_samples = total;
+        self.media_ms = duration;
         Ok(())
     }
 
@@ -743,6 +898,10 @@ impl SessionRecorder {
     }
 
     fn append(&mut self, mut record: Vec<u8>) -> Result<(), RuntimeError> {
+        let mut timing_state = self.timed_validation.clone();
+        if let Some(state) = timing_state.as_mut() {
+            state.accept(&decode_chunk(&record)?)?;
+        }
         let Some(file) = self.file.as_mut() else {
             return Err(invalid_state_error("recording is already finalized"));
         };
@@ -768,6 +927,7 @@ impl SessionRecorder {
         self.sealed_digest.update(&length.to_be_bytes());
         self.sealed_digest.update(&record);
         self.capability_poisoned = previously_poisoned;
+        self.timed_validation = timing_state;
         Ok(())
     }
 }
@@ -821,8 +981,8 @@ fn decode_handle(handle: &str) -> Option<[u8; BINDING_BYTES]> {
 /// an option there. Both readers validate the header through the one [`read_header`] function,
 /// so neither can accept a layout the other refuses.
 pub struct RecordedChunks {
-    reader: BufReader<File>,
-    key: RecordingKey,
+    reader: BufReader<PositionedFile>,
+    key: Arc<RecordingKey>,
     header: [u8; HEADER_LEN],
     session_id: SessionId,
     counter: u32,
@@ -842,8 +1002,8 @@ pub fn open_session_recording(path: &Path, key_env: &str) -> Result<RecordedChun
         .map_err(|_| adapter_error("recording header is incomplete"))?;
     let session_id = read_header(&header)?;
     Ok(RecordedChunks {
-        reader: BufReader::new(file),
-        key,
+        reader: BufReader::new(PositionedFile::new(file, HEADER_LEN as u64)),
+        key: Arc::new(key),
         header,
         session_id,
         counter: 0,
@@ -855,6 +1015,32 @@ pub fn open_session_recording(path: &Path, key_env: &str) -> Result<RecordedChun
 }
 
 impl RecordedChunks {
+    pub fn is_timed(&self) -> bool {
+        &self.header[..8] == TIMED_MAGIC
+    }
+
+    /// Exactly two logical cursors over the retained authenticated snapshot.
+    /// Neither cursor reopens a pathname or shares the other's seek position.
+    pub(crate) fn into_alignment_cursors(self) -> Result<(Self, Self), RuntimeError> {
+        if !self.strict || self._snapshot.is_none() || self.counter != 0 {
+            return Err(recovery_error());
+        }
+        let other = Self {
+            reader: BufReader::new(PositionedFile {
+                file: Arc::clone(&self.reader.get_ref().file),
+                offset: HEADER_LEN as u64,
+            }),
+            key: Arc::clone(&self.key),
+            header: self.header,
+            session_id: self.session_id,
+            counter: 0,
+            truncated: false,
+            finished: false,
+            strict: true,
+            _snapshot: None,
+        };
+        Ok((self, other))
+    }
     /// The session that made this recording, as the header states it. Provenance only: what
     /// proves a file answers to a handle is the binding identifier, not this.
     pub const fn session_id(&self) -> SessionId {
@@ -900,6 +1086,10 @@ impl RecordedChunks {
             &mut buffer,
         )?;
         let record = &buffer[..plaintext];
+        let kind = record.first().copied().ok_or_else(recovery_error)?;
+        if (self.is_timed() && kind == CHUNK_FRAME) || (!self.is_timed() && kind >= CHUNK_POLICY) {
+            return Err(recovery_error());
+        }
         if self.strict
             && record.first() == Some(&CHUNK_GAP_STARTED)
             && (record.len() < 10 || record.len() != 10 + usize::from(record[9]))
@@ -959,7 +1149,7 @@ fn read_header(header: &[u8; HEADER_LEN]) -> Result<SessionId, RuntimeError> {
     if &header[..8] == SUPERSEDED_MAGIC {
         return Err(adapter_error("recording uses a superseded header layout"));
     }
-    if &header[..8] != MAGIC || header[8] != AEAD_AES_256_GCM {
+    if (&header[..8] != MAGIC && &header[..8] != TIMED_MAGIC) || header[8] != AEAD_AES_256_GCM {
         return Err(adapter_error("recording header is not recognised"));
     }
     if header[9..12] != [0; 3] || header[44..48] != [0; 4] {
@@ -975,6 +1165,72 @@ fn decode_chunk(record: &[u8]) -> Result<RecordedChunk, RuntimeError> {
         .split_first()
         .ok_or_else(|| adapter_error("recording chunk is empty"))?;
     match *kind {
+        CHUNK_POLICY if record == policy_record() => Ok(RecordedChunk::TimingPolicy),
+        CHUNK_TIMED_FRAME => {
+            if body.len() < 16 {
+                return Err(recovery_error());
+            }
+            let at_ms = u64::from_be_bytes(body[..8].try_into().unwrap());
+            let format = PcmFormat::new(
+                u32::from_be_bytes(body[9..13].try_into().unwrap()),
+                u16::from_be_bytes(body[13..15].try_into().unwrap()),
+                sample_format_from_code(body[8])?,
+            )
+            .map_err(|_| recovery_error())?;
+            let (timing, offset) = match body[15] {
+                0 => (None, 16),
+                1 if body.len() >= 16 + CAPTURE_TIMING_BYTES => (
+                    Some(
+                        FrameProvenance::decode(&body[16..16 + CAPTURE_TIMING_BYTES])
+                            .map_err(|_| recovery_error())?,
+                    ),
+                    16 + CAPTURE_TIMING_BYTES,
+                ),
+                _ => return Err(recovery_error()),
+            };
+            let bytes = &body[offset..];
+            if bytes.is_empty()
+                || bytes.len() > conversation_model_adapters::MAX_PCM_FRAME_BYTES
+                || !bytes.len().is_multiple_of(
+                    format
+                        .frame_alignment_bytes()
+                        .map_err(|_| recovery_error())?,
+                )
+            {
+                return Err(recovery_error());
+            }
+            if let Some(timing) = &timing {
+                timing
+                    .validate_pcm(format, bytes.len())
+                    .map_err(|_| recovery_error())?;
+            }
+            Ok(RecordedChunk::TimedFrame {
+                at_ms,
+                format,
+                timing,
+                bytes: bytes.to_vec(),
+            })
+        }
+        CHUNK_EPOCH => Ok(RecordedChunk::CaptureMetadata(CaptureMetadata::Epoch(
+            CaptureEpoch::decode(body).map_err(|_| recovery_error())?,
+        ))),
+        CHUNK_CLOCK_PAIR => Ok(RecordedChunk::CaptureMetadata(CaptureMetadata::ClockPair(
+            CaptureClockPair::decode(body).map_err(|_| recovery_error())?,
+        ))),
+        CHUNK_TIMING_DISCONTINUITY if body.len() == 9 => {
+            let capture_epoch = u64::from_be_bytes(body[..8].try_into().unwrap());
+            if capture_epoch == 0 {
+                return Err(recovery_error());
+            }
+            Ok(RecordedChunk::CaptureMetadata(
+                CaptureMetadata::Discontinuity {
+                    capture_epoch,
+                    reason: CaptureDiscontinuityReason::decode(body[8])
+                        .map_err(|_| recovery_error())?,
+                },
+            ))
+        }
+        CHUNK_ALIGNMENT_LIMIT if body.is_empty() => Ok(RecordedChunk::AlignmentLimit),
         CHUNK_FRAME => {
             if body.len() < 23 {
                 return Err(adapter_error("recording frame chunk is truncated"));
@@ -1262,8 +1518,8 @@ fn snapshot_finalized_recording(
         return Err(recovery_error());
     }
     Ok(RecordedChunks {
-        reader: BufReader::new(snapshot),
-        key,
+        reader: BufReader::new(PositionedFile::new(snapshot, HEADER_LEN as u64)),
+        key: Arc::new(key),
         header,
         session_id,
         counter: 0,
@@ -1283,6 +1539,7 @@ fn validate_completed_chunks(
     let mut gap = None;
     let mut gap_count = 0;
     let mut last_at_ms = 0;
+    let mut timed_validation = TimedValidation::default();
     loop {
         check_recovery_cancellation(cancellation)?;
         let Some(chunk) = chunks.next_chunk()? else {
@@ -1291,7 +1548,26 @@ fn validate_completed_chunks(
         if ended {
             return Err(recovery_error());
         }
+        if chunks.is_timed() {
+            timed_validation.accept(&chunk)?;
+        }
         let at_ms = match chunk {
+            RecordedChunk::TimedFrame {
+                at_ms,
+                format: current,
+                bytes,
+                ..
+            } => {
+                if gap.is_some() || format.is_some_and(|prior| prior != current) || bytes.is_empty()
+                {
+                    return Err(recovery_error());
+                }
+                format = Some(current);
+                at_ms
+            }
+            RecordedChunk::TimingPolicy
+            | RecordedChunk::CaptureMetadata(_)
+            | RecordedChunk::AlignmentLimit => continue,
             RecordedChunk::Frame {
                 at_ms,
                 sample_rate_hz,
@@ -1349,9 +1625,242 @@ fn validate_completed_chunks(
     Ok(())
 }
 
+#[derive(Clone, Default)]
+struct TimedValidation {
+    policy: bool,
+    exhausted: bool,
+    records: u64,
+    bytes: u64,
+    epoch: Option<CaptureEpoch>,
+    domains: CaptureDomainHistory,
+    sequence: u64,
+    output_end: Option<u64>,
+    pair: Option<CaptureClockPair>,
+}
+impl TimedValidation {
+    fn accept(&mut self, chunk: &RecordedChunk) -> Result<(), RuntimeError> {
+        if !self.policy {
+            if !matches!(chunk, RecordedChunk::TimingPolicy) {
+                return Err(recovery_error());
+            }
+            self.policy = true;
+            return Ok(());
+        }
+        let metadata_bytes = match chunk {
+            RecordedChunk::TimingPolicy | RecordedChunk::Frame { .. } => {
+                return Err(recovery_error())
+            }
+            RecordedChunk::AlignmentLimit => {
+                if self.exhausted {
+                    return Err(recovery_error());
+                }
+                self.exhausted = true;
+                return Ok(());
+            }
+            RecordedChunk::TimedFrame {
+                timing: Some(timing),
+                ..
+            } => {
+                let epoch = self.epoch.as_ref().ok_or_else(recovery_error)?;
+                if timing.capture_epoch != epoch.capture_epoch
+                    || timing.sequence <= self.sequence
+                    || self
+                        .output_end
+                        .is_some_and(|end| timing.output_start_sample < end)
+                {
+                    return Err(recovery_error());
+                }
+                self.sequence = timing.sequence;
+                self.output_end = Some(
+                    timing
+                        .output_start_sample
+                        .checked_add(u64::from(timing.sample_count))
+                        .ok_or_else(recovery_error)?,
+                );
+                CAPTURE_TIMING_BYTES
+            }
+            RecordedChunk::CaptureMetadata(metadata) => {
+                match metadata {
+                    CaptureMetadata::Epoch(epoch) => {
+                        self.domains
+                            .admit(&epoch.clock_domain_id)
+                            .map_err(|_| recovery_error())?;
+                        if let Some(prior) = &self.epoch {
+                            if prior.bridge_session_id != epoch.bridge_session_id {
+                                return Err(recovery_error());
+                            }
+                            if prior.clock_domain_id == epoch.clock_domain_id {
+                                if epoch.capture_epoch < prior.capture_epoch {
+                                    return Err(recovery_error());
+                                }
+                                if epoch.capture_epoch > prior.capture_epoch {
+                                    self.sequence = 0;
+                                    self.output_end = None;
+                                }
+                            } else {
+                                self.sequence = 0;
+                                self.output_end = None;
+                                self.pair = None;
+                            }
+                        }
+                        self.epoch = Some(epoch.clone());
+                    }
+                    CaptureMetadata::ClockPair(pair) => {
+                        if self
+                            .epoch
+                            .as_ref()
+                            .is_none_or(|epoch| epoch.clock_domain_id != pair.clock_domain_id)
+                        {
+                            return Err(recovery_error());
+                        }
+                        if let Some(prior) = &self.pair {
+                            if pair.sequence <= prior.sequence
+                                || pair.midpoint_twice() <= prior.midpoint_twice()
+                                || pair.wall_epoch < prior.wall_epoch
+                            {
+                                return Err(recovery_error());
+                            }
+                        }
+                        self.pair = Some(pair.clone());
+                    }
+                    CaptureMetadata::Discontinuity { capture_epoch, .. } => {
+                        if self
+                            .epoch
+                            .as_ref()
+                            .is_none_or(|epoch| epoch.capture_epoch != *capture_epoch)
+                        {
+                            return Err(recovery_error());
+                        }
+                    }
+                }
+                metadata_record(metadata)?.len() - 1
+            }
+            _ => return Ok(()),
+        };
+        if self.exhausted {
+            return Err(recovery_error());
+        }
+        self.records = self.records.checked_add(1).ok_or_else(recovery_error)?;
+        self.bytes = self
+            .bytes
+            .checked_add(metadata_bytes as u64)
+            .ok_or_else(recovery_error)?;
+        if self.records > MAX_RECORDING_TIMING_RECORDS || self.bytes > MAX_RECORDING_TIMING_BYTES {
+            return Err(recovery_error());
+        }
+        Ok(())
+    }
+}
+
+fn metadata_record(metadata: &CaptureMetadata) -> Result<Vec<u8>, RuntimeError> {
+    let (kind, body) = match metadata {
+        CaptureMetadata::Epoch(epoch) => {
+            (CHUNK_EPOCH, epoch.encode().map_err(|_| recovery_error())?)
+        }
+        CaptureMetadata::ClockPair(pair) => (
+            CHUNK_CLOCK_PAIR,
+            pair.encode().map_err(|_| recovery_error())?,
+        ),
+        CaptureMetadata::Discontinuity {
+            capture_epoch,
+            reason,
+        } => {
+            if *capture_epoch == 0 {
+                return Err(recovery_error());
+            }
+            let mut bytes = capture_epoch.to_be_bytes().to_vec();
+            bytes.push(reason.code());
+            (CHUNK_TIMING_DISCONTINUITY, bytes)
+        }
+    };
+    let mut record = Vec::with_capacity(1 + body.len());
+    record.push(kind);
+    record.extend_from_slice(&body);
+    Ok(record)
+}
+fn policy_record() -> Vec<u8> {
+    let mut record = vec![CHUNK_POLICY];
+    for value in [
+        CLOCK_PAIR_CADENCE_NS,
+        MAX_CLOCK_BRACKET_NS,
+        MAX_CLOCK_PAIR_GAP_NS,
+        MAX_CLOCK_RESIDUAL_NS,
+    ] {
+        record.extend_from_slice(&value.to_be_bytes());
+    }
+    record
+}
+pub(crate) fn exact_media_ms(samples: u64, rate: u32, gap_ms: u64) -> Result<u64, RuntimeError> {
+    if rate == 0 {
+        return Err(recovery_error());
+    }
+    let audio = u128::from(samples) * 1000 / u128::from(rate);
+    u64::try_from(audio)
+        .ok()
+        .and_then(|audio| audio.checked_add(gap_ms))
+        .ok_or_else(recovery_error)
+}
+
+/// Cursor position belongs to this object. Unix pread/read_at and Windows
+/// seek_read use an explicit offset, unlike File::try_clone + ordinary Read.
+struct PositionedFile {
+    file: Arc<File>,
+    offset: u64,
+}
+impl PositionedFile {
+    fn new(file: File, offset: u64) -> Self {
+        Self {
+            file: Arc::new(file),
+            offset,
+        }
+    }
+    fn metadata(&self) -> std::io::Result<std::fs::Metadata> {
+        self.file.metadata()
+    }
+}
+impl Read for PositionedFile {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        #[cfg(unix)]
+        let read = {
+            use std::os::unix::fs::FileExt;
+            self.file.read_at(bytes, self.offset)?
+        };
+        #[cfg(windows)]
+        let read = {
+            use std::os::windows::fs::FileExt;
+            self.file.seek_read(bytes, self.offset)?
+        };
+        #[cfg(not(any(unix, windows)))]
+        let read: usize = return Err(std::io::Error::other(
+            "positioned recording reads are unsupported",
+        ));
+        self.offset = self
+            .offset
+            .checked_add(read as u64)
+            .ok_or_else(|| std::io::Error::other("recording read offset overflowed"))?;
+        Ok(read)
+    }
+}
+impl Seek for PositionedFile {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        let offset = match position {
+            SeekFrom::Start(offset) => i128::from(offset),
+            SeekFrom::Current(delta) => i128::from(self.offset) + i128::from(delta),
+            SeekFrom::End(delta) => i128::from(self.metadata()?.len()) + i128::from(delta),
+        };
+        self.offset = u64::try_from(offset)
+            .map_err(|_| std::io::Error::other("recording seek offset is invalid"))?;
+        Ok(self.offset)
+    }
+}
+
 #[cfg(test)]
 #[path = "session_recording_recovery_tests.rs"]
 mod recovery_tests;
+
+#[cfg(test)]
+#[path = "session_recording_timing_tests.rs"]
+mod timing_tests;
 
 fn derive(domain: &[u8], material: &[u8]) -> [u8; 32] {
     let mut input = Vec::with_capacity(domain.len() + material.len());

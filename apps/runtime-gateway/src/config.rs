@@ -149,6 +149,8 @@ impl GatewayTestProviderEndpoints {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct MediaConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    capture_format: Option<String>,
     bind: SocketAddr,
     advertised_endpoint: String,
     credential_lifetime_ms: u64,
@@ -196,6 +198,7 @@ impl MediaConfig {
             std::time::Duration::from_millis(self.packet_read_timeout_ms),
             tls,
         )
+        .and_then(|config| config.with_capture_format(self.capture_format.clone()))
         .map_err(adapter_error)
     }
 }

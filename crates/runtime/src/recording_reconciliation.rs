@@ -155,7 +155,10 @@ fn read_chunk_windows(
     sender: &mpsc::Sender<Result<MeetingAudioWindow, AdapterError>>,
     cancellation: &CancellationToken,
 ) -> Result<bool, RuntimeError> {
-    let mut windows = Windows::default();
+    let mut windows = Windows {
+        timed: chunks.is_timed(),
+        ..Windows::default()
+    };
     loop {
         if cancellation.is_cancelled() {
             return Ok(chunks.truncated());
@@ -164,6 +167,12 @@ fn read_chunk_windows(
             break;
         };
         let delivered = match chunk {
+            RecordedChunk::TimedFrame { format, bytes, .. } => {
+                windows.accept(format, bytes, sender)?
+            }
+            RecordedChunk::TimingPolicy
+            | RecordedChunk::CaptureMetadata(_)
+            | RecordedChunk::AlignmentLimit => true,
             RecordedChunk::Frame {
                 sample_rate_hz,
                 channels,
@@ -201,6 +210,9 @@ fn read_chunk_windows(
 /// The window under construction, and the media timeline it sits on.
 #[derive(Default)]
 struct Windows {
+    timed: bool,
+    samples: u64,
+    gap_ms: u64,
     format: Option<PcmFormat>,
     /// The audio recorded so far plus the gaps between it, in milliseconds.
     media_ms: u64,
@@ -241,9 +253,27 @@ impl Windows {
         if self.bytes.is_empty() {
             self.started_at_ms = self.media_ms;
         }
-        self.media_ms = self
-            .media_ms
-            .saturating_add(pcm_duration_ms(format, bytes.len()));
+        if self.timed {
+            self.samples = self
+                .samples
+                .checked_add(
+                    (bytes.len()
+                        / format
+                            .frame_alignment_bytes()
+                            .map_err(|_| adapter_error("recording PCM format is invalid"))?)
+                        as u64,
+                )
+                .ok_or_else(|| adapter_error("recording sample count overflowed"))?;
+            self.media_ms = crate::session_recording::exact_media_ms(
+                self.samples,
+                format.sample_rate_hz(),
+                self.gap_ms,
+            )?;
+        } else {
+            self.media_ms = self
+                .media_ms
+                .saturating_add(pcm_duration_ms(format, bytes.len()));
+        }
         self.bytes.extend_from_slice(&bytes);
         Ok(true)
     }
@@ -262,6 +292,11 @@ impl Windows {
             return;
         };
         if self.format.is_some() {
+            if self.timed {
+                self.gap_ms = self
+                    .gap_ms
+                    .saturating_add(ended_at_ms.saturating_sub(opened_at_ms));
+            }
             self.media_ms = self
                 .media_ms
                 .saturating_add(ended_at_ms.saturating_sub(opened_at_ms));

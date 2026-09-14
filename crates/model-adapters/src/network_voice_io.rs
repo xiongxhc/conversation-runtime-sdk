@@ -14,9 +14,9 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    AdapterError, AdapterFuture, AudioCapture, AudioFrame, CaptureEvent, ContinuousAudioOutput,
-    PlaybackReceipt, VoiceCaptureControl, VoiceInput, VoiceInputEvent, VoiceIoFactory,
-    VoiceIoSession,
+    AdapterError, AdapterFuture, AudioCapture, AudioFrame, CaptureEvent, CaptureMetadata,
+    ContinuousAudioOutput, PlaybackReceipt, VoiceCaptureControl, VoiceInput, VoiceInputEvent,
+    VoiceIoFactory, VoiceIoSession,
 };
 
 const MEDIA_QUEUE_CAPACITY: usize = 16;
@@ -321,6 +321,29 @@ impl NetworkMediaHub {
         })));
         recognition_permit.send(Ok(CaptureEvent::Discontinuity { at_ms }));
         Ok(())
+    }
+
+    /// Bounded recorder-only evidence. The recognizer's channel and activity
+    /// stream never receive epoch/clock records; capture still uses atomic fan-out.
+    pub async fn deliver_capture_metadata(
+        &self,
+        session_id: SessionId,
+        metadata: CaptureMetadata,
+    ) -> Result<(), AdapterError> {
+        let voice = self
+            .sessions
+            .lock()
+            .await
+            .get(&session_id.get())
+            .and_then(|session| session.voice.clone())
+            .ok_or_else(|| AdapterError::new("network media voice input is not attached"))?;
+        tokio::time::timeout(
+            self.operation_timeout,
+            voice.send(Ok(VoiceInputEvent::CaptureMetadata(metadata))),
+        )
+        .await
+        .map_err(|_| AdapterError::new("network media metadata delivery timed out"))?
+        .map_err(|_| AdapterError::new("network media capture input closed"))
     }
 
     pub async fn attach_playback_transport(

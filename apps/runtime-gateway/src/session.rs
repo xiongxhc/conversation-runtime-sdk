@@ -20,10 +20,10 @@ use conversation_protocol::{
     RUNTIME_PROFILE_PROTOCOL_VERSION,
 };
 use conversation_runtime::{
-    process_text, reconcile_finalized_recording, reconcile_recording, ConversationContext,
-    ProcessedText, RecordingSettings, RecordingSummary, SessionRecorder, TextProcessingRequest,
-    TextTurnEventStream, TextTurnRuntime, VoiceSessionAdapters, VoiceSessionEventStream,
-    VoiceSessionRuntime,
+    process_text, read_recording_alignment, reconcile_finalized_recording, reconcile_recording,
+    ConversationContext, ProcessedText, RecordingAlignmentItem, RecordingSettings,
+    RecordingSummary, SessionRecorder, TextProcessingRequest, TextTurnEventStream, TextTurnRuntime,
+    VoiceSessionAdapters, VoiceSessionEventStream, VoiceSessionRuntime,
 };
 #[cfg(not(test))]
 use ring::rand::{SecureRandom, SystemRandom};
@@ -85,6 +85,16 @@ pub struct GatewaySession {
     /// Absent in every configuration the loader builds: like the other online adapters, it is
     /// wired explicitly rather than constructed from a TOML file.
     reconciliation: Option<Arc<dyn TranscriptionDiarizer>>,
+    alignment: Option<ActiveAlignmentRead>,
+}
+
+struct ActiveAlignmentRead {
+    request_id: String,
+    receiver: mpsc::Receiver<RecordingAlignmentItem>,
+    task: Option<JoinHandle<Result<(), RuntimeError>>>,
+    cancellation: CancellationToken,
+    last_sent_page: Option<u64>,
+    credit: bool,
 }
 
 /// The recorder for the voice session that is running, or was the last to run. It outlives the
@@ -212,6 +222,7 @@ impl GatewaySession {
             media_server: None,
             media_capture_handoff: None,
             reconciliation: None,
+            alignment: None,
         }
     }
 
@@ -396,7 +407,15 @@ impl GatewaySession {
             SessionExit::failure(error)
         } else {
             loop {
-                let next = if let Some(active_task) = active
+                let next = if let Some(alignment) = self.alignment.as_mut() {
+                    tokio::select! {biased;
+                        writer=&mut writer_task=>SessionInput::Writer(writer),
+                        _=provider_failure.cancelled()=>SessionInput::ProviderFailure,
+                        result=async {alignment.task.as_mut().expect("guarded task").await},if alignment.task.is_some()=>SessionInput::AlignmentReader(result),
+                        item=alignment.receiver.recv(),if alignment.credit=>SessionInput::AlignmentItem(item),
+                        frame=reader.read_frame()=>SessionInput::Frame(frame),
+                    }
+                } else if let Some(active_task) = active
                     .as_mut()
                     .and_then(|active_turn| active_turn.task.as_mut())
                 {
@@ -441,6 +460,82 @@ impl GatewaySession {
                 };
 
                 match next {
+                    SessionInput::AlignmentReader(result) => {
+                        let alignment = self.alignment.as_mut().expect("active alignment task");
+                        alignment.task.take();
+                        if let Err(error) = result.unwrap_or_else(|_| {
+                            Err(RuntimeError::new(
+                                RuntimeErrorKind::Adapter,
+                                RuntimeStage::AudioCapture,
+                                "recording alignment reader did not finish",
+                            ))
+                        }) {
+                            let request_id = alignment.request_id.clone();
+                            shutdown_alignment(&mut self.alignment).await;
+                            if let Err(error) = send_rejection(
+                                &normal_sender,
+                                &request_id,
+                                ClientRuntimeError::from(error),
+                            ) {
+                                break SessionExit::failure(error);
+                            }
+                        }
+                    }
+                    SessionInput::AlignmentItem(Some(item)) => {
+                        let alignment = self.alignment.as_mut().expect("active alignment read");
+                        let request_id = alignment.request_id.clone();
+                        let message = match item {
+                            RecordingAlignmentItem::Page(page) => {
+                                alignment.last_sent_page =
+                                    Some(page.page_index.parse().expect("validated index"));
+                                alignment.credit = false;
+                                GatewayMessage::RecordingAlignmentPage { request_id, page }
+                            }
+                            RecordingAlignmentItem::Complete(completion) => {
+                                // Completion is sent only after the blocking reader has exited.
+                                if let Some(task) = alignment.task.take() {
+                                    match task.await {
+                                        Ok(Ok(())) => {}
+                                        _ => {
+                                            shutdown_alignment(&mut self.alignment).await;
+                                            if let Err(error) = send_rejection(
+                                                &normal_sender,
+                                                &request_id,
+                                                command_error("recording alignment cleanup failed"),
+                                            ) {
+                                                break SessionExit::failure(error);
+                                            }
+                                            continue;
+                                        }
+                                    }
+                                }
+                                self.alignment.take();
+                                GatewayMessage::RecordingAlignmentComplete {
+                                    request_id,
+                                    completion,
+                                }
+                            }
+                        };
+                        if let Err(error) = send_normal(&normal_sender, message) {
+                            break SessionExit::failure(error);
+                        }
+                    }
+                    SessionInput::AlignmentItem(None) => {
+                        let request_id = self
+                            .alignment
+                            .as_ref()
+                            .expect("active alignment read")
+                            .request_id
+                            .clone();
+                        shutdown_alignment(&mut self.alignment).await;
+                        if let Err(error) = send_rejection(
+                            &normal_sender,
+                            &request_id,
+                            command_error("recording alignment ended without completion"),
+                        ) {
+                            break SessionExit::failure(error);
+                        }
+                    }
                     SessionInput::Writer(result) => {
                         let error = writer_result(result)
                             .err()
@@ -586,6 +681,7 @@ impl GatewaySession {
             }
         };
 
+        shutdown_alignment(&mut self.alignment).await;
         shutdown_active(&self.runtime, &mut active).await;
         shutdown_active_voice(&mut voice.active).await;
         if let Some(message) = exit.fatal_message() {
@@ -636,7 +732,136 @@ impl GatewaySession {
             protocol_version,
             command,
         } = versioned_command;
+        if self
+            .alignment
+            .as_ref()
+            .is_some_and(|alignment| alignment.request_id == command_request_id(&command))
+            && !matches!(
+                command,
+                ClientCommand::RecordingAlignmentCredit { .. }
+                    | ClientCommand::CancelRecordingAlignment { .. }
+            )
+        {
+            let request_id = command_request_id(&command).to_owned();
+            shutdown_alignment(&mut self.alignment).await;
+            return send_rejection(
+                normal,
+                &request_id,
+                command_error("recording alignment request identifier was reused"),
+            )
+            .map_err(CommandFailure::response);
+        }
+        if self.alignment.is_some()
+            && !matches!(
+                command,
+                ClientCommand::RecordingAlignmentCredit { .. }
+                    | ClientCommand::CancelRecordingAlignment { .. }
+                    | ClientCommand::Status { .. }
+            )
+        {
+            return send_rejection(
+                normal,
+                command_request_id(&command),
+                command_error("recording alignment requires exclusive idle admission"),
+            )
+            .map_err(CommandFailure::response);
+        }
+        let (timed_bridge, command) = match command {
+            ClientCommand::StartTimedVoiceSession {
+                request_id,
+                bridge_session_id,
+                profile,
+                response_mode,
+            } => (
+                Some(bridge_session_id),
+                ClientCommand::StartVoiceSession {
+                    request_id,
+                    profile: Some(profile),
+                    response_mode: Some(response_mode),
+                },
+            ),
+            other => (None, other),
+        };
         match command {
+            ClientCommand::ReadRecordingAlignment {
+                request_id,
+                capability,
+            } => {
+                if voice.active.is_some() || active.is_some() || voice.terminal_pending() {
+                    return send_rejection(
+                        normal,
+                        &request_id,
+                        command_error("recording alignment requires an idle session"),
+                    )
+                    .map_err(CommandFailure::response);
+                }
+                let Some(settings) = self.recording.clone() else {
+                    return send_rejection(
+                        normal,
+                        &request_id,
+                        command_error("this deployment does not record sessions"),
+                    )
+                    .map_err(CommandFailure::response);
+                };
+                send_accepted(normal, &request_id).map_err(CommandFailure::response)?;
+                let (sender, receiver) = mpsc::channel(1);
+                let cancellation = CancellationToken::new();
+                let task = tokio::spawn(read_recording_alignment(
+                    settings,
+                    capability,
+                    sender,
+                    cancellation.clone(),
+                ));
+                self.alignment = Some(ActiveAlignmentRead {
+                    request_id,
+                    receiver,
+                    task: Some(task),
+                    cancellation,
+                    last_sent_page: None,
+                    credit: true,
+                });
+                Ok(())
+            }
+            ClientCommand::RecordingAlignmentCredit {
+                request_id,
+                consumed_page_index,
+            } => {
+                let Some(alignment) = self
+                    .alignment
+                    .as_mut()
+                    .filter(|alignment| alignment.request_id == request_id)
+                else {
+                    return Ok(());
+                };
+                if alignment.credit || alignment.last_sent_page != Some(consumed_page_index) {
+                    shutdown_alignment(&mut self.alignment).await;
+                    return send_rejection(
+                        normal,
+                        &request_id,
+                        command_error("recording alignment credit was invalid"),
+                    )
+                    .map_err(CommandFailure::response);
+                }
+                alignment.credit = true;
+                Ok(())
+            }
+            ClientCommand::CancelRecordingAlignment { request_id } => {
+                if self
+                    .alignment
+                    .as_ref()
+                    .is_some_and(|alignment| alignment.request_id == request_id)
+                {
+                    shutdown_alignment(&mut self.alignment).await;
+                    send_rejection(
+                        normal,
+                        &request_id,
+                        command_error("recording alignment was cancelled"),
+                    )
+                    .map_err(CommandFailure::response)?;
+                }
+                Ok(())
+            }
+            ClientCommand::StartTimedVoiceSession { .. } => unreachable!("normalized timed start"),
             ClientCommand::Status { request_id } => {
                 send_accepted(normal, &request_id).map_err(CommandFailure::response)?;
                 send_normal(
@@ -797,6 +1022,16 @@ impl GatewaySession {
                 profile,
                 response_mode,
             } => {
+                if timed_bridge.is_some()
+                    && (self.recording.is_none()
+                        || self
+                            .media_server
+                            .as_ref()
+                            .and_then(|server| server.capture_format())
+                            .is_none())
+                {
+                    return send_rejection(normal,&request_id,command_error("timed capture requires network media, recording and explicit capture format")).map_err(CommandFailure::response);
+                }
                 let Some(lane) = self.voice.as_ref() else {
                     return send_rejection(
                         normal,
@@ -855,7 +1090,11 @@ impl GatewaySession {
                 // The key is resolved here, before any media flows. A recording that cannot be
                 // protected refuses the session rather than starting an unprotected one.
                 let recorder = match self.recording.as_ref() {
-                    Some(settings) => match SessionRecorder::start(settings, session_id) {
+                    Some(settings) => match if timed_bridge.is_some() {
+                        SessionRecorder::start_timed(settings, session_id)
+                    } else {
+                        SessionRecorder::start(settings, session_id)
+                    } {
                         Ok(recorder) => Some(Arc::new(Mutex::new(recorder))),
                         Err(error) => {
                             return send_rejection(
@@ -878,7 +1117,11 @@ impl GatewaySession {
                             )
                             .map_err(CommandFailure::response);
                         }
-                        let lease = match media_server.reserve(session_id).await {
+                        let lease = match if let Some(bridge) = &timed_bridge {
+                            media_server.reserve_timed(session_id, bridge.clone()).await
+                        } else {
+                            media_server.reserve(session_id).await
+                        } {
                             Ok(lease) => lease,
                             Err(_) => {
                                 return send_rejection(
@@ -889,7 +1132,21 @@ impl GatewaySession {
                                 .map_err(CommandFailure::response)
                             }
                         };
-                        let descriptor = match media_lease_descriptor(media_server, &lease) {
+                        let descriptor = match media_lease_descriptor(media_server, &lease)
+                            .and_then(|descriptor| {
+                                if timed_bridge.is_some() {
+                                    descriptor
+                                        .into_timed(
+                                            media_server
+                                                .capture_format()
+                                                .expect("timed admission")
+                                                .to_owned(),
+                                        )
+                                        .map_err(|_| ())
+                                } else {
+                                    Ok(descriptor)
+                                }
+                            }) {
                             Ok(descriptor) => descriptor,
                             Err(()) => {
                                 media_server.revoke(session_id).await;
@@ -1012,9 +1269,27 @@ impl GatewaySession {
                 let accepted = GatewayMessage::CommandAccepted {
                     request_id: request_id.clone(),
                     turn_id: None,
-                    media_lease: lease_descriptor,
+                    media_lease: if timed_bridge.is_some() {
+                        None
+                    } else {
+                        lease_descriptor.clone()
+                    },
                 };
-                if let Err(error) = send_urgent(urgent, accepted) {
+                let acceptance = if timed_bridge.is_some() {
+                    send_normal(normal, accepted).and_then(|()| {
+                        send_normal(
+                            normal,
+                            GatewayMessage::TimedVoiceSessionStarted {
+                                request_id: request_id.clone(),
+                                media_lease: lease_descriptor
+                                    .expect("timed admission supplied lease"),
+                            },
+                        )
+                    })
+                } else {
+                    send_urgent(urgent, accepted)
+                };
+                if let Err(error) = acceptance {
                     let _ = runtime.shutdown().await;
                     revoke_media_lease(media_lease).await;
                     return Err(CommandFailure::response(error));
@@ -1808,6 +2083,8 @@ impl CommandFailure {
 }
 
 enum SessionInput {
+    AlignmentReader(Result<Result<(), RuntimeError>, JoinError>),
+    AlignmentItem(Option<RecordingAlignmentItem>),
     Frame(Result<Option<Vec<u8>>, FrameError>),
     ProviderFailure,
     Forwarder(Result<Result<(), GatewaySessionError>, JoinError>),
@@ -1815,6 +2092,45 @@ enum SessionInput {
     VoiceControl(Result<Result<(), RuntimeError>, JoinError>),
     VoiceTerminalWritten(Option<()>),
     Writer(Result<Result<(), GatewaySessionError>, JoinError>),
+}
+
+async fn shutdown_alignment(active: &mut Option<ActiveAlignmentRead>) {
+    if let Some(mut alignment) = active.take() {
+        alignment.cancellation.cancel();
+        alignment.receiver.close();
+        if let Some(task) = alignment.task.take() {
+            let _ = task.await;
+        }
+    }
+}
+
+fn command_request_id(command: &ClientCommand) -> &str {
+    match command {
+        ClientCommand::StartTimedVoiceSession { request_id, .. }
+        | ClientCommand::ReadRecordingAlignment { request_id, .. }
+        | ClientCommand::RecordingAlignmentCredit { request_id, .. }
+        | ClientCommand::CancelRecordingAlignment { request_id, .. }
+        | ClientCommand::Status { request_id, .. }
+        | ClientCommand::StartTurn { request_id, .. }
+        | ClientCommand::InterruptTurn { request_id, .. }
+        | ClientCommand::StartVoiceSession { request_id, .. }
+        | ClientCommand::StopVoiceSession { request_id, .. }
+        | ClientCommand::PauseVoiceCapture { request_id, .. }
+        | ClientCommand::ResumeVoiceCapture { request_id, .. }
+        | ClientCommand::AuthorizeVoiceResponse { request_id, .. }
+        | ClientCommand::SkipVoiceResponse { request_id, .. }
+        | ClientCommand::SeedConversationContext { request_id, .. }
+        | ClientCommand::MemoryList { request_id, .. }
+        | ClientCommand::MemoryInspect { request_id, .. }
+        | ClientCommand::PersonaGet { request_id, .. }
+        | ClientCommand::PersonaUpdate { request_id, .. }
+        | ClientCommand::MemoryApprove { request_id, .. }
+        | ClientCommand::MemoryDelete { request_id, .. }
+        | ClientCommand::FinalizeRecording { request_id, .. }
+        | ClientCommand::ReconcileRecording { request_id, .. }
+        | ClientCommand::ReconcileFinalizedRecording { request_id, .. }
+        | ClientCommand::ProcessText { request_id, .. } => request_id,
+    }
 }
 
 struct ActiveForwarder {
@@ -9233,5 +9549,52 @@ max_error_bytes = 65536
             "the two causes must be distinguishable: {rejection}"
         );
         recorded.close().await;
+    }
+
+    #[tokio::test]
+    async fn timed_start_requires_recording_network_media_and_explicit_format_before_acceptance() {
+        let key_env = "RUNTIME_TIMED_ADMISSION_SYNTHETIC_KEY";
+        std::env::set_var(key_env, FAKE_RECORDING_KEY);
+        for missing in ["recording", "media", "format"] {
+            let directory = TempDir::new().unwrap();
+            let (mut session, guards) = session_with_voice();
+            session = session.with_v4_control();
+            if missing != "recording" {
+                session = session
+                    .with_recording(RecordingSettings::new(directory.path(), key_env).unwrap());
+            }
+            let media = if missing != "media" {
+                let config = MediaServerConfig::loopback()
+                    .with_capture_format(if missing == "format" {
+                        None
+                    } else {
+                        Some("pcm_s16le/24000/1/20ms".into())
+                    })
+                    .unwrap();
+                Some(Arc::new(MediaServer::bind(config).await.unwrap()))
+            } else {
+                None
+            };
+            if let Some(media) = &media {
+                session = session.with_media_server(media.clone());
+            }
+            let mut gateway = InMemoryGateway::start(session).await;
+            gateway.write(r#"{"protocol_version":4,"type":"start_timed_voice_session","request_id":"timed","bridge_session_id":"bridge-independent","profile":"offline","response_mode":"external_gate"}"#).await;
+            assert_rejected_message(&gateway.read_message().await, "timed", "invalid_state");
+            assert_eq!(
+                guards.io_factory.start_count(),
+                0,
+                "missing {missing} started capture"
+            );
+            assert!(std::fs::read_dir(directory.path())
+                .unwrap()
+                .next()
+                .is_none());
+            gateway.close().await;
+            if let Some(media) = media {
+                media.shutdown().await;
+            }
+        }
+        std::env::remove_var(key_env);
     }
 }

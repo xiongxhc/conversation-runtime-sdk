@@ -1245,6 +1245,136 @@ test("exactly one terminal settles events(); later events are a protocol violati
   await connected.client.close();
 });
 
+const alignmentCapability = { sourceSessionId: 41n, recordingHandle: "11".repeat(16), sha256: "22".repeat(32), keyId: "33".repeat(8), authorization: "44".repeat(32) };
+const alignmentSource = { source_session_id: "41", recording_handle: alignmentCapability.recordingHandle, sha256: alignmentCapability.sha256 };
+function alignmentPage(requestId: string, index = "0"): Record<string, unknown> {
+  return { type: "recording_alignment_page", protocol_version: 4, request_id: requestId, page: {
+    source: alignmentSource, page_index: index,
+    policy: { id: "local-wall-estimate/v1", cadence_target_ns: "1000000000", maximum_bracket_ns: "5000000", maximum_pair_gap_ns: "2000000000", maximum_residual_ns: "10000000" },
+    entries: [{ kind: "epoch", epoch: { bridge_session_id: "bridge-independent", clock_domain_id: "source-process", capture_epoch: "1" } }],
+  } };
+}
+function alignmentComplete(requestId: string, count: string): unknown {
+  return { type: "recording_alignment_complete", protocol_version: 4, request_id: requestId, completion: {
+    source: alignmentSource, page_count: count, coverage_status: "available", warnings: [], traversal_succeeded: true,
+  } };
+}
+async function timedClient() {
+  const transport = new InMemoryTransport();
+  const connecting = RuntimeClient.connect(transport, 4);
+  transport.push({ type: "ready", protocol_version: 4, current_session_id: "42", status: { ...wireStatus(), profile: "offline", last_context_seed_operation_id: null } });
+  const client = await connecting;
+  return { client,transport };
+}
+async function alignmentClient() {
+  const { client,transport }=await timedClient();
+  const iterator = client.readRecordingAlignment({ capability: alignmentCapability })[Symbol.asyncIterator]();
+  const requestId = command(transport, "read_recording_alignment").requestId;
+  transport.push(acceptedForVersion(requestId, 4));
+  return { client, transport, iterator, requestId };
+}
+
+test("timed voice startup awaits a v2 typed lease and retains existing events and stop control", async () => {
+  const { client,transport }=await timedClient();
+  let settled=false;
+  const pending=client.startTimedVoiceSession({bridgeSessionId:"bridge-independent",profile:"offline",responseMode:"external_gate"}).then((session)=>{settled=true;return session;});
+  const start=command(transport,"start_timed_voice_session");assert.equal(start.bridgeSessionId,"bridge-independent");
+  transport.push(acceptedForVersion(start.requestId,4));await setImmediate();assert.equal(settled,false);
+  transport.push({protocol_version:4,type:"timed_voice_session_started",request_id:start.requestId,media_lease:{media_protocol_version:2,session_id:"42",connect_endpoint:"tcp://127.0.0.1:9001",credential:"a".repeat(64),expires_at_ms:String(Date.now()+60_000),reconnect_window_ms:"10000",capture_format:"pcm_s16le/24000/1/20ms",timing_contract:"capture-clock/v1"}});
+  const session=await pending;assert.equal(session.mediaLease.mediaProtocolVersion,2);assert.equal(session.mediaLease.sessionId,42n);
+  transport.push(voiceEventForVersion({type:"voice_session_started",session_id:"42",privacy:{privacy_mode:"local_only",components:wireVoiceComponents()}},4));
+  const stopping=session.stop();transport.push(acceptedForVersion(command(transport,"stop_voice_session").requestId,4));await stopping;
+  transport.push(voiceEventForVersion({type:"voice_session_ended",session_id:"42"},4));
+  assert.deepEqual((await collect(session.events())).map((event)=>event.type),["voice_session_started","voice_session_ended"]);
+  await client.close();
+});
+
+test("alignment grants credit only after a yielded page is pulled again, including terminal credit", async () => {
+  const { client, transport, iterator, requestId } = await alignmentClient();
+  transport.push(alignmentPage(requestId));
+  await setImmediate(); // Compliant producer is waiting for credit, with no second page upstream.
+  assert.equal(transport.sent.filter((item) => item.type === "recording_alignment_credit").length, 0);
+  const first = await iterator.next();
+  assert.equal(first.value.type, "recording_alignment_page");
+  assert.equal(first.value.source.sourceSessionId, 41n);
+  assert.equal(Object.isFrozen(first.value.entries), true);
+  await setImmediate();
+  assert.equal(transport.sent.length, 1);
+  const second = iterator.next();
+  assert.deepEqual(command(transport, "recording_alignment_credit"), { type: "recording_alignment_credit", requestId, consumedPageIndex: 0n });
+  await assert.rejects(iterator.next(), /concurrent.*pulls/);
+  transport.push(alignmentPage(requestId, "1"));
+  assert.equal((await second).value.pageIndex, 1n);
+  const terminal = iterator.next();
+  assert.equal(latestCommand(transport, "recording_alignment_credit").consumedPageIndex, 1n);
+  transport.push(alignmentComplete(requestId, "2"));
+  assert.equal((await terminal).value.type, "recording_alignment_complete");
+  assert.equal((await iterator.next()).done, true);
+  await client.close();
+});
+
+test("alignment return discards held data and waits for the correlated post-cleanup error", async () => {
+  const { client, transport, iterator, requestId } = await alignmentClient();
+  transport.push(alignmentPage(requestId)); await setImmediate();
+  let cleaned = false;
+  const returned = iterator.return!().then((result) => { cleaned = true; return result; });
+  assert.equal(command(transport, "cancel_recording_alignment").requestId, requestId);
+  await setImmediate(); assert.equal(cleaned, false);
+  assert.equal(transport.sent.some((item) => item.type === "recording_alignment_credit"), false);
+  transport.push(rejectedForVersion(requestId, { code: "invalid_state", kind: "invalid_state", stage: "audio_capture", message: "alignment cancelled" }, 4));
+  assert.equal((await returned).done, true);
+  assert.equal((await iterator.next()).done, true);
+  const status = client.status(); const statusId = command(transport, "status").requestId;
+  transport.push(acceptedForVersion(statusId, 4));
+  transport.push({ type: "status", protocol_version: 4, request_id: statusId, status: { ...wireStatus(), profile: "offline", last_context_seed_operation_id: null } });
+  await status; await client.close();
+});
+
+test("alignment EOF is a failed stream and failed cancellation, never a gateway completion", async () => {
+  const { client, transport, iterator } = await alignmentClient();
+  const pending = iterator.next();
+  const returning = iterator.return!(); const returnFailure = assert.rejects(returning, /closed|ended/);
+  transport.inbox.finish();
+  // The outstanding next was cancelled locally; only return must prove remote cleanup.
+  await returnFailure;
+  assert.equal((await pending).done, true);
+  await assert.rejects(iterator.next(), /closed|ended/);
+  await client.close();
+});
+
+test("alignment rejects skipped pages, source changes, and excess uncredited delivery", async () => {
+  for (const defect of ["index", "source", "credit"] as const) {
+    const { client, transport, iterator, requestId } = await alignmentClient();
+    const page = alignmentPage(requestId, defect === "index" ? "1" : "0");
+    if (defect === "source") (page.page as { source: unknown }).source = { ...alignmentSource, source_session_id: "42" };
+    transport.push(page);
+    if (defect === "credit") transport.push(alignmentPage(requestId, "1"));
+    await setImmediate();
+    await assert.rejects(iterator.next(), /contiguous|source changed|exceeded.*credit/);
+    await client.close();
+  }
+});
+
+test("alignment terminal count mismatch invalidates the generation", async () => {
+  const { client, transport, iterator, requestId } = await alignmentClient();
+  transport.push(alignmentPage(requestId)); await iterator.next();
+  const terminal = iterator.next();
+  transport.push(alignmentComplete(requestId, "0"));
+  await assert.rejects(terminal, /count did not match/);
+  await client.close();
+});
+
+test("alignment cannot trust nominal wall estimates without the mandatory terminal warning", async () => {
+  const { readFile }=await import("node:fs/promises");
+  const fixture=JSON.parse(await readFile(new URL("../../../../tests/fixtures/timed-capture-v1/output.json",import.meta.url),"utf8"));
+  const { client,transport,iterator,requestId }=await alignmentClient();
+  fixture.page.request_id=requestId;fixture.page.page.source=alignmentSource;
+  transport.push(fixture.page);await iterator.next();
+  const completed=iterator.next();transport.push(alignmentComplete(requestId,"1"));
+  await assert.rejects(completed,/warning/);
+  await client.close();
+});
+
 class InMemoryTransport implements RuntimeTransport {
   readonly inbox = new AsyncChannel<unknown>();
   readonly messages = this.inbox;

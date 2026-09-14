@@ -18,6 +18,283 @@ use tokio_util::sync::CancellationToken;
 
 const RECEIVE_TIMEOUT: Duration = Duration::from_secs(2);
 
+#[tokio::test]
+async fn timed_metadata_faults_preserve_pcm_without_inventing_audio_gaps_or_recognizer_events() {
+    use conversation_model_adapters::{CaptureDiscontinuityReason, CaptureEpoch, CaptureMetadata};
+    let server = MediaServer::bind(
+        MediaServerConfig::loopback()
+            .with_capture_format(Some("pcm_s16le/24000/1/20ms".into()))
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    let lease = server
+        .reserve_timed(SessionId::new(41), "bridge-independent".into())
+        .await
+        .unwrap();
+    let cancel = CancellationToken::new();
+    let (_factory, mut recording, mut recognition) =
+        attached_ports(&server, &lease, cancel.clone()).await;
+    let mut bridge = TcpStream::connect(lease.endpoint()).await.unwrap();
+    let mut auth = lease.session_id().get().to_be_bytes().to_vec();
+    auth.push(lease.credential().len() as u8);
+    auth.extend_from_slice(lease.credential().as_bytes());
+    auth.push(18);
+    auth.extend_from_slice(b"bridge-independent");
+    send_timed_packet(&mut bridge, 1, &auth).await;
+    let epoch = CaptureEpoch {
+        bridge_session_id: "bridge-independent".into(),
+        clock_domain_id: "source-process".into(),
+        capture_epoch: 1,
+    };
+    let mut body = 41_u64.to_be_bytes().to_vec();
+    body.extend(epoch.encode().unwrap());
+    send_timed_packet(&mut bridge, 6, &body).await;
+    assert_eq!(
+        timeout(RECEIVE_TIMEOUT, recording.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        VoiceInputEvent::CaptureMetadata(CaptureMetadata::Epoch(epoch))
+    );
+    for reason in [
+        CaptureDiscontinuityReason::MissingTiming,
+        CaptureDiscontinuityReason::InconsistentCoordinates,
+    ] {
+        let mut body = 41_u64.to_be_bytes().to_vec();
+        body.extend(1_u64.to_be_bytes());
+        body.push(reason.code());
+        send_timed_packet(&mut bridge, 8, &body).await;
+        assert_eq!(
+            timeout(RECEIVE_TIMEOUT, recording.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            VoiceInputEvent::CaptureMetadata(CaptureMetadata::Discontinuity {
+                capture_epoch: 1,
+                reason
+            }),
+            "a metadata fault fabricated an audio gap"
+        );
+        assert!(recognition.try_recv().is_err());
+    }
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/timed-capture-v1/frame.json"
+    ))
+    .unwrap();
+    let hex = fixture["frameHex"].as_str().unwrap();
+    let frame: Vec<u8> = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+        .collect();
+    bridge.write_all(&frame).await.unwrap();
+    let recorded = timeout(RECEIVE_TIMEOUT, recording.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let recognized = timeout(RECEIVE_TIMEOUT, recognition.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let VoiceInputEvent::Capture(CaptureEvent::Frame(recorded)) = recorded else {
+        panic!("timed frame did not reach recorder")
+    };
+    assert_eq!(recognized, CaptureEvent::Frame(recorded.clone()));
+    assert_eq!(
+        recorded
+            .capture_timing()
+            .unwrap()
+            .frame
+            .span
+            .as_ref()
+            .unwrap()
+            .host_start_ns,
+        1_000_000_000
+    );
+    assert!(recording.try_recv().is_err());
+    assert!(recognition.try_recv().is_err());
+    cancel.cancel();
+    server.shutdown().await;
+}
+
+async fn send_timed_packet(bridge: &mut TcpStream, kind: u8, body: &[u8]) {
+    let mut packet = vec![b'M', b'E', b'D', b'2', 2, kind];
+    packet.extend((body.len() as u32).to_be_bytes());
+    packet.extend(body);
+    bridge.write_all(&packet).await.unwrap();
+}
+
+#[tokio::test]
+async fn timed_listener_refuses_wrong_auth_domain_epoch_replay_and_format_before_frame_delivery() {
+    use conversation_model_adapters::{CaptureClockPair, CaptureEpoch};
+    for fault in [
+        "bridge",
+        "token",
+        "source",
+        "no_epoch",
+        "domain",
+        "epoch",
+        "format",
+        "replay",
+        "retired_domain",
+    ] {
+        let server = MediaServer::bind(
+            MediaServerConfig::loopback()
+                .with_capture_format(Some("pcm_s16le/24000/1/20ms".into()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let lease = server
+            .reserve_timed(SessionId::new(41), "bridge-independent".into())
+            .await
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let (_factory, mut recording, mut recognition) =
+            attached_ports(&server, &lease, cancel.clone()).await;
+        let mut bridge = TcpStream::connect(lease.endpoint()).await.unwrap();
+        let mut auth = if fault == "source" { 42_u64 } else { 41 }
+            .to_be_bytes()
+            .to_vec();
+        let token = if fault == "token" {
+            "invalid-token"
+        } else {
+            lease.credential()
+        };
+        auth.push(token.len() as u8);
+        auth.extend(token.as_bytes());
+        let identity = if fault == "bridge" {
+            "wrong-bridge"
+        } else {
+            "bridge-independent"
+        };
+        auth.push(identity.len() as u8);
+        auth.extend(identity.as_bytes());
+        send_timed_packet(&mut bridge, 1, &auth).await;
+        if !["bridge", "token", "source"].contains(&fault) {
+            if fault != "no_epoch" {
+                let epoch = CaptureEpoch {
+                    bridge_session_id: "bridge-independent".into(),
+                    clock_domain_id: "source-process".into(),
+                    capture_epoch: 1,
+                };
+                let mut body = 41_u64.to_be_bytes().to_vec();
+                body.extend(epoch.encode().unwrap());
+                send_timed_packet(&mut bridge, 6, &body).await;
+                assert!(matches!(
+                    timeout(RECEIVE_TIMEOUT, recording.recv())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .unwrap(),
+                    VoiceInputEvent::CaptureMetadata(_)
+                ));
+            }
+            if fault == "retired_domain" {
+                for domain in ["process-b", "source-process"] {
+                    let epoch = CaptureEpoch {
+                        bridge_session_id: "bridge-independent".into(),
+                        clock_domain_id: domain.into(),
+                        capture_epoch: 1,
+                    };
+                    let mut body = 41_u64.to_be_bytes().to_vec();
+                    body.extend(epoch.encode().unwrap());
+                    send_timed_packet(&mut bridge, 6, &body).await;
+                    if domain == "process-b" {
+                        assert!(matches!(
+                            timeout(RECEIVE_TIMEOUT, recording.recv())
+                                .await
+                                .unwrap()
+                                .unwrap()
+                                .unwrap(),
+                            VoiceInputEvent::CaptureMetadata(_)
+                        ));
+                    }
+                }
+            } else if fault == "domain" {
+                let pair = CaptureClockPair {
+                    clock_domain_id: "different-process".into(),
+                    wall_epoch: 1,
+                    sequence: 1,
+                    host_before_ns: 1,
+                    host_after_ns: 1,
+                    local_unix_ns: 1,
+                    wall_resolution_ns: 1,
+                    external_utc_accuracy_ns: None,
+                };
+                let mut body = 41_u64.to_be_bytes().to_vec();
+                body.extend(pair.encode().unwrap());
+                send_timed_packet(&mut bridge, 7, &body).await;
+            } else {
+                let fixture: serde_json::Value = serde_json::from_str(include_str!(
+                    "../../../tests/fixtures/timed-capture-v1/frame.json"
+                ))
+                .unwrap();
+                let hex = fixture["frameHex"].as_str().unwrap();
+                let mut packet: Vec<u8> = (0..hex.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                    .collect();
+                if fault == "epoch" {
+                    packet[36] = 2;
+                } //88-byte provenance starts at25, epoch ends at36.
+                if fault == "format" {
+                    packet[21] = 0x80;
+                } //Mismatching sample rate, before provenance admission.
+                bridge.write_all(&packet).await.unwrap();
+                if fault == "replay" {
+                    assert!(matches!(
+                        timeout(RECEIVE_TIMEOUT, recording.recv())
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .unwrap(),
+                        VoiceInputEvent::Capture(CaptureEvent::Frame(_))
+                    ));
+                    assert!(matches!(
+                        timeout(RECEIVE_TIMEOUT, recognition.recv())
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .unwrap(),
+                        CaptureEvent::Frame(_)
+                    ));
+                    bridge.write_all(&packet).await.unwrap();
+                }
+            }
+        }
+        let mut byte = [0];
+        assert!(
+            matches!(
+                timeout(RECEIVE_TIMEOUT, bridge.read(&mut byte))
+                    .await
+                    .unwrap(),
+                Ok(0) | Err(_)
+            ),
+            "{fault} kept invalid media alive"
+        );
+        // A rejected replay may truthfully announce disconnect, but never another PCM frame.
+        while let Ok(event) = recognition.try_recv() {
+            assert!(
+                !matches!(event, Ok(CaptureEvent::Frame(_))),
+                "{fault} delivered invalid PCM"
+            );
+        }
+        while let Ok(event) = recording.try_recv() {
+            assert!(
+                !matches!(event, Ok(VoiceInputEvent::Capture(CaptureEvent::Frame(_)))),
+                "{fault} recorded invalid PCM"
+            );
+        }
+        cancel.cancel();
+        server.shutdown().await;
+    }
+}
+
 /// Catches either production regression: deleting the `VoiceInputEvent::Capture` delivery leaves
 /// the recording path empty, while deleting the independent `AudioCapture` delivery starves the
 /// recognizer. It also catches a registry keyed by connection rather than authoritative session.

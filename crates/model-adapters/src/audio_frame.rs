@@ -1,6 +1,6 @@
 use conversation_protocol::{GenerationId, TurnId, UtteranceId};
 
-use crate::AdapterError;
+use crate::{AdapterError, TimedCapture};
 
 pub const MAX_PCM_FRAME_BYTES: usize = 64 * 1024;
 
@@ -80,6 +80,7 @@ pub struct AudioFrame {
     sequence: u64,
     format: PcmFormat,
     bytes: Vec<u8>,
+    capture_timing: Option<TimedCapture>,
 }
 
 impl AudioFrame {
@@ -108,6 +109,7 @@ impl AudioFrame {
             sequence,
             format,
             bytes,
+            capture_timing: None,
         })
     }
 
@@ -133,6 +135,25 @@ impl AudioFrame {
 
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    /// Attaches source-derived timing without replacing PCM or sampling a receipt clock.
+    pub fn with_capture_timing(mut self, timing: TimedCapture) -> Result<Self, AdapterError> {
+        timing.epoch.validate()?;
+        timing.frame.validate_pcm(self.format, self.bytes.len())?;
+        if timing.epoch.capture_epoch != timing.frame.capture_epoch
+            || self.sequence != timing.frame.sequence
+        {
+            return Err(AdapterError::new(
+                "capture timing identity did not match frame",
+            ));
+        }
+        self.capture_timing = Some(timing);
+        Ok(self)
+    }
+
+    pub fn capture_timing(&self) -> Option<&TimedCapture> {
+        self.capture_timing.as_ref()
     }
 
     pub fn next_sequence(&self) -> Result<u64, AdapterError> {

@@ -35,6 +35,10 @@ const MAX_COMPONENT_DESCRIPTORS = 32;
 const MAX_PROVIDER_LABEL_BYTES = 128;
 
 export type ClientCommand =
+  | { type: "start_timed_voice_session"; requestId: string; bridgeSessionId: string; profile: RuntimeProfile; responseMode: VoiceResponseMode }
+  | { type: "read_recording_alignment"; requestId: string; capability: FinalizedRecordingCapability }
+  | { type: "recording_alignment_credit"; requestId: string; consumedPageIndex: bigint }
+  | { type: "cancel_recording_alignment"; requestId: string }
   | { type: "status"; requestId: string }
   | { type: "start_turn"; requestId: string; transcript: string }
   | { type: "interrupt_turn"; requestId: string; turnId: bigint }
@@ -453,7 +457,42 @@ export type MediaLease = {
   reconnectWindowMs: bigint;
 };
 
+export type TimedMediaLease = MediaLease & { readonly mediaProtocolVersion: 2; readonly captureFormat: string; readonly timingContract: "capture-clock/v1" };
+export type RecordingIdentity = { readonly sourceSessionId: bigint; readonly recordingHandle: string; readonly sha256: string };
+export type AlignmentPolicy = { readonly id: "local-wall-estimate/v1"; readonly cadenceTargetNs: bigint; readonly maximumBracketNs: bigint; readonly maximumPairGapNs: bigint; readonly maximumResidualNs: bigint };
+export type CaptureEpoch = { readonly bridgeSessionId: string; readonly clockDomainId: string; readonly captureEpoch: bigint };
+export type NominalCaptureSpan = { readonly hostStartNs: bigint; readonly hostEndNs: bigint; readonly roundingEnvelopeNs: bigint; readonly captureUncertaintyNs: bigint | null };
+export type FrameProvenance = {
+  readonly captureEpoch: bigint; readonly sequence: bigint; readonly outputStartSample: bigint; readonly sampleCount: number;
+  readonly sourceStartNumerator: bigint; readonly sourceEndNumerator: bigint; readonly sourceDenominator: number; readonly sourceRateHz: number;
+  readonly quality: "nominal_frame_endpoint_interpolation" | "unknown_clock" | "unknown_priming" | "filter_edge" | "incomplete_source_coverage";
+  readonly span: NominalCaptureSpan | null;
+};
+export type CaptureClockPair = { readonly clockDomainId: string; readonly wallEpoch: bigint; readonly sequence: bigint; readonly hostBeforeNs: bigint; readonly localUnixNs: bigint; readonly hostAfterNs: bigint; readonly wallResolutionNs: bigint; readonly externalUtcAccuracyNs: bigint | null };
+export type LocalWallEstimate = {
+  readonly quality: "local_wall_estimate"; readonly policyId: "local-wall-estimate/v1";
+  readonly localStartNs: bigint; readonly localEndNs: bigint; readonly wallEpoch: bigint; readonly wallRun: bigint;
+  readonly maximumBracketNs: bigint; readonly maximumResolutionNs: bigint; readonly modelAllowanceNs: bigint;
+  readonly interpolationRoundingNs: bigint; readonly captureRoundingNs: bigint;
+  readonly captureUncertaintyNs: bigint | null; readonly externalUtcAccuracyNs: bigint | null; readonly overallPhysicalAccuracyNs: null;
+};
+export type RecordingAlignmentEntry =
+  | { readonly kind: "epoch"; readonly epoch: CaptureEpoch }
+  | { readonly kind: "clock_pair"; readonly pair: CaptureClockPair }
+  | { readonly kind: "frame"; readonly mediaStartSample: bigint; readonly mediaEndSample: bigint; readonly sampleRateHz: number; readonly gapOffsetMs: bigint; readonly epoch: CaptureEpoch | null; readonly provenance: FrameProvenance | null; readonly captureStatus: "available" | "capture_alignment_missing"; readonly wall: LocalWallEstimate | null; readonly reasons: readonly string[] }
+  | { readonly kind: "discontinuity"; readonly captureEpoch: bigint; readonly reason: string }
+  | { readonly kind: "audio_gap"; readonly startedAtMs: bigint; readonly endedAtMs: bigint | null; readonly reason: "capture_discontinuity" }
+  | { readonly kind: "alignment_limit" };
+/** Tentative until the matching terminal completion validates the entire generation. */
+export type RecordingAlignmentPage = { readonly type: "recording_alignment_page"; readonly source: RecordingIdentity; readonly pageIndex: bigint; readonly policy: AlignmentPolicy; readonly entries: readonly RecordingAlignmentEntry[] };
+export type RecordingAlignmentComplete = { readonly type: "recording_alignment_complete"; readonly source: RecordingIdentity; readonly pageCount: bigint; readonly coverageStatus: "available" | "partial" | "unavailable_legacy"; readonly warnings: readonly string[]; readonly traversalSucceeded: true };
+export const MAX_ALIGNMENT_PAGE_ENTRIES = 64;
+export const MAX_ALIGNMENT_PAGE_BYTES = 32 * 1024;
+
 export type GatewayMessage =
+  | { type: "timed_voice_session_started"; requestId: string; mediaLease: TimedMediaLease }
+  | { type: "recording_alignment_page"; requestId: string; page: RecordingAlignmentPage }
+  | { type: "recording_alignment_complete"; requestId: string; completion: RecordingAlignmentComplete }
   | { type: "ready"; status: RuntimeStatus; currentSessionId?: bigint }
   | { type: "command_accepted"; requestId: string; turnId?: bigint; mediaLease?: MediaLease }
   | { type: "command_rejected"; requestId: string; error: RuntimeFailure }
@@ -488,6 +527,18 @@ export function parseClientCommand(value: unknown, expectedVersion?: ClientProto
   const version = validateProtocolVersion(object, expectedVersion);
   const type = requireString(object, "type");
   switch (type) {
+    case "start_timed_voice_session":
+      requireExactKeys(object, ["protocol_version", "type", "request_id", "bridge_session_id", "profile", "response_mode"]);
+      requireTimedVersion(version);
+      return { type, requestId: requireRequestId(object), bridgeSessionId: captureIdentifier(object.bridge_session_id), profile: requireOneOf(object, "profile", ["offline", "online"] as const), responseMode: requireOneOf(object, "response_mode", ["automatic", "external_gate"] as const) };
+    case "recording_alignment_credit":
+      requireExactKeys(object, ["protocol_version", "type", "request_id", "consumed_page_index"]);
+      requireTimedVersion(version);
+      return { type, requestId: requireRequestId(object), consumedPageIndex: alignmentUnsigned(object.consumed_page_index) };
+    case "cancel_recording_alignment":
+      requireExactKeys(object, ["protocol_version", "type", "request_id"]);
+      requireTimedVersion(version);
+      return { type, requestId: requireRequestId(object) };
     case "status":
       requireExactKeys(object, ["protocol_version", "type", "request_id"]);
       return { type, requestId: requireRequestId(object) };
@@ -590,6 +641,7 @@ export function parseClientCommand(value: unknown, expectedVersion?: ClientProto
         throw new ProtocolError("session recording requires protocol version 3");
       }
       return { type, requestId: requireRequestId(object), sessionId: parseIdentifier(object.session_id) };
+    case "read_recording_alignment":
     case "reconcile_finalized_recording":
       try {
         requireExactKeys(object, ["protocol_version", "type", "request_id", "capability"]);
@@ -671,6 +723,19 @@ export function parseGatewayMessage(
   const object = requireRecord(value, "gateway message");
   const type = requireString(object, "type");
   switch (type) {
+    case "timed_voice_session_started":
+      requireExactKeys(object, ["protocol_version", "type", "request_id", "media_lease"]);
+      validateProtocolVersion(object, version); requireTimedVersion(version);
+      return { type, requestId: requireRequestId(object), mediaLease: parseTimedMediaLease(object.media_lease) };
+    case "recording_alignment_page":
+      requireExactKeys(object, ["protocol_version", "type", "request_id", "page"]);
+      validateProtocolVersion(object, version); requireTimedVersion(version);
+      if (new TextEncoder().encode(JSON.stringify(object)).length > MAX_ALIGNMENT_PAGE_BYTES) throw new ProtocolError("alignment page exceeded byte bound");
+      return { type, requestId: requireRequestId(object), page: parseAlignmentPage(object.page) };
+    case "recording_alignment_complete":
+      requireExactKeys(object, ["protocol_version", "type", "request_id", "completion"]);
+      validateProtocolVersion(object, version); requireTimedVersion(version);
+      return { type, requestId: requireRequestId(object), completion: parseAlignmentComplete(object.completion) };
     case "ready":
       requireExactKeys(object, version === FINALIZED_RECORDING_PROTOCOL_VERSION
         ? ["protocol_version", "type", "status", "current_session_id"]
@@ -804,6 +869,12 @@ export function encodeClientCommand(
   validateClientCommand(command, version);
   const wire = (() => {
     switch (command.type) {
+      case "start_timed_voice_session":
+        return { protocol_version: version, type: command.type, request_id: command.requestId, bridge_session_id: command.bridgeSessionId, profile: command.profile, response_mode: command.responseMode };
+      case "recording_alignment_credit":
+        return { protocol_version: version, type: command.type, request_id: command.requestId, consumed_page_index: command.consumedPageIndex.toString() };
+      case "cancel_recording_alignment":
+        return { protocol_version: version, type: command.type, request_id: command.requestId };
       case "status":
         return { protocol_version: version, type: command.type, request_id: command.requestId };
       case "start_turn":
@@ -886,6 +957,7 @@ export function encodeClientCommand(
           request_id: command.requestId,
           session_id: command.sessionId.toString(),
         };
+      case "read_recording_alignment":
       case "reconcile_finalized_recording":
         return { protocol_version: version, type: command.type, request_id: command.requestId, capability: encodeFinalizedCapability(command.capability) };
       case "reconcile_recording":
@@ -937,6 +1009,15 @@ export function validateClientCommand(
   if (!isCanonicalRequestId(command.requestId)) {
     throw new ProtocolError("request identifier must be non-empty and at most 64 bytes");
   }
+  if (command.type === "start_timed_voice_session") {
+    requireTimedVersion(version); captureIdentifier(command.bridgeSessionId);
+    if (!["online", "offline"].includes(command.profile) || !["automatic", "external_gate"].includes(command.responseMode)) throw new ProtocolError("invalid timed start options");
+  }
+  if (command.type === "recording_alignment_credit") {
+    requireTimedVersion(version);
+    if (typeof command.consumedPageIndex !== "bigint" || command.consumedPageIndex < 0n || command.consumedPageIndex > MAX_U64) throw new ProtocolError("invalid alignment page credit");
+  }
+  if (command.type === "cancel_recording_alignment") requireTimedVersion(version);
   if (command.type === "start_turn") {
     validateTranscript(command.transcript);
   }
@@ -985,7 +1066,7 @@ export function validateClientCommand(
       throw new ProtocolError("session identifier is outside u64 range");
     }
   }
-  if (command.type === "reconcile_finalized_recording") {
+  if (command.type === "reconcile_finalized_recording" || command.type === "read_recording_alignment") {
     if (version !== 4) throw new ProtocolError("finalized recording recovery requires protocol version 4");
     try { parseFinalizedCapability(encodeFinalizedCapability(command.capability)); }
     catch { throw new ProtocolError("invalid finalized recording capability"); }
@@ -1908,6 +1989,131 @@ function requireMemoryLocation(value: unknown): "local" | null {
     return value;
   }
   throw new ProtocolError("runtime status memory_location has an unsupported value");
+}
+
+function requireTimedVersion(version: ClientProtocolVersion): void {
+  if (version !== 4) throw new ProtocolError("timed capture and alignment require protocol version 4");
+}
+function captureIdentifier(value: unknown): string {
+  if (typeof value !== "string" || new TextEncoder().encode(value).length > 64 || value.length === 0 || /[\u0000-\u001f\u007f-\u009f]/u.test(value)) throw new ProtocolError("invalid capture identity");
+  return value;
+}
+function alignmentUnsigned(value: unknown, positive = false): bigint {
+  if (typeof value !== "string" || !/^(0|[1-9][0-9]*)$/.test(value) || value.length > 20) throw new ProtocolError("invalid alignment integer");
+  const number = BigInt(value);
+  if (number > MAX_U64 || (positive && number === 0n)) throw new ProtocolError("invalid alignment integer");
+  return number;
+}
+function alignmentSigned(value: unknown): bigint {
+  if (typeof value !== "string" || !/^(0|-?[1-9][0-9]*)$/.test(value) || value.length > 20) throw new ProtocolError("invalid alignment integer");
+  const number = BigInt(value);
+  if (number < -(1n << 63n) || number > (1n << 63n) - 1n) throw new ProtocolError("invalid alignment integer");
+  return number;
+}
+function alignmentOptional(value: unknown): bigint | null { return value === null ? null : alignmentUnsigned(value); }
+function alignmentU32(value: unknown): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value <= 0 || value > 0xffffffff) throw new ProtocolError("invalid alignment count");
+  return value;
+}
+function alignmentObject(value: unknown, keys: string[]): Record<string, unknown> {
+  const object = requireRecord(value, "recording alignment"); requireExactKeys(object, keys); return object;
+}
+function freezeAlignment<T>(value: T): T {
+  if (value !== null && typeof value === "object") {
+    for (const child of Object.values(value)) freezeAlignment(child);
+    Object.freeze(value);
+  }
+  return value;
+}
+const ALIGNMENT_REASONS = ["source_drop", "sequence_hole", "reconnect", "pause", "epoch_reset", "missing_timing", "inconsistent_coordinates", "source_discontinuity", "alignment_limit_exceeded", "audio_missing", "capture_alignment_missing", "wall_alignment_missing", "wall_clock_discontinuity", "clock_pair_gap", "clock_bracket_exceeded", "missing_clock_pair", "clock_domain_mismatch", "arithmetic_overflow", "local_wall_timestamp_estimate", "unavailable_legacy"] as const;
+function alignmentReasons(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length > ALIGNMENT_REASONS.length || value.some((reason) => typeof reason !== "string" || !(ALIGNMENT_REASONS as readonly string[]).includes(reason)) || new Set(value).size !== value.length) throw new ProtocolError("invalid alignment reasons");
+  return [...value] as string[];
+}
+function alignmentIdentity(value: unknown): RecordingIdentity {
+  const o = alignmentObject(value, ["source_session_id", "recording_handle", "sha256"]);
+  if (typeof o.recording_handle !== "string" || !/^[0-9a-f]{32}$/.test(o.recording_handle) || typeof o.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(o.sha256)) throw new ProtocolError("invalid recording alignment identity");
+  return { sourceSessionId: alignmentUnsigned(o.source_session_id, true), recordingHandle: o.recording_handle, sha256: o.sha256 };
+}
+function alignmentEpoch(value: unknown): CaptureEpoch {
+  const o = alignmentObject(value, ["bridge_session_id", "clock_domain_id", "capture_epoch"]);
+  return { bridgeSessionId: captureIdentifier(o.bridge_session_id), clockDomainId: captureIdentifier(o.clock_domain_id), captureEpoch: alignmentUnsigned(o.capture_epoch, true) };
+}
+function alignmentProvenance(value: unknown): FrameProvenance {
+  const o = alignmentObject(value, ["capture_epoch", "sequence", "output_start_sample", "sample_count", "source_start_numerator", "source_end_numerator", "source_denominator", "source_rate_hz", "quality", "span"]);
+  const quality = requireOneOf(o, "quality", ["nominal_frame_endpoint_interpolation", "unknown_clock", "unknown_priming", "filter_edge", "incomplete_source_coverage"] as const);
+  let span: NominalCaptureSpan | null = null;
+  if (o.span !== null) {
+    const s = alignmentObject(o.span, ["host_start_ns", "host_end_ns", "rounding_envelope_ns", "capture_uncertainty_ns"]);
+    span = { hostStartNs: alignmentUnsigned(s.host_start_ns, true), hostEndNs: alignmentUnsigned(s.host_end_ns, true), roundingEnvelopeNs: alignmentUnsigned(s.rounding_envelope_ns), captureUncertaintyNs: alignmentOptional(s.capture_uncertainty_ns) };
+    if (span.hostStartNs >= span.hostEndNs) throw new ProtocolError("invalid nominal capture span");
+  }
+  const result: FrameProvenance = { captureEpoch: alignmentUnsigned(o.capture_epoch, true), sequence: alignmentUnsigned(o.sequence, true), outputStartSample: alignmentUnsigned(o.output_start_sample), sampleCount: alignmentU32(o.sample_count), sourceStartNumerator: alignmentUnsigned(o.source_start_numerator), sourceEndNumerator: alignmentUnsigned(o.source_end_numerator), sourceDenominator: alignmentU32(o.source_denominator), sourceRateHz: alignmentU32(o.source_rate_hz), quality, span };
+  const end = result.outputStartSample + BigInt(result.sampleCount);
+  if (end > MAX_U64 || result.sourceStartNumerator !== result.outputStartSample * BigInt(result.sourceRateHz) || result.sourceEndNumerator !== end * BigInt(result.sourceRateHz) || (span !== null) !== (quality === "nominal_frame_endpoint_interpolation")) throw new ProtocolError("invalid nominal sample provenance");
+  return result;
+}
+function alignmentPair(value: unknown): CaptureClockPair {
+  const o = alignmentObject(value, ["clock_domain_id", "wall_epoch", "sequence", "host_before_ns", "local_unix_ns", "host_after_ns", "wall_resolution_ns", "external_utc_accuracy_ns"]);
+  const pair = { clockDomainId: captureIdentifier(o.clock_domain_id), wallEpoch: alignmentUnsigned(o.wall_epoch, true), sequence: alignmentUnsigned(o.sequence, true), hostBeforeNs: alignmentUnsigned(o.host_before_ns, true), localUnixNs: alignmentSigned(o.local_unix_ns), hostAfterNs: alignmentUnsigned(o.host_after_ns, true), wallResolutionNs: alignmentUnsigned(o.wall_resolution_ns), externalUtcAccuracyNs: alignmentOptional(o.external_utc_accuracy_ns) };
+  if (pair.hostBeforeNs > pair.hostAfterNs) throw new ProtocolError("invalid clock bracket");
+  return pair;
+}
+function alignmentWall(value: unknown): LocalWallEstimate {
+  const o = alignmentObject(value, ["quality", "policy_id", "local_start_ns", "local_end_ns", "wall_epoch", "wall_run", "maximum_bracket_ns", "maximum_resolution_ns", "model_allowance_ns", "interpolation_rounding_ns", "capture_rounding_ns", "capture_uncertainty_ns", "external_utc_accuracy_ns", "overall_physical_accuracy_ns"]);
+  if (o.quality !== "local_wall_estimate" || o.policy_id !== "local-wall-estimate/v1" || o.overall_physical_accuracy_ns !== null || o.model_allowance_ns !== "10000000") throw new ProtocolError("invalid wall estimate quality");
+  const result: LocalWallEstimate = { quality: "local_wall_estimate", policyId: "local-wall-estimate/v1", localStartNs: alignmentSigned(o.local_start_ns), localEndNs: alignmentSigned(o.local_end_ns), wallEpoch: alignmentUnsigned(o.wall_epoch, true), wallRun: alignmentUnsigned(o.wall_run, true), maximumBracketNs: alignmentUnsigned(o.maximum_bracket_ns), maximumResolutionNs: alignmentUnsigned(o.maximum_resolution_ns), modelAllowanceNs: 10_000_000n, interpolationRoundingNs: alignmentUnsigned(o.interpolation_rounding_ns), captureRoundingNs: alignmentUnsigned(o.capture_rounding_ns), captureUncertaintyNs: alignmentOptional(o.capture_uncertainty_ns), externalUtcAccuracyNs: alignmentOptional(o.external_utc_accuracy_ns), overallPhysicalAccuracyNs: null };
+  if (result.localStartNs > result.localEndNs || result.maximumBracketNs > 5_000_000n) throw new ProtocolError("invalid wall estimate bounds");
+  return result;
+}
+function alignmentEntry(value: unknown): RecordingAlignmentEntry {
+  const o = requireRecord(value, "alignment entry");
+  switch (o.kind) {
+    case "epoch": requireExactKeys(o, ["kind", "epoch"]); return { kind: o.kind, epoch: alignmentEpoch(o.epoch) };
+    case "clock_pair": requireExactKeys(o, ["kind", "pair"]); return { kind: o.kind, pair: alignmentPair(o.pair) };
+    case "alignment_limit": requireExactKeys(o, ["kind"]); return { kind: o.kind };
+    case "discontinuity": requireExactKeys(o, ["kind", "capture_epoch", "reason"]); return { kind: o.kind, captureEpoch: alignmentUnsigned(o.capture_epoch, true), reason: alignmentReasons([o.reason])[0]! };
+    case "audio_gap": {
+      requireExactKeys(o, ["kind", "started_at_ms", "ended_at_ms", "reason"]);
+      const start = alignmentUnsigned(o.started_at_ms), end = alignmentOptional(o.ended_at_ms);
+      if (o.reason !== "capture_discontinuity" || (end !== null && end < start)) throw new ProtocolError("invalid audio gap");
+      return { kind: o.kind, startedAtMs: start, endedAtMs: end, reason: "capture_discontinuity" };
+    }
+    case "frame": {
+      requireExactKeys(o, ["kind", "media_start_sample", "media_end_sample", "sample_rate_hz", "gap_offset_ms", "epoch", "provenance", "capture_status", "wall", "reasons"]);
+      const start = alignmentUnsigned(o.media_start_sample), end = alignmentUnsigned(o.media_end_sample), rate = alignmentU32(o.sample_rate_hz);
+      const epoch = o.epoch === null ? null : alignmentEpoch(o.epoch), provenance = o.provenance === null ? null : alignmentProvenance(o.provenance);
+      const status = requireOneOf(o, "capture_status", ["available", "capture_alignment_missing"] as const), wall = o.wall === null ? null : alignmentWall(o.wall);
+      if (end <= start || (provenance !== null && (provenance.sourceDenominator !== rate || BigInt(provenance.sampleCount) !== end - start || provenance.captureEpoch !== epoch?.captureEpoch)) || (status === "available" && !provenance?.span) || (wall !== null && status !== "available")) throw new ProtocolError("inconsistent alignment frame");
+      return { kind: o.kind, mediaStartSample: start, mediaEndSample: end, sampleRateHz: rate, gapOffsetMs: alignmentUnsigned(o.gap_offset_ms), epoch, provenance, captureStatus: status, wall, reasons: alignmentReasons(o.reasons) };
+    }
+    default: throw new ProtocolError("invalid alignment entry");
+  }
+}
+function parseAlignmentPage(value: unknown): RecordingAlignmentPage {
+  try {
+    const o = alignmentObject(value, ["source", "page_index", "policy", "entries"]);
+    const p = alignmentObject(o.policy, ["id", "cadence_target_ns", "maximum_bracket_ns", "maximum_pair_gap_ns", "maximum_residual_ns"]);
+    if (p.id !== "local-wall-estimate/v1" || p.cadence_target_ns !== "1000000000" || p.maximum_bracket_ns !== "5000000" || p.maximum_pair_gap_ns !== "2000000000" || p.maximum_residual_ns !== "10000000" || !Array.isArray(o.entries) || o.entries.length === 0 || o.entries.length > MAX_ALIGNMENT_PAGE_ENTRIES) throw new ProtocolError("invalid alignment page");
+    return freezeAlignment({ type: "recording_alignment_page", source: alignmentIdentity(o.source), pageIndex: alignmentUnsigned(o.page_index), policy: { id: "local-wall-estimate/v1", cadenceTargetNs: 1_000_000_000n, maximumBracketNs: 5_000_000n, maximumPairGapNs: 2_000_000_000n, maximumResidualNs: 10_000_000n }, entries: o.entries.map(alignmentEntry) });
+  } catch { throw new ProtocolError("invalid recording alignment page"); }
+}
+function parseAlignmentComplete(value: unknown): RecordingAlignmentComplete {
+  try {
+    const o = alignmentObject(value, ["source", "page_count", "coverage_status", "warnings", "traversal_succeeded"]);
+    if (o.traversal_succeeded !== true) throw new ProtocolError("incomplete alignment traversal");
+    return freezeAlignment({ type: "recording_alignment_complete", source: alignmentIdentity(o.source), pageCount: alignmentUnsigned(o.page_count), coverageStatus: requireOneOf(o, "coverage_status", ["available", "partial", "unavailable_legacy"] as const), warnings: alignmentReasons(o.warnings), traversalSucceeded: true });
+  } catch { throw new ProtocolError("invalid recording alignment completion"); }
+}
+function parseTimedMediaLease(value: unknown): TimedMediaLease {
+  try {
+    const o = alignmentObject(value, ["media_protocol_version", "session_id", "connect_endpoint", "credential", "expires_at_ms", "reconnect_window_ms", "capture_format", "timing_contract"]);
+    if (o.media_protocol_version !== 2 || o.timing_contract !== "capture-clock/v1" || typeof o.capture_format !== "string" || new TextEncoder().encode(o.capture_format).length > 64) throw new ProtocolError("invalid timed lease");
+    const match = /^(pcm_s16le|pcm_f32le)\/([1-9][0-9]*)\/([1-9][0-9]*)\/([1-9][0-9]*)ms$/.exec(o.capture_format);
+    if (!match || BigInt(match[2]!) > 0xffffffffn || BigInt(match[3]!) > 65535n || BigInt(match[4]!) > 0xffffffffn) throw new ProtocolError("invalid capture format");
+    const base = parseMediaLease({ media_protocol_version: 1, session_id: o.session_id, connect_endpoint: o.connect_endpoint, credential: o.credential, expires_at_ms: o.expires_at_ms, reconnect_window_ms: o.reconnect_window_ms });
+    return Object.freeze({ ...base, mediaProtocolVersion: 2, captureFormat: o.capture_format, timingContract: "capture-clock/v1" });
+  } catch { throw new ProtocolError("invalid timed media lease"); }
 }
 
 function parseMediaLease(value: unknown): MediaLease {

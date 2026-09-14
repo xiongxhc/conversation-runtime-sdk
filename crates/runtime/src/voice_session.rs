@@ -1036,6 +1036,19 @@ impl VoiceLoop {
             Some(Ok(VoiceInputEvent::Capture(CaptureEvent::Frame(frame)))) => {
                 self.record_frame(&frame).await
             }
+            Some(Ok(VoiceInputEvent::CaptureMetadata(metadata))) => {
+                let recorder = self.recorder.clone()?;
+                let error = recorder
+                    .lock()
+                    .await
+                    .record_capture_metadata(&metadata)
+                    .err()?;
+                if error.kind() == RuntimeErrorKind::InvalidState {
+                    self.recorder = None;
+                    return None;
+                }
+                self.disable_recorder(recorder, error).await
+            }
             Some(Ok(VoiceInputEvent::Capture(_))) => None,
             Some(Ok(_)) => Some(LoopExit::Fatal(adapter_message(
                 RuntimeStage::VoiceSidecar,

@@ -9,6 +9,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::client_diarization::validate_client_recording_reconciliation;
 use crate::client_recording::{is_client_recording_handle, validate_client_recording_summary};
 use crate::client_text_processing::{canonical_processing_schema, validate_client_processed_text};
+use crate::{
+    validate_capture_format, validate_capture_identity, ClientRecordingAlignmentComplete,
+    ClientRecordingAlignmentPage,
+};
 
 use crate::{
     ClientComponentDescriptor, ClientMemoryCursor, ClientMemoryInspection, ClientMemoryRecord,
@@ -74,6 +78,23 @@ impl ConversationContextExchange {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClientCommand {
+    StartTimedVoiceSession {
+        request_id: String,
+        bridge_session_id: String,
+        profile: RuntimeProfile,
+        response_mode: VoiceResponseMode,
+    },
+    ReadRecordingAlignment {
+        request_id: String,
+        capability: FinalizedRecordingCapability,
+    },
+    RecordingAlignmentCredit {
+        request_id: String,
+        consumed_page_index: u64,
+    },
+    CancelRecordingAlignment {
+        request_id: String,
+    },
     Status {
         request_id: String,
     },
@@ -289,6 +310,7 @@ pub struct ClientMediaLeaseDescriptor {
     credential: String,
     expires_at_ms: u64,
     reconnect_window_ms: u64,
+    capture_format: Option<String>,
 }
 
 impl ClientMediaLeaseDescriptor {
@@ -307,9 +329,21 @@ impl ClientMediaLeaseDescriptor {
             credential,
             expires_at_ms,
             reconnect_window_ms,
+            capture_format: None,
         };
         descriptor.validate()?;
         Ok(descriptor)
+    }
+
+    pub fn into_timed(mut self, capture_format: String) -> Result<Self, ClientWireError> {
+        validate_capture_format(&capture_format)?;
+        self.media_protocol_version = 2;
+        self.capture_format = Some(capture_format);
+        self.validate()?;
+        Ok(self)
+    }
+    pub fn capture_format(&self) -> Option<&str> {
+        self.capture_format.as_deref()
     }
 
     pub const fn media_protocol_version(&self) -> u8 {
@@ -337,12 +371,17 @@ impl ClientMediaLeaseDescriptor {
     }
 
     fn validate(&self) -> Result<(), ClientWireError> {
-        if self.media_protocol_version != MEDIA_PROTOCOL_VERSION
-            || self.session_id.get() == 0
+        if !matches!(
+            (self.media_protocol_version, self.capture_format.is_some()),
+            (MEDIA_PROTOCOL_VERSION, false) | (2, true)
+        ) || self.session_id.get() == 0
             || !is_valid_media_endpoint(&self.connect_endpoint)
             || !is_valid_media_credential(&self.credential)
         {
             return Err(ClientWireError::InvalidMediaLease);
+        }
+        if let Some(format) = &self.capture_format {
+            validate_capture_format(format)?;
         }
         let now = unix_now_millis().ok_or(ClientWireError::InvalidMediaLease)?;
         let Some(lifetime_ms) = self.expires_at_ms.checked_sub(now) else {
@@ -379,19 +418,38 @@ impl Serialize for ClientMediaLeaseDescriptor {
     where
         S: Serializer,
     {
-        let mut object = serializer.serialize_struct("ClientMediaLeaseDescriptor", 6)?;
+        let mut object = serializer.serialize_struct(
+            "ClientMediaLeaseDescriptor",
+            if self.capture_format.is_some() { 8 } else { 6 },
+        )?;
         object.serialize_field("media_protocol_version", &self.media_protocol_version)?;
         object.serialize_field("session_id", &self.session_id.get().to_string())?;
         object.serialize_field("connect_endpoint", &self.connect_endpoint)?;
         object.serialize_field("credential", &self.credential)?;
         object.serialize_field("expires_at_ms", &self.expires_at_ms.to_string())?;
         object.serialize_field("reconnect_window_ms", &self.reconnect_window_ms.to_string())?;
+        if let Some(format) = &self.capture_format {
+            object.serialize_field("capture_format", format)?;
+            object.serialize_field("timing_contract", "capture-clock/v1")?;
+        }
         object.end()
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GatewayMessage {
+    TimedVoiceSessionStarted {
+        request_id: String,
+        media_lease: ClientMediaLeaseDescriptor,
+    },
+    RecordingAlignmentPage {
+        request_id: String,
+        page: ClientRecordingAlignmentPage,
+    },
+    RecordingAlignmentComplete {
+        request_id: String,
+        completion: ClientRecordingAlignmentComplete,
+    },
     Ready {
         status: RuntimeStatus,
     },
@@ -721,6 +779,59 @@ fn decode_wire_client_command(
     command: WireClientCommand,
 ) -> Result<ClientCommand, ClientWireError> {
     match command {
+        WireClientCommand::StartTimedVoiceSession {
+            protocol_version,
+            request_id,
+            bridge_session_id,
+            profile,
+            response_mode,
+        } => {
+            validate_timed_request(protocol_version, &request_id)?;
+            validate_capture_identity(&bridge_session_id)?;
+            Ok(ClientCommand::StartTimedVoiceSession {
+                request_id,
+                bridge_session_id,
+                profile: RuntimeProfile::parse(&profile)
+                    .ok_or(ClientWireError::InvalidRuntimeStatus)?,
+                response_mode: VoiceResponseMode::parse(&response_mode)
+                    .ok_or(ClientWireError::InvalidTranscript)?,
+            })
+        }
+        WireClientCommand::ReadRecordingAlignment {
+            protocol_version,
+            request_id,
+            capability,
+        } => {
+            validate_timed_request(protocol_version, &request_id)?;
+            Ok(ClientCommand::ReadRecordingAlignment {
+                request_id,
+                capability: capability.try_into()?,
+            })
+        }
+        WireClientCommand::RecordingAlignmentCredit {
+            protocol_version,
+            request_id,
+            consumed_page_index,
+        } => {
+            validate_timed_request(protocol_version, &request_id)?;
+            let index = consumed_page_index
+                .parse::<u64>()
+                .map_err(|_| ClientWireError::InvalidIdentifier)?;
+            if index.to_string() != consumed_page_index {
+                return Err(ClientWireError::InvalidIdentifier);
+            }
+            Ok(ClientCommand::RecordingAlignmentCredit {
+                request_id,
+                consumed_page_index: index,
+            })
+        }
+        WireClientCommand::CancelRecordingAlignment {
+            protocol_version,
+            request_id,
+        } => {
+            validate_timed_request(protocol_version, &request_id)?;
+            Ok(ClientCommand::CancelRecordingAlignment { request_id })
+        }
         WireClientCommand::Status {
             protocol_version,
             request_id,
@@ -1060,6 +1171,14 @@ pub fn encode_gateway_message_for_version(
     validate_gateway_message(message, protocol_version)?;
     let encoded = serde_json::to_vec(&GatewayMessageEnvelope::new(message, protocol_version))
         .expect("client wire DTOs must serialize");
+    if matches!(message, GatewayMessage::RecordingAlignmentPage { .. })
+        && encoded.len() > crate::MAX_ALIGNMENT_PAGE_BYTES
+    {
+        return Err(ClientWireError::PayloadTooLarge {
+            actual: encoded.len(),
+            maximum: crate::MAX_ALIGNMENT_PAGE_BYTES,
+        });
+    }
     validate_payload_size(encoded.len())?;
     Ok(encoded)
 }
@@ -1067,6 +1186,27 @@ pub fn encode_gateway_message_for_version(
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum WireClientCommand {
+    StartTimedVoiceSession {
+        protocol_version: u64,
+        request_id: String,
+        bridge_session_id: String,
+        profile: String,
+        response_mode: String,
+    },
+    ReadRecordingAlignment {
+        protocol_version: u64,
+        request_id: String,
+        capability: WireFinalizedRecordingCapability,
+    },
+    RecordingAlignmentCredit {
+        protocol_version: u64,
+        request_id: String,
+        consumed_page_index: String,
+    },
+    CancelRecordingAlignment {
+        protocol_version: u64,
+        request_id: String,
+    },
     Status {
         protocol_version: u64,
         request_id: String,
@@ -1182,6 +1322,18 @@ enum WireClientCommand {
 impl WireClientCommand {
     const fn protocol_version(&self) -> u64 {
         match self {
+            Self::StartTimedVoiceSession {
+                protocol_version, ..
+            }
+            | Self::ReadRecordingAlignment {
+                protocol_version, ..
+            }
+            | Self::RecordingAlignmentCredit {
+                protocol_version, ..
+            }
+            | Self::CancelRecordingAlignment {
+                protocol_version, ..
+            } => *protocol_version,
             Self::Status {
                 protocol_version, ..
             }
@@ -1669,6 +1821,21 @@ impl Serialize for WireClientVoiceSessionEvent<'_> {
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum GatewayMessageEnvelope<'a> {
+    TimedVoiceSessionStarted {
+        protocol_version: u64,
+        request_id: &'a str,
+        media_lease: &'a ClientMediaLeaseDescriptor,
+    },
+    RecordingAlignmentPage {
+        protocol_version: u64,
+        request_id: &'a str,
+        page: &'a ClientRecordingAlignmentPage,
+    },
+    RecordingAlignmentComplete {
+        protocol_version: u64,
+        request_id: &'a str,
+        completion: &'a ClientRecordingAlignmentComplete,
+    },
     Ready {
         protocol_version: u64,
         status: WireRuntimeStatus<'a>,
@@ -1754,6 +1921,29 @@ enum GatewayMessageEnvelope<'a> {
 impl<'a> GatewayMessageEnvelope<'a> {
     fn new(message: &'a GatewayMessage, protocol_version: u64) -> Self {
         match message {
+            GatewayMessage::TimedVoiceSessionStarted {
+                request_id,
+                media_lease,
+            } => Self::TimedVoiceSessionStarted {
+                protocol_version,
+                request_id,
+                media_lease,
+            },
+            GatewayMessage::RecordingAlignmentPage { request_id, page } => {
+                Self::RecordingAlignmentPage {
+                    protocol_version,
+                    request_id,
+                    page,
+                }
+            }
+            GatewayMessage::RecordingAlignmentComplete {
+                request_id,
+                completion,
+            } => Self::RecordingAlignmentComplete {
+                protocol_version,
+                request_id,
+                completion,
+            },
             GatewayMessage::Ready { status } => Self::Ready {
                 protocol_version,
                 status: WireRuntimeStatus::new(status, protocol_version),
@@ -1919,6 +2109,13 @@ fn validate_request_id(request_id: &str) -> Result<(), ClientWireError> {
     Ok(())
 }
 
+fn validate_timed_request(version: u64, request_id: &str) -> Result<(), ClientWireError> {
+    if version != FINALIZED_RECORDING_PROTOCOL_VERSION {
+        return Err(ClientWireError::UnsupportedProtocolVersion(version));
+    }
+    validate_request_id(request_id)
+}
+
 fn validate_context_exchanges(
     exchanges: Vec<WireConversationContextExchange>,
 ) -> Result<Vec<ConversationContextExchange>, ClientWireError> {
@@ -1947,6 +2144,27 @@ fn validate_gateway_message(
     protocol_version: u64,
 ) -> Result<(), ClientWireError> {
     match message {
+        GatewayMessage::TimedVoiceSessionStarted {
+            request_id,
+            media_lease,
+        } => {
+            validate_timed_request(protocol_version, request_id)?;
+            if media_lease.media_protocol_version() != 2 {
+                return Err(ClientWireError::InvalidMediaLease);
+            }
+            media_lease.validate()
+        }
+        GatewayMessage::RecordingAlignmentPage { request_id, page } => {
+            validate_timed_request(protocol_version, request_id)?;
+            page.validate()
+        }
+        GatewayMessage::RecordingAlignmentComplete {
+            request_id,
+            completion,
+        } => {
+            validate_timed_request(protocol_version, request_id)?;
+            completion.validate()
+        }
         GatewayMessage::CommandAccepted {
             request_id,
             turn_id,
@@ -1956,6 +2174,9 @@ fn validate_gateway_message(
             validate_request_id(request_id)?;
             turn_id.map_or(Ok(()), validate_turn_id)?;
             if let Some(media_lease) = media_lease {
+                if media_lease.media_protocol_version() != MEDIA_PROTOCOL_VERSION {
+                    return Err(ClientWireError::InvalidMediaLease);
+                }
                 media_lease.validate()?;
             }
             Ok(())

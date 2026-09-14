@@ -8,8 +8,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use conversation_model_adapters::{
-    frame_for_network_capture, AdapterError, NetworkBridgeRequest, NetworkMediaHub,
-    NetworkPlaybackAck, NetworkPlaybackRequest, PcmFormat, PcmSampleFormat, MAX_PCM_FRAME_BYTES,
+    frame_for_network_capture, AdapterError, CaptureClockPair, CaptureDiscontinuityReason,
+    CaptureDomainHistory, CaptureEpoch, CaptureMetadata, FrameProvenance, NetworkBridgeRequest,
+    NetworkMediaHub, NetworkPlaybackAck, NetworkPlaybackRequest, PcmFormat, PcmSampleFormat,
+    TimedCapture, CAPTURE_TIMING_BYTES, MAX_PCM_FRAME_BYTES,
 };
 use conversation_protocol::{GenerationId, SessionId};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -75,6 +77,7 @@ pub struct MediaServerConfig {
     max_playback_queue_duration: Duration,
     packet_read_timeout: Duration,
     tls: Option<MediaTlsConfig>,
+    capture_format: Option<String>,
 }
 
 impl MediaServerConfig {
@@ -90,6 +93,7 @@ impl MediaServerConfig {
             max_playback_queue_duration: Duration::from_secs(10),
             packet_read_timeout: Duration::from_millis(DEFAULT_MEDIA_PACKET_READ_TIMEOUT_MS),
             tls: None,
+            capture_format: None,
         }
     }
 
@@ -117,6 +121,7 @@ impl MediaServerConfig {
             max_playback_queue_duration,
             packet_read_timeout,
             tls,
+            capture_format: None,
         };
         config.validate()?;
         Ok(config)
@@ -176,6 +181,15 @@ impl MediaServerConfig {
     pub fn with_max_payload_bytes(mut self, value: usize) -> Self {
         self.max_payload_bytes = value;
         self
+    }
+
+    pub fn with_capture_format(mut self, value: Option<String>) -> Result<Self, AdapterError> {
+        if let Some(format) = &value {
+            conversation_protocol::validate_capture_format(format)
+                .map_err(|_| AdapterError::new("media capture format was invalid"))?;
+        }
+        self.capture_format = value;
+        Ok(self)
     }
 
     fn validate(&self) -> Result<(), AdapterError> {
@@ -287,6 +301,7 @@ struct MediaServerInner {
     connection_permits: Arc<Semaphore>,
     cancellation: CancellationToken,
     next_reservation_epoch: AtomicU64,
+    capture_format: Option<String>,
 }
 
 struct MediaSession {
@@ -301,6 +316,17 @@ struct MediaSession {
     last_capture_timestamp_ms: Option<u64>,
     rate_window_started: Instant,
     frames_in_window: u32,
+    timed: Option<TimedMediaState>,
+}
+
+#[derive(Clone)]
+struct TimedMediaState {
+    bridge_session_id: String,
+    epoch: Option<CaptureEpoch>,
+    domains: CaptureDomainHistory,
+    sequence: u64,
+    output_end: Option<u64>,
+    pair: Option<CaptureClockPair>,
 }
 
 struct MediaDisconnect {
@@ -345,6 +371,7 @@ impl MediaServer {
             connection_permits: Arc::new(Semaphore::new(MAX_MEDIA_CONNECTIONS)),
             cancellation: CancellationToken::new(),
             next_reservation_epoch: AtomicU64::new(1),
+            capture_format: config.capture_format,
         });
         let worker = Arc::clone(&inner);
         let task = tokio::spawn(async move { accept_loop(listener, tls, worker).await });
@@ -366,6 +393,31 @@ impl MediaServer {
     }
 
     pub async fn reserve(&self, session_id: SessionId) -> Result<MediaLease, AdapterError> {
+        self.reserve_version(session_id, None).await
+    }
+
+    pub fn capture_format(&self) -> Option<&str> {
+        self.inner.capture_format.as_deref()
+    }
+
+    pub async fn reserve_timed(
+        &self,
+        session_id: SessionId,
+        bridge_session_id: String,
+    ) -> Result<MediaLease, AdapterError> {
+        conversation_model_adapters::validate_capture_identifier(&bridge_session_id)?;
+        if self.capture_format().is_none() {
+            return Err(AdapterError::new("timed capture format is not configured"));
+        }
+        self.reserve_version(session_id, Some(bridge_session_id))
+            .await
+    }
+
+    async fn reserve_version(
+        &self,
+        session_id: SessionId,
+        bridge_session_id: Option<String>,
+    ) -> Result<MediaLease, AdapterError> {
         let reservation_epoch = self
             .inner
             .next_reservation_epoch
@@ -401,6 +453,14 @@ impl MediaServer {
                 last_capture_timestamp_ms: None,
                 rate_window_started: now,
                 frames_in_window: 0,
+                timed: bridge_session_id.map(|bridge_session_id| TimedMediaState {
+                    bridge_session_id,
+                    epoch: None,
+                    domains: CaptureDomainHistory::default(),
+                    sequence: 0,
+                    output_end: None,
+                    pair: None,
+                }),
             },
         );
         if previous.is_some() {
@@ -497,14 +557,18 @@ async fn serve_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (session_id, credential) = tokio::select! {
+    let (session_id, credential, bridge_session_id) = tokio::select! {
         _ = inner.cancellation.cancelled() => return Ok(()),
         authentication = tokio::time::timeout(MEDIA_HANDSHAKE_TIMEOUT, read_authentication(&mut stream)) => {
             authentication
                 .map_err(|_| AdapterError::new("media bridge authentication timed out"))??
         },
     };
-    let connection = inner.authenticate(session_id, &credential).await?;
+    let connection = inner
+        .authenticate(session_id, &credential, bridge_session_id.as_deref())
+        .await?;
+    let timed = bridge_session_id.is_some();
+    let mut epoch_started = false;
     let mut playback = inner
         .hub
         .attach_playback_transport(session_id, connection.connection_id)
@@ -520,7 +584,38 @@ where
                     inner.packet_read_timeout,
                 ) => {
                     match message? {
+                        MediaMessage::Timed {session_id:source,record}=>{
+                            if !timed||source!=session_id {return Err(AdapterError::new("timed media identity did not match"));}
+                            inner.admit_timed_rate(session_id).await?;
+                            match record {
+                                TimedMediaRecord::Metadata(CaptureMetadata::Epoch(epoch))=>{
+                                    inner.admit_epoch(session_id,&epoch,!epoch_started).await?;
+                                    inner.hub.deliver_capture_metadata(session_id,CaptureMetadata::Epoch(epoch)).await?;
+                                    epoch_started=true;
+                                }
+                                TimedMediaRecord::Metadata(metadata)=>{
+                                    if !epoch_started {return Err(AdapterError::new("timed media epoch is missing"));}
+                                    inner.admit_timed_metadata(session_id,&metadata).await?;
+                                    if matches!(metadata,CaptureMetadata::Discontinuity {reason:CaptureDiscontinuityReason::SourceDrop|CaptureDiscontinuityReason::SequenceHole|CaptureDiscontinuityReason::Reconnect|CaptureDiscontinuityReason::Pause|CaptureDiscontinuityReason::SourceDiscontinuity,..}) {inner.hub.deliver_discontinuity(session_id,0).await?;}
+                                    inner.hub.deliver_capture_metadata(session_id,metadata).await?;
+                                }
+                                TimedMediaRecord::Frame {format,timing,payload}=>{
+                                    if !epoch_started {return Err(AdapterError::new("timed media epoch is missing"));}
+                                    let (epoch,hole)=inner.validate_timed_frame(session_id,&timing,format,payload.len()).await?;
+                                    if hole {
+                                        inner.hub.deliver_discontinuity(session_id,0).await?;
+                                        inner.hub.deliver_capture_metadata(session_id,CaptureMetadata::Discontinuity {capture_epoch:epoch.capture_epoch,reason:CaptureDiscontinuityReason::SequenceHole}).await?;
+                                    }
+                                    let frame=frame_for_network_capture(timing.sequence,format,payload)?.with_capture_timing(TimedCapture {epoch,frame:timing.clone()})?;
+                                    inner.hub.deliver_capture(session_id,frame).await?;
+                                    let mut sessions=inner.sessions.lock().await;
+                                    let state=sessions.get_mut(&session_id.get()).and_then(|session|session.timed.as_mut()).ok_or_else(||AdapterError::new("timed media session was revoked"))?;
+                                    state.sequence=timing.sequence;state.output_end=Some(timing.output_start_sample+u64::from(timing.sample_count));
+                                }
+                            }
+                        }
                         MediaMessage::Frame { direction, session_id: frame_session_id, sequence, captured_at_ms, format, payload } => {
+                            if timed {return Err(AdapterError::new("legacy capture is not permitted for timed media"));}
                             if frame_session_id != session_id {
                                 return Err(AdapterError::new("media frame session identity did not match"));
                             }
@@ -593,15 +688,200 @@ where
     }
     if let Some(Some(at_ms)) = disconnect.map(|disconnect| disconnect.capture_at_ms) {
         let _ = inner.hub.deliver_discontinuity(session_id, at_ms).await;
+        if timed {
+            let epoch = inner
+                .sessions
+                .lock()
+                .await
+                .get(&session_id.get())
+                .and_then(|session| session.timed.as_ref())
+                .and_then(|state| state.epoch.as_ref())
+                .map(|epoch| epoch.capture_epoch);
+            if let Some(capture_epoch) = epoch {
+                let _ = inner
+                    .hub
+                    .deliver_capture_metadata(
+                        session_id,
+                        CaptureMetadata::Discontinuity {
+                            capture_epoch,
+                            reason: CaptureDiscontinuityReason::Reconnect,
+                        },
+                    )
+                    .await;
+            }
+        }
     }
     result
 }
 
 impl MediaServerInner {
+    async fn admit_timed_rate(&self, session_id: SessionId) -> Result<(), AdapterError> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id.get())
+            .ok_or_else(|| AdapterError::new("timed media session was revoked"))?;
+        let now = Instant::now();
+        if now.duration_since(session.rate_window_started) >= Duration::from_secs(1) {
+            session.rate_window_started = now;
+            session.frames_in_window = 0;
+        }
+        if session.frames_in_window >= self.max_frames_per_second {
+            return Err(AdapterError::new(
+                "timed media record rate exceeded its bound",
+            ));
+        }
+        session.frames_in_window += 1;
+        Ok(())
+    }
+
+    async fn admit_epoch(
+        &self,
+        session_id: SessionId,
+        epoch: &CaptureEpoch,
+        reconnect: bool,
+    ) -> Result<(), AdapterError> {
+        epoch.validate()?;
+        let mut sessions = self.sessions.lock().await;
+        let state = sessions
+            .get_mut(&session_id.get())
+            .and_then(|session| session.timed.as_mut())
+            .ok_or_else(|| AdapterError::new("timed media session was revoked"))?;
+        if state.bridge_session_id != epoch.bridge_session_id {
+            return Err(AdapterError::new("timed bridge identity did not match"));
+        }
+        if state.epoch.as_ref().is_some_and(|prior| {
+            prior.clock_domain_id == epoch.clock_domain_id
+                && (epoch.capture_epoch < prior.capture_epoch
+                    || (!reconnect && epoch.capture_epoch == prior.capture_epoch))
+        }) {
+            return Err(AdapterError::new("timed capture epoch was replayed"));
+        }
+        // Before any watermark mutation: a rejected new/retired domain must not
+        // reset sequence state and authorize replay on the next reconnect.
+        state.domains.admit(&epoch.clock_domain_id)?;
+        if let Some(prior) = &state.epoch {
+            if prior.clock_domain_id == epoch.clock_domain_id {
+                if epoch.capture_epoch > prior.capture_epoch {
+                    state.sequence = 0;
+                    state.output_end = None;
+                }
+            } else {
+                state.sequence = 0;
+                state.output_end = None;
+                state.pair = None;
+            }
+        }
+        state.epoch = Some(epoch.clone());
+        Ok(())
+    }
+
+    async fn admit_timed_metadata(
+        &self,
+        session_id: SessionId,
+        metadata: &CaptureMetadata,
+    ) -> Result<(), AdapterError> {
+        let mut sessions = self.sessions.lock().await;
+        let state = sessions
+            .get_mut(&session_id.get())
+            .and_then(|session| session.timed.as_mut())
+            .ok_or_else(|| AdapterError::new("timed media session was revoked"))?;
+        let epoch = state
+            .epoch
+            .as_ref()
+            .ok_or_else(|| AdapterError::new("timed media epoch is missing"))?;
+        match metadata {
+            CaptureMetadata::ClockPair(pair) => {
+                pair.validate()?;
+                if pair.clock_domain_id != epoch.clock_domain_id
+                    || state.pair.as_ref().is_some_and(|prior| {
+                        pair.sequence <= prior.sequence
+                            || pair.midpoint_twice() <= prior.midpoint_twice()
+                            || pair.wall_epoch < prior.wall_epoch
+                    })
+                {
+                    return Err(AdapterError::new(
+                        "timed clock pair identity or ordering was invalid",
+                    ));
+                }
+                state.pair = Some(pair.clone());
+            }
+            CaptureMetadata::Discontinuity {
+                capture_epoch,
+                reason,
+            } => {
+                if *capture_epoch != epoch.capture_epoch
+                    || matches!(reason, CaptureDiscontinuityReason::AlignmentLimitExceeded)
+                {
+                    return Err(AdapterError::new("timed discontinuity was invalid"));
+                }
+            }
+            CaptureMetadata::Epoch(_) => {
+                return Err(AdapterError::new("timed epoch admission was invalid"))
+            }
+        }
+        Ok(())
+    }
+
+    async fn validate_timed_frame(
+        &self,
+        session_id: SessionId,
+        timing: &FrameProvenance,
+        format: PcmFormat,
+        length: usize,
+    ) -> Result<(CaptureEpoch, bool), AdapterError> {
+        timing.validate_pcm(format, length)?;
+        let configured = self
+            .capture_format
+            .as_ref()
+            .ok_or_else(|| AdapterError::new("timed capture format is not configured"))?;
+        let mut parts = configured.split('/');
+        let codec = parts.next().unwrap();
+        let rate = parts.next().unwrap().parse::<u32>().unwrap();
+        let channels = parts.next().unwrap().parse::<u16>().unwrap();
+        let expected = PcmFormat::new(
+            rate,
+            channels,
+            if codec == "pcm_s16le" {
+                PcmSampleFormat::Signed16LittleEndian
+            } else {
+                PcmSampleFormat::Float32LittleEndian
+            },
+        )?;
+        if format != expected {
+            return Err(AdapterError::new(
+                "timed capture format did not match lease",
+            ));
+        }
+        let sessions = self.sessions.lock().await;
+        let state = sessions
+            .get(&session_id.get())
+            .and_then(|session| session.timed.as_ref())
+            .ok_or_else(|| AdapterError::new("timed media session was revoked"))?;
+        let epoch = state
+            .epoch
+            .as_ref()
+            .ok_or_else(|| AdapterError::new("timed media epoch is missing"))?;
+        if timing.capture_epoch != epoch.capture_epoch
+            || timing.sequence <= state.sequence
+            || state
+                .output_end
+                .is_some_and(|end| timing.output_start_sample < end)
+        {
+            return Err(AdapterError::new(
+                "timed capture sequence or epoch was replayed",
+            ));
+        }
+        let hole = state.sequence > 0
+            && (state.sequence.checked_add(1) != Some(timing.sequence)
+                || state.output_end != Some(timing.output_start_sample));
+        Ok((epoch.clone(), hole))
+    }
+
     async fn authenticate(
         &self,
         session_id: SessionId,
         credential: &str,
+        bridge_session_id: Option<&str>,
     ) -> Result<MediaConnection, AdapterError> {
         let mut sessions = self.sessions.lock().await;
         let session = sessions
@@ -609,6 +889,11 @@ impl MediaServerInner {
             .ok_or_else(|| AdapterError::new("media credential was not accepted"))?;
         let now = Instant::now();
         if credential != session.credential
+            || session
+                .timed
+                .as_ref()
+                .map(|state| state.bridge_session_id.as_str())
+                != bridge_session_id
             || now > session.expires_at
             || now > session.reconnect_deadline
             || session.active
@@ -730,7 +1015,13 @@ impl MediaServerInner {
                 Instant::now() + self.reconnect_window.min(self.max_playback_queue_duration);
             session.reconnect_deadline = reconnect_deadline;
             return Some(MediaDisconnect {
-                capture_at_ms: session.last_capture_timestamp_ms,
+                capture_at_ms: session.last_capture_timestamp_ms.or_else(|| {
+                    session
+                        .timed
+                        .as_ref()
+                        .filter(|state| state.sequence > 0)
+                        .map(|_| 0)
+                }),
                 reconnect_deadline,
             });
         }
@@ -738,7 +1029,9 @@ impl MediaServerInner {
     }
 }
 
-async fn read_authentication<R>(stream: &mut R) -> Result<(SessionId, String), AdapterError>
+async fn read_authentication<R>(
+    stream: &mut R,
+) -> Result<(SessionId, String, Option<String>), AdapterError>
 where
     R: AsyncRead + Unpin,
 {
@@ -747,6 +1040,44 @@ where
         .read_exact(&mut prefix)
         .await
         .map_err(|_| AdapterError::new("media bridge authentication was malformed"))?;
+    if prefix == *b"MED2\x02\x01" {
+        let length = stream
+            .read_u32()
+            .await
+            .map_err(|_| AdapterError::new("media bridge authentication was malformed"))?
+            as usize;
+        if !(11..=202).contains(&length) {
+            return Err(AdapterError::new(
+                "media bridge authentication was malformed",
+            ));
+        }
+        let mut body = vec![0; length];
+        stream
+            .read_exact(&mut body)
+            .await
+            .map_err(|_| AdapterError::new("media bridge authentication was malformed"))?;
+        let session = SessionId::new(u64::from_be_bytes(body[..8].try_into().unwrap()));
+        let token_len = usize::from(body[8]);
+        if token_len == 0 || token_len > MAX_TOKEN_BYTES || 9 + token_len >= body.len() {
+            return Err(AdapterError::new(
+                "media bridge authentication was malformed",
+            ));
+        }
+        let id_len = usize::from(body[9 + token_len]);
+        if body.len() != 10 + token_len + id_len {
+            return Err(AdapterError::new(
+                "media bridge authentication was malformed",
+            ));
+        }
+        let credential = std::str::from_utf8(&body[9..9 + token_len])
+            .map_err(|_| AdapterError::new("media bridge authentication was malformed"))?
+            .to_owned();
+        let bridge = std::str::from_utf8(&body[10 + token_len..])
+            .map_err(|_| AdapterError::new("media bridge authentication was malformed"))?
+            .to_owned();
+        conversation_model_adapters::validate_capture_identifier(&bridge)?;
+        return Ok((session, credential, Some(bridge)));
+    }
     if prefix != [b'M', b'E', b'D', b'1', MEDIA_PROTOCOL_VERSION, AUTH_KIND] {
         return Err(AdapterError::new(
             "media bridge authentication was malformed",
@@ -775,10 +1106,14 @@ where
         .map_err(|_| AdapterError::new("media bridge authentication was malformed"))?;
     let credential = String::from_utf8(credential)
         .map_err(|_| AdapterError::new("media bridge authentication was malformed"))?;
-    Ok((session, credential))
+    Ok((session, credential, None))
 }
 
 enum MediaMessage {
+    Timed {
+        session_id: SessionId,
+        record: TimedMediaRecord,
+    },
     Frame {
         direction: u8,
         session_id: SessionId,
@@ -796,6 +1131,75 @@ enum MediaMessage {
         session_id: SessionId,
         generation_id: GenerationId,
     },
+}
+
+enum TimedMediaRecord {
+    Frame {
+        format: PcmFormat,
+        timing: FrameProvenance,
+        payload: Vec<u8>,
+    },
+    Metadata(CaptureMetadata),
+}
+
+async fn read_timed_media_body<R: AsyncRead + Unpin>(
+    stream: &mut R,
+    kind: u8,
+    max_payload: usize,
+) -> Result<MediaMessage, AdapterError> {
+    let invalid = || AdapterError::new("timed media record was malformed");
+    let length = stream.read_u32().await.map_err(|_| invalid())? as usize;
+    let maximum = if kind == 2 { max_payload + 107 } else { 256 };
+    if length < 8 || length > maximum || ![2, 6, 7, 8].contains(&kind) {
+        return Err(invalid());
+    }
+    let mut body = vec![0; length];
+    stream.read_exact(&mut body).await.map_err(|_| invalid())?;
+    let session_id = SessionId::new(u64::from_be_bytes(body[..8].try_into().unwrap()));
+    let record = match kind {
+        2 => {
+            if body.len() < 107 {
+                return Err(invalid());
+            }
+            let codec = match body[8] {
+                1 => PcmSampleFormat::Signed16LittleEndian,
+                2 => PcmSampleFormat::Float32LittleEndian,
+                _ => return Err(invalid()),
+            };
+            let format = PcmFormat::new(
+                u32::from_be_bytes(body[9..13].try_into().unwrap()),
+                u16::from_be_bytes(body[13..15].try_into().unwrap()),
+                codec,
+            )?;
+            let timing = FrameProvenance::decode(&body[15..15 + CAPTURE_TIMING_BYTES])?;
+            let size = u32::from_be_bytes(body[103..107].try_into().unwrap()) as usize;
+            if size == 0 || size > max_payload || body.len() != 107 + size {
+                return Err(invalid());
+            }
+            timing.validate_pcm(format, size)?;
+            TimedMediaRecord::Frame {
+                format,
+                timing,
+                payload: body[107..].to_vec(),
+            }
+        }
+        6 => TimedMediaRecord::Metadata(CaptureMetadata::Epoch(CaptureEpoch::decode(&body[8..])?)),
+        7 => TimedMediaRecord::Metadata(CaptureMetadata::ClockPair(CaptureClockPair::decode(
+            &body[8..],
+        )?)),
+        8 if body.len() == 17 => {
+            let capture_epoch = u64::from_be_bytes(body[8..16].try_into().unwrap());
+            if capture_epoch == 0 {
+                return Err(invalid());
+            }
+            TimedMediaRecord::Metadata(CaptureMetadata::Discontinuity {
+                capture_epoch,
+                reason: CaptureDiscontinuityReason::decode(body[16])?,
+            })
+        }
+        _ => return Err(invalid()),
+    };
+    Ok(MediaMessage::Timed { session_id, record })
 }
 
 async fn read_media_message<R>(
@@ -831,6 +1235,9 @@ where
         .read_exact(&mut header[1..6])
         .await
         .map_err(|_| AdapterError::new("media frame was malformed"))?;
+    if header[..5] == *b"MED2\x02" {
+        return read_timed_media_body(stream, header[5], max_payload_bytes).await;
+    }
     if header[..5] != [b'M', b'E', b'D', b'1', MEDIA_PROTOCOL_VERSION] {
         return Err(AdapterError::new("media frame was malformed"));
     }
@@ -1070,4 +1477,90 @@ fn load_tls_acceptor(config: &MediaTlsConfig) -> Result<TlsAcceptor, AdapterErro
         .with_single_cert(certificates, private_key)
         .map_err(|_| AdapterError::new("media TLS material could not be loaded"))?;
     Ok(TlsAcceptor::from(Arc::new(configuration)))
+}
+
+#[cfg(test)]
+mod timing_domain_tests {
+    use super::*;
+    #[tokio::test]
+    async fn domain_history_is_per_source_persists_reconnect_and_refuses_257_without_resetting_watermarks(
+    ) {
+        let server = MediaServer::bind(
+            MediaServerConfig::loopback()
+                .with_capture_format(Some("pcm_s16le/24000/1/20ms".into()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let first = SessionId::new(41);
+        let second = SessionId::new(42);
+        server.reserve_timed(first, "bridge".into()).await.unwrap();
+        server.reserve_timed(second, "bridge".into()).await.unwrap();
+        let epoch = |name: &str| CaptureEpoch {
+            bridge_session_id: "bridge".into(),
+            clock_domain_id: name.into(),
+            capture_epoch: 1,
+        };
+        server
+            .inner
+            .admit_epoch(first, &epoch("A"), false)
+            .await
+            .unwrap();
+        server
+            .inner
+            .admit_epoch(first, &epoch("A"), true)
+            .await
+            .unwrap();
+        server
+            .inner
+            .admit_epoch(first, &epoch("B"), false)
+            .await
+            .unwrap();
+        assert!(server
+            .inner
+            .admit_epoch(first, &epoch("A"), true)
+            .await
+            .is_err());
+        server
+            .inner
+            .admit_epoch(second, &epoch("A"), false)
+            .await
+            .unwrap();
+        for index in 1..256 {
+            server
+                .inner
+                .admit_epoch(second, &epoch(&format!("process-{index}")), false)
+                .await
+                .unwrap();
+        }
+        {
+            let mut sessions = server.inner.sessions.lock().await;
+            let state = sessions
+                .get_mut(&second.get())
+                .unwrap()
+                .timed
+                .as_mut()
+                .unwrap();
+            state.sequence = 9;
+            state.output_end = Some(10);
+        }
+        assert!(server
+            .inner
+            .admit_epoch(second, &epoch("process-256"), false)
+            .await
+            .is_err());
+        server
+            .inner
+            .admit_epoch(second, &epoch("process-255"), true)
+            .await
+            .unwrap();
+        {
+            let sessions = server.inner.sessions.lock().await;
+            let state = sessions[&second.get()].timed.as_ref().unwrap();
+            assert_eq!(state.sequence, 9);
+            assert_eq!(state.output_end, Some(10));
+            assert_eq!(state.epoch.as_ref().unwrap().clock_domain_id, "process-255");
+        }
+        server.shutdown().await;
+    }
 }

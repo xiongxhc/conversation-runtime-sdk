@@ -18,6 +18,10 @@ import {
   type RecordingSummary,
   type FinalizedRecordingCapability,
   type FinalizedRecordingForVersion,
+  type TimedMediaLease,
+  type RecordingAlignmentPage,
+  type RecordingAlignmentComplete,
+  type RecordingIdentity,
   type RuntimeEvent,
   type RuntimeFailure,
   type RuntimeStatus,
@@ -45,6 +49,10 @@ export interface VoiceSession<Version extends ClientProtocolVersion = ClientProt
   stop(): Promise<void>;
   pauseCapture(): Promise<void>;
   resumeCapture(): Promise<void>;
+}
+
+export interface TimedVoiceSession extends Omit<VoiceSession<4>, "mediaLease"> {
+  readonly mediaLease: TimedMediaLease;
 }
 
 export class CommandRejectedError extends Error {
@@ -393,6 +401,34 @@ export class RuntimeClient<Version extends ClientProtocolVersion = ClientProtoco
     return result.promise;
   }
 
+  startTimedVoiceSession(this: RuntimeClient<4>, options: { bridgeSessionId: string; profile: RuntimeProfile; responseMode: VoiceResponseMode }): Promise<TimedVoiceSession> {
+    if (this.protocolVersion !== 4) return Promise.reject(new Error("timed voice requires protocol version 4"));
+    const requestId = this.nextRequestId();
+    const command: ClientCommand = { type: "start_timed_voice_session", requestId, ...options };
+    try { validateClientCommand(command, 4); } catch (error) { return Promise.reject(asError(error)); }
+    const result = new Deferred<TimedVoiceSession>();
+    this.controls.set(requestId, { kind: "start_timed_voice_session", accepted: false, result, fail: (error) => result.reject(error) });
+    this.send(command);
+    return result.promise;
+  }
+
+  readRecordingAlignment(this: RuntimeClient<4>, { capability }: { capability: FinalizedRecordingCapability }): AsyncIterable<RecordingAlignmentPage | RecordingAlignmentComplete> {
+    if (this.protocolVersion !== 4) throw new Error("recording alignment requires protocol version 4");
+    if ([...this.controls.values()].some((control) => control.kind === "read_recording_alignment")) throw new Error("a recording alignment read is already active");
+    const requestId = this.nextRequestId();
+    const command: ClientCommand = { type: "read_recording_alignment", requestId, capability };
+    validateClientCommand(command, 4);
+    const iterator = new AlignmentIterator(
+      { sourceSessionId: capability.sourceSessionId, recordingHandle: capability.recordingHandle, sha256: capability.sha256 },
+      (consumedPageIndex) => this.send({ type: "recording_alignment_credit", requestId, consumedPageIndex }),
+      () => this.send({ type: "cancel_recording_alignment", requestId }),
+      (error) => this.fail(error),
+    );
+    this.controls.set(requestId, { kind: "read_recording_alignment", accepted: false, iterator, fail: (error) => iterator.fail(error) });
+    this.send(command);
+    return iterator;
+  }
+
   authorizeVoiceResponse({
     sessionId,
     segmentId,
@@ -520,6 +556,26 @@ export class RuntimeClient<Version extends ClientProtocolVersion = ClientProtoco
   }
 
   private route(message: GatewayMessage): void {
+    if (message.type === "recording_alignment_page" || message.type === "recording_alignment_complete") {
+      const control = this.controls.get(message.requestId);
+      if (!control || control.kind !== "read_recording_alignment" || !control.accepted) {
+        this.fail(new Error("gateway sent uncorrelated recording alignment")); return;
+      }
+      control.iterator.push(message.type === "recording_alignment_page" ? message.page : message.completion);
+      if (message.type === "recording_alignment_complete") this.controls.delete(message.requestId);
+      return;
+    }
+    if (message.type === "timed_voice_session_started") {
+      const control = this.controls.get(message.requestId);
+      if (!control || control.kind !== "start_timed_voice_session" || !control.accepted || !this.activeVoiceSession || message.mediaLease.sessionId !== this.controlSessionId) {
+        this.fail(new Error("gateway sent uncorrelated timed voice start")); return;
+      }
+      const session = this.activeVoiceSession;
+      session.sessionId = message.mediaLease.sessionId;
+      this.controls.delete(message.requestId);
+      control.result.resolve({ mediaLease: message.mediaLease, events: () => session.events as AsyncIterable<VoiceSessionEventForVersion<4>>, stop: () => this.voiceControl("stop_voice_session", session), pauseCapture: () => this.voiceControl("pause_voice_capture", session), resumeCapture: () => this.voiceControl("resume_voice_capture", session) });
+      return;
+    }
     if (message.type === "fatal") {
       this.fail(new Error("gateway emitted a fatal message"));
       return;
@@ -697,6 +753,11 @@ export class RuntimeClient<Version extends ClientProtocolVersion = ClientProtoco
     }
     control.accepted = true;
     switch (control.kind) {
+      case "read_recording_alignment": return;
+      case "start_timed_voice_session":
+        if (this.activeVoiceSession) { this.fail(new Error("gateway accepted concurrent voice sessions")); return; }
+        this.activeVoiceSession = { events: new AsyncQueue<VoiceSessionEvent>(), started: false };
+        return;
       case "status":
       case "memory_list":
       case "memory_inspect":
@@ -761,6 +822,11 @@ export class RuntimeClient<Version extends ClientProtocolVersion = ClientProtoco
 
   private reject(requestId: string, error: Error): void {
     const control = this.controls.get(requestId);
+    if (control?.kind === "read_recording_alignment") {
+      this.controls.delete(requestId);
+      control.iterator.terminalError(error);
+      return;
+    }
     if (control?.accepted || this.acceptedStartRequests.has(requestId)) {
       this.fail(new Error("gateway rejected an accepted command"));
       return;
@@ -845,6 +911,8 @@ export class RuntimeClient<Version extends ClientProtocolVersion = ClientProtoco
 }
 
 type PendingControl<Version extends ClientProtocolVersion> =
+  | { kind: "read_recording_alignment"; accepted: boolean; iterator: AlignmentIterator; fail(error: Error): void }
+  | { kind: "start_timed_voice_session"; accepted: boolean; result: Deferred<TimedVoiceSession>; fail(error: Error): void }
   | { kind: "status"; accepted: boolean; result: Deferred<RuntimeStatus>; fail(error: Error): void }
   | { kind: "memory_list"; accepted: boolean; result: Deferred<MemoryPage>; fail(error: Error): void }
   | { kind: "memory_inspect"; accepted: boolean; result: Deferred<MemoryInspection>; fail(error: Error): void }
@@ -907,6 +975,102 @@ class Deferred<T> {
       this.settled = true;
       this.rejectPromise(error);
     }
+  }
+}
+
+type AlignmentItem = RecordingAlignmentPage | RecordingAlignmentComplete;
+
+/** One held item, one pull, and one transport credit. No generic queue is used. */
+class AlignmentIterator implements AsyncIterableIterator<AlignmentItem> {
+  private held: AlignmentItem | undefined;
+  private waiter: Deferred<IteratorResult<AlignmentItem>> | undefined;
+  private readonly cleanup = new Deferred<void>();
+  private error: Error | undefined;
+  private terminal = false;
+  private cancelling = false;
+  private expecting = true;
+  private nextIndex = 0n;
+  private readonly observedWarnings = new Set<string>();
+  private lastYielded: bigint | undefined;
+  private returnPromise: Promise<IteratorResult<AlignmentItem>> | undefined;
+
+  constructor(private readonly source: RecordingIdentity, private readonly credit: (page: bigint) => void, private readonly cancel: () => void, private readonly fatal: (error: Error) => void) {}
+
+  [Symbol.asyncIterator](): AsyncIterableIterator<AlignmentItem> { return this; }
+
+  next(): Promise<IteratorResult<AlignmentItem>> {
+    if (this.error) return Promise.reject(this.error);
+    if (this.cancelling) return Promise.resolve({ done: true, value: undefined });
+    if (this.waiter) return Promise.reject(new Error("concurrent recording alignment pulls are unsupported"));
+    if (this.held !== undefined) {
+      const item = this.held; this.held = undefined;
+      if (item.type === "recording_alignment_page") this.lastYielded = item.pageIndex;
+      return Promise.resolve({ done: false, value: item });
+    }
+    if (this.terminal) return Promise.resolve({ done: true, value: undefined });
+    this.waiter = new Deferred<IteratorResult<AlignmentItem>>();
+    const promise = this.waiter.promise;
+    if (this.lastYielded !== undefined) {
+      const page = this.lastYielded; this.lastYielded = undefined; this.expecting = true;
+      this.credit(page);
+    }
+    return promise;
+  }
+
+  push(item: AlignmentItem): void {
+    if (this.terminal || !this.expecting || this.held !== undefined) throw new Error("gateway exceeded recording alignment credit");
+    if (item.source.sourceSessionId !== this.source.sourceSessionId || item.source.recordingHandle !== this.source.recordingHandle || item.source.sha256 !== this.source.sha256) throw new Error("recording alignment source changed");
+    if (item.type === "recording_alignment_page") {
+      if (item.pageIndex !== this.nextIndex) throw new Error("recording alignment page index is not contiguous");
+      for (const entry of item.entries) {
+        if (entry.kind === "frame") {
+          if (entry.wall !== null) this.observedWarnings.add("local_wall_timestamp_estimate");
+          for (const reason of entry.reasons) this.observedWarnings.add(reason);
+        } else if (entry.kind === "audio_gap") this.observedWarnings.add("audio_missing");
+        else if (entry.kind === "alignment_limit") this.observedWarnings.add("alignment_limit_exceeded");
+      }
+      this.nextIndex += 1n;
+    } else {
+      if (item.pageCount !== this.nextIndex) throw new Error("recording alignment page count did not match");
+      if ([...this.observedWarnings].some((warning) => !item.warnings.includes(warning))) throw new Error("recording alignment terminal warning was missing");
+      if (item.coverageStatus === "unavailable_legacy" && (this.nextIndex !== 0n || !item.warnings.includes("unavailable_legacy"))) throw new Error("recording alignment legacy completion was inconsistent");
+      if (item.coverageStatus === "available" && [...this.observedWarnings].some((warning) => warning !== "local_wall_timestamp_estimate")) throw new Error("recording alignment coverage status was inconsistent");
+      this.terminal = true; this.cleanup.resolve();
+    }
+    this.expecting = false;
+    if (this.cancelling) return;
+    if (this.waiter) {
+      const waiter = this.waiter; this.waiter = undefined;
+      if (item.type === "recording_alignment_page") this.lastYielded = item.pageIndex;
+      waiter.resolve({ done: false, value: item });
+    } else { this.held = item; }
+  }
+
+  terminalError(error: Error): void {
+    this.terminal = true; this.held = undefined; this.cleanup.resolve();
+    if (!this.cancelling) { this.error = error; this.waiter?.reject(error); this.waiter = undefined; }
+  }
+
+  fail(error: Error): void {
+    this.error = error; this.held = undefined; this.terminal = true;
+    this.waiter?.reject(error); this.waiter = undefined; this.cleanup.reject(error);
+  }
+
+  return(): Promise<IteratorResult<AlignmentItem>> {
+    if (this.returnPromise) return this.returnPromise;
+    this.cancelling = true; this.held = undefined;
+    this.waiter?.resolve({ done: true, value: undefined }); this.waiter = undefined;
+    if (this.error) return Promise.reject(this.error);
+    if (this.terminal) return Promise.resolve({ done: true, value: undefined });
+    this.cancel();
+    this.returnPromise = new Promise<IteratorResult<AlignmentItem>>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const error = new Error("recording alignment cancellation cleanup was not confirmed");
+        this.fatal(error); reject(error);
+      }, 2_000);
+      this.cleanup.promise.then(() => { clearTimeout(timer); resolve({ done: true, value: undefined }); }, (error: unknown) => { clearTimeout(timer); reject(error); });
+    });
+    return this.returnPromise;
   }
 }
 

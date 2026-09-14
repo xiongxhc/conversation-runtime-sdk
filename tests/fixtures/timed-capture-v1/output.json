@@ -1,0 +1,114 @@
+{
+  "schema": "timed-capture-control-results-v1",
+  "fixtureClockUnixMs": 1000000,
+  "started": {
+    "protocol_version": 4,
+    "type": "timed_voice_session_started",
+    "request_id": "timed-start",
+    "media_lease": {
+      "media_protocol_version": 2,
+      "session_id": "41",
+      "connect_endpoint": "tcp://127.0.0.1:9001",
+      "credential": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expires_at_ms": "1060000",
+      "reconnect_window_ms": "10000",
+      "capture_format": "pcm_s16le/24000/1/20ms",
+      "timing_contract": "capture-clock/v1"
+    }
+  },
+  "page": {
+    "protocol_version": 4,
+    "type": "recording_alignment_page",
+    "request_id": "alignment",
+    "page": {
+      "source": {
+        "source_session_id": "41",
+        "recording_handle": "02020202020202020202020202020202",
+        "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "page_index": "0",
+      "policy": {
+        "id": "local-wall-estimate/v1",
+        "cadence_target_ns": "1000000000",
+        "maximum_bracket_ns": "5000000",
+        "maximum_pair_gap_ns": "2000000000",
+        "maximum_residual_ns": "10000000"
+      },
+      "entries": [
+        {
+          "kind": "epoch",
+          "epoch": {
+            "bridge_session_id": "bridge-independent",
+            "clock_domain_id": "source-process",
+            "capture_epoch": "1"
+          }
+        },
+        {
+          "kind": "frame",
+          "media_start_sample": "0",
+          "media_end_sample": "2",
+          "sample_rate_hz": 24000,
+          "gap_offset_ms": "0",
+          "epoch": {
+            "bridge_session_id": "bridge-independent",
+            "clock_domain_id": "source-process",
+            "capture_epoch": "1"
+          },
+          "provenance": {
+            "capture_epoch": "1",
+            "sequence": "7",
+            "output_start_sample": "0",
+            "sample_count": 2,
+            "source_start_numerator": "0",
+            "source_end_numerator": "96000",
+            "source_denominator": 24000,
+            "source_rate_hz": 48000,
+            "quality": "nominal_frame_endpoint_interpolation",
+            "span": {
+              "host_start_ns": "1000000000",
+              "host_end_ns": "1000083334",
+              "rounding_envelope_ns": "4",
+              "capture_uncertainty_ns": null
+            }
+          },
+          "capture_status": "available",
+          "wall": {
+            "quality": "local_wall_estimate",
+            "policy_id": "local-wall-estimate/v1",
+            "local_start_ns": "2100000000",
+            "local_end_ns": "2100083334",
+            "wall_epoch": "1",
+            "wall_run": "1",
+            "maximum_bracket_ns": "0",
+            "maximum_resolution_ns": "1",
+            "model_allowance_ns": "10000000",
+            "interpolation_rounding_ns": "2",
+            "capture_rounding_ns": "4",
+            "capture_uncertainty_ns": null,
+            "external_utc_accuracy_ns": null,
+            "overall_physical_accuracy_ns": null
+          },
+          "reasons": []
+        }
+      ]
+    }
+  },
+  "complete": {
+    "protocol_version": 4,
+    "type": "recording_alignment_complete",
+    "request_id": "alignment",
+    "completion": {
+      "source": {
+        "source_session_id": "41",
+        "recording_handle": "02020202020202020202020202020202",
+        "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "page_count": "1",
+      "coverage_status": "available",
+      "warnings": [
+        "local_wall_timestamp_estimate"
+      ],
+      "traversal_succeeded": true
+    }
+  }
+}

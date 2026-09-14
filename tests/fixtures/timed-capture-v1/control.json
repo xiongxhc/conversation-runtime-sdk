@@ -1,0 +1,6 @@
+{
+  "start": {"protocol_version":4,"type":"start_timed_voice_session","request_id":"timed-start","bridge_session_id":"bridge-independent","profile":"offline","response_mode":"external_gate"},
+  "credit": {"protocol_version":4,"type":"recording_alignment_credit","request_id":"alignment","consumed_page_index":"0"},
+  "cancel": {"protocol_version":4,"type":"cancel_recording_alignment","request_id":"alignment"},
+  "integerBounds": {"unsignedMax":"18446744073709551615","signedMin":"-9223372036854775808","signedMax":"9223372036854775807"}
+}

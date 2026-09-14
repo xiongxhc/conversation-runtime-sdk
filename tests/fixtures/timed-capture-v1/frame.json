@@ -1,0 +1,22 @@
+{
+  "schema": "timed-capture-v1",
+  "timingHex": "01010100000000000000000100000000000000070000000000000000000000020000000000000000000000000001770000005dc00000bb80000000003b9aca00000000003b9c0f8600000000000000040000000000000000",
+  "frameHex": "4d45443202020000006f00000000000000290100005dc0000101010100000000000000000100000000000000070000000000000000000000020000000000000000000000000001770000005dc00000bb80000000003b9aca00000000003b9c0f8600000000000000040000000000000000000000040000ff7f",
+  "expected": {
+    "sourceSessionId": "41",
+    "captureEpoch": "1",
+    "sequence": "7",
+    "outputStartSample": "0",
+    "sampleCount": 2,
+    "sourceStartNumerator": "0",
+    "sourceEndNumerator": "96000",
+    "sourceDenominator": 24000,
+    "sourceRateHz": 48000,
+    "hostStartNs": "1000000000",
+    "hostEndNs": "1000083334",
+    "roundingEnvelopeNs": "4",
+    "captureUncertaintyNs": null,
+    "quality": "nominal_frame_endpoint_interpolation",
+    "pcmHex": "0000ff7f"
+  }
+}

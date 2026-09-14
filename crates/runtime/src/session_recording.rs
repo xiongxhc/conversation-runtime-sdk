@@ -120,7 +120,6 @@ pub struct RecordingSettings {
 pub enum RecordingSinkFault {
     Write,
     Flush,
-    Sync,
 }
 
 impl RecordingSettings {
@@ -213,7 +212,6 @@ impl RecordingSink for FaultingRecordingSink {
     }
 
     fn sync_all(&mut self) -> std::io::Result<()> {
-        self.fail_once(RecordingSinkFault::Sync)?;
         self.file.sync_all()
     }
 }

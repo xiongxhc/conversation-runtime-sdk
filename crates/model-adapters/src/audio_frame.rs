@@ -80,7 +80,7 @@ pub struct AudioFrame {
     sequence: u64,
     format: PcmFormat,
     bytes: Vec<u8>,
-    capture_timing: Option<TimedCapture>,
+    capture_timing: Option<Box<TimedCapture>>,
 }
 
 impl AudioFrame {
@@ -148,12 +148,12 @@ impl AudioFrame {
                 "capture timing identity did not match frame",
             ));
         }
-        self.capture_timing = Some(timing);
+        self.capture_timing = Some(Box::new(timing));
         Ok(self)
     }
 
     pub fn capture_timing(&self) -> Option<&TimedCapture> {
-        self.capture_timing.as_ref()
+        self.capture_timing.as_deref()
     }
 
     pub fn next_sequence(&self) -> Result<u64, AdapterError> {

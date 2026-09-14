@@ -202,14 +202,14 @@ fn walk_alignment(
                     sample_rate_hz: rate,
                     gap_offset_ms: gap_ms.to_string(),
                     epoch: tracker.epoch.as_ref().map(epoch_view),
-                    provenance: timing.as_ref().map(frame_view),
+                    provenance: timing.as_ref().map(frame_view).map(Box::new),
                     capture_status: if assessment.mapped {
                         "available"
                     } else {
                         "capture_alignment_missing"
                     }
                     .into(),
-                    wall,
+                    wall: wall.map(Box::new),
                     reasons,
                 };
                 samples = end;

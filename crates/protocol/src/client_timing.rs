@@ -124,9 +124,9 @@ pub enum ClientAlignmentEntry {
         sample_rate_hz: u32,
         gap_offset_ms: String,
         epoch: Option<ClientCaptureEpoch>,
-        provenance: Option<ClientFrameProvenance>,
+        provenance: Option<Box<ClientFrameProvenance>>,
         capture_status: String,
-        wall: Option<ClientWallEstimate>,
+        wall: Option<Box<ClientWallEstimate>>,
         reasons: Vec<String>,
     },
     Discontinuity {

@@ -51,7 +51,7 @@ fn canonical_alignment_outputs_match_sdk_fixture_and_keep_legacy_bytes_opt_in() 
         sample_rate_hz: 24_000,
         gap_offset_ms: "0".into(),
         epoch: Some(epoch.clone()),
-        provenance: Some(ClientFrameProvenance {
+        provenance: Some(Box::new(ClientFrameProvenance {
             capture_epoch: "1".into(),
             sequence: "7".into(),
             output_start_sample: "0".into(),
@@ -67,10 +67,10 @@ fn canonical_alignment_outputs_match_sdk_fixture_and_keep_legacy_bytes_opt_in() 
                 rounding_envelope_ns: "4".into(),
                 capture_uncertainty_ns: None,
             }),
-        }),
+        })),
         capture_status: "available".into(),
         reasons: vec![],
-        wall: Some(ClientWallEstimate {
+        wall: Some(Box::new(ClientWallEstimate {
             quality: "local_wall_estimate",
             policy_id: "local-wall-estimate/v1",
             local_start_ns: "2100000000".into(),
@@ -85,7 +85,7 @@ fn canonical_alignment_outputs_match_sdk_fixture_and_keep_legacy_bytes_opt_in() 
             capture_uncertainty_ns: None,
             external_utc_accuracy_ns: None,
             overall_physical_accuracy_ns: None,
-        }),
+        })),
     };
     let page = ClientRecordingAlignmentPage {
         source: source.clone(),

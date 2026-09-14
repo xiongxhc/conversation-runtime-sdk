@@ -1,27 +1,31 @@
 //! Online-profile timing and fixture compatibility coverage.
 //!
-//! The production regression this catches is a control-plane decoder or public timing vocabulary
-//! that drops the capture/authorization milestones needed to correlate one external-gated online
-//! turn. The fixture is read as the literal wire bytes Meeting Agent consumes; no builder creates
-//! a look-alike payload here.
+//! The literal fixture protects the public decoder/timing contract. The same sample runner drives
+//! deterministic capture handles and the opt-in real adapter, including canonical lease validation,
+//! bounded PCM, continuous playback ACKs, flush ACKs, and capture-process cleanup.
 
+#[path = "support/latency_capture.rs"]
+mod latency_capture;
 mod support;
 
 use conversation_protocol::{
-    encode_gateway_message, ClientVoiceSessionEvent, GatewayMessage, SessionId, VoiceSessionEvent,
-    VoiceTimingMilestone,
+    encode_gateway_message, ClientMediaLeaseDescriptor, ClientVoiceSessionEvent, GatewayMessage,
+    SessionId, VoiceSessionEvent, VoiceTimingMilestone,
 };
+use latency_capture::{collect_pcm, CaptureFactory, OperatorCapture};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::process::{ChildStdin, ChildStdout, Command};
+use tokio::sync::{watch, Mutex};
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 
 use conversation_runtime_gateway::{FrameReader, FrameWriter};
-use support::{gateway_command, is_accepted, WireMessage};
+use support::{gateway_command, WireMessage};
 
 const REAL_PROVIDER_OPT_IN_ENV: &str = "GATEWAY_ONLINE_LATENCY_REAL_PROVIDER";
 const REAL_PROVIDER_CONFIG_ENV: &str = "GATEWAY_ONLINE_LATENCY_CONFIG";
@@ -224,35 +228,331 @@ fn real_provider_latency_configuration_rejects_too_few_samples() {
     );
 }
 
-#[tokio::test]
-async fn start_acceptance_lease_authenticates_and_drives_the_media_bridge() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = listener.local_addr().unwrap();
-    let accepted = WireMessage::from_payload(
-        format!(
-            r#"{{"protocol_version":3,"type":"command_accepted","request_id":"latency-start","media_lease":{{"session_id":"7","connect_endpoint":"tcp://{endpoint}","credential":"fixture-credential"}}}}"#
-        )
-        .into_bytes(),
-    );
-    let bridge_server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        assert_media_authentication(&mut stream, 7, b"fixture-credential").await;
-        assert_media_capture(&mut stream, 7, 1, b"\x00\x01\x02\x03").await;
-        write_media_playback(&mut stream, 7, 11, 3).await;
-        assert_media_playback_ack(&mut stream, 7, 11, 1).await;
-        write_media_flush(&mut stream, 7, 3).await;
-        assert_media_flush_ack(&mut stream, 7, 3).await;
-    });
+struct FakeCaptures(std::collections::VecDeque<latency_capture::FakeCapture>);
+impl CaptureFactory for FakeCaptures {
+    type Process = latency_capture::FakeCapture;
+    fn start(&mut self) -> HarnessResult<Self::Process> {
+        self.0.pop_front().ok_or("unexpected capture invocation")
+    }
+}
 
-    let mut bridge = start_media_bridge_from_correlated_acceptance(&accepted, "latency-start")
+#[tokio::test]
+async fn media_reader_accepts_clean_eof_at_a_packet_boundary() {
+    for (bytes, clean) in [(b"".as_slice(), true), (b"MED".as_slice(), false)] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        server.write_all(bytes).await.unwrap();
+        drop(server);
+        let (reader, writer) = client.into_split();
+        let bridge = MediaBridge {
+            writer: Arc::new(Mutex::new(writer)),
+            session_id: 7,
+            frame_cap: 8192,
+            next_sequence: 1,
+        };
+        let (progress, _observed) = watch::channel((0, 0));
+        assert_eq!(
+            bridge
+                .drain_playback(reader, progress, CancellationToken::new())
+                .await
+                .is_ok(),
+            clean,
+            "normal stop may close media before control acceptance, but partial packets must fail"
+        );
+    }
+}
+
+fn acceptance(endpoint: std::net::SocketAddr) -> serde_json::Value {
+    let expires = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 60_000;
+    serde_json::json!({
+        "protocol_version": 3, "type": "command_accepted", "request_id": "latency-start-0",
+        "media_lease": { "media_protocol_version": 1, "session_id": "7",
+            "connect_endpoint": format!("tcp://{endpoint}"), "credential": "fixture-credential",
+            "expires_at_ms": expires.to_string(), "reconnect_window_ms": "1000" }
+    })
+}
+
+async fn fixture_message<W: AsyncWrite + Unpin>(
+    writer: &mut FrameWriter<W>,
+    value: serde_json::Value,
+) {
+    writer
+        .write_frame(value.to_string().as_bytes())
         .await
-        .expect("the correlated start acceptance supplies the only media authority");
-    bridge.send_capture(1, 1_000, b"\x00\x01\x02\x03").await;
-    let playback = bridge.read_playback().await.unwrap();
-    bridge.acknowledge_playback(playback.sequence).await;
-    let generation = bridge.read_flush().await.unwrap();
-    bridge.acknowledge_flush(generation).await;
-    bridge_server.await.unwrap();
+        .unwrap();
+}
+
+async fn fixture_timing<W: AsyncWrite + Unpin>(
+    writer: &mut FrameWriter<W>,
+    milestone: &str,
+    elapsed_ms: u64,
+) {
+    fixture_message(
+        writer,
+        serde_json::json!({"protocol_version":3,"type":"voice_event",
+        "event":{"type":"voice_timing","session_id":"7","turn_id":null,
+            "milestone":milestone,"elapsed_ms":elapsed_ms}}),
+    )
+    .await;
+}
+
+// Removing chunking, exact lease authentication, any playback ACK, or flush ACK blocks this runner.
+// Playback 12 must be ACKed while the second capture's stdout is still conditionally pending.
+#[tokio::test]
+async fn shared_runner_authenticates_chunks_and_continuously_acknowledges_through_flush() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let accepted = acceptance(listener.local_addr().unwrap());
+    let pcm: Vec<u8> = (0..=255).cycle().take(32_768).collect();
+    let initial = latency_capture::FakeCapture::new(pcm.clone(), Some(true));
+    let mut interrupt = latency_capture::FakeCapture::new(vec![], None);
+    let (capture_stdout, mut capture_writer) = tokio::io::duplex(4096);
+    interrupt.output = Box::new(capture_stdout);
+    let initial_state = initial.state.clone();
+    let interrupt_state = interrupt.state.clone();
+    let completed_interrupt = interrupt_state.clone();
+    let mut captures = FakeCaptures([initial, interrupt].into());
+    let (client, server) = tokio::io::duplex(16_384);
+    let (client_read, client_write) = tokio::io::split(client);
+    let (server_read, server_write) = tokio::io::split(server);
+    let mut reader = FrameReader::new(client_read);
+    let mut writer = FrameWriter::new(client_write);
+    let fixture = async move {
+        let mut input = FrameReader::new(server_read);
+        let mut output = FrameWriter::new(server_write);
+        output
+            .write_frame(include_bytes!("fixtures/meeting-agent-online-v1.json"))
+            .await
+            .unwrap();
+        let start = wire_value(&read_live_message(&mut input).await.unwrap());
+        assert_eq!(start["request_id"], "latency-start-0");
+        assert_eq!(start["response_mode"], "external_gate");
+        fixture_message(&mut output, accepted).await;
+        fixture_message(
+            &mut output,
+            serde_json::json!({"protocol_version":3,"type":"voice_event",
+            "event":{"type":"voice_session_started","session_id":"7"}}),
+        )
+        .await;
+        let (mut media, _) = listener.accept().await.unwrap();
+        assert_media_authentication(&mut media, 7, b"fixture-credential").await;
+        for index in 0..4 {
+            assert_media_capture(
+                &mut media,
+                7,
+                index as u64 + 1,
+                &pcm[index * 8192..(index + 1) * 8192],
+            )
+            .await;
+        }
+        fixture_timing(&mut output, "audio_received", 10).await;
+        fixture_timing(&mut output, "transcript_final", 20).await;
+        fixture_message(
+            &mut output,
+            serde_json::json!({"protocol_version":3,"type":"voice_event",
+            "event":{"type":"voice_transcript_final","session_id":"7","turn_id":null,
+                "segment_id":"segment-1","text":"fixture"}}),
+        )
+        .await;
+        let authorization = wire_value(&read_live_message(&mut input).await.unwrap());
+        assert_eq!(authorization["type"], "authorize_voice_response");
+        assert_eq!(authorization["session_id"], "7");
+        assert_eq!(authorization["segment_id"], "segment-1");
+        for (milestone, elapsed) in [
+            ("response_authorized", 30),
+            ("first_text_delta", 50),
+            ("first_synthesis_request", 80),
+            ("first_playable_audio", 120),
+        ] {
+            fixture_timing(&mut output, milestone, elapsed).await;
+        }
+        for sequence in [11, 12] {
+            write_media_playback(&mut media, 7, sequence, 3).await;
+            assert_media_playback_ack(&mut media, 7, sequence, 1).await;
+        }
+        capture_writer.write_all(&pcm).await.unwrap();
+        completed_interrupt.lock().unwrap().complete = Some(true);
+        drop(capture_writer);
+        for index in 0..4 {
+            assert_media_capture(
+                &mut media,
+                7,
+                index as u64 + 5,
+                &pcm[index * 8192..(index + 1) * 8192],
+            )
+            .await;
+        }
+        // Playback continues after capture and before the flush request.
+        write_media_playback(&mut media, 7, 13, 3).await;
+        assert_media_playback_ack(&mut media, 7, 13, 1).await;
+        fixture_timing(&mut output, "barge_in_onset", 200).await;
+        write_media_flush(&mut media, 7, 3).await;
+        assert_media_flush_ack(&mut media, 7, 3).await;
+        fixture_timing(&mut output, "playback_flush_acknowledged", 250).await;
+        let stop = wire_value(&read_live_message(&mut input).await.unwrap());
+        assert_eq!(stop["type"], "stop_voice_session");
+        assert_eq!(stop["request_id"], "latency-stop-0");
+        fixture_message(
+            &mut output,
+            serde_json::json!({"protocol_version":3,
+            "type":"command_accepted","request_id":"latency-stop-0"}),
+        )
+        .await;
+        // Keep media alive until the runner cancels and closes its reader/writer.
+        let mut eof = [0];
+        assert_eq!(media.read(&mut eof).await.unwrap(), 0);
+    };
+    let (sample, ()) = timeout(Duration::from_secs(5), async {
+        tokio::join!(
+            run_latency_sample(&mut reader, &mut writer, &mut captures, 0, 8192),
+            fixture
+        )
+    })
+    .await
+    .expect("condition-driven sample stalled");
+    assert_eq!(sample.unwrap(), [10, 20, 30, 40, 50]);
+    assert!(captures.0.is_empty());
+    for state in [initial_state, interrupt_state] {
+        let state = state.lock().unwrap();
+        assert_eq!((state.terminated, state.reaped), (0, 1));
+    }
+}
+
+// Canonical shape/expiry and acceptance/session correlation are enforced by the shared runner.
+#[tokio::test]
+async fn shared_runner_rejects_invalid_or_mismatched_acceptance_before_capture() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let original = acceptance(listener.local_addr().unwrap());
+    for (field, value) in [
+        ("expires_at_ms", serde_json::json!("1")),
+        ("media_protocol_version", serde_json::json!(2)),
+        ("credential", serde_json::json!("short")),
+        ("session_id", serde_json::json!("0")),
+        ("reconnect_window_ms", serde_json::json!("0")),
+        (
+            "connect_endpoint",
+            serde_json::json!("tcp://192.0.2.1:9000"),
+        ),
+        ("request_id", serde_json::json!("unrelated-start")),
+        ("started_session", serde_json::json!("8")),
+        ("missing_field", serde_json::Value::Null),
+    ] {
+        let mut accepted = original.clone();
+        let mut started_session = "7";
+        match field {
+            "request_id" => accepted[field] = value,
+            "started_session" => started_session = "8",
+            "missing_field" => {
+                accepted["media_lease"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("media_protocol_version");
+            }
+            _ => accepted["media_lease"][field] = value,
+        }
+        let (client, server) = tokio::io::duplex(16_384);
+        let (client_read, client_write) = tokio::io::split(client);
+        let (_server_read, server_write) = tokio::io::split(server);
+        let mut output = FrameWriter::new(server_write);
+        output
+            .write_frame(include_bytes!("fixtures/meeting-agent-online-v1.json"))
+            .await
+            .unwrap();
+        fixture_message(&mut output, accepted).await;
+        fixture_message(
+            &mut output,
+            serde_json::json!({"protocol_version":3,"type":"voice_event",
+            "event":{"type":"voice_session_started","session_id":started_session}}),
+        )
+        .await;
+        drop(output);
+        let untouched = latency_capture::FakeCapture::new(vec![0; 32_768], Some(true));
+        let state = untouched.state.clone();
+        let mut captures = FakeCaptures([untouched].into());
+        let result = run_latency_sample(
+            &mut FrameReader::new(client_read),
+            &mut FrameWriter::new(client_write),
+            &mut captures,
+            0,
+            8192,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "invalid acceptance case {field} must fail closed"
+        );
+        assert_eq!(
+            captures.0.len(),
+            1,
+            "invalid lease must never start capture"
+        );
+        assert_eq!(state.lock().unwrap().reaped, 0);
+    }
+}
+
+#[tokio::test]
+async fn shared_runner_capture_failure_cleans_process_and_closes_media() {
+    for (pcm, complete, kills) in [
+        (vec![0; 32_768], None, 1),
+        (vec![0; MAX_CAPTURE_PCM_BYTES + 2], None, 1),
+        (vec![0], Some(true), 0),
+        (vec![], Some(true), 0),
+        (vec![0; 32_768], Some(false), 0),
+        (vec![0; 32_766], Some(true), 0),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (client, server) = tokio::io::duplex(16_384);
+        let (client_read, client_write) = tokio::io::split(client);
+        let (_server_read, server_write) = tokio::io::split(server);
+        let mut output = FrameWriter::new(server_write);
+        output
+            .write_frame(include_bytes!("fixtures/meeting-agent-online-v1.json"))
+            .await
+            .unwrap();
+        fixture_message(&mut output, acceptance(listener.local_addr().unwrap())).await;
+        fixture_message(
+            &mut output,
+            serde_json::json!({"protocol_version":3,"type":"voice_event",
+            "event":{"type":"voice_session_started","session_id":"7"}}),
+        )
+        .await;
+        let capture = latency_capture::FakeCapture::new(pcm, complete);
+        let state = capture.state.clone();
+        let mut captures = FakeCaptures([capture].into());
+        let result = timeout(
+            Duration::from_secs(5),
+            run_latency_sample(
+                &mut FrameReader::new(client_read),
+                &mut FrameWriter::new(client_write),
+                &mut captures,
+                0,
+                8192,
+            ),
+        )
+        .await
+        .expect("failed capture must cancel the media reader");
+        assert!(result.is_err());
+        assert!(captures.0.is_empty());
+        {
+            let state = state.lock().unwrap();
+            assert_eq!((state.terminated, state.reaped), (kills, 1));
+            assert!(state.complete.is_some());
+        }
+        let (mut media, _) = listener.accept().await.unwrap();
+        assert_media_authentication(&mut media, 7, b"fixture-credential").await;
+        let mut unexpected_pcm = [0];
+        assert_eq!(
+            media.read(&mut unexpected_pcm).await.unwrap(),
+            0,
+            "failed capture must close its media connection without submitting PCM"
+        );
+    }
 }
 
 /// This is deliberately ignored: it starts the compiled gateway with a private configuration
@@ -289,13 +589,13 @@ struct RealProviderLatencyConfiguration {
     samples: usize,
 }
 
-struct MediaBridge {
-    stream: TcpStream,
-    session_id: u64,
-}
+type HarnessResult<T> = Result<T, &'static str>;
 
-struct MediaPlayback {
-    sequence: u64,
+struct MediaBridge {
+    writer: Arc<Mutex<OwnedWriteHalf>>,
+    session_id: u64,
+    frame_cap: usize,
+    next_sequence: u64,
 }
 
 fn real_provider_latency_opt_in(value: Option<&str>) -> Result<(), &'static str> {
@@ -374,183 +674,183 @@ fn nearest_rank(values: &[u64], percentile: usize) -> u64 {
     values[rank - 1]
 }
 
-async fn media_bridge_from_start_acceptance(
-    accepted: &WireMessage,
-) -> Result<MediaBridge, &'static str> {
-    let value = wire_value(accepted);
-    if value.get("type").and_then(serde_json::Value::as_str) != Some("command_accepted") {
-        return Err("start acceptance must be a command acceptance");
-    }
-    let lease = value
-        .get("media_lease")
-        .and_then(serde_json::Value::as_object)
-        .ok_or("start acceptance must include a media lease")?;
-    let session_id = lease
-        .get("session_id")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value != 0)
-        .ok_or("media lease session identity was malformed")?;
-    let endpoint = lease
-        .get("connect_endpoint")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|value| value.strip_prefix("tcp://"))
-        .and_then(|value| value.parse().ok())
-        .filter(|endpoint: &std::net::SocketAddr| endpoint.ip().is_loopback())
-        .ok_or("media lease must name an exact loopback tcp endpoint")?;
-    let credential = lease
-        .get("credential")
-        .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.is_empty() && value.len() <= u8::MAX as usize)
-        .ok_or("media lease credential was malformed")?;
-    let mut stream = timeout(LIVE_FRAME_TIMEOUT, TcpStream::connect(endpoint))
-        .await
-        .map_err(|_| "media bridge did not connect within the live timeout")
-        .and_then(|result| result.map_err(|_| "media bridge connection failed"))?;
-    stream
-        .write_all(b"MED1\x01\x01")
-        .await
-        .map_err(|_| "media bridge authentication write failed")?;
-    stream
-        .write_all(&session_id.to_be_bytes())
-        .await
-        .map_err(|_| "media bridge authentication write failed")?;
-    stream
-        .write_u8(credential.len() as u8)
-        .await
-        .map_err(|_| "media bridge authentication write failed")?;
-    stream
-        .write_all(credential.as_bytes())
-        .await
-        .map_err(|_| "media bridge authentication write failed")?;
-    stream
-        .flush()
-        .await
-        .map_err(|_| "media bridge authentication write failed")?;
-    Ok(MediaBridge { stream, session_id })
-}
-
+/// Parse the complete wire shape, then use the production canonical validator.
 async fn start_media_bridge_from_correlated_acceptance(
     accepted: &WireMessage,
     request_id: &str,
-) -> Result<MediaBridge, &'static str> {
+    frame_cap: usize,
+) -> HarnessResult<(MediaBridge, OwnedReadHalf)> {
     if !is_accepted(accepted, request_id) {
         return Err("start media lease was not correlated to the start request");
     }
-    media_bridge_from_start_acceptance(accepted).await
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Lease {
+        media_protocol_version: u8,
+        session_id: String,
+        connect_endpoint: String,
+        credential: String,
+        expires_at_ms: String,
+        reconnect_window_ms: String,
+    }
+    let value = wire_value(accepted);
+    if value["protocol_version"] != 3 {
+        return Err("media acceptance requires protocol v3");
+    }
+    let lease: Lease = serde_json::from_value(value["media_lease"].clone())
+        .map_err(|_| "media lease shape was malformed")?;
+    let number = |value: &str| {
+        value
+            .parse::<u64>()
+            .map_err(|_| "media lease number was malformed")
+    };
+    let lease = ClientMediaLeaseDescriptor::new(
+        lease.media_protocol_version,
+        SessionId::new(number(&lease.session_id)?),
+        lease.connect_endpoint,
+        lease.credential,
+        number(&lease.expires_at_ms)?,
+        number(&lease.reconnect_window_ms)?,
+    )
+    .map_err(|_| "media lease was invalid or expired")?;
+    let endpoint = lease
+        .connect_endpoint()
+        .strip_prefix("tcp://")
+        .and_then(|value| value.parse().ok())
+        .filter(|endpoint: &std::net::SocketAddr| endpoint.ip().is_loopback())
+        .ok_or("media lease must name an exact loopback tcp endpoint")?;
+    let session_id = lease.session_id().get();
+    let stream = timeout(LIVE_FRAME_TIMEOUT, async {
+        let mut stream = TcpStream::connect(endpoint).await?;
+        stream.write_all(b"MED1\x01\x01").await?;
+        stream.write_all(&session_id.to_be_bytes()).await?;
+        stream.write_u8(lease.credential().len() as u8).await?;
+        stream.write_all(lease.credential().as_bytes()).await?;
+        stream.flush().await?;
+        Ok::<_, std::io::Error>(stream)
+    })
+    .await
+    .map_err(|_| "media authentication timed out")?
+    .map_err(|_| "media authentication failed")?;
+    let (reader, writer) = stream.into_split();
+    Ok((
+        MediaBridge {
+            writer: Arc::new(Mutex::new(writer)),
+            session_id,
+            frame_cap,
+            next_sequence: 1,
+        },
+        reader,
+    ))
 }
 
 impl MediaBridge {
-    async fn send_capture(&mut self, sequence: u64, captured_at_ms: u64, pcm: &[u8]) {
-        assert!(
-            !pcm.is_empty() && pcm.len() <= MAX_CAPTURE_PCM_BYTES && pcm.len().is_multiple_of(2),
-            "private capture helper must emit bounded signed-16 PCM"
-        );
-        let mut header = [0_u8; 42];
-        header[..7].copy_from_slice(b"MED1\x01\x02\x01");
-        header[7..15].copy_from_slice(&self.session_id.to_be_bytes());
-        header[15..23].copy_from_slice(&sequence.to_be_bytes());
-        header[23..31].copy_from_slice(&captured_at_ms.to_be_bytes());
-        header[31] = 1;
-        header[32..36].copy_from_slice(&16_000_u32.to_be_bytes());
-        header[36..38].copy_from_slice(&1_u16.to_be_bytes());
-        header[38..42].copy_from_slice(&(pcm.len() as u32).to_be_bytes());
-        self.stream
-            .write_all(&header)
+    async fn send_capture(&mut self, captured_at_ms: u64, pcm: &[u8]) -> HarnessResult<()> {
+        for (index, pcm) in pcm.chunks(self.frame_cap).enumerate() {
+            let mut header = [0_u8; 42];
+            header[..7].copy_from_slice(b"MED1\x01\x02\x01");
+            header[7..15].copy_from_slice(&self.session_id.to_be_bytes());
+            header[15..23].copy_from_slice(&self.next_sequence.to_be_bytes());
+            let timestamp = captured_at_ms + (index * self.frame_cap) as u64 / 32;
+            header[23..31].copy_from_slice(&timestamp.to_be_bytes());
+            header[31] = 1;
+            header[32..36].copy_from_slice(&16_000_u32.to_be_bytes());
+            header[36..38].copy_from_slice(&1_u16.to_be_bytes());
+            header[38..42].copy_from_slice(&(pcm.len() as u32).to_be_bytes());
+            timeout(LIVE_FRAME_TIMEOUT, async {
+                let mut writer = self.writer.lock().await;
+                writer.write_all(&header).await?;
+                writer.write_all(pcm).await?;
+                writer.flush().await
+            })
             .await
-            .unwrap_or_else(|_| panic!("media capture write failed"));
-        self.stream
-            .write_all(pcm)
-            .await
-            .unwrap_or_else(|_| panic!("media capture write failed"));
-        self.stream
-            .flush()
-            .await
-            .unwrap_or_else(|_| panic!("media capture write failed"));
-    }
-
-    async fn read_playback(&mut self) -> Result<MediaPlayback, &'static str> {
-        let mut header = [0_u8; 66];
-        timeout(LIVE_FRAME_TIMEOUT, self.stream.read_exact(&mut header))
-            .await
-            .map_err(|_| "media playback did not arrive within the live timeout")
-            .and_then(|result| result.map_err(|_| "media playback read failed"))?;
-        if header[..7] != *b"MED1\x01\x02\x02"
-            || u64::from_be_bytes(header[7..15].try_into().unwrap()) != self.session_id
-            || header[55] != 1
-            || u32::from_be_bytes(header[56..60].try_into().unwrap()) != 16_000
-            || u16::from_be_bytes(header[60..62].try_into().unwrap()) != 1
-        {
-            return Err("media playback frame was malformed");
+            .map_err(|_| "media capture timed out")?
+            .map_err(|_| "media capture write failed")?;
+            self.next_sequence += 1;
         }
-        let payload_length = u32::from_be_bytes(header[62..66].try_into().unwrap()) as usize;
-        if payload_length == 0 || payload_length > MAX_CAPTURE_PCM_BYTES {
-            return Err("media playback frame exceeded its byte bound");
+        Ok(())
+    }
+
+    /// One reader owns partial packets for the entire sample. Control/capture never cancel it.
+    async fn drain_playback(
+        &self,
+        mut reader: OwnedReadHalf,
+        progress: watch::Sender<(usize, usize)>,
+        stop: CancellationToken,
+    ) -> HarnessResult<()> {
+        let mut counts = (0, 0);
+        loop {
+            let packet = async {
+                let mut prefix = [0; 6];
+                if reader.read(&mut prefix[..1]).await? == 0 {
+                    return Ok(None);
+                }
+                reader.read_exact(&mut prefix[1..]).await?;
+                if prefix[..5] != *b"MED1\x01" {
+                    return Err(std::io::ErrorKind::InvalidData.into());
+                }
+                let (kind, identity, accepted) = match prefix[5] {
+                    2 => {
+                        let mut header = [0; 60];
+                        reader.read_exact(&mut header).await?;
+                        let length =
+                            u32::from_be_bytes(header[56..60].try_into().unwrap()) as usize;
+                        if header[0] != 2
+                            || header[49] != 1
+                            || u32::from_be_bytes(header[50..54].try_into().unwrap()) != 16_000
+                            || u16::from_be_bytes(header[54..56].try_into().unwrap()) != 1
+                            || length == 0
+                            || !length.is_multiple_of(2)
+                            || length > self.frame_cap
+                            || u64::from_be_bytes(header[1..9].try_into().unwrap())
+                                != self.session_id
+                        {
+                            return Err(std::io::ErrorKind::InvalidData.into());
+                        }
+                        let mut pcm = vec![0; length];
+                        reader.read_exact(&mut pcm).await?;
+                        (
+                            3,
+                            u64::from_be_bytes(header[9..17].try_into().unwrap()),
+                            true,
+                        )
+                    }
+                    4 => {
+                        let mut header = [0; 16];
+                        reader.read_exact(&mut header).await?;
+                        if u64::from_be_bytes(header[..8].try_into().unwrap()) != self.session_id {
+                            return Err(std::io::ErrorKind::InvalidData.into());
+                        }
+                        (
+                            5,
+                            u64::from_be_bytes(header[8..16].try_into().unwrap()),
+                            false,
+                        )
+                    }
+                    _ => return Err(std::io::ErrorKind::InvalidData.into()),
+                };
+                let mut writer = self.writer.lock().await;
+                writer.write_all(b"MED1\x01").await?;
+                writer.write_u8(kind).await?;
+                writer.write_all(&self.session_id.to_be_bytes()).await?;
+                writer.write_all(&identity.to_be_bytes()).await?;
+                if accepted {
+                    writer.write_u8(1).await?;
+                }
+                writer.flush().await?;
+                Ok::<_, std::io::Error>(Some(accepted))
+            };
+            tokio::select! {
+                biased;
+                _ = stop.cancelled() => return Ok(()),
+                result = timeout(LIVE_FRAME_TIMEOUT, packet) => {
+                    let Some(accepted) = result.map_err(|_| "media playback timed out")?
+                        .map_err(|_| "media playback or acknowledgement failed")? else { return Ok(()); };
+                    if accepted { counts.0 += 1; } else { counts.1 += 1; }
+                    progress.send_replace(counts);
+                }
+            }
         }
-        let mut payload = vec![0_u8; payload_length];
-        timeout(LIVE_FRAME_TIMEOUT, self.stream.read_exact(&mut payload))
-            .await
-            .map_err(|_| "media playback payload did not arrive within the live timeout")
-            .and_then(|result| result.map_err(|_| "media playback payload read failed"))?;
-        Ok(MediaPlayback {
-            sequence: u64::from_be_bytes(header[15..23].try_into().unwrap()),
-        })
-    }
-
-    async fn acknowledge_playback(&mut self, sequence: u64) {
-        self.stream
-            .write_all(b"MED1\x01\x03")
-            .await
-            .unwrap_or_else(|_| panic!("media playback acknowledgement write failed"));
-        self.stream
-            .write_all(&self.session_id.to_be_bytes())
-            .await
-            .unwrap_or_else(|_| panic!("media playback acknowledgement write failed"));
-        self.stream
-            .write_all(&sequence.to_be_bytes())
-            .await
-            .unwrap_or_else(|_| panic!("media playback acknowledgement write failed"));
-        self.stream
-            .write_u8(1)
-            .await
-            .unwrap_or_else(|_| panic!("media playback acknowledgement write failed"));
-        self.stream
-            .flush()
-            .await
-            .unwrap_or_else(|_| panic!("media playback acknowledgement write failed"));
-    }
-
-    async fn read_flush(&mut self) -> Result<u64, &'static str> {
-        let mut request = [0_u8; 22];
-        timeout(LIVE_FRAME_TIMEOUT, self.stream.read_exact(&mut request))
-            .await
-            .map_err(|_| "media flush did not arrive within the live timeout")
-            .and_then(|result| result.map_err(|_| "media flush read failed"))?;
-        if request[..6] != *b"MED1\x01\x04"
-            || u64::from_be_bytes(request[6..14].try_into().unwrap()) != self.session_id
-        {
-            return Err("media flush request was malformed");
-        }
-        Ok(u64::from_be_bytes(request[14..22].try_into().unwrap()))
-    }
-
-    async fn acknowledge_flush(&mut self, generation: u64) {
-        self.stream
-            .write_all(b"MED1\x01\x05")
-            .await
-            .unwrap_or_else(|_| panic!("media flush acknowledgement write failed"));
-        self.stream
-            .write_all(&self.session_id.to_be_bytes())
-            .await
-            .unwrap_or_else(|_| panic!("media flush acknowledgement write failed"));
-        self.stream
-            .write_all(&generation.to_be_bytes())
-            .await
-            .unwrap_or_else(|_| panic!("media flush acknowledgement write failed"));
-        self.stream
-            .flush()
-            .await
-            .unwrap_or_else(|_| panic!("media flush acknowledgement write failed"));
     }
 }
 
@@ -559,7 +859,18 @@ async fn run_real_provider_latency_sample(
     capture_command: &Path,
     sample: usize,
 ) -> [u64; 5] {
+    let config: toml::Value = std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|contents| toml::from_str(&contents).ok())
+        .expect("private latency config must be readable TOML");
+    let frame_cap = config
+        .get("media")
+        .and_then(|media| media.get("max_payload_bytes"))
+        .and_then(toml::Value::as_integer)
+        .and_then(|value| usize::try_from(value).ok())
+        .expect("private latency config must set a media payload bound");
     let mut child = gateway_command(config_path)
+        .kill_on_drop(true)
         .spawn()
         .unwrap_or_else(|_| panic!("failed to spawn the compiled gateway"));
     let mut writer = FrameWriter::new(child.stdin.take().expect("gateway stdin"));
@@ -568,342 +879,234 @@ async fn run_real_provider_latency_sample(
     let stderr_drain = tokio::spawn(async move {
         let _ = tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await;
     });
-
-    assert_real_provider_ready(&read_live_message(&mut reader).await);
-    write_live_message(
+    let result = run_latency_sample(
+        &mut reader,
         &mut writer,
-        &format!(
-            r#"{{"protocol_version":3,"type":"start_voice_session","request_id":"latency-start-{sample}","response_mode":"external_gate"}}"#
-        ),
+        &mut OperatorCapture(capture_command.to_owned()),
+        sample,
+        frame_cap,
     )
     .await;
-    let (session_id, mut bridge) =
-        wait_for_start_acceptance_and_media_bridge(&mut reader, &format!("latency-start-{sample}"))
-            .await;
-
-    let initial_capture = capture_operator_pcm(capture_command).await;
-    bridge.send_capture(1, 1_000, &initial_capture).await;
-    let (audio_received, transcript_final, segment_id) =
-        wait_for_audio_and_final(&mut reader).await;
-    write_live_message(
-        &mut writer,
-        &format!(
-            r#"{{"protocol_version":3,"type":"authorize_voice_response","request_id":"latency-authorize-{sample}","session_id":"{session_id}","segment_id":"{segment_id}","context_exchanges":[]}}"#
-        ),
-    )
-    .await;
-
-    let authorized = wait_for_timing(&mut reader, "response_authorized").await;
-    let first_text = wait_for_timing(&mut reader, "first_text_delta").await;
-    let first_synthesis = wait_for_timing(&mut reader, "first_synthesis_request").await;
-    let first_playable = wait_for_timing_and_ack_playback(&mut reader, &mut bridge).await;
-    let interrupt_capture = capture_operator_pcm(capture_command).await;
-    bridge.send_capture(2, 2_000, &interrupt_capture).await;
-    let (barge_in, flush_ack) = wait_for_barge_in_and_ack_flush(&mut reader, &mut bridge).await;
-
-    write_live_message(
-        &mut writer,
-        &format!(
-            r#"{{"protocol_version":3,"type":"stop_voice_session","request_id":"latency-stop-{sample}"}}"#
-        ),
-    )
-    .await;
-    wait_for_accepted(&mut reader, &format!("latency-stop-{sample}")).await;
     drop(writer);
-    drain_and_reap_live_gateway(child, reader, stderr_drain).await;
-
-    [
-        transcript_final - audio_received,
-        first_text - authorized,
-        first_synthesis - first_text,
-        first_playable - first_synthesis,
-        flush_ack - barge_in,
-    ]
+    let cleanup = timeout(LIVE_FRAME_TIMEOUT, async {
+        while reader
+            .read_frame()
+            .await
+            .map_err(|_| "gateway drain failed")?
+            .is_some()
+        {}
+        child.wait().await.map_err(|_| "gateway reap failed")
+    })
+    .await;
+    let cleaned = matches!(cleanup, Ok(Ok(status)) if status.success());
+    if !cleaned {
+        let _ = child.start_kill();
+        let _ = timeout(Duration::from_secs(5), child.wait()).await;
+    }
+    stderr_drain.abort();
+    let _ = stderr_drain.await;
+    assert!(cleaned, "gateway cleanup failed");
+    result.unwrap_or_else(|message| panic!("{message}"))
 }
 
-fn assert_real_provider_ready(message: &WireMessage) {
-    let value = wire_value(message);
-    let status = value
-        .get("status")
-        .and_then(serde_json::Value::as_object)
-        .expect("gateway ready message must include status");
-    let remote_component = status
-        .get("components")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|components| {
-            components.iter().any(|component| {
-                component
-                    .get("execution_location")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("remote")
-            })
-        });
-    assert!(
-        value.get("type").and_then(serde_json::Value::as_str) == Some("ready")
-            && status.get("profile").and_then(serde_json::Value::as_str) == Some("online")
-            && status
-                .get("privacy_mode")
-                .and_then(serde_json::Value::as_str)
-                == Some("cloud")
-            && status
-                .get("language_location")
-                .and_then(serde_json::Value::as_str)
-                == Some("remote")
-            && remote_component,
-        "private config must start an explicit online cloud remote gateway"
-    );
-}
-
-async fn wait_for_start_acceptance_and_media_bridge(
-    reader: &mut FrameReader<ChildStdout>,
-    request_id: &str,
-) -> (String, MediaBridge) {
-    let mut media_bridge = None;
-    loop {
-        let message = read_live_message(reader).await;
-        if is_accepted(&message, request_id) {
-            media_bridge = Some(
-                start_media_bridge_from_correlated_acceptance(&message, request_id)
-                    .await
-                    .unwrap_or_else(|message| panic!("{message}")),
+/// Both the opt-in command adapter and deterministic capture factory enter here.
+async fn run_latency_sample<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut FrameReader<R>,
+    writer: &mut FrameWriter<W>,
+    capture: &mut impl CaptureFactory,
+    sample: usize,
+    frame_cap: usize,
+) -> HarnessResult<[u64; 5]> {
+    if !(2..=MAX_CAPTURE_PCM_BYTES).contains(&frame_cap) {
+        return Err("media frame bound was invalid");
+    }
+    let ready = wire_value(&read_live_message(reader).await?);
+    let status = &ready["status"];
+    if ready["type"] != "ready"
+        || status["profile"] != "online"
+        || status["privacy_mode"] != "cloud"
+        || status["language_location"] != "remote"
+        || !status["components"].as_array().is_some_and(|components| {
+            components
+                .iter()
+                .any(|component| component["execution_location"] == "remote")
+        })
+    {
+        return Err("private config must start an explicit online cloud remote gateway");
+    }
+    let start_request = format!("latency-start-{sample}");
+    write_live_message(writer, &format!(
+        r#"{{"protocol_version":3,"type":"start_voice_session","request_id":"{start_request}","response_mode":"external_gate"}}"#
+    )).await?;
+    let mut media = None;
+    let (mut bridge, media_reader) = loop {
+        let message = read_live_message(reader).await?;
+        if is_accepted(&message, &start_request) {
+            media = Some(
+                start_media_bridge_from_correlated_acceptance(
+                    &message,
+                    &start_request,
+                    frame_cap & !1,
+                )
+                .await?,
             );
         }
         let value = wire_value(&message);
-        let event = value.get("event").and_then(serde_json::Value::as_object);
-        if event.and_then(|event| event.get("type").and_then(serde_json::Value::as_str))
-            == Some("voice_session_started")
-        {
-            let session_id = event
-                .and_then(|event| event.get("session_id"))
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-                .expect("voice session start must include a session identity");
-            let bridge = media_bridge
-                .expect("correlated start acceptance must provide the media lease before use");
-            assert_eq!(bridge.session_id.to_string(), session_id);
-            return (session_id, bridge);
+        if value["event"]["type"] == "voice_session_started" {
+            let (bridge, media_reader) =
+                media.ok_or("start acceptance omitted correlated media lease")?;
+            let expected_session = bridge.session_id.to_string();
+            if value["event"]["session_id"].as_str() != Some(expected_session.as_str()) {
+                return Err("started session did not match media lease");
+            }
+            break (bridge, media_reader);
         }
-    }
+    };
+    let session_id = bridge.session_id;
+    let stop = CancellationToken::new();
+    let (progress, mut observed) = watch::channel((0, 0));
+    // The reader and ACK writer run while any control wait or capture process is pending.
+    let drain_bridge = MediaBridge {
+        writer: bridge.writer.clone(),
+        session_id,
+        frame_cap: bridge.frame_cap,
+        next_sequence: 1,
+    };
+    let drain = drain_bridge.drain_playback(media_reader, progress, stop.clone());
+    let control = async {
+        let result = async {
+            let initial = collect_sample_capture(capture).await?;
+            bridge.send_capture(1_000, &initial).await?;
+            let (audio, final_transcript, segment_id) = wait_for_audio_and_final(reader).await?;
+            write_live_message(writer, &format!(
+                r#"{{"protocol_version":3,"type":"authorize_voice_response","request_id":"latency-authorize-{sample}","session_id":"{session_id}","segment_id":"{segment_id}","context_exchanges":[]}}"#
+            )).await?;
+            let authorized = wait_for_timing(reader, "response_authorized").await?;
+            let text = wait_for_timing(reader, "first_text_delta").await?;
+            let synthesis = wait_for_timing(reader, "first_synthesis_request").await?;
+            let playable = wait_for_timing(reader, "first_playable_audio").await?;
+            wait_for_media_progress(&mut observed, false).await?;
+            let interrupt = collect_sample_capture(capture).await?;
+            bridge.send_capture(1_000 + initial.len() as u64 / 32, &interrupt).await?;
+            let barge = wait_for_timing(reader, "barge_in_onset").await?;
+            let flush = wait_for_timing(reader, "playback_flush_acknowledged").await?;
+            wait_for_media_progress(&mut observed, true).await?;
+            let stop_request = format!("latency-stop-{sample}");
+            write_live_message(writer, &format!(
+                r#"{{"protocol_version":3,"type":"stop_voice_session","request_id":"{stop_request}"}}"#
+            )).await?;
+            while !is_accepted(&read_live_message(reader).await?, &stop_request) {}
+            let pairs: [(u64,u64);5] = [(final_transcript, audio), (text, authorized),
+                (synthesis, text), (playable, synthesis), (flush, barge)];
+            let mut intervals = [0;5];
+            for (index, (end, start)) in pairs.into_iter().enumerate() {
+                intervals[index] = end.checked_sub(start).ok_or("timing milestones were out of order")?;
+            }
+            Ok(intervals)
+        }.await;
+        stop.cancel();
+        result
+    };
+    let (sample, drained) = tokio::join!(control, drain);
+    drained?;
+    sample
 }
 
-async fn wait_for_timing_and_ack_playback(
-    reader: &mut FrameReader<ChildStdout>,
-    bridge: &mut MediaBridge,
-) -> u64 {
-    let mut first_playable = None;
-    let mut playback_acknowledged = false;
-    while first_playable.is_none() || !playback_acknowledged {
-        tokio::select! {
-            message = read_live_message(reader) => {
-                let value = wire_value(&message);
-                let Some(event) = value.get("event").and_then(serde_json::Value::as_object) else {
-                    continue;
-                };
-                if event.get("type").and_then(serde_json::Value::as_str) == Some("voice_timing")
-                    && event.get("milestone").and_then(serde_json::Value::as_str)
-                        == Some("first_playable_audio")
-                {
-                    first_playable = Some(timing_elapsed(event));
-                }
-            }
-            playback = bridge.read_playback() => {
-                let playback = playback.unwrap_or_else(|message| panic!("{message}"));
-                bridge.acknowledge_playback(playback.sequence).await;
-                playback_acknowledged = true;
-            }
-        }
+async fn collect_sample_capture(capture: &mut impl CaptureFactory) -> HarnessResult<Vec<u8>> {
+    let mut process = capture.start()?;
+    let pcm = collect_pcm(&mut process, LIVE_FRAME_TIMEOUT).await?;
+    if pcm.len() < 32_768 {
+        return Err("capture must contain at least 32 KiB for online recognition");
     }
-    first_playable.expect("first playable timing was observed")
+    Ok(pcm)
 }
 
-async fn wait_for_barge_in_and_ack_flush(
-    reader: &mut FrameReader<ChildStdout>,
-    bridge: &mut MediaBridge,
-) -> (u64, u64) {
-    let mut barge_in = None;
-    let mut flush_acknowledged = false;
-    let mut flush_ack = None;
-    while barge_in.is_none() || !flush_acknowledged || flush_ack.is_none() {
-        tokio::select! {
-            message = read_live_message(reader) => {
-                let value = wire_value(&message);
-                let Some(event) = value.get("event").and_then(serde_json::Value::as_object) else {
-                    continue;
-                };
-                if event.get("type").and_then(serde_json::Value::as_str) == Some("voice_timing") {
-                    match event.get("milestone").and_then(serde_json::Value::as_str) {
-                        Some("barge_in_onset") => barge_in = Some(timing_elapsed(event)),
-                        Some("playback_flush_acknowledged") => flush_ack = Some(timing_elapsed(event)),
-                        _ => {}
-                    }
-                }
+async fn wait_for_media_progress(
+    progress: &mut watch::Receiver<(usize, usize)>,
+    flush: bool,
+) -> HarnessResult<()> {
+    timeout(LIVE_FRAME_TIMEOUT, async {
+        loop {
+            let counts = *progress.borrow_and_update();
+            if if flush { counts.1 > 0 } else { counts.0 > 0 } {
+                return Ok(());
             }
-            generation = bridge.read_flush() => {
-                let generation = generation.unwrap_or_else(|message| panic!("{message}"));
-                bridge.acknowledge_flush(generation).await;
-                flush_acknowledged = true;
-            }
+            progress
+                .changed()
+                .await
+                .map_err(|_| "media reader ended before acknowledgement")?;
         }
-    }
-    (
-        barge_in.expect("barge-in timing was observed"),
-        flush_ack.expect("flush acknowledgement timing was observed"),
-    )
+    })
+    .await
+    .map_err(|_| "media acknowledgement timed out")?
 }
 
-async fn wait_for_audio_and_final(reader: &mut FrameReader<ChildStdout>) -> (u64, u64, String) {
-    let mut audio_received = None;
-    let mut transcript_final = None;
-    let mut segment_id = None;
+async fn wait_for_audio_and_final<R: AsyncRead + Unpin>(
+    reader: &mut FrameReader<R>,
+) -> HarnessResult<(u64, u64, String)> {
+    let (mut audio, mut final_time, mut segment) = (None, None, None);
     loop {
-        let message = read_live_message(reader).await;
-        let value = wire_value(&message);
-        let Some(event) = value.get("event").and_then(serde_json::Value::as_object) else {
-            continue;
-        };
-        match event.get("type").and_then(serde_json::Value::as_str) {
-            Some("voice_timing")
-                if event.get("milestone").and_then(serde_json::Value::as_str)
-                    == Some("audio_received") =>
-            {
-                audio_received = Some(timing_elapsed(event));
+        let value = wire_value(&read_live_message(reader).await?);
+        let event = &value["event"];
+        match event["type"].as_str() {
+            Some("voice_timing") if event["milestone"] == "audio_received" => {
+                audio = event["elapsed_ms"].as_u64()
             }
-            Some("voice_timing")
-                if event.get("milestone").and_then(serde_json::Value::as_str)
-                    == Some("transcript_final") =>
-            {
-                transcript_final = Some(timing_elapsed(event));
+            Some("voice_timing") if event["milestone"] == "transcript_final" => {
+                final_time = event["elapsed_ms"].as_u64()
             }
             Some("voice_transcript_final") => {
-                segment_id = event
-                    .get("segment_id")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned);
+                segment = event["segment_id"].as_str().map(str::to_owned)
             }
             _ => {}
         }
-        if let (Some(audio_received), Some(transcript_final), Some(segment_id)) =
-            (audio_received, transcript_final, segment_id.as_ref())
+        if let (Some(audio), Some(final_time), Some(segment)) =
+            (audio, final_time, segment.as_ref())
         {
-            return (audio_received, transcript_final, segment_id.clone());
+            return Ok((audio, final_time, segment.clone()));
         }
     }
 }
 
-async fn wait_for_timing(reader: &mut FrameReader<ChildStdout>, milestone: &str) -> u64 {
+async fn wait_for_timing<R: AsyncRead + Unpin>(
+    reader: &mut FrameReader<R>,
+    milestone: &str,
+) -> HarnessResult<u64> {
     loop {
-        let message = read_live_message(reader).await;
-        let value = wire_value(&message);
-        let Some(event) = value.get("event").and_then(serde_json::Value::as_object) else {
-            continue;
-        };
-        if event.get("type").and_then(serde_json::Value::as_str) == Some("voice_timing")
-            && event.get("milestone").and_then(serde_json::Value::as_str) == Some(milestone)
-        {
-            return timing_elapsed(event);
+        let value = wire_value(&read_live_message(reader).await?);
+        let event = &value["event"];
+        if event["type"] == "voice_timing" && event["milestone"] == milestone {
+            return event["elapsed_ms"]
+                .as_u64()
+                .ok_or("timing milliseconds were malformed");
         }
     }
 }
 
-async fn wait_for_accepted(reader: &mut FrameReader<ChildStdout>, request_id: &str) {
-    loop {
-        let message = read_live_message(reader).await;
-        if is_accepted(&message, request_id) {
-            return;
-        }
-    }
-}
-
-async fn read_live_message(reader: &mut FrameReader<ChildStdout>) -> WireMessage {
+async fn read_live_message<R: AsyncRead + Unpin>(
+    reader: &mut FrameReader<R>,
+) -> HarnessResult<WireMessage> {
     let payload = timeout(LIVE_FRAME_TIMEOUT, reader.read_frame())
         .await
-        .unwrap_or_else(|_| panic!("gateway did not produce a frame within the live timeout"))
-        .unwrap_or_else(|_| panic!("gateway frame read failed"))
-        .unwrap_or_else(|| panic!("gateway stdout closed before the expected frame"));
-    WireMessage::from_payload(payload)
+        .map_err(|_| "gateway frame timed out")?
+        .map_err(|_| "gateway frame read failed")?
+        .ok_or("gateway stdout closed before expected frame")?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&payload).map_err(|_| "gateway frame was not valid JSON")?;
+    if !value["type"].is_string() {
+        return Err("gateway message type was missing");
+    }
+    Ok(WireMessage::from_payload(value.to_string().into_bytes()))
 }
 
-async fn write_live_message(writer: &mut FrameWriter<ChildStdin>, message: &str) {
-    writer
-        .write_frame(message.as_bytes())
+async fn write_live_message<W: AsyncWrite + Unpin>(
+    writer: &mut FrameWriter<W>,
+    message: &str,
+) -> HarnessResult<()> {
+    timeout(LIVE_FRAME_TIMEOUT, writer.write_frame(message.as_bytes()))
         .await
-        .unwrap_or_else(|_| panic!("gateway frame write failed"));
-}
-
-async fn drain_and_reap_live_gateway(
-    mut child: tokio::process::Child,
-    mut reader: FrameReader<ChildStdout>,
-    stderr_drain: tokio::task::JoinHandle<()>,
-) {
-    while timeout(LIVE_FRAME_TIMEOUT, reader.read_frame())
-        .await
-        .unwrap_or_else(|_| panic!("gateway did not close stdout within the live timeout"))
-        .unwrap_or_else(|_| panic!("gateway frame read failed while draining"))
-        .is_some()
-    {}
-    let status = timeout(LIVE_FRAME_TIMEOUT, child.wait())
-        .await
-        .unwrap_or_else(|_| panic!("gateway did not exit within the live timeout"))
-        .unwrap_or_else(|_| panic!("failed to wait for the gateway"));
-    let _ = stderr_drain.await;
-    assert!(status.success(), "gateway exited unsuccessfully");
-}
-
-async fn capture_operator_pcm(command: &Path) -> Vec<u8> {
-    let mut child = Command::new(command)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap_or_else(|_| panic!("private capture helper did not start"));
-    let mut stdout = child
-        .stdout
-        .take()
-        .expect("private capture helper stdout was not available");
-    let mut pcm = Vec::new();
-    let capture = timeout(LIVE_FRAME_TIMEOUT, async {
-        let mut buffer = [0_u8; 8_192];
-        loop {
-            let read = stdout
-                .read(&mut buffer)
-                .await
-                .map_err(|_| "private capture helper output could not be read")?;
-            if read == 0 {
-                return Ok(pcm);
-            }
-            if pcm.len() + read > MAX_CAPTURE_PCM_BYTES {
-                return Err("private capture helper output exceeded its byte bound");
-            }
-            pcm.extend_from_slice(&buffer[..read]);
-        }
-    })
-    .await;
-    let pcm = match capture {
-        Ok(Ok(pcm)) => pcm,
-        Ok(Err(message)) => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            panic!("{message}");
-        }
-        Err(_) => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            panic!("private capture helper did not finish within the live timeout");
-        }
-    };
-    let status = child
-        .wait()
-        .await
-        .unwrap_or_else(|_| panic!("private capture helper did not exit"));
-    assert!(
-        status.success(),
-        "private capture helper exited unsuccessfully"
-    );
-    assert!(
-        !pcm.is_empty() && pcm.len().is_multiple_of(2),
-        "private capture helper must emit bounded signed-16 PCM"
-    );
-    pcm
+        .map_err(|_| "gateway frame write timed out")?
+        .map_err(|_| "gateway frame write failed")
 }
 
 async fn assert_media_authentication(stream: &mut TcpStream, session_id: u64, credential: &[u8]) {
@@ -936,6 +1139,11 @@ async fn assert_media_capture(
     assert_eq!(
         u64::from_be_bytes(header[15..23].try_into().unwrap()),
         sequence
+    );
+    assert_eq!(
+        u64::from_be_bytes(header[23..31].try_into().unwrap()),
+        1_000 + (sequence - 1) * 256,
+        "8 KiB of mono 16 kHz S16 PCM spans 256 ms"
     );
     assert_eq!(header[31], 1);
     assert_eq!(
@@ -1021,9 +1229,7 @@ fn wire_value(message: &WireMessage) -> serde_json::Value {
         .unwrap_or_else(|_| panic!("gateway produced invalid wire JSON"))
 }
 
-fn timing_elapsed(event: &serde_json::Map<String, serde_json::Value>) -> u64 {
-    event
-        .get("elapsed_ms")
-        .and_then(serde_json::Value::as_u64)
-        .expect("voice timing must include a non-negative elapsed millisecond value")
+fn is_accepted(message: &WireMessage, request_id: &str) -> bool {
+    let value = wire_value(message);
+    value["type"] == "command_accepted" && value["request_id"] == request_id
 }

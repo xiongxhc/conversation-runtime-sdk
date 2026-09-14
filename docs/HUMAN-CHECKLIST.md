@@ -42,10 +42,17 @@ cargo test -p conversation-runtime-gateway --test online_latency -- --ignored --
 
 The private configuration must report the explicit `online`/`cloud`/remote profile and advertise
 a loopback TCP media endpoint. `GATEWAY_ONLINE_LATENCY_CAPTURE_COMMAND` is a human-gated private
-helper: every invocation must write one non-empty, at-most-1,048,576-byte raw signed-16-bit
+helper: every invocation must write at least 32,768 and at most 1,048,576 bytes of raw signed-16-bit
 little-endian mono 16 kHz PCM capture to stdout, then exit successfully. The harness invokes it
 once for initial speech and once for barge-in speech; it passes no lease credential, discards its
-stderr, and never prints or persists its path or PCM. The output contains only count, p50, p95,
+stderr, and never prints or persists its path or PCM. The helper receives a cleared environment
+with only `LC_ALL=C`; use an absolute executable with all device/private configuration supplied
+by that executable, and do not rely on inherited `PATH`, `HOME`, or provider credentials.
+Capture and reap are bounded. EOF with a still-live helper fails closed and terminates it;
+the helper must exit when its finite capture completes, without a lingering stdout-closed process.
+The shared runner splits capture using the private configuration's `media.max_payload_bytes`
+(rounded down to an even byte count), continuously acknowledges playback, and waits for the
+actual flush acknowledgment before stopping the sample. The output contains only count, p50, p95,
 and max for the internal handoffs. `first_synthesis_request→first_playable_audio` ends at
 validated PCM ready for output, not audibility; `barge_in_onset→playback_flush_acknowledged` ends
 at an internal output-path flush acknowledgement, not the 300 ms audible-stop claim.

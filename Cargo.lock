@@ -482,6 +482,7 @@ dependencies = [
  "conversation-memory",
  "conversation-model-adapters",
  "conversation-protocol",
+ "libc",
  "ring",
  "serde_json",
  "tempfile",

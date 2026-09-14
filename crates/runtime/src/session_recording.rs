@@ -99,6 +99,7 @@ const KEY_DOMAIN: &[u8] = b"conversation-runtime/session-recording/key/v1\0";
 const KEY_ID_DOMAIN: &[u8] = b"conversation-runtime/session-recording/key-id/v1\0";
 const CAPABILITY_DOMAIN: &[u8] = b"conversation-runtime/finalized-recording-capability/v1\0";
 const DIGEST_BUFFER_BYTES: usize = 64 * 1024;
+const MAX_FINALIZED_RECORDING_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// Where recordings are written and which environment variable names the key.
 ///
@@ -622,6 +623,13 @@ impl SessionRecorder {
     /// than reporting the recorder as already closed. Nothing is torn down until every step has
     /// succeeded, so a caller that retries always sees the real error.
     pub fn finalize(&mut self) -> Result<RecordingSummary, RuntimeError> {
+        self.finalize_using(None)
+    }
+
+    fn finalize_using(
+        &mut self,
+        recovery_source: Option<File>,
+    ) -> Result<RecordingSummary, RuntimeError> {
         if let Some(summary) = self.summary.as_ref() {
             return Ok(summary.clone());
         }
@@ -634,7 +642,26 @@ impl SessionRecorder {
                 .and_then(|()| file.sync_all())
                 .map_err(|_| adapter_error("recording file could not be flushed"))?;
         }
-        let sha256 = file_digest(&self.path)?;
+        let sha256 = if let Some(mut source) = recovery_source {
+            // The v4 path retains its admitted descriptor through flush/sync and hashing;
+            // reopening the pathname here would reintroduce special-file replacement races.
+            let size = admitted_recovery_extent(&source)?;
+            source
+                .seek(SeekFrom::Start(0))
+                .map_err(|_| recovery_error())?;
+            let hash = stream_digest(
+                &mut (&mut source).take(size),
+                None,
+                &CancellationToken::new(),
+            )?;
+            let mut extra = [0];
+            if source.read(&mut extra).map_err(|_| recovery_error())? != 0 {
+                return Err(recovery_error());
+            }
+            hash
+        } else {
+            file_digest(&self.path)?
+        };
         let summary = RecordingSummary {
             recording_handle: self.handle.clone(),
             encrypted_path: self.path.clone(),
@@ -667,7 +694,10 @@ impl SessionRecorder {
         if self.recording_failed || self.capability_poisoned {
             return Err(recovery_error());
         }
-        let summary = self.finalize()?;
+        // Also admit/check cached finalizations: never knowingly issue an oversized or
+        // special-file capability. Legacy finalize deliberately retains its old policy.
+        let source = open_recovery_source(&self.path)?;
+        let summary = self.finalize_using(Some(source))?;
         if summary.sha256 != lowercase_hex(self.sealed_digest.clone().finish().as_ref()) {
             return Err(recovery_error());
         }
@@ -1091,6 +1121,45 @@ impl Drop for PrivateSnapshot {
     }
 }
 
+fn open_recovery_source(path: &Path) -> Result<File, RuntimeError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Open the reparse point itself, never its target; admission below checks
+        // the opened handle. Keep sharing compatible with the live finalization sink.
+        options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    #[cfg(not(any(unix, windows)))]
+    return Err(recovery_error());
+    let source = options.open(path).map_err(|_| recovery_error())?;
+    admitted_recovery_extent(&source)?;
+    Ok(source)
+}
+
+fn admitted_recovery_extent(source: &File) -> Result<u64, RuntimeError> {
+    let metadata = source.metadata().map_err(|_| recovery_error())?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        // FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DEVICE. Reject all reparse
+        // kinds, not merely symlinks recognized by std's FileType implementation.
+        if metadata.file_attributes() & (0x0400 | 0x0040) != 0 {
+            return Err(recovery_error());
+        }
+    }
+    if !metadata.is_file() || metadata.len() > MAX_FINALIZED_RECORDING_BYTES {
+        return Err(recovery_error());
+    }
+    Ok(metadata.len())
+}
+
 /// Keep an immutable-to-the-source encrypted snapshot: descriptor retention alone does not
 /// protect against writes to the original inode. No plaintext is ever persisted here.
 pub(crate) fn preflight_finalized_recording(
@@ -1131,12 +1200,10 @@ fn snapshot_finalized_recording(
         "{}.{RECORDING_EXTENSION}",
         capability.recording_handle
     ));
-    let mut source = File::open(path).map_err(|_| recovery_error())?;
-    let metadata = source.metadata().map_err(|_| recovery_error())?;
-    if !metadata.is_file() {
-        return Err(recovery_error());
-    }
-    let size = metadata.len();
+    let mut source = open_recovery_source(&path)?;
+    let size = admitted_recovery_extent(&source)?;
+    #[cfg(test)]
+    recovery_tests::observe_snapshot_allocation(&path)?;
     let mut random = [0; 16];
     SystemRandom::new()
         .fill(&mut random)

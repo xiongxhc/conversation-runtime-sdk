@@ -52,6 +52,13 @@ message is that domain followed by big-endian u64 source identity, 16 decoded
 handle bytes, 32 digest bytes, and 8 key-identity bytes. Tag verification uses ring's
 constant-time verifier; Rust Debug and malformed-capability diagnostics redact it.
 
+Finalized recovery accepts at most **8 GiB (8 × 1024³ bytes) of ciphertext**.
+Oversized files are rejected before snapshot allocation/copy or v4 capability
+issuance, including repeated finalization. Legacy v3 recording/reconciliation has
+no new size policy. Unix source admission uses a no-follow, nonblocking descriptor
+and verifies the opened handle is regular; Windows opens the reparse point itself
+and rejects reparse/device/non-regular handles. Other platforms fail closed.
+
 Recovery opens the canonical handle once, copies only ciphertext through a fixed
 64 KiB hashing buffer, authenticates every chunk, requires exactly one terminal
 Ended and immediate EOF, rehashes the snapshot, and rewinds its retained descriptor.

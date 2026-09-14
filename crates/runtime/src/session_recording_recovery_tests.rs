@@ -10,6 +10,45 @@ use std::sync::{
 const KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 static NEXT_KEY: AtomicUsize = AtomicUsize::new(0);
 
+// This test-only allocation boundary makes the sparse-file RED safe: entering the
+// snapshot path is observable and refused before allocating or copying any bytes.
+static FORBIDDEN_SNAPSHOTS: std::sync::Mutex<Vec<(PathBuf, Arc<AtomicUsize>)>> =
+    std::sync::Mutex::new(Vec::new());
+pub(super) fn observe_snapshot_allocation(path: &Path) -> Result<(), RuntimeError> {
+    if let Some((_, calls)) = FORBIDDEN_SNAPSHOTS
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(candidate, _)| candidate == path)
+    {
+        calls.fetch_add(1, Ordering::SeqCst);
+        return Err(recovery_error());
+    }
+    Ok(())
+}
+#[cfg(unix)]
+struct ForbidSnapshot(PathBuf, Arc<AtomicUsize>);
+#[cfg(unix)]
+impl ForbidSnapshot {
+    fn new(path: &Path) -> Self {
+        let calls = Arc::new(AtomicUsize::new(0));
+        FORBIDDEN_SNAPSHOTS
+            .lock()
+            .unwrap()
+            .push((path.to_owned(), calls.clone()));
+        Self(path.to_owned(), calls)
+    }
+}
+#[cfg(unix)]
+impl Drop for ForbidSnapshot {
+    fn drop(&mut self) {
+        FORBIDDEN_SNAPSHOTS
+            .lock()
+            .unwrap()
+            .retain(|(path, _)| *path != self.0);
+    }
+}
+
 struct Fixture {
     directory: tempfile::TempDir,
     settings: RecordingSettings,
@@ -481,6 +520,204 @@ fn externally_truncated_recording_cannot_acquire_a_finalized_capability() {
         .set_len(HEADER_LEN as u64)
         .unwrap();
     assert!(recorder.finalize_with_capability().is_err());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn oversized_sparse_replacement_is_rejected_before_snapshot_or_provider() {
+    let fixture = Fixture::new();
+    let mut recorder = fixture.recorder();
+    let (summary, capability) = recorder.finalize_with_capability().unwrap();
+    OpenOptions::new()
+        .write(true)
+        .open(&summary.encrypted_path)
+        .unwrap()
+        .set_len(8 * 1024 * 1024 * 1024 + 1)
+        .unwrap();
+    let guard = ForbidSnapshot::new(&summary.encrypted_path);
+    let diarizer = Arc::new(Diarizer::default());
+    let token = CancellationToken::new();
+    assert!(reconcile_finalized_recording(
+        &fixture.settings,
+        &capability,
+        diarizer.clone(),
+        token.clone()
+    )
+    .await
+    .is_err());
+    token.cancel();
+    assert!(
+        reconcile_finalized_recording(&fixture.settings, &capability, diarizer.clone(), token)
+            .await
+            .is_err()
+    );
+    assert_eq!(diarizer.calls.load(Ordering::SeqCst), 0);
+    fixture.assert_no_snapshot();
+    assert_eq!(
+        guard.1.load(Ordering::SeqCst),
+        0,
+        "oversized source entered snapshot allocation/copy"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn oversized_sparse_recording_cannot_reissue_a_cached_capability() {
+    let fixture = Fixture::new();
+    let mut fresh = fixture.recorder();
+    OpenOptions::new()
+        .write(true)
+        .open(fresh.path())
+        .unwrap()
+        .set_len(8 * 1024 * 1024 * 1024 + 1)
+        .unwrap();
+    assert!(fresh.finalize_with_capability().is_err());
+    assert!(
+        !fresh.ended,
+        "reject oversize before append, flush, or digest"
+    );
+    let mut recorder = fixture.recorder();
+    recorder.finalize_with_capability().unwrap();
+    OpenOptions::new()
+        .write(true)
+        .open(recorder.path())
+        .unwrap()
+        .set_len(8 * 1024 * 1024 * 1024 + 1)
+        .unwrap();
+    // Cached finalization makes this a real issuance RED without reading 8 GiB.
+    assert!(recorder.finalize_with_capability().is_err());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn symlink_to_valid_recording_is_not_followed_into_snapshot_allocation() {
+    let fixture = Fixture::new();
+    let mut recorder = fixture.recorder();
+    let (summary, capability) = recorder.finalize_with_capability().unwrap();
+    let saved = fixture.directory.path().join("saved-ciphertext");
+    std::fs::rename(&summary.encrypted_path, &saved).unwrap();
+    std::os::unix::fs::symlink(saved, &summary.encrypted_path).unwrap();
+    let guard = ForbidSnapshot::new(&summary.encrypted_path);
+    let diarizer = Arc::new(Diarizer::default());
+    assert!(reconcile_finalized_recording(
+        &fixture.settings,
+        &capability,
+        diarizer.clone(),
+        CancellationToken::new()
+    )
+    .await
+    .is_err());
+    assert_eq!(diarizer.calls.load(Ordering::SeqCst), 0);
+    fixture.assert_no_snapshot();
+    assert_eq!(
+        guard.1.load(Ordering::SeqCst),
+        0,
+        "symlink was followed into snapshot allocation"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn fifo_replacements_reject_and_join_after_cancellation_in_bounded_child() {
+    const CHILD_ROOT: &str = "RUNTIME_RECOVERY_ADMISSION_CHILD_ROOT";
+    const CHILD_KIND: &str = "RUNTIME_RECOVERY_ADMISSION_CHILD_KIND";
+    if let Some(root) = std::env::var_os(CHILD_ROOT) {
+        let root = PathBuf::from(root);
+        let mut fixture = Fixture::new();
+        fixture.directory = tempfile::tempdir_in(&root).unwrap();
+        fixture.settings =
+            RecordingSettings::new(fixture.directory.path(), fixture.settings.key_env()).unwrap();
+        let mut recorder = fixture.recorder();
+        let (summary, capability) = recorder.finalize_with_capability().unwrap();
+        std::fs::remove_file(&summary.encrypted_path).unwrap();
+        let fifo = fixture.directory.path().join("fifo");
+        let direct = std::env::var(CHILD_KIND).unwrap() == "direct";
+        assert!(std::process::Command::new("mkfifo")
+            .arg(if direct {
+                &summary.encrypted_path
+            } else {
+                &fifo
+            })
+            .status()
+            .unwrap()
+            .success());
+        if !direct {
+            std::os::unix::fs::symlink(fifo, &summary.encrypted_path).unwrap();
+        }
+        let diarizer = Arc::new(Diarizer::default());
+        let token = CancellationToken::new();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        std::fs::write(root.join("armed"), b"fixture ready; entering recovery").unwrap();
+        let outcome = runtime.block_on(async {
+            let recovery = reconcile_finalized_recording(
+                &fixture.settings,
+                &capability,
+                diarizer.clone(),
+                token.clone(),
+            );
+            tokio::pin!(recovery);
+            tokio::select! {
+                result = &mut recovery => return Some(result),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => token.cancel(),
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(1), &mut recovery)
+                .await
+                .ok()
+        });
+        assert_eq!(diarizer.calls.load(Ordering::SeqCst), 0);
+        fixture.assert_no_snapshot();
+        std::fs::write(
+            root.join("outcome"),
+            if matches!(outcome, Some(Err(_))) {
+                "rejected"
+            } else {
+                "blocked"
+            },
+        )
+        .unwrap();
+        // On the unfixed implementation runtime drop would await the blocked open.
+        // The parent owns the hard bound and always kills/reaps this child on failure.
+        assert!(
+            matches!(outcome, Some(Err(_))),
+            "FIFO open did not finish after cancellation"
+        );
+        return;
+    }
+    for kind in ["direct", "symlink"] {
+        let root = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "session_recording::recovery_tests::fifo_replacements_reject_and_join_after_cancellation_in_bounded_child", "--nocapture"])
+            .env(CHILD_ROOT, root.path()).env(CHILD_KIND, kind)
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+        let startup_deadline = Instant::now() + std::time::Duration::from_secs(10);
+        let mut phase_deadline = None;
+        let mut success = false;
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                success = status.success();
+                break;
+            }
+            if phase_deadline.is_none() && root.path().join("armed").exists() {
+                phase_deadline = Some(Instant::now() + std::time::Duration::from_secs(2));
+            }
+            if std::fs::read(root.path().join("outcome")).is_ok_and(|bytes| bytes == b"blocked")
+                || Instant::now() >= phase_deadline.unwrap_or(startup_deadline)
+            {
+                child.kill().unwrap();
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            success,
+            "{kind} FIFO admission failed bounded rejection/join: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[test]

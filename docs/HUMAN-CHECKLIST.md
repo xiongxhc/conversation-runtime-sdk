@@ -50,6 +50,9 @@ with only `LC_ALL=C`; use an absolute executable with all device/private configu
 by that executable, and do not rely on inherited `PATH`, `HOME`, or provider credentials.
 Capture and reap are bounded. EOF with a still-live helper fails closed and terminates it;
 the helper must exit when its finite capture completes, without a lingering stdout-closed process.
+Each sample has one absolute 120-second deadline, unaffected by unrelated control messages.
+Media failure cancels control/capture promptly; cancellation and deadline expiry still explicitly
+terminate and reap a live helper, with a separate five-second reap grace before gateway cleanup.
 The shared runner splits capture using the private configuration's `media.max_payload_bytes`
 (rounded down to an even byte count), continuously acknowledges playback, and waits for the
 actual flush acknowledgment before stopping the sample. The output contains only count, p50, p95,

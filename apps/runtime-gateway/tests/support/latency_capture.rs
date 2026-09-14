@@ -7,6 +7,9 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, ChildStdout, Command};
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
+
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub trait CaptureProcess {
     fn stdout(&mut self) -> &mut (dyn AsyncRead + Unpin + Send);
@@ -76,7 +79,15 @@ pub async fn collect_pcm(
     process: &mut impl CaptureProcess,
     limit: Duration,
 ) -> Result<Vec<u8>, &'static str> {
-    let capture = timeout(limit, async {
+    collect_pcm_until_cancelled(process, limit, &CancellationToken::new()).await
+}
+
+pub async fn collect_pcm_until_cancelled(
+    process: &mut impl CaptureProcess,
+    limit: Duration,
+    cancelled: &CancellationToken,
+) -> Result<Vec<u8>, &'static str> {
+    let read = timeout(limit, async {
         let mut pcm = Vec::new();
         let mut buffer = [0; 8192];
         loop {
@@ -94,15 +105,19 @@ pub async fn collect_pcm(
             pcm.extend_from_slice(&buffer[..count]);
         }
         Ok(pcm)
-    })
-    .await
-    .unwrap_or(Err("capture timed out"));
+    });
+    // Cancellation drops only the stdout read, never the cleanup which follows it.
+    let capture = tokio::select! {
+        biased;
+        _ = cancelled.cancelled() => Err("capture cancelled"),
+        result = read => result.unwrap_or(Err("capture timed out")),
+    };
     // EOF and process exit are separate states. Never wait on a still-live helper after EOF.
     let completed = process.completed().map_err(|_| "capture status failed");
     if !matches!(completed, Ok(Some(_))) {
         let _ = process.terminate();
     }
-    let success = timeout(limit, process.reap())
+    let success = timeout(CLEANUP_TIMEOUT, process.reap())
         .await
         .map_err(|_| "capture reap timed out")?
         .map_err(|_| "capture reap failed")?;
@@ -124,6 +139,7 @@ pub struct State {
     pub complete: Option<bool>,
     pub terminated: usize,
     pub reaped: usize,
+    pub reading: Arc<tokio::sync::Notify>,
 }
 pub struct FakeCapture {
     pub output: Box<dyn AsyncRead + Unpin + Send>,
@@ -142,6 +158,7 @@ impl FakeCapture {
 }
 impl CaptureProcess for FakeCapture {
     fn stdout(&mut self) -> &mut (dyn AsyncRead + Unpin + Send) {
+        self.state.lock().unwrap().reading.notify_one();
         &mut *self.output
     }
     fn completed(&mut self) -> io::Result<Option<bool>> {

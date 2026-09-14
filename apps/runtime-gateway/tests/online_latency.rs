@@ -12,7 +12,7 @@ use conversation_protocol::{
     encode_gateway_message, ClientMediaLeaseDescriptor, ClientVoiceSessionEvent, GatewayMessage,
     SessionId, VoiceSessionEvent, VoiceTimingMilestone,
 };
-use latency_capture::{collect_pcm, CaptureFactory, OperatorCapture};
+use latency_capture::{collect_pcm_until_cancelled, CaptureFactory, OperatorCapture};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -555,6 +555,186 @@ async fn shared_runner_capture_failure_cleans_process_and_closes_media() {
     }
 }
 
+async fn fixture_started<W: AsyncWrite + Unpin>(
+    writer: &mut FrameWriter<W>,
+    accepted: serde_json::Value,
+) {
+    writer
+        .write_frame(include_bytes!("fixtures/meeting-agent-online-v1.json"))
+        .await
+        .unwrap();
+    fixture_message(writer, accepted).await;
+    fixture_message(
+        writer,
+        serde_json::json!({"protocol_version":3,"type":"voice_event",
+        "event":{"type":"voice_session_started","session_id":"7"}}),
+    )
+    .await;
+}
+
+// A media fault must cancel either a pending capture or a control wait despite endless traffic.
+#[tokio::test]
+async fn failed_media_cancels_capture_and_control_despite_unrelated_frames() {
+    for pending_capture in [true, false] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let accepted = acceptance(listener.local_addr().unwrap());
+        let mut capture = latency_capture::FakeCapture::new(vec![0; 32_768], Some(true));
+        let (stdout, _hold_stdout_open) = tokio::io::duplex(1);
+        if pending_capture {
+            capture.output = Box::new(stdout);
+            capture.state.lock().unwrap().complete = None;
+        }
+        let state = capture.state.clone();
+        let reading = state.lock().unwrap().reading.clone();
+        let mut captures = FakeCaptures([capture].into());
+        let (client, server) = tokio::io::duplex(16_384);
+        let (client_read, client_write) = tokio::io::split(client);
+        let (_server_read, server_write) = tokio::io::split(server);
+        let fixture = async move {
+            let mut output = FrameWriter::new(server_write);
+            fixture_started(&mut output, accepted).await;
+            let (mut media, _) = listener.accept().await.unwrap();
+            assert_media_authentication(&mut media, 7, b"fixture-credential").await;
+            reading.notified().await;
+            if !pending_capture {
+                for sequence in 1..=4 {
+                    assert_media_capture(&mut media, 7, sequence, &[0; 8192]).await;
+                }
+            }
+            media.write_all(b"MED").await.unwrap();
+            media.shutdown().await.unwrap(); // EOF in a partial header is a definite media fault.
+            let mut eof = [0];
+            loop {
+                tokio::select! {
+                    result = media.read(&mut eof) => {
+                        assert_eq!(result.unwrap(), 0, "failed sample must close media");
+                        break;
+                    }
+                    result = output.write_frame(br#"{"protocol_version":3,"type":"command_accepted","request_id":"unrelated"}"#) => {
+                        if result.is_err() {
+                            assert_eq!(media.read(&mut eof).await.unwrap(), 0, "failed sample must close media");
+                            break;
+                        }
+                    }
+                }
+            }
+        };
+        let run = async {
+            run_latency_sample_with_limit(
+                &mut FrameReader::new(client_read),
+                &mut FrameWriter::new(client_write),
+                &mut captures,
+                0,
+                8192,
+                Duration::from_secs(30),
+            )
+            .await
+        };
+        let (result, ()) = timeout(Duration::from_secs(5), async { tokio::join!(run, fixture) })
+            .await.unwrap_or_else(|_| {
+                let state = state.lock().unwrap();
+                panic!("media fault stalled: pending_capture={pending_capture}, terminated={}, reaped={}", state.terminated, state.reaped)
+            });
+        assert_eq!(result, Err("media playback or acknowledgement failed"));
+        let state = state.lock().unwrap();
+        assert_eq!(
+            (state.terminated, state.reaped),
+            (usize::from(pending_capture), 1)
+        );
+        assert!(state.complete.is_some());
+    }
+}
+
+// Unrelated frames on a virtual clock must not renew the absolute sample deadline.
+#[tokio::test]
+async fn sample_deadline_is_absolute_despite_continuous_control_frames() {
+    assert_absolute_sample_deadline(false).await;
+}
+
+#[tokio::test]
+async fn sample_deadline_cleans_pending_capture_despite_continuous_control_frames() {
+    assert_absolute_sample_deadline(true).await;
+}
+
+async fn assert_absolute_sample_deadline(pending_capture: bool) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let accepted = acceptance(listener.local_addr().unwrap());
+    let mut capture = latency_capture::FakeCapture::new(vec![0; 32_768], Some(true));
+    let (stdout, _hold_stdout_open) = tokio::io::duplex(1);
+    if pending_capture {
+        capture.output = Box::new(stdout);
+        capture.state.lock().unwrap().complete = None;
+    }
+    let state = capture.state.clone();
+    let reading = state.lock().unwrap().reading.clone();
+    let mut captures = FakeCaptures([capture].into());
+    let (client, server) = tokio::io::duplex(16_384);
+    let (client_read, client_write) = tokio::io::split(client);
+    let (_server_read, server_write) = tokio::io::split(server);
+    let fixture = async move {
+        let mut output = FrameWriter::new(server_write);
+        fixture_started(&mut output, accepted).await;
+        let (mut media, _) = listener.accept().await.unwrap();
+        assert_media_authentication(&mut media, 7, b"fixture-credential").await;
+        reading.notified().await;
+        if !pending_capture {
+            for sequence in 1..=4 {
+                assert_media_capture(&mut media, 7, sequence, &[0; 8192]).await;
+            }
+        }
+        // Establish real loopback I/O before pausing time; subsequent traffic is in-memory only.
+        tokio::time::pause();
+        for _ in 0..40 {
+            if output
+                .write_frame(
+                    br#"{"protocol_version":3,"type":"command_accepted","request_id":"unrelated"}"#,
+                )
+                .await
+                .is_err()
+            {
+                break;
+            }
+            // Paused-time timer, not a wall-clock ordering delay. Let the runtime wake the
+            // sample deadline before the next traffic tick instead of manually skipping it.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    let run = async {
+        let start = tokio::time::Instant::now();
+        let result = run_latency_sample_with_limit(
+            &mut FrameReader::new(client_read),
+            &mut FrameWriter::new(client_write),
+            &mut captures,
+            0,
+            8192,
+            Duration::from_secs(1),
+        )
+        .await;
+        (result, start.elapsed())
+    };
+    let ((result, elapsed), ()) =
+        timeout(Duration::from_secs(5), async { tokio::join!(run, fixture) })
+            .await
+            .expect("sample must finish within its absolute bound");
+    assert_eq!(
+        result,
+        Err(if pending_capture {
+            "capture timed out"
+        } else {
+            "sample exceeded its absolute deadline"
+        })
+    );
+    assert!(
+        elapsed <= Duration::from_millis(1010),
+        "deadline must finish at one second (with timer granularity margin), observed {elapsed:?}"
+    );
+    let state = state.lock().unwrap();
+    assert_eq!(
+        (state.terminated, state.reaped),
+        (usize::from(pending_capture), 1)
+    );
+}
+
 /// This is deliberately ignored: it starts the compiled gateway with a private configuration
 /// whose explicitly selected remote providers and a private human-operated PCM helper are used.
 /// Each sample captures initial speech, approves the external-gated answer, then captures
@@ -917,9 +1097,31 @@ async fn run_latency_sample<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     sample: usize,
     frame_cap: usize,
 ) -> HarnessResult<[u64; 5]> {
+    run_latency_sample_with_limit(
+        reader,
+        writer,
+        capture,
+        sample,
+        frame_cap,
+        LIVE_FRAME_TIMEOUT,
+    )
+    .await
+}
+
+async fn run_latency_sample_with_limit<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut FrameReader<R>,
+    writer: &mut FrameWriter<W>,
+    capture: &mut impl CaptureFactory,
+    sample: usize,
+    frame_cap: usize,
+    sample_limit: Duration,
+) -> HarnessResult<[u64; 5]> {
+    let deadline = tokio::time::Instant::now() + sample_limit;
+    let cancelled = CancellationToken::new();
     if !(2..=MAX_CAPTURE_PCM_BYTES).contains(&frame_cap) {
         return Err("media frame bound was invalid");
     }
+    let (mut bridge, media_reader) = sample_step(&cancelled, deadline, async {
     let ready = wire_value(&read_live_message(reader).await?);
     let status = &ready["status"];
     if ready["type"] != "ready"
@@ -939,7 +1141,7 @@ async fn run_latency_sample<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         r#"{{"protocol_version":3,"type":"start_voice_session","request_id":"{start_request}","response_mode":"external_gate"}}"#
     )).await?;
     let mut media = None;
-    let (mut bridge, media_reader) = loop {
+    loop {
         let message = read_live_message(reader).await?;
         if is_accepted(&message, &start_request) {
             media = Some(
@@ -959,9 +1161,10 @@ async fn run_latency_sample<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             if value["event"]["session_id"].as_str() != Some(expected_session.as_str()) {
                 return Err("started session did not match media lease");
             }
-            break (bridge, media_reader);
+            return Ok((bridge, media_reader));
         }
-    };
+    }
+    }).await?;
     let session_id = bridge.session_id;
     let stop = CancellationToken::new();
     let (progress, mut observed) = watch::channel((0, 0));
@@ -972,10 +1175,19 @@ async fn run_latency_sample<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         frame_cap: bridge.frame_cap,
         next_sequence: 1,
     };
-    let drain = drain_bridge.drain_playback(media_reader, progress, stop.clone());
+    let drain = async {
+        let result = drain_bridge
+            .drain_playback(media_reader, progress, stop.clone())
+            .await;
+        if result.is_err() {
+            cancelled.cancel();
+        }
+        result
+    };
     let control = async {
         let result = async {
-            let initial = collect_sample_capture(capture).await?;
+            let initial = collect_sample_capture(capture, &cancelled, deadline).await?;
+            let (audio, final_transcript, authorized, text, synthesis, playable) = sample_step(&cancelled, deadline, async {
             bridge.send_capture(1_000, &initial).await?;
             let (audio, final_transcript, segment_id) = wait_for_audio_and_final(reader).await?;
             write_live_message(writer, &format!(
@@ -986,7 +1198,10 @@ async fn run_latency_sample<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             let synthesis = wait_for_timing(reader, "first_synthesis_request").await?;
             let playable = wait_for_timing(reader, "first_playable_audio").await?;
             wait_for_media_progress(&mut observed, false).await?;
-            let interrupt = collect_sample_capture(capture).await?;
+            Ok((audio, final_transcript, authorized, text, synthesis, playable))
+            }).await?;
+            let interrupt = collect_sample_capture(capture, &cancelled, deadline).await?;
+            let (barge, flush) = sample_step(&cancelled, deadline, async {
             bridge.send_capture(1_000 + initial.len() as u64 / 32, &interrupt).await?;
             let barge = wait_for_timing(reader, "barge_in_onset").await?;
             let flush = wait_for_timing(reader, "playback_flush_acknowledged").await?;
@@ -996,6 +1211,8 @@ async fn run_latency_sample<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 r#"{{"protocol_version":3,"type":"stop_voice_session","request_id":"{stop_request}"}}"#
             )).await?;
             while !is_accepted(&read_live_message(reader).await?, &stop_request) {}
+            Ok((barge, flush))
+            }).await?;
             let pairs: [(u64,u64);5] = [(final_transcript, audio), (text, authorized),
                 (synthesis, text), (playable, synthesis), (flush, barge)];
             let mut intervals = [0;5];
@@ -1012,9 +1229,34 @@ async fn run_latency_sample<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     sample
 }
 
-async fn collect_sample_capture(capture: &mut impl CaptureFactory) -> HarnessResult<Vec<u8>> {
+/// Control/media I/O can be abandoned only when this sample will close its connections.
+/// Capture collection must instead observe cancellation internally and finish explicit cleanup.
+async fn sample_step<T>(
+    cancelled: &CancellationToken,
+    deadline: tokio::time::Instant,
+    work: impl std::future::Future<Output = HarnessResult<T>>,
+) -> HarnessResult<T> {
+    tokio::select! {
+        biased;
+        _ = cancelled.cancelled() => Err("sample cancelled after media failure"),
+        _ = tokio::time::sleep_until(deadline) => Err("sample exceeded its absolute deadline"),
+        result = work => result,
+    }
+}
+
+async fn collect_sample_capture(
+    capture: &mut impl CaptureFactory,
+    cancelled: &CancellationToken,
+    deadline: tokio::time::Instant,
+) -> HarnessResult<Vec<u8>> {
+    if cancelled.is_cancelled() || tokio::time::Instant::now() >= deadline {
+        return Err("sample ended before capture");
+    }
     let mut process = capture.start()?;
-    let pcm = collect_pcm(&mut process, LIVE_FRAME_TIMEOUT).await?;
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let pcm =
+        collect_pcm_until_cancelled(&mut process, remaining.min(LIVE_FRAME_TIMEOUT), cancelled)
+            .await?;
     if pcm.len() < 32_768 {
         return Err("capture must contain at least 32 KiB for online recognition");
     }
@@ -1086,6 +1328,8 @@ async fn wait_for_timing<R: AsyncRead + Unpin>(
 async fn read_live_message<R: AsyncRead + Unpin>(
     reader: &mut FrameReader<R>,
 ) -> HarnessResult<WireMessage> {
+    // A continuously readable control stream must not starve media failure/ACK polling.
+    tokio::task::yield_now().await;
     let payload = timeout(LIVE_FRAME_TIMEOUT, reader.read_frame())
         .await
         .map_err(|_| "gateway frame timed out")?

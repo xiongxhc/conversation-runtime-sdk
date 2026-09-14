@@ -38,6 +38,7 @@ const PLAYBACK_FRAME_HEADER_BYTES: usize = 66;
 const MAX_MEDIA_CONNECTIONS: usize = 64;
 const MEDIA_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const MEDIA_CONNECTION_REAP_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_TIMED_METADATA_PER_SECOND: u32 = 128;
 
 pub const MAX_MEDIA_ENDPOINT_BYTES: usize = 256;
 pub const MAX_MEDIA_PATH_BYTES: usize = 1_024;
@@ -327,6 +328,8 @@ struct TimedMediaState {
     sequence: u64,
     output_end: Option<u64>,
     pair: Option<CaptureClockPair>,
+    metadata_window_started: Instant,
+    metadata_in_window: u32,
 }
 
 struct MediaDisconnect {
@@ -460,6 +463,8 @@ impl MediaServer {
                     sequence: 0,
                     output_end: None,
                     pair: None,
+                    metadata_window_started: now,
+                    metadata_in_window: 0,
                 }),
             },
         );
@@ -586,7 +591,7 @@ where
                     match message? {
                         MediaMessage::Timed {session_id:source,record}=>{
                             if !timed||source!=session_id {return Err(AdapterError::new("timed media identity did not match"));}
-                            inner.admit_timed_rate(session_id).await?;
+                            inner.admit_timed_rate(session_id,matches!(&record,TimedMediaRecord::Metadata(_))).await?;
                             match record {
                                 TimedMediaRecord::Metadata(CaptureMetadata::Epoch(epoch))=>{
                                     inner.admit_epoch(session_id,&epoch,!epoch_started).await?;
@@ -714,24 +719,55 @@ where
     result
 }
 
+fn admit_rate_window(
+    started: &mut Instant,
+    count: &mut u32,
+    limit: u32,
+    now: Instant,
+) -> Result<(), AdapterError> {
+    if now.duration_since(*started) >= Duration::from_secs(1) {
+        *started = now;
+        *count = 0;
+    }
+    if *count >= limit {
+        return Err(AdapterError::new(
+            "timed media record rate exceeded its bound",
+        ));
+    }
+    *count += 1;
+    Ok(())
+}
+
 impl MediaServerInner {
-    async fn admit_timed_rate(&self, session_id: SessionId) -> Result<(), AdapterError> {
+    async fn admit_timed_rate(
+        &self,
+        session_id: SessionId,
+        is_metadata: bool,
+    ) -> Result<(), AdapterError> {
         let mut sessions = self.sessions.lock().await;
         let session = sessions
             .get_mut(&session_id.get())
             .ok_or_else(|| AdapterError::new("timed media session was revoked"))?;
         let now = Instant::now();
-        if now.duration_since(session.rate_window_started) >= Duration::from_secs(1) {
-            session.rate_window_started = now;
-            session.frames_in_window = 0;
+        if is_metadata {
+            let state = session
+                .timed
+                .as_mut()
+                .ok_or_else(|| AdapterError::new("timed media session was revoked"))?;
+            admit_rate_window(
+                &mut state.metadata_window_started,
+                &mut state.metadata_in_window,
+                MAX_TIMED_METADATA_PER_SECOND,
+                now,
+            )
+        } else {
+            admit_rate_window(
+                &mut session.rate_window_started,
+                &mut session.frames_in_window,
+                self.max_frames_per_second,
+                now,
+            )
         }
-        if session.frames_in_window >= self.max_frames_per_second {
-            return Err(AdapterError::new(
-                "timed media record rate exceeded its bound",
-            ));
-        }
-        session.frames_in_window += 1;
-        Ok(())
     }
 
     async fn admit_epoch(
@@ -1482,6 +1518,135 @@ fn load_tls_acceptor(config: &MediaTlsConfig) -> Result<TlsAcceptor, AdapterErro
 #[cfg(test)]
 mod timing_domain_tests {
     use super::*;
+    #[test]
+    fn review_rate_windows_admit_exact_caps_and_reset_independently_at_one_second() {
+        let origin = Instant::now();
+        let mut pcm_started = origin;
+        let mut metadata_started = origin + Duration::from_millis(250);
+        let (mut pcm, mut metadata) = (0, 0);
+        for _ in 0..2 {
+            admit_rate_window(&mut pcm_started, &mut pcm, 2, metadata_started).unwrap();
+        }
+        for _ in 0..128 {
+            admit_rate_window(
+                &mut metadata_started,
+                &mut metadata,
+                128,
+                origin + Duration::from_millis(250),
+            )
+            .unwrap();
+        }
+        assert!(admit_rate_window(
+            &mut pcm_started,
+            &mut pcm,
+            2,
+            origin + Duration::from_secs(1) - Duration::from_nanos(1)
+        )
+        .is_err());
+        admit_rate_window(
+            &mut pcm_started,
+            &mut pcm,
+            2,
+            origin + Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(pcm, 1);
+        assert!(admit_rate_window(
+            &mut metadata_started,
+            &mut metadata,
+            128,
+            origin + Duration::from_secs(1)
+        )
+        .is_err());
+        assert_eq!(metadata, 128);
+        assert!(admit_rate_window(
+            &mut metadata_started,
+            &mut metadata,
+            128,
+            origin + Duration::from_millis(1250) - Duration::from_nanos(1)
+        )
+        .is_err());
+        admit_rate_window(
+            &mut metadata_started,
+            &mut metadata,
+            128,
+            origin + Duration::from_millis(1250),
+        )
+        .unwrap();
+        assert_eq!(metadata, 1);
+        assert_eq!(pcm, 1);
+    }
+
+    #[tokio::test]
+    async fn review_timed_rate_budgets_survive_reconnect_epoch_and_domain_changes() {
+        let server = MediaServer::bind(
+            MediaServerConfig::loopback()
+                .with_max_frames_per_second(2)
+                .with_capture_format(Some("pcm_s16le/24000/1/20ms".into()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let id = SessionId::new(41);
+        let lease = server.reserve_timed(id, "bridge".into()).await.unwrap();
+        let epoch = |domain: &str, number| CaptureEpoch {
+            bridge_session_id: "bridge".into(),
+            clock_domain_id: domain.into(),
+            capture_epoch: number,
+        };
+        let connection = server
+            .inner
+            .authenticate(id, lease.credential(), Some("bridge"))
+            .await
+            .unwrap();
+        server.inner.admit_timed_rate(id, true).await.unwrap();
+        server
+            .inner
+            .admit_epoch(id, &epoch("A", 1), false)
+            .await
+            .unwrap();
+        for _ in 1..64 {
+            server.inner.admit_timed_rate(id, true).await.unwrap();
+        }
+        for _ in 0..2 {
+            server.inner.admit_timed_rate(id, false).await.unwrap();
+        }
+        assert!(server.inner.admit_timed_rate(id, false).await.is_err());
+        server.inner.disconnect(id, connection).await.unwrap();
+        let reconnected = server
+            .inner
+            .authenticate(id, lease.credential(), Some("bridge"))
+            .await
+            .unwrap();
+        for (domain, number, reconnect) in [("A", 1, true), ("A", 2, false), ("B", 1, false)] {
+            server.inner.admit_timed_rate(id, true).await.unwrap();
+            server
+                .inner
+                .admit_epoch(id, &epoch(domain, number), reconnect)
+                .await
+                .unwrap();
+        }
+        for _ in 67..128 {
+            server.inner.admit_timed_rate(id, true).await.unwrap();
+        }
+        assert!(
+            server.inner.admit_timed_rate(id, true).await.is_err(),
+            "129th metadata record must fail"
+        );
+        assert!(
+            server.inner.admit_timed_rate(id, false).await.is_err(),
+            "reconnect must not reset PCM budget"
+        );
+        {
+            let sessions = server.inner.sessions.lock().await;
+            let session = &sessions[&id.get()];
+            assert_eq!(session.frames_in_window, 2);
+            assert_eq!(session.timed.as_ref().unwrap().metadata_in_window, 128);
+        }
+        server.inner.disconnect(id, reconnected).await.unwrap();
+        server.shutdown().await;
+    }
+
     #[tokio::test]
     async fn domain_history_is_per_source_persists_reconnect_and_refuses_257_without_resetting_watermarks(
     ) {

@@ -1375,6 +1375,29 @@ test("alignment cannot trust nominal wall estimates without the mandatory termin
   await client.close();
 });
 
+test("alignment discontinuity requires bounded reason and missing-capture terminal warnings", async () => {
+  for (const reason of ["missing_timing", "inconsistent_coordinates", "pause"] as const) {
+    const required = reason === "pause" ? [reason] : [reason, "capture_alignment_missing"];
+    for (const defect of ["reason", "capture", "status", "valid"] as const) {
+      if (reason === "pause" && defect === "capture") continue;
+      const { client, transport, iterator, requestId } = await alignmentClient();
+      const page = alignmentPage(requestId);
+      (page.page as { entries: unknown[] }).entries.push({ kind: "discontinuity", capture_epoch: "1", reason });
+      transport.push(page); await iterator.next();
+      const terminal = iterator.next();
+      const warnings = required.filter((value) => defect === "reason" ? value !== reason : defect === "capture" ? value !== "capture_alignment_missing" : true);
+      transport.push({ type: "recording_alignment_complete", protocol_version: 4, request_id: requestId, completion: {
+        source: alignmentSource, page_count: "1", coverage_status: defect === "status" ? "available" : "partial", warnings, traversal_succeeded: true,
+      } });
+      if (defect === "valid") {
+        const result = await terminal; assert.equal(result.value.coverageStatus, "partial");
+        assert.equal(result.value.warnings.includes("audio_missing"), false);
+      } else await assert.rejects(terminal, /warning|coverage status/);
+      await client.close();
+    }
+  }
+});
+
 class InMemoryTransport implements RuntimeTransport {
   readonly inbox = new AsyncChannel<unknown>();
   readonly messages = this.inbox;

@@ -1026,6 +1026,9 @@ class AlignmentIterator implements AsyncIterableIterator<AlignmentItem> {
         if (entry.kind === "frame") {
           if (entry.wall !== null) this.observedWarnings.add("local_wall_timestamp_estimate");
           for (const reason of entry.reasons) this.observedWarnings.add(reason);
+        } else if (entry.kind === "discontinuity") {
+          this.observedWarnings.add(entry.reason);
+          if (entry.reason === "missing_timing" || entry.reason === "inconsistent_coordinates") this.observedWarnings.add("capture_alignment_missing");
         } else if (entry.kind === "audio_gap") this.observedWarnings.add("audio_missing");
         else if (entry.kind === "alignment_limit") this.observedWarnings.add("alignment_limit_exceeded");
       }

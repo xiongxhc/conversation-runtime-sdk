@@ -18,6 +18,13 @@ have independent histories. Producer domains still must be random per process.
 This protocol/resource failure is separate from metadata-byte/count exhaustion,
 whose explicit limit marker continues PCM with absent timing.
 
+The configured `max_frames_per_second` counts PCM frames only. Epoch, clock-pair
+and discontinuity records use a separate fixed128-record/s budget. Each budget
+has an independent one-second window retained by the timed reservation; reconnect,
+epoch and domain changes reset neither. The exact cap is admitted and the next
+record refused until that budget's window resets. Authentication/playback grammar
+and legacy media-v1 admission remain unchanged; metadata is never unbounded.
+
 ## Framing
 
 Integers are big-endian; PCM alone uses the declared little-endian format.

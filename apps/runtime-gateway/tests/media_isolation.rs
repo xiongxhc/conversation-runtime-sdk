@@ -20,9 +20,13 @@ const RECEIVE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[tokio::test]
 async fn timed_metadata_faults_preserve_pcm_without_inventing_audio_gaps_or_recognizer_events() {
-    use conversation_model_adapters::{CaptureDiscontinuityReason, CaptureEpoch, CaptureMetadata};
+    use conversation_model_adapters::{
+        CaptureClockPair, CaptureDiscontinuityReason, CaptureEpoch, CaptureMetadata,
+        FrameProvenance,
+    };
     let server = MediaServer::bind(
         MediaServerConfig::loopback()
+            .with_max_frames_per_second(1)
             .with_capture_format(Some("pcm_s16le/24000/1/20ms".into()))
             .unwrap(),
     )
@@ -57,6 +61,27 @@ async fn timed_metadata_faults_preserve_pcm_without_inventing_audio_gaps_or_reco
             .unwrap()
             .unwrap(),
         VoiceInputEvent::CaptureMetadata(CaptureMetadata::Epoch(epoch))
+    );
+    let pair = CaptureClockPair {
+        clock_domain_id: "source-process".into(),
+        wall_epoch: 1,
+        sequence: 1,
+        host_before_ns: 900_000_000,
+        host_after_ns: 900_000_000,
+        local_unix_ns: 2_000_000_000,
+        wall_resolution_ns: 1,
+        external_utc_accuracy_ns: None,
+    };
+    let mut body = 41_u64.to_be_bytes().to_vec();
+    body.extend(pair.encode().unwrap());
+    send_timed_packet(&mut bridge, 7, &body).await;
+    assert_eq!(
+        timeout(RECEIVE_TIMEOUT, recording.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        VoiceInputEvent::CaptureMetadata(CaptureMetadata::ClockPair(pair))
     );
     for reason in [
         CaptureDiscontinuityReason::MissingTiming,
@@ -117,6 +142,35 @@ async fn timed_metadata_faults_preserve_pcm_without_inventing_audio_gaps_or_reco
     );
     assert!(recording.try_recv().is_err());
     assert!(recognition.try_recv().is_err());
+    // The exact configured PCM cap was admitted alongside mandatory metadata.
+    // The next structurally valid PCM frame must still be refused.
+    let mut next = frame.clone();
+    let mut timing = FrameProvenance::decode(&next[25..113]).unwrap();
+    timing.sequence += 1;
+    timing.output_start_sample += u64::from(timing.sample_count);
+    timing.source_start_numerator = timing.source_end_numerator;
+    timing.source_end_numerator +=
+        u64::from(timing.sample_count) * u64::from(timing.source_rate_hz);
+    if let Some(span) = timing.span.as_mut() {
+        let width = span.host_end_ns - span.host_start_ns;
+        span.host_start_ns = span.host_end_ns;
+        span.host_end_ns += width;
+    }
+    next[25..113].copy_from_slice(&timing.encode().unwrap());
+    bridge.write_all(&next).await.unwrap();
+    assert!(timeout(RECEIVE_TIMEOUT, bridge.read_u8())
+        .await
+        .unwrap()
+        .is_err());
+    while let Ok(Some(Ok(event))) = timeout(Duration::from_millis(20), recording.recv()).await {
+        assert!(!matches!(
+            event,
+            VoiceInputEvent::Capture(CaptureEvent::Frame(_))
+        ));
+    }
+    while let Ok(Some(Ok(event))) = timeout(Duration::from_millis(20), recognition.recv()).await {
+        assert!(!matches!(event, CaptureEvent::Frame(_)));
+    }
     cancel.cancel();
     server.shutdown().await;
 }

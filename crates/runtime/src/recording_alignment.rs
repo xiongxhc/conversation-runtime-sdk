@@ -3,8 +3,8 @@ use crate::session_recording::{
     exact_media_ms, preflight_finalized_recording, RecordedChunk, RecordedChunks, RecordingSettings,
 };
 use conversation_model_adapters::{
-    CaptureClockPair, CaptureEpoch, CaptureMetadata, FrameProvenance, MAX_CLOCK_BRACKET_NS,
-    MAX_CLOCK_PAIR_GAP_NS, MAX_CLOCK_RESIDUAL_NS,
+    CaptureClockPair, CaptureDiscontinuityReason, CaptureEpoch, CaptureMetadata, FrameProvenance,
+    MAX_CLOCK_BRACKET_NS, MAX_CLOCK_PAIR_GAP_NS, MAX_CLOCK_RESIDUAL_NS,
 };
 use conversation_protocol::{
     ClientAlignmentEntry, ClientAlignmentPolicy, ClientCaptureClockPair, ClientCaptureEpoch,
@@ -88,7 +88,7 @@ fn walk_alignment(
     let mut samples = 0_u64;
     let mut rate = 0_u32;
     let mut gap_ms = 0_u64;
-    let mut gap: Option<(u64, u64)> = None;
+    let mut gap: Option<(u64, Option<u64>)> = None;
     while let Some(chunk) = next(&mut frames, cancel)? {
         let entry = match &chunk {
             RecordedChunk::TimingPolicy => None,
@@ -105,19 +105,29 @@ fn walk_alignment(
             RecordedChunk::CaptureMetadata(CaptureMetadata::Discontinuity {
                 capture_epoch,
                 reason,
-            }) => Some(ClientAlignmentEntry::Discontinuity {
-                capture_epoch: capture_epoch.to_string(),
-                reason: reason.as_str().into(),
-            }),
+            }) => {
+                warnings.insert(reason.as_str().into());
+                if matches!(
+                    reason,
+                    CaptureDiscontinuityReason::MissingTiming
+                        | CaptureDiscontinuityReason::InconsistentCoordinates
+                ) {
+                    warnings.insert("capture_alignment_missing".into());
+                }
+                Some(ClientAlignmentEntry::Discontinuity {
+                    capture_epoch: capture_epoch.to_string(),
+                    reason: reason.as_str().into(),
+                })
+            }
             RecordedChunk::AlignmentLimit => {
                 warnings.insert("alignment_limit_exceeded".into());
                 Some(ClientAlignmentEntry::AlignmentLimit)
             }
             RecordedChunk::GapStarted { at_ms, .. } => {
                 let start = if rate == 0 {
-                    0
+                    None
                 } else {
-                    exact_media_ms(samples, rate, gap_ms)?
+                    Some(exact_media_ms(samples, rate, gap_ms)?)
                 };
                 gap = Some((*at_ms, start));
                 warnings.insert("audio_missing".into());
@@ -141,19 +151,19 @@ fn walk_alignment(
                 } else {
                     exact_media_ms(samples, rate, gap_ms)?
                 };
-                Some(ClientAlignmentEntry::AudioGap {
+                start.map(|start| ClientAlignmentEntry::AudioGap {
                     started_at_ms: start.to_string(),
                     ended_at_ms: Some(end.to_string()),
                     reason: "capture_discontinuity".into(),
                 })
             }
-            RecordedChunk::Ended { .. } => {
-                gap.take().map(|(_, start)| ClientAlignmentEntry::AudioGap {
+            RecordedChunk::Ended { .. } => gap.take().and_then(|(_, start)| start).map(|start| {
+                ClientAlignmentEntry::AudioGap {
                     started_at_ms: start.to_string(),
                     ended_at_ms: None,
                     reason: "capture_discontinuity".into(),
-                })
-            }
+                }
+            }),
             RecordedChunk::TimedFrame {
                 format,
                 timing,

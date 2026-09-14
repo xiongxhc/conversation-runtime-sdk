@@ -45,6 +45,9 @@ recorded core gap milliseconds, with integer floor only when projecting an
 endpoint. Writer and reader use the same carried fraction, never independent
 per-frame rounding. Gaps have no capture samples. Unclosed gap end stays unknown.
 Timing-only omission creates no audio gap. Empty recordings have no origin.
+An authenticated core gap before the first PCM retains its discontinuity/barrier
+and warnings, but emits no positioned `audio_gap`, whether closed before later
+PCM or still open at terminal. Later PCM begins at sample0 with no pre-audio extent.
 
 ## Alignment read control v4
 
@@ -58,6 +61,11 @@ frames retain media sample coordinates, nullable capture/wall mapping and bounde
 reasons. Pages contain index, entries and policy, <=64 entries AND <=32768 encoded
 bytes. Completion contains page_count, coverage_status available|partial|
 unavailable_legacy, bounded warnings and traversal_succeeded=true.
+Every emitted discontinuity reason is required in the terminal warning summary
+and forces partial coverage. `missing_timing` and `inconsistent_coordinates` also
+require `capture_alignment_missing`, without inventing `audio_missing` or PCM
+loss. The SDK checks these entry-to-terminal obligations even if all emitted
+frames individually have valid mappings. The closed warning vocabulary is unchanged.
 
 Pages are TENTATIVE until the sole correlated terminal completion validates fixed
 identity, contiguous indexes and page count. Error/EOF/missing terminal invalidates

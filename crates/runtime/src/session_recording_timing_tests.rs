@@ -166,6 +166,152 @@ async fn alignment(
     items
 }
 
+async fn review_pre_pcm_gap(with_pcm: bool) {
+    let fixture = Fixture::new();
+    let mut recorder = fixture.recorder();
+    recorder
+        .record_capture_metadata(&CaptureMetadata::Epoch(epoch()))
+        .unwrap();
+    recorder
+        .record_capture_metadata(&CaptureMetadata::Discontinuity {
+            capture_epoch: 1,
+            reason: CaptureDiscontinuityReason::Pause,
+        })
+        .unwrap();
+    recorder.record_capture_gap().unwrap();
+    if with_pcm {
+        recorder.record_frame(&timed_frame(0)).unwrap();
+    }
+    let (summary, capability) = recorder.finalize_with_capability().unwrap();
+    assert_eq!(summary.duration_ms, 0);
+    let items = alignment(&fixture, capability).await;
+    let entries: Vec<_> = items
+        .iter()
+        .filter_map(|item| match item {
+            RecordingAlignmentItem::Page(page) => Some(page.entries.iter()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| matches!(entry, ClientAlignmentEntry::AudioGap { .. })),
+        "pre-PCM gap fabricated a positioned media origin"
+    );
+    assert!(entries.iter().any(|entry| matches!(entry, ClientAlignmentEntry::Discontinuity { reason, .. } if reason == "pause")));
+    let frames: Vec<_> = entries
+        .iter()
+        .filter_map(|entry| match entry {
+            ClientAlignmentEntry::Frame {
+                media_start_sample,
+                media_end_sample,
+                gap_offset_ms,
+                ..
+            } => Some((
+                media_start_sample.as_str(),
+                media_end_sample.as_str(),
+                gap_offset_ms.as_str(),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        frames,
+        if with_pcm {
+            vec![("0", "1", "0")]
+        } else {
+            vec![]
+        }
+    );
+}
+#[tokio::test]
+async fn review_closed_pre_pcm_gap_has_no_positioned_origin() {
+    review_pre_pcm_gap(true).await;
+}
+#[tokio::test]
+async fn review_terminal_pre_pcm_gap_has_no_positioned_origin() {
+    review_pre_pcm_gap(false).await;
+}
+
+#[tokio::test]
+async fn review_timing_discontinuities_force_partial_without_audio_loss() {
+    for reason in [
+        CaptureDiscontinuityReason::MissingTiming,
+        CaptureDiscontinuityReason::InconsistentCoordinates,
+    ] {
+        for followed_by_frame in [false, true] {
+            let fixture = Fixture::new();
+            let mut recorder = fixture.recorder();
+            recorder
+                .record_capture_metadata(&CaptureMetadata::Epoch(epoch()))
+                .unwrap();
+            recorder
+                .record_capture_metadata(&pair(1, 900_000_000, 2_000_000_000))
+                .unwrap();
+            recorder.record_frame(&timed_frame(0)).unwrap();
+            recorder
+                .record_capture_metadata(&pair(2, 1_000_100_000, 2_100_100_000))
+                .unwrap();
+            recorder
+                .record_capture_metadata(&CaptureMetadata::Discontinuity {
+                    capture_epoch: 1,
+                    reason,
+                })
+                .unwrap();
+            if followed_by_frame {
+                recorder
+                    .record_capture_metadata(&pair(3, 1_000_150_000, 2_100_150_000))
+                    .unwrap();
+                let original = timed_frame(1);
+                let mut timing = original.capture_timing().unwrap().clone();
+                let span = timing.frame.span.as_mut().unwrap();
+                span.host_start_ns = 1_000_200_000;
+                span.host_end_ns = 1_000_241_667;
+                recorder
+                    .record_frame(&original.with_capture_timing(timing).unwrap())
+                    .unwrap();
+                recorder
+                    .record_capture_metadata(&pair(4, 1_000_300_000, 2_100_300_000))
+                    .unwrap();
+            }
+            let (_, capability) = recorder.finalize_with_capability().unwrap();
+            let items = alignment(&fixture, capability).await;
+            let RecordingAlignmentItem::Complete(complete) = items.last().unwrap() else {
+                panic!("missing terminal")
+            };
+            assert_eq!(
+                complete.coverage_status, "partial",
+                "timing discontinuity was hidden"
+            );
+            assert!(complete.warnings.contains(&reason.as_str().to_owned()));
+            assert!(complete
+                .warnings
+                .contains(&"capture_alignment_missing".into()));
+            assert!(!complete.warnings.contains(&"audio_missing".into()));
+            let mut frames = 0;
+            for item in &items {
+                if let RecordingAlignmentItem::Page(page) = item {
+                    for entry in &page.entries {
+                        assert!(!matches!(entry, ClientAlignmentEntry::AudioGap { .. }));
+                        if let ClientAlignmentEntry::Frame {
+                            wall,
+                            capture_status,
+                            ..
+                        } = entry
+                        {
+                            frames += 1;
+                            assert!(wall.is_some());
+                            assert_eq!(capture_status, "available");
+                        }
+                    }
+                }
+            }
+            assert_eq!(frames, if followed_by_frame { 2 } else { 1 });
+        }
+    }
+}
+
 #[tokio::test]
 async fn delayed_pair_reopen_preserves_fractional_samples_and_unknown_accuracy() {
     let fixture = Fixture::new();

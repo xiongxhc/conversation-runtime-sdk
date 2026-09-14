@@ -35,6 +35,21 @@ test("spawns without a shell", async () => {
   );
 });
 
+test("explicit v4 is passed as argv while absent selection preserves default argv", async () => {
+  await withGateway(
+    "emit({ argv: process.argv.slice(2) }); process.stdin.resume(); process.stdin.once('end', () => process.exit(0));",
+    async ({ gatewayPath, configPath }) => {
+      for (const protocolVersion of [undefined, 4] as const) {
+        const transport = await StdioGatewayTransport.start({ gatewayPath, configPath, ...(protocolVersion === undefined ? {} : { protocolVersion }) });
+        const message = await transport.messages[Symbol.asyncIterator]().next();
+        assert.deepEqual(message.value, { argv: ["--config", configPath, ...(protocolVersion === 4 ? ["--client-protocol-version", "4"] : [])] });
+        await transport.close();
+      }
+    },
+  );
+  await assert.rejects(StdioGatewayTransport.start({ gatewayPath: "/nonexistent", configPath: "/nonexistent", protocolVersion: 3 as 4 }), /protocol selection is invalid/);
+});
+
 test("continuously drains bounded stderr until the child exits", async () => {
   await withGateway(
     "emit({ type: 'ready', protocol_version: 1, status }); (async () => { const chunk = 'x'.repeat(65536); for (let index = 0; index < 8; index += 1) { if (!process.stderr.write(chunk)) await new Promise((resolve) => process.stderr.once('drain', resolve)); } process.exit(0); })();",

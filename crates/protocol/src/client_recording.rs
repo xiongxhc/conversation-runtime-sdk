@@ -4,7 +4,40 @@
 //! which key sealed it — never the key itself. `key_id` identifies the key so an operator can
 //! tell two recordings apart; it is a digest of the key material and cannot be inverted.
 
-use crate::ClientWireError;
+use crate::{ClientWireError, SessionId};
+
+/// A bearer authorization for one finalized encrypted recording. Never log or publish it.
+#[derive(Clone, Eq, PartialEq)]
+pub struct FinalizedRecordingCapability {
+    pub source_session_id: SessionId,
+    pub recording_handle: String,
+    pub sha256: String,
+    pub key_id: String,
+    pub authorization: String,
+}
+
+impl std::fmt::Debug for FinalizedRecordingCapability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FinalizedRecordingCapability([REDACTED])")
+    }
+}
+
+impl FinalizedRecordingCapability {
+    /// Structural validation only; the recording-key owner must authenticate the tag.
+    pub fn validate(&self) -> Result<(), ClientWireError> {
+        let hex =
+            |value: &str, length| value.len() == length && value.bytes().all(is_lowercase_hex);
+        if self.source_session_id.get() == 0
+            || !hex(&self.recording_handle, 32)
+            || !hex(&self.sha256, 64)
+            || !hex(&self.key_id, 16)
+            || !hex(&self.authorization, 64)
+        {
+            return Err(ClientWireError::InvalidFinalizedRecordingCapability);
+        }
+        Ok(())
+    }
+}
 
 /// The most gaps one recording may report.
 pub const MAX_CLIENT_RECORDING_GAPS: usize = 256;

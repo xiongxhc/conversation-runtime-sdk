@@ -2,6 +2,8 @@ export { CommandRejectedError, RuntimeClient, type RuntimeTransport, type Runtim
 export { FrameDecoder, FrameError, MAX_FRAME_BYTES, encodeFrame } from "./framing.js";
 export {
   CLIENT_PROTOCOL_VERSION,
+  DEFAULT_CLIENT_PROTOCOL_VERSION,
+  FINALIZED_RECORDING_PROTOCOL_VERSION,
   CONTEXT_SEED_PROTOCOL_VERSION,
   LEGACY_CLIENT_PROTOCOL_VERSION,
   MAX_CONVERSATION_MESSAGE_BYTES,
@@ -42,6 +44,8 @@ export {
   type ProcessedText,
   type RecordingReconciliation,
   type RecordingSummary,
+  type FinalizedRecordingCapability,
+  type FinalizedRecordingForVersion,
   type RuntimeEvent,
   type RuntimeComponentDescriptor,
   type RuntimeFailure,

@@ -45,7 +45,10 @@ export class StdioGatewayTransport implements RuntimeTransport {
     child.stdin.on("error", () => this.fail(new Error("gateway stdin failed")));
   }
 
-  static async start(options: { gatewayPath: string; configPath: string }): Promise<StdioGatewayTransport> {
+  static async start(options: { gatewayPath: string; configPath: string; protocolVersion?: 4 }): Promise<StdioGatewayTransport> {
+    if (options.protocolVersion !== undefined && options.protocolVersion !== 4) {
+      throw new Error("gateway protocol selection is invalid");
+    }
     if (!isAbsolute(options.gatewayPath)) {
       throw new Error("absolute gateway path is required");
     }
@@ -54,7 +57,9 @@ export class StdioGatewayTransport implements RuntimeTransport {
     }
     let child: ChildProcessWithoutNullStreams;
     try {
-      child = spawn(options.gatewayPath, ["--config", options.configPath], {
+      const args = ["--config", options.configPath];
+      if (options.protocolVersion === 4) args.push("--client-protocol-version", "4");
+      child = spawn(options.gatewayPath, args, {
         shell: false,
         stdio: ["pipe", "pipe", "pipe"],
       });

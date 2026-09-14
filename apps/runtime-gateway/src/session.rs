@@ -16,12 +16,14 @@ use conversation_protocol::{
     ClientVoiceSessionEvent, GatewayMessage, MemoryApproval, RecoveryDisposition, RuntimeError,
     RuntimeErrorKind, RuntimeEvent, RuntimeProfile, RuntimeStage, RuntimeStatus, SessionId, TurnId,
     VoiceResponseMode, VoiceSessionEvent, CLIENT_PROTOCOL_VERSION, CONTEXT_SEED_PROTOCOL_VERSION,
-    LEGACY_CLIENT_PROTOCOL_VERSION, MEDIA_PROTOCOL_VERSION, RUNTIME_PROFILE_PROTOCOL_VERSION,
+    DEFAULT_CLIENT_PROTOCOL_VERSION, LEGACY_CLIENT_PROTOCOL_VERSION, MEDIA_PROTOCOL_VERSION,
+    RUNTIME_PROFILE_PROTOCOL_VERSION,
 };
 use conversation_runtime::{
-    process_text, reconcile_recording, ConversationContext, ProcessedText, RecordingSettings,
-    RecordingSummary, SessionRecorder, TextProcessingRequest, TextTurnEventStream, TextTurnRuntime,
-    VoiceSessionAdapters, VoiceSessionEventStream, VoiceSessionRuntime,
+    process_text, reconcile_finalized_recording, reconcile_recording, ConversationContext,
+    ProcessedText, RecordingSettings, RecordingSummary, SessionRecorder, TextProcessingRequest,
+    TextTurnEventStream, TextTurnRuntime, VoiceSessionAdapters, VoiceSessionEventStream,
+    VoiceSessionRuntime,
 };
 #[cfg(not(test))]
 use ring::rand::{SecureRandom, SystemRandom};
@@ -65,6 +67,8 @@ fn next_gateway_session_id() -> SessionId {
 }
 
 pub struct GatewaySession {
+    protocol_v4: bool,
+    control_closed: CancellationToken,
     session_id: SessionId,
     runtime: TextTurnRuntime,
     status: RuntimeStatus,
@@ -193,6 +197,8 @@ impl GatewaySession {
         session_id: SessionId,
     ) -> Self {
         Self {
+            protocol_v4: false,
+            control_closed: CancellationToken::new(),
             session_id,
             runtime,
             status,
@@ -212,6 +218,18 @@ impl GatewaySession {
     #[cfg(test)]
     fn with_test_session_id(mut self, session_id: SessionId) -> Self {
         self.session_id = session_id;
+        self
+    }
+
+    /// Pins this private control connection to v4, including its initial ready frame.
+    pub fn with_v4_control(mut self) -> Self {
+        self.protocol_v4 = true;
+        self
+    }
+
+    /// Signals transport EOF to inline recovery, which cancels and joins its file/provider work.
+    pub fn with_control_closed(mut self, closed: CancellationToken) -> Self {
+        self.control_closed = closed;
         self
     }
 
@@ -338,12 +356,15 @@ impl GatewaySession {
             .take()
             .map(|counts| tokio::spawn(forward_extracted_counts(counts, event_sender.clone())));
         let (terminal_written, mut terminal_written_receiver) = mpsc::unbounded_channel();
-        // The gateway announces its newest version in `ready` and then answers
-        // on whatever version the client actually speaks, so a client that stays
-        // on an older version never receives a field its parser rejects. It
-        // never drops below the lowest version its own status can be stated at.
+        // Explicit v4 remains pinned. Default startup still announces v3 and preserves the
+        // legacy per-command response policy, including the minimum truthful status version.
         let minimum_version = minimum_status_version(&self.status);
-        let negotiated_version = Arc::new(AtomicU64::new(CLIENT_PROTOCOL_VERSION));
+        let initial_version = if self.protocol_v4 {
+            CLIENT_PROTOCOL_VERSION
+        } else {
+            DEFAULT_CLIENT_PROTOCOL_VERSION
+        };
+        let negotiated_version = Arc::new(AtomicU64::new(initial_version));
         let mut writer_task = tokio::spawn(writer_loop(
             writer,
             urgent_receiver,
@@ -361,8 +382,15 @@ impl GatewaySession {
 
         let exit = if let Err(error) = send_urgent(
             &urgent_sender,
-            GatewayMessage::Ready {
-                status: self.status.clone(),
+            if self.protocol_v4 {
+                GatewayMessage::ReadyV4 {
+                    status: self.status.clone(),
+                    current_session_id: self.session_id,
+                }
+            } else {
+                GatewayMessage::Ready {
+                    status: self.status.clone(),
+                }
             },
         ) {
             SessionExit::failure(error)
@@ -510,12 +538,12 @@ impl GatewaySession {
                         }
                         let (version, command) = match decode_client_command_with_version(&payload)
                         {
-                            Ok((version, command)) => {
+                            Ok((version, command)) if (version == 4) == self.protocol_v4 => {
                                 negotiated_version
                                     .store(version.max(minimum_version), Ordering::Relaxed);
                                 (version, command)
                             }
-                            Err(_) => {
+                            _ => {
                                 if let Err(error) = send_rejection(
                                     &normal_sender,
                                     INVALID_COMMAND_REQUEST_ID,
@@ -1108,9 +1136,16 @@ impl GatewaySession {
                     )
                     .map_err(CommandFailure::response);
                 };
-                let finalized = active.recorder.lock().await.finalize();
-                let recording = match finalized {
-                    Ok(summary) => client_recording_summary(&summary),
+                let mut recorder = active.recorder.lock().await;
+                let finalized = if self.protocol_v4 {
+                    recorder
+                        .finalize_with_capability()
+                        .map(|(summary, capability)| (summary, Some(capability)))
+                } else {
+                    recorder.finalize().map(|summary| (summary, None))
+                };
+                let (recording, recovery_capability) = match finalized {
+                    Ok((summary, capability)) => (client_recording_summary(&summary), capability),
                     Err(error) => {
                         return send_rejection(
                             normal,
@@ -1123,9 +1158,17 @@ impl GatewaySession {
                 send_accepted(normal, &request_id).map_err(CommandFailure::response)?;
                 send_normal(
                     normal,
-                    GatewayMessage::RecordingFinalized {
-                        request_id,
-                        recording,
+                    if let Some(recovery_capability) = recovery_capability {
+                        GatewayMessage::RecordingFinalizedV4 {
+                            request_id,
+                            recording,
+                            recovery_capability,
+                        }
+                    } else {
+                        GatewayMessage::RecordingFinalized {
+                            request_id,
+                            recording,
+                        }
                     },
                 )
                 .map_err(CommandFailure::response)
@@ -1200,6 +1243,65 @@ impl GatewaySession {
                     },
                 )
                 .map_err(CommandFailure::response)
+            }
+            ClientCommand::ReconcileFinalizedRecording {
+                request_id,
+                capability,
+            } => {
+                if voice.active.is_some() || active.is_some() {
+                    return send_rejection(
+                        normal,
+                        &request_id,
+                        command_error("recording recovery requires an idle session"),
+                    )
+                    .map_err(CommandFailure::response);
+                }
+                let (Some(settings), Some(diarizer)) =
+                    (self.recording.as_ref(), self.reconciliation.clone())
+                else {
+                    return send_rejection(
+                        normal,
+                        &request_id,
+                        command_error("this deployment does not reconcile recordings"),
+                    )
+                    .map_err(CommandFailure::response);
+                };
+                let cancellation = self
+                    .provider_failure
+                    .clone()
+                    .unwrap_or_default()
+                    .child_token();
+                let recovery = reconcile_finalized_recording(
+                    settings,
+                    &capability,
+                    diarizer,
+                    cancellation.clone(),
+                );
+                tokio::pin!(recovery);
+                let result = tokio::select! {
+                    result = &mut recovery => result,
+                    _ = self.control_closed.cancelled() => {
+                        cancellation.cancel();
+                        recovery.await
+                    }
+                };
+                match result {
+                    Ok(result) => {
+                        send_accepted(normal, &request_id).map_err(CommandFailure::response)?;
+                        send_normal(
+                            normal,
+                            GatewayMessage::RecordingReconciled {
+                                request_id,
+                                reconciliation: client_reconciliation(&result),
+                            },
+                        )
+                        .map_err(CommandFailure::response)
+                    }
+                    Err(error) => {
+                        send_rejection(normal, &request_id, ClientRuntimeError::from(error))
+                            .map_err(CommandFailure::response)
+                    }
+                }
             }
             ClientCommand::ProcessText {
                 request_id,
@@ -2122,7 +2224,7 @@ fn minimum_status_version(status: &RuntimeStatus) -> u64 {
     ]
     .into_iter()
     .find(|version| encode_gateway_message_for_version(&ready, *version).is_ok())
-    .unwrap_or(CLIENT_PROTOCOL_VERSION)
+    .unwrap_or(DEFAULT_CLIENT_PROTOCOL_VERSION)
 }
 
 fn is_terminal_voice_message(message: &GatewayMessage) -> bool {
@@ -3778,7 +3880,10 @@ mod tests {
     async fn context_seed_capability_follows_text_in_the_v2_ready_message() {
         let ready = first_ready_message(GatewaySession::new(unused_runtime(), status())).await;
 
-        assert!(ready.contains(&format!(r#""protocol_version":{CLIENT_PROTOCOL_VERSION}"#)));
+        assert!(ready.contains(&format!(
+            r#""protocol_version":{}"#,
+            super::DEFAULT_CLIENT_PROTOCOL_VERSION
+        )));
         assert_eq!(
             ready_capabilities(&ready),
             vec!["text".to_owned(), "conversation_context_seed".to_owned()]
@@ -8627,6 +8732,145 @@ max_error_bytes = 65536
     }
 
     // --- post-meeting reconciliation -------------------------------------------------------
+
+    #[tokio::test]
+    async fn restart_protocol_is_pinned_without_changing_default_legacy_floor_policy() {
+        for explicit in [false, true] {
+            let session = GatewaySession::new(unused_runtime(), status());
+            let mut gateway = InMemoryGateway::start(if explicit {
+                session.with_v4_control()
+            } else {
+                session
+            })
+            .await;
+            let refused = if explicit { 3 } else { 4 };
+            gateway
+                .write(&format!(
+                    r#"{{"protocol_version":{refused},"type":"status","request_id":"wrong"}}"#
+                ))
+                .await;
+            let rejection: serde_json::Value =
+                serde_json::from_str(&gateway.read_message().await).unwrap();
+            assert_eq!(rejection["type"], "command_rejected");
+            assert_eq!(rejection["protocol_version"], if explicit { 4 } else { 3 });
+            let version = if explicit { 4 } else { 1 };
+            gateway
+                .write(&format!(
+                    r#"{{"protocol_version":{version},"type":"status","request_id":"correct"}}"#
+                ))
+                .await;
+            let accepted: serde_json::Value =
+                serde_json::from_str(&gateway.read_message().await).unwrap();
+            assert_eq!(accepted["type"], "command_accepted");
+            // This fixture advertises context seeding, whose legacy response floor is v2.
+            assert_eq!(accepted["protocol_version"], if explicit { 4 } else { 2 });
+            gateway.read_message().await;
+            gateway.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_recovery_refuses_live_voice_and_pending_text_before_authorization() {
+        let command = serde_json::json!({"protocol_version":4,"type":"reconcile_finalized_recording","request_id":"recovery","capability":{
+            "source_session_id":"41","recording_handle":"a".repeat(32),"sha256":"b".repeat(64),"key_id":"c".repeat(16),"authorization":"d".repeat(64)
+        }}).to_string();
+        let (input, receiver) = mpsc::channel(8);
+        let session = session_with_interactive_voice(
+            receiver,
+            Arc::new(MockGenerationLanguageModel::new(["reply"])),
+            no_speech_frames(),
+        )
+        .with_v4_control();
+        let mut voice = InMemoryGateway::start(session).await;
+        voice
+            .write(r#"{"protocol_version":4,"type":"start_voice_session","request_id":"voice"}"#)
+            .await;
+        voice
+            .read_until(|value| value.contains("voice_session_started"))
+            .await;
+        voice.write(&command).await;
+        let rejected = voice.read_message().await;
+        assert!(rejected.contains("recording recovery requires an idle session"));
+        drop(input);
+        voice.close().await;
+
+        let started = Arc::new(Notify::new());
+        let model = Arc::new(PendingLanguageModel {
+            started: started.clone(),
+            release: Arc::new(Notify::new()),
+        });
+        let session = GatewaySession::new(
+            conversation_runtime::TextTurnRuntime::new(test_context(), model),
+            status(),
+        )
+        .with_v4_control();
+        let mut text = InMemoryGateway::start(session).await;
+        text.write(r#"{"protocol_version":4,"type":"start_turn","request_id":"turn","transcript":"hello"}"#).await;
+        timeout(TEST_TIMEOUT, started.notified()).await.unwrap();
+        text.write(&command).await;
+        let rejected = text
+            .read_until(|value| value.contains(r#""request_id":"recovery""#))
+            .await;
+        assert!(rejected
+            .last()
+            .unwrap()
+            .contains("recording recovery requires an idle session"));
+        text.close().await;
+    }
+
+    #[tokio::test]
+    async fn restart_recovery_on_control_eof_cancels_and_joins_provider_work() {
+        struct PendingRecovery {
+            started: Arc<Notify>,
+            finished: Arc<Notify>,
+        }
+        impl TranscriptionDiarizer for PendingRecovery {
+            fn diarize<'a>(
+                &'a self,
+                windows: MeetingAudioWindows,
+                cancellation: CancellationToken,
+            ) -> AdapterFuture<'a, DiarizationResult> {
+                Box::pin(async move {
+                    self.started.notify_one();
+                    cancellation.cancelled().await;
+                    drop(windows);
+                    self.finished.notify_one();
+                    Err(AdapterError::new("synthetic cancellation"))
+                })
+            }
+        }
+        let directory = TempDir::new().unwrap();
+        let key_env = "RUNTIME_GATEWAY_RECOVERY_CANCEL_SYNTHETIC_KEY";
+        std::env::set_var(key_env, FAKE_RECORDING_KEY);
+        let settings = RecordingSettings::new(directory.path(), key_env).unwrap();
+        let mut recorder =
+            conversation_runtime::SessionRecorder::start(&settings, SessionId::new(41)).unwrap();
+        let (_, capability) = recorder.finalize_with_capability().unwrap();
+        let closed = CancellationToken::new();
+        let started = Arc::new(Notify::new());
+        let finished = Arc::new(Notify::new());
+        let session = GatewaySession::new(unused_runtime(), status())
+            .with_v4_control()
+            .with_control_closed(closed.clone())
+            .with_recording(settings)
+            .with_reconciliation(Arc::new(PendingRecovery {
+                started: started.clone(),
+                finished: finished.clone(),
+            }));
+        let mut gateway = InMemoryGateway::start(session).await;
+        let command = serde_json::json!({"protocol_version":4,"type":"reconcile_finalized_recording","request_id":"recover","capability":{
+            "source_session_id":capability.source_session_id.get().to_string(),"recording_handle":capability.recording_handle,"sha256":capability.sha256,"key_id":capability.key_id,"authorization":capability.authorization
+        }});
+        gateway.write(&command.to_string()).await;
+        timeout(TEST_TIMEOUT, started.notified()).await.unwrap();
+        closed.cancel();
+        timeout(TEST_TIMEOUT, finished.notified()).await.unwrap();
+        let response = gateway.read_message().await;
+        assert_rejected_message(&response, "recover", "invalid_state");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        gateway.close().await;
+        std::env::remove_var(key_env);
+    }
 
     /// A local stand-in for the online diarizer. It answers with one clustered segment and one
     /// unclustered one, which is enough to state the whole wire shape.

@@ -14,10 +14,10 @@ use crate::{
     ClientComponentDescriptor, ClientMemoryCursor, ClientMemoryInspection, ClientMemoryRecord,
     ClientMemoryRetention, ClientMemorySummary, ClientPersonaState, ClientProcessedText,
     ClientRecordingReconciliation, ClientRecordingSummary, ClientVoiceSessionEvent,
-    ConversationMode, ExecutionLocation, FollowUpPolicy, MemoryId, MemoryRetrievalTrace,
-    PrivacyMode, QualityDecision, ResponseControls, RetrievalTraceId, RuntimeError,
-    RuntimeErrorKind, RuntimeEvent, RuntimeProfile, RuntimeStage, RuntimeTimingMilestone,
-    SessionId, SilencePolicy, SpeechPace, TurnId, VoiceResponseMode,
+    ConversationMode, ExecutionLocation, FinalizedRecordingCapability, FollowUpPolicy, MemoryId,
+    MemoryRetrievalTrace, PrivacyMode, QualityDecision, ResponseControls, RetrievalTraceId,
+    RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeProfile, RuntimeStage,
+    RuntimeTimingMilestone, SessionId, SilencePolicy, SpeechPace, TurnId, VoiceResponseMode,
     MAX_CONVERSATION_MESSAGE_BYTES, MAX_HISTORY_BYTES, MAX_MEMORY_CONTENT_BYTES,
     MAX_MEMORY_INSPECTION_HISTORY_ITEMS, MAX_MEMORY_LIST_PAGE_ITEMS, MAX_MEMORY_PREVIEW_BYTES,
 };
@@ -31,10 +31,12 @@ pub const CONTEXT_SEED_PROTOCOL_VERSION: u64 = 2;
 /// The version that introduced the runtime `profile` field and, with it, status
 /// payloads that may report remote execution.
 pub const RUNTIME_PROFILE_PROTOCOL_VERSION: u64 = 3;
-/// The newest protocol version this build speaks. Feature gates name the
-/// version that introduced them instead of this alias, so bumping it never
-/// silently changes how an older client is served.
-pub const CLIENT_PROTOCOL_VERSION: u64 = RUNTIME_PROFILE_PROTOCOL_VERSION;
+/// The version introducing finalized-recording recovery and current control identity.
+pub const FINALIZED_RECORDING_PROTOCOL_VERSION: u64 = 4;
+/// The newest supported version; startup defaults are deliberately separate.
+pub const CLIENT_PROTOCOL_VERSION: u64 = FINALIZED_RECORDING_PROTOCOL_VERSION;
+/// An unchanged client must still receive the version-three startup announcement.
+pub const DEFAULT_CLIENT_PROTOCOL_VERSION: u64 = RUNTIME_PROFILE_PROTOCOL_VERSION;
 pub const MAX_CLIENT_FRAME_BYTES: usize = 512 * 1024;
 pub const MEDIA_PROTOCOL_VERSION: u8 = 1;
 pub const MAX_MEDIA_CONNECT_ENDPOINT_BYTES: usize = 256;
@@ -149,6 +151,10 @@ pub enum ClientCommand {
         request_id: String,
         session_id: SessionId,
         recording_handle: String,
+    },
+    ReconcileFinalizedRecording {
+        request_id: String,
+        capability: FinalizedRecordingCapability,
     },
     /// Turns instructions plus text into JSON the runtime validates against `output_schema`.
     /// It creates no conversation turn. `output_schema` is canonical JSON text. Version 3 only.
@@ -389,6 +395,10 @@ pub enum GatewayMessage {
     Ready {
         status: RuntimeStatus,
     },
+    ReadyV4 {
+        status: RuntimeStatus,
+        current_session_id: SessionId,
+    },
     CommandAccepted {
         request_id: String,
         turn_id: Option<TurnId>,
@@ -438,6 +448,11 @@ pub enum GatewayMessage {
         request_id: String,
         recording: ClientRecordingSummary,
     },
+    RecordingFinalizedV4 {
+        request_id: String,
+        recording: ClientRecordingSummary,
+        recovery_capability: FinalizedRecordingCapability,
+    },
     /// A reconciled recording: timed text and anonymous speaker clusters, never a person.
     /// Version 3 only.
     RecordingReconciled {
@@ -466,6 +481,7 @@ pub enum ClientWireError {
     InvalidMemoryResponse,
     InvalidPersonaState,
     InvalidRecordingSummary,
+    InvalidFinalizedRecordingCapability,
     InvalidRecordingHandle,
     InvalidRecordingReconciliation,
     InvalidTextProcessingRequest,
@@ -500,6 +516,9 @@ impl fmt::Display for ClientWireError {
             Self::InvalidPersonaState => formatter.write_str("invalid client persona state"),
             Self::InvalidRecordingSummary => {
                 formatter.write_str("invalid client recording summary")
+            }
+            Self::InvalidFinalizedRecordingCapability => {
+                formatter.write_str("invalid finalized recording authorization")
             }
             Self::InvalidRecordingHandle => formatter.write_str("invalid client recording handle"),
             Self::InvalidRecordingReconciliation => {
@@ -686,8 +705,14 @@ pub fn decode_client_command_with_version(
     payload: &[u8],
 ) -> Result<(u64, ClientCommand), ClientWireError> {
     validate_payload_size(payload.len())?;
-    let command: WireClientCommand =
-        serde_json::from_slice(payload).map_err(ClientWireError::InvalidJson)?;
+    let command: WireClientCommand = serde_json::from_slice(payload).map_err(|_| {
+        // A malformed tail can prevent identifying the command even after Serde has quoted
+        // a secret unknown key/value. Keep the existing error variant but never retain such
+        // payload-derived diagnostics, including through Error::source or Debug.
+        ClientWireError::InvalidJson(serde_json::Error::io(std::io::Error::other(
+            "client command has invalid JSON or fields",
+        )))
+    })?;
     let protocol_version = command.protocol_version();
     decode_wire_client_command(command).map(|command| (protocol_version, command))
 }
@@ -973,6 +998,22 @@ fn decode_wire_client_command(
                 recording_handle,
             })
         }
+        WireClientCommand::ReconcileFinalizedRecording {
+            protocol_version,
+            request_id,
+            capability,
+        } => {
+            if protocol_version != FINALIZED_RECORDING_PROTOCOL_VERSION {
+                return Err(ClientWireError::UnsupportedProtocolVersion(
+                    protocol_version,
+                ));
+            }
+            validate_request_id(&request_id)?;
+            Ok(ClientCommand::ReconcileFinalizedRecording {
+                request_id,
+                capability: capability.try_into()?,
+            })
+        }
         WireClientCommand::ProcessText {
             protocol_version,
             request_id,
@@ -1122,6 +1163,11 @@ enum WireClientCommand {
         session_id: DecimalIdentifier,
         recording_handle: String,
     },
+    ReconcileFinalizedRecording {
+        protocol_version: u64,
+        request_id: String,
+        capability: WireFinalizedRecordingCapability,
+    },
     ProcessText {
         protocol_version: u64,
         request_id: String,
@@ -1190,6 +1236,9 @@ impl WireClientCommand {
             | Self::ReconcileRecording {
                 protocol_version, ..
             }
+            | Self::ReconcileFinalizedRecording {
+                protocol_version, ..
+            }
             | Self::ProcessText {
                 protocol_version, ..
             } => *protocol_version,
@@ -1202,6 +1251,51 @@ impl WireClientCommand {
 struct WireConversationContextExchange {
     user: String,
     assistant: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireFinalizedRecordingCapability {
+    source_session_id: String,
+    recording_handle: String,
+    sha256: String,
+    key_id: String,
+    authorization: String,
+}
+
+impl TryFrom<WireFinalizedRecordingCapability> for FinalizedRecordingCapability {
+    type Error = ClientWireError;
+    fn try_from(value: WireFinalizedRecordingCapability) -> Result<Self, Self::Error> {
+        if !is_canonical_identifier(&value.source_session_id) {
+            return Err(ClientWireError::InvalidFinalizedRecordingCapability);
+        }
+        let capability = Self {
+            source_session_id: SessionId::new(
+                value
+                    .source_session_id
+                    .parse()
+                    .map_err(|_| ClientWireError::InvalidFinalizedRecordingCapability)?,
+            ),
+            recording_handle: value.recording_handle,
+            sha256: value.sha256,
+            key_id: value.key_id,
+            authorization: value.authorization,
+        };
+        capability.validate()?;
+        Ok(capability)
+    }
+}
+
+impl From<&FinalizedRecordingCapability> for WireFinalizedRecordingCapability {
+    fn from(value: &FinalizedRecordingCapability) -> Self {
+        Self {
+            source_session_id: value.source_session_id.get().to_string(),
+            recording_handle: value.recording_handle.clone(),
+            sha256: value.sha256.clone(),
+            key_id: value.key_id.clone(),
+            authorization: value.authorization.clone(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -1578,6 +1672,8 @@ enum GatewayMessageEnvelope<'a> {
     Ready {
         protocol_version: u64,
         status: WireRuntimeStatus<'a>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        current_session_id: Option<String>,
     },
     CommandAccepted {
         protocol_version: u64,
@@ -1640,6 +1736,8 @@ enum GatewayMessageEnvelope<'a> {
         protocol_version: u64,
         request_id: &'a str,
         recording: WireClientRecordingSummary,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        recovery_capability: Option<WireFinalizedRecordingCapability>,
     },
     RecordingReconciled {
         protocol_version: u64,
@@ -1659,6 +1757,15 @@ impl<'a> GatewayMessageEnvelope<'a> {
             GatewayMessage::Ready { status } => Self::Ready {
                 protocol_version,
                 status: WireRuntimeStatus::new(status, protocol_version),
+                current_session_id: None,
+            },
+            GatewayMessage::ReadyV4 {
+                status,
+                current_session_id,
+            } => Self::Ready {
+                protocol_version,
+                status: WireRuntimeStatus::new(status, protocol_version),
+                current_session_id: Some(current_session_id.get().to_string()),
             },
             GatewayMessage::CommandAccepted {
                 request_id,
@@ -1748,6 +1855,17 @@ impl<'a> GatewayMessageEnvelope<'a> {
                 protocol_version,
                 request_id,
                 recording: WireClientRecordingSummary::from(recording),
+                recovery_capability: None,
+            },
+            GatewayMessage::RecordingFinalizedV4 {
+                request_id,
+                recording,
+                recovery_capability,
+            } => Self::RecordingFinalized {
+                protocol_version,
+                request_id,
+                recording: WireClientRecordingSummary::from(recording),
+                recovery_capability: Some(recovery_capability.into()),
             },
             GatewayMessage::RecordingReconciled {
                 request_id,
@@ -1775,6 +1893,7 @@ fn validate_protocol_version(version: u64) -> Result<(), ClientWireError> {
         LEGACY_CLIENT_PROTOCOL_VERSION
             | CONTEXT_SEED_PROTOCOL_VERSION
             | RUNTIME_PROFILE_PROTOCOL_VERSION
+            | FINALIZED_RECORDING_PROTOCOL_VERSION
     ) {
         Ok(())
     } else {
@@ -1903,7 +2022,24 @@ fn validate_gateway_message(
             }
             crate::client_voice::validate_client_voice_event(event)
         }
-        GatewayMessage::Ready { status } => validate_runtime_status(status, protocol_version),
+        GatewayMessage::Ready { status } => {
+            if protocol_version >= FINALIZED_RECORDING_PROTOCOL_VERSION {
+                return Err(ClientWireError::InvalidIdentifier);
+            }
+            validate_runtime_status(status, protocol_version)
+        }
+        GatewayMessage::ReadyV4 {
+            status,
+            current_session_id,
+        } => {
+            if protocol_version != FINALIZED_RECORDING_PROTOCOL_VERSION {
+                return Err(ClientWireError::UnsupportedProtocolVersion(
+                    protocol_version,
+                ));
+            }
+            validate_identifier(current_session_id.get())?;
+            validate_runtime_status(status, protocol_version)
+        }
         GatewayMessage::PersonaState {
             request_id,
             persona,
@@ -1918,13 +2054,34 @@ fn validate_gateway_message(
         } => {
             // The summary only exists because a version 3 command asked for it, so a frame
             // that cannot name a version 3 message must not carry one.
-            if protocol_version < RUNTIME_PROFILE_PROTOCOL_VERSION {
+            if protocol_version != RUNTIME_PROFILE_PROTOCOL_VERSION {
                 return Err(ClientWireError::UnsupportedProtocolVersion(
                     protocol_version,
                 ));
             }
             validate_request_id(request_id)?;
             validate_client_recording_summary(recording)
+        }
+        GatewayMessage::RecordingFinalizedV4 {
+            request_id,
+            recording,
+            recovery_capability,
+        } => {
+            if protocol_version != FINALIZED_RECORDING_PROTOCOL_VERSION {
+                return Err(ClientWireError::UnsupportedProtocolVersion(
+                    protocol_version,
+                ));
+            }
+            validate_request_id(request_id)?;
+            validate_client_recording_summary(recording)?;
+            recovery_capability.validate()?;
+            if recovery_capability.recording_handle != recording.recording_handle
+                || recovery_capability.sha256 != recording.sha256
+                || recovery_capability.key_id != recording.key_id
+            {
+                return Err(ClientWireError::InvalidFinalizedRecordingCapability);
+            }
+            Ok(())
         }
         GatewayMessage::RecordingReconciled {
             request_id,

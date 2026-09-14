@@ -1452,7 +1452,7 @@ test("refuses a legacy payload that describes remote execution without a profile
   }
 });
 
-test("accepts protocol version 3 commands and rejects version 4", () => {
+test("accepts protocol version 3 commands and rejects unknown version 5", () => {
   assert.deepEqual(
     parseClientCommand({ protocol_version: 3, type: "status", request_id: "req-1" }, 3),
     { type: "status", requestId: "req-1" },
@@ -1473,7 +1473,7 @@ test("accepts protocol version 3 commands and rejects version 4", () => {
     },
   );
   assert.throws(
-    () => parseClientCommand({ protocol_version: 4, type: "status", request_id: "req-1" }),
+    () => parseClientCommand({ protocol_version: 5, type: "status", request_id: "req-1" }),
     /unsupported protocol version/,
   );
 });

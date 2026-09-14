@@ -7,7 +7,8 @@ use conversation_model_adapters::{GenerationLanguageModel, GenerationLanguageReq
 use conversation_protocol::{
     encode_gateway_message_for_version, GatewayMessage, GenerationId, MemoryConfidence,
     MemoryDraft, MemoryKind, MemoryProvenance, MemoryProvenanceKind, MemoryRetention,
-    MemoryRetrievalRequest, SessionId, TurnId, UnixTimestampMillis, CLIENT_PROTOCOL_VERSION,
+    MemoryRetrievalRequest, SessionId, TurnId, UnixTimestampMillis,
+    DEFAULT_CLIENT_PROTOCOL_VERSION as CLIENT_PROTOCOL_VERSION,
 };
 use conversation_runtime_gateway::{
     GatewayAdapters, GatewayConfig, GatewayDeploymentConfig, LanguageDeployment,

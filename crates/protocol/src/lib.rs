@@ -27,8 +27,8 @@ pub use client_memory::{
 };
 pub use client_persona::ClientPersonaState;
 pub use client_recording::{
-    ClientRecordingGap, ClientRecordingSummary, MAX_CLIENT_RECORDING_GAPS,
-    MAX_CLIENT_RECORDING_HANDLE_BYTES, MAX_CLIENT_RECORDING_LABEL_BYTES,
+    ClientRecordingGap, ClientRecordingSummary, FinalizedRecordingCapability,
+    MAX_CLIENT_RECORDING_GAPS, MAX_CLIENT_RECORDING_HANDLE_BYTES, MAX_CLIENT_RECORDING_LABEL_BYTES,
     MAX_CLIENT_RECORDING_PATH_BYTES,
 };
 pub use client_text_processing::{
@@ -46,6 +46,7 @@ pub use client_wire::{
     ClientMemoryTrace, ClientQualityDecision, ClientResponseControls, ClientRuntimeError,
     ClientRuntimeEvent, ClientWireError, ConversationContextExchange, GatewayMessage,
     RuntimeStatus, CLIENT_PROTOCOL_VERSION, CONTEXT_SEED_PROTOCOL_VERSION,
+    DEFAULT_CLIENT_PROTOCOL_VERSION, FINALIZED_RECORDING_PROTOCOL_VERSION,
     LEGACY_CLIENT_PROTOCOL_VERSION, MAX_CLIENT_FRAME_BYTES, MAX_MEDIA_CONNECT_ENDPOINT_BYTES,
     MAX_MEDIA_CREDENTIAL_BYTES, MAX_MEDIA_LEASE_LIFETIME_MS, MAX_MEDIA_RECONNECT_WINDOW_MS,
     MEDIA_PROTOCOL_VERSION, RUNTIME_PROFILE_PROTOCOL_VERSION,

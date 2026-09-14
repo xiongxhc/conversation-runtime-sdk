@@ -10,7 +10,7 @@ import { setImmediate } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
 import {
-  CLIENT_PROTOCOL_VERSION,
+  DEFAULT_CLIENT_PROTOCOL_VERSION as CLIENT_PROTOCOL_VERSION,
   parseGatewayMessage,
   StdioGatewayTransport,
   ClientCommand,

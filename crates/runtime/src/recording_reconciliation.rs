@@ -29,13 +29,15 @@ use conversation_model_adapters::{
     AdapterError, DiarizationResult, DiarizationWarning, MeetingAudioWindow, PcmFormat,
     TranscriptionDiarizer,
 };
-use conversation_protocol::{RuntimeError, RuntimeErrorKind, RuntimeStage, SessionId};
+use conversation_protocol::{
+    FinalizedRecordingCapability, RuntimeError, RuntimeErrorKind, RuntimeStage, SessionId,
+};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::session_recording::{
-    open_session_recording, pcm_duration_ms, resolve_recording_handle, RecordedChunk,
-    RecordingSettings,
+    open_session_recording, pcm_duration_ms, preflight_finalized_recording,
+    resolve_recording_handle, RecordedChunk, RecordedChunks, RecordingSettings,
 };
 
 /// The most plaintext meeting audio one window holds.
@@ -51,6 +53,42 @@ pub const MAX_RECONCILIATION_WINDOW_BYTES: usize = 1024 * 1024;
 /// One window in flight. The reader is a blocking task, so a deeper queue would only buy
 /// resident plaintext.
 const WINDOW_CHANNEL_CAPACITY: usize = 1;
+
+/// Authorizes a finalized recording independently of the current gateway identity. Complete
+/// bounded authentication and decoding precede the first provider call. The second pass uses
+/// the same private encrypted snapshot, never a reopened caller-named path.
+pub async fn reconcile_finalized_recording(
+    settings: &RecordingSettings,
+    capability: &FinalizedRecordingCapability,
+    diarizer: Arc<dyn TranscriptionDiarizer>,
+    cancellation: CancellationToken,
+) -> Result<DiarizationResult, RuntimeError> {
+    let settings = settings.clone();
+    let capability = capability.clone();
+    let preflight_cancellation = cancellation.clone();
+    let chunks = tokio::task::spawn_blocking(move || {
+        preflight_finalized_recording(&settings, &capability, &preflight_cancellation)
+    })
+    .await
+    .map_err(|_| adapter_error("recording preflight did not finish"))??;
+    if cancellation.is_cancelled() {
+        return Err(invalid_state_error("recording recovery was cancelled"));
+    }
+    let (sender, receiver) = mpsc::channel(WINDOW_CHANNEL_CAPACITY);
+    let reader_cancellation = cancellation.clone();
+    let reader = tokio::task::spawn_blocking(move || {
+        read_chunk_windows(chunks, &sender, &reader_cancellation)
+    });
+    let result = diarizer.diarize(receiver, cancellation.clone()).await;
+    let read = reader
+        .await
+        .map_err(|_| adapter_error("recording reader did not finish"))?;
+    read?;
+    if cancellation.is_cancelled() {
+        return Err(invalid_state_error("recording recovery was cancelled"));
+    }
+    result.map_err(|error| adapter_runtime_error(&error))
+}
 
 /// Reconciles the recording named by `handle` into timed text and anonymous clusters.
 ///
@@ -102,13 +140,21 @@ fn read_windows(
     sender: &mpsc::Sender<Result<MeetingAudioWindow, AdapterError>>,
     cancellation: &CancellationToken,
 ) -> Result<bool, RuntimeError> {
-    let mut chunks = open_session_recording(path, key_env)?;
+    let chunks = open_session_recording(path, key_env)?;
     if chunks.session_id() != session_id {
         return Err(invalid_state_error(
             "recording was not made by that session",
         ));
     }
 
+    read_chunk_windows(chunks, sender, cancellation)
+}
+
+fn read_chunk_windows(
+    mut chunks: RecordedChunks,
+    sender: &mpsc::Sender<Result<MeetingAudioWindow, AdapterError>>,
+    cancellation: &CancellationToken,
+) -> Result<bool, RuntimeError> {
     let mut windows = Windows::default();
     loop {
         if cancellation.is_cancelled() {

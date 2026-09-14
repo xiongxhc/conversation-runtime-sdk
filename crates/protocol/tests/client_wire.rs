@@ -15,9 +15,9 @@ use conversation_protocol::{
     QualityDecision, RecoveryDisposition, ResponseControls, RetrievalTraceId, RuntimeError,
     RuntimeErrorKind, RuntimeEvent, RuntimeStage, RuntimeStatus, SessionId, SilencePolicy,
     SpeechPace, TurnId, UnixTimestampMillis, VoiceActivity, VoiceSessionEvent,
-    VoiceTimingMilestone, CLIENT_PROTOCOL_VERSION, CONTEXT_SEED_PROTOCOL_VERSION,
-    LEGACY_CLIENT_PROTOCOL_VERSION, MAX_CLIENT_COMPONENT_DESCRIPTORS,
-    MAX_CLIENT_DEVICE_LABEL_BYTES, MAX_CLIENT_DIARIZED_SEGMENTS,
+    VoiceTimingMilestone, CONTEXT_SEED_PROTOCOL_VERSION,
+    DEFAULT_CLIENT_PROTOCOL_VERSION as CLIENT_PROTOCOL_VERSION, LEGACY_CLIENT_PROTOCOL_VERSION,
+    MAX_CLIENT_COMPONENT_DESCRIPTORS, MAX_CLIENT_DEVICE_LABEL_BYTES, MAX_CLIENT_DIARIZED_SEGMENTS,
     MAX_CLIENT_DIARIZED_SEGMENT_TEXT_BYTES, MAX_CLIENT_FRAME_BYTES,
     MAX_CLIENT_PROCESSED_OUTPUT_BYTES, MAX_CLIENT_PROVIDER_LABEL_BYTES, MAX_CLIENT_RECORDING_GAPS,
     MAX_CONVERSATION_MESSAGE_BYTES, MAX_HISTORY_BYTES, MAX_MEMORY_PREVIEW_BYTES,
@@ -3196,7 +3196,7 @@ fn online_voice_status_may_report_remote_components() {
 }
 
 #[test]
-fn protocol_version_three_is_supported_and_higher_versions_are_rejected() {
+fn protocol_version_three_is_supported_and_unknown_versions_are_rejected() {
     let payload = format!(
         r#"{{"protocol_version":{RUNTIME_PROFILE_PROTOCOL_VERSION},"type":"status","request_id":"req-1"}}"#
     );
@@ -3206,8 +3206,8 @@ fn protocol_version_three_is_supported_and_higher_versions_are_rejected() {
     ));
 
     assert!(matches!(
-        decode_client_command(br#"{"protocol_version":4,"type":"status","request_id":"req-1"}"#),
-        Err(ClientWireError::UnsupportedProtocolVersion(4))
+        decode_client_command(br#"{"protocol_version":5,"type":"status","request_id":"req-1"}"#),
+        Err(ClientWireError::UnsupportedProtocolVersion(5))
     ));
     assert!(matches!(
         decode_client_command(br#"{"protocol_version":0,"type":"status","request_id":"req-1"}"#),
@@ -3303,8 +3303,8 @@ fn finalize_recording_is_a_version_three_command_only() {
     }
     // Unsupported versions stay unsupported rather than becoming a recording command.
     assert!(matches!(
-        decode_client_command(payload(4).as_bytes()),
-        Err(ClientWireError::UnsupportedProtocolVersion(4))
+        decode_client_command(payload(5).as_bytes()),
+        Err(ClientWireError::UnsupportedProtocolVersion(5))
     ));
     // A zero session identifier is not canonical and never reaches the gateway.
     assert!(decode_client_command(
@@ -3511,8 +3511,8 @@ fn reconcile_recording_is_a_version_three_command_only() {
         ));
     }
     assert!(matches!(
-        decode_client_command(payload(4).as_bytes()),
-        Err(ClientWireError::UnsupportedProtocolVersion(4))
+        decode_client_command(payload(5).as_bytes()),
+        Err(ClientWireError::UnsupportedProtocolVersion(5))
     ));
     // A handle that is not a handle never reaches the runtime's resolver.
     for handle in ["", "../escape", "A".repeat(32).as_str(), &"a".repeat(129)] {
@@ -3783,8 +3783,8 @@ fn process_text_is_a_version_three_command_only() {
         ));
     }
     assert!(matches!(
-        decode_client_command(payload(4).as_bytes()),
-        Err(ClientWireError::UnsupportedProtocolVersion(4))
+        decode_client_command(payload(5).as_bytes()),
+        Err(ClientWireError::UnsupportedProtocolVersion(5))
     ));
 }
 

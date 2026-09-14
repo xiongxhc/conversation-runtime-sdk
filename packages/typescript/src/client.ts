@@ -16,6 +16,8 @@ import {
   type ProcessedText,
   type RecordingReconciliation,
   type RecordingSummary,
+  type FinalizedRecordingCapability,
+  type FinalizedRecordingForVersion,
   type RuntimeEvent,
   type RuntimeFailure,
   type RuntimeStatus,
@@ -38,7 +40,7 @@ export interface RuntimeTurn {
 
 export interface VoiceSession<Version extends ClientProtocolVersion = ClientProtocolVersion> {
   /** Present only when a v3 start acceptance grants a media bridge lease. */
-  readonly mediaLease: Version extends 3 ? MediaLease | undefined : undefined;
+  readonly mediaLease: Version extends 3 | 4 ? MediaLease | undefined : undefined;
   events(): AsyncIterable<VoiceSessionEventForVersion<Version>>;
   stop(): Promise<void>;
   pauseCapture(): Promise<void>;
@@ -76,6 +78,12 @@ export class RuntimeClient<Version extends ClientProtocolVersion = ClientProtoco
   private protocolVersion: ClientProtocolVersion | undefined;
   private readyStatus: RuntimeStatus | undefined;
   private requestCounter = 0n;
+  private controlSessionId: bigint | undefined;
+
+  /** Current control identity, distinct from a recovered recording's original provenance. */
+  get currentSessionId(): Version extends 4 ? bigint | undefined : undefined {
+    return this.controlSessionId as Version extends 4 ? bigint | undefined : undefined;
+  }
 
   private constructor(private readonly transport: RuntimeTransport) {}
 
@@ -235,7 +243,7 @@ export class RuntimeClient<Version extends ClientProtocolVersion = ClientProtoco
    * encrypted file; the key that sealed it stays on the runtime host and never reaches a
    * client. Version 3 runtimes only.
    */
-  finalizeRecording({ sessionId }: { sessionId: bigint }): Promise<RecordingSummary> {
+  finalizeRecording({ sessionId }: { sessionId: bigint }): Promise<FinalizedRecordingForVersion<Version>> {
     if (this.protocolVersion === undefined || this.protocolVersion < RUNTIME_PROFILE_PROTOCOL_VERSION) {
       return Promise.reject(new Error("session recording requires protocol version 3"));
     }
@@ -246,13 +254,26 @@ export class RuntimeClient<Version extends ClientProtocolVersion = ClientProtoco
     } catch (error) {
       return Promise.reject(error as Error);
     }
-    const result = new Deferred<RecordingSummary>();
+    const result = new Deferred<RecordingSummary & { recoveryCapability?: FinalizedRecordingCapability }>();
     this.controls.set(requestId, {
       kind: "finalize_recording",
+      sessionId,
       accepted: false,
       result,
       fail: (error) => result.reject(error),
     });
+    this.send(command);
+    return result.promise as Promise<FinalizedRecordingForVersion<Version>>;
+  }
+
+  /** Reconciles a finalized recording after restart; does not change its source identity. */
+  reconcileFinalizedRecording({ capability }: { capability: FinalizedRecordingCapability }): Promise<RecordingReconciliation> {
+    if (this.protocolVersion !== 4) return Promise.reject(new Error("finalized recording recovery requires protocol version 4"));
+    const requestId = this.nextRequestId();
+    const command: ClientCommand = { type: "reconcile_finalized_recording", requestId, capability };
+    try { validateClientCommand(command, 4); } catch { return Promise.reject(new Error("invalid finalized recording capability")); }
+    const result = new Deferred<RecordingReconciliation>();
+    this.controls.set(requestId, { kind: "reconcile_recording", accepted: false, result, fail: (error) => result.reject(error) });
     this.send(command);
     return result.promise;
   }
@@ -479,6 +500,7 @@ export class RuntimeClient<Version extends ClientProtocolVersion = ClientProtoco
           const ready = parseReadyMessage(raw);
           this.protocolVersion = ready.version;
           this.readyStatus = ready.message.status;
+          this.controlSessionId = ready.message.currentSessionId;
           this.route(ready.message);
         } else {
           this.route(parseGatewayMessage(raw, this.protocolVersion!));
@@ -579,8 +601,12 @@ export class RuntimeClient<Version extends ClientProtocolVersion = ClientProtoco
         this.fail(new Error("gateway sent an uncorrelated recording response"));
         return;
       }
+      if (message.recoveryCapability !== undefined && message.recoveryCapability.sourceSessionId !== control.sessionId) {
+        this.fail(new Error("finalized recording capability has different provenance"));
+        return;
+      }
       this.controls.delete(message.requestId);
-      control.result.resolve(message.recording);
+      control.result.resolve(message.recoveryCapability === undefined ? message.recording : { ...message.recording, recoveryCapability: message.recoveryCapability });
       return;
     }
     if (message.type === "recording_reconciled") {
@@ -716,7 +742,7 @@ export class RuntimeClient<Version extends ClientProtocolVersion = ClientProtoco
         const session: VoiceSessionState = { events: new AsyncQueue<VoiceSessionEvent>(), started: false };
         this.activeVoiceSession = session;
         control.result.resolve({
-          mediaLease: mediaLease as Version extends 3 ? MediaLease | undefined : undefined,
+          mediaLease: mediaLease as Version extends 3 | 4 ? MediaLease | undefined : undefined,
           events: () => session.events as AsyncIterable<VoiceSessionEventForVersion<Version>>,
           stop: () => this.voiceControl("stop_voice_session", session),
           pauseCapture: () => this.voiceControl("pause_voice_capture", session),
@@ -770,6 +796,7 @@ export class RuntimeClient<Version extends ClientProtocolVersion = ClientProtoco
       return;
     }
     this.failure = error;
+    this.controlSessionId = undefined;
     this.ready.reject(error);
     for (const control of this.controls.values()) {
       control.fail(error);
@@ -834,7 +861,7 @@ type PendingControl<Version extends ClientProtocolVersion> =
   | { kind: "stop_voice_session"; accepted: boolean; result: Deferred<void>; fail(error: Error): void }
   | { kind: "pause_voice_capture"; accepted: boolean; result: Deferred<void>; fail(error: Error): void }
   | { kind: "resume_voice_capture"; accepted: boolean; result: Deferred<void>; fail(error: Error): void }
-  | { kind: "finalize_recording"; accepted: boolean; result: Deferred<RecordingSummary>; fail(error: Error): void }
+  | { kind: "finalize_recording"; sessionId: bigint; accepted: boolean; result: Deferred<RecordingSummary & { recoveryCapability?: FinalizedRecordingCapability }>; fail(error: Error): void }
   | {
       kind: "reconcile_recording";
       accepted: boolean;

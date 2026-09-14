@@ -4,8 +4,10 @@ export const CONTEXT_SEED_PROTOCOL_VERSION = 2;
 /** The version that introduced the runtime profile and remote execution. */
 export const RUNTIME_PROFILE_PROTOCOL_VERSION = 3;
 /** The newest version this build speaks; feature gates name their own version. */
-export const CLIENT_PROTOCOL_VERSION = RUNTIME_PROFILE_PROTOCOL_VERSION;
-export type ClientProtocolVersion = 1 | 2 | 3;
+export const FINALIZED_RECORDING_PROTOCOL_VERSION = 4;
+export const CLIENT_PROTOCOL_VERSION = FINALIZED_RECORDING_PROTOCOL_VERSION;
+export const DEFAULT_CLIENT_PROTOCOL_VERSION = RUNTIME_PROFILE_PROTOCOL_VERSION;
+export type ClientProtocolVersion = 1 | 2 | 3 | 4;
 export const MAX_CONVERSATION_MESSAGE_BYTES = 16 * 1024;
 export const MAX_HISTORY_MESSAGE_COUNT = 32;
 export const MAX_CONVERSATION_CONTEXT_EXCHANGES = 16;
@@ -66,6 +68,7 @@ export type ClientCommand =
   | { type: "memory_approve"; requestId: string; memoryId: bigint; expectedRevision: bigint }
   | { type: "memory_delete"; requestId: string; memoryId: bigint; expectedRevision: bigint }
   | { type: "finalize_recording"; requestId: string; sessionId: bigint }
+  | { type: "reconcile_finalized_recording"; requestId: string; capability: FinalizedRecordingCapability }
   | {
       type: "reconcile_recording";
       requestId: string;
@@ -105,6 +108,18 @@ export type RecordingSummary = {
   keyId: string;
   gaps: RecordingGap[];
 };
+
+/** Private restart authorization. Persist only in private application state, never logs. */
+export type FinalizedRecordingCapability = {
+  readonly sourceSessionId: bigint;
+  readonly recordingHandle: string;
+  readonly sha256: string;
+  readonly keyId: string;
+  readonly authorization: string;
+};
+
+export type FinalizedRecordingForVersion<Version extends ClientProtocolVersion> =
+  Version extends 4 ? RecordingSummary & { readonly recoveryCapability: FinalizedRecordingCapability } : RecordingSummary;
 
 /**
  * One stretch of speech from a reconciled recording.
@@ -426,7 +441,7 @@ export type VersionThreeVoiceSessionEvent =
 export type VoiceSessionEvent = LegacyVoiceSessionEvent | VersionThreeVoiceSessionEvent;
 
 export type VoiceSessionEventForVersion<Version extends ClientProtocolVersion> =
-  Version extends 3 ? VersionThreeVoiceSessionEvent : LegacyVoiceSessionEvent;
+  Version extends 3 | 4 ? VersionThreeVoiceSessionEvent : LegacyVoiceSessionEvent;
 
 /** Opaque control-plane bridge connection data. It never contains media frames. */
 export type MediaLease = {
@@ -439,7 +454,7 @@ export type MediaLease = {
 };
 
 export type GatewayMessage =
-  | { type: "ready"; status: RuntimeStatus }
+  | { type: "ready"; status: RuntimeStatus; currentSessionId?: bigint }
   | { type: "command_accepted"; requestId: string; turnId?: bigint; mediaLease?: MediaLease }
   | { type: "command_rejected"; requestId: string; error: RuntimeFailure }
   | { type: "status"; requestId: string; status: RuntimeStatus }
@@ -451,7 +466,7 @@ export type GatewayMessage =
   | { type: "persona_state"; requestId: string; persona: PersonaState }
   | { type: "memory_deleted"; requestId: string; memoryId: bigint }
   | ({ type: "memory_extracted" } & MemoryExtractedSummary)
-  | { type: "recording_finalized"; requestId: string; recording: RecordingSummary }
+  | { type: "recording_finalized"; requestId: string; recording: RecordingSummary; recoveryCapability?: FinalizedRecordingCapability }
   | {
       type: "recording_reconciled";
       requestId: string;
@@ -575,6 +590,12 @@ export function parseClientCommand(value: unknown, expectedVersion?: ClientProto
         throw new ProtocolError("session recording requires protocol version 3");
       }
       return { type, requestId: requireRequestId(object), sessionId: parseIdentifier(object.session_id) };
+    case "reconcile_finalized_recording":
+      try {
+        requireExactKeys(object, ["protocol_version", "type", "request_id", "capability"]);
+        if (version !== 4) throw new ProtocolError("invalid finalized recording capability");
+        return { type, requestId: requireRequestId(object), capability: parseFinalizedCapability(object.capability) };
+      } catch { throw new ProtocolError("invalid finalized recording capability"); }
     case "reconcile_recording":
       requireExactKeys(object, [
         "protocol_version",
@@ -651,8 +672,15 @@ export function parseGatewayMessage(
   const type = requireString(object, "type");
   switch (type) {
     case "ready":
-      requireExactKeys(object, ["protocol_version", "type", "status"]);
+      requireExactKeys(object, version === FINALIZED_RECORDING_PROTOCOL_VERSION
+        ? ["protocol_version", "type", "status", "current_session_id"]
+        : ["protocol_version", "type", "status"]);
       validateProtocolVersion(object, version);
+      if (version === FINALIZED_RECORDING_PROTOCOL_VERSION) {
+        const currentSessionId = parseIdentifier(object.current_session_id);
+        if (currentSessionId === 0n) throw new ProtocolError("invalid current session identity");
+        return { type, status: parseRuntimeStatus(object.status, version), currentSessionId };
+      }
       return { type, status: parseRuntimeStatus(object.status, version) };
     case "command_accepted":
       {
@@ -724,13 +752,22 @@ export function parseGatewayMessage(
         activated: requireNonNegativeInteger(object, "activated"),
         pendingApproval: requireNonNegativeInteger(object, "pending_approval"),
       };
-    case "recording_finalized":
-      requireExactKeys(object, ["protocol_version", "type", "request_id", "recording"]);
+    case "recording_finalized": {
+      requireExactKeys(object, version === 4 ? ["protocol_version", "type", "request_id", "recording", "recovery_capability"] : ["protocol_version", "type", "request_id", "recording"]);
       validateProtocolVersion(object, version);
       if (version < RUNTIME_PROFILE_PROTOCOL_VERSION) {
         throw new ProtocolError("session recording requires protocol version 3");
       }
-      return { type, requestId: requireRequestId(object), recording: parseRecordingSummary(object.recording) };
+      const recording = parseRecordingSummary(object.recording);
+      if (version === 4) {
+        const recoveryCapability = parseFinalizedCapability(object.recovery_capability);
+        if (recording.recordingHandle !== recoveryCapability.recordingHandle || recording.sha256 !== recoveryCapability.sha256 || recording.keyId !== recoveryCapability.keyId) {
+          throw new ProtocolError("finalized recording capability does not match summary");
+        }
+        return { type, requestId: requireRequestId(object), recording, recoveryCapability };
+      }
+      return { type, requestId: requireRequestId(object), recording };
+    }
     case "recording_reconciled":
       requireExactKeys(object, ["protocol_version", "type", "request_id", "reconciliation"]);
       validateProtocolVersion(object, version);
@@ -849,6 +886,8 @@ export function encodeClientCommand(
           request_id: command.requestId,
           session_id: command.sessionId.toString(),
         };
+      case "reconcile_finalized_recording":
+        return { protocol_version: version, type: command.type, request_id: command.requestId, capability: encodeFinalizedCapability(command.capability) };
       case "reconcile_recording":
         return {
           protocol_version: version,
@@ -946,6 +985,11 @@ export function validateClientCommand(
       throw new ProtocolError("session identifier is outside u64 range");
     }
   }
+  if (command.type === "reconcile_finalized_recording") {
+    if (version !== 4) throw new ProtocolError("finalized recording recovery requires protocol version 4");
+    try { parseFinalizedCapability(encodeFinalizedCapability(command.capability)); }
+    catch { throw new ProtocolError("invalid finalized recording capability"); }
+  }
   if (command.type === "reconcile_recording") {
     if (version < RUNTIME_PROFILE_PROTOCOL_VERSION) {
       throw new ProtocolError("recording reconciliation requires protocol version 3");
@@ -992,6 +1036,24 @@ const MAX_RECORDING_HANDLE_BYTES = 128;
 const MAX_RECORDING_PATH_BYTES = 1024;
 const MAX_RECORDING_LABEL_BYTES = 64;
 const RECORDING_GAP_REASONS = ["capture_discontinuity", "recording_failed"] as const;
+
+function encodeFinalizedCapability(capability: FinalizedRecordingCapability): Record<string, unknown> {
+  return { source_session_id: capability.sourceSessionId.toString(), recording_handle: capability.recordingHandle, sha256: capability.sha256, key_id: capability.keyId, authorization: capability.authorization };
+}
+
+function parseFinalizedCapability(value: unknown): FinalizedRecordingCapability {
+  try {
+    const object = requireRecord(value, "finalized recording capability");
+    requireExactKeys(object, ["source_session_id", "recording_handle", "sha256", "key_id", "authorization"]);
+    const sourceSessionId = parseIdentifier(object.source_session_id);
+    const recordingHandle = requireString(object, "recording_handle");
+    const sha256 = requireString(object, "sha256");
+    const keyId = requireString(object, "key_id");
+    const authorization = requireString(object, "authorization");
+    if (sourceSessionId === 0n || !/^[0-9a-f]{32}$/.test(recordingHandle) || !/^[0-9a-f]{64}$/.test(sha256) || !/^[0-9a-f]{16}$/.test(keyId) || !/^[0-9a-f]{64}$/.test(authorization)) throw new Error();
+    return Object.freeze({ sourceSessionId, recordingHandle, sha256, keyId, authorization });
+  } catch { throw new ProtocolError("invalid finalized recording capability"); }
+}
 
 function parseRecordingSummary(value: unknown): RecordingSummary {
   const object = requireRecord(value, "recording summary");
@@ -1984,6 +2046,7 @@ function validateProtocolVersion(
     version !== LEGACY_CLIENT_PROTOCOL_VERSION
     && version !== CONTEXT_SEED_PROTOCOL_VERSION
     && version !== RUNTIME_PROFILE_PROTOCOL_VERSION
+    && version !== FINALIZED_RECORDING_PROTOCOL_VERSION
   ) {
     throw new ProtocolError("unsupported protocol version");
   }

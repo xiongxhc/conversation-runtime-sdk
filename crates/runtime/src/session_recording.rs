@@ -46,15 +46,19 @@
 
 use std::fmt;
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use conversation_model_adapters::{AudioFrame, PcmFormat, PcmSampleFormat};
-use conversation_protocol::{RuntimeError, RuntimeErrorKind, RuntimeStage, SessionId};
+use conversation_protocol::{
+    FinalizedRecordingCapability, RuntimeError, RuntimeErrorKind, RuntimeStage, SessionId,
+};
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LEN};
-use ring::digest::{digest, SHA256};
+use ring::digest::{digest, Context as DigestContext, SHA256};
 use ring::rand::{SecureRandom, SystemRandom};
+use ring::{hkdf, hmac};
+use tokio_util::sync::CancellationToken;
 
 /// The reason recorded for a gap opened by a break in the capture bridge.
 pub const CAPTURE_DISCONTINUITY_REASON: &str = "capture_discontinuity";
@@ -93,6 +97,8 @@ const SAMPLE_FORMAT_F32LE: u8 = 2;
 
 const KEY_DOMAIN: &[u8] = b"conversation-runtime/session-recording/key/v1\0";
 const KEY_ID_DOMAIN: &[u8] = b"conversation-runtime/session-recording/key-id/v1\0";
+const CAPABILITY_DOMAIN: &[u8] = b"conversation-runtime/finalized-recording-capability/v1\0";
+const DIGEST_BUFFER_BYTES: usize = 64 * 1024;
 
 /// Where recordings are written and which environment variable names the key.
 ///
@@ -114,6 +120,7 @@ pub struct RecordingSettings {
 pub enum RecordingSinkFault {
     Write,
     Flush,
+    Sync,
 }
 
 impl RecordingSettings {
@@ -206,6 +213,7 @@ impl RecordingSink for FaultingRecordingSink {
     }
 
     fn sync_all(&mut self) -> std::io::Result<()> {
+        self.fail_once(RecordingSinkFault::Sync)?;
         self.file.sync_all()
     }
 }
@@ -267,6 +275,7 @@ pub struct RecordedSession {
 struct RecordingKey {
     key: LessSafeKey,
     key_id: String,
+    capability_key: hmac::Key,
 }
 
 impl fmt::Debug for RecordingKey {
@@ -313,7 +322,39 @@ impl RecordingKey {
         let key = UnboundKey::new(&AES_256_GCM, &derived)
             .map(LessSafeKey::new)
             .map_err(|_| adapter_error("recording key could not be prepared"))?;
-        Ok(Self { key, key_id })
+        // HKDF consumes canonical root bytes, never the existing AES-derived key.
+        let root = decode_hex::<32>(&material).expect("validated hexadecimal root key");
+        let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, CAPABILITY_DOMAIN).extract(&root);
+        let info = [CAPABILITY_DOMAIN];
+        let okm = prk
+            .expand(&info, hkdf::HKDF_SHA256)
+            .map_err(|_| adapter_error("recording authorization could not be prepared"))?;
+        let mut authorization_key = [0_u8; 32];
+        okm.fill(&mut authorization_key)
+            .map_err(|_| adapter_error("recording authorization could not be prepared"))?;
+        let capability_key = hmac::Key::new(hmac::HMAC_SHA256, &authorization_key);
+        Ok(Self {
+            key,
+            key_id,
+            capability_key,
+        })
+    }
+
+    fn authorize(&self, capability: &mut FinalizedRecordingCapability) -> Result<(), RuntimeError> {
+        capability.authorization = "0".repeat(64);
+        let fields = capability_fields(capability)?;
+        capability.authorization =
+            lowercase_hex(hmac::sign(&self.capability_key, &fields).as_ref());
+        Ok(())
+    }
+
+    fn verify(&self, capability: &FinalizedRecordingCapability) -> Result<(), RuntimeError> {
+        let fields = capability_fields(capability)?;
+        let tag = decode_hex::<32>(&capability.authorization).ok_or_else(recovery_error)?;
+        if capability.key_id != self.key_id {
+            return Err(recovery_error());
+        }
+        hmac::verify(&self.capability_key, &fields, &tag).map_err(|_| recovery_error())
     }
 
     fn seal(
@@ -375,6 +416,10 @@ pub struct SessionRecorder {
     ended: bool,
     summary: Option<RecordingSummary>,
     recording_failed: bool,
+    /// Issuance must describe the exact successfully sealed transcript, not bytes replaced
+    /// behind the writer or a retry after a partial encrypted write. Legacy salvage is unchanged.
+    sealed_digest: DigestContext,
+    capability_poisoned: bool,
 }
 
 impl fmt::Debug for SessionRecorder {
@@ -443,6 +488,8 @@ impl SessionRecorder {
             Box::new(file)
         };
 
+        let mut sealed_digest = DigestContext::new(&SHA256);
+        sealed_digest.update(&header);
         Ok(Self {
             session_id,
             handle,
@@ -459,6 +506,8 @@ impl SessionRecorder {
             ended: false,
             summary: None,
             recording_failed: false,
+            sealed_digest,
+            capability_poisoned: false,
         })
     }
 
@@ -612,6 +661,29 @@ impl SessionRecorder {
         Ok(summary)
     }
 
+    /// Finalizes durably before issuing a restart capability. The existing v3 summary and
+    /// encrypted layout are unchanged. An incomplete sink cannot authorize recovery.
+    pub fn finalize_with_capability(
+        &mut self,
+    ) -> Result<(RecordingSummary, FinalizedRecordingCapability), RuntimeError> {
+        if self.recording_failed || self.capability_poisoned {
+            return Err(recovery_error());
+        }
+        let summary = self.finalize()?;
+        if summary.sha256 != lowercase_hex(self.sealed_digest.clone().finish().as_ref()) {
+            return Err(recovery_error());
+        }
+        let mut capability = FinalizedRecordingCapability {
+            source_session_id: self.session_id,
+            recording_handle: summary.recording_handle.clone(),
+            sha256: summary.sha256.clone(),
+            key_id: summary.key_id.clone(),
+            authorization: String::new(),
+        };
+        self.key.authorize(&mut capability)?;
+        Ok((summary, capability))
+    }
+
     /// The recording's length: the audio it holds plus the gaps between that audio. Zero when
     /// no frame was ever recorded, whatever the session cost in wall-clock time.
     fn media_duration_ms(&self) -> u64 {
@@ -646,6 +718,8 @@ impl SessionRecorder {
         let Some(file) = self.file.as_mut() else {
             return Err(invalid_state_error("recording is already finalized"));
         };
+        let previously_poisoned = self.capability_poisoned;
+        self.capability_poisoned = true;
         let counter = self.counter;
         self.counter = counter
             .checked_add(1)
@@ -662,7 +736,11 @@ impl SessionRecorder {
         file.write_all(&length.to_be_bytes())
             .and_then(|()| file.write_all(&record))
             .and_then(|()| file.flush())
-            .map_err(|_| adapter_error("recording chunk could not be written"))
+            .map_err(|_| adapter_error("recording chunk could not be written"))?;
+        self.sealed_digest.update(&length.to_be_bytes());
+        self.sealed_digest.update(&record);
+        self.capability_poisoned = previously_poisoned;
+        Ok(())
     }
 }
 
@@ -722,6 +800,9 @@ pub struct RecordedChunks {
     counter: u32,
     truncated: bool,
     finished: bool,
+    strict: bool,
+    // Drops after the reader, including all early error and cancellation paths.
+    _snapshot: Option<PrivateSnapshot>,
 }
 
 /// Opens a recording and validates its header, without reading a single chunk.
@@ -740,6 +821,8 @@ pub fn open_session_recording(path: &Path, key_env: &str) -> Result<RecordedChun
         counter: 0,
         truncated: false,
         finished: false,
+        strict: false,
+        _snapshot: None,
     })
 }
 
@@ -788,7 +871,14 @@ impl RecordedChunks {
             &aad(&self.header, counter),
             &mut buffer,
         )?;
-        let chunk = decode_chunk(&buffer[..plaintext])?;
+        let record = &buffer[..plaintext];
+        if self.strict
+            && record.first() == Some(&CHUNK_GAP_STARTED)
+            && (record.len() < 10 || record.len() != 10 + usize::from(record[9]))
+        {
+            return Err(recovery_error());
+        }
+        let chunk = decode_chunk(record)?;
         self.counter = counter
             .checked_add(1)
             .ok_or_else(|| adapter_error("recording exceeded its chunk limit"))?;
@@ -934,9 +1024,269 @@ fn aad(header: &[u8; HEADER_LEN], counter: u32) -> [u8; HEADER_LEN + 4] {
 }
 
 fn file_digest(path: &Path) -> Result<String, RuntimeError> {
-    let bytes = std::fs::read(path).map_err(|_| adapter_error("recording could not be read"))?;
-    Ok(lowercase_hex(digest(&SHA256, &bytes).as_ref()))
+    let mut file = File::open(path).map_err(|_| adapter_error("recording could not be read"))?;
+    stream_digest(&mut file, None, &CancellationToken::new())
 }
+
+/// Hash exactly the bytes copied, using one fixed-size buffer for finalization and recovery.
+fn stream_digest(
+    reader: &mut impl Read,
+    mut copy: Option<&mut File>,
+    cancellation: &CancellationToken,
+) -> Result<String, RuntimeError> {
+    let mut hash = DigestContext::new(&SHA256);
+    let mut buffer = [0_u8; DIGEST_BUFFER_BYTES];
+    loop {
+        check_recovery_cancellation(cancellation)?;
+        let count = reader.read(&mut buffer).map_err(|_| recovery_error())?;
+        if count == 0 {
+            break;
+        }
+        if let Some(writer) = copy.as_mut() {
+            Write::write_all(writer, &buffer[..count]).map_err(|_| recovery_error())?;
+        }
+        hash.update(&buffer[..count]);
+    }
+    Ok(lowercase_hex(hash.finish().as_ref()))
+}
+
+fn decode_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
+    if value.len() != N * 2 || !value.bytes().all(is_lowercase_hex_byte) {
+        return None;
+    }
+    let mut result = [0; N];
+    for (byte, pair) in result.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+        *byte = (char::from(pair[0]).to_digit(16)? * 16 + char::from(pair[1]).to_digit(16)?) as u8;
+    }
+    Some(result)
+}
+
+fn capability_fields(capability: &FinalizedRecordingCapability) -> Result<Vec<u8>, RuntimeError> {
+    capability.validate().map_err(|_| recovery_error())?;
+    let mut fields = CAPABILITY_DOMAIN.to_vec();
+    fields.extend_from_slice(&capability.source_session_id.get().to_be_bytes());
+    fields.extend_from_slice(
+        &decode_hex::<16>(&capability.recording_handle).ok_or_else(recovery_error)?,
+    );
+    fields.extend_from_slice(&decode_hex::<32>(&capability.sha256).ok_or_else(recovery_error)?);
+    fields.extend_from_slice(&decode_hex::<8>(&capability.key_id).ok_or_else(recovery_error)?);
+    Ok(fields)
+}
+
+fn recovery_error() -> RuntimeError {
+    invalid_state_error("finalized recording authorization or content is invalid")
+}
+fn check_recovery_cancellation(cancellation: &CancellationToken) -> Result<(), RuntimeError> {
+    if cancellation.is_cancelled() {
+        Err(invalid_state_error("recording recovery was cancelled"))
+    } else {
+        Ok(())
+    }
+}
+
+struct PrivateSnapshot(Option<PathBuf>);
+impl Drop for PrivateSnapshot {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.as_ref() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Keep an immutable-to-the-source encrypted snapshot: descriptor retention alone does not
+/// protect against writes to the original inode. No plaintext is ever persisted here.
+pub(crate) fn preflight_finalized_recording(
+    settings: &RecordingSettings,
+    capability: &FinalizedRecordingCapability,
+    cancellation: &CancellationToken,
+) -> Result<RecordedChunks, RuntimeError> {
+    let mut chunks = snapshot_finalized_recording(settings, capability, cancellation)?;
+    validate_completed_chunks(&mut chunks, cancellation)?;
+    // Verify the snapshot itself too, not just the bytes observed while copying the original.
+    chunks
+        .reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| recovery_error())?;
+    if stream_digest(&mut chunks.reader, None, cancellation)? != capability.sha256 {
+        return Err(recovery_error());
+    }
+    chunks
+        .reader
+        .seek(SeekFrom::Start(HEADER_LEN as u64))
+        .map_err(|_| recovery_error())?;
+    chunks.counter = 0;
+    chunks.finished = false;
+    check_recovery_cancellation(cancellation)?;
+    Ok(chunks)
+}
+
+fn snapshot_finalized_recording(
+    settings: &RecordingSettings,
+    capability: &FinalizedRecordingCapability,
+    cancellation: &CancellationToken,
+) -> Result<RecordedChunks, RuntimeError> {
+    check_recovery_cancellation(cancellation)?;
+    let key = RecordingKey::from_environment(settings.key_env())?;
+    key.verify(capability)?;
+    let binding = decode_handle(&capability.recording_handle).ok_or_else(recovery_error)?;
+    let path = settings.directory().join(format!(
+        "{}.{RECORDING_EXTENSION}",
+        capability.recording_handle
+    ));
+    let mut source = File::open(path).map_err(|_| recovery_error())?;
+    let metadata = source.metadata().map_err(|_| recovery_error())?;
+    if !metadata.is_file() {
+        return Err(recovery_error());
+    }
+    let size = metadata.len();
+    let mut random = [0; 16];
+    SystemRandom::new()
+        .fill(&mut random)
+        .map_err(|_| recovery_error())?;
+    let snapshot_path = settings
+        .directory()
+        .join(format!(".recovery-{}", lowercase_hex(&random)));
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_DELETE_ON_CLOSE: the OS owns removal even on process termination.
+        options.share_mode(0).custom_flags(0x0400_0000);
+    }
+    let mut snapshot = options.open(&snapshot_path).map_err(|_| recovery_error())?;
+    let mut guard = PrivateSnapshot(Some(snapshot_path));
+    // Unlink while the descriptor is owned: a SIGKILL must not strand another encrypted
+    // recording outside custody cleanup. Windows' delete-on-close handle provides the same
+    // lifetime; unsupported platforms fail closed rather than leaving a named snapshot.
+    #[cfg(unix)]
+    {
+        std::fs::remove_file(guard.0.as_ref().unwrap()).map_err(|_| recovery_error())?;
+        guard.0 = None;
+    }
+    #[cfg(windows)]
+    {
+        guard.0 = None;
+    }
+    #[cfg(not(any(unix, windows)))]
+    return Err(recovery_error());
+    // Bound this copy to the initial extent, even if the original is being appended to.
+    let sha256 = stream_digest(
+        &mut (&mut source).take(size),
+        Some(&mut snapshot),
+        cancellation,
+    )?;
+    let mut extra = [0];
+    if source.read(&mut extra).map_err(|_| recovery_error())? != 0 || sha256 != capability.sha256 {
+        return Err(recovery_error());
+    }
+    snapshot
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| recovery_error())?;
+    let mut header = [0; HEADER_LEN];
+    snapshot
+        .read_exact(&mut header)
+        .map_err(|_| recovery_error())?;
+    let session_id = read_header(&header)?;
+    if session_id != capability.source_session_id || header[28..44] != binding {
+        return Err(recovery_error());
+    }
+    Ok(RecordedChunks {
+        reader: BufReader::new(snapshot),
+        key,
+        header,
+        session_id,
+        counter: 0,
+        truncated: false,
+        finished: false,
+        strict: true,
+        _snapshot: Some(guard),
+    })
+}
+
+fn validate_completed_chunks(
+    chunks: &mut RecordedChunks,
+    cancellation: &CancellationToken,
+) -> Result<(), RuntimeError> {
+    let mut ended = false;
+    let mut format = None;
+    let mut gap = None;
+    let mut gap_count = 0;
+    let mut last_at_ms = 0;
+    loop {
+        check_recovery_cancellation(cancellation)?;
+        let Some(chunk) = chunks.next_chunk()? else {
+            break;
+        };
+        if ended {
+            return Err(recovery_error());
+        }
+        let at_ms = match chunk {
+            RecordedChunk::Frame {
+                at_ms,
+                sample_rate_hz,
+                channels,
+                sample_format,
+                bytes,
+                ..
+            } => {
+                let current = PcmFormat::new(sample_rate_hz, channels, sample_format)
+                    .map_err(|_| recovery_error())?;
+                let alignment = current
+                    .frame_alignment_bytes()
+                    .map_err(|_| recovery_error())?;
+                if gap.is_some()
+                    || format.is_some_and(|prior| prior != current)
+                    || bytes.is_empty()
+                    || bytes.len() % alignment != 0
+                {
+                    return Err(recovery_error());
+                }
+                format = Some(current);
+                at_ms
+            }
+            RecordedChunk::GapStarted { at_ms, reason } => {
+                gap_count += 1;
+                if gap.is_some()
+                    || reason != CAPTURE_DISCONTINUITY_REASON
+                    || gap_count > MAX_RECORDING_GAPS
+                {
+                    return Err(recovery_error());
+                }
+                gap = Some(at_ms);
+                at_ms
+            }
+            RecordedChunk::GapEnded { at_ms } => {
+                if gap.take().is_none() {
+                    return Err(recovery_error());
+                }
+                at_ms
+            }
+            // A capture discontinuity may legitimately remain open at finalization.
+            RecordedChunk::Ended { at_ms } => {
+                ended = true;
+                at_ms
+            }
+        };
+        if at_ms < last_at_ms {
+            return Err(recovery_error());
+        }
+        last_at_ms = at_ms;
+    }
+    if !ended || chunks.truncated() {
+        return Err(recovery_error());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "session_recording_recovery_tests.rs"]
+mod recovery_tests;
 
 fn derive(domain: &[u8], material: &[u8]) -> [u8; 32] {
     let mut input = Vec::with_capacity(domain.len() + material.len());

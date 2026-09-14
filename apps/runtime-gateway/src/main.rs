@@ -20,7 +20,7 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> Result<(), ()> {
-    let config_path = parse_config_path().ok_or_else(|| {
+    let (config_path, protocol_v4) = parse_arguments(env::args_os().skip(1)).ok_or_else(|| {
         eprintln!("gateway arguments are invalid");
     })?;
     let adapters = GatewayConfig::load(&config_path).map_err(|_| {
@@ -78,6 +78,10 @@ async fn run() -> Result<(), ()> {
     let provider_failure = CancellationToken::new();
     let mut session =
         GatewaySession::new(runtime, status).with_provider_failure(provider_failure.clone());
+    if protocol_v4 {
+        session = session.with_v4_control();
+    }
+    session = session.with_control_closed(relay.ended.clone());
     if let Some(voice_adapters) = voice {
         session = session.with_voice(voice_adapters, language);
     }
@@ -145,14 +149,61 @@ fn supervision_failure(error: ProviderSupervisorError) -> String {
     )
 }
 
-fn parse_config_path() -> Option<PathBuf> {
-    let mut arguments = env::args_os().skip(1);
+fn parse_arguments(
+    mut arguments: impl Iterator<Item = std::ffi::OsString>,
+) -> Option<(PathBuf, bool)> {
     if arguments.next()?.to_str()? != "--config" {
         return None;
     }
     let path = PathBuf::from(arguments.next()?);
+    let protocol_v4 = match arguments.next() {
+        None => false,
+        Some(option) if option == "--client-protocol-version" => {
+            if arguments.next()? != "4" {
+                return None;
+            }
+            true
+        }
+        Some(_) => return None,
+    };
     if arguments.next().is_some() {
         return None;
     }
-    Some(path)
+    Some((path, protocol_v4))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protocol_selection_is_explicit_exact_and_validated_before_configuration() {
+        let parse = |args: &[&str]| parse_arguments(args.iter().map(std::ffi::OsString::from));
+        assert_eq!(
+            parse(&["--config", "/abs/config"]),
+            Some((PathBuf::from("/abs/config"), false))
+        );
+        assert_eq!(
+            parse(&["--config", "/abs/config", "--client-protocol-version", "4"]),
+            Some((PathBuf::from("/abs/config"), true))
+        );
+        for version in ["1", "2", "3", "5", "04", "4 ", ""] {
+            assert!(parse(&[
+                "--config",
+                "/abs/config",
+                "--client-protocol-version",
+                version
+            ])
+            .is_none());
+        }
+        assert!(parse(&["--config", "/abs/config", "--client-protocol-version"]).is_none());
+        assert!(parse(&[
+            "--config",
+            "/abs/config",
+            "--client-protocol-version",
+            "4",
+            "extra"
+        ])
+        .is_none());
+    }
 }

@@ -433,6 +433,16 @@ async fn timed_alignment_survives_actual_gateway_exit_and_obeys_page_credit_with
     auth.push(18);
     auth.extend(b"bridge-independent");
     timed_packet(&mut media, 1, &auth).await;
+    let mut accepted = [0; 37];
+    timeout(PROCESS_TIMEOUT, media.read_exact(&mut accepted))
+        .await
+        .expect("timed media authentication acknowledgement deadline")
+        .unwrap();
+    let mut expected = b"MED2\x02\x09\x00\x00\x00\x1b".to_vec();
+    expected.extend(source.to_be_bytes());
+    expected.push(18);
+    expected.extend(b"bridge-independent");
+    assert_eq!(accepted.as_slice(), expected);
     let epoch = CaptureEpoch {
         bridge_session_id: "bridge-independent".into(),
         clock_domain_id: "source-process".into(),

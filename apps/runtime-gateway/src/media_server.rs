@@ -334,6 +334,7 @@ struct TimedMediaState {
 
 struct MediaDisconnect {
     capture_at_ms: Option<u64>,
+    capture_epoch: Option<u64>,
     reconnect_deadline: Instant,
 }
 
@@ -582,6 +583,7 @@ where
         inner.authenticate(session_id, &credential, None).await?
     };
     let mut epoch_started = false;
+    let mut media_phase = false;
     let (mut reader, mut writer) = tokio::io::split(stream);
     let result = async {
         if let Some(bridge) = bridge_session_id.as_deref() {
@@ -598,8 +600,9 @@ where
         let mut playback = tokio::select! {
             biased;
             _ = inner.cancellation.cancelled() => return Ok(()),
-            result = inner.hub.attach_playback_transport(session_id, connection.connection_id) => result?,
+            result = inner.hub.attach_playback_transport_for_reservation(session_id, connection.reservation_epoch, connection.connection_id) => result?,
         };
+        media_phase = true;
         loop {
             tokio::select! {
                 _ = inner.cancellation.cancelled() => break Ok(()),
@@ -700,43 +703,37 @@ where
         }
     }
     .await;
-    let disconnect = inner.disconnect(session_id, connection).await;
-    if let Some(disconnect) = disconnect.as_ref() {
-        let _ = inner
-            .hub
-            .disconnect_playback_transport(
-                session_id,
-                connection.connection_id,
-                disconnect.reconnect_deadline,
-            )
-            .await;
-    }
-    if let Some(Some(at_ms)) = disconnect.map(|disconnect| disconnect.capture_at_ms) {
-        let _ = inner.hub.deliver_discontinuity(session_id, at_ms).await;
-        if timed {
-            let epoch = inner
-                .sessions
-                .lock()
-                .await
-                .get(&session_id.get())
-                .and_then(|session| session.timed.as_ref())
-                .and_then(|state| state.epoch.as_ref())
-                .map(|epoch| epoch.capture_epoch);
-            if let Some(capture_epoch) = epoch {
-                let _ = inner
-                    .hub
-                    .deliver_capture_metadata(
-                        session_id,
-                        CaptureMetadata::Discontinuity {
-                            capture_epoch,
-                            reason: CaptureDiscontinuityReason::Reconnect,
-                        },
-                    )
-                    .await;
-            }
-        }
-    }
+    cleanup_connection(&inner, session_id, connection, media_phase).await;
     result
+}
+
+async fn cleanup_connection(
+    inner: &MediaServerInner,
+    session_id: SessionId,
+    connection: MediaConnection,
+    media_phase: bool,
+) {
+    let Some(disconnect) = inner.disconnect_snapshot(session_id, connection).await else {
+        return;
+    };
+    // Keep this connection's admission fence until old notifications settle.
+    // Revoke/re-reserve remains possible; hub operations independently fence the
+    // reservation and retain old sinks, never a global lock across a send.
+    tokio::select! {
+        biased;
+        _ = inner.cancellation.cancelled() => {},
+        _ = async {
+            let _ = inner.hub.disconnect_playback_transport_for_reservation(session_id, connection.reservation_epoch, connection.connection_id, disconnect.reconnect_deadline).await;
+            if media_phase {
+                if let Some(at_ms) = disconnect.capture_at_ms {
+                    let _ = inner.hub.deliver_disconnect_for_reservation(session_id, connection.reservation_epoch, at_ms, disconnect.capture_epoch).await;
+                }
+            }
+        } => {},
+    }
+    inner
+        .release_connection(session_id, connection, disconnect.reconnect_deadline)
+        .await;
 }
 
 async fn write_authentication_accepted<W: AsyncWrite + Unpin>(
@@ -1076,22 +1073,19 @@ impl MediaServerInner {
         Ok(())
     }
 
-    async fn disconnect(
+    async fn disconnect_snapshot(
         &self,
         session_id: SessionId,
         connection: MediaConnection,
     ) -> Option<MediaDisconnect> {
-        if let Some(session) = self.sessions.lock().await.get_mut(&session_id.get()) {
+        if let Some(session) = self.sessions.lock().await.get(&session_id.get()) {
             if session.reservation_epoch != connection.reservation_epoch
                 || session.active_connection_id != Some(connection.connection_id)
             {
                 return None;
             }
-            session.active = false;
-            session.active_connection_id = None;
             let reconnect_deadline =
                 Instant::now() + self.reconnect_window.min(self.max_playback_queue_duration);
-            session.reconnect_deadline = reconnect_deadline;
             return Some(MediaDisconnect {
                 capture_at_ms: session.last_capture_timestamp_ms.or_else(|| {
                     session
@@ -1100,10 +1094,44 @@ impl MediaServerInner {
                         .filter(|state| state.sequence > 0)
                         .map(|_| 0)
                 }),
+                capture_epoch: session
+                    .timed
+                    .as_ref()
+                    .and_then(|state| state.epoch.as_ref())
+                    .map(|epoch| epoch.capture_epoch),
                 reconnect_deadline,
             });
         }
         None
+    }
+
+    async fn release_connection(
+        &self,
+        session_id: SessionId,
+        connection: MediaConnection,
+        reconnect_deadline: Instant,
+    ) {
+        if let Some(session) = self.sessions.lock().await.get_mut(&session_id.get()) {
+            if session.reservation_epoch == connection.reservation_epoch
+                && session.active_connection_id == Some(connection.connection_id)
+            {
+                session.active = false;
+                session.active_connection_id = None;
+                session.reconnect_deadline = reconnect_deadline;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    async fn disconnect(
+        &self,
+        session_id: SessionId,
+        connection: MediaConnection,
+    ) -> Option<MediaDisconnect> {
+        let snapshot = self.disconnect_snapshot(session_id, connection).await?;
+        self.release_connection(session_id, connection, snapshot.reconnect_deadline)
+            .await;
+        Some(snapshot)
     }
 }
 
@@ -1583,6 +1611,7 @@ mod timing_domain_tests {
         entered: Arc<tokio::sync::Notify>,
         dropped: Arc<std::sync::atomic::AtomicBool>,
         delay: Pin<Box<tokio::time::Sleep>>,
+        flush_release: Option<tokio::sync::oneshot::Receiver<()>>,
         fault: AckFault,
     }
     impl Drop for AckIo {
@@ -1629,9 +1658,12 @@ mod timing_domain_tests {
             written.extend_from_slice(&bytes[..count]);
             Poll::Ready(Ok(count))
         }
-        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             match self.fault {
-                AckFault::FlushStall => Poll::Pending,
+                AckFault::FlushStall => match self.flush_release.as_mut() {
+                    Some(release) => Pin::new(release).poll(cx).map(|_| Ok(())),
+                    None => Poll::Pending,
+                },
                 AckFault::FlushError => Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into())),
                 _ => Poll::Ready(Ok(())),
             }
@@ -1660,6 +1692,7 @@ mod timing_domain_tests {
                 entered: Arc::default(),
                 dropped: Arc::default(),
                 delay: Box::pin(tokio::time::sleep(delay)),
+                flush_release: None,
                 fault,
             },
             auth_len,
@@ -1898,6 +1931,347 @@ mod timing_domain_tests {
         assert!(dropped.load(Ordering::SeqCst));
         assert!(server.inner.connections.lock().await.is_empty());
         assert!(!server.inner.sessions.lock().await[&id.get()].active);
+    }
+
+    #[tokio::test]
+    async fn timed_ack_failed_reconnect_does_not_republish_prior_capture_gap() {
+        use conversation_model_adapters::{NetworkVoiceIoFactory, VoiceIoFactory};
+        let server = timed_server().await;
+        let id = SessionId::new(41);
+        let lease = server
+            .reserve_timed(id, "bridge-independent".into())
+            .await
+            .unwrap();
+        let cancellation = CancellationToken::new();
+        let factory = NetworkVoiceIoFactory::new(server.hub(), id);
+        let io = factory.start(id, cancellation.clone()).await.unwrap();
+        let mut recording = io.input.start(id, cancellation.clone()).await.unwrap();
+        let capture = factory.recognition_capture();
+        let mut recognition = capture.start(id, cancellation.clone()).await.unwrap();
+        // Persisted capture state from the preceding connection, whose real
+        // disconnect has already been reported. This attempt admits no media.
+        server
+            .inner
+            .admit_epoch(
+                id,
+                &CaptureEpoch {
+                    bridge_session_id: "bridge-independent".into(),
+                    clock_domain_id: "previous-process".into(),
+                    capture_epoch: 3,
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        server
+            .inner
+            .sessions
+            .lock()
+            .await
+            .get_mut(&id.get())
+            .unwrap()
+            .timed
+            .as_mut()
+            .unwrap()
+            .sequence = 7;
+        let (stream, auth_len) = ack_io(&lease, Duration::ZERO, AckFault::PartialWriteError);
+        let read = stream.read_bytes.clone();
+        let result = serve_connection(stream, server.inner.clone()).await;
+        let recorded = recording.try_recv();
+        let recognized = recognition.try_recv();
+        cancellation.cancel();
+        io.completion.await.unwrap().unwrap();
+        server.shutdown().await;
+        assert!(result.is_err());
+        assert_eq!(read.load(Ordering::SeqCst), auth_len);
+        assert!(
+            recorded.is_err(),
+            "failed confirmation republished old recording event: {recorded:?}"
+        );
+        assert!(
+            recognized.is_err(),
+            "failed confirmation fabricated recognizer loss: {recognized:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_ack_flush_release_cannot_attach_or_read_into_replacement_reservation() {
+        for already_attached in [false, true] {
+            let server = timed_server().await;
+            let id = SessionId::new(41);
+            let lease = server
+                .reserve_timed(id, "bridge-independent".into())
+                .await
+                .unwrap();
+            let (mut stream, auth_len) = ack_io(&lease, Duration::ZERO, AckFault::FlushStall);
+            let entered = stream.entered.clone();
+            let read = stream.read_bytes.clone();
+            let (release, released) = tokio::sync::oneshot::channel();
+            stream.flush_release = Some(released);
+            let old = tokio::spawn(serve_connection(stream, server.inner.clone()));
+            tokio::time::timeout(MEDIA_HANDSHAKE_TIMEOUT, entered.notified())
+                .await
+                .unwrap();
+            server.revoke(id).await;
+            let lease = server
+                .reserve_timed(id, "bridge-independent".into())
+                .await
+                .unwrap();
+            let replacement = server
+                .inner
+                .authenticate(id, lease.credential(), Some("bridge-independent"))
+                .await
+                .unwrap();
+            let mut transport = if already_attached {
+                Some(
+                    server
+                        .hub()
+                        .attach_playback_transport(id, replacement.connection_id)
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            release.send(()).unwrap();
+            let result = tokio::time::timeout(MEDIA_CONNECTION_REAP_TIMEOUT, old)
+                .await
+                .unwrap()
+                .unwrap();
+            let replacement_attach = if transport.is_none() {
+                Some(
+                    server
+                        .hub()
+                        .attach_playback_transport(id, replacement.connection_id)
+                        .await,
+                )
+            } else {
+                None
+            };
+            let untouched = transport.as_mut().is_none_or(|transport| {
+                matches!(
+                    transport.try_recv(),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                )
+            });
+            let active = server.inner.sessions.lock().await[&id.get()].active_connection_id;
+            server.shutdown().await;
+            assert!(result.is_err());
+            assert_eq!(
+                read.load(Ordering::SeqCst),
+                auth_len,
+                "old ACK completion read replacement media"
+            );
+            assert!(
+                replacement_attach.is_none_or(|result| result.is_ok()),
+                "old ACK completion stole replacement attachment"
+            );
+            assert!(untouched);
+            assert_eq!(active, Some(replacement.connection_id));
+        }
+    }
+
+    #[tokio::test]
+    async fn timed_cleanup_fences_new_epoch_until_old_fanout_settles_and_cancels_without_overtaking(
+    ) {
+        use conversation_model_adapters::{
+            CaptureEvent, NetworkVoiceIoFactory, VoiceInputEvent, VoiceIoFactory,
+        };
+        for action in ["drain", "cancel", "replace"] {
+            let server = timed_server().await;
+            let id = SessionId::new(41);
+            let lease = server
+                .reserve_timed(id, "bridge-independent".into())
+                .await
+                .unwrap();
+            let cancellation = CancellationToken::new();
+            let factory = NetworkVoiceIoFactory::new(server.hub(), id);
+            let io = factory.start(id, cancellation.clone()).await.unwrap();
+            let mut recording = io.input.start(id, cancellation.clone()).await.unwrap();
+            let capture = factory.recognition_capture();
+            let mut recognition = capture.start(id, cancellation.clone()).await.unwrap();
+            let connection = server
+                .inner
+                .authenticate(id, lease.credential(), Some("bridge-independent"))
+                .await
+                .unwrap();
+            let mut old_transport = server
+                .hub()
+                .attach_playback_transport(id, connection.connection_id)
+                .await
+                .unwrap();
+            server
+                .inner
+                .admit_epoch(
+                    id,
+                    &CaptureEpoch {
+                        bridge_session_id: "bridge-independent".into(),
+                        clock_domain_id: "old".into(),
+                        capture_epoch: 3,
+                    },
+                    false,
+                )
+                .await
+                .unwrap();
+            server
+                .inner
+                .sessions
+                .lock()
+                .await
+                .get_mut(&id.get())
+                .unwrap()
+                .timed
+                .as_mut()
+                .unwrap()
+                .sequence = 7;
+            for sequence in 1..=16 {
+                server
+                    .hub()
+                    .deliver_capture(
+                        id,
+                        frame_for_network_capture(
+                            sequence,
+                            PcmFormat::new(24000, 1, PcmSampleFormat::Signed16LittleEndian)
+                                .unwrap(),
+                            vec![0, 0],
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let started = Instant::now();
+            let mut cleanup = Box::pin(cleanup_connection(&server.inner, id, connection, true));
+            std::future::poll_fn(|cx| {
+                assert!(cleanup.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            let blocked = Instant::now();
+            assert!(matches!(
+                old_transport.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+            ));
+            assert!(
+                server
+                    .inner
+                    .authenticate(id, lease.credential(), Some("bridge-independent"))
+                    .await
+                    .is_err(),
+                "new epoch could overtake pending old gap"
+            );
+            let mut replacement = None;
+            if action == "replace" {
+                server.revoke(id).await;
+                let lease = server
+                    .reserve_timed(id, "bridge-independent".into())
+                    .await
+                    .unwrap();
+                let factory = NetworkVoiceIoFactory::new(server.hub(), id);
+                let io = factory.start(id, cancellation.clone()).await.unwrap();
+                let recording = io.input.start(id, cancellation.clone()).await.unwrap();
+                let capture = factory.recognition_capture();
+                let recognition = capture.start(id, cancellation.clone()).await.unwrap();
+                let connection = server
+                    .inner
+                    .authenticate(id, lease.credential(), Some("bridge-independent"))
+                    .await
+                    .unwrap();
+                let transport = server
+                    .hub()
+                    .attach_playback_transport(id, connection.connection_id)
+                    .await
+                    .unwrap();
+                server
+                    .inner
+                    .admit_epoch(
+                        id,
+                        &CaptureEpoch {
+                            bridge_session_id: "bridge-independent".into(),
+                            clock_domain_id: "new".into(),
+                            capture_epoch: 99,
+                        },
+                        false,
+                    )
+                    .await
+                    .unwrap();
+                replacement = Some((io, recording, recognition, transport, connection));
+            }
+            if action == "cancel" {
+                server.inner.cancellation.cancel();
+            }
+            for _ in 0..16 {
+                recording.recv().await.unwrap().unwrap();
+                recognition.recv().await.unwrap().unwrap();
+            }
+            tokio::time::timeout(MEDIA_CONNECTION_REAP_TIMEOUT, cleanup)
+                .await
+                .unwrap();
+            if action == "cancel" {
+                assert!(recording.try_recv().is_err());
+                assert!(recognition.try_recv().is_err());
+            } else {
+                assert!(matches!(
+                    recording.try_recv().unwrap().unwrap(),
+                    VoiceInputEvent::Capture(CaptureEvent::Discontinuity { .. })
+                ));
+                assert!(matches!(
+                    recognition.try_recv().unwrap().unwrap(),
+                    CaptureEvent::Discontinuity { .. }
+                ));
+                assert_eq!(
+                    recording.try_recv().unwrap().unwrap(),
+                    VoiceInputEvent::CaptureMetadata(CaptureMetadata::Discontinuity {
+                        capture_epoch: 3,
+                        reason: CaptureDiscontinuityReason::Reconnect
+                    })
+                );
+            }
+            if let Some((
+                new_io,
+                mut new_recording,
+                mut new_recognition,
+                mut transport,
+                new_connection,
+            )) = replacement
+            {
+                assert!(new_recording.try_recv().is_err());
+                assert!(new_recognition.try_recv().is_err());
+                assert!(matches!(
+                    transport.try_recv(),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                ));
+                assert_eq!(
+                    server.inner.sessions.lock().await[&id.get()].active_connection_id,
+                    Some(new_connection.connection_id)
+                );
+                assert_eq!(
+                    server.inner.sessions.lock().await[&id.get()]
+                        .timed
+                        .as_ref()
+                        .unwrap()
+                        .epoch
+                        .as_ref()
+                        .unwrap()
+                        .capture_epoch,
+                    99
+                );
+                cancellation.cancel();
+                new_io.completion.await.unwrap().unwrap();
+            } else {
+                let sessions = server.inner.sessions.lock().await;
+                let state = &sessions[&id.get()];
+                assert!(!state.active);
+                assert!(state.reconnect_deadline >= started + server.inner.reconnect_window);
+                assert!(
+                    state.reconnect_deadline <= blocked + server.inner.reconnect_window,
+                    "cleanup extended original reconnect deadline"
+                );
+            }
+            cancellation.cancel();
+            io.completion.await.unwrap().unwrap();
+            server.shutdown().await;
+        }
     }
     #[test]
     fn review_rate_windows_admit_exact_caps_and_reset_independently_at_one_second() {

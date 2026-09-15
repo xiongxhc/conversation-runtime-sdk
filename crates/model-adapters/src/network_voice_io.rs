@@ -290,6 +290,47 @@ impl NetworkMediaHub {
         Ok(())
     }
 
+    /// Old connection cleanup selects only its reservation's sinks under the
+    /// hub lock. Subsequent bounded sends retain those sinks across revoke/reuse.
+    pub async fn deliver_disconnect_for_reservation(
+        &self,
+        session_id: SessionId,
+        reservation_epoch: u64,
+        at_ms: u64,
+        capture_epoch: Option<u64>,
+    ) -> Result<(), AdapterError> {
+        let (voice, recognition) = {
+            let sessions = self.sessions.lock().await;
+            let Some(session) = sessions
+                .get(&session_id.get())
+                .filter(|session| session.reservation_epoch == reservation_epoch)
+            else {
+                return Ok(());
+            };
+            (
+                session.voice.clone().ok_or_else(|| {
+                    AdapterError::new("network media voice input is not attached")
+                })?,
+                session.recognition.clone().ok_or_else(|| {
+                    AdapterError::new("network media recognition input is not attached")
+                })?,
+            )
+        };
+        self.send_discontinuity(voice.clone(), recognition, at_ms)
+            .await?;
+        if let Some(capture_epoch) = capture_epoch {
+            self.send_capture_metadata(
+                voice,
+                CaptureMetadata::Discontinuity {
+                    capture_epoch,
+                    reason: crate::CaptureDiscontinuityReason::Reconnect,
+                },
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     pub async fn deliver_discontinuity(
         &self,
         session_id: SessionId,
@@ -309,6 +350,15 @@ impl NetworkMediaHub {
                 })?,
             )
         };
+        self.send_discontinuity(voice, recognition, at_ms).await
+    }
+
+    async fn send_discontinuity(
+        &self,
+        voice: mpsc::Sender<Result<VoiceInputEvent, AdapterError>>,
+        recognition: mpsc::Sender<Result<CaptureEvent, AdapterError>>,
+        at_ms: u64,
+    ) -> Result<(), AdapterError> {
         let (voice_permit, recognition_permit) =
             tokio::time::timeout(self.operation_timeout, async {
                 tokio::try_join!(voice.reserve(), recognition.reserve())
@@ -337,6 +387,14 @@ impl NetworkMediaHub {
             .get(&session_id.get())
             .and_then(|session| session.voice.clone())
             .ok_or_else(|| AdapterError::new("network media voice input is not attached"))?;
+        self.send_capture_metadata(voice, metadata).await
+    }
+
+    async fn send_capture_metadata(
+        &self,
+        voice: mpsc::Sender<Result<VoiceInputEvent, AdapterError>>,
+        metadata: CaptureMetadata,
+    ) -> Result<(), AdapterError> {
         tokio::time::timeout(
             self.operation_timeout,
             voice.send(Ok(VoiceInputEvent::CaptureMetadata(metadata))),
@@ -351,11 +409,38 @@ impl NetworkMediaHub {
         session_id: SessionId,
         connection_id: u64,
     ) -> Result<mpsc::Receiver<NetworkBridgeRequest>, AdapterError> {
+        self.attach_playback_transport_checked(session_id, None, connection_id)
+            .await
+    }
+
+    /// An authentication continuation may outlive revoke/re-reserve. Check its
+    /// reservation before installing a transport or moving queued playback.
+    pub async fn attach_playback_transport_for_reservation(
+        &self,
+        session_id: SessionId,
+        reservation_epoch: u64,
+        connection_id: u64,
+    ) -> Result<mpsc::Receiver<NetworkBridgeRequest>, AdapterError> {
+        self.attach_playback_transport_checked(session_id, Some(reservation_epoch), connection_id)
+            .await
+    }
+
+    async fn attach_playback_transport_checked(
+        &self,
+        session_id: SessionId,
+        reservation_epoch: Option<u64>,
+        connection_id: u64,
+    ) -> Result<mpsc::Receiver<NetworkBridgeRequest>, AdapterError> {
         let (sender, receiver) = mpsc::channel(MEDIA_QUEUE_CAPACITY);
         let mut sessions = self.sessions.lock().await;
         let session = sessions
             .get_mut(&session_id.get())
             .ok_or_else(|| AdapterError::new("network media session is not reserved"))?;
+        if reservation_epoch.is_some_and(|epoch| epoch != session.reservation_epoch) {
+            return Err(AdapterError::new(
+                "network media reservation no longer matches",
+            ));
+        }
         if session.playback.is_some() {
             return Err(AdapterError::new(
                 "network media playback transport is already attached",
@@ -427,11 +512,46 @@ impl NetworkMediaHub {
         connection_id: u64,
         reconnect_deadline: Instant,
     ) -> Result<(), AdapterError> {
+        self.disconnect_playback_transport_checked(
+            session_id,
+            None,
+            connection_id,
+            reconnect_deadline,
+        )
+        .await
+    }
+
+    pub async fn disconnect_playback_transport_for_reservation(
+        &self,
+        session_id: SessionId,
+        reservation_epoch: u64,
+        connection_id: u64,
+        reconnect_deadline: Instant,
+    ) -> Result<(), AdapterError> {
+        self.disconnect_playback_transport_checked(
+            session_id,
+            Some(reservation_epoch),
+            connection_id,
+            reconnect_deadline,
+        )
+        .await
+    }
+
+    async fn disconnect_playback_transport_checked(
+        &self,
+        session_id: SessionId,
+        reservation_epoch: Option<u64>,
+        connection_id: u64,
+        reconnect_deadline: Instant,
+    ) -> Result<(), AdapterError> {
         let (voice, completions, flushed_generations, expiry_changed) = {
             let mut sessions = self.sessions.lock().await;
             let session = sessions
                 .get_mut(&session_id.get())
                 .ok_or_else(|| AdapterError::new("network media session is not reserved"))?;
+            if reservation_epoch.is_some_and(|epoch| epoch != session.reservation_epoch) {
+                return Ok(());
+            }
             if session
                 .playback
                 .as_ref()

@@ -26,12 +26,12 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{AdapterError, AdapterFuture, PcmFormat};
+pub use conversation_protocol::DiarizedMediaSampleRange;
 
 /// The most segments one diarization may carry. A longer meeting fails closed rather than
-/// producing a result that cannot be stated on a bounded wire frame: 1024 segments of
-/// timings, identifier and cluster label cost about 133 KiB of JSON, which together with the
-/// text limit below leaves the whole answer inside the 512 KiB client frame even when every
-/// character of text has to be escaped.
+/// producing an unbounded result. These semantic limits do not guarantee the enriched v4
+/// answer fits512KiB: the gateway additionally checks the complete serialized response,
+/// including sample evidence and escaped strings, and rejects it whole if oversized.
 pub const MAX_DIARIZED_SEGMENTS: usize = 1024;
 /// The most text one segment may carry.
 pub const MAX_DIARIZED_SEGMENT_TEXT_BYTES: usize = 2048;
@@ -42,6 +42,51 @@ pub const MAX_SPEAKER_CLUSTERS: usize = 64;
 /// The most bytes one segment identifier may carry.
 pub const MAX_DIARIZED_SEGMENT_ID_BYTES: usize = 64;
 
+/// Exact cumulative PCM position and the closed core-gap offset of a CRSREC03 window.
+/// This is recording provenance, not a provider or physical-clock accuracy claim.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MediaSampleOrigin {
+    media_start_sample: u64,
+    sample_rate_hz: u32,
+    gap_offset_ms: u64,
+}
+
+impl MediaSampleOrigin {
+    pub fn new(
+        media_start_sample: u64,
+        sample_rate_hz: u32,
+        gap_offset_ms: u64,
+    ) -> Result<Self, AdapterError> {
+        let origin = Self {
+            media_start_sample,
+            sample_rate_hz,
+            gap_offset_ms,
+        };
+        origin.project_sample(media_start_sample)?;
+        Ok(origin)
+    }
+
+    pub const fn media_start_sample(self) -> u64 {
+        self.media_start_sample
+    }
+    pub const fn sample_rate_hz(self) -> u32 {
+        self.sample_rate_hz
+    }
+    pub const fn gap_offset_ms(self) -> u64 {
+        self.gap_offset_ms
+    }
+
+    pub(crate) fn project_sample(self, sample: u64) -> Result<u64, AdapterError> {
+        let invalid = || AdapterError::new("meeting sample origin cannot be projected");
+        let millis = u128::from(sample)
+            .checked_mul(1000)
+            .and_then(|value| value.checked_div(u128::from(self.sample_rate_hz)))
+            .and_then(|value| u64::try_from(value).ok())
+            .ok_or_else(invalid)?;
+        millis.checked_add(self.gap_offset_ms).ok_or_else(invalid)
+    }
+}
+
 /// A bounded window of decrypted meeting audio.
 ///
 /// `started_at_ms` is the window's first sample on the media timeline. Windows arrive in order
@@ -51,6 +96,7 @@ pub const MAX_DIARIZED_SEGMENT_ID_BYTES: usize = 64;
 pub struct MeetingAudioWindow {
     format: PcmFormat,
     started_at_ms: u64,
+    sample_origin: Option<MediaSampleOrigin>,
     bytes: Vec<u8>,
 }
 
@@ -62,6 +108,7 @@ impl fmt::Debug for MeetingAudioWindow {
             .debug_struct("MeetingAudioWindow")
             .field("format", &self.format)
             .field("started_at_ms", &self.started_at_ms)
+            .field("sample_origin", &self.sample_origin)
             .field("bytes", &format_args!("<{} bytes>", self.bytes.len()))
             .finish()
     }
@@ -84,8 +131,40 @@ impl MeetingAudioWindow {
         Ok(Self {
             format,
             started_at_ms,
+            sample_origin: None,
             bytes,
         })
+    }
+
+    /// Uses an authoritative sample origin; it never derives sample coordinates from ms.
+    pub fn new_with_sample_origin(
+        format: PcmFormat,
+        origin: MediaSampleOrigin,
+        bytes: Vec<u8>,
+    ) -> Result<Self, AdapterError> {
+        if origin.sample_rate_hz != format.sample_rate_hz() {
+            return Err(AdapterError::new(
+                "meeting sample origin rate differs from PCM",
+            ));
+        }
+        let mut window = Self::new(
+            format,
+            origin.project_sample(origin.media_start_sample)?,
+            bytes,
+        )?;
+        let count = u64::try_from(window.bytes.len() / format.frame_alignment_bytes()?)
+            .map_err(|_| AdapterError::new("meeting sample count overflowed"))?;
+        let end = origin
+            .media_start_sample
+            .checked_add(count)
+            .ok_or_else(|| AdapterError::new("meeting sample count overflowed"))?;
+        origin.project_sample(end)?;
+        window.sample_origin = Some(origin);
+        Ok(window)
+    }
+
+    pub const fn sample_origin(&self) -> Option<MediaSampleOrigin> {
+        self.sample_origin
     }
 
     pub const fn format(&self) -> PcmFormat {
@@ -132,6 +211,7 @@ pub struct DiarizedSegment {
     ended_at_ms: u64,
     text: String,
     speaker_cluster: Option<String>,
+    media_sample_range: Option<DiarizedMediaSampleRange>,
 }
 
 impl DiarizedSegment {
@@ -182,7 +262,23 @@ impl DiarizedSegment {
             ended_at_ms,
             text,
             speaker_cluster,
+            media_sample_range: None,
         })
+    }
+
+    pub fn with_media_sample_range(
+        mut self,
+        range: DiarizedMediaSampleRange,
+    ) -> Result<Self, AdapterError> {
+        range
+            .validate_legacy_projection(self.started_at_ms, self.ended_at_ms)
+            .map_err(|_| AdapterError::new("diarized sample range differs from media timings"))?;
+        self.media_sample_range = Some(range);
+        Ok(self)
+    }
+
+    pub const fn media_sample_range(&self) -> Option<DiarizedMediaSampleRange> {
+        self.media_sample_range
     }
 
     pub fn segment_id(&self) -> &str {
@@ -374,6 +470,7 @@ mod tests {
         is_anonymous_cluster_label, DiarizationResult, DiarizationWarning, DiarizedSegment,
         SpeakerClusters, MAX_DIARIZED_SEGMENTS, MAX_DIARIZED_SEGMENT_TEXT_BYTES,
     };
+    use super::{MediaSampleOrigin, MeetingAudioWindow, PcmFormat};
 
     fn segment(index: usize, text: &str) -> DiarizedSegment {
         DiarizedSegment::new(format!("seg-{index}"), 0, 1, text, None).unwrap()
@@ -385,6 +482,45 @@ mod tests {
         assert!(DiarizedSegment::new("seg 1", 0, 1, "text", None).is_err());
         assert!(DiarizedSegment::new("s".repeat(65), 0, 1, "text", None).is_err());
         assert!(DiarizedSegment::new("seg-1", 0, 1, "line\nbreak", None).is_err());
+    }
+
+    #[test]
+    fn exact_window_origin_preserves_fractional_samples_without_reverse_ms_conversion() {
+        let format =
+            PcmFormat::new(24_000, 1, crate::PcmSampleFormat::Signed16LittleEndian).unwrap();
+        let origin = MediaSampleOrigin::new(524_288, 24_000, 123).unwrap();
+        let window =
+            MeetingAudioWindow::new_with_sample_origin(format, origin, vec![0; 80]).unwrap();
+        assert_eq!(window.started_at_ms(), 21_968);
+        assert_eq!(window.sample_origin(), Some(origin));
+        assert_eq!(origin.media_start_sample(), 524_288);
+        assert_eq!(origin.sample_rate_hz(), 24_000);
+        assert_eq!(origin.gap_offset_ms(), 123);
+        assert_eq!(
+            MeetingAudioWindow::new(format, 21_968, vec![0; 80])
+                .unwrap()
+                .sample_origin(),
+            None
+        );
+        assert!(MediaSampleOrigin::new(0, 0, 0).is_err());
+        assert!(MediaSampleOrigin::new(u64::MAX, 1, 0).is_err());
+        assert!(MediaSampleOrigin::new(24, 24_000, u64::MAX).is_err());
+        assert!(MeetingAudioWindow::new_with_sample_origin(
+            format,
+            MediaSampleOrigin::new(0, 16_000, 0).unwrap(),
+            vec![0; 80]
+        )
+        .is_err());
+        let high_rate =
+            PcmFormat::new(u32::MAX, 1, crate::PcmSampleFormat::Signed16LittleEndian).unwrap();
+        assert!(MeetingAudioWindow::new_with_sample_origin(
+            high_rate,
+            MediaSampleOrigin::new(u64::MAX - 1, u32::MAX, 0).unwrap(),
+            vec![0; 4]
+        )
+        .is_err());
+        assert!(MeetingAudioWindow::new_with_sample_origin(format, origin, Vec::new()).is_err());
+        assert!(MeetingAudioWindow::new_with_sample_origin(format, origin, vec![0; 3]).is_err());
     }
 
     #[test]

@@ -53,6 +53,8 @@ export {
   type MemorySummary,
   type PersonaState,
   type DiarizedSegment,
+  type DiarizedMediaSampleRange,
+  type FinalizedRecordingReconciliation,
   type RecordingGap,
   type ProcessedText,
   type RecordingReconciliation,

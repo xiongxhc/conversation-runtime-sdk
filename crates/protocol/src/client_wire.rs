@@ -1550,6 +1550,17 @@ struct WireClientDiarizedSegment {
     ended_at_ms: String,
     text: String,
     speaker_cluster: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    media_sample_range: Option<Option<WireDiarizedMediaSampleRange>>,
+}
+
+#[derive(Serialize)]
+struct WireDiarizedMediaSampleRange {
+    start_sample_inclusive: String,
+    end_sample_exclusive: String,
+    sample_rate_hz: u32,
+    gap_offset_ms: String,
+    quantization_policy: &'static str,
 }
 
 #[derive(Serialize)]
@@ -1559,8 +1570,8 @@ struct WireClientRecordingReconciliation {
     warnings: Vec<String>,
 }
 
-impl From<&ClientRecordingReconciliation> for WireClientRecordingReconciliation {
-    fn from(reconciliation: &ClientRecordingReconciliation) -> Self {
+impl WireClientRecordingReconciliation {
+    fn new(reconciliation: &ClientRecordingReconciliation, protocol_version: u64) -> Self {
         Self {
             segments: reconciliation
                 .segments
@@ -1571,6 +1582,20 @@ impl From<&ClientRecordingReconciliation> for WireClientRecordingReconciliation 
                     ended_at_ms: segment.ended_at_ms.to_string(),
                     text: segment.text.clone(),
                     speaker_cluster: segment.speaker_cluster.clone(),
+                    media_sample_range: (protocol_version >= FINALIZED_RECORDING_PROTOCOL_VERSION)
+                        .then(|| {
+                            segment
+                                .media_sample_range
+                                .map(|range| WireDiarizedMediaSampleRange {
+                                    start_sample_inclusive: range
+                                        .start_sample_inclusive()
+                                        .to_string(),
+                                    end_sample_exclusive: range.end_sample_exclusive().to_string(),
+                                    sample_rate_hz: range.sample_rate_hz(),
+                                    gap_offset_ms: range.gap_offset_ms().to_string(),
+                                    quantization_policy: range.quantization_policy(),
+                                })
+                        }),
                 })
                 .collect(),
             warnings: reconciliation.warnings.clone(),
@@ -2081,7 +2106,10 @@ impl<'a> GatewayMessageEnvelope<'a> {
             } => Self::RecordingReconciled {
                 protocol_version,
                 request_id,
-                reconciliation: WireClientRecordingReconciliation::from(reconciliation),
+                reconciliation: WireClientRecordingReconciliation::new(
+                    reconciliation,
+                    protocol_version,
+                ),
             },
             GatewayMessage::TextProcessed {
                 request_id,

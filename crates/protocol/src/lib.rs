@@ -22,9 +22,9 @@ pub use utterance_capture::{
 };
 
 pub use client_diarization::{
-    ClientDiarizedSegment, ClientRecordingReconciliation, MAX_CLIENT_DIARIZED_SEGMENTS,
-    MAX_CLIENT_DIARIZED_SEGMENT_ID_BYTES, MAX_CLIENT_DIARIZED_SEGMENT_TEXT_BYTES,
-    MAX_CLIENT_DIARIZED_TEXT_BYTES,
+    ClientDiarizedSegment, ClientRecordingReconciliation, DiarizedMediaSampleRange,
+    MAX_CLIENT_DIARIZED_SEGMENTS, MAX_CLIENT_DIARIZED_SEGMENT_ID_BYTES,
+    MAX_CLIENT_DIARIZED_SEGMENT_TEXT_BYTES, MAX_CLIENT_DIARIZED_TEXT_BYTES,
 };
 pub use client_memory::{
     memory_preview, ClientMemoryApproval, ClientMemoryCursor, ClientMemoryInspection,

@@ -18,6 +18,69 @@ const fixtureDirectory = new URL(
   "../../../../tests/fixtures/client-wire-v1/",
   import.meta.url,
 );
+
+test("v4 reconciliation preserves outward sample coordinates and distinguishes legacy null", () => {
+  const segment = { segment_id: "seg-1", started_at_ms: "375299968947665", ended_at_ms: "375299968947665", text: "fractional", speaker_cluster: "cluster-1" };
+  const range = { start_sample_inclusive: "9007199254741009", end_sample_exclusive: "9007199254741018", sample_rate_hz: 24000, gap_offset_ms: "123", quantization_policy: "provider_seconds_outward_samples/v1" };
+  const wire = (segments: unknown[], version = 4) => ({ protocol_version: version, type: "recording_reconciled", request_id: "r", reconciliation: { segments, warnings: [] } });
+  const parsed = parseGatewayMessage(wire([{ ...segment, media_sample_range: range }]), 4);
+  assert.equal(parsed.type, "recording_reconciled");
+  if (parsed.type !== "recording_reconciled") assert.fail("wrong response");
+  assert.deepEqual(Reflect.get(parsed.reconciliation.segments[0]!, "mediaSampleRange"), { startSampleInclusive: 9007199254741009n, endSampleExclusive: 9007199254741018n, sampleRateHz: 24000, gapOffsetMs: 123n, quantizationPolicy: "provider_seconds_outward_samples/v1" });
+  const nullResult = parseGatewayMessage(wire([{ ...segment, media_sample_range: null }]), 4);
+  if (nullResult.type !== "recording_reconciled") assert.fail("wrong response");
+  assert.equal(Reflect.get(nullResult.reconciliation.segments[0]!, "mediaSampleRange"), null);
+  assert.throws(() => parseGatewayMessage(wire([segment]), 4));
+  assert.throws(() => parseGatewayMessage(wire([{ ...segment, media_sample_range: null }], 3), 3));
+  assert.equal(parseGatewayMessage(wire([segment], 3), 3).type, "recording_reconciled");
+  for (const patch of [
+    { start_sample_inclusive: "09007199254741009" }, { start_sample_inclusive: 9007199254741009 },
+    { end_sample_exclusive: "9007199254741009" }, { end_sample_exclusive: "18446744073709551616" },
+    { sample_rate_hz: 0 }, { sample_rate_hz: 24000.5 }, { sample_rate_hz: 4294967296 }, { sample_rate_hz: 16000 },
+    { gap_offset_ms: "124" }, { gap_offset_ms: "18446744073709551615" },
+    { quantization_policy: "exact_word_timing" }, { extra: "PRIVATE" },
+  ]) assert.throws(() => parseGatewayMessage(wire([{ ...segment, media_sample_range: { ...range, ...patch } }]), 4));
+  for (const key of Object.keys(range)) {
+    const missing = { ...range } as Record<string, unknown>; delete missing[key];
+    assert.throws(() => parseGatewayMessage(wire([{ ...segment, media_sample_range: missing }]), 4));
+  }
+  // Each zero-ms segment is independently valid; only their contradictory rates
+  // make the combined result invalid for one fixed-rate recording.
+  const tiny = (id: string, rate: number) => ({ ...segment, segment_id: id,
+    started_at_ms: "0", ended_at_ms: "0", media_sample_range: { ...range,
+      start_sample_inclusive: "0", end_sample_exclusive: "1", gap_offset_ms: "0", sample_rate_hz: rate } });
+  assert.equal(parseGatewayMessage(wire([tiny("one", 24000)]), 4).type, "recording_reconciled");
+  assert.equal(parseGatewayMessage(wire([tiny("two", 16000)]), 4).type, "recording_reconciled");
+  assert.throws(() => parseGatewayMessage(wire([tiny("one", 24000), tiny("two", 16000)]), 4));
+});
+
+test("canonical Rust v3/v4 diarization vectors preserve exact source-sample evidence", async () => {
+  const lines = (await readFile(new URL("../../../../tests/fixtures/diarization-v4/events.jsonl", import.meta.url), "utf8")).trim().split("\n");
+  assert.equal(lines.length, 2);
+  for (const [index, line] of lines.entries()) {
+    const parsed = parseGatewayMessage(JSON.parse(line), index === 0 ? 3 : 4);
+    if (parsed.type !== "recording_reconciled") assert.fail("wrong message");
+    const [exact, legacy] = parsed.reconciliation.segments;
+    assert.equal(exact!.startedAtMs, 375299968947665n);
+    assert.equal(exact!.endedAtMs, exact!.startedAtMs);
+    if (index === 0) { assert.equal(Object.hasOwn(exact!, "mediaSampleRange"), false); }
+    else {
+      assert.equal(exact!.mediaSampleRange!.startSampleInclusive, 9007199254741009n);
+      assert.equal(exact!.mediaSampleRange!.endSampleExclusive, 9007199254741018n);
+      assert.equal(legacy!.mediaSampleRange, null);
+    }
+  }
+});
+
+test("v4 rejects an actually oversized enriched result without reducing 1024 segments", () => {
+  const range = { start_sample_inclusive:"23",end_sample_exclusive:"25",sample_rate_hz:24000,gap_offset_ms:"0",quantization_policy:"provider_seconds_outward_samples/v1" };
+  const segments = Array.from({length:1024}, (_,index) => ({ segment_id:`seg-${String(index).padStart(60,"0")}`,started_at_ms:"0",ended_at_ms:"1",text:'"'.repeat(128),speaker_cluster:"cluster-1",media_sample_range:range }));
+  const wire = {protocol_version:4,type:"recording_reconciled",request_id:"bound",reconciliation:{segments,warnings:[]}};
+  assert.ok(new TextEncoder().encode(JSON.stringify(wire)).byteLength > 512*1024);
+  assert.throws(() => parseGatewayMessage(wire,4), /size limit/);
+  for (const segment of segments) segment.text="";
+  assert.equal(parseGatewayMessage(wire,4).type,"recording_reconciled");
+});
 const meetingOnlineFixture = new URL(
   "../../../../apps/runtime-gateway/tests/fixtures/meeting-agent-online-v1.json",
   import.meta.url,

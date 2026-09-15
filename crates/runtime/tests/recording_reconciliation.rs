@@ -30,6 +30,106 @@ const ONE_SECOND_BYTES: usize = 32_000;
 const PLAINTEXT_MARKER: &[u8] = b"PLAINTEXT-MEETING-AUDIO-MARKER-32";
 
 #[tokio::test]
+async fn encrypted_03_reopen_supplies_exact_window_origins_but_02_remains_absent() {
+    use conversation_model_adapters::MediaSampleOrigin;
+    use conversation_runtime::reconcile_finalized_recording;
+    type Seen = Vec<(Option<MediaSampleOrigin>, u64, usize)>;
+    struct ObserveOrigins(Arc<StdMutex<Seen>>);
+    impl TranscriptionDiarizer for ObserveOrigins {
+        fn diarize<'a>(
+            &'a self,
+            mut windows: MeetingAudioWindows,
+            _cancel: CancellationToken,
+        ) -> AdapterFuture<'a, DiarizationResult> {
+            Box::pin(async move {
+                while let Some(window) = windows.recv().await {
+                    let window = window?;
+                    self.0.lock().unwrap().push((
+                        window.sample_origin(),
+                        window.started_at_ms(),
+                        window.bytes().len(),
+                    ));
+                }
+                DiarizationResult::new(Vec::new(), Vec::new())
+            })
+        }
+    }
+    for timed in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let key_env = "RUNTIME_DIARIZATION_REOPEN_ORIGIN_SYNTHETIC_KEY";
+        std::env::set_var(key_env, FAKE_KEY);
+        let settings = RecordingSettings::new(directory.path(), key_env).unwrap();
+        let mut recorder = if timed {
+            SessionRecorder::start_timed(&settings, SessionId::new(41))
+        } else {
+            SessionRecorder::start(&settings, SessionId::new(41))
+        }
+        .unwrap();
+        let format = PcmFormat::new(24_000, 1, PcmSampleFormat::Signed16LittleEndian).unwrap();
+        let make = |sequence, count| {
+            AudioFrame::new(
+                TurnId::new(1),
+                GenerationId::new(1),
+                UtteranceId::new(1),
+                sequence,
+                format,
+                vec![0x31; count],
+            )
+            .unwrap()
+        };
+        for sequence in 1..=16 {
+            recorder.record_frame(&make(sequence, 65_536)).unwrap();
+        }
+        recorder.record_frame(&make(17, 80)).unwrap();
+        recorder.record_capture_gap().unwrap();
+        recorder.record_frame(&make(18, 80)).unwrap();
+        let (summary, capability) = recorder.finalize_with_capability().unwrap();
+        drop(recorder); // No writer or live handle is retained through recovery.
+        let gap = summary.gaps[0].ended_at_ms.unwrap() - summary.gaps[0].started_at_ms;
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        reconcile_finalized_recording(
+            &settings,
+            &capability,
+            Arc::new(ObserveOrigins(seen.clone())),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3);
+        assert_eq!(
+            seen.iter().map(|(_, _, bytes)| *bytes).collect::<Vec<_>>(),
+            [1_048_576, 80, 80]
+        );
+        if timed {
+            assert_eq!(
+                seen.as_slice(),
+                [
+                    (
+                        Some(MediaSampleOrigin::new(0, 24_000, 0).unwrap()),
+                        0,
+                        1_048_576
+                    ),
+                    (
+                        Some(MediaSampleOrigin::new(524_288, 24_000, 0).unwrap()),
+                        21_845,
+                        80
+                    ),
+                    (
+                        Some(MediaSampleOrigin::new(524_328, 24_000, gap).unwrap()),
+                        21_847 + gap,
+                        80
+                    ),
+                ]
+            );
+        } else {
+            assert!(seen.iter().all(|(origin, _, _)| origin.is_none()));
+            assert_eq!(seen[1].1, 16 * 1365);
+        }
+    }
+}
+
+#[tokio::test]
 async fn a_recording_answers_only_to_the_handle_it_was_minted_with() {
     let key_env = "CONVERSATION_TEST_RECONCILE_HANDLE_KEY";
     let directory = tempfile::tempdir().unwrap();

@@ -82,8 +82,7 @@ pub struct GatewaySession {
     media_server: Option<Arc<MediaServer>>,
     media_capture_handoff: Option<mpsc::Sender<Arc<dyn AudioCapture>>>,
     /// The adapter that turns a finished recording into timed text and anonymous clusters.
-    /// Absent in every configuration the loader builds: like the other online adapters, it is
-    /// wired explicitly rather than constructed from a TOML file.
+    /// Selected by the TOML loader and attached by main; absent when no diarizer is configured.
     reconciliation: Option<Arc<dyn TranscriptionDiarizer>>,
     alignment: Option<ActiveAlignmentRead>,
 }
@@ -1509,15 +1508,8 @@ impl GatewaySession {
                         .map_err(CommandFailure::response);
                     }
                 };
-                send_accepted(normal, &request_id).map_err(CommandFailure::response)?;
-                send_normal(
-                    normal,
-                    GatewayMessage::RecordingReconciled {
-                        request_id,
-                        reconciliation,
-                    },
-                )
-                .map_err(CommandFailure::response)
+                send_reconciliation(normal, request_id, reconciliation, protocol_version)
+                    .map_err(CommandFailure::response)
             }
             ClientCommand::ReconcileFinalizedRecording {
                 request_id,
@@ -1561,17 +1553,13 @@ impl GatewaySession {
                     }
                 };
                 match result {
-                    Ok(result) => {
-                        send_accepted(normal, &request_id).map_err(CommandFailure::response)?;
-                        send_normal(
-                            normal,
-                            GatewayMessage::RecordingReconciled {
-                                request_id,
-                                reconciliation: client_reconciliation(&result),
-                            },
-                        )
-                        .map_err(CommandFailure::response)
-                    }
+                    Ok(result) => send_reconciliation(
+                        normal,
+                        request_id,
+                        client_reconciliation(&result),
+                        protocol_version,
+                    )
+                    .map_err(CommandFailure::response),
                     Err(error) => {
                         send_rejection(normal, &request_id, ClientRuntimeError::from(error))
                             .map_err(CommandFailure::response)
@@ -2754,6 +2742,29 @@ fn send_normal(
     send_bounded(writer, message)
 }
 
+fn send_reconciliation(
+    writer: &mpsc::Sender<GatewayMessage>,
+    request_id: String,
+    reconciliation: ClientRecordingReconciliation,
+    protocol_version: u64,
+) -> Result<(), GatewaySessionError> {
+    let message = GatewayMessage::RecordingReconciled {
+        request_id: request_id.clone(),
+        reconciliation,
+    };
+    // Includes request ID, JSON escaping and every populated v4 evidence object. Validate
+    // the complete serialized frame before accepting; never truncate a successful answer.
+    if encode_gateway_message_for_version(&message, protocol_version).is_err() {
+        return send_rejection(
+            writer,
+            &request_id,
+            command_error("recording reconciliation exceeded its wire contract"),
+        );
+    }
+    send_accepted(writer, &request_id)?;
+    send_normal(writer, message)
+}
+
 fn send_urgent(
     writer: &mpsc::Sender<GatewayMessage>,
     message: GatewayMessage,
@@ -2843,6 +2854,7 @@ fn client_reconciliation(result: &DiarizationResult) -> ClientRecordingReconcili
                 ended_at_ms: segment.ended_at_ms(),
                 text: segment.text().to_owned(),
                 speaker_cluster: segment.speaker_cluster().map(str::to_owned),
+                media_sample_range: segment.media_sample_range(),
             })
             .collect(),
         warnings: result
@@ -9300,6 +9312,76 @@ max_error_bytes = 65536
             .unwrap()
             .contains("recording recovery requires an idle session"));
         text.close().await;
+    }
+
+    #[tokio::test]
+    async fn enriched_reconciliation_over_actual_wire_budget_is_rejected_before_acceptance() {
+        struct EnrichedDiarizer;
+        impl TranscriptionDiarizer for EnrichedDiarizer {
+            fn diarize<'a>(
+                &'a self,
+                mut windows: MeetingAudioWindows,
+                _cancellation: CancellationToken,
+            ) -> AdapterFuture<'a, DiarizationResult> {
+                Box::pin(async move {
+                    while let Some(window) = windows.recv().await {
+                        window?;
+                    }
+                    let range = conversation_model_adapters::DiarizedMediaSampleRange::new(
+                        23, 25, 24_000, 0,
+                    )
+                    .unwrap();
+                    let segments = (0..1024)
+                        .map(|index| {
+                            DiarizedSegment::new(
+                                format!("seg-{index:060}"),
+                                0,
+                                1,
+                                "\"".repeat(128),
+                                Some("cluster-1".to_owned()),
+                            )?
+                            .with_media_sample_range(range)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    DiarizationResult::new(segments, Vec::new())
+                })
+            }
+        }
+        let directory = TempDir::new().unwrap();
+        let key_env = "RUNTIME_DIARIZATION_ENRICHED_BOUND_SYNTHETIC_KEY";
+        std::env::set_var(key_env, FAKE_RECORDING_KEY);
+        let settings = RecordingSettings::new(directory.path(), key_env).unwrap();
+        let mut recorder =
+            conversation_runtime::SessionRecorder::start(&settings, SessionId::new(41)).unwrap();
+        let (_, capability) = recorder.finalize_with_capability().unwrap();
+        drop(recorder);
+        let session = GatewaySession::new(unused_runtime(), status())
+            .with_v4_control()
+            .with_recording(settings)
+            .with_reconciliation(Arc::new(EnrichedDiarizer));
+        let mut gateway = InMemoryGateway::start(session).await;
+        gateway.write(&serde_json::json!({"protocol_version":4,"type":"reconcile_finalized_recording","request_id":"enriched-bound","capability":{
+            "source_session_id":"41","recording_handle":capability.recording_handle,"sha256":capability.sha256,"key_id":capability.key_id,"authorization":capability.authorization
+        }}).to_string()).await;
+        let response = gateway.read_message().await;
+        if response.contains("command_rejected") {
+            gateway
+                .write(r#"{"protocol_version":4,"type":"status","request_id":"still-open"}"#)
+                .await;
+            assert_accepted_message(&gateway.read_message().await, "still-open");
+            assert!(gateway.read_message().await.contains(r#""type":"status""#));
+        }
+        let InMemoryGateway {
+            input,
+            output,
+            task,
+        } = gateway;
+        drop(input);
+        drop(output);
+        let exited = timeout(TEST_TIMEOUT, task).await.unwrap().unwrap();
+        assert_rejected_message(&response, "enriched-bound", "invalid_state");
+        assert!(response.len() < 1024 && !response.contains(FAKE_RECORDING_KEY));
+        assert!(exited.is_ok(), "bounded rejection leaves gateway healthy");
     }
 
     #[tokio::test]

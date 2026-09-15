@@ -30,7 +30,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tokio-rustls = "0.26"
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", features = ["sink"] }
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "multipart"] }
 # Pinned to the version rustls already locks in through reqwest, so making the AEAD a
 # direct dependency adds no third-party code to the build.
 ring = "0.17.14"

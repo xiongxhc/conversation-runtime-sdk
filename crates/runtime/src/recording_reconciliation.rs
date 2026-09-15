@@ -26,8 +26,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use conversation_model_adapters::{
-    AdapterError, DiarizationResult, DiarizationWarning, MeetingAudioWindow, PcmFormat,
-    TranscriptionDiarizer,
+    AdapterError, DiarizationResult, DiarizationWarning, MediaSampleOrigin, MeetingAudioWindow,
+    PcmFormat, TranscriptionDiarizer,
 };
 use conversation_protocol::{
     FinalizedRecordingCapability, RuntimeError, RuntimeErrorKind, RuntimeStage, SessionId,
@@ -42,12 +42,11 @@ use crate::session_recording::{
 
 /// The most plaintext meeting audio one window holds.
 ///
-/// A mebibyte is about 33 seconds of 16 kHz mono signed 16-bit audio and roughly 1.4 MB once
-/// base64 encoded into a request body — the same order as the streaming recognizer's upload
-/// chunk. A two-hour meeting is around 230 MB, which this turns into some 225 windows; the
-/// resident cost is one window being filled plus the one in flight, whatever the meeting's
-/// length. Sizing a buffer from a recording's *duration* would be wrong: the duration is the
-/// media timeline and includes silence no audio was recorded for.
+/// A mebibyte is about 33 seconds of 16 kHz mono signed 16-bit audio. The full online
+/// pipeline can retain the current window, one queued window, one reader-builder window,
+/// a separate WAV of at most1MiB+44 bytes, a512KiB response, plus bounded parsed metadata
+/// and transport/serialization overhead. It never retains the whole recording. Sizing a
+/// buffer from recording duration would include gaps that contain no recorded samples.
 pub const MAX_RECONCILIATION_WINDOW_BYTES: usize = 1024 * 1024;
 
 /// One window in flight. The reader is a blocking task, so a deeper queue would only buy
@@ -315,9 +314,29 @@ impl Windows {
         let format = self
             .format
             .ok_or_else(|| adapter_error("recording window has no format"))?;
-        let window =
-            MeetingAudioWindow::new(format, self.started_at_ms, std::mem::take(&mut self.bytes))
-                .map_err(|error| adapter_runtime_error(&error))?;
+        let origin = if self.timed {
+            let count = (self.bytes.len()
+                / format
+                    .frame_alignment_bytes()
+                    .map_err(|error| adapter_runtime_error(&error))?)
+                as u64;
+            let start = self
+                .samples
+                .checked_sub(count)
+                .ok_or_else(|| adapter_error("recording window sample origin underflowed"))?;
+            Some(
+                MediaSampleOrigin::new(start, format.sample_rate_hz(), self.gap_ms)
+                    .map_err(|error| adapter_runtime_error(&error))?,
+            )
+        } else {
+            None
+        };
+        let bytes = std::mem::take(&mut self.bytes);
+        let window = match origin {
+            Some(origin) => MeetingAudioWindow::new_with_sample_origin(format, origin, bytes),
+            None => MeetingAudioWindow::new(format, self.started_at_ms, bytes),
+        }
+        .map_err(|error| adapter_runtime_error(&error))?;
         Ok(sender.blocking_send(Ok(window)).is_ok())
     }
 }
@@ -344,4 +363,53 @@ fn invalid_state_error(message: impl Into<String>) -> RuntimeError {
         RuntimeStage::AudioCapture,
         message,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use conversation_model_adapters::{MediaSampleOrigin, PcmSampleFormat};
+
+    #[test]
+    fn timed_windows_keep_exact_fractional_origin_across_size_flush_and_gap() {
+        let format = PcmFormat::new(24_000, 1, PcmSampleFormat::Signed16LittleEndian).unwrap();
+        let (sender, mut receiver) = mpsc::channel(4);
+        let mut windows = Windows {
+            timed: true,
+            ..Windows::default()
+        };
+        for _ in 0..16 {
+            assert!(windows.accept(format, vec![0x25; 65_536], &sender).unwrap());
+        }
+        assert!(windows.accept(format, vec![0x36; 80], &sender).unwrap());
+        assert!(windows.flush(&sender).unwrap());
+        windows.gap_opened_at_ms = Some(100_000);
+        windows.close_gap(100_123);
+        assert!(windows.accept(format, vec![0x47; 80], &sender).unwrap());
+        assert!(windows.flush(&sender).unwrap());
+        assert!(windows.flush(&sender).unwrap());
+        for (sample, gap, started, count, byte) in [
+            (0, 0, 0, 1_048_576, 0x25),
+            (524_288, 0, 21_845, 80, 0x36),
+            (524_328, 123, 21_970, 80, 0x47),
+        ] {
+            let window = receiver.try_recv().unwrap().unwrap();
+            assert_eq!(
+                window.sample_origin(),
+                Some(MediaSampleOrigin::new(sample, 24_000, gap).unwrap())
+            );
+            assert_eq!(window.started_at_ms(), started);
+            assert_eq!(window.bytes(), vec![byte; count]);
+        }
+        assert!(receiver.try_recv().is_err());
+        let other = PcmFormat::new(16_000, 1, PcmSampleFormat::Signed16LittleEndian).unwrap();
+        assert!(windows.accept(other, vec![0; 80], &sender).is_err());
+
+        let mut legacy = Windows::default();
+        legacy.accept(format, vec![0; 80], &sender).unwrap();
+        legacy.accept(format, vec![0; 80], &sender).unwrap();
+        legacy.flush(&sender).unwrap();
+        assert_eq!(legacy.media_ms, 2); // Preserve two separate legacy frame floors.
+        assert_eq!(receiver.try_recv().unwrap().unwrap().sample_origin(), None);
+    }
 }

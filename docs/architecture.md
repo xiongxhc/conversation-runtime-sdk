@@ -161,8 +161,10 @@ still appending to would answer for a prefix of the meeting and call it the whol
 Decryption happens only inside the runtime, in bounded in-memory windows of at
 most one mebibyte that are streamed straight to the provider adapter. **No
 plaintext file is created on any path** — not on success, not on failure, not on
-cancellation — because none is created at all; a two-hour meeting costs one
-window of resident audio rather than its 230 MB. A window never spans a gap, so a
+cancellation — because none is created at all. The online pipeline can retain three 1 MiB
+PCM windows (current, queued, builder), a 1 MiB + 44-byte WAV, a 512 KiB response and
+bounded parsed/transport/serialization overhead, independently of meeting length.
+A window never spans a gap, so a
 provider is never handed two discontiguous stretches of audio as one buffer. The
 key stays on the runtime host and reaches nothing but the reader.
 
@@ -182,7 +184,8 @@ label is discarded at the adapter boundary and the wire refuses anything that is
 not an anonymous label, so a provider that guesses a name cannot have that name
 reach a client by any route. Mapping a cluster onto a real participant is the
 Meeting Agent's work, from evidence this runtime does not have. A provider's
-warning text is counted rather than relayed, because it may quote speech. A deployment without a diarizer records
+warning text is never relayed, because it may quote speech; the online adapter ignores
+unknown metadata and emits only its own closed warnings. A deployment without a diarizer records
 meetings and says plainly that it does not reconcile them.
 
 Which backend reconciles a recording is an explicit configuration choice, never a
@@ -196,8 +199,9 @@ and speech to a provider while its speakers are still clustered on the machine
 that recorded them; the status names the diarization component's execution
 location, so which of the two happened is a fact a client can read rather than a
 claim it has to trust. The local adapter is constructed by the configuration
-loader like every other offline adapter; the remote one is wired by the runtime,
-like the other online adapters.
+loader, as is the remote one; main attaches the selected adapter to the session.
+The online multipart and exact03/v4 sample contract is documented in
+[finalized recording recovery](finalized-recording-recovery.md).
 
 The local sidecar is handed bytes, never a path, so the plaintext window it
 clusters exists only in memory on both sides of the pipe. It loads its model from

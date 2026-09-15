@@ -1,3 +1,5 @@
+import { MAX_FRAME_BYTES } from "./framing.js";
+
 export const LEGACY_CLIENT_PROTOCOL_VERSION = 1;
 /** The version that introduced context seeding and its status field. */
 export const CONTEXT_SEED_PROTOCOL_VERSION = 2;
@@ -140,6 +142,17 @@ export type DiarizedSegment = {
   endedAtMs: bigint;
   text: string;
   speakerCluster: string | null;
+  /** Present (possibly null) in v4 only; never reconstructed from millisecond points. */
+  mediaSampleRange?: DiarizedMediaSampleRange | null;
+};
+
+/** Outward sample-cell enclosure, not exact word boundaries or provider accuracy. */
+export type DiarizedMediaSampleRange = {
+  readonly startSampleInclusive: bigint;
+  readonly endSampleExclusive: bigint;
+  readonly sampleRateHz: number;
+  readonly gapOffsetMs: bigint;
+  readonly quantizationPolicy: "provider_seconds_outward_samples/v1";
 };
 
 /** A whole meeting's reconciliation. */
@@ -147,6 +160,9 @@ export type RecordingReconciliation = {
   segments: DiarizedSegment[];
   warnings: string[];
 };
+
+/** The request's pinned non-secret source identity; never the current control session. */
+export type FinalizedRecordingReconciliation = RecordingReconciliation & { readonly source: RecordingIdentity };
 
 /**
  * One batch call's answer. `output` is whatever JSON the caller's schema allowed — the runtime
@@ -866,17 +882,25 @@ export function parseGatewayMessage(
       }
       return { type, requestId: requireRequestId(object), recording };
     }
-    case "recording_reconciled":
+    case "recording_reconciled": {
       requireExactKeys(object, ["protocol_version", "type", "request_id", "reconciliation"]);
       validateProtocolVersion(object, version);
       if (version < RUNTIME_PROFILE_PROTOCOL_VERSION) {
         throw new ProtocolError("recording reconciliation requires protocol version 3");
       }
+      const requestId = requireRequestId(object);
+      const reconciliation = parseRecordingReconciliation(object.reconciliation, version);
+      // A custom object transport must enforce the same enriched-frame bound as framing.
+      // Validate bounded fields first so serialization cannot visit an unbounded result.
+      if (version === 4 && utf8Bytes(JSON.stringify(object)) > MAX_FRAME_BYTES) {
+        throw new ProtocolError("recording reconciliation exceeded its frame size limit");
+      }
       return {
         type,
-        requestId: requireRequestId(object),
-        reconciliation: parseRecordingReconciliation(object.reconciliation),
+        requestId,
+        reconciliation,
       };
+    }
     case "text_processed":
       requireExactKeys(object, ["protocol_version", "type", "request_id", "processed"]);
       validateProtocolVersion(object, version);
@@ -1276,18 +1300,23 @@ function parseProcessedText(value: unknown): ProcessedText {
   return { output: object.output, warnings };
 }
 
-function parseRecordingReconciliation(value: unknown): RecordingReconciliation {
+function parseRecordingReconciliation(value: unknown, version: ClientProtocolVersion): RecordingReconciliation {
   const object = requireRecord(value, "recording reconciliation");
   requireExactKeys(object, ["segments", "warnings"]);
   const segments = parseBoundedArray(
     object.segments,
     MAX_DIARIZED_SEGMENTS,
     "reconciled segments",
-    parseDiarizedSegment,
+    (segment) => parseDiarizedSegment(segment, version),
   );
   let textBytes = 0;
   const identifiers = new Set<string>();
+  let sampleRate: number | undefined;
   for (const segment of segments) {
+    if (segment.mediaSampleRange != null) {
+      if (sampleRate !== undefined && sampleRate !== segment.mediaSampleRange.sampleRateHz) throw new ProtocolError("reconciliation sample rates differ");
+      sampleRate = segment.mediaSampleRange.sampleRateHz;
+    }
     textBytes += utf8Bytes(segment.text);
     if (textBytes > MAX_DIARIZED_TEXT_BYTES) {
       throw new ProtocolError("reconciled text exceeded its size limit");
@@ -1314,7 +1343,7 @@ function parseRecordingReconciliation(value: unknown): RecordingReconciliation {
   return { segments, warnings };
 }
 
-function parseDiarizedSegment(value: unknown): DiarizedSegment {
+function parseDiarizedSegment(value: unknown, version: ClientProtocolVersion): DiarizedSegment {
   const object = requireRecord(value, "diarized segment");
   requireExactKeys(object, [
     "segment_id",
@@ -1322,6 +1351,7 @@ function parseDiarizedSegment(value: unknown): DiarizedSegment {
     "ended_at_ms",
     "text",
     "speaker_cluster",
+    ...(version === 4 ? ["media_sample_range"] : []),
   ]);
   const segmentId = requireString(object, "segment_id");
   if (!/^[a-z0-9-]+$/.test(segmentId)) {
@@ -1346,7 +1376,27 @@ function parseDiarizedSegment(value: unknown): DiarizedSegment {
   if (speakerCluster !== null && !isAnonymousClusterLabel(speakerCluster)) {
     throw new ProtocolError("speaker cluster is not an anonymous label");
   }
-  return { segmentId, startedAtMs, endedAtMs, text, speakerCluster };
+  const segment: DiarizedSegment = { segmentId, startedAtMs, endedAtMs, text, speakerCluster };
+  if (version === 4) segment.mediaSampleRange = parseDiarizedMediaSampleRange(object.media_sample_range, startedAtMs, endedAtMs);
+  return segment;
+}
+
+function parseDiarizedMediaSampleRange(value: unknown, startedAtMs: bigint, endedAtMs: bigint): DiarizedMediaSampleRange | null {
+  if (value === null) return null;
+  const object = requireRecord(value, "diarized media sample range");
+  requireExactKeys(object, ["start_sample_inclusive", "end_sample_exclusive", "sample_rate_hz", "gap_offset_ms", "quantization_policy"]);
+  const startSampleInclusive = parseTimestamp(object.start_sample_inclusive);
+  const endSampleExclusive = parseTimestamp(object.end_sample_exclusive);
+  const sampleRateHz = requireIntegerInRange(object, "sample_rate_hz", 1, 0xffff_ffff);
+  const gapOffsetMs = parseTimestamp(object.gap_offset_ms);
+  const quantizationPolicy = requireOneOf(object, "quantization_policy", ["provider_seconds_outward_samples/v1"] as const);
+  const project = (sample: bigint) => sample * 1000n / BigInt(sampleRateHz) + gapOffsetMs;
+  if (startSampleInclusive >= endSampleExclusive || project(endSampleExclusive) > MAX_U64
+    || startedAtMs !== project(startSampleInclusive)
+    || (endedAtMs !== project(endSampleExclusive) && endedAtMs !== project(endSampleExclusive - 1n))) {
+    throw new ProtocolError("invalid diarized sample range projection");
+  }
+  return Object.freeze({ startSampleInclusive, endSampleExclusive, sampleRateHz, gapOffsetMs, quantizationPolicy });
 }
 
 /**

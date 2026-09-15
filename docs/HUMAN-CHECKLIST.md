@@ -6,24 +6,12 @@ each step are implemented; only the step itself is deferred.
 
 ## 1. Confirm the real streaming transcription wire format
 
-The streaming online recognizer in `crates/model-adapters/src/openai_speech_recognition.rs`
-speaks a chunked POST per audio chunk with a streamed NDJSON response. That shape was
-chosen because this workspace's `reqwest` has no `stream` feature and the workspace has
-no WebSocket crate, so a streaming request body and a realtime WebSocket session are both
-unavailable. It was verified only against a local scripted server.
-
-Before the first real meeting, confirm the shape against the provider that will actually
-be configured. If the provider speaks OpenAI Realtime over a WebSocket, the two DTOs
-`TranscriptionRequest` and `ProviderEvent` must be replaced. The session loop, segment-id
-discipline, cancellation binding, and credential redaction are independent of the wire
-DTOs and survive that change.
-
-```bash
-# Run with a real endpoint and credential, outside CI, on a machine authorised to call it.
-cd /Users/cx/Workspace/conversation-runtime-sdk
-export OPENAI_API_KEY=...            # never commit; never echo
-cargo test -p conversation-model-adapters --test openai_speech_recognition -- --ignored
-```
+The old POST/NDJSON prototype is superseded by the ordered transcription WebSocket
+implementation. See [online transcription](online-transcription.md) for its configured
+endpoint, bootstrap, server-VAD, finalized-utterance and capture-evidence contracts.
+Its automated evidence uses scripted local peers. Before a real meeting, an authorized
+operator must verify the configured provider/model and real deployment behavior; no paid
+request, real credential, device or live-provider acceptance is implied by local tests.
 
 ## 2. Real-provider latency measurement
 
@@ -81,24 +69,27 @@ cargo test -p conversation-runtime-gateway --test text_processing -- --ignored -
 
 ## 5. Confirm the batch diarization request shape against the real provider
 
-`reconcileRecording` posts to `{endpoint}/audio/diarizations` with a request body this
-repository defined itself. No real vendor is known to speak it. Confirm the endpoint and
-body against the provider that will actually be configured before the first real meeting.
+The adapter now posts multipart to the configured API base plus `/audio/transcriptions`:
+in-memory PCM16 WAV (`window.wav`, `audio/wav`), exact configured model,
+`response_format=diarized_json`, `chunking_strategy=auto`, and optional singular language.
+The required diarized response schema and fractional-second semantics are exercised against
+scripted local HTTP peers, not a paid provider. See [the recovery contract](finalized-recording-recovery.md)
+for sample provenance, strict raw endpoint admission, limits and the fixture-process boundary.
 
 The current adapter deliberately namespaces labels returned by separate bounded requests. Do
 not remove that isolation unless the selected provider proves that one request/session preserves
 speaker identity across every window.
 
-```bash
-cd /Users/cx/Workspace/conversation-runtime-sdk
-export OPENAI_API_KEY=...            # never commit; never echo
-cargo test -p conversation-model-adapters --test openai_diarization -- --ignored --nocapture
-```
+Before real meeting acceptance, an authorized operator must configure the intended HTTPS
+API base/model and private credential reference, then run a permitted synthetic recording
+through the application's finalized-recovery flow. Verify actual multipart/model support,
+response schema, cancellation, limits and deployment TLS without logging audio, transcript
+or credentials. The normal adapter tests do not call a live provider; `--ignored` is not a
+live-provider harness. No such paid run has been performed here.
 
-Expected evidence: the provider documentation or captured response identifies one explicit
-diarization session spanning all uploaded windows, or returns speaker embeddings suitable for
-one global clustering pass. If neither is true, leave labels window-scoped and keep final
-attribution anonymous across windows.
+Keep labels window-scoped and final attribution anonymous across requests. Cross-window
+voice matching, speaker enrollment and embeddings are not implemented or authorized by this
+wire correction. Do not infer stable identity from a repeated provider label.
 
 ## 3. Feishu client, test tenant, and real meeting acceptance
 

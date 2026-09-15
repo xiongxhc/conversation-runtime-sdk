@@ -3704,6 +3704,142 @@ fn a_reconciled_recording_states_anonymous_clusters_only_from_version_three() {
 }
 
 #[test]
+fn canonical_diarization_versions_preserve_samples_above_f64_integer_precision() {
+    use conversation_protocol::DiarizedMediaSampleRange;
+    let message = GatewayMessage::RecordingReconciled {
+        request_id: "diarization-vectors".into(),
+        reconciliation: ClientRecordingReconciliation {
+            segments: vec![
+                ClientDiarizedSegment {
+                    segment_id: "seg-1".into(),
+                    started_at_ms: 375_299_968_947_665,
+                    ended_at_ms: 375_299_968_947_665,
+                    text: "fractional".into(),
+                    speaker_cluster: Some("cluster-1".into()),
+                    media_sample_range: Some(
+                        DiarizedMediaSampleRange::new(
+                            9_007_199_254_741_009,
+                            9_007_199_254_741_018,
+                            24_000,
+                            123,
+                        )
+                        .unwrap(),
+                    ),
+                },
+                ClientDiarizedSegment {
+                    segment_id: "seg-2".into(),
+                    started_at_ms: 0,
+                    ended_at_ms: 0,
+                    text: "legacy".into(),
+                    speaker_cluster: None,
+                    media_sample_range: None,
+                },
+            ],
+            warnings: Vec::new(),
+        },
+    };
+    for (version, line) in [3, 4]
+        .into_iter()
+        .zip(include_str!("../../../tests/fixtures/diarization-v4/events.jsonl").lines())
+    {
+        assert_eq!(
+            encode_gateway_message_for_version(&message, version).unwrap(),
+            line.as_bytes()
+        );
+    }
+}
+
+#[test]
+fn populated_sample_results_use_actual_serialized_budget_without_reducing_segment_limit() {
+    use conversation_protocol::DiarizedMediaSampleRange;
+    let range = DiarizedMediaSampleRange::new(23, 25, 24_000, 0).unwrap();
+    let mut result = ClientRecordingReconciliation {
+        segments: (0..1024)
+            .map(|index| ClientDiarizedSegment {
+                segment_id: format!("seg-{index:060}"),
+                started_at_ms: 0,
+                ended_at_ms: 1,
+                text: "\"".repeat(128),
+                speaker_cluster: Some("cluster-1".into()),
+                media_sample_range: Some(range),
+            })
+            .collect(),
+        warnings: Vec::new(),
+    };
+    let message = |result| GatewayMessage::RecordingReconciled {
+        request_id: "bound".into(),
+        reconciliation: result,
+    };
+    assert!(encode_gateway_message_for_version(&message(result.clone()), 3).is_ok());
+    match encode_gateway_message_for_version(&message(result.clone()), 4) {
+        Err(ClientWireError::PayloadTooLarge { actual, maximum }) => {
+            assert!(actual > maximum);
+            assert_eq!(maximum, 512 * 1024);
+            eprintln!("1024 populated escaped segments: {actual} bytes vs {maximum} bound");
+        }
+        other => panic!("expected actual whole-frame size rejection, received {other:?}"),
+    }
+    for segment in &mut result.segments {
+        segment.text.clear();
+    }
+    assert!(
+        encode_gateway_message_for_version(&message(result), 4).is_ok(),
+        "1024 populated ranges remain supported when the whole frame fits"
+    );
+}
+
+#[test]
+fn exact_sample_evidence_rejects_cross_segment_rate_changes() {
+    use conversation_protocol::DiarizedMediaSampleRange;
+    let segment = |id: &str, rate| ClientDiarizedSegment {
+        segment_id: id.into(),
+        started_at_ms: 0,
+        ended_at_ms: 0,
+        text: "tiny".into(),
+        speaker_cluster: None,
+        media_sample_range: Some(DiarizedMediaSampleRange::new(0, 1, rate, 0).unwrap()),
+    };
+    let message = |segments| GatewayMessage::RecordingReconciled {
+        request_id: "rates".into(),
+        reconciliation: ClientRecordingReconciliation {
+            segments,
+            warnings: Vec::new(),
+        },
+    };
+    assert!(encode_gateway_message_for_version(&message(vec![segment("one", 24_000)]), 4).is_ok());
+    assert!(encode_gateway_message_for_version(&message(vec![segment("two", 16_000)]), 4).is_ok());
+    assert!(encode_gateway_message_for_version(
+        &message(vec![segment("one", 24_000), segment("two", 16_000)]),
+        4
+    )
+    .is_err());
+}
+
+#[test]
+fn version_four_requires_explicit_null_sample_evidence_while_v3_is_unchanged() {
+    let message = GatewayMessage::RecordingReconciled {
+        request_id: "r-1".to_owned(),
+        reconciliation: reconciliation(),
+    };
+    let v4: serde_json::Value =
+        serde_json::from_slice(&encode_gateway_message_for_version(&message, 4).unwrap()).unwrap();
+    let v3: serde_json::Value =
+        serde_json::from_slice(&encode_gateway_message_for_version(&message, 3).unwrap()).unwrap();
+    for segment in v4["reconciliation"]["segments"].as_array().unwrap() {
+        assert_eq!(
+            segment.as_object().unwrap().get("media_sample_range"),
+            Some(&serde_json::Value::Null)
+        );
+    }
+    for segment in v3["reconciliation"]["segments"].as_array().unwrap() {
+        assert!(!segment
+            .as_object()
+            .unwrap()
+            .contains_key("media_sample_range"));
+    }
+}
+
+#[test]
 fn an_empty_reconciliation_is_expressible() {
     let encoded = encode_gateway_message_for_version(
         &GatewayMessage::RecordingReconciled {
@@ -3859,6 +3995,7 @@ fn segment() -> ClientDiarizedSegment {
         ended_at_ms: 1_200,
         text: "good morning".to_owned(),
         speaker_cluster: Some("cluster-1".to_owned()),
+        media_sample_range: None,
     }
 }
 
@@ -3872,6 +4009,7 @@ fn reconciliation() -> ClientRecordingReconciliation {
                 ended_at_ms: 61_000,
                 text: "and now the agenda".to_owned(),
                 speaker_cluster: None,
+                media_sample_range: None,
             },
         ],
         warnings: vec!["recording_truncated".to_owned()],

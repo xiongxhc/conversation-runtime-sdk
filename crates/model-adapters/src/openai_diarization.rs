@@ -1,55 +1,55 @@
 //! Online batch transcription and diarization behind the provider-neutral port.
 //!
 //! The adapter is handed one bounded window of decrypted meeting audio at a time and uploads
-//! each window as its own request, so a two-hour recording costs one window of resident
-//! plaintext rather than the whole file. Nothing here ever sees a path, a recording handle or
+//! each window as its own request, retaining bounded PCM/WAV/response buffers rather than the
+//! whole file. Nothing here ever sees a path, a recording handle or
 //! a key: the runtime owns the recording and pushes windows down a channel.
 //!
 //! Two properties are the adapter's own rather than the provider's:
 //!
 //! - **The result never claims a person.** A provider's own speaker label is discarded at the
-//!   boundary and replaced by an adapter-minted `cluster-N`, stable across the whole meeting.
+//!   boundary and replaced by an adapter-minted `cluster-N`, scoped to that window's request.
 //!   A provider that answers `"speaker": "Chris Xiong"` produces `cluster-1`.
-//! - **A provider's prose never travels.** Its warnings are counted, not relayed, and every
+//! - **A provider's prose never travels.** Unknown warning fields are ignored, not relayed, and every
 //!   diagnostic this adapter emits is a fixed string: an error body may quote speech, and a
 //!   status line is not a place for a meeting transcript.
 //!
 //! # The clock
 //!
 //! A provider states a segment's timings relative to the window it was given. The adapter
-//! rebases them onto the **media timeline** by adding the window's own `started_at_ms`, which
-//! is the timeline the finalized recording summary's `duration_ms` and gaps are on. A segment
+//! rebases them onto the **media timeline**. Exact03 windows add their integer sample origin
+//! before millisecond projection, then add the closed-gap offset. Legacy windows retain their
+//! millisecond origin without claiming an exact sample coordinate. A segment
 //! that claims to run past the audio in its window is refused: an out-of-range timing would
 //! produce a plausible wrong answer rather than a visible failure.
 
 use std::time::Duration;
 
 use reqwest::redirect::Policy;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::credential::{validate_credential_env_name, Credential};
 use crate::diarization::{
-    DiarizationResult, DiarizationWarning, DiarizedSegment, MeetingAudioWindow,
-    MeetingAudioWindows, SpeakerClusters, TranscriptionDiarizer, MAX_DIARIZED_SEGMENTS,
-    MAX_DIARIZED_TEXT_BYTES,
+    DiarizationResult, DiarizationWarning, DiarizedMediaSampleRange, DiarizedSegment,
+    MeetingAudioWindow, MeetingAudioWindows, SpeakerClusters, TranscriptionDiarizer,
+    MAX_DIARIZED_SEGMENTS, MAX_DIARIZED_TEXT_BYTES,
 };
-use crate::{AdapterError, AdapterFuture, PcmFormat, PcmSampleFormat};
+use crate::{AdapterError, AdapterFuture, PcmSampleFormat};
 
 /// The largest answer that can still become a result.
 ///
-/// The result budget is 1024 segments and 128 KiB of text; with the JSON a provider wraps them
-/// in, and its own speaker labels, an answer beyond this cannot produce a result the runtime
-/// would accept, so buffering more of it is work spent on the way to a refusal. It matches the
-/// client frame limit, which is the same reasoning applied one layer out.
+/// This is an independent encoded-body admission limit, alongside 1024 segments and 128 KiB
+/// of text. Required schema, opaque labels and escaping can exhaust this budget first. The
+/// separately enriched client result is checked against its own actual encoded frame limit.
 const MAX_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_MODEL_BYTES: usize = 256;
 const MAX_LANGUAGE_BYTES: usize = 64;
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
-/// How far past its window a provider timing may fall before the segment is refused. A batch
-/// recognizer rounds its own frame boundaries, so a second of slack is tolerance for rounding
-/// rather than permission to invent a timeline.
-const WINDOW_TIMING_TOLERANCE_MS: u64 = 1_000;
+const MAX_WINDOW_BYTES: usize = 1024 * 1024;
+const MAX_PROVIDER_ID_BYTES: usize = 256;
+const MAX_PROVIDER_LABEL_BYTES: usize = 256;
 
 /// Configuration for the online batch transcription and diarization adapter.
 ///
@@ -86,8 +86,10 @@ impl OpenAiDiarizationConfig {
     }
 
     pub fn with_request_timeout(mut self, request_timeout: Duration) -> Result<Self, AdapterError> {
-        if request_timeout.is_zero() {
-            return Err(invalid_config("request timeout must be non-zero"));
+        if request_timeout.is_zero() || Instant::now().checked_add(request_timeout).is_none() {
+            return Err(invalid_config(
+                "request timeout must be non-zero and representable",
+            ));
         }
         self.request_timeout = request_timeout;
         Ok(self)
@@ -125,6 +127,7 @@ impl OpenAiTranscriptionDiarizer {
         Self {
             client: reqwest::Client::builder()
                 .redirect(Policy::none())
+                .retry(reqwest::retry::never())
                 .build()
                 .expect("online diarization client configuration is valid"),
             config,
@@ -159,6 +162,7 @@ impl OpenAiTranscriptionDiarizer {
 
         while let Some(window) = windows.recv().await {
             let window = window?;
+            let wav = prepare_wav(&window)?;
             // Read on first use, so a reconciliation that never reaches the provider — an
             // unreadable recording, a cancellation — never touches the variable at all.
             if credential.is_none() {
@@ -167,7 +171,7 @@ impl OpenAiTranscriptionDiarizer {
             let key = credential
                 .as_ref()
                 .expect("the credential was resolved for this window");
-            let answer = self.transcribe(&window, key, cancellation).await?;
+            let answer = self.transcribe(wav, key, cancellation).await?;
             state.accept(&window, answer)?;
         }
 
@@ -176,29 +180,35 @@ impl OpenAiTranscriptionDiarizer {
 
     async fn transcribe(
         &self,
-        window: &MeetingAudioWindow,
+        wav: Vec<u8>,
         credential: &Credential,
         cancellation: &CancellationToken,
     ) -> Result<ProviderAnswer, AdapterError> {
-        let format = window.format();
-        let payload = DiarizationRequest {
-            model: &self.config.model,
-            encoding: provider_encoding(format)?,
-            sample_rate_hz: format.sample_rate_hz(),
-            channels: format.channels(),
-            started_at_ms: window.started_at_ms(),
-            audio: crate::base64::encode(window.bytes()),
-            language: self.config.language.as_deref(),
-        };
+        let deadline = Instant::now()
+            .checked_add(self.config.request_timeout)
+            .ok_or_else(stalled)?;
+        let file = reqwest::multipart::Part::bytes(wav)
+            .file_name("window.wav")
+            .mime_str("audio/wav")
+            .map_err(|_| transport_failed())?;
+        let mut payload = reqwest::multipart::Form::new()
+            .part("file", file)
+            .text("model", self.config.model.clone())
+            .text("response_format", "diarized_json")
+            .text("chunking_strategy", "auto");
+        if let Some(language) = &self.config.language {
+            payload = payload.text("language", language.clone());
+        }
 
         let response = self
             .await_provider(
                 self.client
                     .post(diarization_endpoint(&self.config.endpoint))
                     .bearer_auth(credential.expose())
-                    .json(&payload)
+                    .multipart(payload)
                     .send(),
                 cancellation,
+                deadline,
             )
             .await?
             .map_err(|_| transport_failed())?;
@@ -218,7 +228,7 @@ impl OpenAiTranscriptionDiarizer {
         // provider that never sends one — or lies about the one it does — must not be able to
         // make the runtime resident-buffer past the cap before it is refused.
         let body = self
-            .await_provider(read_bounded_body(response), cancellation)
+            .await_provider(read_bounded_body(response), cancellation, deadline)
             .await??;
         serde_json::from_slice::<ProviderAnswer>(&body).map_err(|_| unsupported_answer())
     }
@@ -227,11 +237,12 @@ impl OpenAiTranscriptionDiarizer {
         &self,
         future: impl std::future::Future<Output = T>,
         cancellation: &CancellationToken,
+        deadline: Instant,
     ) -> Result<T, AdapterError> {
         tokio::select! {
             biased;
             _ = cancellation.cancelled() => Err(cancelled()),
-            result = tokio::time::timeout(self.config.request_timeout, future) => {
+            result = tokio::time::timeout_at(deadline, future) => {
                 result.map_err(|_| stalled())
             }
         }
@@ -244,7 +255,6 @@ struct Reconciliation {
     segments: Vec<DiarizedSegment>,
     clusters: SpeakerClusters,
     text_bytes: usize,
-    provider_warned: bool,
     windows: u64,
 }
 
@@ -255,12 +265,41 @@ impl Reconciliation {
         answer: ProviderAnswer,
     ) -> Result<(), AdapterError> {
         let window_index = self.windows;
-        self.windows = self.windows.saturating_add(1);
-        self.provider_warned |= !answer.warnings.is_empty();
-        let limit = window.audio_ms().saturating_add(WINDOW_TIMING_TOLERANCE_MS);
+        self.windows = self.windows.checked_add(1).ok_or_else(unsupported_answer)?;
+        if answer.task != "transcribe"
+            || !answer.duration.is_finite()
+            || answer.duration < 0.0
+            || answer.text.len() > MAX_DIARIZED_TEXT_BYTES
+            || (answer.segments.is_empty() && !answer.text.is_empty())
+        {
+            return Err(unsupported_answer());
+        }
+        if answer.segments.len() > MAX_DIARIZED_SEGMENTS {
+            return Err(AdapterError::new("diarization exceeded its segment limit"));
+        }
+        let samples = (window.bytes().len() / window.format().frame_alignment_bytes()?) as u64;
+        let rate = window.format().sample_rate_hz();
+        let extent = samples as f64 / f64::from(rate);
+        let mut identifiers = Vec::with_capacity(answer.segments.len());
 
         for segment in answer.segments {
-            if segment.end_ms < segment.start_ms || segment.end_ms > limit {
+            if segment.kind != "transcript.text.segment"
+                || segment.id.is_empty()
+                || segment.id.len() > MAX_PROVIDER_ID_BYTES
+                || segment.speaker.is_empty()
+                || segment.speaker.len() > MAX_PROVIDER_LABEL_BYTES
+                || identifiers.contains(&segment.id)
+            {
+                return Err(unsupported_answer());
+            }
+            identifiers.push(segment.id);
+            if !segment.start.is_finite()
+                || !segment.end.is_finite()
+                || segment.start < 0.0
+                || segment.end <= segment.start
+                || segment.start > extent
+                || segment.end > extent
+            {
                 return Err(unusable_timings());
             }
             // Bounded as the answer is read, so an oversized reply is refused before it is
@@ -274,22 +313,62 @@ impl Reconciliation {
                 .filter(|used| *used <= MAX_DIARIZED_TEXT_BYTES)
                 .ok_or_else(|| AdapterError::new("diarization exceeded its text limit"))?;
 
-            let cluster = segment
-                .speaker
-                .as_deref()
-                .map(|label| {
-                    self.clusters
-                        .label_for(&format!("window-{window_index}:{label}"))
-                })
-                .transpose()?;
+            let cluster = self
+                .clusters
+                .label_for(&format!("window-{window_index}:{}", segment.speaker))?;
+            let floor_sample = |seconds: f64| -> Result<u64, AdapterError> {
+                let product = seconds * f64::from(rate);
+                if !product.is_finite() || product.floor() > samples as f64 {
+                    return Err(unusable_timings());
+                }
+                // The independently bounded PCM count is <= 524288, exactly representable.
+                Ok(product.floor() as u64)
+            };
+            let start = floor_sample(segment.start)?;
+            let end = floor_sample(segment.end)?;
+            let project = |sample: u64| -> Result<u64, AdapterError> {
+                if let Some(origin) = window.sample_origin() {
+                    let absolute = origin
+                        .media_start_sample()
+                        .checked_add(sample)
+                        .ok_or_else(unusable_timings)?;
+                    return origin.project_sample(absolute);
+                }
+                let relative_ms = u64::try_from(u128::from(sample) * 1000 / u128::from(rate))
+                    .map_err(|_| unusable_timings())?;
+                window
+                    .started_at_ms()
+                    .checked_add(relative_ms)
+                    .ok_or_else(unusable_timings)
+            };
             let segment_id = format!("seg-{}", self.segments.len() + 1);
-            self.segments.push(DiarizedSegment::new(
+            let mut parsed = DiarizedSegment::new(
                 segment_id,
-                window.started_at_ms().saturating_add(segment.start_ms),
-                window.started_at_ms().saturating_add(segment.end_ms),
+                project(start)?,
+                project(end)?,
                 segment.text,
-                cluster,
-            )?);
+                Some(cluster),
+            )?;
+            if let Some(origin) = window.sample_origin() {
+                // Raw endpoints already passed strict f64 extent admission. Ceil can cross
+                // N only through multiplication rounding at that admitted boundary.
+                let outward_end = (segment.end * f64::from(rate)).ceil().min(samples as f64) as u64;
+                let absolute = |sample| {
+                    origin
+                        .media_start_sample()
+                        .checked_add(sample)
+                        .ok_or_else(unusable_timings)
+                };
+                let range = DiarizedMediaSampleRange::new(
+                    absolute(start)?,
+                    absolute(outward_end)?,
+                    rate,
+                    origin.gap_offset_ms(),
+                )
+                .map_err(|_| unusable_timings())?;
+                parsed = parsed.with_media_sample_range(range)?;
+            }
+            self.segments.push(parsed);
         }
         Ok(())
     }
@@ -298,9 +377,6 @@ impl Reconciliation {
         let mut warnings = Vec::new();
         if self.segments.is_empty() {
             warnings.push(DiarizationWarning::NoSpeechDetected);
-        }
-        if self.provider_warned {
-            warnings.push(DiarizationWarning::ProviderReportedWarnings);
         }
         DiarizationResult::new(self.segments, warnings)
     }
@@ -319,34 +395,23 @@ async fn read_bounded_body(mut response: reqwest::Response) -> Result<Vec<u8>, A
     Ok(body)
 }
 
-#[derive(Serialize)]
-struct DiarizationRequest<'a> {
-    model: &'a str,
-    encoding: &'a str,
-    sample_rate_hz: u32,
-    channels: u16,
-    started_at_ms: u64,
-    audio: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    language: Option<&'a str>,
-}
-
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ProviderAnswer {
+    task: String,
+    duration: f64,
+    text: String,
     segments: Vec<ProviderSegment>,
-    #[serde(default)]
-    warnings: Vec<String>,
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ProviderSegment {
-    start_ms: u64,
-    end_ms: u64,
+    #[serde(rename = "type")]
+    kind: String,
+    id: String,
+    start: f64,
+    end: f64,
     text: String,
-    #[serde(default)]
-    speaker: Option<String>,
+    speaker: String,
 }
 
 fn read_credential(name: &str) -> Result<Credential, AdapterError> {
@@ -354,17 +419,46 @@ fn read_credential(name: &str) -> Result<Credential, AdapterError> {
         .ok_or_else(|| AdapterError::new("online diarization credential is not available"))
 }
 
-/// The provider's name for the window's sample format. Exhaustive on purpose: a new sample
-/// format must be given a provider spelling here rather than silently reaching the wire.
-fn provider_encoding(format: PcmFormat) -> Result<&'static str, AdapterError> {
-    match format.sample_format() {
-        PcmSampleFormat::Signed16LittleEndian => Ok("pcm_s16le"),
-        PcmSampleFormat::Float32LittleEndian => Ok("pcm_f32le"),
+fn prepare_wav(window: &MeetingAudioWindow) -> Result<Vec<u8>, AdapterError> {
+    let format = window.format();
+    if format.sample_format() != PcmSampleFormat::Signed16LittleEndian {
+        return Err(AdapterError::new(
+            "online diarization requires signed 16-bit PCM",
+        ));
     }
+    let invalid = || AdapterError::new("online diarization window exceeds supported WAV bounds");
+    let length = window.bytes().len();
+    let alignment = format.channels().checked_mul(2).ok_or_else(invalid)?;
+    let byte_rate = format
+        .sample_rate_hz()
+        .checked_mul(u32::from(alignment))
+        .ok_or_else(invalid)?;
+    if length > MAX_WINDOW_BYTES || !length.is_multiple_of(usize::from(alignment)) {
+        return Err(invalid());
+    }
+    window
+        .started_at_ms()
+        .checked_add(window.audio_ms())
+        .ok_or_else(invalid)?;
+    let data_length = u32::try_from(length).map_err(|_| invalid())?;
+    let riff_length = data_length.checked_add(36).ok_or_else(invalid)?;
+    let mut wav = Vec::with_capacity(length.checked_add(44).ok_or_else(invalid)?);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&riff_length.to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt \x10\0\0\0\x01\0");
+    wav.extend_from_slice(&format.channels().to_le_bytes());
+    wav.extend_from_slice(&format.sample_rate_hz().to_le_bytes());
+    wav.extend_from_slice(&byte_rate.to_le_bytes());
+    wav.extend_from_slice(&alignment.to_le_bytes());
+    wav.extend_from_slice(&16_u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_length.to_le_bytes());
+    wav.extend_from_slice(window.bytes());
+    Ok(wav)
 }
 
 fn parse_endpoint(endpoint: &str) -> Result<reqwest::Url, AdapterError> {
-    let mut endpoint = reqwest::Url::parse(endpoint)
+    let endpoint = reqwest::Url::parse(endpoint)
         .map_err(|_| invalid_config("endpoint must be a valid URL"))?;
     if !matches!(endpoint.scheme(), "http" | "https") || endpoint.host_str().is_none() {
         return Err(invalid_config("endpoint must be an http or https URL"));
@@ -372,15 +466,30 @@ fn parse_endpoint(endpoint: &str) -> Result<reqwest::Url, AdapterError> {
     if !endpoint.username().is_empty() || endpoint.password().is_some() {
         return Err(invalid_config("endpoint must not carry credentials"));
     }
-    endpoint.set_query(None);
-    endpoint.set_fragment(None);
+    if endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+        || endpoint
+            .path()
+            .trim_end_matches('/')
+            .ends_with("/audio/transcriptions")
+    {
+        return Err(invalid_config("endpoint must be an unambiguous API base"));
+    }
+    if endpoint.scheme() == "http"
+        && !matches!(
+            endpoint.host_str(),
+            Some("127.0.0.1" | "[::1]" | "localhost")
+        )
+    {
+        return Err(invalid_config("remote endpoint requires HTTPS"));
+    }
     Ok(endpoint)
 }
 
 fn diarization_endpoint(endpoint: &reqwest::Url) -> reqwest::Url {
     let mut endpoint = endpoint.clone();
     let path = endpoint.path().trim_end_matches('/').to_owned();
-    endpoint.set_path(&format!("{path}/audio/diarizations"));
+    endpoint.set_path(&format!("{path}/audio/transcriptions"));
     endpoint
 }
 
@@ -444,7 +553,7 @@ mod tests {
 
         assert_eq!(
             diarization_endpoint(config.endpoint()).path(),
-            "/v1/audio/diarizations"
+            "/v1/audio/transcriptions"
         );
     }
 
@@ -456,5 +565,21 @@ mod tests {
         assert!(OpenAiDiarizationConfig::new("ftp://example.test", "m", "T").is_err());
         assert!(OpenAiDiarizationConfig::new("https://example.test", "", "T").is_err());
         assert!(OpenAiDiarizationConfig::new("https://example.test", "m", "lower").is_err());
+        for endpoint in [
+            "https://example.test/v1?x=1",
+            "https://example.test/v1#private",
+            "https://example.test/v1/audio/transcriptions/",
+            "http://example.test/v1",
+        ] {
+            assert!(OpenAiDiarizationConfig::new(endpoint, "m", "TOKEN").is_err());
+        }
+        for timeout in [std::time::Duration::ZERO, std::time::Duration::MAX] {
+            assert!(
+                OpenAiDiarizationConfig::new("https://example.test/v1", "m", "TOKEN")
+                    .unwrap()
+                    .with_request_timeout(timeout)
+                    .is_err()
+            );
+        }
     }
 }

@@ -49,12 +49,18 @@ test("v4 client separates current identity from finalized source and clears it o
   const legacyCompatible: RecordingSummary = recording;
   assert.equal(legacyCompatible.sha256, capability.sha256);
   assert.deepEqual(recording.recoveryCapability, capability);
-  const recovered = client.reconcileFinalizedRecording({ capability: recording.recoveryCapability });
+  const mutableCapability = { ...recording.recoveryCapability };
+  const recovered = client.reconcileFinalizedRecording({ capability: mutableCapability });
+  mutableCapability.sourceSessionId = 999n;
+  mutableCapability.sha256 = "e".repeat(64);
   const command = transport.commands[1]!;
   assert.equal(command.type, "reconcile_finalized_recording");
+  if (command.type === "reconcile_finalized_recording") assert.deepEqual(command.capability, capability);
   transport.push({ protocol_version: 4, type: "command_accepted", request_id: command.requestId });
   transport.push({ protocol_version: 4, type: "recording_reconciled", request_id: command.requestId, reconciliation: { segments: [], warnings: [] } });
-  assert.deepEqual(await recovered, { segments: [], warnings: [] });
+  const result = await recovered;
+  assert.deepEqual(result, { segments: [], warnings: [], source: { sourceSessionId: 41n, recordingHandle: capability.recordingHandle, sha256: capability.sha256 } });
+  assert.equal(JSON.stringify(result, (_, value: unknown) => typeof value === "bigint" ? value.toString() : value).includes(capability.authorization), false);
   await client.close(); assert.equal(client.currentSessionId, undefined);
 });
 

@@ -52,10 +52,10 @@ pub use capture_timing::{
 };
 pub use continuous_audio_output::{ContinuousAudioOutput, PlaybackReceipt};
 pub use diarization::{
-    DiarizationResult, DiarizationWarning, DiarizedSegment, MeetingAudioWindow,
-    MeetingAudioWindows, TranscriptionDiarizer, MAX_DIARIZED_SEGMENTS,
-    MAX_DIARIZED_SEGMENT_ID_BYTES, MAX_DIARIZED_SEGMENT_TEXT_BYTES, MAX_DIARIZED_TEXT_BYTES,
-    MAX_SPEAKER_CLUSTERS,
+    DiarizationResult, DiarizationWarning, DiarizedMediaSampleRange, DiarizedSegment,
+    MediaSampleOrigin, MeetingAudioWindow, MeetingAudioWindows, TranscriptionDiarizer,
+    MAX_DIARIZED_SEGMENTS, MAX_DIARIZED_SEGMENT_ID_BYTES, MAX_DIARIZED_SEGMENT_TEXT_BYTES,
+    MAX_DIARIZED_TEXT_BYTES, MAX_SPEAKER_CLUSTERS,
 };
 pub use generation_language::{
     GenerationLanguageModel, GenerationLanguageRequest, GenerationTextDelta,

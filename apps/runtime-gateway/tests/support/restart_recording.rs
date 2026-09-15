@@ -11,7 +11,7 @@ use std::{
     },
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     process::{Child, ChildStdin, ChildStdout},
     task::JoinHandle,
@@ -22,10 +22,10 @@ const KEY_ENV: &str = "RUNTIME_RESTART_PROCESS_SYNTHETIC_KEY";
 const KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 static KEY_OWNER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-struct Gateway {
+struct Gateway<R = ChildStdout, W = ChildStdin> {
     child: Child,
-    input: Option<FrameWriter<ChildStdin>>,
-    output: FrameReader<ChildStdout>,
+    input: Option<FrameWriter<W>>,
+    output: FrameReader<R>,
     errors: JoinHandle<Vec<u8>>,
 }
 impl Gateway {
@@ -50,6 +50,8 @@ impl Gateway {
             errors,
         }
     }
+}
+impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Gateway<R, W> {
     async fn send(&mut self, value: Value) {
         self.input
             .as_mut()
@@ -90,13 +92,23 @@ impl Gateway {
     }
     async fn close(mut self) {
         drop(self.input.take());
-        assert!(timeout(PROCESS_TIMEOUT, self.child.wait())
-            .await
-            .unwrap()
-            .unwrap()
-            .success());
-        let errors = self.errors.await.unwrap();
+        let exited = timeout(PROCESS_TIMEOUT, self.child.wait()).await;
+        if exited.is_err() {
+            self.child.start_kill().unwrap();
+            // Cleanup grace is separate from the unchanged five-second shutdown failure.
+            timeout(PROCESS_TIMEOUT, self.child.wait())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let diagnostics = timeout(PROCESS_TIMEOUT, &mut self.errors).await;
+        if diagnostics.is_err() {
+            self.errors.abort();
+            let _ = self.errors.await;
+        }
+        let errors = diagnostics.unwrap().unwrap();
         assert!(!String::from_utf8_lossy(&errors).contains(KEY));
+        assert!(exited.unwrap().unwrap().success());
     }
 }
 
@@ -385,10 +397,6 @@ async fn recording_recovers_after_actual_gateway_exit_with_new_control_identity_
 #[tokio::test]
 async fn timed_alignment_survives_actual_gateway_exit_and_obeys_page_credit_without_provider_calls()
 {
-    use conversation_model_adapters::{
-        CaptureClockPair, CaptureEpoch, CaptureMappingQuality, FrameProvenance, NominalCaptureSpan,
-    };
-    use conversation_runtime::{read_session_recording, RecordedChunk};
     let _key_owner = KEY_OWNER.lock().await;
     let directory = tempfile::tempdir().unwrap();
     let language = Language::start().await;
@@ -402,7 +410,372 @@ async fn timed_alignment_survives_actual_gateway_exit_and_obeys_page_credit_with
     std::fs::write(&config, configuration).unwrap();
     std::env::set_var(KEY_ENV, KEY);
     GatewayConfig::load(&config).unwrap();
-    let mut first = Gateway::start(&config).await;
+    let (first_id, capability, _) = finalized_timed_capture(&config, directory.path()).await;
+    let mut second = Gateway::start(&config).await;
+    let second_id = second.read().await["current_session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(first_id, second_id);
+    second.send(json!({"protocol_version":4,"type":"read_recording_alignment","request_id":"alignment","capability":capability})).await;
+    let first_page = second.until("recording_alignment_page", "alignment").await;
+    assert_eq!(first_page["page"]["source"]["source_session_id"], first_id);
+    assert_eq!(first_page["page"]["page_index"], "0");
+    assert_eq!(first_page["page"]["entries"].as_array().unwrap().len(), 64);
+    let frame = first_page["page"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["kind"] == "frame")
+        .unwrap();
+    assert_eq!(frame["provenance"]["span"]["host_start_ns"], "1000000000");
+    assert_eq!(frame["wall"]["local_start_ns"], "2100000000");
+    assert_eq!(frame["wall"]["overall_physical_accuracy_ns"], Value::Null);
+    // Status proves the loop remains responsive; no page/completion may jump ahead of credit.
+    second
+        .send(json!({"protocol_version":4,"type":"status","request_id":"while-held"}))
+        .await;
+    for kind in ["command_accepted", "status"] {
+        let message = second.read().await;
+        assert_eq!(message["type"], kind);
+        assert_eq!(message["request_id"], "while-held");
+    }
+    second.send(json!({"protocol_version":4,"type":"recording_alignment_credit","request_id":"alignment","consumed_page_index":"0"})).await;
+    let page = second.read().await;
+    assert_eq!(page["type"], "recording_alignment_page");
+    assert_eq!(page["page"]["page_index"], "1");
+    second.send(json!({"protocol_version":4,"type":"recording_alignment_credit","request_id":"alignment","consumed_page_index":"1"})).await;
+    let complete = second.read().await;
+    assert_eq!(complete["type"], "recording_alignment_complete");
+    assert_eq!(complete["completion"]["page_count"], "2");
+    assert_eq!(complete["completion"]["coverage_status"], "available");
+    assert_eq!(
+        complete["completion"]["warnings"],
+        json!(["local_wall_timestamp_estimate"])
+    );
+    second.send(json!({"protocol_version":4,"type":"read_recording_alignment","request_id":"cancelled-read","capability":capability})).await;
+    second
+        .until("recording_alignment_page", "cancelled-read")
+        .await;
+    second.send(json!({"protocol_version":4,"type":"cancel_recording_alignment","request_id":"alignment"})).await;
+    second.send(json!({"protocol_version":4,"type":"recording_alignment_credit","request_id":"alignment","consumed_page_index":"1"})).await;
+    second
+        .send(json!({"protocol_version":4,"type":"status","request_id":"late-controls"}))
+        .await;
+    for kind in ["command_accepted", "status"] {
+        let message = second.read().await;
+        assert_eq!(message["type"], kind);
+        assert_eq!(message["request_id"], "late-controls");
+    }
+    second.send(json!({"protocol_version":4,"type":"cancel_recording_alignment","request_id":"cancelled-read"})).await;
+    second.until("command_rejected", "cancelled-read").await;
+    for defect in ["future", "duplicate", "regressing"] {
+        second.send(json!({"protocol_version":4,"type":"read_recording_alignment","request_id":defect,"capability":capability})).await;
+        second.until("recording_alignment_page", defect).await;
+        if defect != "future" {
+            second.send(json!({"protocol_version":4,"type":"recording_alignment_credit","request_id":defect,"consumed_page_index":"0"})).await;
+            if defect == "regressing" {
+                second.until("recording_alignment_page", defect).await;
+            }
+        }
+        second.send(json!({"protocol_version":4,"type":"recording_alignment_credit","request_id":defect,"consumed_page_index":if defect=="future" {"999"}else{"0"}})).await;
+        second.until("command_rejected", defect).await;
+        second
+            .send(json!({"protocol_version":4,"type":"status","request_id":"one-terminal"}))
+            .await;
+        for kind in ["command_accepted", "status"] {
+            let message = second.read().await;
+            assert_eq!(message["type"], kind);
+            assert_eq!(message["request_id"], "one-terminal");
+        }
+    }
+    second.send(json!({"protocol_version":4,"type":"read_recording_alignment","request_id":"disconnect","capability":capability})).await;
+    second.until("recording_alignment_page", "disconnect").await;
+    assert!(!requests.exists());
+    assert_eq!(language.calls.load(Ordering::SeqCst), 0);
+    second.close().await;
+    assert!(std::fs::read_dir(directory.path().join("recordings"))
+        .unwrap()
+        .all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".recovery-")));
+    std::env::remove_var(KEY_ENV);
+}
+
+// A separately executed test entry, never an operator-facing gateway/config bypass.
+// Its framed test socket isolates Rust's test-harness stdout from control frames.
+#[tokio::test]
+async fn diarization_recovery_fixture_process() {
+    let Ok(control) = std::env::var("RUNTIME_TASK12_FIXTURE_CONTROL") else {
+        return;
+    };
+    use conversation_model_adapters::{OpenAiDiarizationConfig, OpenAiTranscriptionDiarizer};
+    use conversation_protocol::ClientComponentDescriptor;
+    use conversation_runtime::TextTurnRuntime;
+    use conversation_runtime_gateway::GatewaySession;
+    let config = std::env::var("RUNTIME_TASK12_FIXTURE_CONFIG").unwrap();
+    let endpoint = std::env::var("RUNTIME_TASK12_FIXTURE_HTTP").unwrap();
+    let adapters = GatewayConfig::load(Path::new(&config)).unwrap();
+    let mut status = adapters.text_only_status();
+    status.profile = "online".into();
+    status.privacy_mode = "cloud".into();
+    status
+        .components
+        .retain(|component| component.kind != "diarization");
+    status.components.push(ClientComponentDescriptor {
+        kind: "diarization".into(),
+        execution_location: "remote".into(),
+        provider_label: "scripted-diarization".into(),
+    });
+    let session = GatewaySession::new(
+        TextTurnRuntime::new(adapters.context, adapters.language),
+        status,
+    )
+    .with_v4_control()
+    .with_recording(adapters.recording.unwrap())
+    .with_reconciliation(Arc::new(OpenAiTranscriptionDiarizer::new(
+        OpenAiDiarizationConfig::new(
+            endpoint,
+            "configured-diarization-model",
+            "RUNTIME_TASK12_SYNTHETIC_TOKEN",
+        )
+        .unwrap(),
+    )));
+    let stream = timeout(PROCESS_TIMEOUT, TcpStream::connect(control))
+        .await
+        .unwrap()
+        .unwrap();
+    let (reader, writer) = stream.into_split();
+    timeout(PROCESS_TIMEOUT, session.run(reader, writer))
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+async fn fixture_consumer(
+    config: &Path,
+    endpoint: &str,
+    root: &Path,
+) -> Gateway<tokio::net::tcp::OwnedReadHalf, tokio::net::tcp::OwnedWriteHalf> {
+    use std::process::Stdio;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "restart_recording::diarization_recovery_fixture_process",
+            "--nocapture",
+        ])
+        .env_clear()
+        .env("TMPDIR", root)
+        .env(KEY_ENV, KEY)
+        .env(
+            "RUNTIME_TASK12_FIXTURE_CONTROL",
+            listener.local_addr().unwrap().to_string(),
+        )
+        .env("RUNTIME_TASK12_FIXTURE_CONFIG", config)
+        .env("RUNTIME_TASK12_FIXTURE_HTTP", endpoint)
+        .env("RUNTIME_TASK12_SYNTHETIC_TOKEN", "synthetic-task12-token")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let mut errors = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stderr.take(8193).read_to_end(&mut bytes).await.unwrap();
+        assert!(bytes.len() <= 8192, "fixture diagnostic bound");
+        bytes
+    });
+    let connected = timeout(PROCESS_TIMEOUT, listener.accept()).await;
+    let (stream, _) = match connected {
+        Ok(Ok(value)) => value,
+        failure => {
+            let _ = child.start_kill();
+            let reaped = timeout(PROCESS_TIMEOUT, child.wait()).await;
+            let diagnostic = timeout(PROCESS_TIMEOUT, &mut errors).await;
+            if diagnostic.is_err() {
+                errors.abort();
+                let _ = errors.await;
+            }
+            reaped.unwrap().unwrap();
+            let diagnostic = diagnostic.unwrap().unwrap();
+            panic!(
+                "fixture connection failed: {failure:?}; {}",
+                String::from_utf8_lossy(&diagnostic)
+            );
+        }
+    };
+    let (reader, writer) = stream.into_split();
+    Gateway {
+        child,
+        input: Some(FrameWriter::new(writer)),
+        output: FrameReader::new(reader),
+        errors,
+    }
+}
+
+#[tokio::test]
+async fn timed_recording_reopens_in_fixture_process_for_real_multipart_and_alignment_join() {
+    use futures_util::FutureExt;
+    let _key_owner = KEY_OWNER.lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let mut language = Language::start().await;
+    let (config, requests) = configuration(directory.path(), &language.endpoint);
+    let mut contents = std::fs::read_to_string(&config).unwrap();
+    contents.push_str("capture_format = \"pcm_s16le/24000/1/20ms\"\n");
+    let begin = contents.find("[voice.diarization]").unwrap();
+    let end = begin + contents[begin..].find("[recording]").unwrap();
+    contents.replace_range(begin..end, "");
+    std::fs::write(&config, contents).unwrap();
+    std::env::set_var(KEY_ENV, KEY);
+    let (source_id, capability, producer_pid) =
+        finalized_timed_capture(&config, directory.path()).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+    let mut peer = tokio::spawn(async move {
+        let (mut stream, _) = timeout(PROCESS_TIMEOUT, listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut request = Vec::new();
+        let mut part = [0; 4096];
+        let header_end = loop {
+            let count = timeout(PROCESS_TIMEOUT, stream.read(&mut part))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(count > 0);
+            request.extend_from_slice(&part[..count]);
+            assert!(request.len() <= 2 * 1024 * 1024);
+            if let Some(position) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                break position + 4;
+            }
+        };
+        let headers = String::from_utf8(request[..header_end].to_vec()).unwrap();
+        let length = headers
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(|value| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap();
+        assert!(length <= 2 * 1024 * 1024);
+        while request.len() - header_end < length {
+            let count = timeout(PROCESS_TIMEOUT, stream.read(&mut part))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(count > 0);
+            request.extend_from_slice(&part[..count]);
+        }
+        assert!(headers.starts_with("POST /v1/audio/transcriptions HTTP/1.1\r\n"));
+        assert!(headers
+            .to_ascii_lowercase()
+            .contains("authorization: bearer synthetic-task12-token\r\n"));
+        let body = &request[header_end..];
+        let riff = body.windows(4).position(|bytes| bytes == b"RIFF").unwrap();
+        assert_eq!(&body[riff + 8..riff + 12], b"WAVE");
+        assert_eq!(
+            u32::from_le_bytes(body[riff + 24..riff + 28].try_into().unwrap()),
+            24_000
+        );
+        assert_eq!(
+            u32::from_le_bytes(body[riff + 40..riff + 44].try_into().unwrap()),
+            48
+        );
+        assert_eq!(&body[riff + 44..riff + 92], &[0; 48]);
+        let response = json!({"task":"transcribe","duration":0.001,"text":"tiny phrase","segments":[{"id":"provider-1","type":"transcript.text.segment","start":0.0001,"end":0.0006,"text":"tiny phrase","speaker":"untrusted-name"}]}).to_string();
+        stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).await.unwrap();
+    });
+    let connected =
+        std::panic::AssertUnwindSafe(fixture_consumer(&config, &endpoint, directory.path()))
+            .catch_unwind()
+            .await;
+    let mut consumer = match connected {
+        Ok(consumer) => consumer,
+        Err(panic) => {
+            peer.abort();
+            let _ = peer.await;
+            language.task.abort();
+            let _ = (&mut language.task).await;
+            std::env::remove_var(KEY_ENV);
+            std::panic::resume_unwind(panic);
+        }
+    };
+    let outcome = std::panic::AssertUnwindSafe(async {
+    let consumer_id = consumer.read().await["current_session_id"].as_str().unwrap().to_owned();
+    assert_ne!(consumer_id, source_id);
+    assert_ne!(consumer.child.id().unwrap(), std::process::id());
+    assert_ne!(consumer.child.id().unwrap(), producer_pid);
+    consumer.send(json!({"protocol_version":4,"type":"reconcile_finalized_recording","request_id":"transcribe","capability":capability})).await;
+    let response = consumer.until("recording_reconciled", "transcribe").await;
+    let segment = &response["reconciliation"]["segments"][0];
+    assert_eq!(segment["text"], "tiny phrase");
+    assert_eq!(segment["speaker_cluster"], "cluster-1");
+    assert_eq!(segment["started_at_ms"], "0"); assert_eq!(segment["ended_at_ms"], "0");
+    assert_eq!(segment["media_sample_range"], json!({"start_sample_inclusive":"2","end_sample_exclusive":"15","sample_rate_hz":24000,"gap_offset_ms":"0","quantization_policy":"provider_seconds_outward_samples/v1"}));
+    consumer.send(json!({"protocol_version":4,"type":"read_recording_alignment","request_id":"join","capability":capability})).await;
+    let page = consumer.until("recording_alignment_page", "join").await;
+    assert_eq!(page["page"]["source"]["source_session_id"], source_id);
+    assert_eq!(page["page"]["source"]["recording_handle"], capability["recording_handle"]);
+    assert_eq!(page["page"]["source"]["sha256"], capability["sha256"]);
+    let frames = page["page"]["entries"].as_array().unwrap().iter().filter(|entry| entry["kind"] == "frame").collect::<Vec<_>>();
+    assert_eq!(frames.len(), 12);
+    for (index, frame) in frames.iter().enumerate() {
+        assert_eq!(frame["media_start_sample"], (index*2).to_string());
+        assert_eq!(frame["media_end_sample"], (index*2+2).to_string());
+        assert_eq!(frame["sample_rate_hz"], 24000);
+        assert_eq!(frame["gap_offset_ms"], "0");
+        assert_eq!(frame["epoch"]["clock_domain_id"], "source-process");
+        assert_eq!(frame["epoch"]["capture_epoch"], "1");
+        assert_eq!(frame["provenance"]["output_start_sample"], (index*2).to_string());
+        assert_eq!(frame["provenance"]["sequence"], (index+1).to_string());
+    }
+    let touched = frames.iter().filter(|frame| {
+        let start = frame["media_start_sample"].as_str().unwrap().parse::<u64>().unwrap();
+        let end = frame["media_end_sample"].as_str().unwrap().parse::<u64>().unwrap();
+        start < 15 && end > 2
+    }).map(|frame| frame["provenance"]["sequence"].as_str().unwrap()).collect::<Vec<_>>();
+    assert_eq!(touched, ["2","3","4","5","6","7","8"]);
+    consumer.send(json!({"protocol_version":4,"type":"recording_alignment_credit","request_id":"join","consumed_page_index":"0"})).await;
+    assert_eq!(consumer.read().await["type"], "recording_alignment_page");
+    consumer.send(json!({"protocol_version":4,"type":"recording_alignment_credit","request_id":"join","consumed_page_index":"1"})).await;
+    assert_eq!(consumer.read().await["type"], "recording_alignment_complete");
+    }).catch_unwind().await;
+    let exited = std::panic::AssertUnwindSafe(consumer.close())
+        .catch_unwind()
+        .await;
+    let peer_exit = timeout(PROCESS_TIMEOUT, &mut peer).await;
+    if peer_exit.is_err() {
+        peer.abort();
+        let _ = peer.await;
+    }
+    let no_other_provider = !requests.exists() && language.calls.load(Ordering::SeqCst) == 0;
+    language.task.abort();
+    let _ = (&mut language.task).await;
+    std::env::remove_var(KEY_ENV);
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+    if let Err(panic) = exited {
+        std::panic::resume_unwind(panic);
+    }
+    peer_exit.unwrap().unwrap();
+    assert!(no_other_provider);
+}
+
+async fn finalized_timed_capture(config: &Path, directory: &Path) -> (String, Value, u32) {
+    use conversation_model_adapters::{
+        CaptureClockPair, CaptureEpoch, CaptureMappingQuality, FrameProvenance, NominalCaptureSpan,
+    };
+    use conversation_runtime::{read_session_recording, RecordedChunk};
+    let mut first = Gateway::start(config).await;
+    let producer_pid = first.child.id().unwrap();
     let first_id = first.read().await["current_session_id"]
         .as_str()
         .unwrap()
@@ -506,7 +879,7 @@ async fn timed_alignment_survives_actual_gateway_exit_and_obeys_page_credit_with
     }
     // Read the encrypted recorder, not a file-length heuristic (03 starts with policy).
     timeout(PROCESS_TIMEOUT,async {loop {
-        let seen=std::fs::read_dir(directory.path().join("recordings")).unwrap().filter_map(Result::ok).any(|entry|
+        let seen=std::fs::read_dir(directory.join("recordings")).unwrap().filter_map(Result::ok).any(|entry|
             read_session_recording(&entry.path(),KEY_ENV).is_ok_and(|recording|recording.chunks.iter().any(|chunk|matches!(chunk,RecordedChunk::CaptureMetadata(conversation_model_adapters::CaptureMetadata::ClockPair(pair)) if pair.sequence==60))));
         if seen {break;}tokio::task::yield_now().await;
     }}).await.expect("late clock pair must reach the actual encrypted recorder");
@@ -531,97 +904,7 @@ async fn timed_alignment_survives_actual_gateway_exit_and_obeys_page_credit_with
         .await
         .unwrap()
         .unwrap();
-    let mut second = Gateway::start(&config).await;
-    let second_id = second.read().await["current_session_id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    assert_ne!(first_id, second_id);
-    second.send(json!({"protocol_version":4,"type":"read_recording_alignment","request_id":"alignment","capability":capability})).await;
-    let first_page = second.until("recording_alignment_page", "alignment").await;
-    assert_eq!(first_page["page"]["source"]["source_session_id"], first_id);
-    assert_eq!(first_page["page"]["page_index"], "0");
-    assert_eq!(first_page["page"]["entries"].as_array().unwrap().len(), 64);
-    let frame = first_page["page"]["entries"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|entry| entry["kind"] == "frame")
-        .unwrap();
-    assert_eq!(frame["provenance"]["span"]["host_start_ns"], "1000000000");
-    assert_eq!(frame["wall"]["local_start_ns"], "2100000000");
-    assert_eq!(frame["wall"]["overall_physical_accuracy_ns"], Value::Null);
-    // Status proves the loop remains responsive; no page/completion may jump ahead of credit.
-    second
-        .send(json!({"protocol_version":4,"type":"status","request_id":"while-held"}))
-        .await;
-    for kind in ["command_accepted", "status"] {
-        let message = second.read().await;
-        assert_eq!(message["type"], kind);
-        assert_eq!(message["request_id"], "while-held");
-    }
-    second.send(json!({"protocol_version":4,"type":"recording_alignment_credit","request_id":"alignment","consumed_page_index":"0"})).await;
-    let page = second.read().await;
-    assert_eq!(page["type"], "recording_alignment_page");
-    assert_eq!(page["page"]["page_index"], "1");
-    second.send(json!({"protocol_version":4,"type":"recording_alignment_credit","request_id":"alignment","consumed_page_index":"1"})).await;
-    let complete = second.read().await;
-    assert_eq!(complete["type"], "recording_alignment_complete");
-    assert_eq!(complete["completion"]["page_count"], "2");
-    assert_eq!(complete["completion"]["coverage_status"], "available");
-    assert_eq!(
-        complete["completion"]["warnings"],
-        json!(["local_wall_timestamp_estimate"])
-    );
-    second.send(json!({"protocol_version":4,"type":"read_recording_alignment","request_id":"cancelled-read","capability":capability})).await;
-    second
-        .until("recording_alignment_page", "cancelled-read")
-        .await;
-    second.send(json!({"protocol_version":4,"type":"cancel_recording_alignment","request_id":"alignment"})).await;
-    second.send(json!({"protocol_version":4,"type":"recording_alignment_credit","request_id":"alignment","consumed_page_index":"1"})).await;
-    second
-        .send(json!({"protocol_version":4,"type":"status","request_id":"late-controls"}))
-        .await;
-    for kind in ["command_accepted", "status"] {
-        let message = second.read().await;
-        assert_eq!(message["type"], kind);
-        assert_eq!(message["request_id"], "late-controls");
-    }
-    second.send(json!({"protocol_version":4,"type":"cancel_recording_alignment","request_id":"cancelled-read"})).await;
-    second.until("command_rejected", "cancelled-read").await;
-    for defect in ["future", "duplicate", "regressing"] {
-        second.send(json!({"protocol_version":4,"type":"read_recording_alignment","request_id":defect,"capability":capability})).await;
-        second.until("recording_alignment_page", defect).await;
-        if defect != "future" {
-            second.send(json!({"protocol_version":4,"type":"recording_alignment_credit","request_id":defect,"consumed_page_index":"0"})).await;
-            if defect == "regressing" {
-                second.until("recording_alignment_page", defect).await;
-            }
-        }
-        second.send(json!({"protocol_version":4,"type":"recording_alignment_credit","request_id":defect,"consumed_page_index":if defect=="future" {"999"}else{"0"}})).await;
-        second.until("command_rejected", defect).await;
-        second
-            .send(json!({"protocol_version":4,"type":"status","request_id":"one-terminal"}))
-            .await;
-        for kind in ["command_accepted", "status"] {
-            let message = second.read().await;
-            assert_eq!(message["type"], kind);
-            assert_eq!(message["request_id"], "one-terminal");
-        }
-    }
-    second.send(json!({"protocol_version":4,"type":"read_recording_alignment","request_id":"disconnect","capability":capability})).await;
-    second.until("recording_alignment_page", "disconnect").await;
-    assert!(!requests.exists());
-    assert_eq!(language.calls.load(Ordering::SeqCst), 0);
-    second.close().await;
-    assert!(std::fs::read_dir(directory.path().join("recordings"))
-        .unwrap()
-        .all(|entry| !entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .starts_with(".recovery-")));
-    std::env::remove_var(KEY_ENV);
+    (first_id, capability, producer_pid)
 }
 
 async fn timed_packet(media: &mut TcpStream, kind: u8, body: &[u8]) {

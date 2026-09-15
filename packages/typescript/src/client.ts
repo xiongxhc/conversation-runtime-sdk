@@ -15,6 +15,7 @@ import {
   type PersonaState,
   type ProcessedText,
   type RecordingReconciliation,
+  type FinalizedRecordingReconciliation,
   type RecordingSummary,
   type FinalizedRecordingCapability,
   type FinalizedRecordingForVersion,
@@ -275,15 +276,16 @@ export class RuntimeClient<Version extends ClientProtocolVersion = ClientProtoco
   }
 
   /** Reconciles a finalized recording after restart; does not change its source identity. */
-  reconcileFinalizedRecording({ capability }: { capability: FinalizedRecordingCapability }): Promise<RecordingReconciliation> {
+  reconcileFinalizedRecording({ capability }: { capability: FinalizedRecordingCapability }): Promise<FinalizedRecordingReconciliation> {
     if (this.protocolVersion !== 4) return Promise.reject(new Error("finalized recording recovery requires protocol version 4"));
     const requestId = this.nextRequestId();
-    const command: ClientCommand = { type: "reconcile_finalized_recording", requestId, capability };
+    const command: ClientCommand = { type: "reconcile_finalized_recording", requestId, capability: { ...capability } };
     try { validateClientCommand(command, 4); } catch { return Promise.reject(new Error("invalid finalized recording capability")); }
+    const source: RecordingIdentity = Object.freeze({ sourceSessionId: command.capability.sourceSessionId, recordingHandle: command.capability.recordingHandle, sha256: command.capability.sha256 });
     const result = new Deferred<RecordingReconciliation>();
     this.controls.set(requestId, { kind: "reconcile_recording", accepted: false, result, fail: (error) => result.reject(error) });
     this.send(command);
-    return result.promise;
+    return result.promise.then((reconciliation) => ({ ...reconciliation, source }));
   }
 
   /**

@@ -7,6 +7,13 @@ samples at24kHz cover source numerator0..96000 /24000 at48kHz. Nominal host star
 arithmetic envelope, unknown physical capture error). PCM is0,32767. Source
 session41 is NOT bridge identity. Authentication/epoch are required separately.
 
+`metadata.json.authenticationAcceptedHex` is the mandatory server-to-bridge
+MED2 kind9 confirmation for source41 and `bridge-independent`. Each new or
+reconnected timed socket must consume this exact identity-bound response before
+starting capture/renderer/pair sampling or sending epoch/PCM. A local auth write
+or playback silence is not confirmation. The response contains no credential;
+all pre-existing authentication and other fixture bytes are unchanged.
+
 All integer JSON strings are canonical decimal; `control.json` pins command
 field names and signed/unsigned boundaries. See normative docs for exact bounds
 and forbidden unknown/trailing fields. This fixture does not transmit the local

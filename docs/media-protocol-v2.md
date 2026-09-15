@@ -40,6 +40,25 @@ trailing bytes, unknown kinds, flags, enum values or reserved bits are accepted.
 | 6 epoch start | source session:u64, bridge ID, clock domain ID, capture epoch:u64, host basis:u8 (=1, host_monotonic_ns) |
 | 7 clock pair | source session:u64, clock domain ID, wall epoch:u64, sequence:u64, host before:u64, local Unix ns:i64, host after:u64, wall resolution:u64, external accuracy present:u8, external accuracy:u64 |
 | 8 discontinuity | source session:u64, capture epoch:u64, reason:u8 |
+| 9 authentication accepted (server to bridge only) | source session:u64, bridge ID |
+
+Kind9 is mandatory, success-only and exactly10..73 body bytes (9 plus the
+1..64-byte bridge identifier). No trailing bytes or credential echo is allowed.
+After authenticating kind1, Runtime writes AND flushes exactly one kind9 before
+attaching playback or admitting media. Timed authentication read, validation and
+confirmation flush share one absolute2s deadline. Invalid/expired/active or
+mismatched credentials/source/bridge close without a negative response. Any
+post-authentication failure or cancellation releases only that exact connection.
+
+Every new/reconnected bridge socket must read the entire matching kind9 under
+its connect deadline BEFORE renderer/capture/pair startup or epoch/PCM delivery.
+Wrong identity/version/kind/length, truncation, EOF, timeout or playback before
+kind9 fails closed. A local auth write, silence or a previous socket's response
+does not establish authentication. Confirmation is under existing endpoint/TLS
+trust, not a new cryptographic server identity protocol. Kind9 consumes no PCM
+or metadata-rate budget and creates no epoch. Server admission follows ACK flush;
+it cannot retrospectively detect a malicious peer's earlier TCP-queued bytes.
+Legacy media1 receives no confirmation; its one-way authentication is unchanged.
 
 Positive epoch/sequence; domain is newly random for each producer process.
 Reasons: 1 source_drop, 2 sequence_hole, 3 reconnect, 4 pause, 5 epoch_reset,

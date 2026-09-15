@@ -562,24 +562,44 @@ async fn serve_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let handshake_deadline = tokio::time::Instant::now() + MEDIA_HANDSHAKE_TIMEOUT;
     let (session_id, credential, bridge_session_id) = tokio::select! {
         _ = inner.cancellation.cancelled() => return Ok(()),
-        authentication = tokio::time::timeout(MEDIA_HANDSHAKE_TIMEOUT, read_authentication(&mut stream)) => {
+        authentication = tokio::time::timeout_at(handshake_deadline, read_authentication(&mut stream)) => {
             authentication
                 .map_err(|_| AdapterError::new("media bridge authentication timed out"))??
         },
     };
-    let connection = inner
-        .authenticate(session_id, &credential, bridge_session_id.as_deref())
-        .await?;
     let timed = bridge_session_id.is_some();
+    let connection = if timed {
+        tokio::select! {
+            biased;
+            _ = inner.cancellation.cancelled() => return Ok(()),
+            _ = tokio::time::sleep_until(handshake_deadline) => return Err(AdapterError::new("media bridge authentication timed out")),
+            result = inner.authenticate(session_id, &credential, bridge_session_id.as_deref()) => result?,
+        }
+    } else {
+        inner.authenticate(session_id, &credential, None).await?
+    };
     let mut epoch_started = false;
-    let mut playback = inner
-        .hub
-        .attach_playback_transport(session_id, connection.connection_id)
-        .await?;
     let (mut reader, mut writer) = tokio::io::split(stream);
     let result = async {
+        if let Some(bridge) = bridge_session_id.as_deref() {
+            tokio::select! {
+                biased;
+                _ = inner.cancellation.cancelled() => return Ok(()),
+                _ = tokio::time::sleep_until(handshake_deadline) => return Err(AdapterError::new("media bridge authentication timed out")),
+                result = write_authentication_accepted(&mut writer, session_id, bridge) => result?,
+            }
+        }
+        // Every operation after active-state assignment is inside this result
+        // scope. ACK/flush, cancellation and attachment failures all reach the
+        // same exact-connection cleanup below; no playback precedes kind9.
+        let mut playback = tokio::select! {
+            biased;
+            _ = inner.cancellation.cancelled() => return Ok(()),
+            result = inner.hub.attach_playback_transport(session_id, connection.connection_id) => result?,
+        };
         loop {
             tokio::select! {
                 _ = inner.cancellation.cancelled() => break Ok(()),
@@ -717,6 +737,28 @@ where
         }
     }
     result
+}
+
+async fn write_authentication_accepted<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    session_id: SessionId,
+    bridge_session_id: &str,
+) -> Result<(), AdapterError> {
+    conversation_model_adapters::validate_capture_identifier(bridge_session_id)?;
+    let mut packet = Vec::with_capacity(83);
+    packet.extend_from_slice(b"MED2\x02\x09");
+    packet.extend_from_slice(&(9 + bridge_session_id.len() as u32).to_be_bytes());
+    packet.extend_from_slice(&session_id.get().to_be_bytes());
+    packet.push(bridge_session_id.len() as u8);
+    packet.extend_from_slice(bridge_session_id.as_bytes());
+    writer
+        .write_all(&packet)
+        .await
+        .map_err(|_| AdapterError::new("media authentication confirmation write failed"))?;
+    writer
+        .flush()
+        .await
+        .map_err(|_| AdapterError::new("media authentication confirmation flush failed"))
 }
 
 fn admit_rate_window(
@@ -1518,6 +1560,345 @@ fn load_tls_acceptor(config: &MediaTlsConfig) -> Result<TlsAcceptor, AdapterErro
 #[cfg(test)]
 mod timing_domain_tests {
     use super::*;
+    use std::{
+        future::Future,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+    use tokio::io::ReadBuf;
+
+    #[derive(Clone, Copy, Debug)]
+    enum AckFault {
+        WriteStall,
+        FlushStall,
+        PartialWriteError,
+        FlushError,
+        None,
+    }
+
+    struct AckIo {
+        input: std::io::Cursor<Vec<u8>>,
+        read_bytes: Arc<std::sync::atomic::AtomicUsize>,
+        written: Arc<std::sync::Mutex<Vec<u8>>>,
+        entered: Arc<tokio::sync::Notify>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+        delay: Pin<Box<tokio::time::Sleep>>,
+        fault: AckFault,
+    }
+    impl Drop for AckIo {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+    impl AsyncRead for AckIo {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            out: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.delay.as_mut().poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+            let position = self.input.position() as usize;
+            let count = out.remaining().min(self.input.get_ref().len() - position);
+            out.put_slice(&self.input.get_ref()[position..position + count]);
+            self.input.set_position((position + count) as u64);
+            self.read_bytes.fetch_add(count, Ordering::SeqCst);
+            Poll::Ready(Ok(()))
+        }
+    }
+    impl AsyncWrite for AckIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.entered.notify_one();
+            if matches!(self.fault, AckFault::WriteStall) {
+                return Poll::Pending;
+            }
+            let mut written = self.written.lock().unwrap();
+            if matches!(self.fault, AckFault::PartialWriteError) && !written.is_empty() {
+                return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+            }
+            let count = if matches!(self.fault, AckFault::PartialWriteError) {
+                bytes.len().min(3)
+            } else {
+                bytes.len()
+            };
+            written.extend_from_slice(&bytes[..count]);
+            Poll::Ready(Ok(count))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            match self.fault {
+                AckFault::FlushStall => Poll::Pending,
+                AckFault::FlushError => Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into())),
+                _ => Poll::Ready(Ok(())),
+            }
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+    fn ack_io(lease: &MediaLease, delay: Duration, fault: AckFault) -> (AckIo, usize) {
+        let mut body = lease.session_id().get().to_be_bytes().to_vec();
+        body.push(lease.credential().len() as u8);
+        body.extend(lease.credential().as_bytes());
+        body.push(18);
+        body.extend(b"bridge-independent");
+        let mut input = b"MED2\x02\x01".to_vec();
+        input.extend((body.len() as u32).to_be_bytes());
+        input.extend(body);
+        let auth_len = input.len();
+        // Deliberately queued early. It must not be read/admitted on ACK failure.
+        input.extend_from_slice(b"MED2\x02\x06\x00\x00\x00\x00");
+        (
+            AckIo {
+                input: std::io::Cursor::new(input),
+                read_bytes: Arc::default(),
+                written: Arc::default(),
+                entered: Arc::default(),
+                dropped: Arc::default(),
+                delay: Box::pin(tokio::time::sleep(delay)),
+                fault,
+            },
+            auth_len,
+        )
+    }
+    async fn timed_server() -> MediaServer {
+        MediaServer::bind(
+            MediaServerConfig::loopback()
+                .with_capture_format(Some("pcm_s16le/24000/1/20ms".into()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_ack_stall_shares_read_deadline_and_releases_exact_connection() {
+        for fault in [AckFault::WriteStall, AckFault::FlushStall] {
+            let server = timed_server().await;
+            let id = SessionId::new(41);
+            let lease = server
+                .reserve_timed(id, "bridge-independent".into())
+                .await
+                .unwrap();
+            let (io, auth_len) = ack_io(&lease, Duration::from_millis(1500), fault);
+            let entered = io.entered.clone();
+            let read = io.read_bytes.clone();
+            let dropped = io.dropped.clone();
+            let origin = tokio::time::Instant::now();
+            let task = tokio::spawn(serve_connection(io, server.inner.clone()));
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_millis(1500)).await;
+            tokio::time::timeout(MEDIA_HANDSHAKE_TIMEOUT, entered.notified())
+                .await
+                .expect("ACK writer was never entered");
+            assert_eq!(read.load(Ordering::SeqCst), auth_len);
+            let hub = server.hub();
+            let frame = frame_for_network_capture(
+                1,
+                PcmFormat::new(24000, 1, PcmSampleFormat::Signed16LittleEndian).unwrap(),
+                vec![0, 0],
+            )
+            .unwrap();
+            let mut playback = Box::pin(hub.enqueue_playback(id, frame, CancellationToken::new()));
+            std::future::poll_fn(|cx| {
+                assert!(
+                    matches!(playback.as_mut().poll(cx), Poll::Ready(Err(_))),
+                    "playback attached before ACK flush"
+                );
+                Poll::Ready(())
+            })
+            .await;
+            let old = {
+                let sessions = server.inner.sessions.lock().await;
+                let state = &sessions[&id.get()];
+                assert!(state.active);
+                MediaConnection {
+                    reservation_epoch: state.reservation_epoch,
+                    connection_id: state.active_connection_id.unwrap(),
+                }
+            };
+            tokio::time::advance(Duration::from_millis(499)).await;
+            assert!(!task.is_finished());
+            tokio::time::advance(Duration::from_millis(1)).await;
+            assert!(task.await.unwrap().is_err());
+            assert_eq!(
+                tokio::time::Instant::now() - origin,
+                MEDIA_HANDSHAKE_TIMEOUT
+            );
+            assert!(dropped.load(Ordering::SeqCst));
+            assert_eq!(
+                read.load(Ordering::SeqCst),
+                auth_len,
+                "ACK failure admitted media"
+            );
+            assert!(!server.inner.sessions.lock().await[&id.get()].active);
+            let replacement = server
+                .inner
+                .authenticate(id, lease.credential(), Some("bridge-independent"))
+                .await
+                .unwrap();
+            assert!(server.inner.disconnect(id, old).await.is_none());
+            assert_eq!(
+                server.inner.sessions.lock().await[&id.get()].active_connection_id,
+                Some(replacement.connection_id)
+            );
+            server.inner.disconnect(id, replacement).await.unwrap();
+            server.shutdown().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_ack_partial_write_flush_error_and_cancellation_cleanup_are_owned() {
+        for fault in [
+            AckFault::PartialWriteError,
+            AckFault::FlushError,
+            AckFault::WriteStall,
+            AckFault::FlushStall,
+        ] {
+            let server = timed_server().await;
+            let id = SessionId::new(41);
+            let lease = server
+                .reserve_timed(id, "bridge-independent".into())
+                .await
+                .unwrap();
+            let (io, auth_len) = ack_io(&lease, Duration::ZERO, fault);
+            let entered = io.entered.clone();
+            let read = io.read_bytes.clone();
+            let dropped = io.dropped.clone();
+            let written = io.written.clone();
+            let task = tokio::spawn(serve_connection(io, server.inner.clone()));
+            tokio::time::timeout(MEDIA_HANDSHAKE_TIMEOUT, entered.notified())
+                .await
+                .expect("ACK writer was never entered");
+            let stalled = matches!(fault, AckFault::WriteStall | AckFault::FlushStall);
+            if stalled {
+                server.inner.cancellation.cancel();
+            }
+            let result = task.await.unwrap();
+            assert_eq!(result.is_ok(), stalled);
+            assert!(dropped.load(Ordering::SeqCst));
+            assert_eq!(read.load(Ordering::SeqCst), auth_len);
+            assert!(!server.inner.sessions.lock().await[&id.get()].active);
+            if matches!(fault, AckFault::PartialWriteError) {
+                assert_eq!(written.lock().unwrap().len(), 3);
+            }
+            assert_eq!(
+                server.inner.sessions.lock().await[&id.get()]
+                    .timed
+                    .as_ref()
+                    .unwrap()
+                    .metadata_in_window,
+                0
+            );
+            server.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn timed_ack_canonical_bytes_and_attachment_failure_release_active_state() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/timed-capture-v1/metadata.json"
+        ))
+        .unwrap();
+        let mut bytes = Vec::new();
+        write_authentication_accepted(&mut bytes, SessionId::new(41), "bridge-independent")
+            .await
+            .unwrap();
+        let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(hex, fixture["authenticationAcceptedHex"]);
+        assert!(!bytes
+            .windows(b"fixture-token".len())
+            .any(|part| part == b"fixture-token"));
+        for bridge in ["", "bad\nbridge", &"x".repeat(65)] {
+            assert!(
+                write_authentication_accepted(&mut Vec::new(), SessionId::new(41), bridge)
+                    .await
+                    .is_err()
+            );
+        }
+        let server = timed_server().await;
+        let id = SessionId::new(41);
+        let lease = server
+            .reserve_timed(id, "bridge-independent".into())
+            .await
+            .unwrap();
+        server.hub().revoke(id).await; // Auth registry still valid; playback attach fails.
+        let (io, auth_len) = ack_io(&lease, Duration::ZERO, AckFault::None);
+        let read = io.read_bytes.clone();
+        let written = io.written.clone();
+        assert!(serve_connection(io, server.inner.clone()).await.is_err());
+        assert_eq!(*written.lock().unwrap(), bytes);
+        assert_eq!(read.load(Ordering::SeqCst), auth_len);
+        assert!(!server.inner.sessions.lock().await[&id.get()].active);
+        server.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_ack_revoke_while_stalled_is_bounded_and_cannot_release_new_reservation() {
+        let server = timed_server().await;
+        let id = SessionId::new(41);
+        let lease = server
+            .reserve_timed(id, "bridge-independent".into())
+            .await
+            .unwrap();
+        let (io, _) = ack_io(&lease, Duration::ZERO, AckFault::FlushStall);
+        let entered = io.entered.clone();
+        let dropped = io.dropped.clone();
+        let task = tokio::spawn(serve_connection(io, server.inner.clone()));
+        tokio::time::timeout(MEDIA_HANDSHAKE_TIMEOUT, entered.notified())
+            .await
+            .expect("ACK writer was never entered");
+        server.revoke(id).await;
+        let lease = server
+            .reserve_timed(id, "bridge-independent".into())
+            .await
+            .unwrap();
+        let replacement = server
+            .inner
+            .authenticate(id, lease.credential(), Some("bridge-independent"))
+            .await
+            .unwrap();
+        tokio::time::advance(MEDIA_HANDSHAKE_TIMEOUT).await;
+        assert!(task.await.unwrap().is_err());
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(
+            server.inner.sessions.lock().await[&id.get()].active_connection_id,
+            Some(replacement.connection_id)
+        );
+        server.inner.disconnect(id, replacement).await.unwrap();
+        server.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_ack_shutdown_joins_the_registered_stalled_connection_owner() {
+        let server = timed_server().await;
+        let id = SessionId::new(41);
+        let lease = server
+            .reserve_timed(id, "bridge-independent".into())
+            .await
+            .unwrap();
+        let (io, _) = ack_io(&lease, Duration::ZERO, AckFault::FlushStall);
+        let entered = io.entered.clone();
+        let dropped = io.dropped.clone();
+        let inner = server.inner.clone();
+        let task = tokio::spawn(async move {
+            let _ = serve_connection(io, inner).await;
+        });
+        server.inner.connections.lock().await.push(task);
+        tokio::time::timeout(MEDIA_HANDSHAKE_TIMEOUT, entered.notified())
+            .await
+            .expect("ACK writer was never entered");
+        tokio::time::timeout(MEDIA_CONNECTION_REAP_TIMEOUT, server.shutdown())
+            .await
+            .expect("shutdown failed to join ACK owner");
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(server.inner.connections.lock().await.is_empty());
+        assert!(!server.inner.sessions.lock().await[&id.get()].active);
+    }
     #[test]
     fn review_rate_windows_admit_exact_caps_and_reset_independently_at_one_second() {
         let origin = Instant::now();

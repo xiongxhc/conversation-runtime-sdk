@@ -19,6 +19,94 @@ use tokio_util::sync::CancellationToken;
 const RECEIVE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[tokio::test]
+async fn timed_authentication_confirmation_precedes_queued_playback_and_binds_source() {
+    let server = MediaServer::bind(
+        MediaServerConfig::loopback()
+            .with_capture_format(Some("pcm_s16le/24000/1/20ms".into()))
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    let lease = server
+        .reserve_timed(SessionId::new(41), "bridge-independent".into())
+        .await
+        .unwrap();
+    let cancellation = CancellationToken::new();
+    let hub = server.hub();
+    // Reconnect queue setup through the existing transport port. Initial
+    // reservations intentionally reject playback before any transport exists.
+    let old_transport = hub
+        .attach_playback_transport(lease.session_id(), 99)
+        .await
+        .unwrap();
+    hub.disconnect_playback_transport(
+        lease.session_id(),
+        99,
+        std::time::Instant::now() + Duration::from_secs(10),
+    )
+    .await
+    .unwrap();
+    drop(old_transport);
+    let mut receipt = Box::pin(hub.enqueue_playback(
+        lease.session_id(),
+        playback_test_frame(23, 43),
+        cancellation.clone(),
+    ));
+    // No other task holds the hub lock: this first poll queues playback and
+    // waits for the remote acknowledgement, before TCP authentication starts.
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(receipt.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    let mut bridge = TcpStream::connect(lease.endpoint()).await.unwrap();
+    let mut auth = lease.session_id().get().to_be_bytes().to_vec();
+    auth.push(lease.credential().len() as u8);
+    auth.extend(lease.credential().as_bytes());
+    auth.push(18);
+    auth.extend(b"bridge-independent");
+    send_timed_packet(&mut bridge, 1, &auth).await;
+    let mut confirmation = vec![0; 37];
+    let received = timeout(RECEIVE_TIMEOUT, bridge.read_exact(&mut confirmation)).await;
+    let mut expected = b"MED2\x02\x09\x00\x00\x00\x1b".to_vec();
+    expected.extend(41_u64.to_be_bytes());
+    expected.push(18);
+    expected.extend(b"bridge-independent");
+    // Clean up before asserting RED so no receipt/listener task is detached.
+    if received.is_err() || confirmation != expected {
+        cancellation.cancel();
+        let _ = receipt.await;
+        server.shutdown().await;
+        assert_eq!(
+            confirmation, expected,
+            "kind9 must be first, never queued playback"
+        );
+        panic!("confirmation read timed out");
+    }
+    assert!(!confirmation
+        .windows(lease.credential().len())
+        .any(|window| window == lease.credential().as_bytes()));
+    let sequence = timeout(
+        RECEIVE_TIMEOUT,
+        read_playback_frame(
+            &mut bridge,
+            lease.session_id(),
+            TurnId::new(62),
+            GenerationId::new(23),
+            UtteranceId::new(52),
+            43,
+            b"accepted-only!",
+        ),
+    )
+    .await
+    .unwrap();
+    send_playback_ack(&mut bridge, lease.session_id(), sequence, 1).await;
+    assert_eq!(receipt.await.unwrap().state(), PlaybackState::Accepted);
+    cancellation.cancel();
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn timed_metadata_faults_preserve_pcm_without_inventing_audio_gaps_or_recognizer_events() {
     use conversation_model_adapters::{
         CaptureClockPair, CaptureDiscontinuityReason, CaptureEpoch, CaptureMetadata,
@@ -46,6 +134,7 @@ async fn timed_metadata_faults_preserve_pcm_without_inventing_audio_gaps_or_reco
     auth.push(18);
     auth.extend_from_slice(b"bridge-independent");
     send_timed_packet(&mut bridge, 1, &auth).await;
+    read_timed_confirmation(&mut bridge, lease.session_id(), "bridge-independent").await;
     let epoch = CaptureEpoch {
         bridge_session_id: "bridge-independent".into(),
         clock_domain_id: "source-process".into(),
@@ -182,6 +271,99 @@ async fn send_timed_packet(bridge: &mut TcpStream, kind: u8, body: &[u8]) {
     bridge.write_all(&packet).await.unwrap();
 }
 
+async fn read_timed_confirmation(bridge: &mut TcpStream, session: SessionId, identity: &str) {
+    let mut expected = b"MED2\x02\x09".to_vec();
+    expected.extend((9_u32 + identity.len() as u32).to_be_bytes());
+    expected.extend(session.get().to_be_bytes());
+    expected.push(identity.len() as u8);
+    expected.extend(identity.as_bytes());
+    let mut actual = vec![0; expected.len()];
+    timeout(RECEIVE_TIMEOUT, bridge.read_exact(&mut actual))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(actual, expected);
+}
+
+async fn send_timed_authentication(
+    bridge: &mut TcpStream,
+    lease: &conversation_runtime_gateway::MediaLease,
+) {
+    let mut body = lease.session_id().get().to_be_bytes().to_vec();
+    body.push(lease.credential().len() as u8);
+    body.extend(lease.credential().as_bytes());
+    body.push(18);
+    body.extend(b"bridge-independent");
+    send_timed_packet(bridge, 1, &body).await;
+}
+
+#[tokio::test]
+async fn timed_authentication_reconnect_requires_fresh_confirmation_and_rejects_active_expired_or_revoked(
+) {
+    let server = MediaServer::bind(
+        MediaServerConfig::loopback()
+            .with_capture_format(Some("pcm_s16le/24000/1/20ms".into()))
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    let id = SessionId::new(41);
+    let lease = server
+        .reserve_timed(id, "bridge-independent".into())
+        .await
+        .unwrap();
+    let mut first = TcpStream::connect(lease.endpoint()).await.unwrap();
+    send_timed_authentication(&mut first, &lease).await;
+    read_timed_confirmation(&mut first, id, "bridge-independent").await;
+    let mut duplicate = TcpStream::connect(lease.endpoint()).await.unwrap();
+    send_timed_authentication(&mut duplicate, &lease).await;
+    assert!(timeout(RECEIVE_TIMEOUT, duplicate.read_u8())
+        .await
+        .unwrap()
+        .is_err());
+    first.shutdown().await.unwrap();
+    assert!(timeout(RECEIVE_TIMEOUT, first.read_u8())
+        .await
+        .unwrap()
+        .is_err());
+    let mut replacement = TcpStream::connect(lease.endpoint()).await.unwrap();
+    send_timed_authentication(&mut replacement, &lease).await;
+    read_timed_confirmation(&mut replacement, id, "bridge-independent").await;
+    server.revoke(id).await;
+    let mut revoked = TcpStream::connect(lease.endpoint()).await.unwrap();
+    send_timed_authentication(&mut revoked, &lease).await;
+    assert!(timeout(RECEIVE_TIMEOUT, revoked.read_u8())
+        .await
+        .unwrap()
+        .is_err());
+    server.shutdown().await;
+    assert!(timeout(RECEIVE_TIMEOUT, replacement.read_u8())
+        .await
+        .unwrap()
+        .is_err());
+
+    let server = MediaServer::bind(
+        MediaServerConfig::loopback()
+            .with_lifetimes(Duration::from_millis(10), Duration::from_secs(1))
+            .with_capture_format(Some("pcm_s16le/24000/1/20ms".into()))
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    let lease = server
+        .reserve_timed(id, "bridge-independent".into())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let mut expired = TcpStream::connect(lease.endpoint()).await.unwrap();
+    send_timed_authentication(&mut expired, &lease).await;
+    assert!(timeout(RECEIVE_TIMEOUT, expired.read_u8())
+        .await
+        .unwrap()
+        .is_err());
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn timed_listener_refuses_wrong_auth_domain_epoch_replay_and_format_before_frame_delivery() {
     use conversation_model_adapters::{CaptureClockPair, CaptureEpoch};
@@ -189,6 +371,7 @@ async fn timed_listener_refuses_wrong_auth_domain_epoch_replay_and_format_before
         "bridge",
         "token",
         "source",
+        "malformed_auth",
         "no_epoch",
         "domain",
         "epoch",
@@ -228,8 +411,12 @@ async fn timed_listener_refuses_wrong_auth_domain_epoch_replay_and_format_before
         };
         auth.push(identity.len() as u8);
         auth.extend(identity.as_bytes());
+        if fault == "malformed_auth" {
+            auth.push(0);
+        }
         send_timed_packet(&mut bridge, 1, &auth).await;
-        if !["bridge", "token", "source"].contains(&fault) {
+        if !["bridge", "token", "source", "malformed_auth"].contains(&fault) {
+            read_timed_confirmation(&mut bridge, lease.session_id(), "bridge-independent").await;
             if fault != "no_epoch" {
                 let epoch = CaptureEpoch {
                     bridge_session_id: "bridge-independent".into(),

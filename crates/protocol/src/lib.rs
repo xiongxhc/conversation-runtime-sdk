@@ -13,7 +13,13 @@ mod ids;
 mod memory;
 mod privacy;
 mod quality;
+mod utterance_capture;
 mod voice_event;
+
+pub use utterance_capture::{
+    CaptureUnavailableReason, SourceSampleRange, UtteranceCaptureEvidence,
+    WholeFrameNominalEnvelope, MAX_UTTERANCE_CAPTURE_BYTES,
+};
 
 pub use client_diarization::{
     ClientDiarizedSegment, ClientRecordingReconciliation, MAX_CLIENT_DIARIZED_SEGMENTS,

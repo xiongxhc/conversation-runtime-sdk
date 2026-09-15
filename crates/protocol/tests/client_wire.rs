@@ -661,6 +661,7 @@ fn voice_events_project_every_approved_lifecycle_variant() {
             segment_id: 1,
             turn_id: Some(turn_id),
             text: "hello".to_owned(),
+            capture_evidence: None,
         },
         VoiceSessionEvent::BargeIn {
             session_id,
@@ -1598,6 +1599,128 @@ fn root_runtime_messages_reject_voice_only_event_variants() {
 }
 
 #[test]
+fn shared_transcription_v4_vectors_encode_without_losing_source_or_unknown_evidence() {
+    let vectors = include_str!("../../../tests/fixtures/transcription-v4/events.jsonl");
+    let source = conversation_protocol::SourceSampleRange {
+        clock_domain_id: "source-process".into(),
+        capture_epoch: 1,
+        first_frame_sequence: 7,
+        last_frame_sequence: 8,
+        source_start_sample: 9007199254740993,
+        source_end_sample: 9007199254741017,
+        sample_rate_hz: 24000,
+    };
+    let evidence = [
+        conversation_protocol::UtteranceCaptureEvidence {
+            capture: Some(source.clone()),
+            live_coverage: Some(conversation_protocol::WholeFrameNominalEnvelope {
+                host_start_ns: 1000000000,
+                host_end_ns: 2000000000,
+                first_frame_host_end_ns: 1500000000,
+                capture_uncertainty_ns: None,
+                known_rounding_allowance_ns: 1,
+            }),
+            capture_unavailable_reason: None,
+        },
+        conversation_protocol::UtteranceCaptureEvidence {
+            capture: Some(conversation_protocol::SourceSampleRange {
+                first_frame_sequence: 9,
+                last_frame_sequence: 9,
+                source_start_sample: 9007199254741017,
+                source_end_sample: 9007199254741041,
+                ..source
+            }),
+            live_coverage: None,
+            capture_unavailable_reason: Some(
+                conversation_protocol::CaptureUnavailableReason::CaptureTimingMissing,
+            ),
+        },
+        conversation_protocol::UtteranceCaptureEvidence::unavailable(
+            conversation_protocol::CaptureUnavailableReason::CaptureBoundaryEvicted,
+        ),
+    ];
+    for ((line, evidence), (segment_id, text)) in vectors.lines().zip(evidence).zip([
+        (9, "wording"),
+        (10, "timing unavailable"),
+        (11, "boundary unavailable"),
+    ]) {
+        let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        let event = ClientVoiceSessionEvent::try_from(VoiceSessionEvent::TranscriptFinal {
+            session_id: SessionId::new(7),
+            segment_id,
+            turn_id: None,
+            text: text.into(),
+            capture_evidence: Some(Box::new(evidence)),
+        })
+        .unwrap();
+        let encoded =
+            encode_gateway_message_for_version(&GatewayMessage::VoiceEvent { event }, 4).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&encoded).unwrap(),
+            value
+        );
+    }
+}
+
+#[test]
+fn finalized_capture_evidence_is_v4_only_and_legacy_transcript_bytes_are_unchanged() {
+    let event = ClientVoiceSessionEvent::try_from(VoiceSessionEvent::TranscriptFinal {
+        session_id: SessionId::new(7),
+        segment_id: 9,
+        turn_id: Some(TurnId::new(11)),
+        text: "wording".into(),
+        capture_evidence: Some(Box::new(conversation_protocol::UtteranceCaptureEvidence {
+            capture: Some(conversation_protocol::SourceSampleRange {
+                clock_domain_id: "source-process".into(),
+                capture_epoch: 1,
+                first_frame_sequence: 7,
+                last_frame_sequence: 8,
+                source_start_sample: 9007199254740993,
+                source_end_sample: 9007199254741017,
+                sample_rate_hz: 24000,
+            }),
+            live_coverage: None,
+            capture_unavailable_reason: Some(
+                conversation_protocol::CaptureUnavailableReason::CaptureTimingMissing,
+            ),
+        })),
+    })
+    .unwrap();
+    let message = GatewayMessage::VoiceEvent { event };
+    for version in [1, 2, 3, 4] {
+        let encoded = encode_gateway_message_for_version(&message, version).unwrap();
+        let decoded: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        if version == 4 {
+            assert_eq!(
+                decoded["event"]["capture"]["source_start_sample"],
+                "9007199254740993"
+            );
+            assert_eq!(
+                decoded["event"]["capture_unavailable_reason"],
+                "capture_timing_missing"
+            );
+        } else {
+            let expected = if version == 3 {
+                serde_json::json!({"type":"voice_transcript_final","session_id":"7","segment_id":"9","turn_id":"11","text":"wording"})
+            } else {
+                serde_json::json!({"type":"voice_transcript_final","session_id":"7","turn_id":"11","text":"wording"})
+            };
+            assert_eq!(decoded["event"], expected);
+        }
+    }
+    for version in [1, 2] {
+        let link = GatewayMessage::VoiceEvent {
+            event: ClientVoiceSessionEvent::ResponseAuthorized {
+                session_id: SessionId::new(7),
+                segment_id: 9,
+                turn_id: TurnId::new(11),
+            },
+        };
+        assert!(encode_gateway_message_for_version(&link, version).is_err());
+    }
+}
+
+#[test]
 fn voice_transcript_and_response_fields_enforce_conversation_bounds() {
     let oversized = "x".repeat(MAX_CONVERSATION_MESSAGE_BYTES + 1);
     for event in [
@@ -1611,6 +1734,7 @@ fn voice_transcript_and_response_fields_enforce_conversation_bounds() {
             segment_id: 1,
             turn_id: Some(TurnId::new(1)),
             text: oversized.clone(),
+            capture_evidence: None,
         },
         VoiceSessionEvent::Turn {
             session_id: SessionId::new(1),

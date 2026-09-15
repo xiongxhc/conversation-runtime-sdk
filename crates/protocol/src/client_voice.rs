@@ -77,6 +77,8 @@ pub enum ClientVoiceSessionEvent {
         #[serde(serialize_with = "serialize_optional_turn_id")]
         turn_id: Option<TurnId>,
         text: String,
+        #[serde(flatten, skip_serializing_if = "Option::is_none")]
+        capture_evidence: Option<Box<crate::UtteranceCaptureEvidence>>,
     },
     ResponseAuthorized {
         #[serde(serialize_with = "serialize_session_id")]
@@ -210,11 +212,13 @@ impl TryFrom<VoiceSessionEvent> for ClientVoiceSessionEvent {
                 segment_id,
                 turn_id,
                 text,
+                capture_evidence,
             } => Self::VoiceTranscriptFinal {
                 session_id,
                 segment_id,
                 turn_id,
                 text,
+                capture_evidence,
             },
             VoiceSessionEvent::ResponseAuthorized {
                 session_id,
@@ -417,8 +421,12 @@ pub(crate) fn validate_client_voice_event(
             segment_id,
             turn_id,
             text,
+            capture_evidence,
             ..
         } => {
+            if let Some(evidence) = capture_evidence {
+                evidence.validate()?;
+            }
             validate_identifier(*segment_id)?;
             turn_id
                 .map(|turn_id| validate_identifier(turn_id.get()))

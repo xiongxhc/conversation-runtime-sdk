@@ -3275,7 +3275,7 @@ mod tests {
             ONLINE_CREDENTIAL,
         )
         .unwrap()
-        .with_chunk_bytes(b"online".len())
+        .with_server_vad(0.5, 300, 500)
         .unwrap();
         let language = Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new()));
         let speech = Arc::new(PerRequestSpeech::default());
@@ -3316,7 +3316,7 @@ mod tests {
             .await
             .unwrap();
         bridge
-            .write_all(&media_capture(session_id, 1, 1_000, b"online"))
+            .write_all(&online_media_capture(session_id, 1, 1_000, b"online"))
             .await
             .unwrap();
         recognizer.wait_for_request().await;
@@ -3402,7 +3402,7 @@ mod tests {
             ONLINE_CREDENTIAL,
         )
         .unwrap()
-        .with_chunk_bytes(b"online".len())
+        .with_server_vad(0.5, 300, 500)
         .unwrap();
         let speech = Arc::new(PerRequestSpeech::default());
         let voice = GatewayVoiceAdapters {
@@ -3442,7 +3442,7 @@ mod tests {
             .await
             .unwrap();
         bridge
-            .write_all(&media_capture(session_id, 1, 1_000, b"online"))
+            .write_all(&online_media_capture(session_id, 1, 1_000, b"online"))
             .await
             .unwrap();
         recognizer.wait_for_request().await;
@@ -3492,14 +3492,14 @@ mod tests {
 
     /// Catches a Task 7 regression where an externally gated online meeting reaches only a
     /// mock language or speech boundary after the real recognizer finalizes a bridge capture.
-    /// All three production adapters must traverse their own scripted loopback HTTP contract,
+    /// Production ASR must traverse WebSocket and language/speech their HTTP contracts,
     /// and the returned streaming WAV must become a playable media-bridge frame.
     #[tokio::test]
     async fn online_external_gate_runs_production_asr_language_and_streaming_speech_over_loopback()
     {
         const CREDENTIAL: &str = "CONVERSATION_ONLINE_CHAIN_CREDENTIAL";
         std::env::set_var(CREDENTIAL, "fake-not-a-real-credential-0000");
-        let recognizer = ScriptedHttpProvider::start(recognizer_final_response()).await;
+        let recognizer = ScriptedRecognizerServer::two_chunks().await;
         let language = ScriptedHttpProvider::start(language_sse_response("approved reply.")).await;
         let speech_pcm = pcm16_wav(16_000, 1, 160, 0x1234);
         let speech = ScriptedHttpProvider::start(http_response(&speech_pcm)).await;
@@ -3550,7 +3550,7 @@ mod tests {
             .await
             .unwrap();
         bridge
-            .write_all(&media_capture(
+            .write_all(&online_media_capture(
                 session_id,
                 1,
                 1_000,
@@ -3559,7 +3559,7 @@ mod tests {
             .await
             .unwrap();
         bridge
-            .write_all(&media_capture(
+            .write_all(&online_media_capture(
                 session_id,
                 2,
                 1_001,
@@ -3575,7 +3575,7 @@ mod tests {
         assert!(final_transcript
             .iter()
             .any(|message| message.contains(r#""text":"agenda item""#)));
-        assert_eq!(recognizer.request_count().await, 1);
+        assert_eq!(recognizer.request_count().await, 2);
         assert_eq!(language.request_count().await, 0);
         assert_eq!(speech.request_count().await, 0);
 
@@ -3590,7 +3590,10 @@ mod tests {
         speech.wait_for_request().await;
 
         let recognition_request = recognizer.request(0).await;
-        assert_eq!(recognition_request.target, "/v1/audio/transcriptions");
+        assert_eq!(
+            recognition_request.target,
+            "/v1/realtime?intent=transcription"
+        );
         assert_eq!(
             recognition_request.authorization.as_deref(),
             Some("Bearer fake-not-a-real-credential-0000")
@@ -3603,30 +3606,29 @@ mod tests {
             .cloned()
             .collect::<Vec<_>>();
         recognition_keys.sort();
+        assert_eq!(recognition_keys, ["audio", "type"]);
         assert_eq!(
-            recognition_keys,
-            [
-                "audio",
-                "channels",
-                "encoding",
-                "model",
-                "sample_rate_hz",
-                "segment_id",
-                "sequence",
-                "stream",
-            ]
+            recognition_request.payload["type"],
+            "input_audio_buffer.append"
         );
-        assert_eq!(recognition_request.payload["model"], "scripted-asr-model");
-        assert_eq!(recognition_request.payload["encoding"], "pcm_s16le");
-        assert_eq!(recognition_request.payload["sample_rate_hz"], 16_000);
-        assert_eq!(recognition_request.payload["channels"], 1);
-        assert_eq!(recognition_request.payload["segment_id"], "s709-seg1");
-        assert_eq!(recognition_request.payload["sequence"], 0);
-        assert_eq!(recognition_request.payload["stream"], true);
-        let audio = recognition_request.payload["audio"].as_str().unwrap();
-        assert_eq!(audio.len(), 42_668);
-        assert!(audio.starts_with("b29vb29v"));
-        assert!(audio.ends_with("b28="));
+        // 16,000 literal bytes 0x6f = 5,333 complete b29v groups and one bw== tail.
+        let expected_audio = format!("{}bw==", "b29v".repeat(5_333));
+        assert_eq!(recognition_request.payload["audio"], expected_audio);
+        assert_eq!(
+            recognizer.request(1).await.payload,
+            recognition_request.payload
+        );
+        let update = recognizer.update().await;
+        assert_eq!(
+            update["session"]["audio"]["input"]["transcription"]["model"],
+            "scripted-asr-model"
+        );
+        assert_eq!(
+            update["session"]["audio"]["input"]["turn_detection"],
+            serde_json::json!({
+                "type":"server_vad", "threshold":0.5, "prefix_padding_ms":300, "silence_duration_ms":500
+            })
+        );
         let language_request = language.request(0).await;
         assert_eq!(language_request.target, "/v1/chat/completions");
         assert_eq!(
@@ -3692,6 +3694,9 @@ mod tests {
             })
             .await;
         gateway.close().await;
+        recognizer.finish().await;
+        language.finish().await;
+        speech.finish().await;
         media.shutdown().await;
     }
 
@@ -3702,7 +3707,7 @@ mod tests {
     async fn online_external_gate_skip_leaves_production_language_and_speech_unstarted() {
         const CREDENTIAL: &str = "CONVERSATION_ONLINE_CHAIN_SKIP_CREDENTIAL";
         std::env::set_var(CREDENTIAL, "fake-not-a-real-credential-0000");
-        let recognizer = ScriptedHttpProvider::start(recognizer_final_response()).await;
+        let recognizer = ScriptedRecognizerServer::two_chunks().await;
         let language = ScriptedHttpProvider::start(language_sse_response("unreachable")).await;
         let speech =
             ScriptedHttpProvider::start(http_response(&pcm16_wav(16_000, 1, 160, 1))).await;
@@ -3753,7 +3758,7 @@ mod tests {
             .await
             .unwrap();
         bridge
-            .write_all(&media_capture(
+            .write_all(&online_media_capture(
                 session_id,
                 1,
                 1_000,
@@ -3762,7 +3767,7 @@ mod tests {
             .await
             .unwrap();
         bridge
-            .write_all(&media_capture(
+            .write_all(&online_media_capture(
                 session_id,
                 2,
                 1_001,
@@ -3781,7 +3786,7 @@ mod tests {
         gateway
             .read_until(|message| message.contains(r#""type":"response_skipped""#))
             .await;
-        assert_eq!(recognizer.request_count().await, 1);
+        assert_eq!(recognizer.request_count().await, 2);
         assert_eq!(language.request_count().await, 0);
         assert_eq!(speech.request_count().await, 0);
 
@@ -3794,16 +3799,32 @@ mod tests {
             })
             .await;
         gateway.close().await;
+        recognizer.finish().await;
+        language.finish().await;
+        speech.finish().await;
         media.shutdown().await;
     }
 
     #[tokio::test]
     async fn online_recognizer_loss_reports_its_stage_without_losing_capture_or_cloud_status() {
+        assert_online_recognizer_failure_preserves_recording(false).await;
+    }
+
+    #[tokio::test]
+    async fn online_recognizer_startup_refusal_preserves_recording_with_zero_audio_upload() {
+        assert_online_recognizer_failure_preserves_recording(true).await;
+    }
+
+    async fn assert_online_recognizer_failure_preserves_recording(startup_refusal: bool) {
         const CREDENTIAL: &str = "CONVERSATION_ONLINE_LOSS_CREDENTIAL";
         const RECORDING_KEY: &str = "CONVERSATION_ONLINE_LOSS_RECORDING_KEY";
         std::env::set_var(CREDENTIAL, "fake-not-a-real-credential-0000");
         std::env::set_var(RECORDING_KEY, FAKE_RECORDING_KEY);
-        let recognizer = ScriptedRecognizerServer::failing().await;
+        let recognizer = if startup_refusal {
+            ScriptedRecognizerServer::responding(true, 0).await
+        } else {
+            ScriptedRecognizerServer::failing().await
+        };
         let directory = TempDir::new().unwrap();
         let media = Arc::new(
             MediaServer::bind(MediaServerConfig::loopback())
@@ -3817,7 +3838,7 @@ mod tests {
             CREDENTIAL,
         )
         .unwrap()
-        .with_chunk_bytes(b"lost".len())
+        .with_server_vad(0.5, 300, 500)
         .unwrap();
         let language = Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new()));
         let speech = Arc::new(PerRequestSpeech::default());
@@ -3855,7 +3876,7 @@ mod tests {
             .await
             .unwrap();
         bridge
-            .write_all(&media_capture(session_id, 1, 1_000, b"lost"))
+            .write_all(&online_media_capture(session_id, 1, 1_000, b"lost"))
             .await
             .unwrap();
         recognizer.wait_for_request().await;
@@ -3869,6 +3890,12 @@ mod tests {
             "{failed:?}"
         );
         assert!(language.requests().is_empty() && speech.requests().is_empty());
+        if startup_refusal {
+            assert_eq!(recognizer.request_count().await, 0);
+        }
+        // Confirm actual provider socket closure/reap BEFORE the second media
+        // frame. Keeping that socket alive cannot accidentally sustain capture.
+        recognizer.finish().await;
         let path = wait_for_recording_bytes(directory.path(), 80).await;
         gateway
             .write(r#"{"protocol_version":3,"type":"status","request_id":"loss-status"}"#)
@@ -3879,7 +3906,7 @@ mod tests {
             })
             .await;
         bridge
-            .write_all(&media_capture(session_id, 2, 1_001, b"still!"))
+            .write_all(&online_media_capture(session_id, 2, 1_001, b"still!"))
             .await
             .unwrap();
         wait_for_recording_growth(&path).await;
@@ -3898,7 +3925,6 @@ mod tests {
             "post-failure bridge frame was not recorded: {recording:?}"
         );
         gateway.close().await;
-        recognizer.finish().await;
         media.shutdown().await;
     }
 
@@ -7880,13 +7906,32 @@ mod tests {
         captured_at_ms: u64,
         payload: &[u8],
     ) -> Vec<u8> {
+        media_capture_at_rate(session_id, sequence, captured_at_ms, payload, 16_000)
+    }
+
+    fn online_media_capture(
+        session_id: SessionId,
+        sequence: u64,
+        captured_at_ms: u64,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        media_capture_at_rate(session_id, sequence, captured_at_ms, payload, 24_000)
+    }
+
+    fn media_capture_at_rate(
+        session_id: SessionId,
+        sequence: u64,
+        captured_at_ms: u64,
+        payload: &[u8],
+        sample_rate: u32,
+    ) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(42 + payload.len());
         bytes.extend_from_slice(b"MED1\x01\x02\x01");
         bytes.extend_from_slice(&session_id.get().to_be_bytes());
         bytes.extend_from_slice(&sequence.to_be_bytes());
         bytes.extend_from_slice(&captured_at_ms.to_be_bytes());
         bytes.push(1);
-        bytes.extend_from_slice(&16_000_u32.to_be_bytes());
+        bytes.extend_from_slice(&sample_rate.to_be_bytes());
         bytes.extend_from_slice(&1_u16.to_be_bytes());
         bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         bytes.extend_from_slice(payload);
@@ -8277,6 +8322,14 @@ mod tests {
             .await
             .expect("scripted online provider did not receive a request");
         }
+
+        async fn finish(mut self) {
+            self.task.abort();
+            assert!((&mut self.task)
+                .await
+                .as_mut()
+                .is_err_and(|error| error.is_cancelled()));
+        }
     }
 
     impl Drop for ScriptedHttpProvider {
@@ -8402,9 +8455,14 @@ final_silence_ms = 600
 backend = "openai-streaming"
 execution = "remote"
 provider = "scripted-online-asr"
-endpoint = "https://provider.example.invalid/v1"
+endpoint = "wss://provider.example.invalid/v1/realtime?intent=transcription"
 model = "scripted-asr-model"
 credential_env = "{credential_env}"
+
+[voice.asr.server_vad]
+threshold = 0.5
+prefix_padding_ms = 300
+silence_duration_ms = 500
 
 [voice.speech]
 backend = "openai-compatible"
@@ -8442,16 +8500,11 @@ max_error_bytes = 65536
             &path,
             crate::config::GatewayTestProviderEndpoints::new(
                 format!("{language_endpoint}/v1"),
-                format!("{recognition_endpoint}/v1"),
+                recognition_endpoint.to_owned(),
                 format!("{speech_endpoint}/v1"),
             ),
         )
         .unwrap()
-    }
-
-    fn recognizer_final_response() -> Vec<u8> {
-        let body = b"{\"type\":\"final\",\"text\":\"agenda item\",\"start_ms\":0,\"end_ms\":1}\n";
-        http_response_with_content_type(body, "application/x-ndjson")
     }
 
     fn language_sse_response(text: &str) -> Vec<u8> {
@@ -8572,39 +8625,134 @@ max_error_bytes = 65536
     struct ScriptedRecognizerServer {
         endpoint: String,
         request_seen: Arc<Condition>,
+        requests: Arc<Mutex<Vec<ProviderRequest>>>,
+        update: Arc<Mutex<Option<serde_json::Value>>>,
         task: tokio::task::JoinHandle<()>,
     }
 
     impl ScriptedRecognizerServer {
         async fn start() -> Self {
-            Self::responding(
-                b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n{\"type\":\"final\",\"text\":\"agenda item\",\"start_ms\":0,\"end_ms\":1}\n",
-            )
-            .await
+            Self::responding(false, 1).await
         }
-
         async fn failing() -> Self {
-            Self::responding(
-                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            )
-            .await
+            Self::responding(true, 1).await
+        }
+        async fn two_chunks() -> Self {
+            Self::responding(false, 2).await
         }
 
-        async fn responding(response: &'static [u8]) -> Self {
+        async fn responding(fail: bool, chunks: usize) -> Self {
+            use futures_util::{SinkExt, StreamExt};
+            use tokio_tungstenite::tungstenite::{
+                handshake::server::{Callback, ErrorResponse, Request, Response},
+                Message,
+            };
+            struct CaptureHandshake<'a>(&'a mut Option<(String, Option<String>)>);
+            impl Callback for CaptureHandshake<'_> {
+                fn on_request(
+                    self,
+                    request: &Request,
+                    response: Response,
+                ) -> Result<Response, ErrorResponse> {
+                    *self.0 = Some((
+                        request.uri().path_and_query().unwrap().as_str().to_owned(),
+                        request
+                            .headers()
+                            .get("authorization")
+                            .map(|value| value.to_str().unwrap().to_owned()),
+                    ));
+                    Ok(response)
+                }
+            }
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let endpoint = format!(
+                "ws://{}/v1/realtime?intent=transcription",
+                listener.local_addr().unwrap()
+            );
             let request_seen = Arc::new(Condition::default());
-            let observed = Arc::clone(&request_seen);
+            let observed = request_seen.clone();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let received = requests.clone();
+            let update = Arc::new(Mutex::new(None));
+            let received_update = update.clone();
             let task = tokio::spawn(async move {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                read_request(&mut stream).await;
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut handshake = None;
+                let mut socket =
+                    tokio_tungstenite::accept_hdr_async(stream, CaptureHandshake(&mut handshake))
+                        .await
+                        .unwrap();
+                let (target, authorization) = handshake.unwrap();
+                socket.send(Message::Text(serde_json::json!({"type":"session.created","session":{"type":"transcription"}}).to_string().into())).await.unwrap();
+                let message = socket.next().await.unwrap().unwrap();
+                let update: serde_json::Value =
+                    serde_json::from_str(message.to_text().unwrap()).unwrap();
+                assert_eq!(update["type"], "session.update");
+                assert_eq!(
+                    update["session"]["audio"]["input"]["format"],
+                    serde_json::json!({"type":"audio/pcm","rate":24000})
+                );
+                *received_update.lock().await = Some(update.clone());
+                let mut confirmed = update["session"].clone();
+                if chunks == 0 {
+                    confirmed["audio"]["input"]["transcription"]["model"] =
+                        serde_json::json!("wrong-model");
+                }
+                socket
+                    .send(Message::Text(
+                        serde_json::json!({"type":"session.updated","session":confirmed})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                for _ in 0..chunks {
+                    let message = socket.next().await.unwrap().unwrap();
+                    let payload: serde_json::Value =
+                        serde_json::from_str(message.to_text().unwrap()).unwrap();
+                    assert_eq!(payload["type"], "input_audio_buffer.append");
+                    received.lock().await.push(ProviderRequest {
+                        target: target.clone(),
+                        authorization: authorization.clone(),
+                        payload,
+                    });
+                }
                 observed.set();
-                stream.write_all(response).await.unwrap();
-                stream.flush().await.unwrap();
+                let events = if chunks == 0 {
+                    vec![]
+                } else if fail {
+                    vec![
+                        serde_json::json!({"type":"error","error":{"message":"scripted unavailable"}}),
+                    ]
+                } else {
+                    vec![
+                        serde_json::json!({"type":"input_audio_buffer.speech_started","item_id":"provider-A","audio_start_ms":0}),
+                        serde_json::json!({"type":"input_audio_buffer.speech_stopped","item_id":"provider-A","audio_end_ms":1}),
+                        serde_json::json!({"type":"input_audio_buffer.committed","item_id":"provider-A","previous_item_id":null}),
+                        serde_json::json!({"type":"conversation.item.input_audio_transcription.completed","item_id":"provider-A","content_index":0,"transcript":"agenda item"}),
+                    ]
+                };
+                for event in events {
+                    socket
+                        .send(Message::Text(event.to_string().into()))
+                        .await
+                        .unwrap();
+                }
+                while let Some(Ok(message)) = socket.next().await {
+                    assert!(
+                        !(chunks == 0 && matches!(message, Message::Text(_))),
+                        "startup refusal uploaded audio"
+                    );
+                    if matches!(message, Message::Close(_)) {
+                        break;
+                    }
+                }
             });
             Self {
                 endpoint,
                 request_seen,
+                requests,
+                update,
                 task,
             }
         }
@@ -8612,15 +8760,35 @@ max_error_bytes = 65536
         fn endpoint(&self) -> &str {
             &self.endpoint
         }
-
+        async fn request_count(&self) -> usize {
+            self.requests.lock().await.len()
+        }
+        async fn request(&self, index: usize) -> ProviderRequest {
+            let requests = self.requests.lock().await;
+            let request = &requests[index];
+            ProviderRequest {
+                target: request.target.clone(),
+                payload: request.payload.clone(),
+                authorization: request.authorization.clone(),
+            }
+        }
+        async fn update(&self) -> serde_json::Value {
+            self.update.lock().await.clone().unwrap()
+        }
         async fn wait_for_request(&self) {
             timeout(TEST_TIMEOUT, self.request_seen.wait())
                 .await
                 .expect("online recognizer never received the bridge capture");
         }
-
-        async fn finish(self) {
-            self.task.await.unwrap();
+        async fn finish(mut self) {
+            match timeout(TEST_TIMEOUT, &mut self.task).await {
+                Ok(result) => result.unwrap(),
+                Err(_) => {
+                    self.task.abort();
+                    let _ = self.task.await;
+                    panic!("scripted recognition socket did not reap");
+                }
+            }
         }
     }
 

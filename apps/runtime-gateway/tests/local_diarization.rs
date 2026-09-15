@@ -696,7 +696,12 @@ execution = "remote"
 provider = "openai-streaming"
 model = "operator-supplied-transcription-model"
 credential_env = "CONVERSATION_TEST_DIARIZATION_CREDENTIAL"
-endpoint = "https://api.example.invalid/v1"
+endpoint = "wss://api.example.invalid/v1/realtime?intent=transcription"
+
+[voice.asr.server_vad]
+threshold = 0.5
+prefix_padding_ms = 300
+silence_duration_ms = 500
 
 [voice.speech]
 backend = "openai-compatible"

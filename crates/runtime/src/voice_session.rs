@@ -5,9 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use conversation_model_adapters::{
-    AdapterError, AudioFrame, CaptureEvent, GenerationLanguageModel, PlaybackReceipt,
-    RecognitionEvent, StreamingSpeechSynthesizer, VoiceCaptureControl, VoiceInputEvent,
-    VoiceIoFactory, VoiceIoSession,
+    AdapterError, AudioFrame, CaptureEvent, FinalizedUtterance, GenerationLanguageModel,
+    PlaybackReceipt, RecognitionEvent, StreamingSpeechSynthesizer, VoiceCaptureControl,
+    VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
 };
 use conversation_protocol::{
     ConversationContextExchange, GenerationId, PlaybackState, PrivacySummary, RecoveryDisposition,
@@ -533,6 +533,8 @@ struct VoiceLoop {
     first_audio_received: bool,
     pending_segments: BTreeMap<u64, PendingSegment>,
     pending_order: VecDeque<u64>,
+    automatic_responses: VecDeque<(u64, String)>,
+    last_finalized_segment: u64,
     context: ConversationContext,
 }
 
@@ -599,6 +601,8 @@ impl VoiceLoop {
             first_audio_received: false,
             pending_segments: BTreeMap::new(),
             pending_order: VecDeque::new(),
+            automatic_responses: VecDeque::new(),
+            last_finalized_segment: 0,
             context,
         }
     }
@@ -606,6 +610,11 @@ impl VoiceLoop {
     async fn run(mut self) -> VoiceSessionEvent {
         let exit = self.run_until_exit().await;
         let mut cleanup_error = self.cleanup_capture_operation().await.err();
+        if !self.automatic_responses.is_empty() {
+            cleanup_error.get_or_insert_with(|| {
+                runtime_error("voice session ended with unadmitted automatic responses")
+            });
+        }
         if let Err(error) = self.cleanup_active_turn().await {
             cleanup_error.get_or_insert(error);
         }
@@ -657,6 +666,10 @@ impl VoiceLoop {
                     if self.capture_operation.is_some() => LoopSignal::Capture(capture),
                 completion = wait_for_completion(&mut self.completion),
                     if self.completion.is_some() => LoopSignal::Completion(completion),
+                _ = std::future::ready(()),
+                    if poll_producers && self.state == VoiceLoopState::Listening
+                        && self.turn_events.is_none() && !self.automatic_responses.is_empty()
+                    => LoopSignal::AutomaticResponse,
                 input = self.input.recv(),
                     if poll_producers => LoopSignal::Input(input),
                 turn = recv_turn_event(&mut self.turn_events),
@@ -679,6 +692,11 @@ impl VoiceLoop {
                     Some(LoopExit::Fatal(completion_failure(completion)))
                 }
                 LoopSignal::Input(input) => self.handle_input(input).await,
+                LoopSignal::AutomaticResponse => self
+                    .start_queued_automatic_response()
+                    .await
+                    .err()
+                    .map(LoopExit::Fatal),
                 LoopSignal::Turn(turn) => self.handle_turn_event(turn).await,
                 LoopSignal::Deadline => self.handle_deadline().await,
                 LoopSignal::Delivery(delivery) => {
@@ -756,6 +774,11 @@ impl VoiceLoop {
         if let Some(PendingSegment::Authorized(turn_id)) = self.pending_segments.get(&segment_id) {
             return Ok(*turn_id);
         }
+        if self.state != VoiceLoopState::Listening || self.turn_events.is_some() {
+            return Err(runtime_error(
+                "voice response authorization cannot replace an active response",
+            ));
+        }
         let Some(PendingSegment::Pending(text)) = self.pending_segments.get(&segment_id) else {
             return Err(runtime_error("voice response segment is not pending"));
         };
@@ -766,6 +789,20 @@ impl VoiceLoop {
                 &context_exchanges,
             )
             .await?;
+        self.start_segment_response(segment_id, text, true).await
+    }
+
+    async fn start_segment_response(
+        &mut self,
+        segment_id: u64,
+        text: String,
+        external_gate: bool,
+    ) -> Result<TurnId, RuntimeError> {
+        if self.state != VoiceLoopState::Listening || self.turn_events.is_some() {
+            return Err(runtime_error(
+                "voice response cannot replace an active response",
+            ));
+        }
         let started = self
             .turn_runtime
             .start_turn(
@@ -778,8 +815,10 @@ impl VoiceLoop {
         let identity = started.identity();
         let turn_id = identity.turn_id();
         let generation_id = identity.generation_id();
-        self.pending_segments
-            .insert(segment_id, PendingSegment::Authorized(turn_id));
+        if external_gate {
+            self.pending_segments
+                .insert(segment_id, PendingSegment::Authorized(turn_id));
+        }
         let mut turn_events = started.into_events();
         if !self
             .publish_reliable(VoiceSessionEvent::ResponseAuthorized {
@@ -793,12 +832,25 @@ impl VoiceLoop {
                 .turn_runtime
                 .abort_turn(turn_id, generation_id, &mut turn_events)
                 .await;
-            self.pending_segments
-                .insert(segment_id, PendingSegment::Pending(text));
+            if external_gate {
+                self.pending_segments
+                    .insert(segment_id, PendingSegment::Pending(text));
+            }
             return Err(runtime_error(
                 "voice session event stream closed during authorization",
             ));
         }
+        // Reliable linkage has succeeded. Own the started turn before any
+        // subsequent publication can fail, so fatal cleanup can abort/reap it.
+        self.turn_events = Some(turn_events);
+        self.state = VoiceLoopState::Responding {
+            turn_id,
+            generation_id,
+        };
+        self.playback = Some(PlaybackLifecycle::AwaitingAcceptance {
+            generation_id,
+            pending_rendered: None,
+        });
         if !self.publish_best_effort(VoiceSessionEvent::Timing {
             session_id: self.session_id,
             turn_id: Some(turn_id),
@@ -809,15 +861,6 @@ impl VoiceLoop {
                 "voice session event stream closed during authorization timing",
             ));
         }
-        self.turn_events = Some(turn_events);
-        self.state = VoiceLoopState::Responding {
-            turn_id,
-            generation_id,
-        };
-        self.playback = Some(PlaybackLifecycle::AwaitingAcceptance {
-            generation_id,
-            pending_rendered: None,
-        });
         Ok(turn_id)
     }
 
@@ -990,6 +1033,13 @@ impl VoiceLoop {
                 }
             }
             Some(Ok(VoiceInputEvent::Activity(activity))) => self.handle_activity(activity).await,
+            Some(Ok(VoiceInputEvent::Recognition(RecognitionEvent::FinalizedUtterance(
+                utterance,
+            )))) => self
+                .admit_finalized_utterance(utterance)
+                .await
+                .err()
+                .map(LoopExit::Fatal),
             Some(Ok(VoiceInputEvent::Recognition(RecognitionEvent::Hypothesis(hypothesis)))) => {
                 let is_engine_final = hypothesis.is_engine_final();
                 let segment_id = hypothesis.segment_id();
@@ -1230,6 +1280,7 @@ impl VoiceLoop {
                 segment_id,
                 turn_id: Some(turn_id),
                 text: finalized.text.clone(),
+                capture_evidence: None,
             })
             .await
             && self.publish_best_effort(VoiceSessionEvent::Timing {
@@ -1260,10 +1311,91 @@ impl VoiceLoop {
         Ok(())
     }
 
+    async fn admit_finalized_utterance(
+        &mut self,
+        utterance: FinalizedUtterance,
+    ) -> Result<(), RuntimeError> {
+        let segment_id = utterance.segment_id();
+        if segment_id <= self.last_finalized_segment {
+            return Err(runtime_error(
+                "finalized utterance identity was repeated or out of order",
+            ));
+        }
+        self.last_finalized_segment = segment_id;
+        let text = utterance.text().to_owned();
+        let capture_evidence = utterance.capture_evidence().cloned().map(Box::new);
+        if self.response_mode == VoiceResponseMode::ExternalGate {
+            return self
+                .register_pending_segment_with_capture(segment_id, text, capture_evidence)
+                .await;
+        }
+        if !self
+            .publish_reliable(VoiceSessionEvent::TranscriptFinal {
+                session_id: self.session_id,
+                segment_id,
+                turn_id: None,
+                text: text.clone(),
+                capture_evidence,
+            })
+            .await
+        {
+            return Err(runtime_error(
+                "voice session event stream closed during finalization",
+            ));
+        }
+        self.publish_best_effort(VoiceSessionEvent::Timing {
+            session_id: self.session_id,
+            turn_id: None,
+            milestone: VoiceTimingMilestone::TranscriptFinal,
+            elapsed_ms: self.clock.now_ms(),
+        });
+        if self.automatic_responses.len() >= MAX_PENDING_SEGMENTS {
+            self.publish_reliable(VoiceSessionEvent::ResponseSkipped {
+                session_id: self.session_id,
+                segment_id,
+                reason: "automatic_response_queue_full".into(),
+            })
+            .await;
+            return Err(runtime_error(
+                "automatic response queue exceeded its bounded capacity",
+            ));
+        }
+        self.automatic_responses.push_back((segment_id, text));
+        self.start_queued_automatic_response().await
+    }
+
+    async fn start_queued_automatic_response(&mut self) -> Result<(), RuntimeError> {
+        if self.state != VoiceLoopState::Listening || self.turn_events.is_some() {
+            return Ok(());
+        }
+        if let Some((segment_id, text)) = self.automatic_responses.pop_front() {
+            if let Err(error) = self.start_segment_response(segment_id, text, false).await {
+                self.publish_reliable(VoiceSessionEvent::ResponseSkipped {
+                    session_id: self.session_id,
+                    segment_id,
+                    reason: "automatic_response_start_failed".into(),
+                })
+                .await;
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
     async fn register_pending_segment(
         &mut self,
         segment_id: u64,
         text: String,
+    ) -> Result<(), RuntimeError> {
+        self.register_pending_segment_with_capture(segment_id, text, None)
+            .await
+    }
+
+    async fn register_pending_segment_with_capture(
+        &mut self,
+        segment_id: u64,
+        text: String,
+        capture_evidence: Option<Box<conversation_protocol::UtteranceCaptureEvidence>>,
     ) -> Result<(), RuntimeError> {
         while self.pending_order.len() >= MAX_PENDING_SEGMENTS {
             let Some(expired) = self.pending_order.pop_front() else {
@@ -1294,6 +1426,7 @@ impl VoiceLoop {
                 segment_id,
                 turn_id: None,
                 text,
+                capture_evidence,
             })
             .await
         {
@@ -1803,6 +1936,7 @@ impl VoiceLoop {
 }
 
 enum LoopSignal {
+    AutomaticResponse,
     ConsumerDropped,
     Command(Option<SessionCommand>),
     Capture(Result<Result<(), AdapterError>, JoinError>),
@@ -2076,6 +2210,621 @@ mod tests {
             });
             receiver
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn already_finalized_wording_is_immediate_and_not_merged_in_either_response_mode() {
+        use conversation_model_adapters::FinalizedUtterance;
+        for response_mode in [
+            VoiceResponseMode::Automatic,
+            VoiceResponseMode::ExternalGate,
+        ] {
+            let session_id = SessionId::new(1);
+            let policy = VoiceSessionPolicy::new(
+                session_id,
+                PrivacyMode::Cloud,
+                200,
+                600,
+                [ComponentDescriptor::new(
+                    ComponentKind::SpeechRecognition,
+                    "remote-recognition",
+                    ExecutionLocation::Remote,
+                )],
+            )
+            .unwrap();
+            let context = ConversationContext::new(ConversationQualityController::new(
+                PersonaProfile::default(),
+                ResponseControls::default(),
+                ConversationMode::DirectAnswer,
+            ));
+            let turn_runtime = StreamingTurnRuntime::new(
+                context.clone(),
+                Arc::new(BlockingLanguage::default()),
+                Arc::new(MockStreamingSpeechSynthesizer::new([])),
+                Arc::new(MockContinuousAudioOutput::new()),
+            );
+            let (_input, input_receiver) = mpsc::channel(1);
+            let (_commands, command_receiver) = mpsc::channel(1);
+            let (event_sender, mut events) = mpsc::channel(SESSION_EVENT_BUFFER_SIZE);
+            let mut loop_ = VoiceLoop::new(
+                policy,
+                VoiceLoopDependencies {
+                    input_events: input_receiver,
+                    capture: Arc::new(MockVoiceCaptureControl::new()),
+                    completion: tokio::spawn(async { Ok(()) }),
+                    turn_runtime,
+                    commands: command_receiver,
+                    events: event_sender,
+                    cancellation: CancellationToken::new(),
+                    recorder: None,
+                    response_mode,
+                    context,
+                },
+            );
+            tokio::time::advance(Duration::from_millis(9000)).await;
+            let mut accepted = Vec::new();
+            let evidence = conversation_protocol::UtteranceCaptureEvidence {
+                capture: Some(conversation_protocol::SourceSampleRange {
+                    clock_domain_id: "source-process".into(),
+                    capture_epoch: 1,
+                    first_frame_sequence: 1,
+                    last_frame_sequence: 1,
+                    source_start_sample: 1000,
+                    source_end_sample: 2000,
+                    sample_rate_hz: 24000,
+                }),
+                live_coverage: Some(conversation_protocol::WholeFrameNominalEnvelope {
+                    host_start_ns: 1_000_000_000,
+                    host_end_ns: 2_000_000_000,
+                    first_frame_host_end_ns: 2_000_000_000,
+                    capture_uncertainty_ns: None,
+                    known_rounding_allowance_ns: 1,
+                }),
+                capture_unavailable_reason: None,
+            };
+            for (id, text) in [(1, "first"), (2, "second")] {
+                accepted.push(
+                    loop_
+                        .handle_input(Some(Ok(VoiceInputEvent::Recognition(
+                            RecognitionEvent::FinalizedUtterance(
+                                FinalizedUtterance::new(id, text)
+                                    .unwrap()
+                                    .with_capture_evidence(evidence.clone())
+                                    .unwrap(),
+                            ),
+                        ))))
+                        .await
+                        .is_none(),
+                );
+            }
+            let mut finals = Vec::new();
+            let mut wire_finals = Vec::new();
+            while let Ok(event) = events.try_recv() {
+                if matches!(event, VoiceSessionEvent::TranscriptFinal { .. }) {
+                    let message = conversation_protocol::GatewayMessage::VoiceEvent {
+                        event: conversation_protocol::ClientVoiceSessionEvent::try_from(
+                            event.clone(),
+                        )
+                        .unwrap(),
+                    };
+                    wire_finals.push(
+                        serde_json::from_slice::<serde_json::Value>(
+                            &conversation_protocol::encode_gateway_message_for_version(&message, 4)
+                                .unwrap(),
+                        )
+                        .unwrap(),
+                    );
+                }
+                if let VoiceSessionEvent::TranscriptFinal {
+                    segment_id,
+                    text,
+                    turn_id,
+                    ..
+                } = event
+                {
+                    finals.push((segment_id, text, turn_id));
+                }
+            }
+            loop_.cleanup_active_turn().await.unwrap();
+            loop_.cancellation.cancel();
+            loop_.completion.take().unwrap().await.unwrap().unwrap();
+            assert_eq!(
+                accepted,
+                [true, true],
+                "already-finalized events must bypass fragment accumulation"
+            );
+            assert_eq!(
+                finals.len(),
+                2,
+                "wording must not wait for response playback or local silence"
+            );
+            assert_eq!(
+                (&finals[0].1, &finals[1].1),
+                (&"first".to_owned(), &"second".to_owned())
+            );
+            assert_eq!(
+                finals[1].2, None,
+                "second Automatic response cannot overwrite the first active turn"
+            );
+            assert_eq!(
+                wire_finals[0]["event"]["capture"]["source_start_sample"],
+                "1000"
+            );
+            assert_eq!(
+                wire_finals[0]["event"]["capture"]["source_end_sample"],
+                "2000"
+            );
+            assert_eq!(
+                wire_finals[0]["event"]["live_coverage"]["host_start_ns"],
+                "1000000000"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn finalized_response_capacity_and_external_authorization_preserve_active_turn() {
+        for response_mode in [
+            VoiceResponseMode::Automatic,
+            VoiceResponseMode::ExternalGate,
+        ] {
+            let session_id = SessionId::new(1);
+            let context = ConversationContext::new(ConversationQualityController::new(
+                PersonaProfile::default(),
+                ResponseControls::default(),
+                ConversationMode::DirectAnswer,
+            ));
+            let policy = VoiceSessionPolicy::new(
+                session_id,
+                PrivacyMode::Cloud,
+                200,
+                600,
+                [ComponentDescriptor::new(
+                    ComponentKind::SpeechRecognition,
+                    "remote-recognition",
+                    ExecutionLocation::Remote,
+                )],
+            )
+            .unwrap();
+            let cancellation = CancellationToken::new();
+            let completion_cancel = cancellation.clone();
+            let (_input, input_events) = mpsc::channel(1);
+            let (commands, command_events) = mpsc::channel(1);
+            let (event_sender, mut events) = mpsc::channel(SESSION_EVENT_BUFFER_SIZE);
+            let mut loop_ = VoiceLoop::new(
+                policy,
+                VoiceLoopDependencies {
+                    input_events,
+                    capture: Arc::new(MockVoiceCaptureControl::new()),
+                    completion: tokio::spawn(async move {
+                        completion_cancel.cancelled().await;
+                        Ok(())
+                    }),
+                    turn_runtime: StreamingTurnRuntime::new(
+                        context.clone(),
+                        Arc::new(BlockingLanguage::default()),
+                        Arc::new(MockStreamingSpeechSynthesizer::new([])),
+                        Arc::new(MockContinuousAudioOutput::new()),
+                    ),
+                    commands: command_events,
+                    events: event_sender,
+                    cancellation,
+                    recorder: None,
+                    response_mode,
+                    context,
+                },
+            );
+            let mut observed = Vec::new();
+            loop_
+                .admit_finalized_utterance(FinalizedUtterance::new(1, "first").unwrap())
+                .await
+                .unwrap();
+            if response_mode == VoiceResponseMode::ExternalGate {
+                let history = vec![ConversationContextExchange::new("prior", "answer").unwrap()];
+                assert_eq!(
+                    loop_
+                        .authorize_segment(session_id, 1, history.clone())
+                        .await
+                        .unwrap(),
+                    TurnId::new(1)
+                );
+                loop_
+                    .admit_finalized_utterance(FinalizedUtterance::new(2, "second").unwrap())
+                    .await
+                    .unwrap();
+                assert!(loop_
+                    .authorize_segment(session_id, 2, history.clone())
+                    .await
+                    .is_err());
+                assert!(
+                    matches!(loop_.pending_segments.get(&2),Some(PendingSegment::Pending(text)) if text=="second")
+                );
+                assert!(
+                    matches!(loop_.state,VoiceLoopState::Responding {turn_id,..} if turn_id==TurnId::new(1))
+                );
+                loop_.interrupt_current_turn().await.unwrap();
+                assert_eq!(
+                    loop_
+                        .authorize_segment(session_id, 2, history.clone())
+                        .await
+                        .unwrap(),
+                    TurnId::new(2)
+                );
+                assert_eq!(
+                    loop_
+                        .authorize_segment(session_id, 2, history)
+                        .await
+                        .unwrap(),
+                    TurnId::new(2)
+                );
+            } else {
+                for id in 2..=34 {
+                    while let Ok(event) = events.try_recv() {
+                        observed.push(event);
+                    }
+                    let admitted = loop_
+                        .admit_finalized_utterance(
+                            FinalizedUtterance::new(id, format!("wording-{id}")).unwrap(),
+                        )
+                        .await;
+                    assert_eq!(
+                        admitted.is_ok(),
+                        id <= 33,
+                        "one active response plus exactly32 queued responses"
+                    );
+                }
+                assert!(
+                    matches!(loop_.state,VoiceLoopState::Responding {turn_id,..} if turn_id==TurnId::new(1))
+                );
+            }
+            drop(commands);
+            let terminal = loop_.run().await;
+            while let Ok(event) = events.try_recv() {
+                observed.push(event);
+            }
+            let finals = observed
+                .iter()
+                .filter(|event| matches!(event, VoiceSessionEvent::TranscriptFinal { .. }))
+                .count();
+            let links = observed
+                .iter()
+                .filter(|event| matches!(event, VoiceSessionEvent::ResponseAuthorized { .. }))
+                .count();
+            if response_mode == VoiceResponseMode::ExternalGate {
+                assert_eq!((finals, links), (2, 2));
+                assert!(matches!(terminal, VoiceSessionEvent::SessionEnded { .. }));
+            } else {
+                assert_eq!((finals, links), (34, 1));
+                assert!(observed.iter().any(|event|matches!(event,VoiceSessionEvent::ResponseSkipped {segment_id:34,reason,..} if reason=="automatic_response_queue_full")));
+                assert!(matches!(terminal, VoiceSessionEvent::SessionFailed { .. }));
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn finalized_response_closed_consumer_keeps_the_started_turn_owned_until_cleanup() {
+        for mode in [
+            VoiceResponseMode::Automatic,
+            VoiceResponseMode::ExternalGate,
+        ] {
+            let session_id = SessionId::new(1);
+            let context = ConversationContext::new(ConversationQualityController::new(
+                PersonaProfile::default(),
+                ResponseControls::default(),
+                ConversationMode::DirectAnswer,
+            ));
+            let policy = VoiceSessionPolicy::new(
+                session_id,
+                PrivacyMode::Cloud,
+                200,
+                600,
+                [ComponentDescriptor::new(
+                    ComponentKind::SpeechRecognition,
+                    "remote-recognition",
+                    ExecutionLocation::Remote,
+                )],
+            )
+            .unwrap();
+            let (_input, input_events) = mpsc::channel(1);
+            let (_commands, commands) = mpsc::channel(1);
+            let (sender, mut events) = mpsc::channel(SESSION_EVENT_BUFFER_SIZE);
+            let cancellation = CancellationToken::new();
+            let completed = Arc::new(AtomicUsize::new(0));
+            let finished = completed.clone();
+            let worker_cancel = cancellation.clone();
+            let mut loop_ = VoiceLoop::new(
+                policy,
+                VoiceLoopDependencies {
+                    input_events,
+                    commands,
+                    events: sender,
+                    cancellation,
+                    capture: Arc::new(MockVoiceCaptureControl::new()),
+                    completion: tokio::spawn(async move {
+                        worker_cancel.cancelled().await;
+                        finished.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }),
+                    turn_runtime: StreamingTurnRuntime::new(
+                        context.clone(),
+                        Arc::new(BlockingLanguage::default()),
+                        Arc::new(MockStreamingSpeechSynthesizer::new([])),
+                        Arc::new(MockContinuousAudioOutput::new()),
+                    ),
+                    recorder: None,
+                    response_mode: mode,
+                    context: context.clone(),
+                },
+            );
+            loop_
+                .admit_finalized_utterance(FinalizedUtterance::new(1, "wording").unwrap())
+                .await
+                .unwrap();
+            if mode == VoiceResponseMode::ExternalGate {
+                loop_
+                    .authorize_segment(
+                        session_id,
+                        1,
+                        vec![ConversationContextExchange::new("prior", "answer").unwrap()],
+                    )
+                    .await
+                    .unwrap();
+            }
+            let observed: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+            assert_eq!(
+                observed
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        VoiceSessionEvent::ResponseAuthorized { segment_id: 1, .. }
+                    ))
+                    .count(),
+                1
+            );
+            assert!(loop_.turn_events.is_some());
+            drop(events);
+            let _terminal = loop_.run().await;
+            assert_eq!(completed.load(Ordering::SeqCst), 1);
+            // Reusing the actual context proves the started response was
+            // aborted/finalized and released, not just its receiver dropped.
+            let next = context
+                .begin_turn(ConversationTurnSource::Text, "next")
+                .await
+                .unwrap();
+            context.discard_turn(next.identity(), false).await.unwrap();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn finalized_response_shutdown_and_start_failure_are_explicit() {
+        for blocked_start in [false, true] {
+            let session_id = SessionId::new(1);
+            let context = ConversationContext::new(ConversationQualityController::new(
+                PersonaProfile::default(),
+                ResponseControls::default(),
+                ConversationMode::DirectAnswer,
+            ));
+            let policy = VoiceSessionPolicy::new(
+                session_id,
+                PrivacyMode::Cloud,
+                200,
+                600,
+                [ComponentDescriptor::new(
+                    ComponentKind::SpeechRecognition,
+                    "remote-recognition",
+                    ExecutionLocation::Remote,
+                )],
+            )
+            .unwrap();
+            let cancellation = CancellationToken::new();
+            let completion_cancel = cancellation.clone();
+            let (_input, input_events) = mpsc::channel(1);
+            let (commands, command_events) = mpsc::channel(1);
+            let (event_sender, mut events) = mpsc::channel(SESSION_EVENT_BUFFER_SIZE);
+            let mut loop_ = VoiceLoop::new(
+                policy,
+                VoiceLoopDependencies {
+                    input_events,
+                    capture: Arc::new(MockVoiceCaptureControl::new()),
+                    completion: tokio::spawn(async move {
+                        completion_cancel.cancelled().await;
+                        Ok(())
+                    }),
+                    turn_runtime: StreamingTurnRuntime::new(
+                        context.clone(),
+                        Arc::new(BlockingLanguage::default()),
+                        Arc::new(MockStreamingSpeechSynthesizer::new([])),
+                        Arc::new(MockContinuousAudioOutput::new()),
+                    ),
+                    commands: command_events,
+                    events: event_sender,
+                    cancellation,
+                    recorder: None,
+                    response_mode: VoiceResponseMode::Automatic,
+                    context: context.clone(),
+                },
+            );
+            let occupied = if blocked_start {
+                Some(
+                    context
+                        .begin_turn(ConversationTurnSource::Text, "occupied")
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            let first = loop_
+                .admit_finalized_utterance(FinalizedUtterance::new(1, "first").unwrap())
+                .await;
+            if !blocked_start {
+                loop_
+                    .admit_finalized_utterance(FinalizedUtterance::new(2, "second").unwrap())
+                    .await
+                    .unwrap();
+            }
+            if let Some(occupied) = occupied {
+                context
+                    .discard_turn(occupied.identity(), false)
+                    .await
+                    .unwrap();
+            }
+            drop(commands);
+            let terminal = loop_.run().await;
+            let observed: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+            assert_eq!(first.is_err(), blocked_start);
+            assert_eq!(
+                observed
+                    .iter()
+                    .filter(|event| matches!(event, VoiceSessionEvent::TranscriptFinal { .. }))
+                    .count(),
+                if blocked_start { 1 } else { 2 }
+            );
+            if blocked_start {
+                assert!(observed.iter().any(|event|matches!(event,VoiceSessionEvent::ResponseSkipped {segment_id:1,reason,..} if reason=="automatic_response_start_failed")),"published wording must get an explicit failed response disposition");
+            } else {
+                assert!(
+                    matches!(terminal, VoiceSessionEvent::SessionFailed { .. }),
+                    "unadmitted queued responses must not become a successful session completion"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn finalized_response_queue_links_once_after_interruption_without_republishing_text() {
+        let session_id = SessionId::new(1);
+        let context = ConversationContext::new(ConversationQualityController::new(
+            PersonaProfile::default(),
+            ResponseControls::default(),
+            ConversationMode::DirectAnswer,
+        ));
+        let policy = VoiceSessionPolicy::new(
+            session_id,
+            PrivacyMode::Cloud,
+            200,
+            600,
+            [ComponentDescriptor::new(
+                ComponentKind::SpeechRecognition,
+                "remote-recognition",
+                ExecutionLocation::Remote,
+            )],
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+        let completion_cancel = cancellation.clone();
+        let (input, input_receiver) = mpsc::channel(4);
+        let (commands, command_receiver) = mpsc::channel(4);
+        let (event_sender, mut events) = mpsc::channel(SESSION_EVENT_BUFFER_SIZE);
+        let loop_ = VoiceLoop::new(
+            policy,
+            VoiceLoopDependencies {
+                input_events: input_receiver,
+                capture: Arc::new(MockVoiceCaptureControl::new()),
+                completion: tokio::spawn(async move {
+                    completion_cancel.cancelled().await;
+                    Ok(())
+                }),
+                turn_runtime: StreamingTurnRuntime::new(
+                    context.clone(),
+                    Arc::new(BlockingLanguage::default()),
+                    Arc::new(MockStreamingSpeechSynthesizer::new([])),
+                    Arc::new(MockContinuousAudioOutput::new()),
+                ),
+                commands: command_receiver,
+                events: event_sender,
+                cancellation,
+                recorder: None,
+                response_mode: VoiceResponseMode::Automatic,
+                context,
+            },
+        );
+        let running = tokio::spawn(loop_.run());
+        for (id, text) in [(1, "first"), (2, "second")] {
+            input
+                .send(Ok(VoiceInputEvent::Recognition(
+                    RecognitionEvent::FinalizedUtterance(
+                        FinalizedUtterance::new(id, text).unwrap(),
+                    ),
+                )))
+                .await
+                .unwrap();
+        }
+        let mut observed = Vec::new();
+        let before_interrupt = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                let second = matches!(
+                    event,
+                    VoiceSessionEvent::TranscriptFinal { segment_id: 2, .. }
+                );
+                observed.push(event);
+                if second {
+                    break;
+                }
+            }
+        })
+        .await;
+        let (completion, completed) = oneshot::channel();
+        commands
+            .send(SessionCommand::BargeIn {
+                turn_id: TurnId::new(1),
+                generation_id: GenerationId::new(1),
+                completion,
+            })
+            .await
+            .unwrap();
+        completed.await.unwrap();
+        let linked = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                let second = matches!(event,VoiceSessionEvent::ResponseAuthorized {segment_id:2,turn_id,..} if turn_id==TurnId::new(2));
+                observed.push(event);
+                if second {break;}
+            }
+        }).await;
+        let (completion, completed) = oneshot::channel();
+        commands
+            .send(SessionCommand::Shutdown { completion })
+            .await
+            .unwrap();
+        completed.await.unwrap();
+        let terminal = running.await.unwrap();
+        while let Ok(event) = events.try_recv() {
+            observed.push(event);
+        }
+        assert!(
+            before_interrupt.is_ok(),
+            "B wording must be visible while A is responding"
+        );
+        assert!(
+            linked.is_ok(),
+            "queued B must receive its response link after A is interrupted"
+        );
+        assert!(matches!(terminal, VoiceSessionEvent::SessionEnded { .. }));
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    VoiceSessionEvent::TranscriptFinal {
+                        segment_id: 2,
+                        turn_id: None,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    VoiceSessionEvent::ResponseAuthorized { segment_id: 2, .. }
+                ))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test(start_paused = true)]

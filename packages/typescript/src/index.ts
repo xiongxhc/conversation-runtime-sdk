@@ -67,5 +67,11 @@ export {
   type VoiceActivity,
   type VoiceResponseMode,
   type VoiceSessionEvent,
+  type VersionFourVoiceSessionEvent,
+  type VersionFourVoiceTranscriptFinalEvent,
+  type SourceSampleRange,
+  type WholeFrameNominalEnvelope,
+  type CaptureUnavailableReason,
+  type UtteranceCaptureEvidence,
 } from "./protocol.js";
 export { StdioGatewayTransport } from "./stdio.js";

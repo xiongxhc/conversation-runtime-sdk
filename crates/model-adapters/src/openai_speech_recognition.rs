@@ -2,29 +2,26 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use conversation_protocol::{RuntimeStage, SessionId};
-use reqwest::redirect::Policy;
-use serde::{Deserialize, Serialize};
+use futures_util::{FutureExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::credential::{validate_credential_env_name, Credential};
 use crate::{
-    AdapterError, AdapterFuture, AudioCapture, AudioFrame, CaptureEvent, PcmFormat,
-    PcmSampleFormat, RecognitionEvent, RecognitionHypothesis, SpeechRecognizer,
+    AdapterError, AdapterFuture, AudioCapture, CaptureEvent, FinalizedUtterance, PcmFormat,
+    PcmSampleFormat, RecognitionEvent, RecognitionStream, SpeechRecognizer,
 };
 
 const SEGMENT_CHANNEL_CAPACITY: usize = 1;
-const DEFAULT_SAMPLE_RATE_HZ: u32 = 16_000;
-const DEFAULT_CHUNK_BYTES: usize = 32_000;
-const MAX_CHUNK_BYTES: usize = 1024 * 1024;
-const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
-const MAX_EVENT_BYTES: usize = 64 * 1024;
+const DEFAULT_SAMPLE_RATE_HZ: u32 = 24_000;
 const MAX_MODEL_BYTES: usize = 256;
 const MAX_LANGUAGE_BYTES: usize = 64;
-const MAX_CONSECUTIVE_TRANSPORT_FAILURES: u32 = 16;
-const DEFAULT_CONSECUTIVE_TRANSPORT_FAILURES: u32 = 3;
 const DEFAULT_RESPONSE_START_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_STALL_TIMEOUT: Duration = Duration::from_secs(5);
+
+mod capture_evidence;
+mod items;
+mod wire;
 
 /// Configuration for the streaming online speech-to-text adapter.
 ///
@@ -39,11 +36,10 @@ pub struct OpenAiSpeechRecognitionConfig {
     model: String,
     credential_env: String,
     input_format: PcmFormat,
-    chunk_bytes: usize,
     response_start_timeout: Duration,
     stall_timeout: Duration,
-    max_consecutive_transport_failures: u32,
     language: Option<String>,
+    server_vad_threshold: Option<f64>,
 }
 
 impl OpenAiSpeechRecognitionConfig {
@@ -65,11 +61,10 @@ impl OpenAiSpeechRecognitionConfig {
                 PcmSampleFormat::Signed16LittleEndian,
             )
             .expect("default online speech recognition input format is valid"),
-            chunk_bytes: DEFAULT_CHUNK_BYTES,
             response_start_timeout: DEFAULT_RESPONSE_START_TIMEOUT,
             stall_timeout: DEFAULT_STALL_TIMEOUT,
-            max_consecutive_transport_failures: DEFAULT_CONSECUTIVE_TRANSPORT_FAILURES,
             language: None,
+            server_vad_threshold: None,
         })
     }
 
@@ -94,45 +89,28 @@ impl OpenAiSpeechRecognitionConfig {
         self
     }
 
-    pub fn with_chunk_bytes(mut self, chunk_bytes: usize) -> Result<Self, AdapterError> {
-        if chunk_bytes == 0 || chunk_bytes > MAX_CHUNK_BYTES {
-            return Err(invalid_config(
-                "chunk size must be within 1..=1048576 bytes",
-            ));
-        }
-        self.chunk_bytes = chunk_bytes;
-        Ok(self)
-    }
-
     pub fn with_response_start_timeout(
         mut self,
         response_start_timeout: Duration,
     ) -> Result<Self, AdapterError> {
-        if response_start_timeout.is_zero() {
-            return Err(invalid_config("response start timeout must be non-zero"));
+        if response_start_timeout.is_zero()
+            || response_start_timeout > DEFAULT_RESPONSE_START_TIMEOUT
+        {
+            return Err(invalid_config(
+                "response start timeout must be positive and at most 30 seconds",
+            ));
         }
         self.response_start_timeout = response_start_timeout;
         Ok(self)
     }
 
     pub fn with_stall_timeout(mut self, stall_timeout: Duration) -> Result<Self, AdapterError> {
-        if stall_timeout.is_zero() {
-            return Err(invalid_config("stall timeout must be non-zero"));
-        }
-        self.stall_timeout = stall_timeout;
-        Ok(self)
-    }
-
-    pub fn with_max_consecutive_transport_failures(
-        mut self,
-        failures: u32,
-    ) -> Result<Self, AdapterError> {
-        if failures > MAX_CONSECUTIVE_TRANSPORT_FAILURES {
+        if stall_timeout.is_zero() || stall_timeout > DEFAULT_STALL_TIMEOUT {
             return Err(invalid_config(
-                "consecutive transport failure budget must be within 0..=16",
+                "stall timeout must be positive and at most 5 seconds",
             ));
         }
-        self.max_consecutive_transport_failures = failures;
+        self.stall_timeout = stall_timeout;
         Ok(self)
     }
 
@@ -140,6 +118,31 @@ impl OpenAiSpeechRecognitionConfig {
         let language = language.into();
         validate_configured_text(&language, MAX_LANGUAGE_BYTES, "language tags")?;
         self.language = Some(language);
+        Ok(self)
+    }
+
+    /// Explicit first-profile VAD policy; no private configuration is upgraded
+    /// merely by constructing the adapter. Prefix/silence support is deliberately
+    /// limited to the documented 300/500 ms profile.
+    pub fn with_server_vad(
+        mut self,
+        threshold: f64,
+        prefix_padding_ms: u32,
+        silence_duration_ms: u32,
+    ) -> Result<Self, AdapterError> {
+        if !threshold.is_finite()
+            || !(0.0..=1.0).contains(&threshold)
+            || prefix_padding_ms != 300
+            || silence_duration_ms != 500
+        {
+            return Err(invalid_config("unsupported server VAD configuration"));
+        }
+        if self.model == "gpt-realtime-whisper" {
+            return Err(invalid_config(
+                "configured model does not support server VAD",
+            ));
+        }
+        self.server_vad_threshold = Some(threshold);
         Ok(self)
     }
 
@@ -160,17 +163,13 @@ impl OpenAiSpeechRecognitionConfig {
     pub const fn input_format(&self) -> PcmFormat {
         self.input_format
     }
-
-    pub const fn chunk_bytes(&self) -> usize {
-        self.chunk_bytes
-    }
 }
 
-/// One recognition hypothesis carrying the adapter-minted segment identifier.
+/// One authoritative completed utterance carrying an adapter-minted identifier.
 ///
 /// `segment_id` is opaque to the runtime: nothing parses it. It is unique
-/// within a session, stable across provider reconnects while the segment is
-/// open, and retired for good once the segment is final.
+/// within the session's single recognition epoch. Socket loss terminates that
+/// epoch; the adapter does not replay audio or automatically reconnect.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OnlineRecognitionSegment {
     segment_id: String,
@@ -179,6 +178,7 @@ pub struct OnlineRecognitionSegment {
     is_final: bool,
     provider_start_ms: Option<u64>,
     provider_end_ms: Option<u64>,
+    capture_evidence: conversation_protocol::UtteranceCaptureEvidence,
 }
 
 impl OnlineRecognitionSegment {
@@ -206,30 +206,26 @@ impl OnlineRecognitionSegment {
     pub const fn provider_end_ms(&self) -> Option<u64> {
         self.provider_end_ms
     }
+
+    pub fn capture_evidence(&self) -> &conversation_protocol::UtteranceCaptureEvidence {
+        &self.capture_evidence
+    }
 }
 
 /// Streaming online speech-to-text behind the runtime's recognition port.
 ///
 /// The adapter owns the session's audio path: it starts the supplied capture
 /// with the session's own cancellation token, uploads PCM to the provider in
-/// bounded chunks, and streams the provider's hypotheses back. Audio stays in
+/// bounded frames, and releases ordered authoritative utterances. Audio stays in
 /// memory; nothing is written to disk.
 pub struct OpenAiSpeechRecognizer {
-    client: reqwest::Client,
     config: OpenAiSpeechRecognitionConfig,
     capture: Arc<dyn AudioCapture>,
 }
 
 impl OpenAiSpeechRecognizer {
     pub fn new(config: OpenAiSpeechRecognitionConfig, capture: Arc<dyn AudioCapture>) -> Self {
-        Self {
-            client: reqwest::Client::builder()
-                .redirect(Policy::none())
-                .build()
-                .expect("online speech recognition client configuration is valid"),
-            config,
-            capture,
-        }
+        Self { config, capture }
     }
 
     /// The stable identifier for one session's segment.
@@ -237,7 +233,7 @@ impl OpenAiSpeechRecognizer {
     /// The value is derived from the session and the segment's index within
     /// it, so a segment identifier minted for one session can never name a
     /// segment of another, and the same index always names the same segment
-    /// however many times the provider connection is re-established.
+    /// within its one provider connection. There is no automatic re-establishment.
     pub fn segment_id(session_id: SessionId, segment_index: u64) -> String {
         format!("s{session_id}-seg{segment_index}")
     }
@@ -245,42 +241,71 @@ impl OpenAiSpeechRecognizer {
     /// Starts one recognition session and streams segments carrying their
     /// stable identifiers.
     ///
-    /// Like [`SpeechRecognizer::start`], the returned receiver closes only
-    /// after the session's own work has stopped, and every close that is not a
-    /// cancellation is preceded by a terminal error.
+    /// Like [`SpeechRecognizer::start`], the returned stream includes actual
+    /// owned completion. Owners cancel and await it; receiver EOF alone is not
+    /// proof of cleanup. A full consumer can observe failure through completion.
     pub fn start_segments(
         &self,
         session_id: SessionId,
         cancellation: CancellationToken,
-    ) -> AdapterFuture<'_, mpsc::Receiver<Result<OnlineRecognitionSegment, AdapterError>>> {
-        let client = self.client.clone();
+    ) -> AdapterFuture<'_, RecognitionStream<OnlineRecognitionSegment>> {
+        Box::pin(async move {
+            let (sender, events) = mpsc::channel(SEGMENT_CHANNEL_CAPACITY);
+            let completion = self
+                .start_actor(
+                    session_id,
+                    cancellation,
+                    RecognitionOutput::Segments(sender),
+                )
+                .await?;
+            Ok(RecognitionStream { events, completion })
+        })
+    }
+
+    fn start_actor(
+        &self,
+        session_id: SessionId,
+        cancellation: CancellationToken,
+        sender: RecognitionOutput,
+    ) -> AdapterFuture<'_, tokio::task::JoinHandle<Result<(), AdapterError>>> {
         let config = self.config.clone();
         let capture = Arc::clone(&self.capture);
 
         Box::pin(async move {
-            let encoding = provider_encoding(config.input_format)?;
+            if config.server_vad_threshold.is_none() {
+                return Err(invalid_config(
+                    "explicit server VAD configuration is required",
+                ));
+            }
+            provider_encoding(config.input_format)?;
+            let startup_deadline = tokio::time::Instant::now() + config.response_start_timeout;
+            let epoch_cancellation = cancellation.child_token();
+            let capture_guard = epoch_cancellation.clone().drop_guard();
             let credential = read_credential(&config.credential_env)?;
-            let captures = capture.start(session_id, cancellation.clone()).await?;
-            let (sender, receiver) = mpsc::channel(SEGMENT_CHANNEL_CAPACITY);
-
-            tokio::spawn(
+            let captures = tokio::select! {
+                biased;
+                _ = epoch_cancellation.cancelled() => return Err(wire::protocol_error("startup cancelled")),
+                captures = tokio::time::timeout_at(startup_deadline,capture.start(session_id,epoch_cancellation.clone())) => {
+                    captures.map_err(|_|wire::protocol_error("startup deadline expired"))??
+                }
+            };
+            let completion = tokio::spawn(async move {
+                // Also cancelled on startup failure, actor failure, task abort,
+                // or receiver drop; never cancels the independent parent media.
+                let _capture_guard = capture_guard;
                 RecognitionSession {
-                    client,
                     config,
                     credential,
-                    encoding,
                     session_id,
-                    cancellation,
+                    cancellation: epoch_cancellation,
+                    startup_deadline,
                     sender,
-                    segment_index: 1,
-                    request_sequence: 0,
-                    pending: Vec::new(),
-                    transport_failures: 0,
                 }
-                .run(captures),
-            );
+                .run(captures)
+                .await
+            });
 
-            Ok(receiver)
+            Ok(completion)
         })
     }
 }
@@ -290,340 +315,165 @@ impl SpeechRecognizer for OpenAiSpeechRecognizer {
         &'a self,
         session_id: SessionId,
         cancellation: CancellationToken,
-    ) -> AdapterFuture<'a, mpsc::Receiver<Result<RecognitionEvent, AdapterError>>> {
+    ) -> AdapterFuture<'a, RecognitionStream> {
         Box::pin(async move {
-            let mut segments = self
-                .start_segments(session_id, cancellation.clone())
+            let (sender, events) = mpsc::channel(SEGMENT_CHANNEL_CAPACITY);
+            let completion = self
+                .start_actor(session_id, cancellation, RecognitionOutput::Events(sender))
                 .await?;
-            let (sender, receiver) = mpsc::channel(SEGMENT_CHANNEL_CAPACITY);
-
-            tokio::spawn(async move {
-                while let Some(result) = segments.recv().await {
-                    let event = result.map(|segment| {
-                        RecognitionEvent::Hypothesis(if segment.is_final() {
-                            RecognitionHypothesis::engine_final(
-                                segment.segment_index(),
-                                segment.text(),
-                            )
-                        } else {
-                            RecognitionHypothesis::partial(segment.segment_index(), segment.text())
-                        })
-                    });
-                    tokio::select! {
-                        biased;
-                        _ = cancellation.cancelled() => return,
-                        result = sender.send(event) => {
-                            if result.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                }
-            });
-
-            Ok(receiver)
+            Ok(RecognitionStream { events, completion })
         })
     }
 }
 
-/// Why a provider exchange stopped.
-///
-/// `Recoverable` keeps the session: the failure is surfaced and capture
-/// continues. `Terminal` ends it. `Stop` is cancellation or a dropped
-/// receiver, which emits nothing at all.
-enum StreamError {
-    Recoverable(AdapterError),
-    Terminal(AdapterError),
-    Stop,
+/// Both public ports share the same socket actor; no relay owns an inner task
+/// that could be detached if an enclosing cancellation deadline aborts it.
+enum RecognitionOutput {
+    Segments(mpsc::Sender<Result<OnlineRecognitionSegment, AdapterError>>),
+    Events(mpsc::Sender<Result<RecognitionEvent, AdapterError>>),
+}
+
+impl RecognitionOutput {
+    async fn closed(&self) {
+        match self {
+            Self::Segments(sender) => sender.closed().await,
+            Self::Events(sender) => sender.closed().await,
+        }
+    }
+
+    async fn send(&self, result: Result<OnlineRecognitionSegment, AdapterError>) -> Result<(), ()> {
+        match self {
+            Self::Segments(sender) => sender.send(result).await.map_err(|_| ()),
+            Self::Events(sender) => {
+                let event = result.and_then(|segment| {
+                    FinalizedUtterance::new(segment.segment_index, segment.text)
+                        .and_then(|utterance| {
+                            utterance.with_capture_evidence(segment.capture_evidence)
+                        })
+                        .map(RecognitionEvent::FinalizedUtterance)
+                });
+                sender.send(event).await.map_err(|_| ())
+            }
+        }
+    }
 }
 
 struct RecognitionSession {
-    client: reqwest::Client,
     config: OpenAiSpeechRecognitionConfig,
     credential: Credential,
-    encoding: &'static str,
     session_id: SessionId,
     cancellation: CancellationToken,
-    sender: mpsc::Sender<Result<OnlineRecognitionSegment, AdapterError>>,
-    segment_index: u64,
-    request_sequence: u64,
-    pending: Vec<u8>,
-    transport_failures: u32,
+    startup_deadline: tokio::time::Instant,
+    sender: RecognitionOutput,
 }
 
 impl RecognitionSession {
-    async fn run(mut self, mut captures: mpsc::Receiver<Result<CaptureEvent, AdapterError>>) {
-        loop {
-            let event = tokio::select! {
-                biased;
-                _ = self.cancellation.cancelled() => return,
-                _ = self.sender.closed() => return,
-                event = captures.recv() => event,
-            };
-
-            let buffered = match event {
-                Some(Ok(CaptureEvent::Frame(frame))) => self.accept(frame),
-                Some(Ok(CaptureEvent::Discontinuity { .. })) => Ok(true),
-                Some(Err(error)) => {
-                    self.send_terminal(error).await;
-                    return;
-                }
-                None => {
-                    if self.flush().await.is_ok() {
-                        self.send_terminal(capture_ended()).await;
-                    }
-                    return;
-                }
-            };
-
-            match buffered {
-                Ok(true) => {
-                    if self.flush().await.is_err() {
-                        return;
-                    }
-                }
-                Ok(false) => {}
-                Err(error) => {
-                    self.send_terminal(error).await;
-                    return;
-                }
-            }
-        }
-    }
-
-    /// Buffers one capture frame, reporting whether the buffer is now large
-    /// enough to upload.
-    fn accept(&mut self, frame: AudioFrame) -> Result<bool, AdapterError> {
-        if frame.format() != self.config.input_format {
-            return Err(unsupported_audio_format());
-        }
-        self.pending.extend_from_slice(frame.bytes());
-        Ok(self.pending.len() >= self.config.chunk_bytes)
-    }
-
-    /// Uploads the buffered audio and streams the provider's hypotheses.
-    ///
-    /// The buffer is taken before the request, so a failed upload discards its
-    /// audio rather than growing an unbounded backlog of plaintext speech.
-    async fn flush(&mut self) -> Result<(), ()> {
-        if self.pending.is_empty() {
-            return Ok(());
-        }
-        let audio = std::mem::take(&mut self.pending);
-
-        match self.transcribe(audio).await {
-            Ok(()) => {
-                self.transport_failures = 0;
-                Ok(())
-            }
-            Err(StreamError::Recoverable(error)) => {
-                self.transport_failures = self.transport_failures.saturating_add(1);
-                if self.transport_failures > self.config.max_consecutive_transport_failures {
-                    self.send_terminal(repeated_transport_failure()).await;
-                    return Err(());
-                }
-                if self
-                    .send(Err(error.with_stage(RuntimeStage::SpeechRecognizer)))
-                    .await
-                    .is_err()
-                {
-                    return Err(());
-                }
-                Ok(())
-            }
-            Err(StreamError::Terminal(error)) => {
-                self.send_terminal(error).await;
-                Err(())
-            }
-            Err(StreamError::Stop) => Err(()),
-        }
-    }
-
-    async fn transcribe(&mut self, audio: Vec<u8>) -> Result<(), StreamError> {
-        let payload = TranscriptionRequest {
-            model: &self.config.model,
-            stream: true,
-            encoding: self.encoding,
-            sample_rate_hz: self.config.input_format.sample_rate_hz(),
-            channels: self.config.input_format.channels(),
-            segment_id: &OpenAiSpeechRecognizer::segment_id(self.session_id, self.segment_index),
-            sequence: self.request_sequence,
-            audio: crate::base64::encode(&audio),
-            language: self.config.language.as_deref(),
-        };
-        self.request_sequence = self.request_sequence.saturating_add(1);
-
-        let response = await_transport(
-            self.client
-                .post(transcription_endpoint(&self.config.endpoint))
-                .bearer_auth(self.credential.expose())
-                .json(&payload)
-                .send(),
-            self.config.response_start_timeout,
-            &self.cancellation,
-            &self.sender,
-        )
-        .await?
-        .map_err(|_| StreamError::Recoverable(transport_failed()))?;
-
-        if !response.status().is_success() {
-            return Err(StreamError::Recoverable(http_error(
-                response.status().as_u16(),
-            )));
-        }
-        if response
-            .content_length()
-            .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
-        {
-            return Err(StreamError::Terminal(response_limit()));
-        }
-
-        self.read_events(response).await
-    }
-
-    async fn read_events(&mut self, mut response: reqwest::Response) -> Result<(), StreamError> {
-        let mut buffer = Vec::new();
-        let mut received_bytes = 0_usize;
-
-        loop {
-            let chunk = await_transport(
-                response.chunk(),
-                self.config.stall_timeout,
-                &self.cancellation,
-                &self.sender,
-            )
-            .await?
-            .map_err(|_| StreamError::Recoverable(transport_failed()))?;
-            let Some(chunk) = chunk else {
-                break;
-            };
-
-            received_bytes = received_bytes
-                .checked_add(chunk.len())
-                .filter(|total| *total <= MAX_RESPONSE_BYTES)
-                .ok_or_else(|| StreamError::Terminal(response_limit()))?;
-            buffer.extend_from_slice(&chunk);
-
-            while let Some(end) = buffer.iter().position(|byte| *byte == b'\n') {
-                let line = buffer.drain(..=end).collect::<Vec<u8>>();
-                let line = trim_ascii(&line[..end]);
-                if line.is_empty() {
-                    continue;
-                }
-                let event = serde_json::from_slice::<ProviderEvent>(line)
-                    .map_err(|_| StreamError::Terminal(unsupported_event()))?;
-                self.emit(event).await?;
-            }
-
-            if buffer.len() > MAX_EVENT_BYTES {
-                return Err(StreamError::Terminal(response_limit()));
-            }
-        }
-
-        if !trim_ascii(&buffer).is_empty() {
-            return Err(StreamError::Terminal(incomplete_event()));
-        }
-        Ok(())
-    }
-
-    async fn emit(&mut self, event: ProviderEvent) -> Result<(), StreamError> {
-        let (text, is_final, provider_start_ms, provider_end_ms) = match event {
-            ProviderEvent::Partial {
-                text,
-                start_ms,
-                end_ms,
-            } => (text, false, start_ms, end_ms),
-            ProviderEvent::Final {
-                text,
-                start_ms,
-                end_ms,
-            } => (text, true, start_ms, end_ms),
-        };
-        let segment = OnlineRecognitionSegment {
-            segment_id: OpenAiSpeechRecognizer::segment_id(self.session_id, self.segment_index),
-            segment_index: self.segment_index,
-            text,
-            is_final,
-            provider_start_ms,
-            provider_end_ms,
-        };
-
-        self.send(Ok(segment))
-            .await
-            .map_err(|()| StreamError::Stop)?;
-        if is_final {
-            // The identifier retires with the segment: the next hypothesis
-            // opens a new one, and this one is never minted again.
-            self.segment_index = self.segment_index.saturating_add(1);
-        }
-        Ok(())
-    }
-
-    async fn send(&self, item: Result<OnlineRecognitionSegment, AdapterError>) -> Result<(), ()> {
-        tokio::select! {
+    async fn run(
+        self,
+        captures: mpsc::Receiver<Result<CaptureEvent, AdapterError>>,
+    ) -> Result<(), AdapterError> {
+        let result = tokio::select! {
             biased;
-            _ = self.cancellation.cancelled() => Err(()),
-            result = self.sender.send(item) => result.map_err(|_| ()),
+            _ = self.cancellation.cancelled() => return Ok(()),
+            _ = self.sender.closed() => return Ok(()),
+            result = self.exchange(captures) => result,
+        };
+        if let Err(error) = result {
+            tokio::select! {
+                biased;
+                _ = self.cancellation.cancelled() => {},
+                _ = self.sender.closed() => {},
+                _ = tokio::time::sleep(self.config.stall_timeout) => {},
+                _ = self.sender.send(Err(error.clone().with_stage(RuntimeStage::SpeechRecognizer))) => {},
+            }
+            return Err(error.with_stage(RuntimeStage::SpeechRecognizer));
         }
+        Ok(())
     }
 
-    /// Emits the session's last event, so the receiver never closes silently
-    /// on anything but a cancellation.
-    async fn send_terminal(&self, error: AdapterError) {
-        if self.cancellation.is_cancelled() || self.sender.is_closed() {
-            return;
+    async fn exchange(
+        &self,
+        mut captures: mpsc::Receiver<Result<CaptureEvent, AdapterError>>,
+    ) -> Result<(), AdapterError> {
+        let deadline = self.startup_deadline;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(wire::protocol_error("startup deadline expired"));
         }
-        let _ = self.send(Err(error)).await;
-    }
-}
-
-async fn await_transport<T>(
-    future: impl std::future::Future<Output = T>,
-    timeout: Duration,
-    cancellation: &CancellationToken,
-    sender: &mpsc::Sender<Result<OnlineRecognitionSegment, AdapterError>>,
-) -> Result<T, StreamError> {
-    tokio::select! {
-        biased;
-        _ = cancellation.cancelled() => Err(StreamError::Stop),
-        _ = sender.closed() => Err(StreamError::Stop),
-        result = tokio::time::timeout(timeout, future) => {
-            result.map_err(|_| StreamError::Recoverable(stalled()))
+        let socket =
+            tokio::time::timeout_at(deadline, wire::connect(&self.config, &self.credential))
+                .await
+                .map_err(|_| wire::protocol_error("startup deadline expired"))??;
+        let (writer, mut reader) = socket.split();
+        let mut outbound = wire::Outbound::new(writer, self.config.stall_timeout);
+        let mut items = items::Items::default();
+        let mut segment_index = 0_u64;
+        let mut capture_open = true;
+        loop {
+            for completed in items.ready(tokio::time::Instant::now())? {
+                segment_index = segment_index
+                    .checked_add(1)
+                    .ok_or_else(|| wire::protocol_error("runtime segment identity exhausted"))?;
+                let segment = OnlineRecognitionSegment {
+                    segment_id: OpenAiSpeechRecognizer::segment_id(self.session_id, segment_index),
+                    segment_index,
+                    text: completed.text,
+                    is_final: true,
+                    provider_start_ms: completed.start_ms,
+                    provider_end_ms: completed.end_ms,
+                    capture_evidence: completed.capture,
+                };
+                tokio::time::timeout(self.config.stall_timeout, self.sender.send(Ok(segment)))
+                    .await
+                    .map_err(|_| wire::protocol_error("final delivery deadline expired"))?
+                    .map_err(|_| wire::protocol_error("final receiver closed"))?;
+            }
+            if !capture_open && outbound.is_empty() {
+                return Err(capture_ended());
+            }
+            let deadline = items.deadline();
+            tokio::select! {
+                _ = async {
+                    match deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                } => {},
+                event = captures.recv(), if capture_open => {
+                    match event {
+                        Some(Ok(CaptureEvent::Frame(frame))) => {
+                            if frame.format() != self.config.input_format {
+                                return Err(unsupported_audio_format());
+                            }
+                            outbound.enqueue(frame)?;
+                        }
+                        Some(Ok(CaptureEvent::Discontinuity { .. })) => {
+                            return Err(wire::protocol_error("capture discontinuity"));
+                        }
+                        Some(Err(_)) => return Err(wire::protocol_error("capture failed")),
+                        None => capture_open = false,
+                    }
+                }
+                sent = outbound.sent() => { if let Some(frame) = sent? { items.submitted(&frame)?; } }
+                event = reader.next() => {
+                    match event {
+                        Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(_))) => outbound.request_flush(),
+                        Some(Ok(tokio_tungstenite::tungstenite::Message::Pong(_))) => {},
+                        Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
+                            // A provider can answer immediately after flush. Harvest
+                            // an already-completed send before freezing its offsets;
+                            // the persistent future is never restarted when pending.
+                            if let Some(sent) = outbound.sent().now_or_never() {
+                                if let Some(frame) = sent? { items.submitted(&frame)?; }
+                            }
+                            let event = wire::parse_json(&text)?;
+                            items.apply(&event, tokio::time::Instant::now())?;
+                        }
+                        _ => return Err(wire::protocol_error("socket closed")),
+                    }
+                }
+            }
         }
     }
-}
-
-#[derive(Serialize)]
-struct TranscriptionRequest<'a> {
-    model: &'a str,
-    stream: bool,
-    encoding: &'a str,
-    sample_rate_hz: u32,
-    channels: u16,
-    segment_id: &'a str,
-    sequence: u64,
-    audio: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    language: Option<&'a str>,
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-enum ProviderEvent {
-    Partial {
-        text: String,
-        #[serde(default)]
-        start_ms: Option<u64>,
-        #[serde(default)]
-        end_ms: Option<u64>,
-    },
-    Final {
-        text: String,
-        #[serde(default)]
-        start_ms: Option<u64>,
-        #[serde(default)]
-        end_ms: Option<u64>,
-    },
 }
 
 fn read_credential(name: &str) -> Result<Credential, AdapterError> {
@@ -632,33 +482,35 @@ fn read_credential(name: &str) -> Result<Credential, AdapterError> {
 }
 
 fn provider_encoding(format: PcmFormat) -> Result<&'static str, AdapterError> {
-    match format.sample_format() {
-        PcmSampleFormat::Signed16LittleEndian => Ok("pcm_s16le"),
-        _ => Err(invalid_config(
-            "input format must be signed 16-bit little-endian PCM",
-        )),
+    if format.sample_format() == PcmSampleFormat::Signed16LittleEndian
+        && format.sample_rate_hz() == 24_000
+        && format.channels() == 1
+    {
+        Ok("pcm_s16le")
+    } else {
+        Err(invalid_config(
+            "input format must be 24000 Hz mono signed 16-bit little-endian PCM",
+        ))
     }
 }
 
 fn parse_endpoint(endpoint: &str) -> Result<reqwest::Url, AdapterError> {
-    let mut endpoint = reqwest::Url::parse(endpoint)
+    let endpoint = reqwest::Url::parse(endpoint)
         .map_err(|_| invalid_config("endpoint must be a valid URL"))?;
-    if !matches!(endpoint.scheme(), "http" | "https") || endpoint.host_str().is_none() {
-        return Err(invalid_config("endpoint must be an http or https URL"));
+    let local_ws = endpoint.scheme() == "ws"
+        && endpoint
+            .host_str()
+            .is_some_and(|host| host == "127.0.0.1" || host == "[::1]" || host == "localhost");
+    if (endpoint.scheme() != "wss" && !local_ws) || endpoint.host_str().is_none() {
+        return Err(invalid_config("endpoint must be WSS or loopback-only WS"));
     }
     if !endpoint.username().is_empty() || endpoint.password().is_some() {
         return Err(invalid_config("endpoint must not carry credentials"));
     }
-    endpoint.set_query(None);
-    endpoint.set_fragment(None);
+    if endpoint.fragment().is_some() {
+        return Err(invalid_config("endpoint must not carry a fragment"));
+    }
     Ok(endpoint)
-}
-
-fn transcription_endpoint(endpoint: &reqwest::Url) -> reqwest::Url {
-    let mut endpoint = endpoint.clone();
-    let path = endpoint.path().trim_end_matches('/').to_owned();
-    endpoint.set_path(&format!("{path}/audio/transcriptions"));
-    endpoint
 }
 
 fn validate_credential_env(name: String) -> Result<String, AdapterError> {
@@ -678,52 +530,14 @@ fn validate_configured_text(
     Ok(())
 }
 
-fn trim_ascii(bytes: &[u8]) -> &[u8] {
-    let start = bytes
-        .iter()
-        .position(|byte| !byte.is_ascii_whitespace())
-        .unwrap_or(bytes.len());
-    let end = bytes
-        .iter()
-        .rposition(|byte| !byte.is_ascii_whitespace())
-        .map_or(start, |position| position + 1);
-    &bytes[start..end]
-}
-
 fn invalid_config(detail: &str) -> AdapterError {
     AdapterError::new(format!(
         "invalid online speech recognition configuration: {detail}"
     ))
 }
 
-fn http_error(status: u16) -> AdapterError {
-    AdapterError::new(format!(
-        "online speech recognition request failed with HTTP status {status}"
-    ))
-}
-
 fn transport_failed() -> AdapterError {
     AdapterError::new("online speech recognition transport failed")
-}
-
-fn repeated_transport_failure() -> AdapterError {
-    AdapterError::new("online speech recognition transport failed repeatedly")
-}
-
-fn stalled() -> AdapterError {
-    AdapterError::new("online speech recognition response stalled")
-}
-
-fn response_limit() -> AdapterError {
-    AdapterError::new("online speech recognition response exceeded the configured limit")
-}
-
-fn unsupported_event() -> AdapterError {
-    AdapterError::new("online speech recognition returned an unsupported event")
-}
-
-fn incomplete_event() -> AdapterError {
-    AdapterError::new("online speech recognition response ended with an incomplete event")
 }
 
 fn unsupported_audio_format() -> AdapterError {
@@ -736,20 +550,7 @@ fn capture_ended() -> AdapterError {
 
 #[cfg(test)]
 mod tests {
-    use super::{transcription_endpoint, OpenAiSpeechRecognitionConfig};
     use conversation_protocol::SessionId;
-
-    #[test]
-    fn the_transcription_path_is_appended_once() {
-        let config =
-            OpenAiSpeechRecognitionConfig::new("https://example.test/v1/", "model", "TOKEN_NAME")
-                .unwrap();
-
-        assert_eq!(
-            transcription_endpoint(config.endpoint()).path(),
-            "/v1/audio/transcriptions"
-        );
-    }
 
     #[test]
     fn segment_identifiers_are_unique_per_session_and_index() {

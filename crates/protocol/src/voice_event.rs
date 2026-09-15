@@ -74,6 +74,7 @@ pub enum VoiceSessionEvent {
         segment_id: u64,
         turn_id: Option<TurnId>,
         text: String,
+        capture_evidence: Option<Box<crate::UtteranceCaptureEvidence>>,
     },
     ResponseAuthorized {
         session_id: SessionId,

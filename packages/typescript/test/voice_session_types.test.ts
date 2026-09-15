@@ -39,8 +39,25 @@ async function unpinnedFinalTurnIdRequiresNullHandling(): Promise<void> {
   }
 }
 
+async function onlyPinnedFourExposesCaptureEvidence(): Promise<void> {
+  const four = await (await RuntimeClient.connect(transport, 4)).startVoiceSession();
+  for await (const event of four.events()) {
+    if (event.type === "voice_transcript_final" && event.capture) {
+      acceptsBigint(event.capture.sourceStartSample);
+    }
+  }
+  const three = await (await RuntimeClient.connect(transport, 3)).startVoiceSession();
+  for await (const event of three.events()) {
+    if (event.type === "voice_transcript_final") {
+      // @ts-expect-error capture evidence is not part of the v3 public event.
+      acceptsBigint(event.capture.sourceStartSample);
+    }
+  }
+}
+
 test("version-typed voice sessions retain final-turn nullability", () => {
   assert.ok(legacyFinalTurnIdIsNonNull);
   assert.ok(versionThreeFinalTurnIdRequiresNullHandling);
   assert.ok(unpinnedFinalTurnIdRequiresNullHandling);
+  assert.ok(onlyPinnedFourExposesCaptureEvidence);
 });

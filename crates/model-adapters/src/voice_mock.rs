@@ -9,8 +9,9 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     AdapterError, AdapterFuture, AudioCapture, AudioFrame, CaptureEvent, ContinuousAudioOutput,
     GenerationLanguageModel, GenerationLanguageRequest, GenerationTextDelta, PlaybackReceipt,
-    RecognitionEvent, SpeechRecognizer, StreamingSpeechRequest, StreamingSpeechSynthesizer,
-    VoiceCaptureControl, VoiceInput, VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
+    RecognitionEvent, RecognitionStream, SpeechRecognizer, StreamingSpeechRequest,
+    StreamingSpeechSynthesizer, VoiceCaptureControl, VoiceInput, VoiceInputEvent, VoiceIoFactory,
+    VoiceIoSession,
 };
 
 #[derive(Clone, Debug)]
@@ -78,9 +79,9 @@ impl SpeechRecognizer for MockSpeechRecognizer {
         &'a self,
         _session_id: SessionId,
         cancellation: CancellationToken,
-    ) -> AdapterFuture<'a, mpsc::Receiver<Result<RecognitionEvent, AdapterError>>> {
+    ) -> AdapterFuture<'a, RecognitionStream> {
         Box::pin(async move {
-            Ok(scripted_receiver(
+            Ok(scripted_owned_receiver(
                 self.events.clone(),
                 cancellation,
                 self.scripted_stream.clone(),
@@ -413,8 +414,19 @@ fn scripted_receiver<T>(
 where
     T: Send + 'static,
 {
+    scripted_owned_receiver(events, cancellation, scripted_stream).events
+}
+
+fn scripted_owned_receiver<T>(
+    events: Vec<T>,
+    cancellation: CancellationToken,
+    scripted_stream: ScriptedStream,
+) -> RecognitionStream<T>
+where
+    T: Send + 'static,
+{
     let (sender, receiver) = mpsc::channel(1);
-    tokio::spawn(async move {
+    let completion = tokio::spawn(async move {
         for event in events {
             if sender.capacity() == 0 {
                 scripted_stream.blocked_sends.fetch_add(1, Ordering::SeqCst);
@@ -422,16 +434,20 @@ where
             }
             tokio::select! {
                 biased;
-                _ = cancellation.cancelled() => return,
+                _ = cancellation.cancelled() => return Ok(()),
                 result = sender.send(Ok(event)) => {
                     if result.is_err() {
-                        return;
+                        return Ok(());
                     }
                 }
             }
         }
+        Ok(())
     });
-    receiver
+    RecognitionStream {
+        events: receiver,
+        completion,
+    }
 }
 
 #[derive(Clone, Debug, Default)]

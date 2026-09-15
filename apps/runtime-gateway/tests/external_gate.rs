@@ -46,6 +46,7 @@ fn legacy_transcript_final_payload_stays_exactly_version_one_compatible() {
                 segment_id: 9,
                 turn_id: Some(TurnId::new(11)),
                 text: "agenda item".to_owned(),
+                capture_evidence: None,
             },
         },
         1,

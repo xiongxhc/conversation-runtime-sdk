@@ -90,7 +90,10 @@ pub use openai_language::{OpenAiLanguageConfig, OpenAiLanguageModel};
 pub use openai_speech_recognition::{
     OnlineRecognitionSegment, OpenAiSpeechRecognitionConfig, OpenAiSpeechRecognizer,
 };
-pub use recognition::{RecognitionEvent, RecognitionHypothesis, SpeechRecognizer};
+pub use recognition::{
+    FinalizedUtterance, RecognitionEvent, RecognitionHypothesis, RecognitionStream,
+    SpeechRecognizer,
+};
 pub use speech::{AudioFormat, SpeechRequest, SpeechSynthesizer, SynthesizedAudio};
 #[cfg(unix)]
 pub use speechbrain_diarization::{SpeechbrainDiarizationConfig, SpeechbrainTranscriptionDiarizer};

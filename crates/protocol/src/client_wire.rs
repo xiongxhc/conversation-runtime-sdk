@@ -1791,6 +1791,24 @@ struct WireClientVoiceSessionEvent<'a> {
 
 impl Serialize for WireClientVoiceSessionEvent<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.protocol_version == RUNTIME_PROFILE_PROTOCOL_VERSION {
+            if let ClientVoiceSessionEvent::VoiceTranscriptFinal {
+                session_id,
+                segment_id,
+                turn_id,
+                text,
+                ..
+            } = self.event
+            {
+                let mut object = serializer.serialize_struct("ClientVoiceSessionEvent", 5)?;
+                object.serialize_field("type", "voice_transcript_final")?;
+                object.serialize_field("session_id", &session_id.get().to_string())?;
+                object.serialize_field("segment_id", &segment_id.to_string())?;
+                object.serialize_field("turn_id", &turn_id.map(|id| id.get().to_string()))?;
+                object.serialize_field("text", text)?;
+                return object.end();
+            }
+        }
         if self.protocol_version >= RUNTIME_PROFILE_PROTOCOL_VERSION {
             return self.event.serialize(serializer);
         }

@@ -377,6 +377,37 @@ export type VersionThreeVoiceTranscriptFinalEvent = {
   text: string;
 };
 
+export type SourceSampleRange = {
+  kind: "source_sample_range/v1";
+  clockDomainId: string;
+  captureEpoch: bigint;
+  firstFrameSequence: bigint;
+  lastFrameSequence: bigint;
+  sourceStartSample: bigint;
+  sourceEndSample: bigint;
+  sampleRateHz: 24000;
+};
+
+/** Coarse nominal bounds of every touched source frame, not word timestamps. */
+export type WholeFrameNominalEnvelope = {
+  kind: "whole_touched_frame_nominal_host_envelope/v1";
+  hostStartNs: bigint;
+  hostEndNs: bigint;
+  firstFrameHostEndNs: bigint;
+  mappingQuality: "nominal_frame_endpoint_interpolation";
+  captureUncertaintyNs: bigint | null;
+  knownRoundingAllowanceNs: bigint;
+};
+
+const CAPTURE_UNAVAILABLE_REASONS = ["provider_offsets_unavailable", "provider_offsets_out_of_range", "capture_boundary_evicted", "capture_timing_missing", "capture_timing_inconsistent", "capture_epoch_changed", "capture_not_contiguous", "capture_evidence_limit"] as const;
+export type CaptureUnavailableReason = typeof CAPTURE_UNAVAILABLE_REASONS[number];
+export type UtteranceCaptureEvidence = {
+  capture?: SourceSampleRange;
+  liveCoverage?: WholeFrameNominalEnvelope;
+  captureUnavailableReason?: CaptureUnavailableReason;
+};
+export type VersionFourVoiceTranscriptFinalEvent = VersionThreeVoiceTranscriptFinalEvent & UtteranceCaptureEvidence;
+
 type CommonVoiceSessionEvent =
   | {
       type: "voice_session_started";
@@ -442,10 +473,12 @@ export type VersionThreeVoiceSessionEvent =
   | { type: "response_authorized"; sessionId: bigint; segmentId: string; turnId: bigint }
   | { type: "response_skipped"; sessionId: bigint; segmentId: string; reason: string };
 
-export type VoiceSessionEvent = LegacyVoiceSessionEvent | VersionThreeVoiceSessionEvent;
+export type VersionFourVoiceSessionEvent = Exclude<VersionThreeVoiceSessionEvent, VersionThreeVoiceTranscriptFinalEvent> | VersionFourVoiceTranscriptFinalEvent;
+
+export type VoiceSessionEvent = LegacyVoiceSessionEvent | VersionThreeVoiceSessionEvent | VersionFourVoiceSessionEvent;
 
 export type VoiceSessionEventForVersion<Version extends ClientProtocolVersion> =
-  Version extends 3 | 4 ? VersionThreeVoiceSessionEvent : LegacyVoiceSessionEvent;
+  Version extends 4 ? VersionFourVoiceSessionEvent : Version extends 3 ? VersionThreeVoiceSessionEvent : LegacyVoiceSessionEvent;
 
 /** Opaque control-plane bridge connection data. It never contains media frames. */
 export type MediaLease = {
@@ -1763,9 +1796,11 @@ function parseVoiceSessionEvent(
         segmentId: parseIdentifier(object.segment_id),
         text: requireTranscript(object, "text"),
       };
-    case "voice_transcript_final":
+    case "voice_transcript_final": {
+      const evidenceKeys = version === 4
+        ? ["capture", "live_coverage", "capture_unavailable_reason"].filter((key) => Object.hasOwn(object, key)) : [];
       requireExactKeys(object, version >= RUNTIME_PROFILE_PROTOCOL_VERSION
-        ? ["type", "session_id", "segment_id", "turn_id", "text"]
+        ? ["type", "session_id", "segment_id", "turn_id", "text", ...evidenceKeys]
         : ["type", "session_id", "turn_id", "text"]);
       if (version < RUNTIME_PROFILE_PROTOCOL_VERSION) {
         return {
@@ -1781,7 +1816,9 @@ function parseVoiceSessionEvent(
         segmentId: requireSegmentId(object.segment_id),
         turnId: object.turn_id === null ? null : parseIdentifier(object.turn_id),
         text: requireTranscript(object, "text"),
+        ...(evidenceKeys.length > 0 ? parseUtteranceCaptureEvidence(object) : {}),
       };
+    }
     case "response_authorized":
       if (version < RUNTIME_PROFILE_PROTOCOL_VERSION) throw new ProtocolError("voice response authorization requires protocol version 3");
       requireExactKeys(object, ["type", "session_id", "segment_id", "turn_id"]);
@@ -1993,6 +2030,42 @@ function requireMemoryLocation(value: unknown): "local" | null {
 
 function requireTimedVersion(version: ClientProtocolVersion): void {
   if (version !== 4) throw new ProtocolError("timed capture and alignment require protocol version 4");
+}
+
+function parseUtteranceCaptureEvidence(object: Record<string, unknown>): UtteranceCaptureEvidence {
+  const result: UtteranceCaptureEvidence = {};
+  if (Object.hasOwn(object, "capture")) {
+    const capture = alignmentObject(object.capture, ["kind", "clock_domain_id", "capture_epoch", "first_frame_sequence", "last_frame_sequence", "source_start_sample", "source_end_sample", "sample_rate_hz"]);
+    result.capture = {
+      kind: requireOneOf(capture, "kind", ["source_sample_range/v1"] as const),
+      clockDomainId: captureIdentifier(capture.clock_domain_id),
+      captureEpoch: alignmentUnsigned(capture.capture_epoch, true),
+      firstFrameSequence: alignmentUnsigned(capture.first_frame_sequence, true),
+      lastFrameSequence: alignmentUnsigned(capture.last_frame_sequence, true),
+      sourceStartSample: alignmentUnsigned(capture.source_start_sample),
+      sourceEndSample: alignmentUnsigned(capture.source_end_sample),
+      sampleRateHz: 24000,
+    };
+    if (capture.sample_rate_hz !== 24000 || result.capture.lastFrameSequence < result.capture.firstFrameSequence || result.capture.sourceEndSample <= result.capture.sourceStartSample) throw new ProtocolError("invalid utterance source range");
+  }
+  if (Object.hasOwn(object, "live_coverage")) {
+    const coverage = alignmentObject(object.live_coverage, ["kind", "host_start_ns", "host_end_ns", "first_frame_host_end_ns", "mapping_quality", "capture_uncertainty_ns", "known_rounding_allowance_ns"]);
+    result.liveCoverage = {
+      kind: requireOneOf(coverage, "kind", ["whole_touched_frame_nominal_host_envelope/v1"] as const),
+      hostStartNs: alignmentUnsigned(coverage.host_start_ns, true),
+      hostEndNs: alignmentUnsigned(coverage.host_end_ns, true),
+      firstFrameHostEndNs: alignmentUnsigned(coverage.first_frame_host_end_ns, true),
+      mappingQuality: requireOneOf(coverage, "mapping_quality", ["nominal_frame_endpoint_interpolation"] as const),
+      captureUncertaintyNs: alignmentOptional(coverage.capture_uncertainty_ns),
+      knownRoundingAllowanceNs: alignmentUnsigned(coverage.known_rounding_allowance_ns),
+    };
+    if (!result.capture || result.liveCoverage.firstFrameHostEndNs <= result.liveCoverage.hostStartNs || result.liveCoverage.hostEndNs < result.liveCoverage.firstFrameHostEndNs) throw new ProtocolError("invalid utterance nominal envelope");
+  }
+  if (Object.hasOwn(object, "capture_unavailable_reason")) result.captureUnavailableReason = requireOneOf(object, "capture_unavailable_reason", CAPTURE_UNAVAILABLE_REASONS);
+  if (Boolean(result.liveCoverage) === Boolean(result.captureUnavailableReason)) throw new ProtocolError("utterance evidence requires mapping or explicit absence");
+  const encoded = JSON.stringify({ capture: object.capture, live_coverage: object.live_coverage, capture_unavailable_reason: object.capture_unavailable_reason });
+  if (new TextEncoder().encode(encoded).byteLength > 2048) throw new ProtocolError("utterance capture evidence exceeds its bound");
+  return freezeAlignment(result);
 }
 function captureIdentifier(value: unknown): string {
   if (typeof value !== "string" || new TextEncoder().encode(value).length > 64 || value.length === 0 || /[\u0000-\u001f\u007f-\u009f]/u.test(value)) throw new ProtocolError("invalid capture identity");

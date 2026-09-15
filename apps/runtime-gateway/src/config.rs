@@ -763,6 +763,7 @@ impl GatewayConfig {
                 || voice.asr.model.is_some()
                 || voice.asr.endpoint.is_some()
                 || voice.asr.credential_env.is_some()
+                || voice.asr.server_vad.is_some()
                 || voice.speech.credential_env.is_some()
         });
         if self.profile.is_some()
@@ -971,6 +972,11 @@ impl VoiceConfig {
 
         match self.asr.execution {
             ExecutionConfig::Local => {
+                if self.asr.server_vad.is_some() {
+                    return Err(config_error(
+                        "local voice ASR must not configure remote server VAD",
+                    ));
+                }
                 if self.asr.endpoint.is_some() {
                     return Err(config_error("local voice ASR must not name an endpoint"));
                 }
@@ -1014,7 +1020,8 @@ impl VoiceConfig {
                 let endpoint = self.asr.endpoint.as_deref().ok_or_else(|| {
                     config_error("streaming online voice ASR requires an endpoint")
                 })?;
-                validate_endpoint(endpoint, self.asr.execution, "voice ASR")?;
+                validate_transcription_endpoint(endpoint)?;
+                self.asr.online_recognition(endpoint)?;
             }
         }
         validate_credential_reference(
@@ -1124,19 +1131,7 @@ impl VoiceConfig {
                     .ok_or_else(|| {
                         config_error("streaming online voice ASR requires an endpoint")
                     })?;
-                let model =
-                    self.asr.model.as_deref().ok_or_else(|| {
-                        config_error("streaming online voice ASR requires a model")
-                    })?;
-                let credential = self.asr.credential_env.as_deref().ok_or_else(|| {
-                    config_error("remote voice ASR requires a credential environment variable")
-                })?;
-                let mut recognition =
-                    OpenAiSpeechRecognitionConfig::new(endpoint, model, credential)
-                        .map_err(adapter_error)?;
-                if let Some(language) = self.asr.language.as_deref() {
-                    recognition = recognition.with_language(language).map_err(adapter_error)?;
-                }
+                let recognition = self.asr.online_recognition(endpoint)?;
                 (
                     GatewayVoiceAdapters::unavailable_online_io(),
                     Some(recognition),
@@ -1347,6 +1342,41 @@ fn validate_endpoint(
         ExecutionConfig::Local => validate_loopback_http_endpoint(endpoint, component),
         ExecutionConfig::Remote => validate_remote_https_endpoint(endpoint, component),
     }
+}
+
+fn validate_transcription_endpoint(endpoint: &str) -> Result<(), GatewayConfigError> {
+    if endpoint.len() > MAX_REMOTE_ENDPOINT_BYTES {
+        return Err(config_error("voice ASR endpoint exceeded 2048 UTF-8 bytes"));
+    }
+    let endpoint = reqwest::Url::parse(endpoint)
+        .map_err(|_| config_error("voice ASR endpoint must be a valid URL"))?;
+    if endpoint.scheme() != "wss"
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.fragment().is_some()
+    {
+        return Err(config_error(
+            "voice ASR endpoint must use WSS without credentials or fragments",
+        ));
+    }
+    let host = endpoint
+        .host_str()
+        .ok_or_else(|| config_error("voice ASR endpoint must name a host"))?;
+    if host.is_empty()
+        || host.len() > MAX_REMOTE_ENDPOINT_HOST_BYTES
+        || host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+    {
+        return Err(config_error(
+            "voice ASR endpoint must name a remote host within 253 bytes",
+        ));
+    }
+    // Preserve the complete configured query, including intent=transcription.
+    Ok(())
 }
 
 fn require_execution(
@@ -1830,6 +1860,47 @@ struct VoiceAsrConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     download: Option<bool>,
     language: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    server_vad: Option<VoiceServerVadConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct VoiceServerVadConfig {
+    threshold: f64,
+    prefix_padding_ms: u32,
+    silence_duration_ms: u32,
+}
+
+impl VoiceAsrConfig {
+    fn online_recognition(
+        &self,
+        endpoint: &str,
+    ) -> Result<OpenAiSpeechRecognitionConfig, GatewayConfigError> {
+        let model = self
+            .model
+            .as_deref()
+            .ok_or_else(|| config_error("streaming online voice ASR requires a model"))?;
+        let credential = self.credential_env.as_deref().ok_or_else(|| {
+            config_error("remote voice ASR requires a credential environment variable")
+        })?;
+        let vad = self.server_vad.as_ref().ok_or_else(|| {
+            config_error("streaming online voice ASR requires explicit server VAD configuration")
+        })?;
+        let mut recognition = OpenAiSpeechRecognitionConfig::new(endpoint, model, credential)
+            .and_then(|config| {
+                config.with_server_vad(
+                    vad.threshold,
+                    vad.prefix_padding_ms,
+                    vad.silence_duration_ms,
+                )
+            })
+            .map_err(adapter_error)?;
+        if let Some(language) = &self.language {
+            recognition = recognition.with_language(language).map_err(adapter_error)?;
+        }
+        Ok(recognition)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]

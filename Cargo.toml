@@ -28,6 +28,8 @@ libc = "0.2"
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "test-util", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tokio-rustls = "0.26"
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+futures-util = { version = "0.3", features = ["sink"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 # Pinned to the version rustls already locks in through reqwest, so making the AEAD a
 # direct dependency adds no third-party code to the build.

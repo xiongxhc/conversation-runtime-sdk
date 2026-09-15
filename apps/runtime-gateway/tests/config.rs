@@ -1489,9 +1489,14 @@ final_silence_ms = 600
 backend = "openai-streaming"
 execution = "remote"
 provider = "openai-streaming"
-endpoint = "https://api.example.invalid/v1"
+endpoint = "wss://api.example.invalid/v1/realtime?intent=transcription"
 model = "operator-supplied-transcription-model"
 credential_env = "CONVERSATION_TEST_ONLINE_CREDENTIAL"
+
+[voice.asr.server_vad]
+threshold = 0.5
+prefix_padding_ms = 300
+silence_duration_ms = 500
 
 [voice.speech]
 backend = "openai-compatible"
@@ -1966,7 +1971,7 @@ fn an_online_configuration_rejects_endpoints_that_are_not_remote_https() {
         );
 
         let contents = ONLINE_CONFIG.replacen(
-            "endpoint = \"https://api.example.invalid/v1\"\nmodel = \"operator-supplied-transcription-model\"",
+            "endpoint = \"wss://api.example.invalid/v1/realtime?intent=transcription\"\nmodel = \"operator-supplied-transcription-model\"",
             &format!(
                 "endpoint = \"{endpoint}\"\nmodel = \"operator-supplied-transcription-model\""
             ),
@@ -1982,7 +1987,7 @@ fn an_online_configuration_rejects_endpoints_that_are_not_remote_https() {
 
     let fixture = tempfile::tempdir().unwrap();
     let contents = ONLINE_CONFIG.replacen(
-        "endpoint = \"https://api.example.invalid/v1\"\nmodel = \"operator-supplied-transcription-model\"\n",
+        "endpoint = \"wss://api.example.invalid/v1/realtime?intent=transcription\"\nmodel = \"operator-supplied-transcription-model\"\n",
         "",
         1,
     );
@@ -2007,6 +2012,70 @@ fn an_offline_configuration_still_rejects_remote_endpoints_and_executions() {
     let contents = VALID_CONFIG.replacen("execution = \"local\"", "execution = \"remote\"", 1);
     let path = write_config(fixture.path(), &contents);
     assert!(GatewayConfig::validate(&path).is_err());
+}
+
+#[test]
+fn transcription_wire_configuration_accepts_complete_wss_and_explicit_vad() {
+    set_online_credential();
+    let fixture = tempfile::tempdir().unwrap();
+    let path = write_config(fixture.path(), ONLINE_CONFIG);
+    let validated = GatewayConfig::validate(&path);
+    assert!(validated.is_ok(), "documented transcription bootstrap must be accepted without provider startup: {validated:?}");
+}
+
+#[test]
+fn transcription_wire_configuration_refuses_implicit_vad_upgrade() {
+    set_online_credential();
+    let fixture = tempfile::tempdir().unwrap();
+    let contents = ONLINE_CONFIG.replace("[voice.asr.server_vad]\nthreshold = 0.5\nprefix_padding_ms = 300\nsilence_duration_ms = 500\n", "");
+    let path = write_config(fixture.path(), &contents);
+    let error = GatewayConfig::validate(&path).unwrap_err();
+    assert!(
+        error.to_string().contains("explicit server VAD"),
+        "missing VAD must not inherit a private default: {error}"
+    );
+}
+
+#[test]
+fn transcription_wire_configuration_rejects_unsupported_vad_options_and_bad_targets() {
+    set_online_credential();
+    let fixture = tempfile::tempdir().unwrap();
+    for (old, new) in [
+        ("threshold = 0.5", "threshold = nan"),
+        ("threshold = 0.5", "threshold = -0.1"),
+        ("threshold = 0.5", "threshold = 1.1"),
+        ("prefix_padding_ms = 300", "prefix_padding_ms = 301"),
+        ("silence_duration_ms = 500", "silence_duration_ms = 501"),
+        ("threshold = 0.5", "threshold = 0.5\ncreate_response = true"),
+        (
+            "threshold = 0.5",
+            "threshold = 0.5\ninterrupt_response = true",
+        ),
+        ("threshold = 0.5", "threshold = 0.5\nidle_timeout_ms = 5000"),
+        (
+            "operator-supplied-transcription-model",
+            "gpt-realtime-whisper",
+        ),
+        (
+            "wss://api.example.invalid/v1/realtime?intent=transcription",
+            "ws://127.0.0.1:9000/realtime",
+        ),
+        (
+            "wss://api.example.invalid/v1/realtime?intent=transcription",
+            "wss://api.example.invalid/realtime#fragment",
+        ),
+        (
+            "wss://api.example.invalid/v1/realtime?intent=transcription",
+            "wss://user:password@api.example.invalid/realtime",
+        ),
+    ] {
+        let contents = ONLINE_CONFIG.replace(old, new);
+        let path = write_config(fixture.path(), &contents);
+        assert!(
+            GatewayConfig::validate(&path).is_err(),
+            "unsupported transcription profile was admitted"
+        );
+    }
 }
 
 #[test]

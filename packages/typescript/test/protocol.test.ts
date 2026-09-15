@@ -594,6 +594,47 @@ test("rejects unsupported inbound protocol versions", () => {
   );
 });
 
+test("v4 final capture evidence keeps exact source addresses and nominal whole-frame bounds", async () => {
+  const fixtures = (await readFile(new URL("../../../../tests/fixtures/transcription-v4/events.jsonl", import.meta.url), "utf8"))
+    .trim().split("\n").map((line) => JSON.parse(line));
+  const event = fixtures[0].event;
+  const sourceOnly = parseGatewayMessage(fixtures[1], 4);
+  assert.deepEqual(sourceOnly, {type: "voice_event", event: {
+    type: "voice_transcript_final", sessionId: 7n, segmentId: "10", turnId: null, text: "timing unavailable",
+    capture: {kind: "source_sample_range/v1", clockDomainId: "source-process", captureEpoch: 1n,
+      firstFrameSequence: 9n, lastFrameSequence: 9n, sourceStartSample: 9007199254741017n, sourceEndSample: 9007199254741041n, sampleRateHz: 24000},
+    captureUnavailableReason: "capture_timing_missing",
+  }});
+  const unknown = parseGatewayMessage(fixtures[2], 4);
+  assert.deepEqual(unknown, {type: "voice_event", event: {
+    type: "voice_transcript_final", sessionId: 7n, segmentId: "11", turnId: null, text: "boundary unavailable",
+    captureUnavailableReason: "capture_boundary_evicted",
+  }});
+  const parse = (value: unknown) => parseGatewayMessage({ protocol_version: 4, type: "voice_event", event: value }, 4);
+  assert.deepEqual(parse(event), { type: "voice_event", event: {
+    type: "voice_transcript_final", sessionId: 7n, segmentId: "9", turnId: null, text: "wording",
+    capture: { kind: "source_sample_range/v1", clockDomainId: "source-process", captureEpoch: 1n, firstFrameSequence: 7n, lastFrameSequence: 8n, sourceStartSample: 9007199254740993n, sourceEndSample: 9007199254741017n, sampleRateHz: 24000 },
+    liveCoverage: { kind: "whole_touched_frame_nominal_host_envelope/v1", hostStartNs: 1000000000n, hostEndNs: 2000000000n, firstFrameHostEndNs: 1500000000n, mappingQuality: "nominal_frame_endpoint_interpolation", captureUncertaintyNs: null, knownRoundingAllowanceNs: 1n },
+  }});
+  for (const invalid of [
+    { ...event, capture: { ...event.capture, source_start_sample: 9007199254740993 } },
+    { ...event, capture: { ...event.capture, source_end_sample: "9007199254740993" } },
+    { ...event, capture: { ...event.capture, clock_domain_id: "x".repeat(65) } },
+    { ...event, capture: { ...event.capture, sample_rate_hz: 16000 } },
+    { ...event, live_coverage: { ...event.live_coverage, first_frame_host_end_ns: "2000000001" } },
+    { ...event, capture_unavailable_reason: "capture_timing_missing" },
+    { ...event, live_coverage: null },
+    { ...event, provider_item_id: "private" },
+  ]) assert.throws(() => parse(invalid));
+  const { capture: _capture, live_coverage: _coverage, ...wording } = event;
+  assert.deepEqual(parse({ ...wording, capture_unavailable_reason: "capture_boundary_evicted" }), {
+    type: "voice_event", event: { type: "voice_transcript_final", sessionId: 7n, segmentId: "9", turnId: null, text: "wording", captureUnavailableReason: "capture_boundary_evicted" },
+  });
+  assert.throws(() => parse({ ...wording, live_coverage: event.live_coverage }));
+  assert.throws(() => parse({ ...wording, capture_unavailable_reason: "private provider reason" }));
+  for (const version of [1, 2, 3] as const) assert.throws(() => parseGatewayMessage({ protocol_version: version, type: "voice_event", event }, version));
+});
+
 test("rejects voice-only runtime events outside the voice envelope", () => {
   for (const event of [
     { type: "transcript_final", turn_id: "1", text: "hello" },

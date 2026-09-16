@@ -317,6 +317,7 @@ describe("desktop app", () => {
 
     connectWithAbsolutePaths();
     await screen.findByLabelText("Message");
+    await waitFor(() => expect(session.onMemoryExtracted).toHaveBeenCalled());
 
     act(() => session.emitMemoryExtracted({ created: 3, activated: 2, pendingApproval: 1 }));
 

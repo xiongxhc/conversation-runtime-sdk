@@ -732,6 +732,21 @@ test("treats an early memory response as fatal", async () => {
   await connected.client.close();
 });
 
+test("explicit close after fatal exposes the same owned cleanup failure", async () => {
+  const transport = new FailingCloseTransport();
+  const connecting = RuntimeClient.connect(transport);
+  transport.push(ready());
+  const client = await connecting;
+  const pending = client.status();
+  transport.fail(new Error("synthetic transport failure"));
+  await assert.rejects(pending, /synthetic transport failure/);
+  const first = client.close();
+  const second = client.close();
+  assert.equal(first, second);
+  await assert.rejects(first, /gateway cleanup failed/);
+  assert.equal(transport.closeCalls, 1);
+});
+
 test("treats mismatched and duplicate memory responses as fatal", async () => {
   const mismatched = await connectedClient();
   const mismatchedPending = mismatched.client.listMemories();
@@ -1429,6 +1444,13 @@ class InMemoryTransport implements RuntimeTransport {
 class ThrowingTransport extends InMemoryTransport {
   send(_message: ClientCommand, _version: ClientProtocolVersion): Promise<void> {
     throw new Error("synchronous send failure");
+  }
+}
+
+class FailingCloseTransport extends InMemoryTransport {
+  override async close(): Promise<void> {
+    await super.close();
+    throw new Error("gateway cleanup failed");
   }
 }
 

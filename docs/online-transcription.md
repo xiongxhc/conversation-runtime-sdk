@@ -1,5 +1,20 @@
 # Ordered online transcription
 
+For a standalone Node owner, `StdioGatewayTransport.start` accepts an optional
+exact-replacement `env` object, `startupAbortSignal`, and
+`cleanupTimeouts: { eofGraceMs, termGraceMs, killGraceMs }`. Omit `env` to retain
+legacy inheritance. Pass only non-secret allowlisted loader values to a private
+executable that loads Runtime-owned credentials and `exec`s the gateway; the SDK
+still uses `shell:false`, exact gateway argv, and only three stdio pipes. The
+first application profile selects `5000/1000/1000` ms; SDK defaults remain
+`100/100/1000` ms. Each phase is an integer 1..30000 ms and the sum is at most
+60000 ms. Phase deadlines use a monotonic elapsed-time clock, so wall-clock
+adjustments neither extend nor truncate cleanup grace. `cleanupOutcome` is a
+read-only content-free terminal snapshot:
+`graceful`, `forced`, or `failed`. Awaited `close()` resolves only after the
+owned process exit and stdio pipe closures are observed; it does not certify
+provider completion, recording finalization, or descendant cleanup.
+
 This profile uses one transcription WebSocket, not the audio-upload HTTP API.
 Configure the complete `wss://api.openai.com/v1/realtime?intent=transcription`
 endpoint, a transcription model and credential **environment-variable name**.

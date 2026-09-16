@@ -422,7 +422,7 @@ describe("Voice Focus", () => {
   it("enters manually, exits with Escape, and restores focus to the entry control", async () => {
     renderConnectedApp({ session: new FakeSession(configuredVoiceState()) });
 
-    const entry = await screen.findByRole("button", { name: "Voice Focus" });
+    const entry = await enabledVoiceEntry("Voice Focus");
     expect(screen.queryByRole("dialog", { name: "Voice Focus" })).toBeNull();
     fireEvent.click(entry);
 

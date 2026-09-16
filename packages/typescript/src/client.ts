@@ -514,7 +514,7 @@ export class RuntimeClient<Version extends ClientProtocolVersion = ClientProtoco
     }
     this.closing = true;
     this.fail(new Error("runtime client closed"), false);
-    this.closePromise = this.transport.close();
+    this.closePromise = Promise.resolve().then(() => this.transport.close());
     return this.closePromise;
   }
 
@@ -880,7 +880,8 @@ export class RuntimeClient<Version extends ClientProtocolVersion = ClientProtoco
       this.activeVoiceSession = undefined;
     }
     if (closeTransport && !this.closing) {
-      void this.transport.close().catch(() => undefined);
+      this.closePromise ??= Promise.resolve().then(() => this.transport.close());
+      void this.closePromise.catch(() => undefined);
       for (const listener of this.unexpectedFailureListeners) {
         this.notifyUnexpectedFailureListener(listener, error);
       }

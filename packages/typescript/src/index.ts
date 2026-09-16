@@ -76,4 +76,9 @@ export {
   type CaptureUnavailableReason,
   type UtteranceCaptureEvidence,
 } from "./protocol.js";
-export { StdioGatewayTransport } from "./stdio.js";
+export {
+  StdioGatewayTransport,
+  type StdioGatewayStartOptions,
+  type StdioGatewayCleanupTimeouts,
+  type StdioGatewayCleanupOutcome,
+} from "./stdio.js";

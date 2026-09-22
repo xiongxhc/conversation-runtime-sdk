@@ -186,6 +186,45 @@ remain human-gated in [docs/HUMAN-CHECKLIST.md](docs/HUMAN-CHECKLIST.md). The
 2,000 ms transcript, 2,500 ms first-audible, 300 ms audible-stop, one-hour
 capture, provider-shape, and deployment claims are not verified locally.
 
+### Scripted provider entry (tests only)
+
+`conversation-runtime-gateway-scripted` is the scripted E2E executable, not the
+production CLI. It exists so an online meeting can be driven end to end without a
+network: it composes the same public `GatewaySession`, framed stdio control,
+media server and provider adapters as `conversation-runtime-gateway`, admits the
+pinned `online` profile unchanged, and keeps capture, recognition, alignment,
+reconciliation and finalization on the real engine paths. Only the provider
+transports move, to loopback plaintext peers.
+
+It is compiled only with the `scripted-providers` feature, which no deployed
+gateway is built with, and it reads a configuration the production loader
+refuses: the ordinary online deployment file plus a `[scripted_providers]` table
+naming `http://127.0.0.1:…` and `ws://127.0.0.1:…` peers. The deployment half is
+still validated by the production rules, so it must still name remote HTTPS and
+WSS providers on non-loopback hosts, and there is no flag that turns the
+production binary into this mode. `conversation-runtime-scripted-peers` serves
+the four peers it needs — transcription over WebSocket, language, speech and
+diarization over HTTP — and appends a redacted line per request to its log.
+
+```bash
+cargo test -p conversation-runtime-gateway --features scripted-providers \
+  --test scripted_provider_entry
+```
+
+To drive it by hand, start the peers, take the JSON endpoint line they print,
+write it into `[scripted_providers]`, and run:
+
+```bash
+cargo run -p conversation-runtime-gateway --features scripted-providers \
+  --bin conversation-runtime-scripted-peers -- --log /tmp/scripted-peers.jsonl
+cargo run -p conversation-runtime-gateway --features scripted-providers \
+  --bin conversation-runtime-gateway-scripted -- \
+  --config /absolute/path/scripted-online.toml --client-protocol-version 4
+```
+
+Record that executable by name in scripted E2E evidence. A run of it is not a
+run of the production CLI.
+
 Schema-v1 session configuration accepts optional `[persona]`, `[response]`,
 and `[quality_metrics]` sections with explicit defaults:
 

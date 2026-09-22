@@ -7,6 +7,8 @@ mod provider_supervisor;
 mod session;
 mod voice_adapters;
 
+#[cfg(feature = "scripted-providers")]
+pub use config::ScriptedGatewayConfig;
 pub use config::{
     GatewayAdapters, GatewayConfig, GatewayConfigError, GatewayDeploymentConfig,
     GatewayMemoryExtraction, LanguageDeployment, ProviderEnvironmentPolicy, ProviderHost,

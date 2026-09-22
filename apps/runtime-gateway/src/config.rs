@@ -2220,3 +2220,190 @@ mod optional_voice_response_mode {
             .transpose()
     }
 }
+
+// --- scripted provider entry (test-only, behind the `scripted-providers` feature) ------------
+//
+// Everything below compiles only when the crate is built with `--features scripted-providers`,
+// which the production `conversation-runtime-gateway` binary never is. It is additive: no
+// production function, error string, or validation rule above this line is reached, changed or
+// bypassed by it. A scripted deployment file is still parsed and validated by the very same
+// `deployment_plan`/`build_adapters` path as a real online deployment — it must still name
+// remote HTTPS/WSS providers on non-loopback hosts — and only the already validated adapter
+// transport targets are replaced with loopback plaintext peers.
+
+/// Loopback plaintext peers a scripted run substitutes for the validated remote transports.
+#[cfg(feature = "scripted-providers")]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScriptedProvidersTable {
+    /// `http://127.0.0.1:PORT/v1` for the OpenAI-compatible chat completions peer.
+    language: String,
+    /// `ws://127.0.0.1:PORT/...` for the streaming transcription peer.
+    recognition: String,
+    /// `http://127.0.0.1:PORT/v1` for the speech synthesis peer.
+    speech: String,
+    /// `http://127.0.0.1:PORT/v1` for the multipart diarization peer. Required exactly when
+    /// the file configures a remote `[voice.diarization]` section.
+    #[serde(default)]
+    diarization: Option<String>,
+}
+
+/// The test-only loader. Its schema is the production schema plus a `[scripted_providers]`
+/// table, which the production loader refuses outright through `deny_unknown_fields`.
+#[cfg(feature = "scripted-providers")]
+pub struct ScriptedGatewayConfig;
+
+#[cfg(feature = "scripted-providers")]
+impl ScriptedGatewayConfig {
+    /// Builds the same adapter set `GatewayConfig::load` builds for this file, then points the
+    /// language, recognition, speech and diarization transports at loopback plaintext peers.
+    pub fn load(path: &Path) -> Result<GatewayAdapters, GatewayConfigError> {
+        let (parsed, scripted) = Self::parse(path)?;
+        let mut adapters =
+            parsed.build_adapters_with_provider_endpoints(Some(ProviderEndpointOverrides {
+                language: &scripted.language,
+                recognition: &scripted.recognition,
+                speech: &scripted.speech,
+            }))?;
+        if let Some(endpoint) = scripted.diarization.as_deref() {
+            let diarization = parsed
+                .voice
+                .as_ref()
+                .and_then(|voice| voice.diarization.as_ref())
+                .ok_or_else(|| {
+                    config_error(
+                        "scripted diarization endpoint requires a voice diarization section",
+                    )
+                })?;
+            adapters.diarizer = Some(diarization.scripted_diarizer(endpoint)?);
+        }
+        Ok(adapters)
+    }
+
+    /// Reads the file under the same bounds and open flags the production loader uses, splits
+    /// the scripted table off, and validates both halves.
+    fn parse(path: &Path) -> Result<(GatewayConfig, ScriptedProvidersTable), GatewayConfigError> {
+        let contents = read_scripted_config_text(path)?;
+        let mut document: toml::Value = toml::from_str(&contents)
+            .map_err(|_| config_error("gateway configuration file was not valid TOML"))?;
+        let table = document
+            .as_table_mut()
+            .ok_or_else(|| config_error("gateway configuration file was not valid TOML"))?;
+        let scripted = table.remove("scripted_providers").ok_or_else(|| {
+            config_error("scripted gateway configuration requires a [scripted_providers] table")
+        })?;
+        let scripted: ScriptedProvidersTable = scripted
+            .try_into()
+            .map_err(|_| config_error("scripted_providers table was not valid"))?;
+        let parsed: GatewayConfig = document
+            .try_into()
+            .map_err(|_| config_error("gateway configuration file was not valid TOML"))?;
+        if parsed.profile() != RuntimeProfile::Online {
+            return Err(config_error(
+                "scripted provider entry requires the online profile",
+            ));
+        }
+        // The loopback rule is this entry's own: the deployment file itself still had to name
+        // remote HTTPS/WSS providers, which `build_adapters` re-validates.
+        validate_loopback_http_endpoint(&scripted.language, "scripted language")?;
+        validate_loopback_http_endpoint(&scripted.speech, "scripted speech")?;
+        validate_scripted_websocket_endpoint(&scripted.recognition)?;
+        if let Some(diarization) = scripted.diarization.as_deref() {
+            validate_loopback_http_endpoint(diarization, "scripted diarization")?;
+        } else if parsed.voice.as_ref().is_some_and(|voice| {
+            voice
+                .diarization
+                .as_ref()
+                .is_some_and(|diarization| diarization.execution == ExecutionConfig::Remote)
+        }) {
+            return Err(config_error(
+                "remote voice diarization requires a scripted diarization endpoint",
+            ));
+        }
+        Ok((parsed, scripted))
+    }
+}
+
+/// The production read path, duplicated rather than shared so that not one byte of
+/// `load_toml` or `open_config_file` changes for this feature.
+#[cfg(feature = "scripted-providers")]
+fn read_scripted_config_text(path: &Path) -> Result<String, GatewayConfigError> {
+    if !path.is_absolute() {
+        return Err(config_error("gateway configuration path must be absolute"));
+    }
+    let file = open_config_file(path)?;
+    let mut contents = Vec::new();
+    file.take(MAX_CONFIG_BYTES + 1)
+        .read_to_end(&mut contents)
+        .map_err(|_| config_error("gateway configuration file could not be read"))?;
+    if contents.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(config_error("gateway configuration file exceeded 64 KiB"));
+    }
+    String::from_utf8(contents)
+        .map_err(|_| config_error("gateway configuration file was not valid UTF-8"))
+}
+
+/// A scripted transcription peer: plaintext WebSocket on a loopback IP literal. The query is
+/// kept because the transcription contract carries `intent=transcription` there.
+#[cfg(feature = "scripted-providers")]
+fn validate_scripted_websocket_endpoint(endpoint: &str) -> Result<(), GatewayConfigError> {
+    let component = "scripted recognition";
+    if endpoint.len() > MAX_REMOTE_ENDPOINT_BYTES {
+        return Err(config_error(format!(
+            "{component} endpoint exceeded 2048 UTF-8 bytes"
+        )));
+    }
+    let endpoint = reqwest::Url::parse(endpoint)
+        .map_err(|_| config_error(format!("{component} endpoint must be a valid URL")))?;
+    if endpoint.scheme() != "ws" {
+        return Err(config_error(format!(
+            "{component} endpoint must use plain WebSocket"
+        )));
+    }
+    if !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.fragment().is_some()
+    {
+        return Err(config_error(format!(
+            "{component} endpoint must not contain credentials or a fragment"
+        )));
+    }
+    let address = endpoint
+        .host_str()
+        .and_then(|host| host.parse::<IpAddr>().ok())
+        .ok_or_else(|| {
+            config_error(format!(
+                "{component} endpoint must use a loopback IP address"
+            ))
+        })?;
+    if !address.is_loopback() {
+        return Err(config_error(format!(
+            "{component} endpoint must use a loopback IP address"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "scripted-providers")]
+impl VoiceDiarizationConfig {
+    /// The diarizer this section names, against a scripted loopback peer. The production
+    /// `diarizer` is untouched; this one exists so a scripted run never reaches the remote
+    /// endpoint the file declares.
+    fn scripted_diarizer(
+        &self,
+        endpoint: &str,
+    ) -> Result<Arc<dyn TranscriptionDiarizer>, GatewayConfigError> {
+        if !matches!(self.backend, VoiceDiarizationBackend::Openai) {
+            return Err(config_error(
+                "scripted diarization requires the remote diarization backend",
+            ));
+        }
+        let credential = self.credential_env.as_deref().ok_or_else(|| {
+            config_error("remote voice diarization requires a credential environment variable")
+        })?;
+        Ok(Arc::new(OpenAiTranscriptionDiarizer::new(
+            OpenAiDiarizationConfig::new(endpoint, &self.model, credential)
+                .map_err(adapter_error)?,
+        )))
+    }
+}

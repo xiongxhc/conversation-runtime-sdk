@@ -19,7 +19,30 @@ serde_json.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tokio-rustls.workspace = true
+# Only the test-only scripted peers need a WebSocket server; the production binary is built
+# without `scripted-providers`, so this is not compiled into it.
+tokio-tungstenite = { workspace = true, optional = true }
 toml.workspace = true
+
+# Test-only. Enables the scripted provider entry (`conversation-runtime-gateway-scripted`)
+# and its loopback peers. NEVER enable this for a deployed gateway.
+[features]
+scripted-providers = ["dep:tokio-tungstenite"]
+
+[[bin]]
+name = "conversation-runtime-gateway-scripted"
+path = "src/bin/conversation-runtime-gateway-scripted.rs"
+required-features = ["scripted-providers"]
+
+[[bin]]
+name = "conversation-runtime-scripted-peers"
+path = "src/bin/conversation-runtime-scripted-peers.rs"
+required-features = ["scripted-providers"]
+
+[[test]]
+name = "scripted_provider_entry"
+path = "tests/scripted_provider_entry.rs"
+required-features = ["scripted-providers"]
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

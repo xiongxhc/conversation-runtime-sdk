@@ -1,4 +1,4 @@
-export { CommandRejectedError, RuntimeClient, type RuntimeTransport, type RuntimeTurn, type VoiceSession, type TimedVoiceSession } from "./client.js";
+export { CommandRejectedError, RuntimeClient, type RuntimeTransport, type RuntimeTurn, type VoiceSession, type TimedVoiceSession, type DrainableTimedVoiceSession } from "./client.js";
 export { FrameDecoder, FrameError, MAX_FRAME_BYTES, encodeFrame } from "./framing.js";
 export {
   CLIENT_PROTOCOL_VERSION,
@@ -18,6 +18,8 @@ export {
   MAX_MEDIA_RECONNECT_WINDOW_MS,
   MAX_U64,
   MEDIA_PROTOCOL_VERSION,
+  TIMED_MEDIA_PROTOCOL_VERSION,
+  DRAINABLE_TIMED_MEDIA_PROTOCOL_VERSION,
   ProtocolError,
   RUNTIME_PROFILE_PROTOCOL_VERSION,
   encodeClientCommand,
@@ -31,6 +33,7 @@ export {
   type MemoryApproval,
   type MediaLease,
   type TimedMediaLease,
+  type DrainableTimedMediaLease,
   type RecordingIdentity,
   type AlignmentPolicy,
   type CaptureEpoch,

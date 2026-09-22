@@ -3830,3 +3830,210 @@ async fn timed_and_drainable_leases_reject_each_others_envelopes() {
         server.shutdown().await;
     }
 }
+
+// --- media-v3 finish under recognition-provider failure ------------------------
+//
+// The governing correction is "VAD check gates speech recognition, not encrypted
+// recording. Recording must remain independent of provider failures." A gateway
+// deployment may only reach a non-loopback HTTPS/WSS provider, so an installed
+// consumer cannot host a failing recognition provider on loopback. These two
+// tests therefore carry the negative at the media lane, where the two distinct
+// states a failing provider produces are both reachable:
+//
+//   * the provider socket is gone while the gateway's media-lifetime consumer
+//     keeps draining recognition (`voice_adapters.rs` owns that receiver for the
+//     whole media lifetime), and
+//   * the recognition consumer itself is closed.
+
+/// A clock pair at an explicit sequence and host instant, in the fixture's domain.
+fn pair_body_at(sequence: u64, host_ns: u64, local_unix_ns: i64) -> Vec<u8> {
+    use conversation_model_adapters::CaptureClockPair;
+    let mut body = 41_u64.to_be_bytes().to_vec();
+    body.extend(
+        CaptureClockPair {
+            clock_domain_id: "source-process".into(),
+            wall_epoch: 1,
+            sequence,
+            host_before_ns: host_ns,
+            host_after_ns: host_ns,
+            local_unix_ns,
+            wall_resolution_ns: 1,
+            external_utc_accuracy_ns: None,
+        }
+        .encode()
+        .unwrap(),
+    );
+    body
+}
+
+/// One timed frame under the v3 envelope, continuing the fixture's epoch and stream.
+fn drainable_tail_frame(sequence: u64, output_start_sample: u64) -> Vec<u8> {
+    use conversation_model_adapters::{CaptureMappingQuality, FrameProvenance, NominalCaptureSpan};
+    let timing = FrameProvenance {
+        capture_epoch: 1,
+        sequence,
+        output_start_sample,
+        sample_count: 2,
+        source_start_numerator: output_start_sample * 48_000,
+        source_end_numerator: (output_start_sample + 2) * 48_000,
+        source_denominator: 24_000,
+        source_rate_hz: 48_000,
+        quality: CaptureMappingQuality::NominalFrameEndpointInterpolation,
+        span: Some(NominalCaptureSpan {
+            host_start_ns: 1_000_000_000 + output_start_sample * 1_000_000_000 / 24_000,
+            host_end_ns: 1_000_000_000
+                + ((output_start_sample + 2) * 1_000_000_000).div_ceil(24_000),
+            rounding_envelope_ns: 4,
+            capture_uncertainty_ns: None,
+        }),
+    };
+    let mut body = 41_u64.to_be_bytes().to_vec();
+    body.push(1);
+    body.extend(24_000_u32.to_be_bytes());
+    body.extend(1_u16.to_be_bytes());
+    body.extend(timing.encode().unwrap());
+    body.extend(4_u32.to_be_bytes());
+    body.extend([0, 0, 0xff, 0x7f]);
+    med3(2, &body)
+}
+
+/// A failed recognition provider whose media-lifetime consumer keeps draining must
+/// not stop the tail: the last frame and final clock pair still reach the recorder
+/// and the exact acknowledgement follows recorder success.
+#[tokio::test]
+async fn drainable_finish_keeps_the_tail_when_the_recognition_provider_fails() {
+    use conversation_model_adapters::CaptureFinishBoundary;
+    let server = drainable_server().await;
+    let lease = server
+        .reserve_drainable_timed(SessionId::new(41), "bridge-independent".into())
+        .await
+        .unwrap();
+    let cancel = CancellationToken::new();
+    let (_factory, mut recording, mut recognition) =
+        attached_ports(&server, &lease, cancel.clone()).await;
+    let mut bridge = drainable_bridge_with_epoch_and_pair(&lease, &mut recording).await;
+    bridge.write_all(&drainable_fixture_frame()).await.unwrap();
+    assert!(matches!(
+        timeout(RECEIVE_TIMEOUT, recording.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        VoiceInputEvent::Capture(CaptureEvent::Frame(_))
+    ));
+    assert!(matches!(
+        timeout(RECEIVE_TIMEOUT, recognition.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        CaptureEvent::Frame(_)
+    ));
+
+    // The provider is gone. The gateway's media-lifetime capture keeps consuming
+    // and discarding recognition events for the rest of the media lifetime, so
+    // the recognition queue neither closes nor fills.
+    let drain_cancel = cancel.child_token();
+    let drain = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = drain_cancel.cancelled() => break,
+                event = recognition.recv() => if event.is_none() { break },
+            }
+        }
+        recognition
+    });
+
+    bridge.write_all(&drainable_tail_frame(8, 2)).await.unwrap();
+    assert!(
+        matches!(
+            timeout(RECEIVE_TIMEOUT, recording.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            VoiceInputEvent::Capture(CaptureEvent::Frame(_))
+        ),
+        "the tail frame must reach the recorder after the provider failed"
+    );
+    bridge
+        .write_all(&med3(7, &pair_body_at(2, 1_000_400_000, 2_100_400_000)))
+        .await
+        .unwrap();
+    recorded_metadata(&mut recording).await;
+
+    let body = finish_body(41, 1, 1, 8, 4, 2);
+    bridge.write_all(&med3(10, &body)).await.unwrap();
+    let VoiceInputEvent::CaptureFinish(finish) = timeout(RECEIVE_TIMEOUT, recording.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("the finish barrier did not reach the recorder lane")
+    };
+    assert_eq!(
+        *finish.boundary(),
+        CaptureFinishBoundary::new(lease.session_id(), 1, true, 8, 4, 2).unwrap()
+    );
+    finish.complete(Ok(()));
+    let mut ack = vec![0; 51];
+    timeout(RECEIVE_TIMEOUT, bridge.read_exact(&mut ack))
+        .await
+        .expect("finish acknowledgement timed out")
+        .expect("finish acknowledgement was not written");
+    assert_eq!(ack, expected_finish_ack(&body));
+    cancel.cancel();
+    let _ = timeout(RECEIVE_TIMEOUT, drain).await;
+    server.shutdown().await;
+}
+
+/// A closed recognition consumer is a different state: today's atomic capture
+/// fan-out fails closed, so the tail frame is refused and no acknowledgement is
+/// invented. Everything the recorder already accepted stays accepted.
+#[tokio::test]
+async fn drainable_finish_is_refused_when_the_recognition_consumer_is_closed() {
+    let server = drainable_server().await;
+    let lease = server
+        .reserve_drainable_timed(SessionId::new(41), "bridge-independent".into())
+        .await
+        .unwrap();
+    let cancel = CancellationToken::new();
+    let (_factory, mut recording, mut recognition) =
+        attached_ports(&server, &lease, cancel.clone()).await;
+    let mut bridge = drainable_bridge_with_epoch_and_pair(&lease, &mut recording).await;
+    bridge.write_all(&drainable_fixture_frame()).await.unwrap();
+    assert!(matches!(
+        timeout(RECEIVE_TIMEOUT, recording.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        VoiceInputEvent::Capture(CaptureEvent::Frame(_))
+    ));
+    assert!(matches!(
+        timeout(RECEIVE_TIMEOUT, recognition.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        CaptureEvent::Frame(_)
+    ));
+    recognition.close();
+    drop(recognition);
+
+    bridge.write_all(&drainable_tail_frame(8, 2)).await.unwrap();
+    bridge
+        .write_all(&med3(10, &finish_body(41, 1, 1, 8, 4, 1)))
+        .await
+        .unwrap();
+    assert_bridge_closed(&mut bridge, "closed recognition consumer").await;
+    while let Ok(event) = recording.try_recv() {
+        assert!(
+            !matches!(event, Ok(VoiceInputEvent::CaptureFinish(_))),
+            "a refused fan-out admitted the finish barrier: {event:?}"
+        );
+    }
+    cancel.cancel();
+    server.shutdown().await;
+}

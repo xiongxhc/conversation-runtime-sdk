@@ -3228,3 +3228,605 @@ async fn send_flush_ack(
         .unwrap();
     stream.flush().await.unwrap();
 }
+
+// --- media-v3 explicit capture finish -------------------------------------------------------
+
+async fn drainable_server() -> MediaServer {
+    MediaServer::bind(
+        MediaServerConfig::loopback()
+            .with_capture_format(Some("pcm_s16le/24000/1/20ms".into()))
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+}
+
+fn med3(kind: u8, body: &[u8]) -> Vec<u8> {
+    let mut packet = b"MED3\x03".to_vec();
+    packet.push(kind);
+    packet.extend((body.len() as u32).to_be_bytes());
+    packet.extend_from_slice(body);
+    packet
+}
+
+fn finish_body(
+    session_id: u64,
+    capture_epoch: u64,
+    frame_present: u8,
+    sequence: u64,
+    output_end: u64,
+    pair_sequence: u64,
+) -> Vec<u8> {
+    let mut body = session_id.to_be_bytes().to_vec();
+    body.extend(capture_epoch.to_be_bytes());
+    body.push(frame_present);
+    body.extend(sequence.to_be_bytes());
+    body.extend(output_end.to_be_bytes());
+    body.extend(pair_sequence.to_be_bytes());
+    body
+}
+
+fn timed_auth_body(lease: &conversation_runtime_gateway::MediaLease) -> Vec<u8> {
+    let mut body = lease.session_id().get().to_be_bytes().to_vec();
+    body.push(lease.credential().len() as u8);
+    body.extend(lease.credential().as_bytes());
+    body.push(18);
+    body.extend(b"bridge-independent");
+    body
+}
+
+fn epoch_body() -> Vec<u8> {
+    use conversation_model_adapters::CaptureEpoch;
+    let mut body = 41_u64.to_be_bytes().to_vec();
+    body.extend(
+        CaptureEpoch {
+            bridge_session_id: "bridge-independent".into(),
+            clock_domain_id: "source-process".into(),
+            capture_epoch: 1,
+        }
+        .encode()
+        .unwrap(),
+    );
+    body
+}
+
+fn pair_body() -> Vec<u8> {
+    use conversation_model_adapters::CaptureClockPair;
+    let mut body = 41_u64.to_be_bytes().to_vec();
+    body.extend(
+        CaptureClockPair {
+            clock_domain_id: "source-process".into(),
+            wall_epoch: 1,
+            sequence: 1,
+            host_before_ns: 900_000_000,
+            host_after_ns: 900_000_000,
+            local_unix_ns: 2_000_000_000,
+            wall_resolution_ns: 1,
+            external_utc_accuracy_ns: None,
+        }
+        .encode()
+        .unwrap(),
+    );
+    body
+}
+
+/// The v1 fixture frame (session 41, epoch 1, sequence 7, output 0..2) under the v3 envelope.
+fn drainable_fixture_frame() -> Vec<u8> {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/timed-capture-v1/frame.json"
+    ))
+    .unwrap();
+    let hex = fixture["frameHex"].as_str().unwrap();
+    let mut frame: Vec<u8> = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+        .collect();
+    assert_eq!(&frame[..5], b"MED2\x02");
+    frame[..5].copy_from_slice(b"MED3\x03");
+    frame
+}
+
+async fn read_drainable_confirmation(bridge: &mut TcpStream, session: SessionId) {
+    let mut expected = b"MED3\x03\x09".to_vec();
+    expected.extend(27_u32.to_be_bytes());
+    expected.extend(session.get().to_be_bytes());
+    expected.push(18);
+    expected.extend(b"bridge-independent");
+    let mut actual = vec![0; expected.len()];
+    timeout(RECEIVE_TIMEOUT, bridge.read_exact(&mut actual))
+        .await
+        .expect("drainable confirmation timed out")
+        .expect("drainable confirmation was not written");
+    assert_eq!(actual, expected);
+}
+
+async fn recorded_metadata(
+    recording: &mut mpsc::Receiver<Result<VoiceInputEvent, AdapterError>>,
+) -> VoiceInputEvent {
+    let event = timeout(RECEIVE_TIMEOUT, recording.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(event, VoiceInputEvent::CaptureMetadata(_)),
+        "expected capture metadata, received {event:?}"
+    );
+    event
+}
+
+/// Authenticates a v3 bridge and admits the fixture epoch and clock pair.
+async fn drainable_bridge_with_epoch_and_pair(
+    lease: &conversation_runtime_gateway::MediaLease,
+    recording: &mut mpsc::Receiver<Result<VoiceInputEvent, AdapterError>>,
+) -> TcpStream {
+    let mut bridge = TcpStream::connect(lease.endpoint()).await.unwrap();
+    bridge
+        .write_all(&med3(1, &timed_auth_body(lease)))
+        .await
+        .unwrap();
+    read_drainable_confirmation(&mut bridge, lease.session_id()).await;
+    bridge.write_all(&med3(6, &epoch_body())).await.unwrap();
+    recorded_metadata(recording).await;
+    bridge.write_all(&med3(7, &pair_body())).await.unwrap();
+    recorded_metadata(recording).await;
+    bridge
+}
+
+async fn assert_bridge_closed(bridge: &mut TcpStream, context: &str) {
+    let mut byte = [0_u8; 1];
+    assert!(
+        matches!(
+            timeout(RECEIVE_TIMEOUT, bridge.read(&mut byte))
+                .await
+                .unwrap_or_else(|_| panic!("{context}: connection stayed open")),
+            Ok(0) | Err(_)
+        ),
+        "{context}: a capture finish acknowledgement was written"
+    );
+}
+
+fn expected_finish_ack(body: &[u8]) -> Vec<u8> {
+    med3(11, body)
+}
+
+#[tokio::test]
+async fn drainable_finish_flushes_written_playback_before_the_barrier_and_acks_only_after_recorder_success(
+) {
+    use conversation_model_adapters::{CaptureFinishBoundary, CaptureMetadata};
+    let server = drainable_server().await;
+    let lease = server
+        .reserve_drainable_timed(SessionId::new(41), "bridge-independent".into())
+        .await
+        .unwrap();
+    let cancel = CancellationToken::new();
+    let (factory, mut recording, mut recognition) =
+        attached_ports(&server, &lease, cancel.clone()).await;
+    let io = factory
+        .start(lease.session_id(), cancel.child_token())
+        .await
+        .unwrap();
+    let mut bridge = drainable_bridge_with_epoch_and_pair(&lease, &mut recording).await;
+    bridge.write_all(&drainable_fixture_frame()).await.unwrap();
+    assert!(matches!(
+        timeout(RECEIVE_TIMEOUT, recording.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        VoiceInputEvent::Capture(CaptureEvent::Frame(_))
+    ));
+    assert!(matches!(
+        timeout(RECEIVE_TIMEOUT, recognition.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        CaptureEvent::Frame(_)
+    ));
+
+    // Written playback whose acknowledgement never arrives before the finish.
+    let output = Arc::clone(&io.output);
+    let receipt_cancellation = cancel.child_token();
+    let receipt = tokio::spawn(async move {
+        output
+            .enqueue(playback_test_frame(23, 43), receipt_cancellation)
+            .await
+    });
+    let outbound_sequence = timeout(
+        RECEIVE_TIMEOUT,
+        read_playback_frame(
+            &mut bridge,
+            lease.session_id(),
+            TurnId::new(62),
+            GenerationId::new(23),
+            UtteranceId::new(52),
+            43,
+            b"accepted-only!",
+        ),
+    )
+    .await
+    .unwrap();
+
+    let body = finish_body(41, 1, 1, 7, 2, 1);
+    bridge.write_all(&med3(10, &body)).await.unwrap();
+    // Planned detach: the pending enqueue fails, its written generation is
+    // reported flushed, and only then does the recorder barrier follow.
+    assert!(timeout(RECEIVE_TIMEOUT, receipt)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_err());
+    assert_playback_flushed(
+        timeout(RECEIVE_TIMEOUT, recording.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        GenerationId::new(23),
+    );
+    let VoiceInputEvent::CaptureFinish(finish) = timeout(RECEIVE_TIMEOUT, recording.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("finish barrier did not follow the flushed receipt")
+    };
+    assert_eq!(
+        *finish.boundary(),
+        CaptureFinishBoundary::new(lease.session_id(), 1, true, 7, 2, 1).unwrap()
+    );
+    assert!(
+        recognition.try_recv().is_err(),
+        "finish reached recognition"
+    );
+    // No acknowledgement without recorder success.
+    assert!(timeout(Duration::from_millis(100), bridge.read_u8())
+        .await
+        .is_err());
+    // The duplex loop keeps reading while the barrier is pending: late
+    // media-v1 acknowledgements are bounded no-ops, not stalls or failures.
+    send_playback_ack(&mut bridge, lease.session_id(), outbound_sequence, 1).await;
+    send_flush_ack(&mut bridge, lease.session_id(), GenerationId::new(23)).await;
+    assert!(timeout(Duration::from_millis(100), bridge.read_u8())
+        .await
+        .is_err());
+    assert!(recording.try_recv().is_err());
+
+    finish.complete(Ok(()));
+    let mut ack = vec![0; 51];
+    timeout(RECEIVE_TIMEOUT, bridge.read_exact(&mut ack))
+        .await
+        .expect("finish acknowledgement timed out")
+        .expect("finish acknowledgement was not written");
+    assert_eq!(ack, expected_finish_ack(&body));
+    // The producer may still write pre-close acknowledgements after kind 11;
+    // the server half-closes after the ACK and waits for the producer's EOF.
+    send_playback_ack(&mut bridge, lease.session_id(), outbound_sequence, 2).await;
+    let mut byte = [0_u8; 1];
+    assert_eq!(
+        timeout(RECEIVE_TIMEOUT, bridge.read(&mut byte))
+            .await
+            .expect("server did not half-close after the ACK")
+            .expect("late acknowledgement reset the connection"),
+        0
+    );
+    assert!(
+        timeout(Duration::from_millis(100), recording.recv())
+            .await
+            .is_err(),
+        "late acknowledgement failed the acknowledged connection"
+    );
+    drop(bridge);
+    // Planned completion on the producer's clean EOF: no reconnect state and
+    // no synthetic disconnect capture metadata, and the lease admits no reconnect.
+    assert!(
+        timeout(Duration::from_millis(100), recording.recv())
+            .await
+            .is_err(),
+        "planned completion synthesized capture metadata"
+    );
+    assert!(recognition.try_recv().is_err());
+    let mut reconnect = TcpStream::connect(lease.endpoint()).await.unwrap();
+    reconnect
+        .write_all(&med3(1, &timed_auth_body(&lease)))
+        .await
+        .unwrap();
+    assert_bridge_closed(&mut reconnect, "reconnect after finish").await;
+    assert!(!matches!(
+        recording.try_recv(),
+        Ok(Ok(VoiceInputEvent::CaptureMetadata(
+            CaptureMetadata::Discontinuity { .. }
+        )))
+    ));
+    cancel.cancel();
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn drainable_finish_acknowledges_the_exact_zero_frame_boundary() {
+    use conversation_model_adapters::CaptureFinishBoundary;
+    let server = drainable_server().await;
+    let lease = server
+        .reserve_drainable_timed(SessionId::new(41), "bridge-independent".into())
+        .await
+        .unwrap();
+    let cancel = CancellationToken::new();
+    let (_factory, mut recording, mut recognition) =
+        attached_ports(&server, &lease, cancel.clone()).await;
+    let mut bridge = drainable_bridge_with_epoch_and_pair(&lease, &mut recording).await;
+    let body = finish_body(41, 1, 0, 0, 0, 1);
+    bridge.write_all(&med3(10, &body)).await.unwrap();
+    let VoiceInputEvent::CaptureFinish(finish) = timeout(RECEIVE_TIMEOUT, recording.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("finish barrier expected")
+    };
+    assert_eq!(
+        *finish.boundary(),
+        CaptureFinishBoundary::new(lease.session_id(), 1, false, 0, 0, 1).unwrap()
+    );
+    assert!(timeout(Duration::from_millis(100), bridge.read_u8())
+        .await
+        .is_err());
+    finish.complete(Ok(()));
+    let mut ack = vec![0; 51];
+    timeout(RECEIVE_TIMEOUT, bridge.read_exact(&mut ack))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ack, expected_finish_ack(&body));
+    assert_bridge_closed(&mut bridge, "planned close").await;
+    assert!(recording.try_recv().is_err());
+    assert!(recognition.try_recv().is_err());
+    cancel.cancel();
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn drainable_finish_negatives_close_without_any_acknowledgement() {
+    for case in [
+        "before_auth",
+        "no_epoch",
+        "no_pair",
+        "reconnect_without_epoch",
+        "wrong_session",
+        "wrong_epoch",
+        "wrong_pair",
+        "phantom_frame",
+        "missing_frame",
+        "wrong_sequence",
+        "wrong_output_end",
+        "mixed_zero",
+        "mixed_nonzero",
+        "flag",
+        "short",
+        "long",
+        "duplicate",
+        "frame_after_finish",
+        "recorder_failure",
+        "voice_closed",
+    ] {
+        let server = drainable_server().await;
+        let lease = server
+            .reserve_drainable_timed(SessionId::new(41), "bridge-independent".into())
+            .await
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let (_factory, mut recording, mut recognition) =
+            attached_ports(&server, &lease, cancel.clone()).await;
+        let mut bridge = match case {
+            "before_auth" => TcpStream::connect(lease.endpoint()).await.unwrap(),
+            "no_epoch" | "no_pair" => {
+                let mut bridge = TcpStream::connect(lease.endpoint()).await.unwrap();
+                bridge
+                    .write_all(&med3(1, &timed_auth_body(&lease)))
+                    .await
+                    .unwrap();
+                read_drainable_confirmation(&mut bridge, lease.session_id()).await;
+                if case == "no_pair" {
+                    bridge.write_all(&med3(6, &epoch_body())).await.unwrap();
+                    recorded_metadata(&mut recording).await;
+                }
+                bridge
+            }
+            "reconnect_without_epoch" => {
+                // The session's epoch and pair persist across reconnect, but a
+                // finish on the new connection needs its own admitted epoch.
+                let old = drainable_bridge_with_epoch_and_pair(&lease, &mut recording).await;
+                drop(old);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                let mut bridge = TcpStream::connect(lease.endpoint()).await.unwrap();
+                bridge
+                    .write_all(&med3(1, &timed_auth_body(&lease)))
+                    .await
+                    .unwrap();
+                read_drainable_confirmation(&mut bridge, lease.session_id()).await;
+                bridge
+            }
+            _ => drainable_bridge_with_epoch_and_pair(&lease, &mut recording).await,
+        };
+        let with_frame = matches!(
+            case,
+            "missing_frame" | "wrong_sequence" | "wrong_output_end"
+        );
+        if with_frame {
+            bridge.write_all(&drainable_fixture_frame()).await.unwrap();
+            assert!(matches!(
+                timeout(RECEIVE_TIMEOUT, recording.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap(),
+                VoiceInputEvent::Capture(CaptureEvent::Frame(_))
+            ));
+            recognition.recv().await.unwrap().unwrap();
+        }
+        let mut held_barrier = None;
+        let body = match case {
+            "wrong_session" => finish_body(42, 1, 0, 0, 0, 1),
+            "wrong_epoch" => finish_body(41, 2, 0, 0, 0, 1),
+            "wrong_pair" => finish_body(41, 1, 0, 0, 0, 2),
+            "phantom_frame" => finish_body(41, 1, 1, 7, 2, 1),
+            "missing_frame" => finish_body(41, 1, 0, 0, 0, 1),
+            "wrong_sequence" => finish_body(41, 1, 1, 8, 2, 1),
+            "wrong_output_end" => finish_body(41, 1, 1, 7, 3, 1),
+            "mixed_zero" => finish_body(41, 1, 0, 7, 2, 1),
+            "mixed_nonzero" => finish_body(41, 1, 1, 0, 0, 1),
+            "flag" => finish_body(41, 1, 2, 0, 0, 1),
+            "short" => finish_body(41, 1, 0, 0, 0, 1)[..40].to_vec(),
+            "long" => {
+                let mut body = finish_body(41, 1, 0, 0, 0, 1);
+                body.push(0);
+                body
+            }
+            "duplicate" | "frame_after_finish" | "recorder_failure" | "voice_closed" => {
+                bridge
+                    .write_all(&med3(10, &finish_body(41, 1, 0, 0, 0, 1)))
+                    .await
+                    .unwrap();
+                let VoiceInputEvent::CaptureFinish(finish) =
+                    timeout(RECEIVE_TIMEOUT, recording.recv())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .unwrap()
+                else {
+                    panic!("{case}: finish barrier expected")
+                };
+                match case {
+                    "recorder_failure" => {
+                        finish.complete(Err(AdapterError::new("recorder refused the boundary")));
+                    }
+                    "voice_closed" => {
+                        // Natural terminal: the voice input and its barrier are gone.
+                        drop(finish);
+                        let (_, closed) = mpsc::channel(1);
+                        drop(std::mem::replace(&mut recording, closed));
+                    }
+                    _ => held_barrier = Some(finish),
+                }
+                if case == "frame_after_finish" {
+                    drainable_fixture_frame()
+                } else {
+                    finish_body(41, 1, 0, 0, 0, 1)
+                }
+            }
+            _ => finish_body(41, 1, 0, 0, 0, 1),
+        };
+        if case == "frame_after_finish" {
+            bridge.write_all(&body).await.unwrap();
+        } else if case != "recorder_failure" && case != "voice_closed" {
+            bridge.write_all(&med3(10, &body)).await.unwrap();
+        }
+        assert_bridge_closed(&mut bridge, case).await;
+        if let Some(finish) = held_barrier {
+            // A late recorder success cannot revive the failed connection.
+            finish.complete(Ok(()));
+            assert_bridge_closed(&mut bridge, case).await;
+        }
+        while let Ok(event) = recording.try_recv() {
+            assert!(
+                !matches!(event, Ok(VoiceInputEvent::CaptureFinish(_))),
+                "{case}: rejected finish still reached the recorder"
+            );
+        }
+        while let Ok(event) = recognition.try_recv() {
+            assert!(
+                !matches!(event, Ok(CaptureEvent::Frame(_))),
+                "{case}: invalid PCM reached recognition"
+            );
+        }
+        cancel.cancel();
+        server.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn timed_and_drainable_leases_reject_each_others_envelopes() {
+    for case in [
+        "v2_lease_med3_auth",
+        "v3_lease_med2_auth",
+        "v3_lease_med2_record",
+        "v2_lease_finish",
+    ] {
+        let server = drainable_server().await;
+        let drainable = case.starts_with("v3");
+        let lease = if drainable {
+            server
+                .reserve_drainable_timed(SessionId::new(41), "bridge-independent".into())
+                .await
+                .unwrap()
+        } else {
+            server
+                .reserve_timed(SessionId::new(41), "bridge-independent".into())
+                .await
+                .unwrap()
+        };
+        let cancel = CancellationToken::new();
+        let (_factory, mut recording, _recognition) =
+            attached_ports(&server, &lease, cancel.clone()).await;
+        let mut bridge = TcpStream::connect(lease.endpoint()).await.unwrap();
+        match case {
+            "v2_lease_med3_auth" => {
+                bridge
+                    .write_all(&med3(1, &timed_auth_body(&lease)))
+                    .await
+                    .unwrap();
+            }
+            "v3_lease_med2_auth" => {
+                send_timed_packet(&mut bridge, 1, &timed_auth_body(&lease)).await;
+            }
+            "v3_lease_med2_record" => {
+                bridge
+                    .write_all(&med3(1, &timed_auth_body(&lease)))
+                    .await
+                    .unwrap();
+                read_drainable_confirmation(&mut bridge, lease.session_id()).await;
+                send_timed_packet(&mut bridge, 6, &epoch_body()).await;
+            }
+            _ => {
+                send_timed_packet(&mut bridge, 1, &timed_auth_body(&lease)).await;
+                read_timed_confirmation(&mut bridge, lease.session_id(), "bridge-independent")
+                    .await;
+                send_timed_packet(&mut bridge, 6, &epoch_body()).await;
+                recorded_metadata(&mut recording).await;
+                send_timed_packet(&mut bridge, 7, &pair_body()).await;
+                recorded_metadata(&mut recording).await;
+                // Kind 10 exists only under the v3 envelope; neither spelling
+                // is admissible on a v2 lease.
+                send_timed_packet(&mut bridge, 10, &finish_body(41, 1, 0, 0, 0, 1)).await;
+            }
+        }
+        assert_bridge_closed(&mut bridge, case).await;
+        if case == "v2_lease_finish" {
+            let mut bridge = TcpStream::connect(lease.endpoint()).await.unwrap();
+            bridge
+                .write_all(&med3(10, &finish_body(41, 1, 0, 0, 0, 1)))
+                .await
+                .unwrap();
+            assert_bridge_closed(&mut bridge, "v2 lease MED3 finish").await;
+        }
+        while let Ok(event) = recording.try_recv() {
+            assert!(
+                !matches!(event, Ok(VoiceInputEvent::CaptureFinish(_))),
+                "{case}: a rejected finish reached the recorder: {event:?}"
+            );
+            assert!(
+                !matches!(
+                    event,
+                    Ok(VoiceInputEvent::CaptureMetadata(
+                        conversation_model_adapters::CaptureMetadata::Epoch(_)
+                    ))
+                ),
+                "{case}: a rejected envelope admitted an epoch: {event:?}"
+            );
+        }
+        cancel.cancel();
+        server.shutdown().await;
+    }
+}

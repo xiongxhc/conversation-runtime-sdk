@@ -503,6 +503,11 @@ enum PlaybackLifecycle {
     Rendered {
         generation_id: GenerationId,
     },
+    /// The transport discarded the generation's written audio. Terminal: a later accepted
+    /// or rendered signal for the same generation is stale and never reported.
+    Flushed {
+        generation_id: GenerationId,
+    },
 }
 
 struct VoiceLoop {
@@ -1069,6 +1074,11 @@ impl VoiceLoop {
             {
                 self.handle_rendered_playback(receipt).await
             }
+            Some(Ok(VoiceInputEvent::Playback(receipt)))
+                if receipt.state() == PlaybackState::Flushed =>
+            {
+                self.handle_flushed_playback(receipt).await
+            }
             Some(Ok(VoiceInputEvent::Playback(_))) => Some(LoopExit::Fatal(adapter_message(
                 RuntimeStage::VoiceSidecar,
                 "voice input playback state is unsupported",
@@ -1098,6 +1108,19 @@ impl VoiceLoop {
                     return None;
                 }
                 self.disable_recorder(recorder, error).await
+            }
+            Some(Ok(VoiceInputEvent::CaptureFinish(finish))) => {
+                let result = if let Some(recorder) = self.recorder.clone() {
+                    recorder
+                        .lock()
+                        .await
+                        .confirm_capture_boundary(finish.boundary())
+                        .map_err(|_| AdapterError::new("recording boundary confirmation failed"))
+                } else {
+                    Err(AdapterError::new("timed recording is unavailable"))
+                };
+                finish.complete(result);
+                None
             }
             Some(Ok(VoiceInputEvent::Capture(_))) => None,
             Some(Ok(_)) => Some(LoopExit::Fatal(adapter_message(
@@ -1733,6 +1756,44 @@ impl VoiceLoop {
                     return Some(LoopExit::ConsumerDropped);
                 }
                 self.playback = Some(PlaybackLifecycle::Rendered { generation_id });
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Settles a transport flush against the active lifecycle. A flush is a statement that the
+    /// transport discarded the generation's written audio; it is never acceptance, a rendered
+    /// acknowledgement, or device proof. It is published once for the generation the loop is
+    /// awaiting or has accepted and ends that lifecycle. Before acceptance it is published
+    /// immediately rather than held like a rendered receipt: the enqueue that would have
+    /// confirmed acceptance fails once the transport has flushed, so a held flush would be lost
+    /// when that failure ends the turn, and any retained rendered receipt is dropped because the
+    /// runtime never confirmed acceptance. Any other generation, or one already rendered, is
+    /// stale and discarded.
+    async fn handle_flushed_playback(&mut self, receipt: PlaybackReceipt) -> Option<LoopExit> {
+        let generation_id = receipt.generation_id();
+        match self.playback {
+            Some(
+                PlaybackLifecycle::AwaitingAcceptance {
+                    generation_id: active_generation,
+                    ..
+                }
+                | PlaybackLifecycle::Accepted {
+                    generation_id: active_generation,
+                },
+            ) if active_generation == generation_id => {
+                if !self
+                    .publish_reliable(VoiceSessionEvent::Playback {
+                        session_id: self.session_id,
+                        generation_id,
+                        state: PlaybackState::Flushed,
+                    })
+                    .await
+                {
+                    return Some(LoopExit::ConsumerDropped);
+                }
+                self.playback = Some(PlaybackLifecycle::Flushed { generation_id });
                 None
             }
             _ => None,

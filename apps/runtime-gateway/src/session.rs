@@ -765,7 +765,9 @@ impl GatewaySession {
             )
             .map_err(CommandFailure::response);
         }
-        let (timed_bridge, command) = match command {
+        // Both timed starts share one start implementation; only the requested
+        // media version differs and binds the reservation, codec and lease.
+        let (timed_bridge, drainable, command) = match command {
             ClientCommand::StartTimedVoiceSession {
                 request_id,
                 bridge_session_id,
@@ -773,13 +775,28 @@ impl GatewaySession {
                 response_mode,
             } => (
                 Some(bridge_session_id),
+                false,
                 ClientCommand::StartVoiceSession {
                     request_id,
                     profile: Some(profile),
                     response_mode: Some(response_mode),
                 },
             ),
-            other => (None, other),
+            ClientCommand::StartDrainableTimedVoiceSession {
+                request_id,
+                bridge_session_id,
+                profile,
+                response_mode,
+            } => (
+                Some(bridge_session_id),
+                true,
+                ClientCommand::StartVoiceSession {
+                    request_id,
+                    profile: Some(profile),
+                    response_mode: Some(response_mode),
+                },
+            ),
+            other => (None, false, other),
         };
         match command {
             ClientCommand::ReadRecordingAlignment {
@@ -860,7 +877,10 @@ impl GatewaySession {
                 }
                 Ok(())
             }
-            ClientCommand::StartTimedVoiceSession { .. } => unreachable!("normalized timed start"),
+            ClientCommand::StartTimedVoiceSession { .. }
+            | ClientCommand::StartDrainableTimedVoiceSession { .. } => {
+                unreachable!("normalized timed start")
+            }
             ClientCommand::Status { request_id } => {
                 send_accepted(normal, &request_id).map_err(CommandFailure::response)?;
                 send_normal(
@@ -1117,7 +1137,13 @@ impl GatewaySession {
                             .map_err(CommandFailure::response);
                         }
                         let lease = match if let Some(bridge) = &timed_bridge {
-                            media_server.reserve_timed(session_id, bridge.clone()).await
+                            if drainable {
+                                media_server
+                                    .reserve_drainable_timed(session_id, bridge.clone())
+                                    .await
+                            } else {
+                                media_server.reserve_timed(session_id, bridge.clone()).await
+                            }
                         } else {
                             media_server.reserve(session_id).await
                         } {
@@ -1134,14 +1160,16 @@ impl GatewaySession {
                         let descriptor = match media_lease_descriptor(media_server, &lease)
                             .and_then(|descriptor| {
                                 if timed_bridge.is_some() {
-                                    descriptor
-                                        .into_timed(
-                                            media_server
-                                                .capture_format()
-                                                .expect("timed admission")
-                                                .to_owned(),
-                                        )
-                                        .map_err(|_| ())
+                                    let capture_format = media_server
+                                        .capture_format()
+                                        .expect("timed admission")
+                                        .to_owned();
+                                    if drainable {
+                                        descriptor.into_drainable_timed(capture_format)
+                                    } else {
+                                        descriptor.into_timed(capture_format)
+                                    }
+                                    .map_err(|_| ())
                                 } else {
                                     Ok(descriptor)
                                 }
@@ -2095,6 +2123,7 @@ async fn shutdown_alignment(active: &mut Option<ActiveAlignmentRead>) {
 fn command_request_id(command: &ClientCommand) -> &str {
     match command {
         ClientCommand::StartTimedVoiceSession { request_id, .. }
+        | ClientCommand::StartDrainableTimedVoiceSession { request_id, .. }
         | ClientCommand::ReadRecordingAlignment { request_id, .. }
         | ClientCommand::RecordingAlignmentCredit { request_id, .. }
         | ClientCommand::CancelRecordingAlignment { request_id, .. }
@@ -9799,6 +9828,64 @@ max_error_bytes = 65536
             "the two causes must be distinguishable: {rejection}"
         );
         recorded.close().await;
+    }
+
+    /// Both timed starts share the one start pipeline, but each binds exactly
+    /// the media version it asked for: the old command stays media2 and the
+    /// additive drainable command yields a media3 lease. Unknown command types
+    /// keep the generic decode rejection with no fallback.
+    #[tokio::test]
+    async fn timed_starts_bind_the_exact_requested_media_version_and_unknown_commands_stay_rejected(
+    ) {
+        let key_env = "RUNTIME_DRAINABLE_ADMISSION_SYNTHETIC_KEY";
+        std::env::set_var(key_env, FAKE_RECORDING_KEY);
+        for (command, expected_version) in [
+            ("start_timed_voice_session", 2),
+            ("start_drainable_timed_voice_session", 3),
+        ] {
+            let directory = TempDir::new().unwrap();
+            let (session, _guards) = session_with_voice();
+            let media = Arc::new(
+                MediaServer::bind(
+                    MediaServerConfig::loopback()
+                        .with_capture_format(Some("pcm_s16le/24000/1/20ms".into()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+            );
+            let session = session
+                .with_v4_control()
+                .with_recording(RecordingSettings::new(directory.path(), key_env).unwrap())
+                .with_media_server(Arc::clone(&media));
+            let mut gateway = InMemoryGateway::start(session).await;
+            gateway.write(&format!(r#"{{"protocol_version":4,"type":"{command}","request_id":"timed","bridge_session_id":"bridge-independent","profile":"offline","response_mode":"external_gate"}}"#)).await;
+            assert_accepted_message(&gateway.read_message().await, "timed");
+            let started: serde_json::Value =
+                serde_json::from_str(&gateway.read_message().await).unwrap();
+            assert_eq!(started["type"], "timed_voice_session_started", "{command}");
+            assert_eq!(started["request_id"], "timed");
+            assert_eq!(
+                started["media_lease"]["media_protocol_version"], expected_version,
+                "{command} bound the wrong media version"
+            );
+            assert_eq!(
+                started["media_lease"]["capture_format"],
+                "pcm_s16le/24000/1/20ms"
+            );
+            gateway.close().await;
+            media.shutdown().await;
+        }
+        let (session, _guards) = session_with_voice();
+        let mut gateway = InMemoryGateway::start(session.with_v4_control()).await;
+        gateway.write(r#"{"protocol_version":4,"type":"start_drainable_timed_voice_session_v9","request_id":"unknown","bridge_session_id":"bridge-independent","profile":"offline","response_mode":"external_gate"}"#).await;
+        assert_rejected_message(
+            &gateway.read_message().await,
+            "invalid-command",
+            "invalid_state",
+        );
+        gateway.close().await;
+        std::env::remove_var(key_env);
     }
 
     #[tokio::test]

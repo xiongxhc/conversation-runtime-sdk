@@ -55,9 +55,33 @@ async function onlyPinnedFourExposesCaptureEvidence(): Promise<void> {
   }
 }
 
+async function timedMediaVersionsAndConditionalStopStayExact(): Promise<void> {
+  const client = await RuntimeClient.connect(transport, 4);
+  const timed = await client.startTimedVoiceSession({
+    bridgeSessionId: "bridge-independent",
+    profile: "offline",
+    responseMode: "external_gate",
+  });
+  const timedVersion: 2 = timed.mediaLease.mediaProtocolVersion;
+  const drainable = await client.startDrainableTimedVoiceSession({
+    bridgeSessionId: "bridge-independent",
+    profile: "offline",
+    responseMode: "external_gate",
+  });
+  const drainableVersion: 3 = drainable.mediaLease.mediaProtocolVersion;
+  // @ts-expect-error the existing timed start must never imply the drainable media protocol.
+  const wrongVersion: 3 = timed.mediaLease.mediaProtocolVersion;
+  const conditionalStop: "stopped" | "already_terminal" = await drainable.stopIfActive();
+  assert.ok(timedVersion);
+  assert.ok(drainableVersion);
+  assert.ok(wrongVersion);
+  assert.ok(conditionalStop);
+}
+
 test("version-typed voice sessions retain final-turn nullability", () => {
   assert.ok(legacyFinalTurnIdIsNonNull);
   assert.ok(versionThreeFinalTurnIdRequiresNullHandling);
   assert.ok(unpinnedFinalTurnIdRequiresNullHandling);
   assert.ok(onlyPinnedFourExposesCaptureEvidence);
+  assert.ok(timedMediaVersionsAndConditionalStopStayExact);
 });

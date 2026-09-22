@@ -14,9 +14,9 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    AdapterError, AdapterFuture, AudioCapture, AudioFrame, CaptureEvent, CaptureMetadata,
-    ContinuousAudioOutput, PlaybackReceipt, VoiceCaptureControl, VoiceInput, VoiceInputEvent,
-    VoiceIoFactory, VoiceIoSession,
+    AdapterError, AdapterFuture, AudioCapture, AudioFrame, CaptureEvent, CaptureFinish,
+    CaptureFinishBoundary, CaptureMetadata, ContinuousAudioOutput, PlaybackReceipt,
+    VoiceCaptureControl, VoiceInput, VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
 };
 
 const MEDIA_QUEUE_CAPACITY: usize = 16;
@@ -86,6 +86,9 @@ struct NetworkSession {
     pending_playback: HashMap<u64, PendingPlayback>,
     pending_flush: HashMap<u64, PendingFlush>,
     reconnect_deadline: Option<Instant>,
+    playback_finished: bool,
+    finish_connection_id: Option<u64>,
+    finish_delivered: bool,
     waiting_playback: VecDeque<WaitingPlayback>,
     waiting_playback_bytes: usize,
 }
@@ -108,6 +111,9 @@ impl NetworkSession {
             pending_playback: HashMap::new(),
             pending_flush: HashMap::new(),
             reconnect_deadline: None,
+            playback_finished: false,
+            finish_connection_id: None,
+            finish_delivered: false,
             waiting_playback: VecDeque::new(),
             waiting_playback_bytes: 0,
         }
@@ -404,6 +410,47 @@ impl NetworkMediaHub {
         .map_err(|_| AdapterError::new("network media capture input closed"))
     }
 
+    /// Delivers one reservation-bound recorder barrier without involving recognition.
+    pub async fn deliver_capture_finish_for_reservation(
+        &self,
+        session_id: SessionId,
+        reservation_epoch: u64,
+        connection_id: u64,
+        boundary: CaptureFinishBoundary,
+    ) -> Result<oneshot::Receiver<Result<(), AdapterError>>, AdapterError> {
+        if boundary.session_id() != session_id {
+            return Err(AdapterError::new(
+                "network media finish session did not match",
+            ));
+        }
+        let voice = {
+            let mut sessions = self.sessions.lock().await;
+            let session = sessions
+                .get_mut(&session_id.get())
+                .filter(|session| {
+                    session.reservation_epoch == reservation_epoch
+                        && session.playback_finished
+                        && session.finish_connection_id == Some(connection_id)
+                        && !session.finish_delivered
+                })
+                .ok_or_else(|| AdapterError::new("network media finish ownership did not match"))?;
+            session.finish_delivered = true;
+            session
+                .voice
+                .clone()
+                .ok_or_else(|| AdapterError::new("network media voice input is not attached"))?
+        };
+        let (finish, completion) = CaptureFinish::new(boundary);
+        tokio::time::timeout(
+            self.operation_timeout,
+            voice.send(Ok(VoiceInputEvent::CaptureFinish(finish))),
+        )
+        .await
+        .map_err(|_| AdapterError::new("network media finish delivery timed out"))?
+        .map_err(|_| AdapterError::new("network media capture input closed"))?;
+        Ok(completion)
+    }
+
     pub async fn attach_playback_transport(
         &self,
         session_id: SessionId,
@@ -440,6 +487,9 @@ impl NetworkMediaHub {
             return Err(AdapterError::new(
                 "network media reservation no longer matches",
             ));
+        }
+        if session.playback_finished {
+            return Err(AdapterError::new("network media playback is finishing"));
         }
         if session.playback.is_some() {
             return Err(AdapterError::new(
@@ -481,6 +531,97 @@ impl NetworkMediaHub {
                 session.playback = None;
             }
         }
+    }
+
+    /// Permanently detaches the exact finishing connection and settles its bounded owners.
+    pub async fn planned_detach_playback_transport_for_finish(
+        &self,
+        session_id: SessionId,
+        reservation_epoch: u64,
+        connection_id: u64,
+    ) -> Result<(), AdapterError> {
+        let (voice, completions, mut flushed_generations) = {
+            let mut sessions = self.sessions.lock().await;
+            let session = sessions
+                .get_mut(&session_id.get())
+                .ok_or_else(|| AdapterError::new("network media session is not reserved"))?;
+            if session.reservation_epoch != reservation_epoch {
+                return Err(AdapterError::new(
+                    "network media finish reservation no longer matches",
+                ));
+            }
+            if session.playback_finished
+                || session
+                    .playback
+                    .as_ref()
+                    .is_none_or(|transport| transport.connection_id != connection_id)
+            {
+                return Err(AdapterError::new(
+                    "network media finish connection no longer matches",
+                ));
+            }
+            if !session.waiting_playback.is_empty()
+                || session.waiting_playback_bytes != 0
+                || session
+                    .pending_playback
+                    .values()
+                    .any(|pending| pending.connection_id != Some(connection_id))
+                || session
+                    .pending_flush
+                    .values()
+                    .any(|pending| pending.connection_id != connection_id)
+            {
+                return Err(AdapterError::new(
+                    "network media finish found playback owned elsewhere",
+                ));
+            }
+            session.playback = None;
+            session.reconnect_deadline = None;
+            session.playback_finished = true;
+            session.finish_connection_id = Some(connection_id);
+            session.finish_delivered = false;
+            let mut completions = Vec::new();
+            let mut flushed_generations = HashSet::new();
+            for (_, mut pending) in session.pending_playback.drain() {
+                if let Some(completion) = pending.completion.take() {
+                    completions.push(completion);
+                }
+                if pending.written {
+                    flushed_generations.insert(pending.generation_id);
+                }
+            }
+            for (_, pending) in session.pending_flush.drain() {
+                completions.push(pending.completion);
+            }
+            (
+                session.voice.clone(),
+                completions,
+                flushed_generations.into_iter().collect::<Vec<_>>(),
+            )
+        };
+        for completion in completions {
+            let _ = completion.send(Err(AdapterError::new(
+                "network media playback stopped for capture finish",
+            )));
+        }
+        flushed_generations.sort_unstable_by_key(|generation| generation.get());
+        if !flushed_generations.is_empty() {
+            let voice = voice
+                .ok_or_else(|| AdapterError::new("network media voice input is not attached"))?;
+            for generation_id in flushed_generations {
+                tokio::time::timeout(
+                    self.operation_timeout,
+                    voice.send(Ok(VoiceInputEvent::Playback(PlaybackReceipt::new(
+                        generation_id,
+                        PlaybackState::Flushed,
+                    )))),
+                )
+                .await
+                .map_err(|_| AdapterError::new("network media playback event timed out"))?
+                .map_err(|_| AdapterError::new("network media voice input closed"))?;
+            }
+        }
+        Ok(())
     }
 
     pub async fn mark_playback_written(
@@ -667,6 +808,9 @@ impl NetworkMediaHub {
             let session = sessions
                 .get_mut(&session_id.get())
                 .ok_or_else(|| AdapterError::new("network media session is not reserved"))?;
+            if session.playback_finished {
+                return Err(AdapterError::new("network media playback is finishing"));
+            }
             if session.pending_playback.len() >= MEDIA_QUEUE_CAPACITY {
                 return Err(AdapterError::new(
                     "network media playback queue exceeded its configured bound",
@@ -853,6 +997,9 @@ impl NetworkMediaHub {
             let session = sessions
                 .get_mut(&session_id.get())
                 .ok_or_else(|| AdapterError::new("network media session is not reserved"))?;
+            if session.playback_finished {
+                return Err(AdapterError::new("network media playback is finishing"));
+            }
             let transport = session
                 .playback
                 .as_ref()

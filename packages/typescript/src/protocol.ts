@@ -24,6 +24,8 @@ export const MAX_PROCESSING_INPUT_BYTES = 16 * 1024;
 export const MAX_PROCESSING_SCHEMA_BYTES = 8 * 1024;
 export const MAX_PROCESSED_OUTPUT_BYTES = 64 * 1024;
 export const MEDIA_PROTOCOL_VERSION = 1;
+export const TIMED_MEDIA_PROTOCOL_VERSION = 2;
+export const DRAINABLE_TIMED_MEDIA_PROTOCOL_VERSION = 3;
 export const MAX_MEDIA_CONNECT_ENDPOINT_BYTES = 256;
 export const MAX_MEDIA_CREDENTIAL_BYTES = 128;
 export const MAX_MEDIA_LEASE_LIFETIME_MS = 5n * 60n * 1_000n;
@@ -38,6 +40,7 @@ const MAX_PROVIDER_LABEL_BYTES = 128;
 
 export type ClientCommand =
   | { type: "start_timed_voice_session"; requestId: string; bridgeSessionId: string; profile: RuntimeProfile; responseMode: VoiceResponseMode }
+  | { type: "start_drainable_timed_voice_session"; requestId: string; bridgeSessionId: string; profile: RuntimeProfile; responseMode: VoiceResponseMode }
   | { type: "read_recording_alignment"; requestId: string; capability: FinalizedRecordingCapability }
   | { type: "recording_alignment_credit"; requestId: string; consumedPageIndex: bigint }
   | { type: "cancel_recording_alignment"; requestId: string }
@@ -507,6 +510,7 @@ export type MediaLease = {
 };
 
 export type TimedMediaLease = MediaLease & { readonly mediaProtocolVersion: 2; readonly captureFormat: string; readonly timingContract: "capture-clock/v1" };
+export type DrainableTimedMediaLease = MediaLease & { readonly mediaProtocolVersion: 3; readonly captureFormat: string; readonly timingContract: "capture-clock/v1" };
 export type RecordingIdentity = { readonly sourceSessionId: bigint; readonly recordingHandle: string; readonly sha256: string };
 export type AlignmentPolicy = { readonly id: "local-wall-estimate/v1"; readonly cadenceTargetNs: bigint; readonly maximumBracketNs: bigint; readonly maximumPairGapNs: bigint; readonly maximumResidualNs: bigint };
 export type CaptureEpoch = { readonly bridgeSessionId: string; readonly clockDomainId: string; readonly captureEpoch: bigint };
@@ -539,7 +543,7 @@ export const MAX_ALIGNMENT_PAGE_ENTRIES = 64;
 export const MAX_ALIGNMENT_PAGE_BYTES = 32 * 1024;
 
 export type GatewayMessage =
-  | { type: "timed_voice_session_started"; requestId: string; mediaLease: TimedMediaLease }
+  | { type: "timed_voice_session_started"; requestId: string; mediaLease: TimedMediaLease | DrainableTimedMediaLease }
   | { type: "recording_alignment_page"; requestId: string; page: RecordingAlignmentPage }
   | { type: "recording_alignment_complete"; requestId: string; completion: RecordingAlignmentComplete }
   | { type: "ready"; status: RuntimeStatus; currentSessionId?: bigint }
@@ -577,6 +581,7 @@ export function parseClientCommand(value: unknown, expectedVersion?: ClientProto
   const type = requireString(object, "type");
   switch (type) {
     case "start_timed_voice_session":
+    case "start_drainable_timed_voice_session":
       requireExactKeys(object, ["protocol_version", "type", "request_id", "bridge_session_id", "profile", "response_mode"]);
       requireTimedVersion(version);
       return { type, requestId: requireRequestId(object), bridgeSessionId: captureIdentifier(object.bridge_session_id), profile: requireOneOf(object, "profile", ["offline", "online"] as const), responseMode: requireOneOf(object, "response_mode", ["automatic", "external_gate"] as const) };
@@ -927,6 +932,7 @@ export function encodeClientCommand(
   const wire = (() => {
     switch (command.type) {
       case "start_timed_voice_session":
+      case "start_drainable_timed_voice_session":
         return { protocol_version: version, type: command.type, request_id: command.requestId, bridge_session_id: command.bridgeSessionId, profile: command.profile, response_mode: command.responseMode };
       case "recording_alignment_credit":
         return { protocol_version: version, type: command.type, request_id: command.requestId, consumed_page_index: command.consumedPageIndex.toString() };
@@ -1066,7 +1072,7 @@ export function validateClientCommand(
   if (!isCanonicalRequestId(command.requestId)) {
     throw new ProtocolError("request identifier must be non-empty and at most 64 bytes");
   }
-  if (command.type === "start_timed_voice_session") {
+  if (command.type === "start_timed_voice_session" || command.type === "start_drainable_timed_voice_session") {
     requireTimedVersion(version); captureIdentifier(command.bridgeSessionId);
     if (!["online", "offline"].includes(command.profile) || !["automatic", "external_gate"].includes(command.responseMode)) throw new ProtocolError("invalid timed start options");
   }
@@ -2228,14 +2234,14 @@ function parseAlignmentComplete(value: unknown): RecordingAlignmentComplete {
     return freezeAlignment({ type: "recording_alignment_complete", source: alignmentIdentity(o.source), pageCount: alignmentUnsigned(o.page_count), coverageStatus: requireOneOf(o, "coverage_status", ["available", "partial", "unavailable_legacy"] as const), warnings: alignmentReasons(o.warnings), traversalSucceeded: true });
   } catch { throw new ProtocolError("invalid recording alignment completion"); }
 }
-function parseTimedMediaLease(value: unknown): TimedMediaLease {
+function parseTimedMediaLease(value: unknown): TimedMediaLease | DrainableTimedMediaLease {
   try {
     const o = alignmentObject(value, ["media_protocol_version", "session_id", "connect_endpoint", "credential", "expires_at_ms", "reconnect_window_ms", "capture_format", "timing_contract"]);
-    if (o.media_protocol_version !== 2 || o.timing_contract !== "capture-clock/v1" || typeof o.capture_format !== "string" || new TextEncoder().encode(o.capture_format).length > 64) throw new ProtocolError("invalid timed lease");
+    if ((o.media_protocol_version !== TIMED_MEDIA_PROTOCOL_VERSION && o.media_protocol_version !== DRAINABLE_TIMED_MEDIA_PROTOCOL_VERSION) || o.timing_contract !== "capture-clock/v1" || typeof o.capture_format !== "string" || new TextEncoder().encode(o.capture_format).length > 64) throw new ProtocolError("invalid timed lease");
     const match = /^(pcm_s16le|pcm_f32le)\/([1-9][0-9]*)\/([1-9][0-9]*)\/([1-9][0-9]*)ms$/.exec(o.capture_format);
     if (!match || BigInt(match[2]!) > 0xffffffffn || BigInt(match[3]!) > 65535n || BigInt(match[4]!) > 0xffffffffn) throw new ProtocolError("invalid capture format");
     const base = parseMediaLease({ media_protocol_version: 1, session_id: o.session_id, connect_endpoint: o.connect_endpoint, credential: o.credential, expires_at_ms: o.expires_at_ms, reconnect_window_ms: o.reconnect_window_ms });
-    return Object.freeze({ ...base, mediaProtocolVersion: 2, captureFormat: o.capture_format, timingContract: "capture-clock/v1" });
+    return Object.freeze({ ...base, mediaProtocolVersion: o.media_protocol_version, captureFormat: o.capture_format, timingContract: "capture-clock/v1" });
   } catch { throw new ProtocolError("invalid timed media lease"); }
 }
 

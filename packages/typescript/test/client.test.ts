@@ -1304,6 +1304,162 @@ test("timed voice startup awaits a v2 typed lease and retains existing events an
   await client.close();
 });
 
+test("drainable timed startup is explicit and resolves only an exact v3 lease", async () => {
+  const { client,transport }=await timedClient();
+  let settled=false;
+  const pending=client.startDrainableTimedVoiceSession({bridgeSessionId:"bridge-independent",profile:"offline",responseMode:"external_gate"}).then((session)=>{settled=true;return session;});
+  const start=command(transport,"start_drainable_timed_voice_session");assert.equal(start.bridgeSessionId,"bridge-independent");
+  assert.equal(transport.sent.some((item)=>item.type==="start_timed_voice_session"),false);
+  transport.push(acceptedForVersion(start.requestId,4));await setImmediate();assert.equal(settled,false);
+  transport.push({protocol_version:4,type:"timed_voice_session_started",request_id:start.requestId,media_lease:{media_protocol_version:3,session_id:"42",connect_endpoint:"tcp://127.0.0.1:9001",credential:"a".repeat(64),expires_at_ms:String(Date.now()+60_000),reconnect_window_ms:"10000",capture_format:"pcm_s16le/24000/1/20ms",timing_contract:"capture-clock/v1"}});
+  const session=await pending;assert.equal(session.mediaLease.mediaProtocolVersion,3);assert.equal(session.mediaLease.sessionId,42n);
+  const stopping=session.stop();
+  transport.push(voiceEventForVersion({type:"voice_session_ended",session_id:"42"},4));
+  transport.push(acceptedForVersion(command(transport,"stop_voice_session").requestId,4));
+  await stopping;
+  await client.close();
+});
+
+test("drainable timed startup rejects a request-correlated media2 lease", async () => {
+  const { client,transport }=await timedClient();
+  const pending=client.startDrainableTimedVoiceSession({bridgeSessionId:"bridge-independent",profile:"offline",responseMode:"external_gate"});
+  const start=command(transport,"start_drainable_timed_voice_session");
+  transport.push(acceptedForVersion(start.requestId,4));
+  transport.push({protocol_version:4,type:"timed_voice_session_started",request_id:start.requestId,media_lease:{media_protocol_version:2,session_id:"42",connect_endpoint:"tcp://127.0.0.1:9001",credential:"a".repeat(64),expires_at_ms:String(Date.now()+60_000),reconnect_window_ms:"10000",capture_format:"pcm_s16le/24000/1/20ms",timing_contract:"capture-clock/v1"}});
+  try { await assert.rejects(pending,/uncorrelated timed voice start/); }
+  finally { await client.close(); }
+});
+
+test("stopIfActive returns already_terminal only for the same routed terminal handle", async () => {
+  const { client,transport }=await timedClient();
+  const pending=client.startDrainableTimedVoiceSession({bridgeSessionId:"bridge-independent",profile:"offline",responseMode:"external_gate"});
+  const start=command(transport,"start_drainable_timed_voice_session");
+  transport.push(acceptedForVersion(start.requestId,4));
+  transport.push({protocol_version:4,type:"timed_voice_session_started",request_id:start.requestId,media_lease:{media_protocol_version:3,session_id:"42",connect_endpoint:"tcp://127.0.0.1:9001",credential:"a".repeat(64),expires_at_ms:String(Date.now()+60_000),reconnect_window_ms:"10000",capture_format:"pcm_s16le/24000/1/20ms",timing_contract:"capture-clock/v1"}});
+  const session=await pending;
+  transport.push(voiceEventForVersion({type:"voice_session_ended",session_id:"42"},4));
+  await setImmediate();
+  assert.equal(await session.stopIfActive(),"already_terminal");
+  assert.equal(transport.sent.some((item)=>item.type==="stop_voice_session"),false);
+  await client.close();
+});
+
+test("stopIfActive returns stopped after the active stop is accepted", async () => {
+  const { client,transport }=await timedClient();
+  const pending=client.startDrainableTimedVoiceSession({bridgeSessionId:"bridge-independent",profile:"offline",responseMode:"external_gate"});
+  const start=command(transport,"start_drainable_timed_voice_session");
+  transport.push(acceptedForVersion(start.requestId,4));
+  transport.push({protocol_version:4,type:"timed_voice_session_started",request_id:start.requestId,media_lease:{media_protocol_version:3,session_id:"42",connect_endpoint:"tcp://127.0.0.1:9001",credential:"a".repeat(64),expires_at_ms:String(Date.now()+60_000),reconnect_window_ms:"10000",capture_format:"pcm_s16le/24000/1/20ms",timing_contract:"capture-clock/v1"}});
+  const session=await pending;
+  const stopping=session.stopIfActive();
+  transport.push(acceptedForVersion(command(transport,"stop_voice_session").requestId,4));
+  assert.equal(await stopping,"stopped");
+  await client.close();
+});
+
+test("stopIfActive treats a rejection as terminal only after its exact session ended", async () => {
+  const { client,transport }=await timedClient();
+  const pending=client.startDrainableTimedVoiceSession({bridgeSessionId:"bridge-independent",profile:"offline",responseMode:"external_gate"});
+  const start=command(transport,"start_drainable_timed_voice_session");
+  transport.push(acceptedForVersion(start.requestId,4));
+  transport.push({protocol_version:4,type:"timed_voice_session_started",request_id:start.requestId,media_lease:{media_protocol_version:3,session_id:"42",connect_endpoint:"tcp://127.0.0.1:9001",credential:"a".repeat(64),expires_at_ms:String(Date.now()+60_000),reconnect_window_ms:"10000",capture_format:"pcm_s16le/24000/1/20ms",timing_contract:"capture-clock/v1"}});
+  const session=await pending;
+  const stopping=session.stopIfActive();
+  const stop=command(transport,"stop_voice_session");
+  transport.push(voiceEventForVersion({type:"voice_session_ended",session_id:"42"},4));
+  transport.push(rejectedForVersion(stop.requestId,{code:"invalid_state",kind:"invalid_state",stage:"runtime",message:"already ended"},4));
+  assert.equal(await stopping,"already_terminal");
+  await client.close();
+});
+
+test("stopIfActive preserves transport failure after its exact session ended", async () => {
+  const { client,transport }=await timedClient();
+  const pending=client.startDrainableTimedVoiceSession({bridgeSessionId:"bridge-independent",profile:"offline",responseMode:"external_gate"});
+  const start=command(transport,"start_drainable_timed_voice_session");
+  transport.push(acceptedForVersion(start.requestId,4));
+  transport.push({protocol_version:4,type:"timed_voice_session_started",request_id:start.requestId,media_lease:{media_protocol_version:3,session_id:"42",connect_endpoint:"tcp://127.0.0.1:9001",credential:"a".repeat(64),expires_at_ms:String(Date.now()+60_000),reconnect_window_ms:"10000",capture_format:"pcm_s16le/24000/1/20ms",timing_contract:"capture-clock/v1"}});
+  const session=await pending;
+  const stopping=session.stopIfActive();
+  transport.push(voiceEventForVersion({type:"voice_session_ended",session_id:"42"},4));
+  transport.fail(new Error("transport failed during stop"));
+  await assert.rejects(stopping,/transport failed during stop/);
+  await client.close();
+});
+
+test("stopIfActive preserves client close after its exact session ended", async () => {
+  const { client,transport }=await timedClient();
+  const pending=client.startDrainableTimedVoiceSession({bridgeSessionId:"bridge-independent",profile:"offline",responseMode:"external_gate"});
+  const start=command(transport,"start_drainable_timed_voice_session");
+  transport.push(acceptedForVersion(start.requestId,4));
+  transport.push({protocol_version:4,type:"timed_voice_session_started",request_id:start.requestId,media_lease:{media_protocol_version:3,session_id:"42",connect_endpoint:"tcp://127.0.0.1:9001",credential:"a".repeat(64),expires_at_ms:String(Date.now()+60_000),reconnect_window_ms:"10000",capture_format:"pcm_s16le/24000/1/20ms",timing_contract:"capture-clock/v1"}});
+  const session=await pending;
+  const stopping=session.stopIfActive();
+  transport.push(voiceEventForVersion({type:"voice_session_ended",session_id:"42"},4));
+  await setImmediate();
+  const closing=client.close();
+  await assert.rejects(stopping,/runtime client closed/);
+  await closing;
+});
+
+test("stopIfActive preserves a protocol failure after its exact session ended", async () => {
+  const { client,transport }=await timedClient();
+  const pending=client.startDrainableTimedVoiceSession({bridgeSessionId:"bridge-independent",profile:"offline",responseMode:"external_gate"});
+  const start=command(transport,"start_drainable_timed_voice_session");
+  transport.push(acceptedForVersion(start.requestId,4));
+  transport.push({protocol_version:4,type:"timed_voice_session_started",request_id:start.requestId,media_lease:{media_protocol_version:3,session_id:"42",connect_endpoint:"tcp://127.0.0.1:9001",credential:"a".repeat(64),expires_at_ms:String(Date.now()+60_000),reconnect_window_ms:"10000",capture_format:"pcm_s16le/24000/1/20ms",timing_contract:"capture-clock/v1"}});
+  const session=await pending;
+  const stopping=session.stopIfActive();
+  transport.push(voiceEventForVersion({type:"voice_session_ended",session_id:"42"},4));
+  transport.push({protocol_version:4,type:"status",request_id:randomUUID(),status:wireStatus()});
+  await assert.rejects(stopping,/missing or unknown fields/);
+  await client.close();
+});
+
+test("stopIfActive preserves an authoritative invalid_state while its session is active", async () => {
+  const { client,transport }=await timedClient();
+  const pending=client.startDrainableTimedVoiceSession({bridgeSessionId:"bridge-independent",profile:"offline",responseMode:"external_gate"});
+  const start=command(transport,"start_drainable_timed_voice_session");
+  transport.push(acceptedForVersion(start.requestId,4));
+  transport.push({protocol_version:4,type:"timed_voice_session_started",request_id:start.requestId,media_lease:{media_protocol_version:3,session_id:"42",connect_endpoint:"tcp://127.0.0.1:9001",credential:"a".repeat(64),expires_at_ms:String(Date.now()+60_000),reconnect_window_ms:"10000",capture_format:"pcm_s16le/24000/1/20ms",timing_contract:"capture-clock/v1"}});
+  const session=await pending;
+  const stopping=session.stopIfActive();
+  const stop=command(transport,"stop_voice_session");
+  const failure: RuntimeFailure={code:"invalid_state",kind:"invalid_state",stage:"runtime",message:"not stoppable"};
+  transport.push(rejectedForVersion(stop.requestId,failure,4));
+  await assert.rejects(stopping,(error:Error)=>assertCommandRejectedError(error,failure));
+  await client.close();
+});
+
+test("an unsupported drainable start rejects without falling back to media2", async () => {
+  const { client,transport }=await timedClient();
+  const pending=client.startDrainableTimedVoiceSession({bridgeSessionId:"bridge-independent",profile:"offline",responseMode:"external_gate"});
+  const start=command(transport,"start_drainable_timed_voice_session");
+  const failure: RuntimeFailure={code:"invalid_state",kind:"invalid_state",stage:"runtime",message:"unknown command"};
+  transport.push(rejectedForVersion(start.requestId,failure,4));
+  await assert.rejects(pending,(error:Error)=>assertCommandRejectedError(error,failure));
+  assert.equal(transport.sent.some((item)=>item.type==="start_timed_voice_session"),false);
+  await client.close();
+});
+
+test("an old runtime uncorrelated rejection fails drainable start without fallback", async () => {
+  const { client,transport }=await timedClient();
+  const pending=client.startDrainableTimedVoiceSession({bridgeSessionId:"bridge-independent",profile:"offline",responseMode:"external_gate"});
+  transport.push(rejectedForVersion(randomUUID(),{code:"invalid_state",kind:"invalid_state",stage:"runtime",message:"unknown command"},4));
+  await assert.rejects(pending,/rejected an unknown command/);
+  assert.equal(transport.sent.some((item)=>item.type==="start_timed_voice_session"),false);
+  await client.close();
+});
+
+test("the existing timed start rejects a request-correlated media3 lease", async () => {
+  const { client,transport }=await timedClient();
+  const pending=client.startTimedVoiceSession({bridgeSessionId:"bridge-independent",profile:"offline",responseMode:"external_gate"});
+  const start=command(transport,"start_timed_voice_session");
+  transport.push(acceptedForVersion(start.requestId,4));
+  transport.push({protocol_version:4,type:"timed_voice_session_started",request_id:start.requestId,media_lease:{media_protocol_version:3,session_id:"42",connect_endpoint:"tcp://127.0.0.1:9001",credential:"a".repeat(64),expires_at_ms:String(Date.now()+60_000),reconnect_window_ms:"10000",capture_format:"pcm_s16le/24000/1/20ms",timing_contract:"capture-clock/v1"}});
+  await assert.rejects(pending,/uncorrelated timed voice start/);
+  await client.close();
+});
+
 test("alignment grants credit only after a yielded page is pulled again, including terminal credit", async () => {
   const { client, transport, iterator, requestId } = await alignmentClient();
   transport.push(alignmentPage(requestId));

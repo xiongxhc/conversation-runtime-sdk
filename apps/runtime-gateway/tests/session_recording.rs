@@ -497,6 +497,10 @@ async fn a_recording_sink_write_or_flush_failure_keeps_capture_alive_and_marks_t
         let key_env = match fault {
             RecordingSinkFault::Write => "CONVERSATION_TEST_RECORDING_KEY_SINK_WRITE",
             RecordingSinkFault::Flush => "CONVERSATION_TEST_RECORDING_KEY_SINK_FLUSH",
+            RecordingSinkFault::WriteAfterSuccessful(_)
+            | RecordingSinkFault::FlushAfterSuccessful(_) => {
+                unreachable!("this loop drives only the first-append faults")
+            }
         };
         set_fake_key(key_env);
         let directory = TempDir::new().expect("temporary recording directory");

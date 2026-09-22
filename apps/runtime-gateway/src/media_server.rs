@@ -1,17 +1,19 @@
 //! Authenticated, loopback-testable bridge media listener.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use conversation_model_adapters::{
     frame_for_network_capture, AdapterError, CaptureClockPair, CaptureDiscontinuityReason,
-    CaptureDomainHistory, CaptureEpoch, CaptureMetadata, FrameProvenance, NetworkBridgeRequest,
-    NetworkMediaHub, NetworkPlaybackAck, NetworkPlaybackRequest, PcmFormat, PcmSampleFormat,
-    TimedCapture, CAPTURE_TIMING_BYTES, MAX_PCM_FRAME_BYTES,
+    CaptureDomainHistory, CaptureEpoch, CaptureFinishBoundary, CaptureMetadata, FrameProvenance,
+    NetworkBridgeRequest, NetworkMediaHub, NetworkPlaybackAck, NetworkPlaybackRequest, PcmFormat,
+    PcmSampleFormat, TimedCapture, CAPTURE_TIMING_BYTES, MAX_PCM_FRAME_BYTES,
 };
 use conversation_protocol::{GenerationId, SessionId};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -39,6 +41,30 @@ const MAX_MEDIA_CONNECTIONS: usize = 64;
 const MEDIA_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const MEDIA_CONNECTION_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_TIMED_METADATA_PER_SECOND: u32 = 128;
+const AUTH_ACCEPTED_KIND: u8 = 9;
+const CAPTURE_FINISH_KIND: u8 = 10;
+const CAPTURE_FINISH_ACK_KIND: u8 = 11;
+const CAPTURE_FINISH_BODY_BYTES: usize = 41;
+const CAPTURE_FINISH_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MediaVersion {
+    Legacy,
+    Timed,
+    DrainableTimed,
+}
+
+impl MediaVersion {
+    /// The exact timed envelope prefix (magic and version byte) this lease
+    /// speaks. Legacy leases carry only media-v1 records.
+    const fn timed_prefix(self) -> Option<&'static [u8; 5]> {
+        match self {
+            Self::Legacy => None,
+            Self::Timed => Some(b"MED2\x02"),
+            Self::DrainableTimed => Some(b"MED3\x03"),
+        }
+    }
+}
 
 pub const MAX_MEDIA_ENDPOINT_BYTES: usize = 256;
 pub const MAX_MEDIA_PATH_BYTES: usize = 1_024;
@@ -306,6 +332,7 @@ struct MediaServerInner {
 }
 
 struct MediaSession {
+    version: MediaVersion,
     reservation_epoch: u64,
     credential: String,
     expires_at: Instant,
@@ -318,6 +345,8 @@ struct MediaSession {
     rate_window_started: Instant,
     frames_in_window: u32,
     timed: Option<TimedMediaState>,
+    capture_finished: bool,
+    revoked: CancellationToken,
 }
 
 #[derive(Clone)]
@@ -397,7 +426,8 @@ impl MediaServer {
     }
 
     pub async fn reserve(&self, session_id: SessionId) -> Result<MediaLease, AdapterError> {
-        self.reserve_version(session_id, None).await
+        self.reserve_version(session_id, MediaVersion::Legacy, None)
+            .await
     }
 
     pub fn capture_format(&self) -> Option<&str> {
@@ -413,13 +443,31 @@ impl MediaServer {
         if self.capture_format().is_none() {
             return Err(AdapterError::new("timed capture format is not configured"));
         }
-        self.reserve_version(session_id, Some(bridge_session_id))
+        self.reserve_version(session_id, MediaVersion::Timed, Some(bridge_session_id))
             .await
+    }
+
+    pub async fn reserve_drainable_timed(
+        &self,
+        session_id: SessionId,
+        bridge_session_id: String,
+    ) -> Result<MediaLease, AdapterError> {
+        conversation_model_adapters::validate_capture_identifier(&bridge_session_id)?;
+        if self.capture_format().is_none() {
+            return Err(AdapterError::new("timed capture format is not configured"));
+        }
+        self.reserve_version(
+            session_id,
+            MediaVersion::DrainableTimed,
+            Some(bridge_session_id),
+        )
+        .await
     }
 
     async fn reserve_version(
         &self,
         session_id: SessionId,
+        version: MediaVersion,
         bridge_session_id: Option<String>,
     ) -> Result<MediaLease, AdapterError> {
         let reservation_epoch = self
@@ -446,6 +494,7 @@ impl MediaServer {
         let previous = self.inner.sessions.lock().await.insert(
             session_id.get(),
             MediaSession {
+                version,
                 reservation_epoch,
                 credential: credential.clone(),
                 expires_at,
@@ -467,6 +516,8 @@ impl MediaServer {
                     metadata_window_started: now,
                     metadata_in_window: 0,
                 }),
+                capture_finished: false,
+                revoked: CancellationToken::new(),
             },
         );
         if previous.is_some() {
@@ -486,7 +537,9 @@ impl MediaServer {
     }
 
     pub async fn revoke(&self, session_id: SessionId) {
-        self.inner.sessions.lock().await.remove(&session_id.get());
+        if let Some(session) = self.inner.sessions.lock().await.remove(&session_id.get()) {
+            session.revoked.cancel();
+        }
         self.inner.hub.revoke(session_id).await;
     }
 
@@ -556,6 +609,24 @@ async fn accept_loop(
     }
 }
 
+/// One connection's pending explicit capture finish. `operation` is the single
+/// pinned future the connection loop owns and polls; dropping this state drops
+/// the barrier receiver, so cancellation can never leave an orphaned waiter.
+struct PendingFinish {
+    boundary: CaptureFinishBoundary,
+    deadline: tokio::time::Instant,
+    revoked: CancellationToken,
+    operation: Pin<Box<dyn Future<Output = Result<(), AdapterError>> + Send>>,
+}
+
+/// The exact kind 11 was written and flushed and the write side half-closed.
+/// Only the producer's clean EOF completes the connection; the same absolute
+/// finish deadline still bounds that wait.
+struct AckedFinish {
+    deadline: tokio::time::Instant,
+    revoked: CancellationToken,
+}
+
 async fn serve_connection<S>(
     mut stream: S,
     inner: Arc<MediaServerInner>,
@@ -564,7 +635,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let handshake_deadline = tokio::time::Instant::now() + MEDIA_HANDSHAKE_TIMEOUT;
-    let (session_id, credential, bridge_session_id) = tokio::select! {
+    let (session_id, credential, bridge_session_id, version) = tokio::select! {
         _ = inner.cancellation.cancelled() => return Ok(()),
         authentication = tokio::time::timeout_at(handshake_deadline, read_authentication(&mut stream)) => {
             authentication
@@ -577,21 +648,30 @@ where
             biased;
             _ = inner.cancellation.cancelled() => return Ok(()),
             _ = tokio::time::sleep_until(handshake_deadline) => return Err(AdapterError::new("media bridge authentication timed out")),
-            result = inner.authenticate(session_id, &credential, bridge_session_id.as_deref()) => result?,
+            result = inner.authenticate(session_id, &credential, bridge_session_id.as_deref(), version) => result?,
         }
     } else {
-        inner.authenticate(session_id, &credential, None).await?
+        inner
+            .authenticate(session_id, &credential, None, version)
+            .await?
     };
     let mut epoch_started = false;
     let mut media_phase = false;
-    let (mut reader, mut writer) = tokio::io::split(stream);
+    let mut planned = false;
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut reader = MediaPacketReader::new(
+        reader,
+        version,
+        inner.max_payload_bytes,
+        inner.packet_read_timeout,
+    );
     let result = async {
         if let Some(bridge) = bridge_session_id.as_deref() {
             tokio::select! {
                 biased;
                 _ = inner.cancellation.cancelled() => return Ok(()),
                 _ = tokio::time::sleep_until(handshake_deadline) => return Err(AdapterError::new("media bridge authentication timed out")),
-                result = write_authentication_accepted(&mut writer, session_id, bridge) => result?,
+                result = write_authentication_accepted(&mut writer, session_id, bridge, version) => result?,
             }
         }
         // Every operation after active-state assignment is inside this result
@@ -603,17 +683,74 @@ where
             result = inner.hub.attach_playback_transport_for_reservation(session_id, connection.reservation_epoch, connection.connection_id) => result?,
         };
         media_phase = true;
+        // Connection state: running while both are `None`; finishPending while
+        // `finish` is `Some`; acked while `acked` is `Some`. Both later states
+        // disable outbound playback, refuse every later timed record, and are
+        // bounded by the one absolute finish deadline; the socket reader stays
+        // live so media-v1 acknowledgements remain bounded no-ops instead of
+        // stalling the peer, and the producer's clean EOF after the ACK is the
+        // planned completion.
+        let mut finish: Option<PendingFinish> = None;
+        let mut acked: Option<AckedFinish> = None;
         loop {
+            let deadline = finish
+                .as_ref()
+                .map(|pending| pending.deadline)
+                .or_else(|| acked.as_ref().map(|acked| acked.deadline));
+            let revoked = finish
+                .as_ref()
+                .map(|pending| pending.revoked.clone())
+                .or_else(|| acked.as_ref().map(|acked| acked.revoked.clone()));
+            let closing = finish.is_some() || acked.is_some();
             tokio::select! {
+                biased;
                 _ = inner.cancellation.cancelled() => break Ok(()),
-                message = read_media_message(
-                    &mut reader,
-                    inner.max_payload_bytes,
-                    inner.packet_read_timeout,
-                ) => {
-                    match message? {
+                _ = async { revoked.as_ref().expect("finish pending").cancelled().await }, if revoked.is_some() => {
+                    break Err(AdapterError::new("media session was revoked before capture finish"));
+                }
+                _ = tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)), if deadline.is_some() => {
+                    break Err(AdapterError::new("capture finish timed out"));
+                }
+                result = async { finish.as_mut().expect("finish pending").operation.as_mut().await }, if finish.is_some() => {
+                    result?;
+                    let pending = finish.take().expect("finish pending");
+                    tokio::time::timeout_at(
+                        pending.deadline,
+                        write_capture_finish_ack(&mut writer, &pending.boundary),
+                    )
+                    .await
+                    .map_err(|_| AdapterError::new("capture finish acknowledgement timed out"))??;
+                    // Half-close so the producer sees FIN right after the ACK
+                    // bytes; the read side stays open for its own clean EOF.
+                    tokio::time::timeout_at(pending.deadline, writer.shutdown())
+                        .await
+                        .map_err(|_| AdapterError::new("capture finish acknowledgement timed out"))?
+                        .map_err(|_| AdapterError::new("capture finish acknowledgement flush failed"))?;
+                    acked = Some(AckedFinish { deadline: pending.deadline, revoked: pending.revoked });
+                }
+                message = reader.next_message() => {
+                    let Some(message) = message? else {
+                        if acked.is_some() {
+                            planned = true;
+                            break Ok(());
+                        }
+                        return Err(AdapterError::new("media frame was malformed"));
+                    };
+                    match message {
                         MediaMessage::Timed {session_id:source,record}=>{
                             if !timed||source!=session_id {return Err(AdapterError::new("timed media identity did not match"));}
+                            if closing {return Err(AdapterError::new("timed capture is finished"));}
+                            if let TimedMediaRecord::Finish(boundary)=record {
+                                if !epoch_started {return Err(AdapterError::new("timed media epoch is missing"));}
+                                let revoked=inner.admit_capture_finish(session_id,connection,&boundary).await?;
+                                finish=Some(PendingFinish {
+                                    deadline:tokio::time::Instant::now()+CAPTURE_FINISH_TIMEOUT,
+                                    revoked,
+                                    operation:Box::pin(finish_operation(Arc::clone(&inner),session_id,connection,boundary.clone())),
+                                    boundary,
+                                });
+                                continue;
+                            }
                             inner.admit_timed_rate(session_id,matches!(&record,TimedMediaRecord::Metadata(_))).await?;
                             match record {
                                 TimedMediaRecord::Metadata(CaptureMetadata::Epoch(epoch))=>{
@@ -640,6 +777,7 @@ where
                                     let state=sessions.get_mut(&session_id.get()).and_then(|session|session.timed.as_mut()).ok_or_else(||AdapterError::new("timed media session was revoked"))?;
                                     state.sequence=timing.sequence;state.output_end=Some(timing.output_start_sample+u64::from(timing.sample_count));
                                 }
+                                TimedMediaRecord::Finish(_)=>unreachable!("finish admitted above"),
                             }
                         }
                         MediaMessage::Frame { direction, session_id: frame_session_id, sequence, captured_at_ms, format, payload } => {
@@ -676,7 +814,7 @@ where
                         }
                     }
                 }
-                request = playback.recv() => {
+                request = playback.recv(), if !closing => {
                     let request = request.ok_or_else(|| AdapterError::new("network media playback transport closed"))?;
                     match request {
                         NetworkBridgeRequest::Playback(request) => {
@@ -703,8 +841,50 @@ where
         }
     }
     .await;
-    cleanup_connection(&inner, session_id, connection, media_phase).await;
+    if planned {
+        // Planned completion: the transport was already detached by the finish
+        // operation and the recorder holds the acknowledged boundary. No
+        // reconnect window and no synthetic disconnect capture metadata.
+        inner
+            .release_planned_connection(session_id, connection)
+            .await;
+    } else {
+        cleanup_connection(&inner, session_id, connection, media_phase).await;
+    }
     result
+}
+
+/// The whole finish sequence after admission, in order: planned playback
+/// detach (which delivers any `Flushed` receipts first), recorder barrier
+/// admission under the hub's bounded operation timeout, then the single
+/// take-once completion. Success means only that the recorder matched and
+/// flushed the boundary.
+async fn finish_operation(
+    inner: Arc<MediaServerInner>,
+    session_id: SessionId,
+    connection: MediaConnection,
+    boundary: CaptureFinishBoundary,
+) -> Result<(), AdapterError> {
+    inner
+        .hub
+        .planned_detach_playback_transport_for_finish(
+            session_id,
+            connection.reservation_epoch,
+            connection.connection_id,
+        )
+        .await?;
+    let completion = inner
+        .hub
+        .deliver_capture_finish_for_reservation(
+            session_id,
+            connection.reservation_epoch,
+            connection.connection_id,
+            boundary,
+        )
+        .await?;
+    completion
+        .await
+        .map_err(|_| AdapterError::new("capture finish barrier was dropped"))?
 }
 
 async fn cleanup_connection(
@@ -740,10 +920,15 @@ async fn write_authentication_accepted<W: AsyncWrite + Unpin>(
     writer: &mut W,
     session_id: SessionId,
     bridge_session_id: &str,
+    version: MediaVersion,
 ) -> Result<(), AdapterError> {
     conversation_model_adapters::validate_capture_identifier(bridge_session_id)?;
+    let prefix = version.timed_prefix().ok_or_else(|| {
+        AdapterError::new("media authentication confirmation requires a timed lease")
+    })?;
     let mut packet = Vec::with_capacity(83);
-    packet.extend_from_slice(b"MED2\x02\x09");
+    packet.extend_from_slice(prefix);
+    packet.push(AUTH_ACCEPTED_KIND);
     packet.extend_from_slice(&(9 + bridge_session_id.len() as u32).to_be_bytes());
     packet.extend_from_slice(&session_id.get().to_be_bytes());
     packet.push(bridge_session_id.len() as u8);
@@ -787,6 +972,9 @@ impl MediaServerInner {
         let session = sessions
             .get_mut(&session_id.get())
             .ok_or_else(|| AdapterError::new("timed media session was revoked"))?;
+        if session.capture_finished {
+            return Err(AdapterError::new("timed capture is finished"));
+        }
         let now = Instant::now();
         if is_metadata {
             let state = session
@@ -957,6 +1145,7 @@ impl MediaServerInner {
         session_id: SessionId,
         credential: &str,
         bridge_session_id: Option<&str>,
+        version: MediaVersion,
     ) -> Result<MediaConnection, AdapterError> {
         let mut sessions = self.sessions.lock().await;
         let session = sessions
@@ -964,6 +1153,7 @@ impl MediaServerInner {
             .ok_or_else(|| AdapterError::new("media credential was not accepted"))?;
         let now = Instant::now();
         if credential != session.credential
+            || session.version != version
             || session
                 .timed
                 .as_ref()
@@ -972,6 +1162,7 @@ impl MediaServerInner {
             || now > session.expires_at
             || now > session.reconnect_deadline
             || session.active
+            || session.capture_finished
         {
             return Err(AdapterError::new("media credential was not accepted"));
         }
@@ -1122,6 +1313,80 @@ impl MediaServerInner {
         }
     }
 
+    /// Admits exactly one capture finish for the authenticated drainable
+    /// connection: the wire boundary must equal the current timed watermarks
+    /// (epoch, last frame sequence and output end, final clock pair). On
+    /// success the capture lane is marked finished so no later frame,
+    /// metadata, finish or reconnect is admitted, and the session's revocation
+    /// token is returned so the pending finish stays interruptible.
+    async fn admit_capture_finish(
+        &self,
+        session_id: SessionId,
+        connection: MediaConnection,
+        boundary: &CaptureFinishBoundary,
+    ) -> Result<CancellationToken, AdapterError> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id.get())
+            .ok_or_else(|| AdapterError::new("timed media session was revoked"))?;
+        if session.reservation_epoch != connection.reservation_epoch
+            || session.active_connection_id != Some(connection.connection_id)
+        {
+            return Err(AdapterError::new("capture finish connection did not match"));
+        }
+        if session.version != MediaVersion::DrainableTimed {
+            return Err(AdapterError::new(
+                "capture finish requires a drainable lease",
+            ));
+        }
+        if session.capture_finished {
+            return Err(AdapterError::new("capture finish was duplicated"));
+        }
+        let state = session
+            .timed
+            .as_ref()
+            .ok_or_else(|| AdapterError::new("timed media session was revoked"))?;
+        let epoch = state
+            .epoch
+            .as_ref()
+            .ok_or_else(|| AdapterError::new("timed media epoch is missing"))?;
+        let pair = state
+            .pair
+            .as_ref()
+            .ok_or_else(|| AdapterError::new("timed clock pair is missing"))?;
+        let frame = match (state.sequence, state.output_end) {
+            (0, None) => None,
+            (sequence, Some(output_end)) if sequence > 0 => Some((sequence, output_end)),
+            _ => {
+                return Err(AdapterError::new(
+                    "timed capture watermark was inconsistent",
+                ))
+            }
+        };
+        if boundary.capture_epoch() != epoch.capture_epoch
+            || boundary.final_clock_pair_sequence() != pair.sequence
+            || boundary.frame() != frame
+        {
+            return Err(AdapterError::new("capture finish boundary did not match"));
+        }
+        session.capture_finished = true;
+        Ok(session.revoked.clone())
+    }
+
+    /// Planned completion after an acknowledged finish: only the active flag
+    /// is released. The reservation, watermarks and finished capture lane stay
+    /// until control-plane voice stop revokes them.
+    async fn release_planned_connection(&self, session_id: SessionId, connection: MediaConnection) {
+        if let Some(session) = self.sessions.lock().await.get_mut(&session_id.get()) {
+            if session.reservation_epoch == connection.reservation_epoch
+                && session.active_connection_id == Some(connection.connection_id)
+            {
+                session.active = false;
+                session.active_connection_id = None;
+            }
+        }
+    }
+
     #[cfg(test)]
     async fn disconnect(
         &self,
@@ -1137,7 +1402,7 @@ impl MediaServerInner {
 
 async fn read_authentication<R>(
     stream: &mut R,
-) -> Result<(SessionId, String, Option<String>), AdapterError>
+) -> Result<(SessionId, String, Option<String>, MediaVersion), AdapterError>
 where
     R: AsyncRead + Unpin,
 {
@@ -1146,7 +1411,12 @@ where
         .read_exact(&mut prefix)
         .await
         .map_err(|_| AdapterError::new("media bridge authentication was malformed"))?;
-    if prefix == *b"MED2\x02\x01" {
+    let timed_version = match &prefix {
+        b"MED2\x02\x01" => Some(MediaVersion::Timed),
+        b"MED3\x03\x01" => Some(MediaVersion::DrainableTimed),
+        _ => None,
+    };
+    if let Some(version) = timed_version {
         let length = stream
             .read_u32()
             .await
@@ -1182,7 +1452,7 @@ where
             .map_err(|_| AdapterError::new("media bridge authentication was malformed"))?
             .to_owned();
         conversation_model_adapters::validate_capture_identifier(&bridge)?;
-        return Ok((session, credential, Some(bridge)));
+        return Ok((session, credential, Some(bridge), version));
     }
     if prefix != [b'M', b'E', b'D', b'1', MEDIA_PROTOCOL_VERSION, AUTH_KIND] {
         return Err(AdapterError::new(
@@ -1212,7 +1482,7 @@ where
         .map_err(|_| AdapterError::new("media bridge authentication was malformed"))?;
     let credential = String::from_utf8(credential)
         .map_err(|_| AdapterError::new("media bridge authentication was malformed"))?;
-    Ok((session, credential, None))
+    Ok((session, credential, None, MediaVersion::Legacy))
 }
 
 enum MediaMessage {
@@ -1246,21 +1516,119 @@ enum TimedMediaRecord {
         payload: Vec<u8>,
     },
     Metadata(CaptureMetadata),
+    Finish(CaptureFinishBoundary),
 }
 
-async fn read_timed_media_body<R: AsyncRead + Unpin>(
-    stream: &mut R,
+/// How much of the current packet the reader must hold before it can act.
+enum PacketTarget {
+    /// More header bytes are needed before the packet length is known.
+    Header(usize),
+    /// The complete packet occupies exactly this many bytes.
+    Packet(usize),
+}
+
+const MEDIA_PREFIX_BYTES: usize = 6;
+const TIMED_HEADER_BYTES: usize = 10;
+
+/// Inspects the bytes buffered so far and either rejects a malformed prefix,
+/// asks for more header bytes, or states the exact packet length. Every
+/// bound is checked before the corresponding bytes are requested, so the
+/// reader never consumes a payload the envelope already disqualified.
+fn packet_target(
+    buffer: &[u8],
+    version: MediaVersion,
+    max_payload_bytes: usize,
+) -> Result<PacketTarget, AdapterError> {
+    if buffer.len() < MEDIA_PREFIX_BYTES {
+        return Ok(PacketTarget::Header(MEDIA_PREFIX_BYTES));
+    }
+    let kind = buffer[5];
+    if version
+        .timed_prefix()
+        .is_some_and(|prefix| prefix == &buffer[..5])
+    {
+        if buffer.len() < TIMED_HEADER_BYTES {
+            return Ok(PacketTarget::Header(TIMED_HEADER_BYTES));
+        }
+        let invalid = || AdapterError::new("timed media record was malformed");
+        let length = u32::from_be_bytes(buffer[6..10].try_into().unwrap()) as usize;
+        if kind == CAPTURE_FINISH_KIND {
+            if version != MediaVersion::DrainableTimed || length != CAPTURE_FINISH_BODY_BYTES {
+                return Err(AdapterError::new("capture finish record was malformed"));
+            }
+            return Ok(PacketTarget::Packet(TIMED_HEADER_BYTES + length));
+        }
+        let maximum = if kind == 2 {
+            max_payload_bytes + 107
+        } else {
+            256
+        };
+        if length < 8 || length > maximum || ![2, 6, 7, 8].contains(&kind) {
+            return Err(invalid());
+        }
+        return Ok(PacketTarget::Packet(TIMED_HEADER_BYTES + length));
+    }
+    if buffer[..5] != [b'M', b'E', b'D', b'1', MEDIA_PROTOCOL_VERSION] {
+        return Err(AdapterError::new("media frame was malformed"));
+    }
+    match kind {
+        FRAME_KIND => {
+            if buffer.len() < FRAME_HEADER_BYTES {
+                return Ok(PacketTarget::Header(FRAME_HEADER_BYTES));
+            }
+            let direction = buffer[6];
+            if direction != CAPTURE_DIRECTION && direction != PLAYBACK_DIRECTION {
+                return Err(AdapterError::new("media frame direction was malformed"));
+            }
+            if !matches!(buffer[31], 1 | 2) {
+                return Err(AdapterError::new("media frame codec was malformed"));
+            }
+            let payload_length = u32::from_be_bytes(buffer[38..42].try_into().unwrap()) as usize;
+            if payload_length == 0 || payload_length > max_payload_bytes {
+                return Err(AdapterError::new(
+                    "media frame payload was outside its byte bound",
+                ));
+            }
+            Ok(PacketTarget::Packet(FRAME_HEADER_BYTES + payload_length))
+        }
+        PLAYBACK_ACK_KIND => Ok(PacketTarget::Packet(MEDIA_PREFIX_BYTES + 17)),
+        FLUSH_ACK_KIND => Ok(PacketTarget::Packet(MEDIA_PREFIX_BYTES + 16)),
+        _ => Err(AdapterError::new("media frame was malformed")),
+    }
+}
+
+fn parse_media_packet(
+    packet: &[u8],
+    version: MediaVersion,
+    max_payload_bytes: usize,
+) -> Result<MediaMessage, AdapterError> {
+    if version
+        .timed_prefix()
+        .is_some_and(|prefix| prefix == &packet[..5])
+    {
+        return parse_timed_media_body(packet[5], &packet[TIMED_HEADER_BYTES..], max_payload_bytes);
+    }
+    match packet[5] {
+        FRAME_KIND => parse_frame_body(packet),
+        PLAYBACK_ACK_KIND => parse_playback_ack(&packet[MEDIA_PREFIX_BYTES..]),
+        FLUSH_ACK_KIND => parse_flush_ack(&packet[MEDIA_PREFIX_BYTES..]),
+        _ => Err(AdapterError::new("media frame was malformed")),
+    }
+}
+
+fn parse_timed_media_body(
     kind: u8,
+    body: &[u8],
     max_payload: usize,
 ) -> Result<MediaMessage, AdapterError> {
     let invalid = || AdapterError::new("timed media record was malformed");
-    let length = stream.read_u32().await.map_err(|_| invalid())? as usize;
-    let maximum = if kind == 2 { max_payload + 107 } else { 256 };
-    if length < 8 || length > maximum || ![2, 6, 7, 8].contains(&kind) {
-        return Err(invalid());
+    if kind == CAPTURE_FINISH_KIND {
+        let boundary = decode_capture_finish_body(body)?;
+        return Ok(MediaMessage::Timed {
+            session_id: boundary.session_id(),
+            record: TimedMediaRecord::Finish(boundary),
+        });
     }
-    let mut body = vec![0; length];
-    stream.read_exact(&mut body).await.map_err(|_| invalid())?;
     let session_id = SessionId::new(u64::from_be_bytes(body[..8].try_into().unwrap()));
     let record = match kind {
         2 => {
@@ -1308,69 +1676,142 @@ async fn read_timed_media_body<R: AsyncRead + Unpin>(
     Ok(MediaMessage::Timed { session_id, record })
 }
 
-async fn read_media_message<R>(
-    stream: &mut R,
+/// Decodes the exact 41-byte capture finish body shared by kinds 10 and 11.
+fn decode_capture_finish_body(body: &[u8]) -> Result<CaptureFinishBoundary, AdapterError> {
+    let invalid = || AdapterError::new("capture finish record was malformed");
+    if body.len() != CAPTURE_FINISH_BODY_BYTES {
+        return Err(invalid());
+    }
+    let session_id = u64::from_be_bytes(body[..8].try_into().unwrap());
+    let capture_epoch = u64::from_be_bytes(body[8..16].try_into().unwrap());
+    let frame_present = match body[16] {
+        0 => false,
+        1 => true,
+        _ => return Err(invalid()),
+    };
+    let last_sequence = u64::from_be_bytes(body[17..25].try_into().unwrap());
+    let output_end = u64::from_be_bytes(body[25..33].try_into().unwrap());
+    let final_pair_sequence = u64::from_be_bytes(body[33..41].try_into().unwrap());
+    if session_id == 0 {
+        return Err(invalid());
+    }
+    CaptureFinishBoundary::new(
+        SessionId::new(session_id),
+        capture_epoch,
+        frame_present,
+        last_sequence,
+        output_end,
+        final_pair_sequence,
+    )
+    .map_err(|_| invalid())
+}
+
+fn encode_capture_finish_body(boundary: &CaptureFinishBoundary) -> [u8; CAPTURE_FINISH_BODY_BYTES] {
+    let (last_sequence, output_end) = boundary.frame().unwrap_or((0, 0));
+    let mut body = [0_u8; CAPTURE_FINISH_BODY_BYTES];
+    body[..8].copy_from_slice(&boundary.session_id().get().to_be_bytes());
+    body[8..16].copy_from_slice(&boundary.capture_epoch().to_be_bytes());
+    body[16] = u8::from(boundary.frame().is_some());
+    body[17..25].copy_from_slice(&last_sequence.to_be_bytes());
+    body[25..33].copy_from_slice(&output_end.to_be_bytes());
+    body[33..41].copy_from_slice(&boundary.final_clock_pair_sequence().to_be_bytes());
+    body
+}
+
+/// Writes and flushes the exact kind 11 acknowledgement echoing `boundary`.
+/// Called only after the recorder confirmed that boundary.
+async fn write_capture_finish_ack<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    boundary: &CaptureFinishBoundary,
+) -> Result<(), AdapterError> {
+    let mut packet = Vec::with_capacity(TIMED_HEADER_BYTES + CAPTURE_FINISH_BODY_BYTES);
+    packet.extend_from_slice(b"MED3\x03");
+    packet.push(CAPTURE_FINISH_ACK_KIND);
+    packet.extend_from_slice(&(CAPTURE_FINISH_BODY_BYTES as u32).to_be_bytes());
+    packet.extend_from_slice(&encode_capture_finish_body(boundary));
+    writer
+        .write_all(&packet)
+        .await
+        .map_err(|_| AdapterError::new("capture finish acknowledgement write failed"))?;
+    writer
+        .flush()
+        .await
+        .map_err(|_| AdapterError::new("capture finish acknowledgement flush failed"))
+}
+
+/// One owned in-progress packet read. Bytes already consumed from the socket
+/// stay buffered here when a competing `select!` branch wins, so a resumed
+/// read continues the same packet instead of resetting mid-packet. Only
+/// dropping the reader at connection termination discards them. The idle
+/// packet timeout starts at a packet's first byte and is absolute across
+/// resumptions.
+struct MediaPacketReader<R> {
+    stream: R,
+    version: MediaVersion,
     max_payload_bytes: usize,
     packet_read_timeout: Duration,
-) -> Result<MediaMessage, AdapterError>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut header = [0_u8; FRAME_HEADER_BYTES];
-    stream
-        .read_exact(&mut header[..1])
-        .await
-        .map_err(|_| AdapterError::new("media frame was malformed"))?;
-    tokio::time::timeout(
-        packet_read_timeout,
-        read_media_message_after_first_byte(stream, header, max_payload_bytes),
-    )
-    .await
-    .map_err(|_| AdapterError::new("media bridge packet read timed out"))?
+    buffer: Vec<u8>,
+    deadline: Option<tokio::time::Instant>,
 }
 
-async fn read_media_message_after_first_byte<R>(
-    stream: &mut R,
-    mut header: [u8; FRAME_HEADER_BYTES],
-    max_payload_bytes: usize,
-) -> Result<MediaMessage, AdapterError>
-where
-    R: AsyncRead + Unpin,
-{
-    stream
-        .read_exact(&mut header[1..6])
-        .await
-        .map_err(|_| AdapterError::new("media frame was malformed"))?;
-    if header[..5] == *b"MED2\x02" {
-        return read_timed_media_body(stream, header[5], max_payload_bytes).await;
+impl<R: AsyncRead + Unpin> MediaPacketReader<R> {
+    fn new(
+        stream: R,
+        version: MediaVersion,
+        max_payload_bytes: usize,
+        packet_read_timeout: Duration,
+    ) -> Self {
+        Self {
+            stream,
+            version,
+            max_payload_bytes,
+            packet_read_timeout,
+            buffer: Vec::new(),
+            deadline: None,
+        }
     }
-    if header[..5] != [b'M', b'E', b'D', b'1', MEDIA_PROTOCOL_VERSION] {
-        return Err(AdapterError::new("media frame was malformed"));
-    }
-    match header[5] {
-        FRAME_KIND => read_frame_body(stream, header, max_payload_bytes).await,
-        PLAYBACK_ACK_KIND => read_playback_ack(stream).await,
-        FLUSH_ACK_KIND => read_flush_ack(stream).await,
-        _ => Err(AdapterError::new("media frame was malformed")),
+
+    /// `Ok(None)` is a clean EOF at a packet boundary; EOF inside a packet is
+    /// malformed input like any other truncation.
+    async fn next_message(&mut self) -> Result<Option<MediaMessage>, AdapterError> {
+        loop {
+            let goal = match packet_target(&self.buffer, self.version, self.max_payload_bytes)? {
+                PacketTarget::Packet(length) if self.buffer.len() >= length => {
+                    let packet = std::mem::take(&mut self.buffer);
+                    self.deadline = None;
+                    return parse_media_packet(&packet, self.version, self.max_payload_bytes)
+                        .map(Some);
+                }
+                PacketTarget::Packet(length) | PacketTarget::Header(length) => length,
+            };
+            let mut chunk = [0_u8; 4_096];
+            let wanted = (goal - self.buffer.len()).min(chunk.len());
+            let read = match self.deadline {
+                None => self.stream.read(&mut chunk[..wanted]).await,
+                Some(deadline) => {
+                    tokio::time::timeout_at(deadline, self.stream.read(&mut chunk[..wanted]))
+                        .await
+                        .map_err(|_| AdapterError::new("media bridge packet read timed out"))?
+                }
+            };
+            match read {
+                Ok(0) if self.buffer.is_empty() => return Ok(None),
+                Ok(0) | Err(_) => return Err(AdapterError::new("media frame was malformed")),
+                Ok(count) => {
+                    if self.deadline.is_none() {
+                        self.deadline =
+                            Some(tokio::time::Instant::now() + self.packet_read_timeout);
+                    }
+                    self.buffer.extend_from_slice(&chunk[..count]);
+                }
+            }
+        }
     }
 }
 
-async fn read_frame_body<R>(
-    stream: &mut R,
-    mut header: [u8; FRAME_HEADER_BYTES],
-    max_payload_bytes: usize,
-) -> Result<MediaMessage, AdapterError>
-where
-    R: AsyncRead + Unpin,
-{
-    stream
-        .read_exact(&mut header[6..])
-        .await
-        .map_err(|_| AdapterError::new("media frame was malformed"))?;
+fn parse_frame_body(packet: &[u8]) -> Result<MediaMessage, AdapterError> {
+    let header = &packet[..FRAME_HEADER_BYTES];
     let direction = header[6];
-    if direction != CAPTURE_DIRECTION && direction != PLAYBACK_DIRECTION {
-        return Err(AdapterError::new("media frame direction was malformed"));
-    }
     let session_id = SessionId::new(u64::from_be_bytes(header[7..15].try_into().unwrap()));
     let sequence = u64::from_be_bytes(header[15..23].try_into().unwrap());
     let captured_at_ms = u64::from_be_bytes(header[23..31].try_into().unwrap());
@@ -1381,37 +1822,18 @@ where
     };
     let sample_rate_hz = u32::from_be_bytes(header[32..36].try_into().unwrap());
     let channels = u16::from_be_bytes(header[36..38].try_into().unwrap());
-    let payload_length = u32::from_be_bytes(header[38..42].try_into().unwrap()) as usize;
-    if payload_length == 0 || payload_length > max_payload_bytes {
-        return Err(AdapterError::new(
-            "media frame payload was outside its byte bound",
-        ));
-    }
     let format = PcmFormat::new(sample_rate_hz, channels, sample_format)?;
-    let mut payload = vec![0_u8; payload_length];
-    stream
-        .read_exact(&mut payload)
-        .await
-        .map_err(|_| AdapterError::new("media frame was truncated"))?;
     Ok(MediaMessage::Frame {
         direction,
         session_id,
         sequence,
         captured_at_ms,
         format,
-        payload,
+        payload: packet[FRAME_HEADER_BYTES..].to_vec(),
     })
 }
 
-async fn read_playback_ack<R>(stream: &mut R) -> Result<MediaMessage, AdapterError>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut body = [0_u8; 17];
-    stream
-        .read_exact(&mut body)
-        .await
-        .map_err(|_| AdapterError::new("media playback acknowledgement was malformed"))?;
+fn parse_playback_ack(body: &[u8]) -> Result<MediaMessage, AdapterError> {
     let acknowledgement = match body[16] {
         1 => NetworkPlaybackAck::Accepted,
         2 => NetworkPlaybackAck::Rendered,
@@ -1428,15 +1850,7 @@ where
     })
 }
 
-async fn read_flush_ack<R>(stream: &mut R) -> Result<MediaMessage, AdapterError>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut body = [0_u8; 16];
-    stream
-        .read_exact(&mut body)
-        .await
-        .map_err(|_| AdapterError::new("media flush acknowledgement was malformed"))?;
+fn parse_flush_ack(body: &[u8]) -> Result<MediaMessage, AdapterError> {
     Ok(MediaMessage::FlushAck {
         session_id: SessionId::new(u64::from_be_bytes(body[..8].try_into().unwrap())),
         generation_id: GenerationId::new(u64::from_be_bytes(body[8..16].try_into().unwrap())),
@@ -1771,7 +2185,12 @@ mod timing_domain_tests {
             assert!(!server.inner.sessions.lock().await[&id.get()].active);
             let replacement = server
                 .inner
-                .authenticate(id, lease.credential(), Some("bridge-independent"))
+                .authenticate(
+                    id,
+                    lease.credential(),
+                    Some("bridge-independent"),
+                    MediaVersion::Timed,
+                )
                 .await
                 .unwrap();
             assert!(server.inner.disconnect(id, old).await.is_none());
@@ -1838,20 +2257,28 @@ mod timing_domain_tests {
         ))
         .unwrap();
         let mut bytes = Vec::new();
-        write_authentication_accepted(&mut bytes, SessionId::new(41), "bridge-independent")
-            .await
-            .unwrap();
+        write_authentication_accepted(
+            &mut bytes,
+            SessionId::new(41),
+            "bridge-independent",
+            MediaVersion::Timed,
+        )
+        .await
+        .unwrap();
         let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
         assert_eq!(hex, fixture["authenticationAcceptedHex"]);
         assert!(!bytes
             .windows(b"fixture-token".len())
             .any(|part| part == b"fixture-token"));
         for bridge in ["", "bad\nbridge", &"x".repeat(65)] {
-            assert!(
-                write_authentication_accepted(&mut Vec::new(), SessionId::new(41), bridge)
-                    .await
-                    .is_err()
-            );
+            assert!(write_authentication_accepted(
+                &mut Vec::new(),
+                SessionId::new(41),
+                bridge,
+                MediaVersion::Timed
+            )
+            .await
+            .is_err());
         }
         let server = timed_server().await;
         let id = SessionId::new(41);
@@ -1892,7 +2319,12 @@ mod timing_domain_tests {
             .unwrap();
         let replacement = server
             .inner
-            .authenticate(id, lease.credential(), Some("bridge-independent"))
+            .authenticate(
+                id,
+                lease.credential(),
+                Some("bridge-independent"),
+                MediaVersion::Timed,
+            )
             .await
             .unwrap();
         tokio::time::advance(MEDIA_HANDSHAKE_TIMEOUT).await;
@@ -2019,7 +2451,12 @@ mod timing_domain_tests {
                 .unwrap();
             let replacement = server
                 .inner
-                .authenticate(id, lease.credential(), Some("bridge-independent"))
+                .authenticate(
+                    id,
+                    lease.credential(),
+                    Some("bridge-independent"),
+                    MediaVersion::Timed,
+                )
                 .await
                 .unwrap();
             let mut transport = if already_attached {
@@ -2092,7 +2529,12 @@ mod timing_domain_tests {
             let mut recognition = capture.start(id, cancellation.clone()).await.unwrap();
             let connection = server
                 .inner
-                .authenticate(id, lease.credential(), Some("bridge-independent"))
+                .authenticate(
+                    id,
+                    lease.credential(),
+                    Some("bridge-independent"),
+                    MediaVersion::Timed,
+                )
                 .await
                 .unwrap();
             let mut old_transport = server
@@ -2155,7 +2597,12 @@ mod timing_domain_tests {
             assert!(
                 server
                     .inner
-                    .authenticate(id, lease.credential(), Some("bridge-independent"))
+                    .authenticate(
+                        id,
+                        lease.credential(),
+                        Some("bridge-independent"),
+                        MediaVersion::Timed
+                    )
                     .await
                     .is_err(),
                 "new epoch could overtake pending old gap"
@@ -2174,7 +2621,12 @@ mod timing_domain_tests {
                 let recognition = capture.start(id, cancellation.clone()).await.unwrap();
                 let connection = server
                     .inner
-                    .authenticate(id, lease.credential(), Some("bridge-independent"))
+                    .authenticate(
+                        id,
+                        lease.credential(),
+                        Some("bridge-independent"),
+                        MediaVersion::Timed,
+                    )
                     .await
                     .unwrap();
                 let transport = server
@@ -2351,7 +2803,7 @@ mod timing_domain_tests {
         };
         let connection = server
             .inner
-            .authenticate(id, lease.credential(), Some("bridge"))
+            .authenticate(id, lease.credential(), Some("bridge"), MediaVersion::Timed)
             .await
             .unwrap();
         server.inner.admit_timed_rate(id, true).await.unwrap();
@@ -2370,7 +2822,7 @@ mod timing_domain_tests {
         server.inner.disconnect(id, connection).await.unwrap();
         let reconnected = server
             .inner
-            .authenticate(id, lease.credential(), Some("bridge"))
+            .authenticate(id, lease.credential(), Some("bridge"), MediaVersion::Timed)
             .await
             .unwrap();
         for (domain, number, reconnect) in [("A", 1, true), ("A", 2, false), ("B", 1, false)] {
@@ -2481,6 +2933,554 @@ mod timing_domain_tests {
             assert_eq!(state.output_end, Some(10));
             assert_eq!(state.epoch.as_ref().unwrap().clock_domain_id, "process-255");
         }
+        server.shutdown().await;
+    }
+
+    fn finish_body(
+        session_id: u64,
+        capture_epoch: u64,
+        frame_present: u8,
+        sequence: u64,
+        output_end: u64,
+        pair_sequence: u64,
+    ) -> Vec<u8> {
+        let mut body = Vec::with_capacity(CAPTURE_FINISH_BODY_BYTES);
+        body.extend_from_slice(&session_id.to_be_bytes());
+        body.extend_from_slice(&capture_epoch.to_be_bytes());
+        body.push(frame_present);
+        body.extend_from_slice(&sequence.to_be_bytes());
+        body.extend_from_slice(&output_end.to_be_bytes());
+        body.extend_from_slice(&pair_sequence.to_be_bytes());
+        body
+    }
+
+    #[tokio::test]
+    async fn drainable_finish_codec_accepts_exact_nonempty_and_zero_frame_boundaries() {
+        for (present, sequence, output_end) in [(1, 7, 960), (0, 0, 0)] {
+            let body = finish_body(41, 2, present, sequence, output_end, 3);
+            let boundary = decode_capture_finish_body(&body).unwrap();
+            assert_eq!(boundary.session_id(), SessionId::new(41));
+            assert_eq!(boundary.capture_epoch(), 2);
+            assert_eq!(
+                boundary.frame(),
+                (present == 1).then_some((sequence, output_end))
+            );
+            assert_eq!(boundary.final_clock_pair_sequence(), 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn drainable_finish_codec_rejects_noncanonical_or_truncated_boundaries() {
+        for body in [
+            finish_body(41, 2, 2, 7, 960, 3),
+            finish_body(41, 2, 0, 7, 960, 3),
+            finish_body(41, 0, 1, 7, 960, 3),
+            finish_body(41, 2, 1, 7, 960, 0),
+            finish_body(41, 2, 1, 7, 960, 3)[..40].to_vec(),
+        ] {
+            assert!(decode_capture_finish_body(&body).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn drainable_finish_ack_is_exact_and_flushed() {
+        let boundary = CaptureFinishBoundary::new(SessionId::new(41), 2, true, 7, 960, 3).unwrap();
+        let mut output = Vec::new();
+        write_capture_finish_ack(&mut output, &boundary)
+            .await
+            .unwrap();
+        let mut expected = b"MED3\x03\x0b\x00\x00\x00\x29".to_vec();
+        expected.extend(finish_body(41, 2, 1, 7, 960, 3));
+        assert_eq!(output, expected);
+        assert_eq!(output.len(), 51);
+    }
+
+    #[tokio::test]
+    async fn timed_and_drainable_envelopes_are_not_interchangeable() {
+        let body = finish_body(41, 2, 1, 7, 960, 3);
+        let mut media3 = b"MED3\x03\x0a\x00\x00\x00\x29".to_vec();
+        media3.extend(body);
+        assert!(MediaPacketReader::new(
+            std::io::Cursor::new(media3),
+            MediaVersion::Timed,
+            MAX_PCM_FRAME_BYTES,
+            Duration::from_secs(1),
+        )
+        .next_message()
+        .await
+        .is_err());
+
+        let media2 = b"MED2\x02\x06\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00\x00\x29";
+        assert!(MediaPacketReader::new(
+            std::io::Cursor::new(media2),
+            MediaVersion::DrainableTimed,
+            MAX_PCM_FRAME_BYTES,
+            Duration::from_secs(1),
+        )
+        .next_message()
+        .await
+        .is_err());
+    }
+
+    /// Serves scripted input in chunks. Serving the chunk at `gate_before`
+    /// waits for the gate, returning `Pending` so a competing `select!`
+    /// branch can win while a packet is only partly consumed.
+    struct FragmentIo {
+        chunks: std::collections::VecDeque<Vec<u8>>,
+        gate_before: usize,
+        served: usize,
+        gate: Option<tokio::sync::oneshot::Receiver<()>>,
+        stalled: Arc<tokio::sync::Notify>,
+        written: Arc<std::sync::Mutex<Vec<u8>>>,
+        flushed: Arc<tokio::sync::Notify>,
+    }
+    impl AsyncRead for FragmentIo {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            out: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.served == self.gate_before {
+                if let Some(gate) = self.gate.as_mut() {
+                    if Pin::new(gate).poll(cx).is_pending() {
+                        self.stalled.notify_one();
+                        return Poll::Pending;
+                    }
+                    self.gate = None;
+                }
+            }
+            let Some(mut chunk) = self.chunks.pop_front() else {
+                return Poll::Pending;
+            };
+            let count = out.remaining().min(chunk.len());
+            out.put_slice(&chunk[..count]);
+            if count < chunk.len() {
+                chunk.drain(..count);
+                self.chunks.push_front(chunk);
+            } else {
+                self.served += 1;
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+    impl AsyncWrite for FragmentIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.written.lock().unwrap().extend_from_slice(bytes);
+            Poll::Ready(Ok(bytes.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            self.flushed.notify_one();
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A playback acknowledgement split across the moment the outbound
+    /// playback branch wins the connection `select!`. The bytes already
+    /// consumed before the stall must still belong to that acknowledgement.
+    #[tokio::test]
+    async fn fragmented_acknowledgement_survives_a_competing_playback_branch() {
+        use conversation_protocol::PlaybackState;
+        let server = MediaServer::bind(MediaServerConfig::loopback())
+            .await
+            .unwrap();
+        let id = SessionId::new(41);
+        let lease = server.reserve(id).await.unwrap();
+        let mut auth = b"MED1\x01\x01".to_vec();
+        auth.extend(id.get().to_be_bytes());
+        auth.push(lease.credential().len() as u8);
+        auth.extend(lease.credential().as_bytes());
+        let mut ack_tail = vec![PLAYBACK_ACK_KIND];
+        ack_tail.extend(id.get().to_be_bytes());
+        ack_tail.extend(1_u64.to_be_bytes());
+        ack_tail.push(1);
+        let (release, gate) = tokio::sync::oneshot::channel();
+        let io = FragmentIo {
+            chunks: [auth, b"MED1\x01".to_vec(), ack_tail].into(),
+            gate_before: 2,
+            served: 0,
+            gate: Some(gate),
+            stalled: Arc::default(),
+            written: Arc::default(),
+            flushed: Arc::default(),
+        };
+        let stalled = io.stalled.clone();
+        let written = io.written.clone();
+        let flushed = io.flushed.clone();
+        let task = tokio::spawn(serve_connection(io, server.inner.clone()));
+        tokio::time::timeout(MEDIA_HANDSHAKE_TIMEOUT, stalled.notified())
+            .await
+            .expect("reader never stalled mid-packet");
+        let hub = server.hub();
+        let frame = frame_for_network_capture(
+            1,
+            PcmFormat::new(24000, 1, PcmSampleFormat::Signed16LittleEndian).unwrap(),
+            vec![0, 0],
+        )
+        .unwrap();
+        let playback = tokio::spawn(async move {
+            hub.enqueue_playback(id, frame, CancellationToken::new())
+                .await
+        });
+        tokio::time::timeout(MEDIA_HANDSHAKE_TIMEOUT, flushed.notified())
+            .await
+            .expect("playback frame was never written while the read was stalled");
+        assert!(written.lock().unwrap().starts_with(b"MED1\x01\x02\x02"));
+        release.send(()).unwrap();
+        let receipt = tokio::time::timeout(MEDIA_HANDSHAKE_TIMEOUT, playback)
+            .await
+            .expect("fragmented acknowledgement was never processed")
+            .unwrap();
+        assert_eq!(
+            receipt
+                .expect("partially read acknowledgement was reset by the playback branch")
+                .state(),
+            PlaybackState::Accepted
+        );
+        assert!(
+            !task.is_finished(),
+            "connection failed after the fragmented acknowledgement"
+        );
+        server.shutdown().await;
+        assert!(task.await.unwrap().is_ok());
+    }
+
+    fn med3(kind: u8, body: &[u8]) -> Vec<u8> {
+        let mut packet = b"MED3\x03".to_vec();
+        packet.push(kind);
+        packet.extend((body.len() as u32).to_be_bytes());
+        packet.extend_from_slice(body);
+        packet
+    }
+
+    struct PendingFinishFixture {
+        peer: tokio::io::DuplexStream,
+        task: JoinHandle<Result<(), AdapterError>>,
+        recording: tokio::sync::mpsc::Receiver<Result<VoiceInputEvent, AdapterError>>,
+        _recognition: tokio::sync::mpsc::Receiver<Result<CaptureEvent, AdapterError>>,
+        io: conversation_model_adapters::VoiceIoSession,
+        finish: conversation_model_adapters::CaptureFinish,
+    }
+    use conversation_model_adapters::{CaptureEvent, VoiceInputEvent};
+
+    /// Authenticates a drainable in-process peer, admits an epoch and clock
+    /// pair, sends the zero-frame finish and returns once the recorder
+    /// barrier is on the voice queue; the test decides how it settles.
+    async fn drainable_pending_finish(
+        server: &MediaServer,
+        cancellation: &CancellationToken,
+    ) -> PendingFinishFixture {
+        use conversation_model_adapters::{
+            CaptureClockPair, CaptureEpoch, NetworkVoiceIoFactory, VoiceIoFactory,
+        };
+        let id = SessionId::new(41);
+        let lease = server
+            .reserve_drainable_timed(id, "bridge-independent".into())
+            .await
+            .unwrap();
+        let factory = NetworkVoiceIoFactory::new(server.hub(), id);
+        let io = factory.start(id, cancellation.clone()).await.unwrap();
+        let mut recording = io.input.start(id, cancellation.clone()).await.unwrap();
+        let recognition = factory
+            .recognition_capture()
+            .start(id, cancellation.clone())
+            .await
+            .unwrap();
+        let (server_side, mut peer) = tokio::io::duplex(65_536);
+        let task = tokio::spawn(serve_connection(server_side, server.inner.clone()));
+        let mut body = id.get().to_be_bytes().to_vec();
+        body.push(lease.credential().len() as u8);
+        body.extend(lease.credential().as_bytes());
+        body.push(18);
+        body.extend(b"bridge-independent");
+        peer.write_all(&med3(AUTH_KIND, &body)).await.unwrap();
+        let mut confirmation = [0_u8; 37];
+        peer.read_exact(&mut confirmation).await.unwrap();
+        assert_eq!(&confirmation[..6], b"MED3\x03\x09");
+        let epoch = CaptureEpoch {
+            bridge_session_id: "bridge-independent".into(),
+            clock_domain_id: "source-process".into(),
+            capture_epoch: 1,
+        };
+        let mut body = id.get().to_be_bytes().to_vec();
+        body.extend(epoch.encode().unwrap());
+        peer.write_all(&med3(6, &body)).await.unwrap();
+        assert!(matches!(
+            recording.recv().await.unwrap().unwrap(),
+            VoiceInputEvent::CaptureMetadata(CaptureMetadata::Epoch(_))
+        ));
+        let pair = CaptureClockPair {
+            clock_domain_id: "source-process".into(),
+            wall_epoch: 1,
+            sequence: 1,
+            host_before_ns: 900_000_000,
+            host_after_ns: 900_000_000,
+            local_unix_ns: 2_000_000_000,
+            wall_resolution_ns: 1,
+            external_utc_accuracy_ns: None,
+        };
+        let mut body = id.get().to_be_bytes().to_vec();
+        body.extend(pair.encode().unwrap());
+        peer.write_all(&med3(7, &body)).await.unwrap();
+        assert!(matches!(
+            recording.recv().await.unwrap().unwrap(),
+            VoiceInputEvent::CaptureMetadata(CaptureMetadata::ClockPair(_))
+        ));
+        peer.write_all(&med3(CAPTURE_FINISH_KIND, &finish_body(41, 1, 0, 0, 0, 1)))
+            .await
+            .unwrap();
+        let VoiceInputEvent::CaptureFinish(finish) = recording.recv().await.unwrap().unwrap()
+        else {
+            panic!("finish barrier expected on the voice queue")
+        };
+        assert_eq!(
+            *finish.boundary(),
+            CaptureFinishBoundary::new(id, 1, false, 0, 0, 1).unwrap()
+        );
+        PendingFinishFixture {
+            peer,
+            task,
+            recording,
+            _recognition: recognition,
+            io,
+            finish,
+        }
+    }
+
+    async fn assert_no_ack_and_failed_close(
+        server: &MediaServer,
+        fixture: PendingFinishFixture,
+        cancellation: CancellationToken,
+        expect_ok: bool,
+    ) {
+        let PendingFinishFixture {
+            mut peer,
+            task,
+            recording,
+            _recognition,
+            io,
+            finish,
+        } = fixture;
+        let result = tokio::time::timeout(MEDIA_CONNECTION_REAP_TIMEOUT, task)
+            .await
+            .expect("connection did not settle")
+            .unwrap();
+        assert_eq!(result.is_ok(), expect_ok, "{result:?}");
+        let mut byte = [0_u8; 1];
+        assert!(
+            matches!(peer.read(&mut byte).await, Ok(0) | Err(_)),
+            "a capture finish acknowledgement was written without recorder success"
+        );
+        // The single owned operation is gone: a late recorder completion is ignored.
+        finish.complete(Ok(()));
+        assert!(!server
+            .inner
+            .sessions
+            .lock()
+            .await
+            .get(&41)
+            .is_some_and(|session| session.active));
+        drop(recording);
+        cancellation.cancel();
+        io.completion.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drainable_finish_deadline_expires_without_ack_and_reaps_the_operation() {
+        let server = timed_server().await;
+        let cancellation = CancellationToken::new();
+        let fixture = drainable_pending_finish(&server, &cancellation).await;
+        tokio::time::advance(CAPTURE_FINISH_TIMEOUT - Duration::from_millis(1)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !fixture.task.is_finished(),
+            "finish failed before its deadline"
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_no_ack_and_failed_close(&server, fixture, cancellation, false).await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn drainable_finish_cancellation_revocation_and_dropped_barrier_yield_no_ack() {
+        for action in ["cancel", "revoke", "drop_barrier", "drop_voice"] {
+            let server = timed_server().await;
+            let cancellation = CancellationToken::new();
+            let mut fixture = drainable_pending_finish(&server, &cancellation).await;
+            match action {
+                "cancel" => server.inner.cancellation.cancel(),
+                "revoke" => server.revoke(SessionId::new(41)).await,
+                "drop_barrier" => {
+                    // The voice loop exited while holding the barrier.
+                    let (replacement, _) = conversation_model_adapters::CaptureFinish::new(
+                        fixture.finish.boundary().clone(),
+                    );
+                    drop(std::mem::replace(&mut fixture.finish, replacement));
+                }
+                _ => {
+                    // Voice input closed (natural terminal) before the recorder ran.
+                    let (_, closed) = tokio::sync::mpsc::channel(1);
+                    drop(std::mem::replace(&mut fixture.recording, closed));
+                    let (replacement, _) = conversation_model_adapters::CaptureFinish::new(
+                        fixture.finish.boundary().clone(),
+                    );
+                    drop(std::mem::replace(&mut fixture.finish, replacement));
+                }
+            }
+            assert_no_ack_and_failed_close(&server, fixture, cancellation, action == "cancel")
+                .await;
+            server.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn drainable_finish_ack_write_failure_is_a_truthful_false_negative() {
+        let server = timed_server().await;
+        let cancellation = CancellationToken::new();
+        let PendingFinishFixture {
+            peer,
+            task,
+            recording,
+            _recognition,
+            io,
+            finish,
+        } = drainable_pending_finish(&server, &cancellation).await;
+        // The peer is gone before the recorder confirms; the biased loop settles
+        // the recorder result first and the acknowledgement write must fail.
+        drop(peer);
+        finish.complete(Ok(()));
+        let result = tokio::time::timeout(MEDIA_CONNECTION_REAP_TIMEOUT, task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "acknowledgement write failure was reported as success"
+        );
+        assert!(!server.inner.sessions.lock().await[&41].active);
+        assert!(
+            server.inner.sessions.lock().await[&41].capture_finished,
+            "failed acknowledgement reopened the capture lane"
+        );
+        drop(recording);
+        cancellation.cancel();
+        io.completion.await.unwrap().unwrap();
+        server.shutdown().await;
+    }
+
+    /// After kind 11 the producer may still write pre-close media-v1
+    /// acknowledgements; planned completion is its clean EOF, not the ACK.
+    #[tokio::test]
+    async fn drainable_finish_planned_close_waits_for_the_producer_eof() {
+        use tokio::sync::mpsc::error::TryRecvError;
+        let server = timed_server().await;
+        let cancellation = CancellationToken::new();
+        let PendingFinishFixture {
+            mut peer,
+            task,
+            mut recording,
+            _recognition,
+            io,
+            finish,
+        } = drainable_pending_finish(&server, &cancellation).await;
+        let reconnect_deadline = server.inner.sessions.lock().await[&41].reconnect_deadline;
+        finish.complete(Ok(()));
+        let mut ack = [0_u8; 51];
+        peer.read_exact(&mut ack).await.unwrap();
+        assert_eq!(&ack[..10], b"MED3\x03\x0b\x00\x00\x00\x29");
+        let mut late = b"MED1\x01\x03".to_vec();
+        late.extend(41_u64.to_be_bytes());
+        late.extend(1_u64.to_be_bytes());
+        late.push(1);
+        peer.write_all(&late)
+            .await
+            .expect("server closed before the producer finished");
+        peer.flush().await.unwrap();
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            peer.read(&mut byte).await.unwrap(),
+            0,
+            "no FIN after the ACK"
+        );
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!task.is_finished(), "server closed before the producer EOF");
+        drop(peer);
+        let result = tokio::time::timeout(MEDIA_CONNECTION_REAP_TIMEOUT, task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result.is_ok(),
+            "clean producer EOF was not planned completion: {result:?}"
+        );
+        let sessions = server.inner.sessions.lock().await;
+        assert!(!sessions[&41].active);
+        assert_eq!(
+            sessions[&41].reconnect_deadline, reconnect_deadline,
+            "planned completion set a reconnect window"
+        );
+        drop(sessions);
+        assert!(matches!(recording.try_recv(), Err(TryRecvError::Empty)));
+        drop(recording);
+        cancellation.cancel();
+        io.completion.await.unwrap().unwrap();
+        server.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drainable_finish_acked_producer_that_never_closes_fails_at_the_deadline() {
+        let server = timed_server().await;
+        let cancellation = CancellationToken::new();
+        let PendingFinishFixture {
+            mut peer,
+            task,
+            recording,
+            _recognition,
+            io,
+            finish,
+        } = drainable_pending_finish(&server, &cancellation).await;
+        tokio::time::advance(Duration::from_secs(4)).await;
+        finish.complete(Ok(()));
+        let mut ack = [0_u8; 51];
+        peer.read_exact(&mut ack).await.unwrap();
+        let mut byte = [0_u8; 1];
+        assert_eq!(peer.read(&mut byte).await.unwrap(), 0);
+        tokio::time::advance(Duration::from_secs(6) - Duration::from_millis(1)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !task.is_finished(),
+            "acked connection failed before the deadline"
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let result = tokio::time::timeout(MEDIA_CONNECTION_REAP_TIMEOUT, task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "silent producer was treated as planned completion"
+        );
+        assert_eq!(
+            peer.read(&mut byte).await.unwrap(),
+            0,
+            "a second packet followed the ACK"
+        );
+        assert!(!server.inner.sessions.lock().await[&41].active);
+        drop(recording);
+        cancellation.cancel();
+        io.completion.await.unwrap().unwrap();
         server.shutdown().await;
     }
 }

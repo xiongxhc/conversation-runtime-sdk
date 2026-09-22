@@ -44,11 +44,11 @@ pub use buffered_streaming_speech::BufferedStreamingSpeechSynthesizer;
 pub use capture::{AudioCapture, CaptureEvent};
 pub use capture_timing::{
     validate_capture_identifier, CaptureClockPair, CaptureDiscontinuityReason,
-    CaptureDomainHistory, CaptureEpoch, CaptureMappingQuality, CaptureMetadata, FrameProvenance,
-    NominalCaptureSpan, TimedCapture, CAPTURE_TIMING_BYTES, CLOCK_PAIR_CADENCE_NS,
-    MAX_CAPTURE_CLOCK_DOMAINS, MAX_CAPTURE_IDENTIFIER_BYTES, MAX_CAPTURE_TIMING_BYTES,
-    MAX_CLOCK_BRACKET_NS, MAX_CLOCK_PAIR_GAP_NS, MAX_CLOCK_RESIDUAL_NS, MAX_RECORDING_TIMING_BYTES,
-    MAX_RECORDING_TIMING_RECORDS,
+    CaptureDomainHistory, CaptureEpoch, CaptureFinishBoundary, CaptureMappingQuality,
+    CaptureMetadata, FrameProvenance, NominalCaptureSpan, TimedCapture, CAPTURE_TIMING_BYTES,
+    CLOCK_PAIR_CADENCE_NS, MAX_CAPTURE_CLOCK_DOMAINS, MAX_CAPTURE_IDENTIFIER_BYTES,
+    MAX_CAPTURE_TIMING_BYTES, MAX_CLOCK_BRACKET_NS, MAX_CLOCK_PAIR_GAP_NS, MAX_CLOCK_RESIDUAL_NS,
+    MAX_RECORDING_TIMING_BYTES, MAX_RECORDING_TIMING_RECORDS,
 };
 pub use continuous_audio_output::{ContinuousAudioOutput, PlaybackReceipt};
 pub use diarization::{
@@ -99,7 +99,7 @@ pub use speech::{AudioFormat, SpeechRequest, SpeechSynthesizer, SynthesizedAudio
 pub use speechbrain_diarization::{SpeechbrainDiarizationConfig, SpeechbrainTranscriptionDiarizer};
 pub use streaming_speech::{StreamingSpeechRequest, StreamingSpeechSynthesizer};
 pub use voice_capture_control::VoiceCaptureControl;
-pub use voice_input::{AudioDeviceStatus, VoiceInput, VoiceInputEvent};
+pub use voice_input::{AudioDeviceStatus, CaptureFinish, VoiceInput, VoiceInputEvent};
 pub use voice_io::{VoiceIoFactory, VoiceIoSession};
 pub use voice_mock::{
     MockAudioCapture, MockContinuousAudioOutput, MockGenerationLanguageModel, MockSpeechRecognizer,

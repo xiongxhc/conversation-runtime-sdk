@@ -20,6 +20,7 @@ import {
   type FinalizedRecordingCapability,
   type FinalizedRecordingForVersion,
   type TimedMediaLease,
+  type DrainableTimedMediaLease,
   type RecordingAlignmentPage,
   type RecordingAlignmentComplete,
   type RecordingIdentity,
@@ -54,6 +55,12 @@ export interface VoiceSession<Version extends ClientProtocolVersion = ClientProt
 
 export interface TimedVoiceSession extends Omit<VoiceSession<4>, "mediaLease"> {
   readonly mediaLease: TimedMediaLease;
+  stopIfActive(): Promise<"stopped" | "already_terminal">;
+}
+
+export interface DrainableTimedVoiceSession extends Omit<VoiceSession<4>, "mediaLease"> {
+  readonly mediaLease: DrainableTimedMediaLease;
+  stopIfActive(): Promise<"stopped" | "already_terminal">;
 }
 
 export class CommandRejectedError extends Error {
@@ -414,6 +421,17 @@ export class RuntimeClient<Version extends ClientProtocolVersion = ClientProtoco
     return result.promise;
   }
 
+  startDrainableTimedVoiceSession(this: RuntimeClient<4>, options: { bridgeSessionId: string; profile: RuntimeProfile; responseMode: VoiceResponseMode }): Promise<DrainableTimedVoiceSession> {
+    if (this.protocolVersion !== 4) return Promise.reject(new Error("drainable timed voice requires protocol version 4"));
+    const requestId = this.nextRequestId();
+    const command: ClientCommand = { type: "start_drainable_timed_voice_session", requestId, ...options };
+    try { validateClientCommand(command, 4); } catch (error) { return Promise.reject(asError(error)); }
+    const result = new Deferred<DrainableTimedVoiceSession>();
+    this.controls.set(requestId, { kind: "start_drainable_timed_voice_session", accepted: false, result, fail: (error) => result.reject(error) });
+    this.send(command);
+    return result.promise;
+  }
+
   readRecordingAlignment(this: RuntimeClient<4>, { capability }: { capability: FinalizedRecordingCapability }): AsyncIterable<RecordingAlignmentPage | RecordingAlignmentComplete> {
     if (this.protocolVersion !== 4) throw new Error("recording alignment requires protocol version 4");
     if ([...this.controls.values()].some((control) => control.kind === "read_recording_alignment")) throw new Error("a recording alignment read is already active");
@@ -495,6 +513,22 @@ export class RuntimeClient<Version extends ClientProtocolVersion = ClientProtoco
     return result.promise;
   }
 
+  private stopVoiceIfActive(session: VoiceSessionState): Promise<"stopped" | "already_terminal"> {
+    if (this.failure) return Promise.reject(this.failure);
+    if (this.activeVoiceSession !== session) {
+      return session.terminal
+        ? Promise.resolve("already_terminal")
+        : Promise.reject(new Error("voice session is no longer active"));
+    }
+    return this.voiceControl("stop_voice_session", session).then(
+      () => "stopped" as const,
+      (error: unknown) => {
+        if (session.terminal && error instanceof CommandRejectedError) return "already_terminal" as const;
+        throw error;
+      },
+    );
+  }
+
   interrupt(turnId: bigint): Promise<void> {
     const requestId = this.nextRequestId();
     const result = new Deferred<void>();
@@ -569,13 +603,16 @@ export class RuntimeClient<Version extends ClientProtocolVersion = ClientProtoco
     }
     if (message.type === "timed_voice_session_started") {
       const control = this.controls.get(message.requestId);
-      if (!control || control.kind !== "start_timed_voice_session" || !control.accepted || !this.activeVoiceSession || message.mediaLease.sessionId !== this.controlSessionId) {
+      if (!control || (control.kind !== "start_timed_voice_session" && control.kind !== "start_drainable_timed_voice_session") || !control.accepted || !this.activeVoiceSession || message.mediaLease.sessionId !== this.controlSessionId ||
+          (control.kind === "start_timed_voice_session" ? message.mediaLease.mediaProtocolVersion !== 2 : message.mediaLease.mediaProtocolVersion !== 3)) {
         this.fail(new Error("gateway sent uncorrelated timed voice start")); return;
       }
       const session = this.activeVoiceSession;
       session.sessionId = message.mediaLease.sessionId;
       this.controls.delete(message.requestId);
-      control.result.resolve({ mediaLease: message.mediaLease, events: () => session.events as AsyncIterable<VoiceSessionEventForVersion<4>>, stop: () => this.voiceControl("stop_voice_session", session), pauseCapture: () => this.voiceControl("pause_voice_capture", session), resumeCapture: () => this.voiceControl("resume_voice_capture", session) });
+      const timed = { mediaLease: message.mediaLease, events: () => session.events as AsyncIterable<VoiceSessionEventForVersion<4>>, stop: () => this.voiceControl("stop_voice_session", session), stopIfActive: () => this.stopVoiceIfActive(session), pauseCapture: () => this.voiceControl("pause_voice_capture", session), resumeCapture: () => this.voiceControl("resume_voice_capture", session) };
+      if (control.kind === "start_timed_voice_session") control.result.resolve(timed as TimedVoiceSession);
+      else control.result.resolve(timed as DrainableTimedVoiceSession);
       return;
     }
     if (message.type === "fatal") {
@@ -723,6 +760,7 @@ export class RuntimeClient<Version extends ClientProtocolVersion = ClientProtoco
       }
       session.events.push(message.event);
       if (terminal) {
+        session.terminal = true;
         this.activeVoiceSession = undefined;
         session.events.finish();
       }
@@ -757,8 +795,9 @@ export class RuntimeClient<Version extends ClientProtocolVersion = ClientProtoco
     switch (control.kind) {
       case "read_recording_alignment": return;
       case "start_timed_voice_session":
+      case "start_drainable_timed_voice_session":
         if (this.activeVoiceSession) { this.fail(new Error("gateway accepted concurrent voice sessions")); return; }
-        this.activeVoiceSession = { events: new AsyncQueue<VoiceSessionEvent>(), started: false };
+        this.activeVoiceSession = { events: new AsyncQueue<VoiceSessionEvent>(), started: false, terminal: false };
         return;
       case "status":
       case "memory_list":
@@ -802,7 +841,7 @@ export class RuntimeClient<Version extends ClientProtocolVersion = ClientProtoco
           control.fail(new Error("gateway accepted a start voice session while one was already active"));
           return;
         }
-        const session: VoiceSessionState = { events: new AsyncQueue<VoiceSessionEvent>(), started: false };
+        const session: VoiceSessionState = { events: new AsyncQueue<VoiceSessionEvent>(), started: false, terminal: false };
         this.activeVoiceSession = session;
         control.result.resolve({
           mediaLease: mediaLease as Version extends 3 | 4 ? MediaLease | undefined : undefined,
@@ -916,6 +955,7 @@ export class RuntimeClient<Version extends ClientProtocolVersion = ClientProtoco
 type PendingControl<Version extends ClientProtocolVersion> =
   | { kind: "read_recording_alignment"; accepted: boolean; iterator: AlignmentIterator; fail(error: Error): void }
   | { kind: "start_timed_voice_session"; accepted: boolean; result: Deferred<TimedVoiceSession>; fail(error: Error): void }
+  | { kind: "start_drainable_timed_voice_session"; accepted: boolean; result: Deferred<DrainableTimedVoiceSession>; fail(error: Error): void }
   | { kind: "status"; accepted: boolean; result: Deferred<RuntimeStatus>; fail(error: Error): void }
   | { kind: "memory_list"; accepted: boolean; result: Deferred<MemoryPage>; fail(error: Error): void }
   | { kind: "memory_inspect"; accepted: boolean; result: Deferred<MemoryInspection>; fail(error: Error): void }
@@ -950,6 +990,7 @@ type VoiceSessionState = {
   events: AsyncQueue<VoiceSessionEvent>;
   sessionId?: bigint;
   started: boolean;
+  terminal: boolean;
 };
 
 class Deferred<T> {

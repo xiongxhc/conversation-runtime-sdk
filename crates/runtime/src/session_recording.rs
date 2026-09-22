@@ -53,9 +53,9 @@ use std::time::Instant;
 
 use conversation_model_adapters::{
     AudioFrame, CaptureClockPair, CaptureDiscontinuityReason, CaptureDomainHistory, CaptureEpoch,
-    CaptureMetadata, FrameProvenance, PcmFormat, PcmSampleFormat, CAPTURE_TIMING_BYTES,
-    CLOCK_PAIR_CADENCE_NS, MAX_CLOCK_BRACKET_NS, MAX_CLOCK_PAIR_GAP_NS, MAX_CLOCK_RESIDUAL_NS,
-    MAX_RECORDING_TIMING_BYTES, MAX_RECORDING_TIMING_RECORDS,
+    CaptureFinishBoundary, CaptureMetadata, FrameProvenance, PcmFormat, PcmSampleFormat,
+    CAPTURE_TIMING_BYTES, CLOCK_PAIR_CADENCE_NS, MAX_CLOCK_BRACKET_NS, MAX_CLOCK_PAIR_GAP_NS,
+    MAX_CLOCK_RESIDUAL_NS, MAX_RECORDING_TIMING_BYTES, MAX_RECORDING_TIMING_RECORDS,
 };
 use conversation_protocol::{
     FinalizedRecordingCapability, RuntimeError, RuntimeErrorKind, RuntimeStage, SessionId,
@@ -134,6 +134,8 @@ pub struct RecordingSettings {
 pub enum RecordingSinkFault {
     Write,
     Flush,
+    WriteAfterSuccessful(u32),
+    FlushAfterSuccessful(u32),
 }
 
 impl RecordingSettings {
@@ -200,14 +202,33 @@ struct FaultingRecordingSink {
     file: File,
     fault: RecordingSinkFault,
     faulted: bool,
+    successful_writes: u32,
+    successful_flushes: u32,
 }
 
 #[cfg(feature = "recording-test-support")]
 impl FaultingRecordingSink {
     fn fail_once(&mut self, operation: RecordingSinkFault) -> std::io::Result<()> {
-        if !self.faulted && self.fault == operation {
+        let should_fail = match (self.fault, operation) {
+            (RecordingSinkFault::Write, RecordingSinkFault::Write)
+            | (RecordingSinkFault::Flush, RecordingSinkFault::Flush) => true,
+            (RecordingSinkFault::WriteAfterSuccessful(expected), RecordingSinkFault::Write) => {
+                self.successful_writes == expected
+            }
+            (RecordingSinkFault::FlushAfterSuccessful(expected), RecordingSinkFault::Flush) => {
+                self.successful_flushes == expected
+            }
+            _ => false,
+        };
+        if !self.faulted && should_fail {
             self.faulted = true;
             return Err(std::io::Error::other("test recording sink fault"));
+        }
+        match operation {
+            RecordingSinkFault::Write => self.successful_writes += 1,
+            RecordingSinkFault::Flush => self.successful_flushes += 1,
+            RecordingSinkFault::WriteAfterSuccessful(_)
+            | RecordingSinkFault::FlushAfterSuccessful(_) => unreachable!("operation kind"),
         }
         Ok(())
     }
@@ -541,6 +562,8 @@ impl SessionRecorder {
                     file,
                     fault,
                     faulted: false,
+                    successful_writes: 0,
+                    successful_flushes: 0,
                 })
             } else {
                 Box::new(file)
@@ -768,6 +791,45 @@ impl SessionRecorder {
             ended_at_ms: None,
             reason: reason.to_owned(),
         });
+        Ok(())
+    }
+
+    /// Confirms and flushes the exact final timed-capture boundary without appending data.
+    pub fn confirm_capture_boundary(
+        &mut self,
+        boundary: &CaptureFinishBoundary,
+    ) -> Result<(), RuntimeError> {
+        let validation = self.timed_validation.as_ref().ok_or_else(recovery_error)?;
+        if boundary.session_id() != self.session_id
+            || self.recording_failed
+            || self.capability_poisoned
+            || self.ended
+            || self.summary.is_some()
+            || self.file.is_none()
+            || self
+                .timing_budget
+                .as_ref()
+                .is_none_or(|budget| budget.exhausted)
+            || validation.exhausted
+            || validation
+                .epoch
+                .as_ref()
+                .is_none_or(|epoch| epoch.capture_epoch != boundary.capture_epoch())
+            || validation.frame_boundary() != boundary.frame()
+            || validation
+                .pair
+                .as_ref()
+                .is_none_or(|pair| pair.sequence != boundary.final_clock_pair_sequence())
+        {
+            return Err(recovery_error());
+        }
+        self.capability_poisoned = true;
+        self.file
+            .as_mut()
+            .expect("checked recording sink")
+            .flush()
+            .map_err(|_| adapter_error("recording file could not be flushed"))?;
+        self.capability_poisoned = false;
         Ok(())
     }
 
@@ -1638,6 +1700,11 @@ struct TimedValidation {
     pair: Option<CaptureClockPair>,
 }
 impl TimedValidation {
+    fn frame_boundary(&self) -> Option<(u64, u64)> {
+        self.output_end
+            .map(|output_end| (self.sequence, output_end))
+    }
+
     fn accept(&mut self, chunk: &RecordedChunk) -> Result<(), RuntimeError> {
         if !self.policy {
             if !matches!(chunk, RecordedChunk::TimingPolicy) {

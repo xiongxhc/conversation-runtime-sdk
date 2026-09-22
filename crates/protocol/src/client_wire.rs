@@ -43,6 +43,8 @@ pub const CLIENT_PROTOCOL_VERSION: u64 = FINALIZED_RECORDING_PROTOCOL_VERSION;
 pub const DEFAULT_CLIENT_PROTOCOL_VERSION: u64 = RUNTIME_PROFILE_PROTOCOL_VERSION;
 pub const MAX_CLIENT_FRAME_BYTES: usize = 512 * 1024;
 pub const MEDIA_PROTOCOL_VERSION: u8 = 1;
+pub const TIMED_MEDIA_PROTOCOL_VERSION: u8 = 2;
+pub const DRAINABLE_TIMED_MEDIA_PROTOCOL_VERSION: u8 = 3;
 pub const MAX_MEDIA_CONNECT_ENDPOINT_BYTES: usize = 256;
 pub const MAX_MEDIA_CREDENTIAL_BYTES: usize = 128;
 pub const MAX_MEDIA_LEASE_LIFETIME_MS: u64 = 5 * 60 * 1_000;
@@ -79,6 +81,12 @@ impl ConversationContextExchange {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClientCommand {
     StartTimedVoiceSession {
+        request_id: String,
+        bridge_session_id: String,
+        profile: RuntimeProfile,
+        response_mode: VoiceResponseMode,
+    },
+    StartDrainableTimedVoiceSession {
         request_id: String,
         bridge_session_id: String,
         profile: RuntimeProfile,
@@ -335,9 +343,21 @@ impl ClientMediaLeaseDescriptor {
         Ok(descriptor)
     }
 
-    pub fn into_timed(mut self, capture_format: String) -> Result<Self, ClientWireError> {
+    pub fn into_timed(self, capture_format: String) -> Result<Self, ClientWireError> {
+        self.into_timed_version(capture_format, TIMED_MEDIA_PROTOCOL_VERSION)
+    }
+
+    pub fn into_drainable_timed(self, capture_format: String) -> Result<Self, ClientWireError> {
+        self.into_timed_version(capture_format, DRAINABLE_TIMED_MEDIA_PROTOCOL_VERSION)
+    }
+
+    fn into_timed_version(
+        mut self,
+        capture_format: String,
+        media_protocol_version: u8,
+    ) -> Result<Self, ClientWireError> {
         validate_capture_format(&capture_format)?;
-        self.media_protocol_version = 2;
+        self.media_protocol_version = media_protocol_version;
         self.capture_format = Some(capture_format);
         self.validate()?;
         Ok(self)
@@ -373,7 +393,9 @@ impl ClientMediaLeaseDescriptor {
     fn validate(&self) -> Result<(), ClientWireError> {
         if !matches!(
             (self.media_protocol_version, self.capture_format.is_some()),
-            (MEDIA_PROTOCOL_VERSION, false) | (2, true)
+            (MEDIA_PROTOCOL_VERSION, false)
+                | (TIMED_MEDIA_PROTOCOL_VERSION, true)
+                | (DRAINABLE_TIMED_MEDIA_PROTOCOL_VERSION, true)
         ) || self.session_id.get() == 0
             || !is_valid_media_endpoint(&self.connect_endpoint)
             || !is_valid_media_credential(&self.credential)
@@ -797,6 +819,24 @@ fn decode_wire_client_command(
                     .ok_or(ClientWireError::InvalidTranscript)?,
             })
         }
+        WireClientCommand::StartDrainableTimedVoiceSession {
+            protocol_version,
+            request_id,
+            bridge_session_id,
+            profile,
+            response_mode,
+        } => {
+            validate_timed_request(protocol_version, &request_id)?;
+            validate_capture_identity(&bridge_session_id)?;
+            Ok(ClientCommand::StartDrainableTimedVoiceSession {
+                request_id,
+                bridge_session_id,
+                profile: RuntimeProfile::parse(&profile)
+                    .ok_or(ClientWireError::InvalidRuntimeStatus)?,
+                response_mode: VoiceResponseMode::parse(&response_mode)
+                    .ok_or(ClientWireError::InvalidTranscript)?,
+            })
+        }
         WireClientCommand::ReadRecordingAlignment {
             protocol_version,
             request_id,
@@ -1193,6 +1233,13 @@ enum WireClientCommand {
         profile: String,
         response_mode: String,
     },
+    StartDrainableTimedVoiceSession {
+        protocol_version: u64,
+        request_id: String,
+        bridge_session_id: String,
+        profile: String,
+        response_mode: String,
+    },
     ReadRecordingAlignment {
         protocol_version: u64,
         request_id: String,
@@ -1323,6 +1370,9 @@ impl WireClientCommand {
     const fn protocol_version(&self) -> u64 {
         match self {
             Self::StartTimedVoiceSession {
+                protocol_version, ..
+            }
+            | Self::StartDrainableTimedVoiceSession {
                 protocol_version, ..
             }
             | Self::ReadRecordingAlignment {
@@ -2195,7 +2245,10 @@ fn validate_gateway_message(
             media_lease,
         } => {
             validate_timed_request(protocol_version, request_id)?;
-            if media_lease.media_protocol_version() != 2 {
+            if !matches!(
+                media_lease.media_protocol_version(),
+                TIMED_MEDIA_PROTOCOL_VERSION | DRAINABLE_TIMED_MEDIA_PROTOCOL_VERSION
+            ) {
                 return Err(ClientWireError::InvalidMediaLease);
             }
             media_lease.validate()

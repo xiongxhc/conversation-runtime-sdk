@@ -74,11 +74,49 @@ fn malformed_provenance_cannot_relabel_pcm_or_unknown_accuracy() {
         .is_err());
 }
 
+#[test]
+fn finish_boundary_has_one_exact_zero_or_nonzero_frame_spelling() {
+    use conversation_model_adapters::CaptureFinishBoundary;
+    use conversation_protocol::SessionId;
+    let session = SessionId::new(41);
+    assert_eq!(
+        CaptureFinishBoundary::new(session, 1, false, 0, 0, 3)
+            .unwrap()
+            .frame(),
+        None
+    );
+    assert_eq!(
+        CaptureFinishBoundary::new(session, 1, true, 7, 960, 3)
+            .unwrap()
+            .frame(),
+        Some((7, 960))
+    );
+    for malformed in [
+        (0, false, 0, 0, 3),
+        (1, false, 7, 0, 3),
+        (1, false, 0, 960, 3),
+        (1, true, 0, 960, 3),
+        (1, true, 7, 0, 3),
+        (1, false, 0, 0, 0),
+    ] {
+        assert!(CaptureFinishBoundary::new(
+            session,
+            malformed.0,
+            malformed.1,
+            malformed.2,
+            malformed.3,
+            malformed.4,
+        )
+        .is_err());
+    }
+}
+
 #[tokio::test]
 async fn metadata_is_recorder_only_and_pcm_fanout_preserves_identical_provenance() {
     use conversation_model_adapters::{
-        frame_for_network_capture, CaptureEpoch, CaptureEvent, CaptureMetadata, NetworkMediaHub,
-        NetworkVoiceIoFactory, TimedCapture, VoiceInputEvent, VoiceIoFactory,
+        frame_for_network_capture, CaptureClockPair, CaptureEpoch, CaptureEvent,
+        CaptureFinishBoundary, CaptureMetadata, NetworkMediaHub, NetworkVoiceIoFactory,
+        TimedCapture, VoiceInputEvent, VoiceIoFactory,
     };
     use conversation_protocol::SessionId;
     use tokio_util::sync::CancellationToken;
@@ -120,6 +158,54 @@ async fn metadata_is_recorder_only_and_pcm_fanout_preserves_identical_provenance
         recognition.recv().await.unwrap().unwrap(),
         CaptureEvent::Frame(frame)
     );
+    let pair = CaptureClockPair {
+        clock_domain_id: "process-domain".into(),
+        wall_epoch: 1,
+        sequence: 3,
+        host_before_ns: 2_000_000_000,
+        local_unix_ns: 3_000_000_000,
+        host_after_ns: 2_000_000_000,
+        wall_resolution_ns: 1,
+        external_utc_accuracy_ns: None,
+    };
+    hub.deliver_capture_metadata(session, CaptureMetadata::ClockPair(pair.clone()))
+        .await
+        .unwrap();
+    let playback = hub
+        .attach_playback_transport_for_reservation(session, 1, 9)
+        .await
+        .unwrap();
+    hub.planned_detach_playback_transport_for_finish(session, 1, 9)
+        .await
+        .unwrap();
+    drop(playback);
+    let timing = FrameProvenance::decode(&fixture()).unwrap();
+    let completion = hub
+        .deliver_capture_finish_for_reservation(
+            session,
+            1,
+            9,
+            CaptureFinishBoundary::new(
+                session,
+                1,
+                true,
+                timing.sequence,
+                timing.output_start_sample + u64::from(timing.sample_count),
+                pair.sequence,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        voice.recv().await.unwrap().unwrap(),
+        VoiceInputEvent::CaptureMetadata(CaptureMetadata::ClockPair(pair))
+    );
+    let VoiceInputEvent::CaptureFinish(finish) = voice.recv().await.unwrap().unwrap() else {
+        panic!("finish did not retain voice FIFO")
+    };
+    finish.complete(Ok(()));
+    completion.await.unwrap().unwrap();
     assert!(voice.try_recv().is_err());
     assert!(recognition.try_recv().is_err());
     cancellation.cancel();

@@ -8,8 +8,9 @@ use conversation_memory::{
     SqliteMemoryContextProvider, SqliteMemoryStore,
 };
 use conversation_model_adapters::{
-    AdapterError, AdapterFuture, AudioDeviceStatus, AudioFrame, CaptureEvent,
-    ContinuousAudioOutput, GenerationLanguageModel, GenerationLanguageRequest, GenerationTextDelta,
+    AdapterError, AdapterFuture, AudioDeviceStatus, AudioFrame, CaptureClockPair, CaptureEpoch,
+    CaptureEvent, CaptureFinish, CaptureFinishBoundary, CaptureMetadata, ContinuousAudioOutput,
+    GenerationLanguageModel, GenerationLanguageRequest, GenerationTextDelta,
     MockContinuousAudioOutput, MockGenerationLanguageModel, MockStreamingSpeechSynthesizer,
     MockVoiceCaptureControl, PcmFormat, PcmSampleFormat, PlaybackReceipt, StreamingSpeechRequest,
     StreamingSpeechSynthesizer, VoiceCaptureControl, VoiceInput, VoiceInputEvent, VoiceIoFactory,
@@ -23,8 +24,9 @@ use conversation_protocol::{
     VoiceSessionEvent, VoiceSessionPolicy, VoiceTimingMilestone,
 };
 use conversation_runtime::{
-    ConversationContext, ConversationQualityController, TextTurnEventStream, TextTurnRuntime,
-    VoiceSessionAdapters, VoiceSessionEventStream, VoiceSessionRuntime,
+    ConversationContext, ConversationQualityController, RecordingSettings, SessionRecorder,
+    TextTurnEventStream, TextTurnRuntime, VoiceSessionAdapters, VoiceSessionEventStream,
+    VoiceSessionRuntime,
 };
 use tempfile::TempDir;
 use tokio::sync::{mpsc, Notify};
@@ -32,6 +34,111 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 const SESSION_ID: SessionId = SessionId::new(1);
+
+#[tokio::test]
+async fn capture_finish_completes_only_after_the_voice_fifo_reaches_the_recorder() {
+    let directory = tempfile::tempdir().unwrap();
+    let key_env = "RUNTIME_CAPTURE_FINISH_VOICE_TEST_KEY";
+    std::env::set_var(
+        key_env,
+        "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+    );
+    let settings = RecordingSettings::new(directory.path(), key_env).unwrap();
+    let recorder = Arc::new(tokio::sync::Mutex::new(
+        SessionRecorder::start_timed(&settings, SESSION_ID).unwrap(),
+    ));
+    let (input, input_receiver) = mpsc::channel(32);
+    let factory = Arc::new(TestVoiceIoFactory::new(
+        input_receiver,
+        Arc::new(MockContinuousAudioOutput::new()),
+    ));
+    let runtime = VoiceSessionRuntime::new(
+        conversation_context(),
+        VoiceSessionAdapters::new(
+            factory.clone(),
+            Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new())),
+            Arc::new(MockStreamingSpeechSynthesizer::new([])),
+        )
+        .with_recorder(recorder.clone()),
+    );
+    let mut events = runtime.start(policy()).await.unwrap();
+    timeout(Duration::from_secs(1), factory.wait_for_input_start())
+        .await
+        .unwrap();
+    assert_session_started(events.recv().await);
+
+    let guard = recorder.lock().await;
+    input
+        .send(Ok(VoiceInputEvent::CaptureMetadata(
+            CaptureMetadata::Epoch(CaptureEpoch {
+                bridge_session_id: "bridge-independent".into(),
+                clock_domain_id: "source-process".into(),
+                capture_epoch: 1,
+            }),
+        )))
+        .await
+        .unwrap();
+    input
+        .send(Ok(VoiceInputEvent::CaptureMetadata(
+            CaptureMetadata::ClockPair(CaptureClockPair {
+                clock_domain_id: "source-process".into(),
+                wall_epoch: 1,
+                sequence: 1,
+                host_before_ns: 1_000_000_000,
+                local_unix_ns: 2_000_000_000,
+                host_after_ns: 1_000_000_000,
+                wall_resolution_ns: 1,
+                external_utc_accuracy_ns: None,
+            }),
+        )))
+        .await
+        .unwrap();
+    let (finish, mut completion) =
+        CaptureFinish::new(CaptureFinishBoundary::new(SESSION_ID, 1, false, 0, 0, 1).unwrap());
+    input
+        .send(Ok(VoiceInputEvent::CaptureFinish(finish)))
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+    assert!(matches!(
+        completion.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    drop(guard);
+    timeout(Duration::from_secs(1), &mut completion)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+    runtime.shutdown().await.unwrap();
+    while events
+        .recv()
+        .await
+        .is_some_and(|event| !event.is_session_terminal())
+    {}
+    std::env::remove_var(key_env);
+}
+
+#[tokio::test]
+async fn capture_finish_fails_when_the_voice_session_has_no_timed_recorder() {
+    let harness = VoiceSessionHarness::new();
+    let mut events = harness.start().await;
+    assert_session_started(events.recv().await);
+    let (finish, completion) =
+        CaptureFinish::new(CaptureFinishBoundary::new(SESSION_ID, 1, false, 0, 0, 1).unwrap());
+    harness.send(VoiceInputEvent::CaptureFinish(finish)).await;
+    assert_eq!(
+        timeout(Duration::from_secs(1), completion)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err()
+            .message(),
+        "timed recording is unavailable"
+    );
+    harness.shutdown(&mut events).await;
+}
 
 #[tokio::test]
 async fn active_audio_devices_are_published_as_session_status() {
@@ -1224,6 +1331,197 @@ async fn matching_playback_lifecycle_is_reliable_under_saturated_output() {
     harness.shutdown(&mut events).await;
 }
 
+#[tokio::test(start_paused = true)]
+async fn flushed_receipt_for_the_accepted_generation_is_published_and_keeps_the_session_alive() {
+    let directory = tempfile::tempdir().unwrap();
+    let key_env = "RUNTIME_FLUSHED_PLAYBACK_VOICE_TEST_KEY";
+    std::env::set_var(
+        key_env,
+        "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+    );
+    let settings = RecordingSettings::new(directory.path(), key_env).unwrap();
+    let recorder = Arc::new(tokio::sync::Mutex::new(
+        SessionRecorder::start_timed(&settings, SESSION_ID).unwrap(),
+    ));
+    let generation_id = GenerationId::new(1);
+    let harness = VoiceSessionHarness::with_gated_playback(2, Some(recorder));
+    let mut events = harness.start().await;
+    assert_session_started(events.recv().await);
+    harness.hold_first_frame().await;
+    harness.release_playback_acceptance();
+    let mut observed =
+        recv_until_playback(&mut events, generation_id, PlaybackState::Accepted).await;
+    harness.wait_for_frame_count(2).await;
+
+    // The transport reports that it flushed the accepted generation, then finishes capture.
+    harness
+        .send(VoiceInputEvent::Playback(PlaybackReceipt::new(
+            generation_id,
+            PlaybackState::Flushed,
+        )))
+        .await;
+    observed.extend(recv_until_playback(&mut events, generation_id, PlaybackState::Flushed).await);
+    for metadata in capture_timing_metadata() {
+        harness.send(metadata).await;
+    }
+    let (finish, completion) =
+        CaptureFinish::new(CaptureFinishBoundary::new(SESSION_ID, 1, false, 0, 0, 1).unwrap());
+    harness.send(VoiceInputEvent::CaptureFinish(finish)).await;
+    timeout(Duration::from_secs(1), completion)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+    // A rendered receipt after the flush is stale: the flushed generation never renders.
+    harness
+        .send(VoiceInputEvent::Playback(PlaybackReceipt::new(
+            generation_id,
+            PlaybackState::Rendered,
+        )))
+        .await;
+    harness.release_playback_acceptance();
+    observed.extend(drain_until_turn_terminal(&mut events).await);
+
+    assert_eq!(
+        count_playback(&observed, generation_id, PlaybackState::Flushed),
+        1
+    );
+    assert_eq!(
+        count_playback(&observed, generation_id, PlaybackState::Rendered),
+        0
+    );
+    assert!(observed.iter().any(|event| matches!(
+        event,
+        VoiceSessionEvent::Turn {
+            event: RuntimeEvent::TurnCompleted { .. },
+            ..
+        }
+    )));
+    assert!(!observed
+        .iter()
+        .any(|event| matches!(event, VoiceSessionEvent::SessionFailed { .. })));
+    harness.shutdown(&mut events).await;
+    std::env::remove_var(key_env);
+}
+
+#[tokio::test(start_paused = true)]
+async fn flushed_receipt_for_another_generation_is_discarded_without_touching_the_lifecycle() {
+    let generation_id = GenerationId::new(1);
+    let harness = VoiceSessionHarness::with_gated_playback(2, None);
+    let mut events = harness.start().await;
+    assert_session_started(events.recv().await);
+    harness.hold_first_frame().await;
+    harness.release_playback_acceptance();
+    let mut observed =
+        recv_until_playback(&mut events, generation_id, PlaybackState::Accepted).await;
+    harness.wait_for_frame_count(2).await;
+
+    // An unknown generation is discarded like a stale rendered receipt; the accepted
+    // generation still renders afterwards, proving its lifecycle was untouched.
+    harness
+        .send(VoiceInputEvent::Playback(PlaybackReceipt::new(
+            GenerationId::new(7),
+            PlaybackState::Flushed,
+        )))
+        .await;
+    harness
+        .send(VoiceInputEvent::Playback(PlaybackReceipt::new(
+            generation_id,
+            PlaybackState::Rendered,
+        )))
+        .await;
+    observed.extend(recv_until_playback(&mut events, generation_id, PlaybackState::Rendered).await);
+    harness.release_playback_acceptance();
+    observed.extend(drain_until_turn_terminal(&mut events).await);
+
+    // With no lifecycle left, a late flush for the finished generation is stale as well.
+    harness
+        .send(VoiceInputEvent::Playback(PlaybackReceipt::new(
+            generation_id,
+            PlaybackState::Flushed,
+        )))
+        .await;
+    harness.runtime.shutdown().await.unwrap();
+    observed.extend(drain_until_session_terminal(&mut events).await);
+
+    assert!(!observed.iter().any(|event| matches!(
+        event,
+        VoiceSessionEvent::Playback {
+            state: PlaybackState::Flushed,
+            ..
+        }
+    )));
+    assert_eq!(
+        count_playback(&observed, generation_id, PlaybackState::Rendered),
+        1
+    );
+    assert!(!observed
+        .iter()
+        .any(|event| matches!(event, VoiceSessionEvent::SessionFailed { .. })));
+    assert_eq!(
+        observed.last(),
+        Some(&VoiceSessionEvent::SessionEnded {
+            session_id: SESSION_ID
+        })
+    );
+}
+
+/// A flush that arrives while the loop still awaits acceptance is published at once and ends
+/// the lifecycle: the transport already discarded the written frames, so the runtime never
+/// confirms acceptance for that generation and a retained rendered receipt is dropped rather
+/// than reported. Holding the flush until acceptance would lose it whenever the failed enqueue
+/// ends the turn first.
+#[tokio::test(start_paused = true)]
+async fn flushed_receipt_before_acceptance_is_published_and_ends_the_lifecycle() {
+    let generation_id = GenerationId::new(1);
+    let harness = VoiceSessionHarness::with_playback();
+    let mut events = harness.start().await;
+    assert_session_started(events.recv().await);
+    harness.hold_first_frame().await;
+
+    harness
+        .send(VoiceInputEvent::Playback(PlaybackReceipt::new(
+            generation_id,
+            PlaybackState::Rendered,
+        )))
+        .await;
+    harness
+        .send(VoiceInputEvent::Playback(PlaybackReceipt::new(
+            generation_id,
+            PlaybackState::Flushed,
+        )))
+        .await;
+    let mut observed =
+        recv_until_playback(&mut events, generation_id, PlaybackState::Flushed).await;
+    harness.release_playback_acceptance();
+    observed.extend(drain_until_turn_terminal(&mut events).await);
+
+    assert_eq!(
+        count_playback(&observed, generation_id, PlaybackState::Flushed),
+        1
+    );
+    assert_eq!(
+        count_playback(&observed, generation_id, PlaybackState::Accepted),
+        0
+    );
+    assert_eq!(
+        count_playback(&observed, generation_id, PlaybackState::Rendered),
+        0
+    );
+    assert!(observed.iter().any(|event| matches!(
+        event,
+        VoiceSessionEvent::Turn {
+            event: RuntimeEvent::TurnCompleted { .. },
+            ..
+        }
+    )));
+    assert!(!observed
+        .iter()
+        .any(|event| matches!(event, VoiceSessionEvent::SessionFailed { .. })));
+    harness.shutdown(&mut events).await;
+}
+
 enum LanguageOutcome {
     Text(&'static str),
     Failure(&'static str),
@@ -1425,18 +1723,29 @@ impl VoiceSessionHarness {
     }
 
     fn with_playback() -> Self {
+        Self::with_gated_playback(1, None)
+    }
+
+    /// Every synthesized frame waits on the playback gate, so releasing one frame while a
+    /// later frame is still held keeps the turn responding after acceptance.
+    fn with_gated_playback(
+        frame_count: u64,
+        recorder: Option<Arc<tokio::sync::Mutex<SessionRecorder>>>,
+    ) -> Self {
         let turn_id = TurnId::new(1);
         let generation_id = GenerationId::new(1);
         let format = PcmFormat::new(24_000, 1, PcmSampleFormat::Signed16LittleEndian).unwrap();
-        let frame = AudioFrame::new(
-            turn_id,
-            generation_id,
-            UtteranceId::new(1),
-            0,
-            format,
-            vec![0; 960],
-        )
-        .unwrap();
+        let frames = (0..frame_count).map(|sequence| {
+            AudioFrame::new(
+                turn_id,
+                generation_id,
+                UtteranceId::new(1),
+                sequence,
+                format,
+                vec![0; 960],
+            )
+            .unwrap()
+        });
         let (input, input_receiver) = mpsc::channel(32);
         let playback_gate = Arc::new(GatedAcceptOutput::new());
         let factory = Arc::new(TestVoiceIoFactory::new(
@@ -1444,11 +1753,12 @@ impl VoiceSessionHarness {
             playback_gate.clone(),
         ));
         let language = Arc::new(MockGenerationLanguageModel::new(["Fixture response."]));
-        let speech = Arc::new(MockStreamingSpeechSynthesizer::new([frame]));
-        let runtime = VoiceSessionRuntime::new(
-            conversation_context(),
-            VoiceSessionAdapters::new(factory.clone(), language.clone(), speech),
-        );
+        let speech = Arc::new(MockStreamingSpeechSynthesizer::new(frames));
+        let mut adapters = VoiceSessionAdapters::new(factory.clone(), language.clone(), speech);
+        if let Some(recorder) = recorder {
+            adapters = adapters.with_recorder(recorder);
+        }
+        let runtime = VoiceSessionRuntime::new(conversation_context(), adapters);
         Self {
             runtime,
             factory,
@@ -1540,6 +1850,16 @@ impl VoiceSessionHarness {
             .as_ref()
             .expect("playback harness has a gated output")
             .release();
+    }
+
+    /// Finalizes one utterance and waits until its first synthesized frame is held at the
+    /// playback gate, so the loop awaits acceptance for generation 1.
+    async fn hold_first_frame(&self) {
+        self.engine_final(1, "final question").await;
+        self.speech_ended(0).await;
+        tokio::time::advance(Duration::from_millis(600)).await;
+        self.wait_for_request_count(1).await;
+        self.wait_for_frame_count(1).await;
     }
 
     async fn shutdown(&self, events: &mut VoiceSessionEventStream) {
@@ -2033,6 +2353,79 @@ async fn drain_until_turn_terminal(events: &mut VoiceSessionEventStream) -> Vec<
     })
     .await
     .expect("turn terminal timed out")
+}
+
+/// Collects events until the named playback event arrives, failing if the session ends first.
+async fn recv_until_playback(
+    events: &mut VoiceSessionEventStream,
+    generation_id: GenerationId,
+    state: PlaybackState,
+) -> Vec<VoiceSessionEvent> {
+    timeout(Duration::from_secs(1), async {
+        let mut observed = Vec::new();
+        while let Some(event) = events.recv().await {
+            let terminal = event.is_session_terminal();
+            let matched = matches!(
+                event,
+                VoiceSessionEvent::Playback {
+                    generation_id: observed_generation,
+                    state: observed_state,
+                    ..
+                } if observed_generation == generation_id && observed_state == state
+            );
+            observed.push(event);
+            if matched {
+                return observed;
+            }
+            assert!(
+                !terminal,
+                "session terminated before playback {state:?}: {observed:?}"
+            );
+        }
+        panic!("voice session ended before playback {state:?}");
+    })
+    .await
+    .expect("playback event timed out")
+}
+
+fn count_playback(
+    observed: &[VoiceSessionEvent],
+    generation_id: GenerationId,
+    state: PlaybackState,
+) -> usize {
+    observed
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                VoiceSessionEvent::Playback {
+                    generation_id: observed_generation,
+                    state: observed_state,
+                    ..
+                } if *observed_generation == generation_id && *observed_state == state
+            )
+        })
+        .count()
+}
+
+fn capture_timing_metadata() -> [VoiceInputEvent; 2] {
+    [
+        VoiceInputEvent::CaptureMetadata(CaptureMetadata::Epoch(CaptureEpoch {
+            bridge_session_id: "bridge-independent".into(),
+            clock_domain_id: "source-process".into(),
+            capture_epoch: 1,
+        })),
+        VoiceInputEvent::CaptureMetadata(CaptureMetadata::ClockPair(CaptureClockPair {
+            clock_domain_id: "source-process".into(),
+            wall_epoch: 1,
+            sequence: 1,
+            host_before_ns: 1_000_000_000,
+            local_unix_ns: 2_000_000_000,
+            host_after_ns: 1_000_000_000,
+            wall_resolution_ns: 1,
+            external_utc_accuracy_ns: None,
+        })),
+    ]
 }
 
 async fn drain_text_turn(events: TextTurnEventStream) -> Vec<RuntimeEvent> {

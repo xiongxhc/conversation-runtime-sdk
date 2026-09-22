@@ -291,6 +291,59 @@ pub struct TimedCapture {
     pub frame: FrameProvenance,
 }
 
+/// The exact producer boundary a timed recorder must match before capture may close.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CaptureFinishBoundary {
+    session_id: conversation_protocol::SessionId,
+    capture_epoch: u64,
+    frame: Option<(u64, u64)>,
+    final_clock_pair_sequence: u64,
+}
+
+impl CaptureFinishBoundary {
+    pub fn new(
+        session_id: conversation_protocol::SessionId,
+        capture_epoch: u64,
+        frame_present: bool,
+        last_frame_sequence: u64,
+        output_end_sample: u64,
+        final_clock_pair_sequence: u64,
+    ) -> Result<Self, AdapterError> {
+        let frame = match (frame_present, last_frame_sequence, output_end_sample) {
+            (true, sequence, output_end) if sequence > 0 && output_end > 0 => {
+                Some((sequence, output_end))
+            }
+            (false, 0, 0) => None,
+            _ => return Err(invalid()),
+        };
+        if capture_epoch == 0 || final_clock_pair_sequence == 0 {
+            return Err(invalid());
+        }
+        Ok(Self {
+            session_id,
+            capture_epoch,
+            frame,
+            final_clock_pair_sequence,
+        })
+    }
+
+    pub const fn session_id(&self) -> conversation_protocol::SessionId {
+        self.session_id
+    }
+
+    pub const fn capture_epoch(&self) -> u64 {
+        self.capture_epoch
+    }
+
+    pub const fn frame(&self) -> Option<(u64, u64)> {
+        self.frame
+    }
+
+    pub const fn final_clock_pair_sequence(&self) -> u64 {
+        self.final_clock_pair_sequence
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CaptureClockPair {
     pub clock_domain_id: String,

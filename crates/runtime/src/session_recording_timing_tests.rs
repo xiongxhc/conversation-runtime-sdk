@@ -37,7 +37,8 @@ fn timed_record_decoder_accepts_distinct_receipt_and_capture_coordinates() {
 
 use crate::{read_recording_alignment, RecordingAlignmentItem};
 use conversation_model_adapters::{
-    frame_for_network_capture, CaptureMappingQuality, NominalCaptureSpan, TimedCapture,
+    frame_for_network_capture, CaptureFinishBoundary, CaptureMappingQuality, NominalCaptureSpan,
+    TimedCapture,
 };
 use conversation_protocol::ClientAlignmentEntry;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -125,6 +126,158 @@ fn timed_frame(index: u64) -> AudioFrame {
             },
         })
         .unwrap()
+}
+
+fn finish_boundary(frame: Option<u64>, pair_sequence: u64) -> CaptureFinishBoundary {
+    let (present, sequence, output_end) = frame
+        .map(|index| (true, index + 1, index + 1))
+        .unwrap_or((false, 0, 0));
+    CaptureFinishBoundary::new(
+        SessionId::new(41),
+        1,
+        present,
+        sequence,
+        output_end,
+        pair_sequence,
+    )
+    .unwrap()
+}
+
+#[test]
+fn recorder_confirms_only_its_exact_timed_boundary() {
+    let fixture = Fixture::new();
+    let mut recorder = fixture.recorder();
+    recorder
+        .record_capture_metadata(&CaptureMetadata::Epoch(epoch()))
+        .unwrap();
+    recorder.record_frame(&timed_frame(0)).unwrap();
+    recorder
+        .record_capture_metadata(&pair(1, 1_000_000_000, 2_000_000_000))
+        .unwrap();
+
+    recorder
+        .confirm_capture_boundary(&finish_boundary(Some(0), 1))
+        .unwrap();
+    assert!(recorder
+        .confirm_capture_boundary(
+            &CaptureFinishBoundary::new(SessionId::new(41), 1, true, 2, 1, 1,).unwrap()
+        )
+        .is_err());
+}
+
+#[test]
+fn recorder_confirms_a_zero_frame_epoch_and_final_pair() {
+    let fixture = Fixture::new();
+    let mut recorder = fixture.recorder();
+    recorder
+        .record_capture_metadata(&CaptureMetadata::Epoch(epoch()))
+        .unwrap();
+    recorder
+        .record_capture_metadata(&pair(1, 1_000_000_000, 2_000_000_000))
+        .unwrap();
+
+    recorder
+        .confirm_capture_boundary(&finish_boundary(None, 1))
+        .unwrap();
+}
+
+#[test]
+fn recorder_refuses_missing_or_wrong_boundary_evidence() {
+    let fixture = Fixture::new();
+    let mut recorder = fixture.recorder();
+    assert!(recorder
+        .confirm_capture_boundary(&finish_boundary(None, 1))
+        .is_err());
+    recorder
+        .record_capture_metadata(&CaptureMetadata::Epoch(epoch()))
+        .unwrap();
+    assert!(recorder
+        .confirm_capture_boundary(&finish_boundary(None, 1))
+        .is_err());
+    recorder
+        .record_capture_metadata(&pair(1, 1_000_000_000, 2_000_000_000))
+        .unwrap();
+    let wrong_session = CaptureFinishBoundary::new(SessionId::new(42), 1, false, 0, 0, 1).unwrap();
+    assert!(recorder.confirm_capture_boundary(&wrong_session).is_err());
+}
+
+#[test]
+fn recorder_refuses_non_timed_failed_finalized_and_exhausted_state() {
+    let fixture = Fixture::new();
+    let boundary = finish_boundary(None, 1);
+    let mut legacy = SessionRecorder::start(&fixture.settings, SessionId::new(41)).unwrap();
+    assert!(legacy.confirm_capture_boundary(&boundary).is_err());
+
+    let mut failed = fixture.recorder();
+    failed
+        .record_capture_metadata(&CaptureMetadata::Epoch(epoch()))
+        .unwrap();
+    failed
+        .record_capture_metadata(&pair(1, 1_000_000_000, 2_000_000_000))
+        .unwrap();
+    failed.mark_incomplete();
+    assert!(failed.confirm_capture_boundary(&boundary).is_err());
+
+    let mut finalized = fixture.recorder();
+    finalized
+        .record_capture_metadata(&CaptureMetadata::Epoch(epoch()))
+        .unwrap();
+    finalized
+        .record_capture_metadata(&pair(1, 1_000_000_000, 2_000_000_000))
+        .unwrap();
+    finalized.finalize().unwrap();
+    assert!(finalized.confirm_capture_boundary(&boundary).is_err());
+
+    let mut exhausted = fixture.recorder();
+    exhausted
+        .record_capture_metadata(&CaptureMetadata::Epoch(epoch()))
+        .unwrap();
+    exhausted
+        .record_capture_metadata(&pair(1, 1_000_000_000, 2_000_000_000))
+        .unwrap();
+    exhausted.timing_budget.as_mut().unwrap().exhausted = true;
+    assert!(exhausted.confirm_capture_boundary(&boundary).is_err());
+}
+
+#[test]
+fn recorder_boundary_does_not_mask_an_append_failure() {
+    let fixture = Fixture::new();
+    let settings = fixture
+        .settings
+        .clone()
+        .with_test_sink_fault(RecordingSinkFault::WriteAfterSuccessful(2));
+    let mut recorder = SessionRecorder::start_timed(&settings, SessionId::new(41)).unwrap();
+    assert!(recorder
+        .record_capture_metadata(&CaptureMetadata::Epoch(epoch()))
+        .is_err());
+    assert!(recorder
+        .confirm_capture_boundary(&finish_boundary(None, 1))
+        .is_err());
+}
+
+#[test]
+fn recorder_boundary_reports_its_own_sink_flush_failure() {
+    let fixture = Fixture::new();
+    let settings = fixture
+        .settings
+        .clone()
+        .with_test_sink_fault(RecordingSinkFault::FlushAfterSuccessful(3));
+    let mut recorder = SessionRecorder::start_timed(&settings, SessionId::new(41)).unwrap();
+    recorder
+        .record_capture_metadata(&CaptureMetadata::Epoch(epoch()))
+        .unwrap();
+    recorder
+        .record_capture_metadata(&pair(1, 1_000_000_000, 2_000_000_000))
+        .unwrap();
+    assert!(recorder
+        .confirm_capture_boundary(&finish_boundary(None, 1))
+        .is_err());
+    assert!(
+        recorder
+            .confirm_capture_boundary(&finish_boundary(None, 1))
+            .is_err(),
+        "a failed boundary flush became retryable"
+    );
 }
 fn record_fixture(
     fixture: &Fixture,

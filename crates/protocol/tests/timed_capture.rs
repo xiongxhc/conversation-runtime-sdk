@@ -1,4 +1,5 @@
-use conversation_protocol::decode_client_command_with_version;
+use conversation_protocol::{decode_client_command_with_version, ClientCommand};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // Removing the v4 timed command would prevent the real start transaction from
 // negotiating a capture format and binding the independent bridge identity.
@@ -15,6 +16,82 @@ fn timed_start_reaches_v4_admission_but_never_legacy_admission() {
             1,
         );
         assert!(decode_client_command_with_version(old.as_bytes()).is_err());
+    }
+}
+
+// Removing this discriminator would silently force existing media2 callers to
+// understand the recorder-finish records. The new path is explicit and v4-only.
+#[test]
+fn drainable_timed_start_is_an_additive_v4_command() {
+    let wire = br#"{"protocol_version":4,"type":"start_drainable_timed_voice_session","request_id":"drainable-start","bridge_session_id":"bridge-independent","profile":"offline","response_mode":"external_gate"}"#;
+    let (version, command) = decode_client_command_with_version(wire)
+        .expect("explicit drainable start must reach gateway admission");
+    assert_eq!(version, 4);
+    assert!(matches!(
+        command,
+        ClientCommand::StartDrainableTimedVoiceSession {
+            request_id,
+            bridge_session_id,
+            ..
+        } if request_id == "drainable-start" && bridge_session_id == "bridge-independent"
+    ));
+
+    for legacy in [1, 2, 3] {
+        let old = String::from_utf8(wire.to_vec()).unwrap().replacen(
+            "\"protocol_version\":4",
+            &format!("\"protocol_version\":{legacy}"),
+            1,
+        );
+        assert!(decode_client_command_with_version(old.as_bytes()).is_err());
+    }
+
+    let existing = br#"{"protocol_version":4,"type":"start_timed_voice_session","request_id":"timed-start","bridge_session_id":"bridge-independent","profile":"offline","response_mode":"external_gate"}"#;
+    assert!(matches!(
+        decode_client_command_with_version(existing).unwrap().1,
+        ClientCommand::StartTimedVoiceSession { .. }
+    ));
+}
+
+// Accidentally upgrading the existing response or accepting an untyped version would
+// break media2 clients. Each explicit start path must retain its exact lease version.
+#[test]
+fn timed_start_responses_preserve_exact_media_versions() {
+    use conversation_protocol::{
+        encode_gateway_message_for_version, ClientMediaLeaseDescriptor, GatewayMessage, SessionId,
+    };
+
+    let expires_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 60_000;
+    let base = || {
+        ClientMediaLeaseDescriptor::new(
+            1,
+            SessionId::new(41),
+            "tcp://127.0.0.1:9001".into(),
+            "a".repeat(64),
+            expires_at_ms,
+            10_000,
+        )
+        .unwrap()
+    };
+    let old = base().into_timed("pcm_s16le/24000/1/20ms".into()).unwrap();
+    let drainable = base()
+        .into_drainable_timed("pcm_s16le/24000/1/20ms".into())
+        .unwrap();
+
+    for (lease, expected) in [(old, 2_u64), (drainable, 3_u64)] {
+        let encoded = encode_gateway_message_for_version(
+            &GatewayMessage::TimedVoiceSessionStarted {
+                request_id: "timed-start".into(),
+                media_lease: lease,
+            },
+            4,
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(value["media_lease"]["media_protocol_version"], expected);
     }
 }
 

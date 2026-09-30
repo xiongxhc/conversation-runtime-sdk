@@ -8,7 +8,7 @@ use tokio::time::Instant;
 
 use super::capture_evidence::{Ledger, Tracker};
 use super::wire::protocol_error;
-use crate::{AdapterError, AudioFrame};
+use crate::{AdapterError, AudioFrame, RecognitionEvent};
 
 const MAX_ITEMS: usize = 32;
 const MAX_RETIRED: usize = 64;
@@ -63,12 +63,16 @@ impl Items {
         }
         Ok(())
     }
-    pub(super) fn apply(&mut self, event: &Value, now: Instant) -> Result<(), AdapterError> {
+    pub(super) fn apply(
+        &mut self,
+        event: &Value,
+        now: Instant,
+    ) -> Result<Option<RecognitionEvent>, AdapterError> {
         let kind = event["type"]
             .as_str()
             .ok_or_else(|| protocol_error("missing event type"))?;
         if kind == "rate_limits.updated" {
-            return Ok(());
+            return Ok(None);
         }
         if kind == "error" {
             return Err(protocol_error("provider rejected transcription"));
@@ -90,7 +94,7 @@ impl Items {
             }
             // Unrelated bounded provider notifications carry no ordering or
             // completion authority and cannot mutate pending item deadlines.
-            return Ok(());
+            return Ok(None);
         }
         let id = identifier(&event["item_id"])?;
         let transcription = kind.starts_with("conversation.item.input_audio_transcription.");
@@ -119,7 +123,8 @@ impl Items {
             None
         };
         if let Some(retired) = self.retired.iter().find(|item| item.id == id) {
-            return validate_replay(&retired.item, event, kind, predecessor.as_ref());
+            return validate_replay(&retired.item, event, kind, predecessor.as_ref())
+                .map(|()| None);
         }
         if let Some(previous) = &predecessor {
             if previous.as_deref() == Some(id) {
@@ -145,17 +150,28 @@ impl Items {
             return Err(protocol_error("unresolved item limit exceeded"));
         }
         let item = self.pending.entry(id.to_owned()).or_default();
+        let mut activity = None;
         match kind {
             "input_audio_buffer.speech_started" => {
                 let start = offset(event, "audio_start_ms")?;
+                let first = item.start_ms.is_none();
                 set_once(&mut item.start_ms, start)?;
                 item.capture.start(start, &self.ledger);
+                // Late metadata can improve capture evidence but cannot
+                // resurrect speech after an observed or timed-out stop.
+                if first && item.end_ms.is_none() && !item.stop_missing {
+                    activity = Some(RecognitionEvent::SpeechStarted);
+                }
             }
             "input_audio_buffer.speech_stopped" => {
                 let end = offset(event, "audio_end_ms")?;
+                let first = item.end_ms.is_none();
                 set_once(&mut item.end_ms, end)?;
                 item.capture.end(end, &self.ledger);
                 item.stopped_at.get_or_insert(now);
+                if first {
+                    activity = Some(RecognitionEvent::SpeechEnded);
+                }
             }
             "input_audio_buffer.committed" => {
                 let previous = predecessor.expect("parsed committed predecessor");
@@ -179,7 +195,7 @@ impl Items {
                     item.delta_replays.iter().find(|(id, _)| id == event_id)
                 {
                     return if previous == &fingerprint {
-                        Ok(())
+                        Ok(None)
                     } else {
                         Err(protocol_error("conflicting delta replay"))
                     };
@@ -190,7 +206,7 @@ impl Items {
                 item.delta_replays
                     .push_back((event_id.to_owned(), fingerprint));
                 if item.completed.is_some() {
-                    return Ok(());
+                    return Ok(None);
                 }
                 if item
                     .delta
@@ -218,7 +234,7 @@ impl Items {
             }
             _ => unreachable!("relevant kinds checked above"),
         }
-        Ok(())
+        Ok(activity)
     }
 
     pub(super) fn deadline(&self) -> Option<Instant> {
@@ -368,6 +384,66 @@ mod tests {
     fn delta(event_id: &str, value: &str) -> Value {
         json!({"type":"conversation.item.input_audio_transcription.delta", "event_id":event_id,
             "item_id":"A", "content_index":0, "delta":value})
+    }
+
+    #[test]
+    fn speech_boundaries_emit_once_and_conflicts_never_emit_activity() {
+        let now = Instant::now();
+        let mut items = Items::default();
+        let start =
+            json!({"type":"input_audio_buffer.speech_started","item_id":"A","audio_start_ms":0});
+        let stop =
+            json!({"type":"input_audio_buffer.speech_stopped","item_id":"A","audio_end_ms":20});
+        assert_eq!(
+            items.apply(&start, now).unwrap(),
+            Some(RecognitionEvent::SpeechStarted)
+        );
+        assert_eq!(items.apply(&start, now).unwrap(), None);
+        assert!(items.apply(&json!({"type":"input_audio_buffer.speech_started","item_id":"A","audio_start_ms":1}), now).is_err());
+        assert_eq!(
+            items.apply(&stop, now).unwrap(),
+            Some(RecognitionEvent::SpeechEnded)
+        );
+        assert_eq!(items.apply(&stop, now).unwrap(), None);
+        assert!(items.apply(&json!({"type":"input_audio_buffer.speech_stopped","item_id":"A","audio_end_ms":21}), now).is_err());
+        assert_eq!(items.apply(&start, now).unwrap(), None);
+        items.apply(&json!({"type":"input_audio_buffer.committed","item_id":"A","previous_item_id":null}), now).unwrap();
+        items.apply(&json!({"type":"conversation.item.input_audio_transcription.completed","item_id":"A","content_index":0,"transcript":"kept"}), now).unwrap();
+        assert_eq!(items.ready(now).unwrap().len(), 1);
+        assert_eq!(items.apply(&start, now).unwrap(), None);
+        assert_eq!(items.apply(&stop, now).unwrap(), None);
+        assert!(items.apply(&json!({"type":"input_audio_buffer.speech_started","item_id":"A","audio_start_ms":1}), now).is_err());
+    }
+
+    #[test]
+    fn late_starts_after_stop_timeout_or_release_never_create_a_new_onset() {
+        let now = Instant::now();
+        let mut items = Items::default();
+        let start =
+            json!({"type":"input_audio_buffer.speech_started","item_id":"A","audio_start_ms":0});
+        let stop =
+            json!({"type":"input_audio_buffer.speech_stopped","item_id":"A","audio_end_ms":20});
+        assert_eq!(
+            items.apply(&stop, now).unwrap(),
+            Some(RecognitionEvent::SpeechEnded)
+        );
+        assert_eq!(items.apply(&start, now).unwrap(), None);
+        // A complete orphan waits for its missing predecessor, even after the
+        // missing-stop deadline. Metadata still cannot announce active speech.
+        let mut items = Items::default();
+        items.apply(&json!({"type":"input_audio_buffer.committed","item_id":"A","previous_item_id":"missing"}), now).unwrap();
+        items.apply(&json!({"type":"conversation.item.input_audio_transcription.completed","item_id":"A","content_index":0,"transcript":"kept"}), now).unwrap();
+        let later = now + COUNTERPART_WAIT;
+        assert!(items.ready(later).unwrap().is_empty());
+        assert_eq!(items.apply(&start, later).unwrap(), None);
+        let mut items = Items::default();
+        items.apply(&json!({"type":"input_audio_buffer.committed","item_id":"A","previous_item_id":null}), now).unwrap();
+        items.apply(&json!({"type":"conversation.item.input_audio_transcription.completed","item_id":"A","content_index":0,"transcript":"kept"}), now).unwrap();
+        assert_eq!(items.ready(later).unwrap().len(), 1);
+        assert!(
+            items.apply(&start, later).is_err(),
+            "an unseen boundary for a retired item is conflicting replay"
+        );
     }
 
     #[test]

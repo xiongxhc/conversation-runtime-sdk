@@ -47,6 +47,11 @@ impl RecognitionHypothesis {
 pub enum RecognitionEvent {
     Hypothesis(RecognitionHypothesis),
     FinalizedUtterance(FinalizedUtterance),
+    /// A validated speech onset. Carries no provider identity or clock;
+    /// the voice input owner assigns local session timing.
+    SpeechStarted,
+    /// A validated speech end, with the same local timing ownership.
+    SpeechEnded,
 }
 
 /// Already-finalized wording, distinct from fragments that require local silence

@@ -9,7 +9,8 @@ use conversation_model_adapters::{
     VoiceInput, VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
 };
 use conversation_protocol::{
-    ComponentDescriptor, PrivacyMode, RuntimeError, RuntimeStage, SessionId, VoiceSessionPolicy,
+    ComponentDescriptor, PrivacyMode, RuntimeError, RuntimeStage, SessionId, VoiceActivity,
+    VoiceSessionPolicy,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -240,6 +241,7 @@ async fn relay_online_input(
     cancellation: CancellationToken,
     recognition_cancellation: CancellationToken,
 ) -> Result<(), AdapterError> {
+    let started = tokio::time::Instant::now();
     let relay = async {
         let mut recognition_open = true;
         let mut media_due = false;
@@ -265,6 +267,17 @@ async fn relay_online_input(
                 event = recognition.recv(), if recognition_open => {
                     media_due = true;
                     match event {
+                    Some(Ok(activity @ (RecognitionEvent::SpeechStarted | RecognitionEvent::SpeechEnded))) => {
+                        // Provider audio offsets locate capture evidence only.
+                        // Activity uses this session's local monotonic receipt
+                        // clock; VoiceLoop owns its finalizer clock separately.
+                        let at_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        let activity = match activity {
+                            RecognitionEvent::SpeechStarted => VoiceActivity::SpeechStarted { at_ms },
+                            _ => VoiceActivity::SpeechEnded { at_ms },
+                        };
+                        if sender.send(Ok(VoiceInputEvent::Activity(activity))).await.is_err() { return; }
+                    }
                     Some(Ok(event @ RecognitionEvent::FinalizedUtterance(_))) => {
                         if sender.send(Ok(VoiceInputEvent::Recognition(event))).await.is_err() { return; }
                     }
@@ -466,6 +479,225 @@ mod ownership_tests {
                 })
             })
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn online_relay_maps_speech_boundaries_to_local_timed_activity_before_wording() {
+        let (_media_sender, media) = mpsc::channel(1);
+        let (recognition_sender, recognition) = mpsc::channel(3);
+        let (sender, mut events) = mpsc::channel(1);
+        let cancellation = CancellationToken::new();
+        let recognition_cancellation = cancellation.child_token();
+        let worker = tokio::spawn(relay_online_input(
+            media,
+            recognition,
+            sender,
+            cancellation.clone(),
+            recognition_cancellation.clone(),
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(37)).await;
+        recognition_sender
+            .send(Ok(RecognitionEvent::SpeechStarted))
+            .await
+            .unwrap();
+        let onset = events.recv().await.unwrap();
+        tokio::time::advance(Duration::from_millis(81)).await;
+        recognition_sender
+            .send(Ok(RecognitionEvent::SpeechEnded))
+            .await
+            .unwrap();
+        recognition_sender
+            .send(Ok(RecognitionEvent::FinalizedUtterance(
+                conversation_model_adapters::FinalizedUtterance::new(1, "wording").unwrap(),
+            )))
+            .await
+            .unwrap();
+        let end = events.recv().await.unwrap();
+        let wording = events.recv().await.unwrap();
+        cancellation.cancel();
+        await_owned_worker(worker, cancellation).await.unwrap();
+        assert!(matches!(
+            onset,
+            Ok(VoiceInputEvent::Activity(VoiceActivity::SpeechStarted {
+                at_ms: 37
+            }))
+        ));
+        assert!(matches!(
+            end,
+            Ok(VoiceInputEvent::Activity(VoiceActivity::SpeechEnded {
+                at_ms: 118
+            }))
+        ));
+        assert!(matches!(
+            wording,
+            Ok(VoiceInputEvent::Recognition(
+                RecognitionEvent::FinalizedUtterance(_)
+            ))
+        ));
+        assert!(recognition_cancellation.is_cancelled());
+        assert!(events.is_closed());
+    }
+
+    #[tokio::test]
+    async fn full_activity_delivery_is_reaped_on_cancellation_or_consumer_drop() {
+        for drop_consumer in [false, true] {
+            let (_media_sender, media) = mpsc::channel(1);
+            let (recognition_sender, recognition) = mpsc::channel(3);
+            for event in [
+                RecognitionEvent::SpeechStarted,
+                RecognitionEvent::SpeechEnded,
+                RecognitionEvent::SpeechStarted,
+            ] {
+                recognition_sender.send(Ok(event)).await.unwrap();
+            }
+            let (sender, events) = mpsc::channel(1);
+            let cancellation = CancellationToken::new();
+            let recognition_cancellation = cancellation.child_token();
+            let worker = tokio::spawn(relay_online_input(
+                media,
+                recognition,
+                sender,
+                cancellation.clone(),
+                recognition_cancellation.clone(),
+            ));
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while recognition_sender.capacity() != 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            // First activity fills output; second has been removed upstream
+            // and is now blocked on delivery. Neither path may detach it.
+            assert!(!worker.is_finished());
+            if drop_consumer {
+                drop(events);
+            } else {
+                cancellation.cancel();
+            }
+            tokio::time::timeout(Duration::from_secs(2), worker)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(recognition_cancellation.is_cancelled());
+            assert!(recognition_sender.is_closed());
+        }
+    }
+
+    #[tokio::test]
+    async fn online_factory_routes_validated_socket_activity_without_media_vad() {
+        use futures_util::SinkExt;
+        use serde_json::json;
+        use tokio_tungstenite::tungstenite::Message;
+
+        const ENV: &str = "CONVERSATION_GATEWAY_ACTIVITY_ROUTE_TEST";
+        std::env::set_var(ENV, "fake-activity-credential");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!(
+            "ws://{}/v1/realtime?intent=transcription",
+            listener.local_addr().unwrap()
+        );
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            socket
+                .send(Message::Text(
+                    json!({"type":"session.created","session":{"type":"transcription"}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            let update = socket.next().await.unwrap().unwrap();
+            let update: serde_json::Value =
+                serde_json::from_str(update.to_text().unwrap()).unwrap();
+            socket
+                .send(Message::Text(
+                    json!({"type":"session.updated","session":update["session"]})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            // Deliberately unrelated provider offsets: they must never become
+            // public session activity timing. No media VAD events are supplied.
+            for event in [
+                json!({"type":"input_audio_buffer.speech_started","item_id":"A","audio_start_ms":1000000}),
+                json!({"type":"input_audio_buffer.speech_started","item_id":"A","audio_start_ms":1000000}),
+                json!({"type":"input_audio_buffer.speech_stopped","item_id":"A","audio_end_ms":2000000}),
+                json!({"type":"input_audio_buffer.speech_stopped","item_id":"A","audio_end_ms":2000000}),
+                json!({"type":"input_audio_buffer.committed","item_id":"A","previous_item_id":null}),
+                json!({"type":"conversation.item.input_audio_transcription.completed","item_id":"A","content_index":0,"transcript":"wording"}),
+            ] {
+                socket
+                    .send(Message::Text(event.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+            while let Some(Ok(message)) = socket.next().await {
+                if matches!(message, Message::Close(_)) {
+                    break;
+                }
+            }
+        });
+        let (_media_sender, media) = mpsc::channel(1);
+        let (capture_sender, capture) = mpsc::channel(1);
+        let factory = OnlineRecognitionVoiceIoFactory {
+            media_io: Arc::new(ControlledFactory(Arc::new(ControlledInput(Mutex::new(
+                Some(media),
+            ))))),
+            config: OpenAiSpeechRecognitionConfig::new(endpoint, "configured-model", ENV)
+                .unwrap()
+                .with_server_vad(0.5, 300, 500)
+                .unwrap(),
+            capture: Arc::new(ControlledCapture(Mutex::new(Some(capture)))),
+        };
+        let cancellation = CancellationToken::new();
+        let session = factory
+            .start(SessionId::new(7), cancellation.clone())
+            .await
+            .unwrap();
+        let mut input = session
+            .input
+            .start(SessionId::new(7), cancellation.clone())
+            .await
+            .unwrap();
+        let observed = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut events = Vec::new();
+            for _ in 0..3 {
+                events.push(input.recv().await.unwrap().unwrap());
+            }
+            events
+        })
+        .await;
+        cancellation.cancel();
+        let completion = tokio::time::timeout(Duration::from_secs(2), session.completion)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        let events = observed.unwrap();
+        assert!(
+            matches!(events[0], VoiceInputEvent::Activity(VoiceActivity::SpeechStarted { at_ms }) if at_ms < 2000)
+        );
+        assert!(
+            matches!(events[1], VoiceInputEvent::Activity(VoiceActivity::SpeechEnded { at_ms }) if at_ms < 2000)
+        );
+        assert!(matches!(
+            events[2],
+            VoiceInputEvent::Recognition(RecognitionEvent::FinalizedUtterance(_))
+        ));
+        assert_eq!(completion, Ok(()));
+        assert!(input.is_closed());
+        assert!(
+            capture_sender.is_closed(),
+            "factory completion must include its independent capture drain"
+        );
     }
 
     #[tokio::test(start_paused = true)]

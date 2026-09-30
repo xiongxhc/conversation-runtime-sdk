@@ -714,6 +714,61 @@ async fn wrong_updated_and_clean_or_abnormal_socket_loss_end_one_epoch_without_r
 }
 
 #[tokio::test]
+async fn speech_activity_precedes_finals_and_replayed_or_late_starts_do_not_resurrect_it() {
+    set_credential();
+    let start =
+        json!({"type":"input_audio_buffer.speech_started","item_id":"A","audio_start_ms":0});
+    let stop = json!({"type":"input_audio_buffer.speech_stopped","item_id":"A","audio_end_ms":20});
+    let mut script = vec![
+        provider_message(start.clone()),
+        provider_message(start.clone()),
+        provider_message(stop.clone()),
+        provider_message(stop.clone()),
+        provider_message(start.clone()),
+    ];
+    script.extend(item_events("A", None, "first"));
+    // A is retired before these identical replay events are read.
+    script.extend([provider_message(start), provider_message(stop)]);
+    // A stop arriving before its start cannot create a fresh onset later.
+    script.extend([
+        provider_message(json!({"type":"input_audio_buffer.speech_stopped","item_id":"B","audio_end_ms":40})),
+        provider_message(json!({"type":"input_audio_buffer.speech_started","item_id":"B","audio_start_ms":20})),
+        provider_message(json!({"type":"input_audio_buffer.committed","item_id":"B","previous_item_id":"A"})),
+        provider_message(json!({"type":"conversation.item.input_audio_transcription.completed","item_id":"B","content_index":0,"transcript":"second"})),
+    ]);
+    let provider = ScriptedProvider::start(script, ScriptEnd::Hold).await;
+    let (recognizer, _capture) = held_recognizer(&provider.endpoint);
+    let cancellation = CancellationToken::new();
+    let mut stream = recognizer
+        .start(SESSION, cancellation.clone())
+        .await
+        .unwrap();
+    let observed = timeout(Duration::from_secs(2), async {
+        let mut events = Vec::new();
+        loop {
+            let event = stream.recv().await.unwrap().unwrap();
+            let last = matches!(&event, RecognitionEvent::FinalizedUtterance(utterance) if utterance.text() == "second");
+            events.push(event);
+            if last { return events; }
+        }
+    }).await;
+    let (actor, server) = finish(stream, cancellation, provider).await;
+    let events = observed.unwrap();
+    assert_eq!(
+        events.len(),
+        5,
+        "first start/stop and stop-before-start must be delivered once before their finals"
+    );
+    assert_eq!(events[0], RecognitionEvent::SpeechStarted);
+    assert_eq!(events[1], RecognitionEvent::SpeechEnded);
+    assert!(matches!(events[2], RecognitionEvent::FinalizedUtterance(_)));
+    assert_eq!(events[3], RecognitionEvent::SpeechEnded);
+    assert!(matches!(events[4], RecognitionEvent::FinalizedUtterance(_)));
+    assert_eq!(actor, Ok(Ok(())));
+    assert_eq!(server, Ok(Ok(())));
+}
+
+#[tokio::test]
 async fn recognition_port_emits_finalized_utterances_not_local_silence_hypotheses() {
     set_credential();
     let mut script = item_events("A", None, "first");
@@ -727,7 +782,7 @@ async fn recognition_port_emits_finalized_utterances_not_local_silence_hypothese
         .unwrap();
     let observed = timeout(Duration::from_secs(2), async {
         let mut values = Vec::new();
-        for _ in 0..2 {
+        for _ in 0..6 {
             values.push(stream.recv().await);
         }
         values
@@ -735,7 +790,11 @@ async fn recognition_port_emits_finalized_utterances_not_local_silence_hypothese
     .await;
     let (actor, server) = finish(stream, cancellation, provider).await;
     let values = observed.unwrap();
-    for (index, value) in values.into_iter().enumerate() {
+    assert_eq!(values[0], Some(Ok(RecognitionEvent::SpeechStarted)));
+    assert_eq!(values[1], Some(Ok(RecognitionEvent::SpeechEnded)));
+    assert_eq!(values[3], Some(Ok(RecognitionEvent::SpeechStarted)));
+    assert_eq!(values[4], Some(Ok(RecognitionEvent::SpeechEnded)));
+    for (index, value) in values.into_iter().skip(2).step_by(3).enumerate() {
         let RecognitionEvent::FinalizedUtterance(utterance) = value.unwrap().unwrap() else {
             panic!("provider wording must bypass hypotheses")
         };
@@ -886,7 +945,7 @@ async fn pending_wire_items_obey_fixed_commit_predecessor_and_missing_stop_deadl
 }
 
 #[tokio::test]
-async fn cancellation_reaps_actor_and_recognition_relay_with_a_full_final_consumer() {
+async fn cancellation_reaps_actor_with_a_full_activity_consumer() {
     set_credential();
     let mut script = item_events("A", None, "first");
     script.extend(item_events("B", Some("A"), "second"));

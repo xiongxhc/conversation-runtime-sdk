@@ -334,6 +334,13 @@ enum RecognitionOutput {
 }
 
 impl RecognitionOutput {
+    async fn send_activity(&self, event: RecognitionEvent) -> Result<(), ()> {
+        match self {
+            Self::Segments(_) => Ok(()),
+            Self::Events(sender) => sender.send(Ok(event)).await.map_err(|_| ()),
+        }
+    }
+
     async fn closed(&self) {
         match self {
             Self::Segments(sender) => sender.closed().await,
@@ -466,7 +473,12 @@ impl RecognitionSession {
                                 if let Some(frame) = sent? { items.submitted(&frame)?; }
                             }
                             let event = wire::parse_json(&text)?;
-                            items.apply(&event, tokio::time::Instant::now())?;
+                            if let Some(activity) = items.apply(&event, tokio::time::Instant::now())? {
+                                tokio::time::timeout(self.config.stall_timeout, self.sender.send_activity(activity))
+                                    .await
+                                    .map_err(|_| wire::protocol_error("activity delivery deadline expired"))?
+                                    .map_err(|_| wire::protocol_error("activity receiver closed"))?;
+                            }
                         }
                         _ => return Err(wire::protocol_error("socket closed")),
                     }

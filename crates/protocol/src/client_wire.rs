@@ -409,11 +409,11 @@ impl ClientMediaLeaseDescriptor {
         let Some(lifetime_ms) = self.expires_at_ms.checked_sub(now) else {
             return Err(ClientWireError::InvalidMediaLease);
         };
+        // Reconnect is a configured duration, not the decaying remaining lifetime.
         if lifetime_ms == 0
             || lifetime_ms > MAX_MEDIA_LEASE_LIFETIME_MS
             || self.reconnect_window_ms == 0
             || self.reconnect_window_ms > MAX_MEDIA_RECONNECT_WINDOW_MS
-            || self.reconnect_window_ms > lifetime_ms
         {
             return Err(ClientWireError::InvalidMediaLease);
         }
@@ -2854,12 +2854,278 @@ fn is_valid_media_credential(value: &str) -> bool {
 }
 
 fn unix_now_millis() -> Option<u64> {
+    #[cfg(test)]
+    if let Some(now) = media_lease_expiry_tests::NOW.with(std::cell::Cell::get) {
+        return Some(now);
+    }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()?
         .as_millis()
         .try_into()
         .ok()
+}
+
+#[cfg(test)]
+mod media_lease_expiry_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        pub(super) static NOW: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+    const ISSUED: u64 = 1_700_000_000_000;
+    const FORMAT: &str = "pcm_s16le/24000/1/20ms";
+    const CREDENTIAL: &str = "public-test-credential";
+
+    fn at<T>(now: u64, run: impl FnOnce() -> T) -> T {
+        struct Reset(Option<u64>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                NOW.with(|clock| clock.set(self.0));
+            }
+        }
+        let _reset = Reset(NOW.with(|clock| clock.replace(Some(now))));
+        run()
+    }
+    fn lease(expiry: u64, reconnect: u64) -> Result<ClientMediaLeaseDescriptor, ClientWireError> {
+        ClientMediaLeaseDescriptor::new(
+            1,
+            SessionId::new(17),
+            "tcp://127.0.0.1:41000".into(),
+            CREDENTIAL.into(),
+            expiry,
+            reconnect,
+        )
+    }
+    fn message(lease: ClientMediaLeaseDescriptor) -> GatewayMessage {
+        if lease.media_protocol_version() == 1 {
+            GatewayMessage::CommandAccepted {
+                request_id: "public-lease".into(),
+                turn_id: None,
+                media_lease: Some(lease),
+            }
+        } else {
+            GatewayMessage::TimedVoiceSessionStarted {
+                request_id: "public-lease".into(),
+                media_lease: lease,
+            }
+        }
+    }
+
+    #[test]
+    fn live_equal_duration_constructor_survives_transit() {
+        for delay in [0, 1, 2_999] {
+            at(ISSUED + delay, || {
+                let value = lease(ISSUED + 3_000, 3_000).unwrap();
+                assert_eq!(value.expires_at_ms(), ISSUED + 3_000);
+                assert_eq!(value.reconnect_window_ms(), 3_000);
+                assert!(!format!("{value:?}").contains(CREDENTIAL));
+            });
+        }
+        assert!(NOW.with(Cell::get).is_none());
+    }
+
+    #[test]
+    fn live_equal_duration_conversion_survives_transit() {
+        for version in [2, 3] {
+            let base = at(ISSUED, || lease(ISSUED + 3_000, 3_000).unwrap());
+            let converted = at(ISSUED + 1, || match version {
+                2 => base.into_timed(FORMAT.into()).unwrap(),
+                _ => base.into_drainable_timed(FORMAT.into()).unwrap(),
+            });
+            assert_eq!(converted.media_protocol_version(), version);
+            assert_eq!(converted.expires_at_ms(), ISSUED + 3_000);
+        }
+    }
+
+    #[test]
+    fn live_equal_duration_serialization_survives_transit() {
+        for version in [1, 2, 3] {
+            let base = at(ISSUED, || lease(ISSUED + 3_000, 3_000).unwrap());
+            let converted = at(ISSUED, || match version {
+                1 => base,
+                2 => base.into_timed(FORMAT.into()).unwrap(),
+                _ => base.into_drainable_timed(FORMAT.into()).unwrap(),
+            });
+            let envelope = message(converted);
+            let wire = at(ISSUED + 2_999, || {
+                encode_gateway_message_for_version(&envelope, if version == 1 { 3 } else { 4 })
+                    .unwrap()
+            });
+            let parsed: serde_json::Value = serde_json::from_slice(&wire).unwrap();
+            assert_eq!(
+                parsed["media_lease"]["expires_at_ms"],
+                (ISSUED + 3_000).to_string()
+            );
+            assert_eq!(parsed["media_lease"]["reconnect_window_ms"], "3000");
+            assert_eq!(parsed["media_lease"]["media_protocol_version"], version);
+            if version != 1 {
+                assert_eq!(parsed["media_lease"]["capture_format"], FORMAT);
+                assert_eq!(parsed["media_lease"]["timing_contract"], "capture-clock/v1");
+                at(ISSUED + 1, || {
+                    assert!(encode_gateway_message_for_version(&envelope, 3).is_err())
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn expiry_is_still_refused_at_constructor_conversion_and_wire_boundaries() {
+        for delay in [3_000, 3_001] {
+            at(ISSUED + delay, || {
+                assert!(matches!(
+                    lease(ISSUED + 3_000, 3_000),
+                    Err(ClientWireError::InvalidMediaLease)
+                ))
+            });
+            for version in [1, 2, 3] {
+                let base = at(ISSUED, || lease(ISSUED + 3_000, 3_000).unwrap());
+                let value = at(ISSUED, || match version {
+                    1 => base,
+                    2 => base.into_timed(FORMAT.into()).unwrap(),
+                    _ => base.into_drainable_timed(FORMAT.into()).unwrap(),
+                });
+                at(ISSUED + delay, || {
+                    assert!(matches!(
+                        value.clone().into_timed(FORMAT.into()),
+                        Err(ClientWireError::InvalidMediaLease)
+                    ));
+                    assert!(matches!(
+                        value.clone().into_drainable_timed(FORMAT.into()),
+                        Err(ClientWireError::InvalidMediaLease)
+                    ));
+                    assert!(matches!(
+                        encode_gateway_message_for_version(
+                            &message(value),
+                            if version == 1 { 3 } else { 4 }
+                        ),
+                        Err(ClientWireError::InvalidMediaLease)
+                    ));
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn independent_duration_and_uint64_bounds_remain_strict() {
+        at(ISSUED, || {
+            for expiry in [
+                0,
+                ISSUED - 1,
+                ISSUED,
+                ISSUED + MAX_MEDIA_LEASE_LIFETIME_MS + 1,
+                u64::MAX,
+            ] {
+                assert!(matches!(
+                    lease(expiry, 1),
+                    Err(ClientWireError::InvalidMediaLease)
+                ));
+            }
+            for reconnect in [0, MAX_MEDIA_RECONNECT_WINDOW_MS + 1, u64::MAX] {
+                assert!(matches!(
+                    lease(ISSUED + 3_000, reconnect),
+                    Err(ClientWireError::InvalidMediaLease)
+                ));
+            }
+            assert!(lease(
+                ISSUED + MAX_MEDIA_LEASE_LIFETIME_MS,
+                MAX_MEDIA_RECONNECT_WINDOW_MS
+            )
+            .is_ok());
+            assert!(lease(ISSUED + 3_000, 1_000).is_ok());
+        });
+    }
+
+    #[test]
+    fn endpoint_credential_version_session_and_capture_guards_remain_strict() {
+        at(ISSUED, || {
+            for endpoint in [
+                "",
+                "https://127.0.0.1:41000",
+                "tcp://127.0.0.1:0",
+                "tcp://127.0.0.1:41000/path",
+                "tcp://localhost:41000",
+            ] {
+                assert!(ClientMediaLeaseDescriptor::new(
+                    1,
+                    SessionId::new(17),
+                    endpoint.into(),
+                    CREDENTIAL.into(),
+                    ISSUED + 3_000,
+                    1_000
+                )
+                .is_err());
+            }
+            for credential in [
+                "".to_owned(),
+                "a".repeat(15),
+                "a".repeat(129),
+                "public-invalid-credential!".into(),
+            ] {
+                assert!(ClientMediaLeaseDescriptor::new(
+                    1,
+                    SessionId::new(17),
+                    "tcp://127.0.0.1:41000".into(),
+                    credential,
+                    ISSUED + 3_000,
+                    1_000
+                )
+                .is_err());
+            }
+            for version in [0, 2, 3, 4] {
+                assert!(ClientMediaLeaseDescriptor::new(
+                    version,
+                    SessionId::new(17),
+                    "tcp://127.0.0.1:41000".into(),
+                    CREDENTIAL.into(),
+                    ISSUED + 3_000,
+                    1_000
+                )
+                .is_err());
+            }
+            assert!(ClientMediaLeaseDescriptor::new(
+                1,
+                SessionId::new(0),
+                "tcp://127.0.0.1:41000".into(),
+                CREDENTIAL.into(),
+                ISSUED + 3_000,
+                1_000
+            )
+            .is_err());
+            for format in [
+                "",
+                "pcm_s16le/0/1/20ms",
+                "pcm_s16le/24000/0/20ms",
+                "pcm_s16le/4294967296/1/20ms",
+                "pcm_s16le/24000/65536/20ms",
+                "pcm_s16le/24000/1/4294967296ms",
+            ] {
+                assert!(lease(ISSUED + 3_000, 1_000)
+                    .unwrap()
+                    .into_timed(format.into())
+                    .is_err());
+                assert!(lease(ISSUED + 3_000, 1_000)
+                    .unwrap()
+                    .into_drainable_timed(format.into())
+                    .is_err());
+            }
+        });
+    }
+
+    #[test]
+    fn test_clock_is_nested_and_restored_even_after_panic() {
+        let _ = std::panic::catch_unwind(|| {
+            at(ISSUED, || {
+                at(ISSUED + 1, || {
+                    assert_eq!(unix_now_millis(), Some(ISSUED + 1))
+                });
+                assert_eq!(unix_now_millis(), Some(ISSUED));
+                panic!("public clock restoration probe");
+            })
+        });
+        assert!(NOW.with(Cell::get).is_none());
+    }
 }
 
 fn serialize_turn_id<S>(turn_id: &TurnId, serializer: S) -> Result<S::Ok, S::Error>

@@ -2269,6 +2269,7 @@ function parseMediaLease(value: unknown): MediaLease {
   );
   const now = BigInt(Date.now());
   const lifetimeMs = expiresAtMs - now;
+  // Reconnect is a configured duration, not the decaying remaining lifetime.
   if (
     !isValidMediaEndpoint(connectEndpoint)
     || !isValidMediaCredential(credential)
@@ -2276,7 +2277,6 @@ function parseMediaLease(value: unknown): MediaLease {
     || lifetimeMs > MAX_MEDIA_LEASE_LIFETIME_MS
     || reconnectWindowMs <= 0n
     || reconnectWindowMs > MAX_MEDIA_RECONNECT_WINDOW_MS
-    || reconnectWindowMs > lifetimeMs
   ) {
     throw new ProtocolError("invalid media lease");
   }

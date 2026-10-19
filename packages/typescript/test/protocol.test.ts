@@ -1581,3 +1581,96 @@ test("accepts protocol version 3 commands and rejects unknown version 5", () => 
     /unsupported protocol version/,
   );
 });
+
+const LEASE_ISSUED = 1_700_000_000_000;
+const PUBLIC_LEASE_CREDENTIAL = "public-test-credential";
+function atLeaseTime<T>(now: number, run: () => T): T {
+  const original = Date.now;
+  try { Date.now = () => now; return run(); }
+  finally { Date.now = original; }
+}
+function leaseWire(mediaVersion: 1 | 2 | 3) {
+  const lease: Record<string, unknown> = {
+    media_protocol_version: mediaVersion, session_id: "17", connect_endpoint: "tcp://127.0.0.1:41000",
+    credential: PUBLIC_LEASE_CREDENTIAL, expires_at_ms: String(LEASE_ISSUED + 3_000), reconnect_window_ms: "3000",
+  };
+  if (mediaVersion !== 1) { lease.capture_format = "pcm_s16le/24000/1/20ms"; lease.timing_contract = "capture-clock/v1"; }
+  return { protocol_version: mediaVersion === 1 ? 3 : 4, type: mediaVersion === 1 ? "command_accepted" : "timed_voice_session_started", request_id: "public-lease", media_lease: lease };
+}
+function refusedLease(wire: ReturnType<typeof leaseWire>, mediaVersion: 1 | 2 | 3) {
+  assert.throws(() => parseGatewayMessage(wire, mediaVersion === 1 ? 3 : 4), (error: unknown) =>
+    error instanceof Error && error.name === "ProtocolError" && !error.message.includes(PUBLIC_LEASE_CREDENTIAL));
+}
+
+for (const mediaVersion of [1, 2, 3] as const) test(`media lease expiry: v${mediaVersion} equal durations stay live after transit`, () => {
+  const original = Date.now;
+  for (const delay of [0, 1, 2_999]) atLeaseTime(LEASE_ISSUED + delay, () => {
+    const parsed = parseGatewayMessage(JSON.parse(JSON.stringify(leaseWire(mediaVersion))), mediaVersion === 1 ? 3 : 4);
+    if (parsed.type !== "command_accepted" && parsed.type !== "timed_voice_session_started") assert.fail("wrong public response");
+    assert.ok(parsed.mediaLease); assert.equal(parsed.mediaLease.expiresAtMs, BigInt(LEASE_ISSUED) + 3_000n);
+    assert.equal(parsed.mediaLease.reconnectWindowMs, 3_000n); assert.equal(parsed.mediaLease.mediaProtocolVersion, mediaVersion);
+    if (mediaVersion !== 1) assert.equal(Reflect.get(parsed.mediaLease, "timingContract"), "capture-clock/v1");
+  });
+  assert.equal(Date.now, original);
+});
+
+test("media lease expiry: independent expiry and reconnect bounds remain strict in all wrappers", () => {
+  atLeaseTime(LEASE_ISSUED, () => {
+    for (const version of [1, 2, 3] as const) {
+      for (const expiry of ["0", String(LEASE_ISSUED - 1), String(LEASE_ISSUED), String(LEASE_ISSUED + 300_001), MAX_U64.toString()]) {
+        const wire = leaseWire(version); wire.media_lease.expires_at_ms = expiry; refusedLease(wire, version);
+      }
+      for (const reconnect of ["0", "60001", MAX_U64.toString()]) {
+        const wire = leaseWire(version); wire.media_lease.reconnect_window_ms = reconnect; refusedLease(wire, version);
+      }
+      for (const delay of [3_000, 3_001]) atLeaseTime(LEASE_ISSUED + delay, () => refusedLease(leaseWire(version), version));
+      const lower = leaseWire(version); lower.media_lease.reconnect_window_ms = "1000";
+      assert.doesNotThrow(() => parseGatewayMessage(lower, version === 1 ? 3 : 4));
+      const maximum = leaseWire(version); maximum.media_lease.expires_at_ms = String(LEASE_ISSUED + 300_000); maximum.media_lease.reconnect_window_ms = "60000";
+      assert.doesNotThrow(() => parseGatewayMessage(maximum, version === 1 ? 3 : 4));
+    }
+  });
+});
+
+test("media lease expiry: malformed and overflowing uint64 decimals remain refused", () => {
+  atLeaseTime(LEASE_ISSUED, () => {
+    for (const version of [1, 2, 3] as const) for (const field of ["session_id", "expires_at_ms", "reconnect_window_ms"]) {
+      for (const invalid of ["", "00", "01", "-1", "+1", "1.0", "1e3", " 1", "1 ", (MAX_U64 + 1n).toString(), 17, 9_007_199_254_740_992, null]) {
+        const wire = leaseWire(version); wire.media_lease[field] = invalid; refusedLease(wire, version);
+      }
+    }
+  });
+});
+
+test("media lease expiry: canonical expiry remains bigint-safe beyond Number precision", () => {
+  const now = Number.MAX_SAFE_INTEGER;
+  atLeaseTime(now, () => {
+    const expiry = BigInt(now) + 3_000n;
+    const wire = leaseWire(3); wire.media_lease.expires_at_ms = expiry.toString();
+    const parsed = parseGatewayMessage(wire, 4); assert.equal(parsed.type, "timed_voice_session_started");
+    if (parsed.type !== "timed_voice_session_started") assert.fail("wrong timed response");
+    assert.equal(parsed.mediaLease.expiresAtMs, expiry);
+  });
+});
+
+test("media lease expiry: endpoint credential version session and timed guards remain strict", () => {
+  atLeaseTime(LEASE_ISSUED, () => {
+    for (const version of [1, 2, 3] as const) for (const [field, invalid] of [
+      ["session_id", "0"], ["media_protocol_version", 0], ["media_protocol_version", 4],
+      ["connect_endpoint", ""], ["connect_endpoint", "https://127.0.0.1:41000"], ["connect_endpoint", "tcp://127.0.0.1:0"], ["connect_endpoint", "tcp://127.0.0.1:41000/path"],
+      ["credential", ""], ["credential", "a".repeat(15)], ["credential", "a".repeat(129)], ["credential", "public-invalid-credential!"],
+    ] as const) { const wire = leaseWire(version); wire.media_lease[field] = invalid; refusedLease(wire, version); }
+    for (const version of [2, 3] as const) for (const [field, invalid] of [
+      ["media_protocol_version", 1], ["timing_contract", "capture-clock/v2"], ["capture_format", ""], ["capture_format", "pcm_s16le/0/1/20ms"],
+      ["capture_format", "pcm_s16le/4294967296/1/20ms"], ["capture_format", "pcm_s16le/24000/65536/20ms"], ["capture_format", "pcm_s16le/24000/1/4294967296ms"],
+    ] as const) { const wire = leaseWire(version); wire.media_lease[field] = invalid; refusedLease(wire, version); }
+    const timed = leaseWire(3); timed.protocol_version = 3; assert.throws(() => parseGatewayMessage(timed, 3), /protocol version 4/);
+    const extra = leaseWire(1); extra.media_lease.issued_at_ms = String(LEASE_ISSUED); refusedLease(extra, 1);
+  });
+});
+
+test("media lease expiry: deterministic test clock restores after parser rejection", () => {
+  const original = Date.now;
+  assert.throws(() => atLeaseTime(LEASE_ISSUED + 3_000, () => parseGatewayMessage(leaseWire(3), 4)), /invalid timed media lease/);
+  assert.equal(Date.now, original);
+});

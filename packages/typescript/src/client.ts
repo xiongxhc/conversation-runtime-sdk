@@ -87,6 +87,10 @@ export class RuntimeClient<Version extends ClientProtocolVersion = ClientProtoco
   private readonly turns = new Map<bigint, TurnState>();
   private readonly acceptedStartRequests = new Set<string>();
   private activeVoiceSession: VoiceSessionState | undefined;
+  // A gateway may write a timed start's `voice_session_started` just before that start's
+  // `command_accepted`. At most one such event is held, for the single pending timed start,
+  // and replayed when that start is accepted.
+  private earlyVoiceStart: { requestId: string; message: Extract<GatewayMessage, { type: "voice_event" }> } | undefined;
   private failure: Error | undefined;
   private closing = false;
   private closePromise: Promise<void> | undefined;
@@ -736,6 +740,13 @@ export class RuntimeClient<Version extends ClientProtocolVersion = ClientProtoco
     }
     if (message.type === "voice_event") {
       if (!this.activeVoiceSession) {
+        const pendingStarts = [...this.controls.entries()].filter(([, control]) => !control.accepted &&
+          (control.kind === "start_voice_session" || control.kind === "start_timed_voice_session" || control.kind === "start_drainable_timed_voice_session"));
+        if (this.earlyVoiceStart === undefined && pendingStarts.length === 1 && pendingStarts[0][1].kind !== "start_voice_session" &&
+            message.event.type === "voice_session_started" && message.event.sessionId === this.controlSessionId) {
+          this.earlyVoiceStart = { requestId: pendingStarts[0][0], message };
+          return;
+        }
         this.fail(new Error("gateway sent a voice event with no active voice session"));
         return;
       }
@@ -798,6 +809,11 @@ export class RuntimeClient<Version extends ClientProtocolVersion = ClientProtoco
       case "start_drainable_timed_voice_session":
         if (this.activeVoiceSession) { this.fail(new Error("gateway accepted concurrent voice sessions")); return; }
         this.activeVoiceSession = { events: new AsyncQueue<VoiceSessionEvent>(), started: false, terminal: false };
+        if (this.earlyVoiceStart?.requestId === requestId) {
+          const early = this.earlyVoiceStart.message;
+          this.earlyVoiceStart = undefined;
+          this.route(early);
+        }
         return;
       case "status":
       case "memory_list":
@@ -863,6 +879,10 @@ export class RuntimeClient<Version extends ClientProtocolVersion = ClientProtoco
 
   private reject(requestId: string, error: Error): void {
     const control = this.controls.get(requestId);
+    if (this.earlyVoiceStart?.requestId === requestId) {
+      this.fail(new Error("gateway sent a voice event with no active voice session"));
+      return;
+    }
     if (control?.kind === "read_recording_alignment") {
       this.controls.delete(requestId);
       control.iterator.terminalError(error);
@@ -903,6 +923,7 @@ export class RuntimeClient<Version extends ClientProtocolVersion = ClientProtoco
       return;
     }
     this.failure = error;
+    this.earlyVoiceStart = undefined;
     this.controlSessionId = undefined;
     this.ready.reject(error);
     for (const control of this.controls.values()) {

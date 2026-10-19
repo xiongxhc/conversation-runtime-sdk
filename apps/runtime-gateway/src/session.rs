@@ -1302,8 +1302,12 @@ impl GatewaySession {
                         lease_descriptor.clone()
                     },
                 };
+                // The acceptance goes on the urgent lane for every start: the pump spawned
+                // below puts `voice_session_started` on the event lane, which the writer can
+                // prefer over the normal lane, and clients open the voice session only on
+                // this acceptance. The timed start may follow that first event.
                 let acceptance = if timed_bridge.is_some() {
-                    send_normal(normal, accepted).and_then(|()| {
+                    send_urgent(urgent, accepted).and_then(|()| {
                         send_normal(
                             normal,
                             GatewayMessage::TimedVoiceSessionStarted {
@@ -9885,6 +9889,184 @@ max_error_bytes = 65536
             "invalid_state",
         );
         gateway.close().await;
+        std::env::remove_var(key_env);
+    }
+
+    /// A writer that completes every write except the one carrying `marker`, which stays
+    /// pending until released. While it is held the writer loop has already picked the
+    /// marked frame's lane, so the lane priority for its next pick is fixed.
+    struct MarkerBlockingWriter {
+        marker: &'static [u8],
+        state: Arc<MarkerBlockingWriterState>,
+    }
+
+    struct MarkerBlockingWriterState {
+        bytes: StdMutex<Vec<u8>>,
+        blocked: Condition,
+        released: AtomicBool,
+        waker: StdMutex<Option<Waker>>,
+    }
+
+    impl MarkerBlockingWriter {
+        fn new(marker: &'static str) -> (Self, Arc<MarkerBlockingWriterState>) {
+            let state = Arc::new(MarkerBlockingWriterState {
+                bytes: StdMutex::new(Vec::new()),
+                blocked: Condition::default(),
+                released: AtomicBool::new(false),
+                waker: StdMutex::new(None),
+            });
+            (
+                Self {
+                    marker: marker.as_bytes(),
+                    state: Arc::clone(&state),
+                },
+                state,
+            )
+        }
+    }
+
+    impl AsyncWrite for MarkerBlockingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let marked = bytes
+                .windows(self.marker.len())
+                .any(|window| window == self.marker);
+            if marked && !self.state.released.load(Ordering::SeqCst) {
+                *self.state.waker.lock().unwrap() = Some(context.waker().clone());
+                self.state.blocked.set();
+                if !self.state.released.load(Ordering::SeqCst) {
+                    return Poll::Pending;
+                }
+            }
+            self.state.bytes.lock().unwrap().extend_from_slice(bytes);
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl MarkerBlockingWriterState {
+        fn release(&self) {
+            self.released.store(true, Ordering::SeqCst);
+            if let Some(waker) = self.waker.lock().unwrap().take() {
+                waker.wake();
+            }
+        }
+
+        fn bytes(&self) -> Vec<u8> {
+            self.bytes.lock().unwrap().clone()
+        }
+    }
+
+    /// Wire order seen in the failing D2 runs: a `status` reply (normal lane) was the
+    /// last frame written, so the writer next prefers the event lane. If the timed
+    /// start's acceptance and the session's `voice_session_started` are both queued
+    /// before the writer picks again, the acceptance must still be written first:
+    /// the SDK only opens its voice session on that acceptance.
+    #[tokio::test]
+    async fn timed_start_acceptance_is_written_before_its_first_voice_event_after_a_normal_lane_reply(
+    ) {
+        let key_env = "RUNTIME_TIMED_START_ORDER_SYNTHETIC_KEY";
+        std::env::set_var(key_env, FAKE_RECORDING_KEY);
+        for command in [
+            "start_timed_voice_session",
+            "start_drainable_timed_voice_session",
+        ] {
+            let directory = TempDir::new().unwrap();
+            let (session, _guards) = session_with_voice();
+            let media = Arc::new(
+                MediaServer::bind(
+                    MediaServerConfig::loopback()
+                        .with_capture_format(Some("pcm_s16le/24000/1/20ms".into()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+            );
+            let session = session
+                .with_v4_control()
+                .with_recording(RecordingSettings::new(directory.path(), key_env).unwrap())
+                .with_media_server(Arc::clone(&media));
+            let (mut client_input, reader) = duplex(MAX_CLIENT_FRAME_BYTES * 2);
+            let (writer, writer_state) = MarkerBlockingWriter::new(r#""type":"status""#);
+            let writer_lanes = super::WriterLanes::new();
+            let urgent_monitor = writer_lanes.urgent_sender.clone();
+            let normal_monitor = writer_lanes.normal_sender.clone();
+            let event_monitor = writer_lanes.event_sender.clone();
+            let session_task =
+                tokio::spawn(session.run_with_writer_lanes(reader, writer, writer_lanes));
+
+            write_command(
+                &mut client_input,
+                r#"{"protocol_version":4,"type":"status","request_id":"status-1"}"#,
+            )
+            .await;
+            timeout(TEST_TIMEOUT, writer_state.blocked.wait())
+                .await
+                .expect("gateway writer did not block on the status reply");
+            write_command(
+                &mut client_input,
+                &format!(r#"{{"protocol_version":4,"type":"{command}","request_id":"timed","bridge_session_id":"bridge-independent","profile":"offline","response_mode":"external_gate"}}"#),
+            )
+            .await;
+            timeout(TEST_TIMEOUT, async {
+                while queued_messages(&urgent_monitor) + queued_messages(&normal_monitor) < 2
+                    || queued_messages(&event_monitor) < 1
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("timed start replies and voice_session_started were not all queued");
+
+            drop(urgent_monitor);
+            drop(normal_monitor);
+            drop(event_monitor);
+            writer_state.release();
+            drop(client_input);
+            timeout(TEST_TIMEOUT, session_task)
+                .await
+                .expect("gateway session did not close")
+                .unwrap()
+                .unwrap();
+            media.shutdown().await;
+
+            let messages = decode_frames(&writer_state.bytes());
+            let types = messages
+                .iter()
+                .map(|message| message_type(message).to_owned())
+                .collect::<Vec<_>>();
+            let accepted = message_index(&messages, |message| {
+                message_type(message) == "command_accepted"
+                    && message.contains(r#""request_id":"timed""#)
+            });
+            let timed = message_index(&messages, |message| {
+                message_type(message) == "timed_voice_session_started"
+            });
+            let voice_started = message_index(&messages, |message| {
+                message.contains(r#""type":"voice_session_started""#)
+            });
+            assert!(
+                accepted < voice_started,
+                "{command}: voice_session_started was written before the start's command_accepted: {types:?}"
+            );
+            assert!(accepted < timed, "{command}: {types:?}");
+        }
         std::env::remove_var(key_env);
     }
 

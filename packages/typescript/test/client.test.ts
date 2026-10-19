@@ -2539,3 +2539,81 @@ test("processed text requires protocol version 3 on the wire", async () => {
     /structured text processing requires protocol version 3/,
   );
 });
+
+// Wire order recorded in the failing D2 run r04 (message types and ids only): a status
+// exchange, then the drainable timed start, with the gateway writing the session's
+// voice_session_started before the start's command_accepted.
+const timedV3Lease = () => ({ media_protocol_version: 3, session_id: "42", connect_endpoint: "tcp://127.0.0.1:9001", credential: "a".repeat(64), expires_at_ms: String(Date.now() + 60_000), reconnect_window_ms: "10000", capture_format: "pcm_s16le/24000/1/20ms", timing_contract: "capture-clock/v1" });
+const wireVoiceStarted = (sessionId = "42") => voiceEventForVersion({ type: "voice_session_started", session_id: sessionId, privacy: { privacy_mode: "local_only", components: wireVoiceComponents() } }, 4);
+async function r04Prelude() {
+  const { client, transport } = await timedClient();
+  const failures: Error[] = [];
+  client.onUnexpectedFailure((error) => failures.push(error));
+  const status = client.status();
+  const statusCommand = command(transport, "status");
+  transport.push(acceptedForVersion(statusCommand.requestId, 4));
+  transport.push({ type: "status", protocol_version: 4, request_id: statusCommand.requestId, status: { ...wireStatus(), profile: "offline", last_context_seed_operation_id: null } });
+  await status;
+  const pending = client.startDrainableTimedVoiceSession({ bridgeSessionId: "bridge-independent", profile: "offline", responseMode: "external_gate" });
+  const start = command(transport, "start_drainable_timed_voice_session");
+  return { client, transport, failures, pending, start };
+}
+
+test("r04 order: voice_session_started before the timed start's acceptance still yields a started session", async () => {
+  const { client, transport, failures, pending, start } = await r04Prelude();
+  transport.push(wireVoiceStarted());
+  transport.push(acceptedForVersion(start.requestId, 4));
+  transport.push({ protocol_version: 4, type: "timed_voice_session_started", request_id: start.requestId, media_lease: timedV3Lease() });
+  const session = await pending;
+  assert.equal(session.mediaLease.sessionId, 42n);
+  assert.equal(transport.closed, false);
+  assert.deepEqual(failures, []);
+  const stopping = session.stop();
+  transport.push(voiceEventForVersion({ type: "voice_session_ended", session_id: "42" }, 4));
+  transport.push(acceptedForVersion(command(transport, "stop_voice_session").requestId, 4));
+  await stopping;
+  assert.deepEqual((await collect(session.events())).map((event) => event.type), ["voice_session_started", "voice_session_ended"]);
+  await client.close();
+});
+
+test("r04 control: acceptance before voice_session_started yields the same started session", async () => {
+  const { client, transport, failures, pending, start } = await r04Prelude();
+  transport.push(acceptedForVersion(start.requestId, 4));
+  transport.push(wireVoiceStarted());
+  transport.push({ protocol_version: 4, type: "timed_voice_session_started", request_id: start.requestId, media_lease: timedV3Lease() });
+  const session = await pending;
+  assert.equal(transport.closed, false);
+  assert.deepEqual(failures, []);
+  const stopping = session.stop();
+  transport.push(voiceEventForVersion({ type: "voice_session_ended", session_id: "42" }, 4));
+  transport.push(acceptedForVersion(command(transport, "stop_voice_session").requestId, 4));
+  await stopping;
+  assert.deepEqual((await collect(session.events())).map((event) => event.type), ["voice_session_started", "voice_session_ended"]);
+  await client.close();
+});
+
+test("a voice event with no voice session and no pending start still fails the client", async () => {
+  const { client, transport } = await timedClient();
+  const status = client.status();
+  transport.push(wireVoiceStarted());
+  await assert.rejects(status, /voice event with no active voice session/);
+  assert.equal(transport.closed, true);
+  await client.close();
+});
+
+test("only one early voice_session_started is held for a pending timed start; anything else still fails", { timeout: 5_000 }, async () => {
+  const cases: Array<[string, (transport: InMemoryTransport, requestId: string) => void]> = [
+    ["nonterminal event first", (transport) => transport.push(voiceEventForVersion({ type: "voice_capture_paused", session_id: "42" }, 4))],
+    ["terminal event first", (transport) => transport.push(voiceEventForVersion({ type: "voice_session_ended", session_id: "42" }, 4))],
+    ["other session", (transport) => transport.push(wireVoiceStarted("43"))],
+    ["second early event", (transport) => { transport.push(wireVoiceStarted()); transport.push(wireVoiceStarted()); }],
+    ["start rejected after early event", (transport, requestId) => { transport.push(wireVoiceStarted()); transport.push({ type: "command_rejected", protocol_version: 4, request_id: requestId, error: { code: "invalid_state", kind: "invalid_state", stage: "runtime", message: "refused" } }); }],
+  ];
+  for (const [name, inject] of cases) {
+    const { client, transport, pending, start } = await r04Prelude();
+    inject(transport, start.requestId);
+    await assert.rejects(pending, /voice event with no active voice session/, name);
+    assert.equal(transport.closed, true, name);
+    await client.close();
+  }
+});

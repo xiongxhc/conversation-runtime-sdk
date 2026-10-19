@@ -25,6 +25,12 @@ use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(feature = "media-admission-evidence")]
+use crate::media_admission_evidence::{
+    Context as EvidenceContext, Journal, Predicates, Record as EvidenceRecord,
+    Transport as EvidenceTransport,
+};
+
 const MEDIA_PROTOCOL_VERSION: u8 = 1;
 const AUTH_KIND: u8 = 1;
 const FRAME_KIND: u8 = 2;
@@ -314,6 +320,8 @@ pub struct MediaServer {
 }
 
 struct MediaServerInner {
+    #[cfg(feature = "media-admission-evidence")]
+    evidence: Option<Arc<Journal>>,
     hub: NetworkMediaHub,
     endpoint: SocketAddr,
     advertised_endpoint: String,
@@ -376,6 +384,9 @@ struct MediaConnection {
 impl MediaServer {
     pub async fn bind(config: MediaServerConfig) -> Result<Self, AdapterError> {
         config.validate()?;
+        #[cfg(feature = "media-admission-evidence")]
+        let evidence = Journal::from_env()
+            .map_err(|_| AdapterError::new("media evidence initialization failed"))?;
         let tls = config.tls.as_ref().map(load_tls_acceptor).transpose()?;
         let listener = TcpListener::bind(config.bind)
             .await
@@ -384,6 +395,8 @@ impl MediaServer {
             .local_addr()
             .map_err(|_| AdapterError::new("media listener has no local address"))?;
         let inner = Arc::new(MediaServerInner {
+            #[cfg(feature = "media-admission-evidence")]
+            evidence,
             hub: NetworkMediaHub::with_limits(
                 config.max_playback_queue_bytes,
                 config.max_playback_queue_duration,
@@ -547,19 +560,46 @@ impl MediaServer {
         self.inner.cancellation.cancel();
         self.inner.hub.cancel_expiry_workers();
         if let Some(task) = self.task.lock().await.take() {
-            let _ = task.await;
+            let _result = task.await;
+            #[cfg(feature = "media-admission-evidence")]
+            if _result.is_err() {
+                if let Some(journal) = &self.inner.evidence {
+                    journal.invalidate();
+                }
+            }
         }
         let connections = std::mem::take(&mut *self.inner.connections.lock().await);
         for mut connection in connections {
-            if tokio::time::timeout(MEDIA_CONNECTION_REAP_TIMEOUT, &mut connection)
-                .await
-                .is_err()
-            {
+            let result = tokio::time::timeout(MEDIA_CONNECTION_REAP_TIMEOUT, &mut connection).await;
+            #[cfg(feature = "media-admission-evidence")]
+            if matches!(&result, Ok(Err(_))) {
+                if let Some(journal) = &self.inner.evidence {
+                    journal.invalidate();
+                }
+            }
+            if result.is_err() {
+                #[cfg(feature = "media-admission-evidence")]
+                if let Some(journal) = &self.inner.evidence {
+                    journal.invalidate();
+                }
                 connection.abort();
                 let _ = connection.await;
             }
         }
         self.inner.hub.shutdown().await;
+        #[cfg(feature = "media-admission-evidence")]
+        if let Some(journal) = &self.inner.evidence {
+            journal.finish().await;
+        }
+    }
+
+    /// Read-only outcome of the compile-time private test journal.
+    #[cfg(feature = "media-admission-evidence")]
+    pub fn media_evidence_complete(&self) -> bool {
+        self.inner
+            .evidence
+            .as_ref()
+            .is_none_or(|journal| journal.complete())
     }
 }
 
@@ -579,7 +619,12 @@ async fn accept_loop(
         tokio::select! {
             _ = inner.cancellation.cancelled() => return,
             accepted = listener.accept() => match accepted {
-                Ok((stream, _)) => {
+                Ok((stream, _peer)) => {
+                    #[cfg(feature = "media-admission-evidence")]
+                    let evidence_context = match stream.local_addr() {
+                        Ok(local) => inner.evidence.as_ref().map(|journal| journal.context(EvidenceTransport::Tcp { peer: _peer, local })),
+                        Err(_) => { if let Some(journal) = &inner.evidence { journal.invalidate(); } None },
+                    };
                     let worker = Arc::clone(&inner);
                     let tls = tls.clone();
                     let Ok(permit) = Arc::clone(&inner.connection_permits).try_acquire_owned() else {
@@ -593,17 +638,32 @@ async fn accept_loop(
                                 result = tokio::time::timeout(MEDIA_HANDSHAKE_TIMEOUT, acceptor.accept(stream)) => result,
                             };
                             if let Ok(Ok(stream)) = handshake {
-                                let _ = serve_connection(stream, worker).await;
+                                let _ = serve_connection_observed(stream, worker, #[cfg(feature = "media-admission-evidence")] evidence_context).await;
                             }
                         } else {
-                            let _ = serve_connection(stream, worker).await;
+                            let _ = serve_connection_observed(stream, worker, #[cfg(feature = "media-admission-evidence")] evidence_context).await;
                         }
                     });
                     let mut connections = inner.connections.lock().await;
+                    #[cfg(not(feature = "media-admission-evidence"))]
                     connections.retain(|connection| !connection.is_finished());
+                    #[cfg(feature = "media-admission-evidence")]
+                    {
+                        let mut index = 0;
+                        while index < connections.len() {
+                            if connections[index].is_finished() {
+                                let completed = connections.swap_remove(index);
+                                if completed.await.is_err() { if let Some(journal) = &inner.evidence { journal.invalidate(); } }
+                            } else { index += 1; }
+                        }
+                    }
                     connections.push(task);
                 }
-                Err(_) => return,
+                Err(_) => {
+                    #[cfg(feature = "media-admission-evidence")]
+                    if let Some(journal) = &inner.evidence { journal.invalidate(); }
+                    return;
+                },
             }
         }
     }
@@ -627,9 +687,29 @@ struct AckedFinish {
     revoked: CancellationToken,
 }
 
-async fn serve_connection<S>(
+#[cfg(test)]
+async fn serve_connection<S>(stream: S, inner: Arc<MediaServerInner>) -> Result<(), AdapterError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    #[cfg(feature = "media-admission-evidence")]
+    let context = inner
+        .evidence
+        .as_ref()
+        .map(|journal| journal.context(EvidenceTransport::Component));
+    serve_connection_observed(
+        stream,
+        inner,
+        #[cfg(feature = "media-admission-evidence")]
+        context,
+    )
+    .await
+}
+
+async fn serve_connection_observed<S>(
     mut stream: S,
     inner: Arc<MediaServerInner>,
+    #[cfg(feature = "media-admission-evidence")] evidence_context: Option<EvidenceContext>,
 ) -> Result<(), AdapterError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -648,11 +728,18 @@ where
             biased;
             _ = inner.cancellation.cancelled() => return Ok(()),
             _ = tokio::time::sleep_until(handshake_deadline) => return Err(AdapterError::new("media bridge authentication timed out")),
-            result = inner.authenticate(session_id, &credential, bridge_session_id.as_deref(), version) => result?,
+            result = inner.authenticate_observed(session_id, &credential, bridge_session_id.as_deref(), version, #[cfg(feature = "media-admission-evidence")] evidence_context.clone()) => result?,
         }
     } else {
         inner
-            .authenticate(session_id, &credential, None, version)
+            .authenticate_observed(
+                session_id,
+                &credential,
+                None,
+                version,
+                #[cfg(feature = "media-admission-evidence")]
+                evidence_context,
+            )
             .await?
     };
     let mut epoch_started = false;
@@ -1140,6 +1227,7 @@ impl MediaServerInner {
         Ok((epoch.clone(), hole))
     }
 
+    #[cfg(test)]
     async fn authenticate(
         &self,
         session_id: SessionId,
@@ -1147,11 +1235,58 @@ impl MediaServerInner {
         bridge_session_id: Option<&str>,
         version: MediaVersion,
     ) -> Result<MediaConnection, AdapterError> {
+        #[cfg(feature = "media-admission-evidence")]
+        let context = self
+            .evidence
+            .as_ref()
+            .map(|journal| journal.context(EvidenceTransport::Component));
+        self.authenticate_observed(
+            session_id,
+            credential,
+            bridge_session_id,
+            version,
+            #[cfg(feature = "media-admission-evidence")]
+            context,
+        )
+        .await
+    }
+
+    async fn authenticate_observed(
+        &self,
+        session_id: SessionId,
+        credential: &str,
+        bridge_session_id: Option<&str>,
+        version: MediaVersion,
+        #[cfg(feature = "media-admission-evidence")] evidence_context: Option<EvidenceContext>,
+    ) -> Result<MediaConnection, AdapterError> {
         let mut sessions = self.sessions.lock().await;
-        let session = sessions
-            .get_mut(&session_id.get())
-            .ok_or_else(|| AdapterError::new("media credential was not accepted"))?;
+        let Some(session) = sessions.get_mut(&session_id.get()) else {
+            #[cfg(feature = "media-admission-evidence")]
+            if let (Some(journal), Some(context)) = (&self.evidence, evidence_context) {
+                journal.record(EvidenceRecord::MissingSession {
+                    session_id: session_id.get().to_string(),
+                    session_present: false,
+                    context,
+                });
+            }
+            return Err(AdapterError::new("media credential was not accepted"));
+        };
         let now = Instant::now();
+        #[cfg(feature = "media-admission-evidence")]
+        let predicates = Predicates {
+            session_present: true,
+            credential_matches: credential == session.credential,
+            media_version_matches: session.version == version,
+            bridge_binding_matches: session
+                .timed
+                .as_ref()
+                .map(|state| state.bridge_session_id.as_str())
+                == bridge_session_id,
+            credential_expired: now > session.expires_at,
+            reconnect_expired: now > session.reconnect_deadline,
+            active: session.active,
+            capture_finished: session.capture_finished,
+        };
         if credential != session.credential
             || session.version != version
             || session
@@ -1164,14 +1299,40 @@ impl MediaServerInner {
             || session.active
             || session.capture_finished
         {
+            #[cfg(feature = "media-admission-evidence")]
+            if let (Some(journal), Some(context)) = (&self.evidence, evidence_context) {
+                journal.record(EvidenceRecord::Admission {
+                    session_id: session_id.get().to_string(),
+                    reservation_epoch: session.reservation_epoch.to_string(),
+                    connection_id: None,
+                    accepted: false,
+                    context,
+                    predicates,
+                });
+            }
             return Err(AdapterError::new("media credential was not accepted"));
         }
         let connection_id = session.next_connection_id;
-        session.next_connection_id = connection_id
-            .checked_add(1)
-            .ok_or_else(|| AdapterError::new("media connection identity overflowed"))?;
+        session.next_connection_id = connection_id.checked_add(1).ok_or_else(|| {
+            #[cfg(feature = "media-admission-evidence")]
+            if let Some(journal) = &self.evidence {
+                journal.invalidate();
+            }
+            AdapterError::new("media connection identity overflowed")
+        })?;
         session.active = true;
         session.active_connection_id = Some(connection_id);
+        #[cfg(feature = "media-admission-evidence")]
+        if let (Some(journal), Some(context)) = (&self.evidence, evidence_context) {
+            journal.record(EvidenceRecord::Admission {
+                session_id: session_id.get().to_string(),
+                reservation_epoch: session.reservation_epoch.to_string(),
+                connection_id: Some(connection_id.to_string()),
+                accepted: true,
+                context,
+                predicates,
+            });
+        }
         Ok(MediaConnection {
             reservation_epoch: session.reservation_epoch,
             connection_id,
@@ -1309,6 +1470,14 @@ impl MediaServerInner {
                 session.active = false;
                 session.active_connection_id = None;
                 session.reconnect_deadline = reconnect_deadline;
+                #[cfg(feature = "media-admission-evidence")]
+                if let Some(journal) = &self.evidence {
+                    journal.record(EvidenceRecord::FenceRelease {
+                        session_id: session_id.get().to_string(),
+                        reservation_epoch: connection.reservation_epoch.to_string(),
+                        connection_id: connection.connection_id.to_string(),
+                    });
+                }
             }
         }
     }
@@ -3482,5 +3651,655 @@ mod timing_domain_tests {
         cancellation.cancel();
         io.completion.await.unwrap().unwrap();
         server.shutdown().await;
+    }
+}
+
+#[cfg(all(test, unix))]
+mod media_evidence_tests {
+    use super::*;
+
+    // Actual server/hub and validated config, with no listener task.
+    fn media_evidence_server(path: &Path, lifetime: Duration) -> MediaServer {
+        #[cfg(not(feature = "media-admission-evidence"))]
+        let _ = path;
+        let config = MediaServerConfig::loopback()
+            .with_lifetimes(lifetime, Duration::from_secs(1))
+            .with_capture_format(Some("pcm_s16le/24000/1/20ms".into()))
+            .unwrap();
+        config.validate().unwrap();
+        MediaServer {
+            inner: Arc::new(MediaServerInner {
+                #[cfg(feature = "media-admission-evidence")]
+                evidence: Some(Arc::new(Journal::open(path).unwrap())),
+                hub: NetworkMediaHub::with_limits(
+                    config.max_playback_queue_bytes,
+                    config.max_playback_queue_duration,
+                ),
+                endpoint: config.bind,
+                advertised_endpoint: config.advertised_endpoint,
+                credential_lifetime: config.credential_lifetime,
+                reconnect_window: config.reconnect_window,
+                max_frames_per_second: config.max_frames_per_second,
+                max_payload_bytes: config.max_payload_bytes,
+                max_playback_queue_duration: config.max_playback_queue_duration,
+                packet_read_timeout: config.packet_read_timeout,
+                sessions: Mutex::new(HashMap::new()),
+                connections: Mutex::new(Vec::new()),
+                connection_permits: Arc::new(Semaphore::new(MAX_MEDIA_CONNECTIONS)),
+                cancellation: CancellationToken::new(),
+                next_reservation_epoch: AtomicU64::new(1),
+                capture_format: config.capture_format,
+            }),
+            task: Mutex::new(None),
+        }
+    }
+
+    #[cfg(feature = "media-admission-evidence")]
+    fn rows(path: &Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[cfg(feature = "media-admission-evidence")]
+    #[tokio::test]
+    async fn media_evidence_real_reserve_auth_cleanup_records_exact_release_and_expiry() {
+        let temp = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = temp.path().canonicalize().unwrap().join("journal.jsonl");
+        let server = media_evidence_server(&path, Duration::from_millis(20));
+        let id = SessionId::new(41);
+        let lease = server
+            .reserve_drainable_timed(id, "private-bridge".into())
+            .await
+            .unwrap();
+        let connection = server
+            .inner
+            .authenticate(
+                id,
+                lease.credential(),
+                Some("private-bridge"),
+                MediaVersion::DrainableTimed,
+            )
+            .await
+            .unwrap();
+        cleanup_connection(&server.inner, id, connection, false).await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(server
+            .inner
+            .authenticate(
+                id,
+                lease.credential(),
+                Some("private-bridge"),
+                MediaVersion::DrainableTimed
+            )
+            .await
+            .is_err());
+        server.shutdown().await;
+        let evidence = rows(&path);
+        assert_eq!(
+            evidence.len(),
+            5,
+            "header, accepted, release, refusal, completion required"
+        );
+        assert_eq!(evidence[1]["type"], "admission");
+        assert_eq!(evidence[1]["accepted"], true);
+        assert_eq!(evidence[2]["type"], "fence_release");
+        assert_eq!(evidence[2]["connection_id"], evidence[1]["connection_id"]);
+        assert_eq!(
+            evidence[2]["reservation_epoch"],
+            evidence[1]["reservation_epoch"]
+        );
+        assert_eq!(evidence[3]["accepted"], false);
+        assert_eq!(evidence[3]["predicates"]["credential_expired"], true);
+        assert_eq!(evidence[3]["predicates"]["active"], false);
+        assert_eq!(evidence[3]["predicates"]["reconnect_expired"], false);
+        let bytes = std::fs::read_to_string(path).unwrap();
+        assert!(!bytes.contains(lease.credential()));
+        assert!(!bytes.contains("private-bridge"));
+    }
+
+    #[cfg(feature = "media-admission-evidence")]
+    #[tokio::test]
+    async fn media_evidence_actual_decisions_preserve_all_simultaneous_predicates() {
+        let temp = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = temp.path().canonicalize().unwrap().join("journal.jsonl");
+        let server = media_evidence_server(&path, Duration::from_millis(20));
+        let id = SessionId::new(41);
+        let lease = server
+            .reserve_drainable_timed(id, "private-bridge".into())
+            .await
+            .unwrap();
+        let connection = server
+            .inner
+            .authenticate(
+                id,
+                lease.credential(),
+                Some("private-bridge"),
+                MediaVersion::DrainableTimed,
+            )
+            .await
+            .unwrap();
+        assert!(server
+            .inner
+            .authenticate(
+                id,
+                lease.credential(),
+                Some("private-bridge"),
+                MediaVersion::DrainableTimed
+            )
+            .await
+            .is_err());
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(server
+            .inner
+            .authenticate(
+                id,
+                lease.credential(),
+                Some("private-bridge"),
+                MediaVersion::DrainableTimed
+            )
+            .await
+            .is_err());
+        assert!(server
+            .inner
+            .authenticate(
+                id,
+                "private-mismatch",
+                Some("private-wrong-bridge"),
+                MediaVersion::Timed
+            )
+            .await
+            .is_err());
+        assert!(server
+            .inner
+            .authenticate(
+                SessionId::new(999),
+                "private-mismatch",
+                None,
+                MediaVersion::Legacy
+            )
+            .await
+            .is_err());
+        cleanup_connection(&server.inner, id, connection, false).await;
+        server.shutdown().await;
+        let evidence = rows(&path);
+        assert_eq!(evidence.len(), 8);
+        assert_eq!(evidence[2]["predicates"]["active"], true);
+        assert_eq!(evidence[2]["predicates"]["credential_expired"], false);
+        assert_eq!(evidence[3]["predicates"]["active"], true);
+        assert_eq!(evidence[3]["predicates"]["credential_expired"], true);
+        for name in [
+            "credential_matches",
+            "media_version_matches",
+            "bridge_binding_matches",
+        ] {
+            assert_eq!(evidence[4]["predicates"][name], false);
+        }
+        assert_eq!(evidence[5]["type"], "missing_session");
+        assert!(evidence[5].get("predicates").is_none());
+        let bytes = std::fs::read_to_string(path).unwrap();
+        for private in [
+            lease.credential(),
+            "private-mismatch",
+            "private-wrong-bridge",
+            "private-bridge",
+        ] {
+            assert!(!bytes.contains(private));
+        }
+    }
+    fn private_path(temp: &tempfile::TempDir) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        temp.path().canonicalize().unwrap().join("journal.jsonl")
+    }
+
+    #[cfg(feature = "media-admission-evidence")]
+    #[tokio::test]
+    async fn media_evidence_reconnect_deadline_and_actual_capture_finish_refuse_independently() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = private_path(&temp);
+        let mut server = media_evidence_server(&path, Duration::from_secs(1));
+        Arc::get_mut(&mut server.inner).unwrap().reconnect_window = Duration::from_millis(10);
+        let id = SessionId::new(41);
+        let lease = server
+            .reserve_drainable_timed(id, "private-bridge".into())
+            .await
+            .unwrap();
+        let connection = server
+            .inner
+            .authenticate(
+                id,
+                lease.credential(),
+                Some("private-bridge"),
+                MediaVersion::DrainableTimed,
+            )
+            .await
+            .unwrap();
+        cleanup_connection(&server.inner, id, connection, false).await;
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        assert!(server
+            .inner
+            .authenticate(
+                id,
+                lease.credential(),
+                Some("private-bridge"),
+                MediaVersion::DrainableTimed
+            )
+            .await
+            .is_err());
+        server.revoke(id).await;
+        let lease = server
+            .reserve_drainable_timed(id, "private-bridge".into())
+            .await
+            .unwrap();
+        let connection = server
+            .inner
+            .authenticate(
+                id,
+                lease.credential(),
+                Some("private-bridge"),
+                MediaVersion::DrainableTimed,
+            )
+            .await
+            .unwrap();
+        server
+            .inner
+            .admit_epoch(
+                id,
+                &CaptureEpoch {
+                    bridge_session_id: "private-bridge".into(),
+                    clock_domain_id: "private-clock".into(),
+                    capture_epoch: 1,
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        server
+            .inner
+            .admit_timed_metadata(
+                id,
+                &CaptureMetadata::ClockPair(CaptureClockPair {
+                    clock_domain_id: "private-clock".into(),
+                    wall_epoch: 1,
+                    sequence: 1,
+                    host_before_ns: 1,
+                    host_after_ns: 1,
+                    local_unix_ns: 1,
+                    wall_resolution_ns: 1,
+                    external_utc_accuracy_ns: None,
+                }),
+            )
+            .await
+            .unwrap();
+        server
+            .inner
+            .admit_capture_finish(
+                id,
+                connection,
+                &CaptureFinishBoundary::new(id, 1, false, 0, 0, 1).unwrap(),
+            )
+            .await
+            .unwrap();
+        server
+            .inner
+            .release_planned_connection(id, connection)
+            .await;
+        assert!(server
+            .inner
+            .authenticate(
+                id,
+                lease.credential(),
+                Some("private-bridge"),
+                MediaVersion::DrainableTimed
+            )
+            .await
+            .is_err());
+        server.shutdown().await;
+        let evidence = rows(&path);
+        let refused: Vec<_> = evidence
+            .iter()
+            .filter(|row| row["type"] == "admission" && row["accepted"] == false)
+            .collect();
+        assert_eq!(refused.len(), 2);
+        assert_eq!(refused[0]["predicates"]["reconnect_expired"], true);
+        assert_eq!(refused[0]["predicates"]["credential_expired"], false);
+        assert_eq!(refused[1]["predicates"]["capture_finished"], true);
+        assert_eq!(refused[1]["predicates"]["active"], false);
+        // Planned capture completion is deliberately not a transport release.
+        assert_eq!(
+            evidence
+                .iter()
+                .filter(|row| row["type"] == "fence_release")
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(feature = "media-admission-evidence")]
+    #[tokio::test]
+    async fn media_evidence_pending_real_fanout_retains_fence_and_stale_cleanup_cannot_release() {
+        let cleanup = CancellationToken::new();
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            use conversation_model_adapters::{NetworkVoiceIoFactory, VoiceIoFactory};
+            for action in ["drain", "cancel", "replace"] {
+                let temp = tempfile::tempdir().unwrap();
+                let path = private_path(&temp);
+                let server = media_evidence_server(&path, Duration::from_secs(1));
+                let id = SessionId::new(41);
+                let lease = server.reserve(id).await.unwrap();
+                let cancellation = cleanup.child_token();
+                let factory = NetworkVoiceIoFactory::new(server.hub(), id);
+                let io = factory.start(id, cancellation.clone()).await.unwrap();
+                let mut recording = io.input.start(id, cancellation.clone()).await.unwrap();
+                let mut recognition = factory
+                    .recognition_capture()
+                    .start(id, cancellation.clone())
+                    .await
+                    .unwrap();
+                let connection = server
+                    .inner
+                    .authenticate(id, lease.credential(), None, MediaVersion::Legacy)
+                    .await
+                    .unwrap();
+                let _transport = server
+                    .hub()
+                    .attach_playback_transport(id, connection.connection_id)
+                    .await
+                    .unwrap();
+                server
+                    .inner
+                    .commit_capture_metadata(id, 1, 1)
+                    .await
+                    .unwrap();
+                for sequence in 1..=16 {
+                    server
+                        .hub()
+                        .deliver_capture(
+                            id,
+                            frame_for_network_capture(
+                                sequence,
+                                PcmFormat::new(24000, 1, PcmSampleFormat::Signed16LittleEndian)
+                                    .unwrap(),
+                                vec![0, 0],
+                            )
+                            .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                }
+                let mut cleanup = Box::pin(cleanup_connection(&server.inner, id, connection, true));
+                std::future::poll_fn(|cx| {
+                    assert!(cleanup.as_mut().poll(cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                assert!(server.inner.sessions.lock().await[&id.get()].active);
+                assert!(server
+                    .inner
+                    .authenticate(id, lease.credential(), None, MediaVersion::Legacy)
+                    .await
+                    .is_err());
+                let mut replacement = None;
+                if action == "replace" {
+                    server.revoke(id).await;
+                    let lease = server.reserve(id).await.unwrap();
+                    replacement = Some(
+                        server
+                            .inner
+                            .authenticate(id, lease.credential(), None, MediaVersion::Legacy)
+                            .await
+                            .unwrap(),
+                    );
+                }
+                if action == "cancel" {
+                    server.inner.cancellation.cancel();
+                }
+                for _ in 0..16 {
+                    recording.recv().await.unwrap().unwrap();
+                    recognition.recv().await.unwrap().unwrap();
+                }
+                tokio::time::timeout(Duration::from_secs(1), cleanup)
+                    .await
+                    .unwrap();
+                if let Some(new) = replacement {
+                    assert_eq!(
+                        server.inner.sessions.lock().await[&id.get()].active_connection_id,
+                        Some(new.connection_id)
+                    );
+                    cleanup_connection(&server.inner, id, new, false).await;
+                } else {
+                    assert!(!server.inner.sessions.lock().await[&id.get()].active);
+                }
+                cancellation.cancel();
+                io.completion.await.unwrap().unwrap();
+                server.shutdown().await;
+                let evidence = rows(&path);
+                let old_epoch = connection.reservation_epoch.to_string();
+                let old_release: Vec<_> = evidence
+                    .iter()
+                    .filter(|row| {
+                        row["type"] == "fence_release"
+                            && row["reservation_epoch"].as_str() == Some(old_epoch.as_str())
+                    })
+                    .collect();
+                assert_eq!(old_release.len(), usize::from(action != "replace"));
+                let active_refusal = evidence
+                    .iter()
+                    .position(|row| row["type"] == "admission" && row["accepted"] == false)
+                    .unwrap();
+                assert_eq!(evidence[active_refusal]["predicates"]["active"], true);
+                if let Some(release) = evidence.iter().position(|row| {
+                    row["type"] == "fence_release"
+                        && row["reservation_epoch"].as_str() == Some(old_epoch.as_str())
+                }) {
+                    assert!(active_refusal < release);
+                }
+            }
+        })
+        .await;
+        // Timeout drops the body/server (cancelling its transport owner); this
+        // also cancels any voice/fanout children before reporting the failure.
+        cleanup.cancel();
+        result.expect("media evidence component test exceeded its overall deadline");
+    }
+
+    #[cfg(feature = "media-admission-evidence")]
+    fn med3_packet(kind: u8, body: &[u8]) -> Vec<u8> {
+        let mut packet = b"MED3\x03".to_vec();
+        packet.push(kind);
+        packet.extend((body.len() as u32).to_be_bytes());
+        packet.extend_from_slice(body);
+        packet
+    }
+
+    #[cfg(feature = "media-admission-evidence")]
+    #[tokio::test]
+    async fn media_evidence_actual_duplex_med3_frame_remains_usable_past_admission_expiry() {
+        let cleanup = CancellationToken::new();
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            use conversation_model_adapters::{
+                CaptureEvent, CaptureMappingQuality, NetworkVoiceIoFactory, VoiceInputEvent,
+                VoiceIoFactory,
+            };
+            let temp = tempfile::tempdir().unwrap();
+            let path = private_path(&temp);
+            let server = media_evidence_server(&path, Duration::from_millis(50));
+            let id = SessionId::new(41);
+            let lease = server
+                .reserve_drainable_timed(id, "private-bridge".into())
+                .await
+                .unwrap();
+            let cancellation = cleanup.child_token();
+            let factory = NetworkVoiceIoFactory::new(server.hub(), id);
+            let io = factory.start(id, cancellation.clone()).await.unwrap();
+            let mut recording = io.input.start(id, cancellation.clone()).await.unwrap();
+            let _recognition = factory
+                .recognition_capture()
+                .start(id, cancellation.clone())
+                .await
+                .unwrap();
+            let (stream, mut peer) = tokio::io::duplex(65536);
+            let inner = server.inner.clone();
+            let task = tokio::spawn(async move {
+                let _ = serve_connection(stream, inner).await;
+            });
+            server.inner.connections.lock().await.push(task);
+            let mut body = id.get().to_be_bytes().to_vec();
+            body.push(lease.credential().len() as u8);
+            body.extend(lease.credential().as_bytes());
+            body.push(14);
+            body.extend(b"private-bridge");
+            peer.write_all(&med3_packet(AUTH_KIND, &body))
+                .await
+                .unwrap();
+            let mut ack = [0u8; 33];
+            tokio::time::timeout(Duration::from_secs(1), peer.read_exact(&mut ack))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&ack[..6], b"MED3\x03\x09");
+            let epoch = CaptureEpoch {
+                bridge_session_id: "private-bridge".into(),
+                clock_domain_id: "private-clock".into(),
+                capture_epoch: 1,
+            };
+            let mut body = id.get().to_be_bytes().to_vec();
+            body.extend(epoch.encode().unwrap());
+            peer.write_all(&med3_packet(6, &body)).await.unwrap();
+            assert!(matches!(
+                recording.recv().await.unwrap().unwrap(),
+                VoiceInputEvent::CaptureMetadata(CaptureMetadata::Epoch(_))
+            ));
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            assert!(lease.is_expired());
+            let timing = FrameProvenance {
+                capture_epoch: 1,
+                sequence: 1,
+                output_start_sample: 0,
+                sample_count: 12,
+                source_start_numerator: 0,
+                source_end_numerator: 288000,
+                source_denominator: 24000,
+                source_rate_hz: 24000,
+                quality: CaptureMappingQuality::UnknownPriming,
+                span: None,
+            };
+            let mut body = id.get().to_be_bytes().to_vec();
+            body.push(1);
+            body.extend(24000u32.to_be_bytes());
+            body.extend(1u16.to_be_bytes());
+            body.extend(timing.encode().unwrap());
+            body.extend(24u32.to_be_bytes());
+            body.extend(b"PRIVATE_PCM_CONTENT_ONLY");
+            peer.write_all(&med3_packet(FRAME_KIND, &body))
+                .await
+                .unwrap();
+            let actual = tokio::time::timeout(Duration::from_secs(1), recording.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let VoiceInputEvent::Capture(CaptureEvent::Frame(frame)) = actual else {
+                panic!("actual frame required");
+            };
+            assert_eq!(frame.bytes(), b"PRIVATE_PCM_CONTENT_ONLY");
+            assert_eq!(frame.capture_timing().unwrap().frame, timing);
+            assert!(server.inner.sessions.lock().await[&id.get()].active);
+            drop(peer);
+            cancellation.cancel();
+            io.completion.await.unwrap().unwrap();
+            server.shutdown().await;
+            assert!(server.media_evidence_complete());
+            let evidence = rows(&path);
+            assert_eq!(
+                evidence
+                    .iter()
+                    .filter(|row| row["type"] == "admission" && row["accepted"] == true)
+                    .count(),
+                1
+            );
+            assert_eq!(evidence[1]["context"]["transport"]["kind"], "component");
+            assert_eq!(
+                evidence
+                    .iter()
+                    .filter(|row| row["type"] == "fence_release")
+                    .count(),
+                1
+            );
+            let bytes = std::fs::read_to_string(path).unwrap();
+            for private in [
+                lease.credential(),
+                "private-bridge",
+                "private-clock",
+                "PRIVATE_PCM_CONTENT_ONLY",
+            ] {
+                assert!(!bytes.contains(private));
+            }
+        })
+        .await;
+        // Timeout drops the body/server (cancelling its transport owner); this
+        // also cancels any voice/fanout children before reporting the failure.
+        cleanup.cancel();
+        result.expect("media evidence component test exceeded its overall deadline");
+    }
+
+    #[cfg(not(feature = "media-admission-evidence"))]
+    #[tokio::test]
+    async fn media_evidence_feature_disabled_ignores_destination_during_real_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = private_path(&temp);
+        let previous = std::env::var_os("RUNTIME_MEDIA_ADMISSION_EVIDENCE_PATH");
+        std::env::set_var("RUNTIME_MEDIA_ADMISSION_EVIDENCE_PATH", &path);
+        let server = media_evidence_server(&path, Duration::from_secs(1));
+        let id = SessionId::new(41);
+        let lease = server.reserve(id).await.unwrap();
+        let connection = server
+            .inner
+            .authenticate(id, lease.credential(), None, MediaVersion::Legacy)
+            .await
+            .unwrap();
+        cleanup_connection(&server.inner, id, connection, false).await;
+        server.shutdown().await;
+        match previous {
+            Some(value) => std::env::set_var("RUNTIME_MEDIA_ADMISSION_EVIDENCE_PATH", value),
+            None => std::env::remove_var("RUNTIME_MEDIA_ADMISSION_EVIDENCE_PATH"),
+        }
+        assert!(!path.exists());
+    }
+
+    #[cfg(feature = "media-admission-evidence")]
+    #[tokio::test]
+    async fn media_evidence_identity_exhaustion_invalidates_without_changing_actual_rejection() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = private_path(&temp);
+        let server = media_evidence_server(&path, Duration::from_secs(1));
+        let id = SessionId::new(41);
+        let lease = server.reserve(id).await.unwrap();
+        // Unit negative fixture, not a lifecycle receipt: force the existing
+        // identity-overflow error at its actual checked increment.
+        server
+            .inner
+            .sessions
+            .lock()
+            .await
+            .get_mut(&id.get())
+            .unwrap()
+            .next_connection_id = u64::MAX;
+        assert!(server
+            .inner
+            .authenticate(id, lease.credential(), None, MediaVersion::Legacy)
+            .await
+            .is_err());
+        assert!(!server.inner.sessions.lock().await[&id.get()].active);
+        server.shutdown().await;
+        assert!(!server.media_evidence_complete());
+        assert!(rows(&path).iter().all(|row| row["type"] != "completion"));
     }
 }

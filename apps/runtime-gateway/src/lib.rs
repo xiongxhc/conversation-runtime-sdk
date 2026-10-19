@@ -1,6 +1,8 @@
 mod config;
 mod framing;
 mod input_relay;
+#[cfg(feature = "media-admission-evidence")]
+mod media_admission_evidence;
 mod media_server;
 mod memory_extraction;
 mod provider_supervisor;

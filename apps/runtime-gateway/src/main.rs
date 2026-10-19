@@ -46,6 +46,11 @@ async fn run() -> Result<(), ()> {
     // The configuration loader validates this before any runtime component is
     // started. Keep the owning handle here while each GatewaySession receives
     // only a shared capability, so every gateway exit can join the listener.
+    #[cfg(feature = "media-admission-evidence")]
+    if env::var_os("RUNTIME_MEDIA_ADMISSION_EVIDENCE_PATH").is_some() && media.is_none() {
+        eprintln!("gateway media evidence requires configured media");
+        return Err(());
+    }
     let media_server = match media {
         Some(config) => Some(Arc::new(MediaServer::bind(config).await.map_err(|_| {
             eprintln!("gateway media server failed");
@@ -60,12 +65,22 @@ async fn run() -> Result<(), ()> {
         Err(error) if error.is_startup_cancelled() => {
             if let Some(server) = media_server.as_ref() {
                 server.shutdown().await;
+                #[cfg(feature = "media-admission-evidence")]
+                if !server.media_evidence_complete() {
+                    eprintln!("gateway media evidence incomplete");
+                    return Err(());
+                }
             }
             return Ok(());
         }
         Err(error) => {
             if let Some(server) = media_server.as_ref() {
                 server.shutdown().await;
+                #[cfg(feature = "media-admission-evidence")]
+                if !server.media_evidence_complete() {
+                    eprintln!("gateway media evidence incomplete");
+                    return Err(());
+                }
             }
             eprintln!(
                 "gateway provider supervision failed: {}",
@@ -122,6 +137,11 @@ async fn run() -> Result<(), ()> {
     let shutdown = providers.shutdown().await;
     if let Some(server) = media_server.as_ref() {
         server.shutdown().await;
+        #[cfg(feature = "media-admission-evidence")]
+        if !server.media_evidence_complete() {
+            eprintln!("gateway media evidence incomplete");
+            return Err(());
+        }
     }
     let failure = provider_error
         .map(supervision_failure)

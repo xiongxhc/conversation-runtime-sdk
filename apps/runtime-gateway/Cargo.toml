@@ -27,6 +27,8 @@ toml.workspace = true
 # Test-only. Enables the scripted provider entry (`conversation-runtime-gateway-scripted`)
 # and its loopback peers. NEVER enable this for a deployed gateway.
 [features]
+# Compile-time-only private admission observations; never enable in deployed builds.
+media-admission-evidence = []
 scripted-providers = ["dep:tokio-tungstenite"]
 
 [[bin]]

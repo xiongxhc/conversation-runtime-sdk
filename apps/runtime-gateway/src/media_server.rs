@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "media-admission-evidence")]
 use crate::media_admission_evidence::{
-    Context as EvidenceContext, Journal, Predicates, Record as EvidenceRecord,
+    saturating_ms, Context as EvidenceContext, Journal, Predicates, Record as EvidenceRecord,
     Transport as EvidenceTransport,
 };
 
@@ -1308,6 +1308,12 @@ impl MediaServerInner {
                     accepted: false,
                     context,
                     predicates,
+                    reconnect_remaining_ms: Some(saturating_ms(
+                        session.reconnect_deadline.saturating_duration_since(now),
+                    )),
+                    credential_overdue_ms: Some(saturating_ms(
+                        now.saturating_duration_since(session.expires_at),
+                    )),
                 });
             }
             return Err(AdapterError::new("media credential was not accepted"));
@@ -1331,6 +1337,8 @@ impl MediaServerInner {
                 accepted: true,
                 context,
                 predicates,
+                reconnect_remaining_ms: None,
+                credential_overdue_ms: None,
             });
         }
         Ok(MediaConnection {
@@ -1476,6 +1484,9 @@ impl MediaServerInner {
                         session_id: session_id.get().to_string(),
                         reservation_epoch: connection.reservation_epoch.to_string(),
                         connection_id: connection.connection_id.to_string(),
+                        reconnect_remaining_ms: saturating_ms(
+                            reconnect_deadline.saturating_duration_since(Instant::now()),
+                        ),
                     });
                 }
             }
@@ -3701,6 +3712,362 @@ mod media_evidence_tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
+    }
+
+    #[cfg(feature = "media-admission-evidence")]
+    fn stage_a_server(path: &Path) -> MediaServer {
+        // Exercise the deployment parser and issuance validation, without binding a listener.
+        let config_path = path.with_extension("toml");
+        let toml = include_str!("../../../configs/gateway.example.toml")
+            .replacen("schema_version = 1", "schema_version = 3", 1)
+            .replacen(
+                "[language]",
+                "[language]\nprovider_host = \"local-language-host\"",
+                1,
+            )
+            + r#"
+[[provider_hosts]]
+id = "local-language-host"
+ownership = "external"
+readiness_url = "http://127.0.0.1:11434/api/tags"
+startup_timeout_ms = 1000
+environment = "inherit"
+
+[media]
+capture_format = "pcm_s16le/24000/1/20ms"
+bind = "127.0.0.1:0"
+advertised_endpoint = "tcp://127.0.0.1:0"
+credential_lifetime_ms = 3000
+reconnect_window_ms = 3000
+max_frames_per_second = 100
+max_payload_bytes = 65536
+max_outbound_queue_bytes = 1048576
+max_outbound_queue_ms = 3000
+"#;
+        std::fs::write(&config_path, toml).unwrap();
+        let config = crate::config::GatewayConfig::load(&config_path)
+            .unwrap()
+            .media
+            .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.credential_lifetime, Duration::from_millis(3000));
+        assert_eq!(config.reconnect_window, Duration::from_millis(3000));
+        assert_eq!(
+            config.max_playback_queue_duration,
+            Duration::from_millis(3000)
+        );
+        MediaServer {
+            inner: Arc::new(MediaServerInner {
+                evidence: Some(Arc::new(Journal::open(path).unwrap())),
+                hub: NetworkMediaHub::with_limits(
+                    config.max_playback_queue_bytes,
+                    config.max_playback_queue_duration,
+                ),
+                endpoint: config.bind,
+                advertised_endpoint: config.advertised_endpoint,
+                credential_lifetime: config.credential_lifetime,
+                reconnect_window: config.reconnect_window,
+                max_frames_per_second: config.max_frames_per_second,
+                max_payload_bytes: config.max_payload_bytes,
+                max_playback_queue_duration: config.max_playback_queue_duration,
+                packet_read_timeout: config.packet_read_timeout,
+                sessions: Mutex::new(HashMap::new()),
+                connections: Mutex::new(Vec::new()),
+                connection_permits: Arc::new(Semaphore::new(MAX_MEDIA_CONNECTIONS)),
+                cancellation: CancellationToken::new(),
+                next_reservation_epoch: AtomicU64::new(1),
+                capture_format: config.capture_format,
+            }),
+            task: Mutex::new(None),
+        }
+    }
+
+    #[cfg(feature = "media-admission-evidence")]
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum StageAProbe {
+        Prompt,
+        Late,
+        StalledRecognition,
+        StalledRecording,
+    }
+
+    /// Stage B, from journal fields only (no harness clock), with the analysis' labels: an
+    /// actual is `eligible` only if the refusal has `credential_overdue_ms > 0` and
+    /// `reconnect_remaining_ms > 0`, the release had reconnect time left, and the release
+    /// precedes the refusal; otherwise `timing_ineligible`. Every field, including `sequence`,
+    /// must be present; a missing one panics rather than comparing absent values.
+    #[cfg(feature = "media-admission-evidence")]
+    fn stage_b_classify(
+        release: &serde_json::Value,
+        rejection: &serde_json::Value,
+    ) -> &'static str {
+        let ms = |row: &serde_json::Value, name: &str| {
+            row[name]
+                .as_u64()
+                .unwrap_or_else(|| panic!("{name} missing"))
+        };
+        let release_precedes_refusal = ms(release, "sequence") < ms(rejection, "sequence");
+        if ms(release, "reconnect_remaining_ms") > 0
+            && ms(rejection, "credential_overdue_ms") > 0
+            && ms(rejection, "reconnect_remaining_ms") > 0
+            && release_precedes_refusal
+        {
+            "eligible"
+        } else {
+            "timing_ineligible"
+        }
+    }
+
+    #[cfg(feature = "media-admission-evidence")]
+    async fn stage_a_probe(probe: StageAProbe) -> &'static str {
+        use conversation_model_adapters::{
+            CaptureEvent, CaptureMappingQuality, NetworkVoiceIoFactory, VoiceInputEvent,
+            VoiceIoFactory,
+        };
+        let cancellation = CancellationToken::new();
+        let result = tokio::time::timeout(Duration::from_secs(12), async {
+            let temp = tempfile::tempdir().unwrap();
+            let path = private_path(&temp);
+            let server = stage_a_server(&path);
+            let window = Duration::from_millis(3000);
+            let stalled = probe == StageAProbe::StalledRecognition;
+            let stalled_recording = probe == StageAProbe::StalledRecording;
+            let id = SessionId::new(41);
+            let lease = server
+                .reserve_drainable_timed(id, "private-bridge".into())
+                .await
+                .unwrap();
+            let expires_at = server.inner.sessions.lock().await[&id.get()].expires_at;
+            let origin = expires_at - window;
+            let connection = server
+                .inner
+                .authenticate(id, lease.credential(), Some("private-bridge"), MediaVersion::DrainableTimed)
+                .await
+                .unwrap();
+            let factory = NetworkVoiceIoFactory::new(server.hub(), id);
+            let io = factory.start(id, cancellation.clone()).await.unwrap();
+            let mut recording = io.input.start(id, cancellation.clone()).await.unwrap();
+            let mut recognition = factory.recognition_capture().start(id, cancellation.clone()).await.unwrap();
+            let _transport = server.hub().attach_playback_transport(id, connection.connection_id).await.unwrap();
+            let epoch = CaptureEpoch {
+                bridge_session_id: "private-bridge".into(),
+                clock_domain_id: "private-clock".into(),
+                capture_epoch: 1,
+            };
+            server.inner.admit_epoch(id, &epoch, false).await.unwrap();
+            server.hub().deliver_capture_metadata(id, CaptureMetadata::Epoch(epoch)).await.unwrap();
+            assert!(matches!(recording.recv().await.unwrap().unwrap(), VoiceInputEvent::CaptureMetadata(CaptureMetadata::Epoch(_))));
+            let frames = if stalled { recognition.max_capacity() } else if stalled_recording { recording.max_capacity() } else { 1 };
+            for sequence in 1..=frames as u64 {
+                let format = PcmFormat::new(24000, 1, PcmSampleFormat::Signed16LittleEndian).unwrap();
+                let timing = FrameProvenance {
+                    capture_epoch: 1, sequence,
+                    output_start_sample: (sequence - 1) * 480, sample_count: 480,
+                    source_start_numerator: (sequence - 1) * 480 * 24000,
+                    source_end_numerator: sequence * 480 * 24000,
+                    source_denominator: 24000, source_rate_hz: 24000,
+                    quality: CaptureMappingQuality::UnknownPriming, span: None,
+                };
+                let payload = vec![0; 960];
+                // Real timed validation, frame construction, fan-out and watermark commit,
+                // in the same order as the MED3 frame arm (no transport listener needed).
+                let (epoch, hole) = server.inner.validate_timed_frame(id, &timing, format, payload.len()).await.unwrap();
+                assert!(!hole);
+                let frame = frame_for_network_capture(sequence, format, payload).unwrap()
+                    .with_capture_timing(TimedCapture { epoch, frame: timing.clone() }).unwrap();
+                server.hub().deliver_capture(id, frame).await.unwrap();
+                {
+                    let mut sessions = server.inner.sessions.lock().await;
+                    let state = sessions.get_mut(&id.get()).unwrap().timed.as_mut().unwrap();
+                    state.sequence = timing.sequence;
+                    state.output_end = Some(timing.output_start_sample + u64::from(timing.sample_count));
+                }
+                if !stalled_recording {
+                    assert!(matches!(recording.recv().await.unwrap().unwrap(), VoiceInputEvent::Capture(CaptureEvent::Frame(_))));
+                }
+                if !stalled {
+                    assert!(matches!(recognition.recv().await.unwrap().unwrap(), CaptureEvent::Frame(_)));
+                }
+            }
+            assert_eq!(recognition.len(), if stalled { frames } else { 0 });
+            assert_eq!(recording.len(), if stalled_recording { frames } else { 0 });
+            let voice_cancel = cancellation.clone();
+            let voice = tokio::spawn(async move {
+                let (mut gaps, mut metadata) = (0, 0);
+                loop {
+                    // Already-queued recording events are counted before cancellation is seen.
+                    tokio::select! {
+                        biased;
+                        event = recording.recv(), if !stalled_recording => match event.unwrap().unwrap() {
+                            VoiceInputEvent::Capture(CaptureEvent::Discontinuity { at_ms: 0 }) => gaps += 1,
+                            VoiceInputEvent::CaptureMetadata(CaptureMetadata::Discontinuity { capture_epoch: 1, reason: CaptureDiscontinuityReason::Reconnect }) => metadata += 1,
+                            _ => panic!("unexpected voice event"),
+                        },
+                        _ = voice_cancel.cancelled() => break,
+                    }
+                    if (gaps, metadata) == (1, 1) { break; }
+                }
+                (gaps, metadata)
+            });
+            let recognition_cancel = cancellation.clone();
+            let recognizer = tokio::spawn(async move {
+                tokio::select! {
+                    biased;
+                    _ = recognition_cancel.cancelled() => 0,
+                    event = recognition.recv(), if !stalled => {
+                        assert!(matches!(event.unwrap().unwrap(), CaptureEvent::Discontinuity { at_ms: 0 }));
+                        1
+                    }
+                }
+            });
+            // Real monotonic time: no paused clock, expiry rewrite, or lifetime bypass.
+            tokio::time::sleep_until((expires_at + Duration::from_millis(20)).into()).await;
+            assert!(Instant::now() > expires_at);
+            let cleanup_before = Instant::now();
+            let mut cleanup = Box::pin(cleanup_connection(&server.inner, id, connection, true));
+            let ready = std::future::poll_fn(|cx| std::task::Poll::Ready(cleanup.as_mut().poll(cx).is_ready())).await;
+            let first_poll_end = Instant::now();
+            if !ready { cleanup.await; }
+            let finished = Instant::now();
+            let deadline = server.inner.sessions.lock().await[&id.get()].reconnect_deadline;
+            // D_s is reconstructed from the real stored deadline, whose only cleanup write
+            // uses the snapshot's deadline. Bracket the first poll to detect a finish-time reset.
+            let disconnect = deadline - window;
+            assert!(disconnect >= cleanup_before && disconnect <= first_poll_end);
+            assert!(deadline <= first_poll_end + window);
+            if probe == StageAProbe::Late {
+                tokio::time::sleep_until((deadline + Duration::from_millis(20)).into()).await;
+            }
+            let probed = Instant::now();
+            let refused = server.inner.authenticate(id, lease.credential(), Some("private-bridge"), MediaVersion::DrainableTimed).await;
+            let probe_end = Instant::now();
+            assert!(refused.is_err());
+            // Join prompt consumers on their expected disconnect events. The stalled
+            // receiver stays alive and unpolled until cleanup finishes its timeout.
+            if stalled || stalled_recording { cancellation.cancel(); }
+            let voice_counts = voice.await.unwrap();
+            let recognition_gaps = recognizer.await.unwrap();
+            cancellation.cancel();
+            io.completion.await.unwrap().unwrap();
+            server.shutdown().await;
+            assert!(server.media_evidence_complete());
+            let journal = rows(&path);
+            assert_eq!(journal.len(), 5, "header, admission, release, rejection, completion");
+            let (admission, release, rejection) = (&journal[1], &journal[2], &journal[3]);
+            assert_eq!(admission["accepted"], true);
+            assert_eq!(release["type"], "fence_release");
+            assert_eq!(rejection["type"], "admission");
+            assert_eq!(rejection["accepted"], false);
+            assert!(release["sequence"].as_u64().unwrap() < rejection["sequence"].as_u64().unwrap());
+            assert_eq!(release["connection_id"], admission["connection_id"]);
+            for row in [release, rejection] {
+                assert_eq!(row["reservation_epoch"], admission["reservation_epoch"]);
+                assert_eq!(row["session_id"], admission["session_id"]);
+            }
+            for name in ["session_present", "credential_matches", "media_version_matches", "bridge_binding_matches", "credential_expired"] {
+                assert_eq!(rejection["predicates"][name], true, "{name}");
+            }
+            for name in ["active", "capture_finished"] {
+                assert_eq!(rejection["predicates"][name], false, "{name}");
+            }
+            let reconnect_expired = rejection["predicates"]["reconnect_expired"].as_bool().unwrap();
+            assert_eq!(reconnect_expired, probed > deadline);
+            let isolated = !reconnect_expired && finished < deadline && probe_end <= deadline;
+            if stalled {
+                // A live, full, unpolled recognition queue must not hold the recording lane or
+                // the fence: the recorder gets its gap and Reconnect promptly, and release waits
+                // only on recording-lane sends. Recognition owes one gap for its next event.
+                assert!(finished.duration_since(disconnect) < Duration::from_millis(500));
+                assert_eq!(voice_counts, (1, 1));
+                assert_eq!(recognition_gaps, 0);
+            } else if stalled_recording {
+                // The recorder's own full queue still bounds release by the operation timeout.
+                assert!(finished.duration_since(disconnect) >= window);
+                assert!(finished.duration_since(disconnect) < window + Duration::from_millis(750));
+                assert_eq!(voice_counts, (0, 0));
+                assert_eq!(recognition_gaps, 0);
+            } else {
+                assert_eq!(voice_counts, (1, 1));
+                assert_eq!(recognition_gaps, 1);
+            }
+            // Stage B fields: timing only, on release and the refused admission, never on acceptance.
+            for row in &journal {
+                assert_eq!(row["schema"], "runtime-media-admission-evidence/v2");
+            }
+            assert!(admission.get("reconnect_remaining_ms").is_none());
+            assert!(admission.get("credential_overdue_ms").is_none());
+            let release_remaining = release["reconnect_remaining_ms"].as_u64().unwrap();
+            let rejection_remaining = rejection["reconnect_remaining_ms"].as_u64().unwrap();
+            let overdue = rejection["credential_overdue_ms"].as_u64().unwrap();
+            // Each journal value is bracketed by the harness instants around its server write.
+            let floor_ms = |later: Instant, earlier: Instant| later.saturating_duration_since(earlier).as_millis() as u64;
+            assert!(release_remaining <= floor_ms(deadline, cleanup_before));
+            if floor_ms(deadline, finished) > 0 { assert!(release_remaining > 0); }
+            assert!(rejection_remaining <= floor_ms(deadline, probed));
+            if reconnect_expired { assert_eq!(rejection_remaining, 0); }
+            if floor_ms(deadline, probe_end) > 0 { assert!(rejection_remaining > 0); }
+            assert!(overdue >= floor_ms(probed, expires_at) && overdue <= floor_ms(probe_end, expires_at));
+            assert!(overdue > 0);
+            let stage_b = stage_b_classify(release, rejection);
+            let expected = match probe {
+                StageAProbe::Prompt | StageAProbe::StalledRecognition => "eligible",
+                StageAProbe::Late | StageAProbe::StalledRecording => "timing_ineligible",
+            };
+            assert_eq!(stage_b, expected);
+            // The journal-only label agrees with Stage A's harness-clock classification.
+            assert_eq!(stage_b == "eligible", isolated);
+            let ms = |instant: Instant| instant.duration_since(origin).as_secs_f64() * 1000.0;
+            let measurement = serde_json::json!({
+                "probe": format!("{probe:?}"), "classification": if isolated { "isolated" } else { "not-isolated" },
+                "stage_b": stage_b,
+                "eligible_at_release": finished < deadline,
+                "credential_expiry_ms": ms(expires_at), "D_s_ms": ms(disconnect), "F_ms": ms(finished),
+                "P_ms": ms(probed), "P_end_ms": ms(probe_end), "deadline_ms": ms(deadline),
+                "cleanup_ms": finished.duration_since(disconnect).as_secs_f64() * 1000.0,
+                "capture_frames": frames, "voice_capture_frames": frames,
+                "recognition_capture_frames": if stalled { 0 } else { frames },
+                "voice_disconnect_events": voice_counts, "recognition_disconnect_events": recognition_gaps,
+                "journal": journal,
+            });
+            println!("STAGE_A_MEASUREMENT {measurement}");
+            stage_b
+        }).await;
+        cancellation.cancel();
+        result.expect("Stage A component test exceeded its real-time bound")
+    }
+
+    #[cfg(feature = "media-admission-evidence")]
+    #[tokio::test]
+    async fn media_evidence_stage_a_prompt_isolates_credential_expiry_at_3000() {
+        assert_eq!(
+            stage_a_probe(StageAProbe::Prompt).await,
+            "eligible",
+            "credential-only isolation required"
+        );
+    }
+
+    #[cfg(feature = "media-admission-evidence")]
+    #[tokio::test]
+    async fn media_evidence_stage_a_late_probe_is_not_isolated() {
+        assert_eq!(stage_a_probe(StageAProbe::Late).await, "timing_ineligible");
+    }
+
+    #[cfg(feature = "media-admission-evidence")]
+    #[tokio::test]
+    async fn media_evidence_stage_a_stalled_recognition_does_not_delay_release() {
+        assert_eq!(
+            stage_a_probe(StageAProbe::StalledRecognition).await,
+            "eligible"
+        );
+    }
+
+    #[cfg(feature = "media-admission-evidence")]
+    #[tokio::test]
+    async fn media_evidence_stage_b_stalled_recording_release_is_timing_ineligible() {
+        assert_eq!(
+            stage_a_probe(StageAProbe::StalledRecording).await,
+            "timing_ineligible"
+        );
     }
 
     #[cfg(feature = "media-admission-evidence")]

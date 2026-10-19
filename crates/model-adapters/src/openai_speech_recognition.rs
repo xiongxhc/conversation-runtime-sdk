@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,8 +9,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::credential::{validate_credential_env_name, Credential};
 use crate::{
-    AdapterError, AdapterFuture, AudioCapture, CaptureEvent, FinalizedUtterance, PcmFormat,
-    PcmSampleFormat, RecognitionEvent, RecognitionStream, SpeechRecognizer,
+    AdapterError, AdapterFuture, AudioCapture, AudioFrame, CaptureEvent, FinalizedUtterance,
+    PcmFormat, PcmSampleFormat, RecognitionEvent, RecognitionStream, SpeechRecognizer,
 };
 
 const SEGMENT_CHANNEL_CAPACITY: usize = 1;
@@ -18,6 +19,8 @@ const MAX_MODEL_BYTES: usize = 256;
 const MAX_LANGUAGE_BYTES: usize = 64;
 const DEFAULT_RESPONSE_START_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_STALL_TIMEOUT: Duration = Duration::from_secs(5);
+/// Real-time capture the recognizer holds beyond its startup window, for bridge jitter.
+const STARTUP_CAPTURE_MARGIN: Duration = Duration::from_secs(2);
 
 mod capture_evidence;
 mod items;
@@ -406,16 +409,30 @@ impl RecognitionSession {
         if tokio::time::Instant::now() >= deadline {
             return Err(wire::protocol_error("startup deadline expired"));
         }
-        let socket =
-            tokio::time::timeout_at(deadline, wire::connect(&self.config, &self.credential))
-                .await
-                .map_err(|_| wire::protocol_error("startup deadline expired"))??;
+        let mut backlog = CaptureBacklog::new(&self.config)?;
+        let mut capture_open = true;
+        // Capture keeps flowing while the provider connects; drain it into the bounded backlog so
+        // the media hub's small recognition queue does not overflow into a gap at startup.
+        let connect =
+            tokio::time::timeout_at(deadline, wire::connect(&self.config, &self.credential));
+        tokio::pin!(connect);
+        let socket = loop {
+            tokio::select! {
+                biased;
+                socket = &mut connect => {
+                    break socket.map_err(|_| wire::protocol_error("startup deadline expired"))??;
+                }
+                event = captures.recv(), if capture_open && backlog.has_room() => {
+                    capture_open = backlog.accept(event, self.config.input_format)?;
+                }
+            }
+        };
         let (writer, mut reader) = socket.split();
         let mut outbound = wire::Outbound::new(writer, self.config.stall_timeout);
         let mut items = items::Items::default();
         let mut segment_index = 0_u64;
-        let mut capture_open = true;
         loop {
+            backlog.feed(&mut outbound)?;
             for completed in items.ready(tokio::time::Instant::now())? {
                 segment_index = segment_index
                     .checked_add(1)
@@ -434,7 +451,7 @@ impl RecognitionSession {
                     .map_err(|_| wire::protocol_error("final delivery deadline expired"))?
                     .map_err(|_| wire::protocol_error("final receiver closed"))?;
             }
-            if !capture_open && outbound.is_empty() {
+            if !capture_open && backlog.is_empty() && outbound.is_empty() {
                 return Err(capture_ended());
             }
             let deadline = items.deadline();
@@ -445,20 +462,8 @@ impl RecognitionSession {
                         None => std::future::pending().await,
                     }
                 } => {},
-                event = captures.recv(), if capture_open => {
-                    match event {
-                        Some(Ok(CaptureEvent::Frame(frame))) => {
-                            if frame.format() != self.config.input_format {
-                                return Err(unsupported_audio_format());
-                            }
-                            outbound.enqueue(frame)?;
-                        }
-                        Some(Ok(CaptureEvent::Discontinuity { .. })) => {
-                            return Err(wire::protocol_error("capture discontinuity"));
-                        }
-                        Some(Err(_)) => return Err(wire::protocol_error("capture failed")),
-                        None => capture_open = false,
-                    }
+                event = captures.recv(), if capture_open && backlog.has_room() => {
+                    capture_open = backlog.accept(event, self.config.input_format)?;
                 }
                 sent = outbound.sent() => { if let Some(frame) = sent? { items.submitted(&frame)?; } }
                 event = reader.next() => {
@@ -485,6 +490,75 @@ impl RecognitionSession {
                 }
             }
         }
+    }
+}
+
+/// Capture accepted from the media source but not yet queued for the socket. Bounded by audio
+/// duration: the startup window (`response_start_timeout`, at most 30 s) plus
+/// `STARTUP_CAPTURE_MARGIN`, in bytes of the configured input format. At the only accepted
+/// format (24 kHz mono s16le, 48,000 B/s) the default is 32 s = 1,536,000 bytes. When it is full
+/// the recognizer stops reading, so an overflow becomes the source's accounted gap; a
+/// discontinuity still ends this recognition session, as before.
+struct CaptureBacklog {
+    frames: VecDeque<AudioFrame>,
+    bytes: usize,
+    budget_bytes: usize,
+}
+
+impl CaptureBacklog {
+    fn new(config: &OpenAiSpeechRecognitionConfig) -> Result<Self, AdapterError> {
+        let bytes_per_second = u128::from(config.input_format.sample_rate_hz())
+            * config.input_format.frame_alignment_bytes()? as u128;
+        let window = config.response_start_timeout + STARTUP_CAPTURE_MARGIN;
+        let budget_bytes = usize::try_from(bytes_per_second * window.as_millis() / 1000)
+            .map_err(|_| invalid_config("capture backlog budget overflowed"))?;
+        Ok(Self {
+            frames: VecDeque::new(),
+            bytes: 0,
+            budget_bytes,
+        })
+    }
+
+    fn has_room(&self) -> bool {
+        self.bytes < self.budget_bytes
+    }
+
+    fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    /// Returns whether capture remains open.
+    fn accept(
+        &mut self,
+        event: Option<Result<CaptureEvent, AdapterError>>,
+        format: PcmFormat,
+    ) -> Result<bool, AdapterError> {
+        match event {
+            Some(Ok(CaptureEvent::Frame(frame))) => {
+                if frame.format() != format {
+                    return Err(unsupported_audio_format());
+                }
+                self.bytes += frame.bytes().len();
+                self.frames.push_back(frame);
+                Ok(true)
+            }
+            Some(Ok(CaptureEvent::Discontinuity { .. })) => {
+                Err(wire::protocol_error("capture discontinuity"))
+            }
+            Some(Err(_)) => Err(wire::protocol_error("capture failed")),
+            None => Ok(false),
+        }
+    }
+
+    fn feed(&mut self, outbound: &mut wire::Outbound) -> Result<(), AdapterError> {
+        while outbound.has_room() {
+            let Some(frame) = self.frames.pop_front() else {
+                break;
+            };
+            self.bytes -= frame.bytes().len();
+            outbound.enqueue(frame)?;
+        }
+        Ok(())
     }
 }
 

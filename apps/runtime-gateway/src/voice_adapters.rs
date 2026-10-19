@@ -116,8 +116,9 @@ impl VoiceIoFactory for OnlineRecognitionVoiceIoFactory {
     }
 }
 
-/// The atomic network fan-out retains its recognition consumer for the MEDIA
-/// lifetime, not the provider socket lifetime. After ASR closes, only this copy
+/// The network fan-out (recording awaited, recognition offered without waiting)
+/// retains its recognition consumer for the MEDIA lifetime, not the provider
+/// socket lifetime. After ASR closes, only this copy
 /// is discarded; the independent recorder/voice copy keeps flowing unchanged.
 /// One queued frame plus one pending send, each validated <=64 KiB. No replay.
 struct MediaLifetimeCapture {

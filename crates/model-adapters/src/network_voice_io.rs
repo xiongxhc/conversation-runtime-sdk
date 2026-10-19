@@ -5,7 +5,7 @@
 //! from accidentally bypassing encrypted capture recording.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 use std::time::{Duration, Instant};
 
 use conversation_protocol::{GenerationId, PlaybackState, SessionId, TurnId, UtteranceId};
@@ -80,7 +80,7 @@ struct NetworkSession {
     expiry_changed: Arc<Notify>,
     expiry_task: Option<JoinHandle<()>>,
     voice: Option<mpsc::Sender<Result<VoiceInputEvent, AdapterError>>>,
-    recognition: Option<mpsc::Sender<Result<CaptureEvent, AdapterError>>>,
+    recognition: Option<RecognitionLane>,
     playback: Option<NetworkPlaybackTransport>,
     next_playback_sequence: u64,
     pending_playback: HashMap<u64, PendingPlayback>,
@@ -116,6 +116,63 @@ impl NetworkSession {
             finish_delivered: false,
             waiting_playback: VecDeque::new(),
             waiting_playback_bytes: 0,
+        }
+    }
+}
+
+/// Recognition is a lossy branch of capture that never waits. When its bounded queue is full the
+/// event is dropped and one discontinuity is owed; it is delivered, in order, before the next
+/// recognition event that fits. The owed gap travels with the retained sink. A closed receiver
+/// still fails capture closed before recording is touched (the gateway keeps it open across ASR
+/// failure for the media lifetime).
+#[derive(Clone)]
+struct RecognitionLane {
+    sender: mpsc::Sender<Result<CaptureEvent, AdapterError>>,
+    owed_gap_ms: Arc<std::sync::Mutex<Option<u64>>>,
+}
+
+impl RecognitionLane {
+    fn ensure_open(&self) -> Result<(), AdapterError> {
+        if self.sender.is_closed() {
+            return Err(AdapterError::new("network media capture input closed"));
+        }
+        Ok(())
+    }
+
+    fn offer(&self, event: CaptureEvent) {
+        // Held only across non-blocking sends, never across an await.
+        let mut owed = self
+            .owed_gap_ms
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match (*owed, event) {
+            (None, event) => {
+                let lost_at_ms = match &event {
+                    CaptureEvent::Discontinuity { at_ms } => *at_ms,
+                    CaptureEvent::Frame(_) => 0,
+                };
+                if self.sender.try_send(Ok(event)).is_err() {
+                    *owed = Some(lost_at_ms);
+                }
+            }
+            (Some(at_ms), CaptureEvent::Discontinuity { .. }) => {
+                if self
+                    .sender
+                    .try_send(Ok(CaptureEvent::Discontinuity { at_ms }))
+                    .is_ok()
+                {
+                    *owed = None;
+                }
+            }
+            (Some(at_ms), event) => {
+                if let Ok(mut permits) = self.sender.try_reserve_many(2) {
+                    if let (Some(gap), Some(next)) = (permits.next(), permits.next()) {
+                        gap.send(Ok(CaptureEvent::Discontinuity { at_ms }));
+                        next.send(Ok(event));
+                        *owed = None;
+                    }
+                }
+            }
         }
     }
 }
@@ -253,7 +310,11 @@ impl NetworkMediaHub {
         let session = sessions
             .get_mut(&session_id.get())
             .ok_or_else(|| AdapterError::new("network media session is not reserved"))?;
-        if session.recognition.replace(sender).is_some() {
+        let lane = RecognitionLane {
+            sender,
+            owed_gap_ms: Arc::new(std::sync::Mutex::new(None)),
+        };
+        if session.recognition.replace(lane).is_some() {
             return Err(AdapterError::new(
                 "network media recognition input is already attached",
             ));
@@ -263,6 +324,7 @@ impl NetworkMediaHub {
 
     /// Delivers one validated bridge capture frame to both consumers. A missing consumer is a
     /// failed-closed condition: the socket layer must not call this an accepted media frame.
+    /// Only recording is awaited; recognition is offered afterwards and never delays it.
     pub async fn deliver_capture(
         &self,
         session_id: SessionId,
@@ -282,17 +344,15 @@ impl NetworkMediaHub {
                 })?,
             )
         };
-        let (voice_permit, recognition_permit) =
-            tokio::time::timeout(self.operation_timeout, async {
-                tokio::try_join!(voice.reserve(), recognition.reserve())
-            })
+        recognition.ensure_open()?;
+        let voice_permit = tokio::time::timeout(self.operation_timeout, voice.reserve())
             .await
             .map_err(|_| AdapterError::new("network media capture fan-out timed out"))?
             .map_err(|_| AdapterError::new("network media capture input closed"))?;
         voice_permit.send(Ok(VoiceInputEvent::Capture(CaptureEvent::Frame(
             frame.clone(),
         ))));
-        recognition_permit.send(Ok(CaptureEvent::Frame(frame)));
+        recognition.offer(CaptureEvent::Frame(frame));
         Ok(())
     }
 
@@ -362,25 +422,23 @@ impl NetworkMediaHub {
     async fn send_discontinuity(
         &self,
         voice: mpsc::Sender<Result<VoiceInputEvent, AdapterError>>,
-        recognition: mpsc::Sender<Result<CaptureEvent, AdapterError>>,
+        recognition: RecognitionLane,
         at_ms: u64,
     ) -> Result<(), AdapterError> {
-        let (voice_permit, recognition_permit) =
-            tokio::time::timeout(self.operation_timeout, async {
-                tokio::try_join!(voice.reserve(), recognition.reserve())
-            })
+        recognition.ensure_open()?;
+        let voice_permit = tokio::time::timeout(self.operation_timeout, voice.reserve())
             .await
             .map_err(|_| AdapterError::new("network media discontinuity fan-out timed out"))?
             .map_err(|_| AdapterError::new("network media capture input closed"))?;
         voice_permit.send(Ok(VoiceInputEvent::Capture(CaptureEvent::Discontinuity {
             at_ms,
         })));
-        recognition_permit.send(Ok(CaptureEvent::Discontinuity { at_ms }));
+        recognition.offer(CaptureEvent::Discontinuity { at_ms });
         Ok(())
     }
 
     /// Bounded recorder-only evidence. The recognizer's channel and activity
-    /// stream never receive epoch/clock records; capture still uses atomic fan-out.
+    /// stream never receive epoch/clock records.
     pub async fn deliver_capture_metadata(
         &self,
         session_id: SessionId,

@@ -5,12 +5,13 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
 
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::Serialize;
 
 pub(crate) const ENV_PATH: &str = "RUNTIME_MEDIA_ADMISSION_EVIDENCE_PATH";
-const SCHEMA: &str = "runtime-media-admission-evidence/v1";
+const SCHEMA: &str = "runtime-media-admission-evidence/v2";
 const MAX_RECORDS: u64 = 4096;
 const MAX_LINE_BYTES: usize = 2048;
 const QUEUE_CAPACITY: usize = 64;
@@ -55,6 +56,11 @@ pub(crate) enum Record {
         accepted: bool,
         context: Context,
         predicates: Predicates,
+        /// Refusals only: reconnect time left and credential lateness at the decision `now`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reconnect_remaining_ms: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        credential_overdue_ms: Option<u64>,
     },
     MissingSession {
         session_id: String,
@@ -65,6 +71,7 @@ pub(crate) enum Record {
         session_id: String,
         reservation_epoch: String,
         connection_id: String,
+        reconnect_remaining_ms: u64,
     },
     Completion {
         record_count: u64,
@@ -95,6 +102,11 @@ pub(crate) struct Journal {
     complete: AtomicBool,
     next_attempt: AtomicU64,
     worker: tokio::sync::Mutex<Option<std::thread::JoinHandle<io::Result<()>>>>,
+}
+
+/// Whole milliseconds, floored and saturating; sub-millisecond time reads as 0.
+pub(crate) fn saturating_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn failure() -> io::Error {

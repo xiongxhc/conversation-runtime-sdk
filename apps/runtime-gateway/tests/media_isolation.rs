@@ -695,9 +695,10 @@ async fn capture_ingress_refuses_a_second_frame_above_the_configured_rate() {
     server.shutdown().await;
 }
 
-/// Catches sequential fan-out: when either bounded consumer is full, the other must not receive
+/// Catches one-sided fan-out: when the recording consumer is full, recognition must not receive
 /// an extra frame. The protocol closes the overflowing bridge rather than publishing one-sided
-/// capture or fabricated silence.
+/// capture or fabricated silence. (A full recognition queue never blocks recording; see
+/// `network_recognition_isolation.rs`.)
 #[tokio::test]
 async fn full_capture_consumer_prevents_partial_fanout() {
     let server = MediaServer::bind(

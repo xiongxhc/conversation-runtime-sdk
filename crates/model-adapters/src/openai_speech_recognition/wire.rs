@@ -156,6 +156,12 @@ impl Outbound {
         Ok(())
     }
 
+    /// Room for one more frame of any admissible size (at most `MAX_PCM_FRAME_BYTES`).
+    pub(super) fn has_room(&self) -> bool {
+        self.frames_including_inflight < MAX_QUEUED_FRAMES
+            && self.bytes_including_inflight + crate::MAX_PCM_FRAME_BYTES <= MAX_QUEUED_PCM_BYTES
+    }
+
     pub(super) fn request_flush(&mut self) {
         self.flush_requested = true;
     }

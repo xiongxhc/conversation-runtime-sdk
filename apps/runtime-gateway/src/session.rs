@@ -1460,9 +1460,15 @@ impl GatewaySession {
                 };
                 let mut recorder = active.recorder.lock().await;
                 let finalized = if self.protocol_v4 {
-                    recorder
+                    let finalized = recorder
                         .finalize_with_capability()
-                        .map(|(summary, capability)| (summary, Some(capability)))
+                        .map(|(summary, capability)| (summary, Some(capability)));
+                    // An incomplete recording can never be issued a capability. Close it anyway,
+                    // so the file is complete on disk and the session can record again.
+                    if finalized.is_err() && recorder.is_incomplete() && !recorder.is_finalized() {
+                        let _ = recorder.finalize();
+                    }
+                    finalized
                 } else {
                     recorder.finalize().map(|summary| (summary, None))
                 };
@@ -7649,12 +7655,11 @@ mod tests {
             _cancellation: CancellationToken,
         ) -> AdapterFuture<'a, mpsc::Receiver<Result<VoiceInputEvent, AdapterError>>> {
             Box::pin(async move {
-                Ok(self
-                    .receiver
+                self.receiver
                     .lock()
                     .expect("test voice input receiver lock poisoned")
                     .take()
-                    .expect("test voice input started more than once"))
+                    .ok_or_else(|| AdapterError::new("test voice input started more than once"))
             })
         }
     }
@@ -9208,6 +9213,73 @@ max_error_bytes = 65536
             .read_message()
             .await
             .contains(r#""type":"recording_finalized""#));
+        gateway.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_refused_v4_finalize_still_closes_an_incomplete_recording_so_voice_can_restart() {
+        let key_env = "CONVERSATION_SESSION_RECORDING_KEY_INCOMPLETE_V4";
+        std::env::set_var(key_env, FAKE_RECORDING_KEY);
+        let directory = TempDir::new().unwrap();
+        let settings = RecordingSettings::new(directory.path(), key_env)
+            .unwrap()
+            .with_test_sink_fault(conversation_runtime::RecordingSinkFault::Write);
+        let (input, input_receiver) = mpsc::channel(8);
+        let session = session_with_interactive_voice(
+            input_receiver,
+            Arc::new(MockGenerationLanguageModel::new(["fixture reply"])),
+            no_speech_frames(),
+        )
+        .with_recording(settings)
+        .with_v4_control();
+        let mut gateway = InMemoryGateway::start(session).await;
+
+        gateway
+            .write(r#"{"protocol_version":4,"type":"start_voice_session","request_id":"voice-1"}"#)
+            .await;
+        gateway
+            .read_until(|message| message.contains(r#""request_id":"voice-1""#))
+            .await;
+        // The first recording write fails: the recording is incomplete from here on.
+        send_voice_input(&input, recording_frame(1)).await;
+        gateway
+            .read_until(|message| message.contains(r#""type":"voice_session_failed""#))
+            .await;
+        gateway
+            .write(r#"{"protocol_version":4,"type":"stop_voice_session","request_id":"stop-1"}"#)
+            .await;
+        gateway
+            .read_until(|message| message.contains(r#""request_id":"stop-1""#))
+            .await;
+
+        // An incomplete recording cannot authorize recovery, so the v4 finalize is refused...
+        gateway
+            .write(
+                r#"{"protocol_version":4,"type":"finalize_recording","request_id":"fin-1","session_id":"1"}"#,
+            )
+            .await;
+        let refused = gateway
+            .read_until(|message| message.contains(r#""request_id":"fin-1""#))
+            .await;
+        assert!(
+            refused
+                .last()
+                .is_some_and(|message| message.contains("command_rejected")),
+            "{refused:?}"
+        );
+        // ...but the recording is closed, so the session is not locked out of voice for good.
+        gateway
+            .write(r#"{"protocol_version":4,"type":"start_voice_session","request_id":"voice-2"}"#)
+            .await;
+        let started = gateway
+            .read_until(|message| message.contains(r#""request_id":"voice-2""#))
+            .await;
+        let started = started.last().unwrap();
+        assert!(
+            started.contains("command_accepted"),
+            "a new voice session starts after the refused finalize: {started}"
+        );
+        drop(input);
         gateway.close().await;
     }
 

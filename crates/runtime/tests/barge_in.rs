@@ -370,7 +370,7 @@ async fn dropped_event_consumer_cleans_turn_and_sidecar_work() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn flush_failure_still_cleans_the_turn_then_ends_the_session() {
+async fn flush_failure_cleans_the_turn_and_keeps_the_session_listening() {
     let harness =
         VoiceSessionHarness::speaking_generations([GenerationId::new(1)]).with_flush_failure();
     let mut events = harness.start().await;
@@ -383,7 +383,7 @@ async fn flush_failure_still_cleans_the_turn_then_ends_the_session() {
         .barge_in(TurnId::new(1), GenerationId::new(1))
         .await
         .unwrap();
-    let observed = drain_until_session_terminal(&mut events).await;
+    let observed = drain_until_turn_recovery(&mut events).await;
 
     assert!(harness.language.cleanup_finished(GenerationId::new(1)));
     assert!(harness.speech.cleanup_finished(GenerationId::new(1)));
@@ -404,14 +404,16 @@ async fn flush_failure_still_cleans_the_turn_then_ends_the_session() {
         event,
         VoiceSessionEvent::SessionFailed {
             error,
-            recovery: RecoveryDisposition::NewSession,
+            recovery: RecoveryDisposition::ContinueSession,
             ..
         } if error.stage() == RuntimeStage::ContinuousAudioOutput
     )));
+    assert!(!observed.iter().any(VoiceSessionEvent::is_session_terminal));
+    harness.shutdown(&mut events).await;
 }
 
 #[tokio::test(start_paused = true)]
-async fn stalled_flush_times_out_to_one_new_session_terminal() {
+async fn stalled_flush_times_out_to_a_recoverable_failure() {
     let harness =
         VoiceSessionHarness::speaking_generations([GenerationId::new(1)]).with_stalled_flush();
     let mut events = harness.start().await;
@@ -423,15 +425,16 @@ async fn stalled_flush_times_out_to_one_new_session_terminal() {
         .emit_barge_in(TurnId::new(1), GenerationId::new(1))
         .await;
     tokio::time::advance(Duration::from_secs(2)).await;
-    let observed = drain_until_session_terminal(&mut events).await;
+    let observed = drain_until_recovery(&mut events).await;
 
-    assert_new_session_cleanup_timeout(&observed);
+    assert_recoverable_cleanup_timeout(&observed);
     assert!(harness.language.cleanup_finished(GenerationId::new(1)));
     assert!(harness.speech.cleanup_finished(GenerationId::new(1)));
+    harness.shutdown(&mut events).await;
 }
 
 #[tokio::test(start_paused = true)]
-async fn stalled_turn_drain_times_out_to_one_new_session_terminal() {
+async fn stalled_turn_drain_times_out_to_a_recoverable_failure() {
     let harness = VoiceSessionHarness::speaking_generations([GenerationId::new(1)])
         .with_stalled_turn_cleanup();
     let mut events = harness.start().await;
@@ -443,13 +446,37 @@ async fn stalled_turn_drain_times_out_to_one_new_session_terminal() {
         .emit_barge_in(TurnId::new(1), GenerationId::new(1))
         .await;
     tokio::time::advance(Duration::from_secs(2)).await;
-    let observed = drain_until_session_terminal(&mut events).await;
+    let observed = drain_until_recovery(&mut events).await;
 
-    assert_new_session_cleanup_timeout(&observed);
+    assert_recoverable_cleanup_timeout(&observed);
     assert!(
         harness.output.stalled_work_stopped(),
-        "session terminal published before stalled turn work was aborted"
+        "recovery published before stalled turn work was aborted"
     );
+    harness.shutdown(&mut events).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_flush_with_a_stalled_drain_aborts_the_turn_before_recovering() {
+    let harness = VoiceSessionHarness::speaking_generations([GenerationId::new(1)])
+        .with_failed_flush_and_stalled_turn_cleanup();
+    let mut events = harness.start().await;
+    harness
+        .start_speaking_generation(&mut events, GenerationId::new(1))
+        .await;
+
+    harness
+        .emit_barge_in(TurnId::new(1), GenerationId::new(1))
+        .await;
+    tokio::time::advance(Duration::from_secs(2)).await;
+    let observed = drain_until_recovery(&mut events).await;
+
+    assert!(!observed.iter().any(VoiceSessionEvent::is_session_terminal));
+    assert!(
+        harness.output.stalled_work_stopped(),
+        "recovery published while the undrained turn still ran"
+    );
+    harness.shutdown(&mut events).await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -590,6 +617,21 @@ fn assert_no_late_generation_work(observed: &[VoiceSessionEvent]) {
     )));
 }
 
+/// A response that cannot be interrupted in time costs only that response: the failure is
+/// recoverable and the session (and its recording) stays up.
+fn assert_recoverable_cleanup_timeout(observed: &[VoiceSessionEvent]) {
+    assert!(!observed.iter().any(VoiceSessionEvent::is_session_terminal));
+    assert!(observed.iter().any(|event| matches!(
+        event,
+        VoiceSessionEvent::SessionFailed {
+            error,
+            recovery: RecoveryDisposition::ContinueSession,
+            ..
+        } if error.stage() == RuntimeStage::Runtime
+            && error.message().contains("cleanup timed out")
+    )));
+}
+
 fn assert_new_session_cleanup_timeout(observed: &[VoiceSessionEvent]) {
     assert_eq!(
         observed
@@ -685,6 +727,15 @@ impl VoiceSessionHarness {
             self.language.active_generations.iter().copied(),
             FlushBehavior::Stall,
             false,
+            false,
+        )
+    }
+
+    fn with_failed_flush_and_stalled_turn_cleanup(self) -> Self {
+        Self::configured(
+            self.language.active_generations.iter().copied(),
+            FlushBehavior::Fail,
+            true,
             false,
         )
     }
@@ -1269,6 +1320,28 @@ async fn drain_until_session_terminal(
     })
     .await
     .expect("session terminal timed out")
+}
+
+async fn drain_until_recovery(events: &mut VoiceSessionEventStream) -> Vec<VoiceSessionEvent> {
+    timeout(Duration::from_secs(1), async {
+        let mut observed = Vec::new();
+        while let Some(event) = events.recv().await {
+            let recovery = matches!(
+                event,
+                VoiceSessionEvent::SessionFailed {
+                    recovery: RecoveryDisposition::ContinueSession,
+                    ..
+                }
+            );
+            observed.push(event);
+            if recovery {
+                return observed;
+            }
+        }
+        panic!("session ended before a recoverable failure");
+    })
+    .await
+    .expect("recoverable failure timed out")
 }
 
 async fn drain_until_turn_recovery(events: &mut VoiceSessionEventStream) -> Vec<VoiceSessionEvent> {

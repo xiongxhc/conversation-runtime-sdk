@@ -726,9 +726,9 @@ impl VoiceLoop {
                 generation_id,
                 completion,
             }) => {
-                let result = self.handle_barge_in(turn_id, generation_id).await;
+                let exit = self.handle_barge_in(turn_id, generation_id).await;
                 let _ = completion.send(());
-                result.err().map(LoopExit::Fatal)
+                exit
             }
             Some(SessionCommand::PauseCapture { completion }) => {
                 self.start_capture_operation(CaptureOperationKind::Pause, completion);
@@ -1128,8 +1128,8 @@ impl VoiceLoop {
                 "voice input event type is unsupported",
             ))),
             Some(Err(error)) if is_recognition_failure(&error) => {
-                if let Err(cleanup_error) = self.interrupt_current_turn().await {
-                    return Some(LoopExit::Fatal(cleanup_error));
+                if let Some(exit) = self.interrupt_or_stop_speaking().await {
+                    return Some(exit);
                 }
                 self.deadline.disarm();
                 self.finalization_due = false;
@@ -1237,8 +1237,8 @@ impl VoiceLoop {
                     generation_id,
                 } = self.state
                 {
-                    if let Err(error) = self.handle_barge_in(turn_id, generation_id).await {
-                        return Some(LoopExit::Fatal(error));
+                    if let Some(exit) = self.handle_barge_in(turn_id, generation_id).await {
+                        return Some(exit);
                     }
                 }
             }
@@ -1522,14 +1522,14 @@ impl VoiceLoop {
         &mut self,
         turn_id: TurnId,
         generation_id: GenerationId,
-    ) -> Result<(), RuntimeError> {
+    ) -> Option<LoopExit> {
         if self.state
             != (VoiceLoopState::Responding {
                 turn_id,
                 generation_id,
             })
         {
-            return Ok(());
+            return None;
         }
         if !self
             .publish_reliable(VoiceSessionEvent::BargeIn {
@@ -1539,12 +1539,42 @@ impl VoiceLoop {
             })
             .await
         {
-            return Err(runtime_error(
-                "voice session event stream closed during barge-in",
-            ));
+            return Some(LoopExit::ConsumerDropped);
         }
 
-        self.interrupt_current_turn().await
+        self.interrupt_or_stop_speaking().await
+    }
+
+    /// Interrupts the response being spoken. A failed interruption — typically a playback
+    /// flush the bridge cannot acknowledge because it is disconnected or slow — costs only the
+    /// response: the turn is reaped, the failure is reported as recoverable, and the session
+    /// keeps listening and recording. Only a closed event stream ends the loop.
+    async fn interrupt_or_stop_speaking(&mut self) -> Option<LoopExit> {
+        let VoiceLoopState::Responding {
+            turn_id,
+            generation_id,
+        } = self.state
+        else {
+            return None;
+        };
+        let error = self.interrupt_current_turn().await.err()?;
+        if self.turn_events.is_some() {
+            let _ = self.abort_interrupted_turn(turn_id, generation_id).await;
+        }
+        self.state = VoiceLoopState::Listening;
+        self.playback = None;
+        if self.events.is_closed()
+            || !self
+                .publish_reliable(VoiceSessionEvent::SessionFailed {
+                    session_id: self.session_id,
+                    error,
+                    recovery: RecoveryDisposition::ContinueSession,
+                })
+                .await
+        {
+            return Some(LoopExit::ConsumerDropped);
+        }
+        None
     }
 
     async fn interrupt_current_turn(&mut self) -> Result<(), RuntimeError> {
@@ -3309,5 +3339,162 @@ mod tests {
             loop_.pending_segments.get(&34),
             Some(PendingSegment::Pending(text)) if text == "after skip and provider recovery"
         ));
+    }
+
+    /// A playback transport that is not attached: every flush fails, as the network bridge's
+    /// does while it is disconnected.
+    struct DisconnectedOutput;
+
+    impl ContinuousAudioOutput for DisconnectedOutput {
+        fn enqueue<'a>(
+            &'a self,
+            _frame: AudioFrame,
+            _cancellation: CancellationToken,
+        ) -> AdapterFuture<'a, PlaybackReceipt> {
+            Box::pin(async { Err(AdapterError::new("test does not enqueue audio")) })
+        }
+
+        fn flush<'a>(
+            &'a self,
+            _session_id: SessionId,
+            _generation_id: GenerationId,
+        ) -> AdapterFuture<'a, PlaybackReceipt> {
+            Box::pin(async { Err(AdapterError::new("network media bridge is not connected")) })
+        }
+    }
+
+    async fn responding_loop_with_disconnected_playback(
+    ) -> (VoiceLoop, mpsc::Receiver<VoiceSessionEvent>, TurnId) {
+        let session_id = SessionId::new(1);
+        let policy = VoiceSessionPolicy::new(
+            session_id,
+            PrivacyMode::Cloud,
+            200,
+            600,
+            [ComponentDescriptor::new(
+                ComponentKind::SpeechRecognition,
+                "remote-recognition",
+                ExecutionLocation::Remote,
+            )],
+        )
+        .unwrap();
+        let context = ConversationContext::new(ConversationQualityController::new(
+            PersonaProfile::default(),
+            ResponseControls::default(),
+            ConversationMode::DirectAnswer,
+        ));
+        let turn_runtime = StreamingTurnRuntime::new(
+            context.clone(),
+            Arc::new(BlockingLanguage::default()),
+            Arc::new(MockStreamingSpeechSynthesizer::new([])),
+            Arc::new(DisconnectedOutput),
+        );
+        let (input, input_receiver) = mpsc::channel(1);
+        std::mem::forget(input);
+        let (commands, command_receiver) = mpsc::channel(1);
+        std::mem::forget(commands);
+        let (event_sender, events) = mpsc::channel(SESSION_EVENT_BUFFER_SIZE);
+        let mut loop_ = VoiceLoop::new(
+            policy,
+            VoiceLoopDependencies {
+                input_events: input_receiver,
+                capture: Arc::new(MockVoiceCaptureControl::new()),
+                completion: tokio::spawn(async { Ok(()) }),
+                turn_runtime,
+                commands: command_receiver,
+                events: event_sender,
+                cancellation: CancellationToken::new(),
+                recorder: None,
+                response_mode: VoiceResponseMode::ExternalGate,
+                context,
+            },
+        );
+        loop_
+            .register_pending_segment(9, "agenda".to_owned())
+            .await
+            .unwrap();
+        let turn_id = loop_
+            .authorize_segment(
+                session_id,
+                9,
+                vec![ConversationContextExchange::new("prior", "context").unwrap()],
+            )
+            .await
+            .unwrap();
+        assert!(matches!(loop_.state, VoiceLoopState::Responding { .. }));
+        (loop_, events, turn_id)
+    }
+
+    fn assert_speaking_degraded(loop_: &VoiceLoop, events: &mut mpsc::Receiver<VoiceSessionEvent>) {
+        assert_eq!(loop_.state, VoiceLoopState::Listening);
+        assert!(loop_.turn_events.is_none(), "the failed turn is reaped");
+        assert!(loop_.playback.is_none());
+        let mut published = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            published.push(event);
+        }
+        published.extend(loop_.reliable_events.iter().cloned());
+        assert!(
+            published.iter().any(|event| matches!(
+                event,
+                VoiceSessionEvent::SessionFailed {
+                    error,
+                    recovery: RecoveryDisposition::ContinueSession,
+                    ..
+                } if error.stage() == RuntimeStage::ContinuousAudioOutput
+            )),
+            "the playback failure is reported as recoverable: {published:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_recognition_failure_whose_playback_flush_fails_only_degrades_speaking() {
+        let (mut loop_, mut events, _) = responding_loop_with_disconnected_playback().await;
+        let exit = loop_
+            .handle_input(Some(Err(AdapterError::new("capture discontinuity")
+                .with_stage(RuntimeStage::SpeechRecognizer))))
+            .await;
+        assert!(
+            exit.is_none(),
+            "the voice session and its recording continue"
+        );
+        assert_speaking_degraded(&loop_, &mut events);
+    }
+
+    #[tokio::test]
+    async fn a_provider_barge_in_whose_playback_flush_fails_only_degrades_speaking() {
+        let (mut loop_, mut events, _) = responding_loop_with_disconnected_playback().await;
+        let exit = loop_
+            .handle_input(Some(Ok(VoiceInputEvent::Activity(
+                VoiceActivity::SpeechStarted { at_ms: 0 },
+            ))))
+            .await;
+        assert!(
+            exit.is_none(),
+            "the voice session and its recording continue"
+        );
+        assert_speaking_degraded(&loop_, &mut events);
+    }
+
+    #[tokio::test]
+    async fn a_client_barge_in_whose_playback_flush_fails_only_degrades_speaking() {
+        let (mut loop_, mut events, turn_id) = responding_loop_with_disconnected_playback().await;
+        let VoiceLoopState::Responding { generation_id, .. } = loop_.state else {
+            unreachable!("asserted responding");
+        };
+        let (completion, completed) = oneshot::channel();
+        let exit = loop_
+            .handle_command(Some(SessionCommand::BargeIn {
+                turn_id,
+                generation_id,
+                completion,
+            }))
+            .await;
+        assert!(
+            exit.is_none(),
+            "the voice session and its recording continue"
+        );
+        completed.await.expect("the barge-in is answered");
+        assert_speaking_degraded(&loop_, &mut events);
     }
 }

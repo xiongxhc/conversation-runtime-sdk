@@ -767,3 +767,66 @@ fn digest_copy_is_bounded_and_hashes_the_exact_bytes_read_despite_in_place_sourc
     assert_eq!(file_digest(&snapshot_path).unwrap(), copied);
     assert_eq!(reader.max_read, DIGEST_BUFFER_BYTES);
 }
+
+#[test]
+fn gaps_beyond_the_summary_cap_keep_recording_and_stay_recoverable() {
+    let fixture = Fixture::new();
+    let mut recorder = fixture.recorder();
+    let gaps = MAX_RECORDING_GAPS as u64 + 5;
+    for sequence in 0..gaps {
+        recorder.record_frame(&frame(sequence)).unwrap();
+        recorder
+            .record_capture_gap()
+            .expect("a gap never stops the recording");
+    }
+    recorder.record_frame(&frame(gaps)).unwrap();
+    let (summary, capability) = recorder.finalize_with_capability().unwrap();
+
+    assert_eq!(summary.gaps.len(), MAX_RECORDING_GAPS);
+    assert!(summary
+        .gaps
+        .iter()
+        .all(|gap| gap.reason == CAPTURE_DISCONTINUITY_REASON && gap.ended_at_ms.is_some()));
+    let coalesced = summary.gaps.last().unwrap();
+    let frame_ms = frame_duration_ms(&frame(0));
+    assert!(
+        coalesced.started_at_ms >= (MAX_RECORDING_GAPS as u64) * frame_ms
+            && coalesced.started_at_ms < (MAX_RECORDING_GAPS as u64 + 1) * frame_ms,
+        "the last summary entry starts at the last gap that fit the cap: {coalesced:?}"
+    );
+    assert_eq!(
+        coalesced.ended_at_ms,
+        Some(summary.duration_ms - frame_ms),
+        "and spans every later gap"
+    );
+    let mut chunks =
+        preflight_finalized_recording(&fixture.settings, &capability, &CancellationToken::new())
+            .expect("a recording with many gaps remains recoverable");
+    let mut frames = 0;
+    let mut gap_chunks = 0;
+    while let Some(chunk) = chunks.next_chunk().unwrap() {
+        match chunk {
+            RecordedChunk::Frame { .. } => frames += 1,
+            RecordedChunk::GapStarted { .. } => gap_chunks += 1,
+            _ => {}
+        }
+    }
+    assert_eq!(frames, gaps + 1, "every frame is recorded");
+    assert_eq!(gap_chunks, gaps, "every gap stays exact in the file");
+}
+
+#[test]
+fn a_gap_past_the_summary_cap_still_open_at_finalize_is_reported_open() {
+    let fixture = Fixture::new();
+    let mut recorder = fixture.recorder();
+    for sequence in 0..=MAX_RECORDING_GAPS as u64 {
+        recorder.record_frame(&frame(sequence)).unwrap();
+        recorder.record_capture_gap().unwrap();
+    }
+    let summary = recorder.finalize().unwrap();
+    assert_eq!(summary.gaps.len(), MAX_RECORDING_GAPS);
+    assert_eq!(summary.gaps.last().unwrap().ended_at_ms, None);
+    assert!(summary.gaps[..MAX_RECORDING_GAPS - 1]
+        .iter()
+        .all(|gap| gap.ended_at_ms.is_some()));
+}

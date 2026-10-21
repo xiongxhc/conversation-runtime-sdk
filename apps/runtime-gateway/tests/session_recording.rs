@@ -695,7 +695,7 @@ async fn production_allocated_gateway_sessions_reject_each_others_recording_hand
 }
 
 #[tokio::test]
-async fn a_recording_gap_limit_keeps_the_meeting_alive_and_marks_the_summary_incomplete() {
+async fn gaps_past_the_summary_cap_never_stop_the_recording() {
     let key_env = "CONVERSATION_TEST_RECORDING_KEY_GAP_LIMIT";
     set_fake_key(key_env);
     let directory = TempDir::new().expect("temporary recording directory");
@@ -717,11 +717,18 @@ async fn a_recording_gap_limit_keeps_the_meeting_alive_and_marks_the_summary_inc
             .expect("the final capped gap closes");
     }
 
+    // A lossy bridge keeps dropping out after the summary is full; every frame still lands.
+    let next = MAX_RECORDING_GAPS as u64 + 2;
     let events = run_voice_session(
         vec![
             Step::Emit(Ok(VoiceInputEvent::Capture(CaptureEvent::Discontinuity {
                 at_ms: 0,
             }))),
+            Step::Emit(Ok(marker_capture_frame(next))),
+            Step::Emit(Ok(VoiceInputEvent::Capture(CaptureEvent::Discontinuity {
+                at_ms: 0,
+            }))),
+            Step::Emit(Ok(marker_capture_frame(next + 1))),
             Step::Sleep(Duration::from_millis(80)),
         ],
         Arc::clone(&recorder),
@@ -732,22 +739,25 @@ async fn a_recording_gap_limit_keeps_the_meeting_alive_and_marks_the_summary_inc
         matches!(events.last(), Some(VoiceSessionEvent::SessionEnded { .. })),
         "{events:?}"
     );
-    assert!(events.iter().any(|event| matches!(
-        event,
-        VoiceSessionEvent::SessionFailed {
-            recovery: RecoveryDisposition::ContinueSession,
-            ..
-        }
-    )));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, VoiceSessionEvent::SessionFailed { .. })),
+        "gaps are not a recording failure: {events:?}"
+    );
     let summary = recorder
         .lock()
         .await
         .finalize()
-        .expect("partial recording finalizes");
+        .expect("recording finalizes");
     assert_eq!(summary.gaps.len(), MAX_RECORDING_GAPS);
+    assert!(summary
+        .gaps
+        .iter()
+        .all(|gap| gap.reason == "capture_discontinuity" && gap.ended_at_ms.is_some()));
     assert_eq!(
-        summary.gaps.last().map(|gap| gap.reason.as_str()),
-        Some("recording_failed")
+        recorded_frames_len(&summary.encrypted_path, key_env),
+        MAX_RECORDING_GAPS + 3
     );
 }
 

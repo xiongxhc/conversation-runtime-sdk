@@ -72,8 +72,9 @@ pub const CAPTURE_DISCONTINUITY_REASON: &str = "capture_discontinuity";
 pub const RECORDING_FAILURE_REASON: &str = "recording_failed";
 /// The reported format of a recording that captured no audio at all.
 pub const EMPTY_RECORDING_FORMAT: &str = "none";
-/// The most gaps one recording may carry. A recording that exceeds it fails closed rather
-/// than reporting a truncated gap list.
+/// The most gaps one recording's summary lists. The file records every gap exactly; past this
+/// many the summary's last entry is widened to span all later gaps, so memory and the summary
+/// stay bounded while the recording itself never stops because of gaps.
 pub const MAX_RECORDING_GAPS: usize = 256;
 
 const MAGIC: &[u8; 8] = b"CRSREC02";
@@ -774,9 +775,6 @@ impl SessionRecorder {
         if self.open_gap_at_ms.is_some() {
             return Ok(());
         }
-        if self.gaps.len() >= MAX_RECORDING_GAPS {
-            return Err(adapter_error("recording exceeded its gap limit"));
-        }
         let at_ms = self.elapsed_ms();
         let reason = CAPTURE_DISCONTINUITY_REASON;
         let mut record = Vec::with_capacity(11 + reason.len());
@@ -786,11 +784,16 @@ impl SessionRecorder {
         record.extend_from_slice(reason.as_bytes());
         self.append(record)?;
         self.open_gap_at_ms = Some(at_ms);
-        self.gaps.push(RecordingGap {
-            started_at_ms: self.media_ms,
-            ended_at_ms: None,
-            reason: reason.to_owned(),
-        });
+        if self.gaps.len() < MAX_RECORDING_GAPS {
+            self.gaps.push(RecordingGap {
+                started_at_ms: self.media_ms,
+                ended_at_ms: None,
+                reason: reason.to_owned(),
+            });
+        } else if let Some(last) = self.gaps.last_mut() {
+            // Reopened, not replaced: the closing frame widens it to cover this gap too.
+            last.ended_at_ms = None;
+        }
         Ok(())
     }
 
@@ -1599,7 +1602,6 @@ fn validate_completed_chunks(
     let mut ended = false;
     let mut format = None;
     let mut gap = None;
-    let mut gap_count = 0;
     let mut last_at_ms = 0;
     let mut timed_validation = TimedValidation::default();
     loop {
@@ -1654,11 +1656,7 @@ fn validate_completed_chunks(
                 at_ms
             }
             RecordedChunk::GapStarted { at_ms, reason } => {
-                gap_count += 1;
-                if gap.is_some()
-                    || reason != CAPTURE_DISCONTINUITY_REASON
-                    || gap_count > MAX_RECORDING_GAPS
-                {
+                if gap.is_some() || reason != CAPTURE_DISCONTINUITY_REASON {
                     return Err(recovery_error());
                 }
                 gap = Some(at_ms);

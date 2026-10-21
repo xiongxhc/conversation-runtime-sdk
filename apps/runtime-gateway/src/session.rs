@@ -1566,14 +1566,15 @@ impl GatewaySession {
                 } else {
                     recorder.finalize().map(|summary| (summary, None))
                 };
+                // Closed counts as finalized even when the finalize itself was refused, so a
+                // provider-host exit can end the session once the file is complete on disk.
+                let closed = recorder.is_finalized();
                 drop(recorder);
+                if let Some(active) = self.active_recording.as_mut() {
+                    active.finalized = closed;
+                }
                 let (recording, recovery_capability) = match finalized {
-                    Ok((summary, capability)) => {
-                        if let Some(active) = self.active_recording.as_mut() {
-                            active.finalized = true;
-                        }
-                        (client_recording_summary(&summary), capability)
-                    }
+                    Ok((summary, capability)) => (client_recording_summary(&summary), capability),
                     Err(error) => {
                         return send_rejection(
                             normal,
@@ -10134,6 +10135,97 @@ max_error_bytes = 65536
         );
         drop(input);
         gateway.close().await;
+    }
+
+    /// The refused-v4-finalize close and the provider-host exit together: once the incomplete
+    /// recording is closed by the refused finalize, a session whose provider host exited ends
+    /// with the provider failure instead of lingering until input EOF.
+    #[tokio::test]
+    async fn a_provider_host_exit_ends_the_session_after_a_refused_v4_finalize_closes_the_recording(
+    ) {
+        let key_env = "CONVERSATION_SESSION_RECORDING_KEY_INCOMPLETE_V4_PROVIDER_EXIT";
+        std::env::set_var(key_env, FAKE_RECORDING_KEY);
+        let directory = TempDir::new().unwrap();
+        let settings = RecordingSettings::new(directory.path(), key_env)
+            .unwrap()
+            .with_test_sink_fault(conversation_runtime::RecordingSinkFault::Write);
+        let provider_failure = CancellationToken::new();
+        let (input, input_receiver) = mpsc::channel(8);
+        let session = session_with_interactive_voice(
+            input_receiver,
+            Arc::new(MockGenerationLanguageModel::new(["fixture reply"])),
+            no_speech_frames(),
+        )
+        .with_recording(settings)
+        .with_v4_control()
+        .with_provider_failure(provider_failure.clone());
+        let mut gateway = InMemoryGateway::start(session).await;
+
+        gateway
+            .write(r#"{"protocol_version":4,"type":"start_voice_session","request_id":"voice-1"}"#)
+            .await;
+        gateway
+            .read_until(|message| message.contains(r#""request_id":"voice-1""#))
+            .await;
+        // The first recording write fails: the recording is incomplete from here on.
+        send_voice_input(&input, recording_frame(1)).await;
+        gateway
+            .read_until(|message| message.contains(r#""type":"voice_session_failed""#))
+            .await;
+
+        provider_failure.cancel();
+        let degraded = gateway
+            .read_until(|message| {
+                message_type(message) == "fatal"
+                    || (message.contains(r#""type":"voice_session_failed""#)
+                        && message.contains(r#""stage":"runtime""#))
+            })
+            .await;
+        assert_ne!(
+            message_type(degraded.last().unwrap()),
+            "fatal",
+            "{degraded:?}"
+        );
+        gateway
+            .write(r#"{"protocol_version":4,"type":"stop_voice_session","request_id":"stop-1"}"#)
+            .await;
+        gateway
+            .read_until(|message| {
+                message_type(message) == "command_accepted"
+                    && message.contains(r#""request_id":"stop-1""#)
+            })
+            .await;
+
+        gateway
+            .write(
+                r#"{"protocol_version":4,"type":"finalize_recording","request_id":"fin-1","session_id":"1"}"#,
+            )
+            .await;
+        let refused = gateway
+            .read_until(|message| message.contains(r#""request_id":"fin-1""#))
+            .await;
+        assert!(
+            refused
+                .last()
+                .is_some_and(|message| message.contains("command_rejected")),
+            "{refused:?}"
+        );
+        let fatal = gateway
+            .read_until(|message| message_type(message) == "fatal")
+            .await;
+        assert!(
+            fatal
+                .last()
+                .unwrap()
+                .contains(r#""code":"adapter_failure""#),
+            "{fatal:?}"
+        );
+        timeout(TEST_TIMEOUT, &mut gateway.task)
+            .await
+            .expect("the degraded session lingered after its recording was closed")
+            .unwrap()
+            .unwrap();
+        drop(input);
     }
 
     #[tokio::test]

@@ -41,6 +41,10 @@ const URGENT_WRITER_BUFFER_SIZE: usize = 2;
 const NORMAL_WRITER_BUFFER_SIZE: usize = 4;
 const EVENT_WRITER_BUFFER_SIZE: usize = 1;
 const WRITER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
+/// Free normal-lane slots a command needs before it is read: a command sends at most two
+/// replies there. The voice pump's terminal slot is reserved when its session starts, so no
+/// other sender competes for this room.
+const COMMAND_REPLY_ROOM: usize = 2;
 const INVALID_COMMAND_REQUEST_ID: &str = "invalid-command";
 #[cfg(not(test))]
 fn next_gateway_session_id() -> SessionId {
@@ -412,7 +416,7 @@ impl GatewaySession {
                         _=provider_failure.cancelled()=>SessionInput::ProviderFailure,
                         result=async {alignment.task.as_mut().expect("guarded task").await},if alignment.task.is_some()=>SessionInput::AlignmentReader(result),
                         item=alignment.receiver.recv(),if alignment.credit=>SessionInput::AlignmentItem(item),
-                        frame=reader.read_frame()=>SessionInput::Frame(frame),
+                        frame=read_frame_with_reply_room(&mut reader,&normal_sender)=>SessionInput::Frame(frame),
                     }
                 } else if let Some(active_task) = active
                     .as_mut()
@@ -424,7 +428,7 @@ impl GatewaySession {
                         writer = &mut writer_task => SessionInput::Writer(writer),
                         _ = provider_failure.cancelled() => SessionInput::ProviderFailure,
                         forwarding = active_task => SessionInput::Forwarder(forwarding),
-                        frame = reader.read_frame() => SessionInput::Frame(frame),
+                        frame = read_frame_with_reply_room(&mut reader, &normal_sender) => SessionInput::Frame(frame),
                     }
                 } else if let Some(voice_session) = voice.active.as_mut() {
                     let voice_task = &mut voice_session.task;
@@ -436,7 +440,7 @@ impl GatewaySession {
                         _ = provider_failure.cancelled() => SessionInput::ProviderFailure,
                             pumped = voice_task => SessionInput::VoicePump(pumped),
                             controlled = &mut control.task => SessionInput::VoiceControl(controlled),
-                            frame = reader.read_frame() => SessionInput::Frame(frame),
+                            frame = read_frame_with_reply_room(&mut reader, &normal_sender) => SessionInput::Frame(frame),
                         }
                     } else {
                         tokio::select! {
@@ -445,7 +449,7 @@ impl GatewaySession {
                             writer = &mut writer_task => SessionInput::Writer(writer),
                         _ = provider_failure.cancelled() => SessionInput::ProviderFailure,
                             pumped = voice_task => SessionInput::VoicePump(pumped),
-                            frame = reader.read_frame() => SessionInput::Frame(frame),
+                            frame = read_frame_with_reply_room(&mut reader, &normal_sender) => SessionInput::Frame(frame),
                         }
                     }
                 } else {
@@ -454,7 +458,7 @@ impl GatewaySession {
                         terminal = terminal_written_receiver.recv(), if !terminal_written_receiver.is_closed() => SessionInput::VoiceTerminalWritten(terminal),
                         writer = &mut writer_task => SessionInput::Writer(writer),
                         _ = provider_failure.cancelled() => SessionInput::ProviderFailure,
-                        frame = reader.read_frame() => SessionInput::Frame(frame),
+                        frame = read_frame_with_reply_room(&mut reader, &normal_sender) => SessionInput::Frame(frame),
                     }
                 };
 
@@ -1322,6 +1326,15 @@ impl GatewaySession {
                 // below puts `voice_session_started` on the event lane, which the writer can
                 // prefer over the normal lane, and clients open the voice session only on
                 // this acceptance. The timed start may follow that first event.
+                // Reserved before any reply so the pump's terminal never competes with
+                // command replies for the room the reader guaranteed.
+                let Ok(terminal_slot) = normal.clone().try_reserve_owned() else {
+                    let _ = runtime.shutdown().await;
+                    revoke_media_lease(media_lease).await;
+                    return Err(CommandFailure::response(
+                        GatewaySessionError::WriterBackpressure,
+                    ));
+                };
                 let acceptance = if timed_bridge.is_some() {
                     send_urgent(urgent, accepted).and_then(|()| {
                         send_normal(
@@ -1346,7 +1359,7 @@ impl GatewaySession {
                 let task = tokio::spawn(pump_voice_events(
                     event_stream,
                     self.memory_extraction.clone(),
-                    normal.clone(),
+                    terminal_slot,
                     events.clone(),
                     control_event_receiver,
                     control_pending_receiver,
@@ -2288,12 +2301,13 @@ async fn forward_events(
 async fn pump_voice_events(
     mut events: VoiceSessionEventStream,
     extractor: Option<Arc<MemoryExtractor>>,
-    normal: mpsc::Sender<GatewayMessage>,
+    terminal_slot: mpsc::OwnedPermit<GatewayMessage>,
     event_writer: mpsc::Sender<GatewayMessage>,
     mut control_events: mpsc::Receiver<VoiceCaptureControlKind>,
     mut control_pending: watch::Receiver<bool>,
 ) -> Result<(), GatewaySessionError> {
     let mut forwarding = true;
+    let mut terminal_slot = Some(terminal_slot);
     let mut exchange = VoiceExchange::default();
     while let Some(event) = events.recv().await {
         if !forwarding {
@@ -2356,12 +2370,15 @@ async fn pump_voice_events(
                 return Err(GatewaySessionError::Projection);
             }
         };
-        let lane = if terminal { &normal } else { &event_writer };
-        if lane
-            .send(GatewayMessage::VoiceEvent { event })
-            .await
-            .is_err()
-        {
+        let message = GatewayMessage::VoiceEvent { event };
+        if terminal {
+            match terminal_slot.take() {
+                Some(slot) => {
+                    slot.send(message);
+                }
+                None => forwarding = false,
+            }
+        } else if event_writer.send(message).await.is_err() {
             forwarding = false;
         }
     }
@@ -2467,6 +2484,25 @@ async fn shutdown_active_voice(active_voice: &mut Option<ActiveVoiceSession>) {
     .await;
     let _ = shutdown_voice_pump(voice_session.task).await;
     revoke_media_lease(voice_session.media_lease).await;
+}
+
+// A stalled stdout consumer pushes back on stdin instead of overflowing the normal reply
+// lane: the next command is read only once its replies fit, so backpressure never ends the
+// session or the recording it owns. Writer death still ends the session through its own
+// arm. Only queued normal-lane replies delay the next read, never queued voice events or
+// urgent acceptances, so stop and interrupt still reach a session whose output is stalled.
+async fn read_frame_with_reply_room<R: AsyncRead + Unpin>(
+    reader: &mut FrameReader<R>,
+    normal: &mpsc::Sender<GatewayMessage>,
+) -> Result<Option<Vec<u8>>, FrameError> {
+    // Permits are released at once: only this loop spends unreserved normal-lane slots.
+    // A closed lane is reported by the writer arm or the next send.
+    drop(
+        normal
+            .reserve_many(COMMAND_REPLY_ROOM.min(normal.max_capacity()))
+            .await,
+    );
+    reader.read_frame().await
 }
 
 async fn revoke_media_lease(lease: Option<ActiveMediaLease>) {
@@ -5205,6 +5241,55 @@ mod tests {
         assert!(accepted < started);
     }
 
+    // Pipelined control requests while stdout is stalled must wait for the writer, never end
+    // the gateway session (and with it an active recording) on lane backpressure.
+    #[tokio::test]
+    async fn pipelined_status_requests_during_a_stdout_stall_wait_instead_of_ending_the_session() {
+        let session = GatewaySession::new(unused_runtime(), status());
+        let (mut input, reader) = duplex(4096);
+        let (writer, writer_state) = BlockingWriter::new(0);
+        let session_task = tokio::spawn(session.run(reader, writer));
+        timeout(TEST_TIMEOUT, writer_state.blocked.wait())
+            .await
+            .expect("gateway writer never stalled");
+        for id in ["s1", "s2", "s3", "s4", "s5"] {
+            write_command(
+                &mut input,
+                &format!(r#"{{"protocol_version":3,"type":"status","request_id":"{id}"}}"#),
+            )
+            .await;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            !session_task.is_finished(),
+            "control-reply backpressure ended the gateway session"
+        );
+        writer_state.release();
+        timeout(
+            TEST_TIMEOUT,
+            writer_state.wait_for_bytes(r#""request_id":"s5","status""#),
+        )
+        .await
+        .expect("every pipelined status reply is written once stdout resumes");
+        drop(input);
+        timeout(TEST_TIMEOUT, session_task)
+            .await
+            .expect("gateway session did not end at input EOF")
+            .unwrap()
+            .unwrap();
+        let messages = decode_frames(&writer_state.bytes());
+        for id in ["s1", "s2", "s3", "s4", "s5"] {
+            let request = format!(r#""request_id":"{id}""#);
+            let accepted = message_index(&messages, |message| {
+                message_type(message) == "command_accepted" && message.contains(&request)
+            });
+            let answered = message_index(&messages, |message| {
+                message_type(message) == "status" && message.contains(&request)
+            });
+            assert!(accepted < answered);
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn fatal_framing_aborts_and_reaps_a_blocked_writer_after_the_deadline() {
         let session = GatewaySession::new(unused_runtime(), status());
@@ -5279,10 +5364,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn normal_control_saturation_fails_closed_and_reaps_active_generation() {
+    async fn normal_control_saturation_waits_for_output_and_keeps_the_session() {
         let language = HoldOpenLanguageServer::start().await;
         let runtime = runtime_for(language.endpoint());
-        let cleanup_runtime = runtime.clone();
         let session = GatewaySession::new(runtime, status());
         let (mut input, reader) = duplex(4096);
         let (writer, writer_state) = BlockingWriter::new(2);
@@ -5312,26 +5396,31 @@ mod tests {
         input.write_all(&commands).await.unwrap();
         input.flush().await.unwrap();
 
-        if timeout(TEST_TIMEOUT, language.connection_reaped.wait())
-            .await
-            .is_err()
-        {
-            let _ = cleanup_runtime.interrupt(TurnId::new(1)).await;
-            writer_state.release();
-            drop(input);
-            let _ = timeout(TEST_TIMEOUT, session_task).await;
-            panic!("normal control saturation did not fail closed through active cleanup");
-        }
+        // Saturated control replies wait for stdout instead of failing the session.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !session_task.is_finished(),
+            "normal control saturation ended the gateway session"
+        );
+        assert!(!language.connection_reaped.is_set());
         assert!(writer_state.blocked.is_set());
 
         writer_state.release();
+        timeout(
+            TEST_TIMEOUT,
+            writer_state.wait_for_bytes(r#""request_id":"status-saturation-7","status""#),
+        )
+        .await
+        .expect("saturated status replies were not written after stdout resumed");
         drop(input);
         let result = timeout(TEST_TIMEOUT, session_task)
             .await
             .expect("saturated gateway session did not finish")
             .unwrap();
-        assert!(result.is_err());
-        writer_state.dropped.wait().await;
+        assert!(result.is_ok(), "{result:?}");
+        timeout(TEST_TIMEOUT, language.connection_reaped.wait())
+            .await
+            .expect("input EOF did not reap the active generation");
     }
 
     #[tokio::test]

@@ -14,21 +14,24 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use conversation_model_adapters::{
-    AdapterError, AdapterFuture, AudioFrame, CaptureEvent, DiarizationResult,
+    AdapterError, AdapterFuture, AudioDeviceStatus, AudioFrame, CaptureEvent, DiarizationResult,
     GenerationLanguageModel, GenerationLanguageRequest, GenerationTextDelta, MeetingAudioWindows,
     MockContinuousAudioOutput, MockVoiceCaptureControl, PcmFormat, PcmSampleFormat,
-    RecognitionEvent, RecognitionHypothesis, StreamingSpeechRequest, StreamingSpeechSynthesizer,
-    TranscriptionDiarizer, VoiceInput, VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
+    PlaybackReceipt, RecognitionEvent, RecognitionHypothesis, StreamingSpeechRequest,
+    StreamingSpeechSynthesizer, TranscriptionDiarizer, VoiceInput, VoiceInputEvent, VoiceIoFactory,
+    VoiceIoSession,
 };
 use conversation_protocol::{
     ComponentDescriptor, ComponentKind, ConversationMode, ExecutionLocation, GenerationId,
-    PersonaProfile, PrivacyMode, RecoveryDisposition, ResponseControls, RuntimeErrorKind,
-    RuntimeStage, SessionId, TurnId, UtteranceId, VoiceSessionEvent, VoiceSessionPolicy,
+    PersonaProfile, PlaybackState, PrivacyMode, RecoveryDisposition, ResponseControls,
+    RuntimeErrorKind, RuntimeStage, SessionId, TurnId, UtteranceId, VoiceSessionEvent,
+    VoiceSessionPolicy,
 };
 use conversation_runtime::{
     read_session_recording, reconcile_recording, resolve_recording_handle, ConversationContext,
     ConversationQualityController, RecordedChunk, RecordingSettings, RecordingSinkFault,
-    SessionRecorder, VoiceSessionAdapters, VoiceSessionRuntime, MAX_RECORDING_GAPS,
+    SessionRecorder, VoiceSessionAdapters, VoiceSessionEventStream, VoiceSessionRuntime,
+    MAX_RECORDING_GAPS,
 };
 use conversation_runtime_gateway::GatewaySession;
 use tempfile::TempDir;
@@ -255,6 +258,99 @@ async fn recording_continues_while_speech_text_and_synthesis_providers_are_down(
             .collect::<Vec<_>>(),
         vec![1, 2, 3, 4],
         "every capture frame is recorded regardless of provider state"
+    );
+}
+
+#[tokio::test]
+async fn recording_keeps_flowing_while_the_voice_event_consumer_is_stalled() {
+    let key_env = "CONVERSATION_TEST_RECORDING_KEY_STALLED_CONSUMER";
+    set_fake_key(key_env);
+    let directory = TempDir::new().expect("temporary recording directory");
+    let settings = RecordingSettings::new(directory.path(), key_env).expect("recording settings");
+    let recorder = Arc::new(Mutex::new(
+        SessionRecorder::start(&settings, SessionId::new(1)).expect("recorder starts"),
+    ));
+    let path = recorder.lock().await.path().to_owned();
+
+    // Far more reliable session events than the loop may hold for a consumer that is not
+    // reading, then capture. Nothing reads the session's events during the whole script.
+    let status = AudioDeviceStatus::new("input", "output").expect("device status");
+    let mut script = (0..96)
+        .map(|_| Step::Emit(Ok(VoiceInputEvent::DeviceStatus(status.clone()))))
+        .collect::<Vec<_>>();
+    script.extend((1..=24).map(|sequence| Step::Emit(Ok(capture_frame(sequence)))));
+    let (runtime, events) = start_scripted_session(script, Arc::clone(&recorder)).await;
+
+    let recorded = wait_for_recorded_frames(&path, key_env, 24).await;
+    assert_eq!(
+        recorded, 24,
+        "a stalled event consumer must not hold back encrypted recording"
+    );
+    drop(events);
+    let _ = runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn recording_outlives_a_failed_voice_loop_until_the_session_is_stopped() {
+    let key_env = "CONVERSATION_TEST_RECORDING_KEY_FAILED_LOOP";
+    set_fake_key(key_env);
+    let directory = TempDir::new().expect("temporary recording directory");
+    let settings = RecordingSettings::new(directory.path(), key_env).expect("recording settings");
+    let recorder = Arc::new(Mutex::new(
+        SessionRecorder::start(&settings, SessionId::new(1)).expect("recorder starts"),
+    ));
+
+    let script = vec![
+        Step::Emit(Ok(capture_frame(1))),
+        // An input the voice loop cannot handle fails it; recording must not care.
+        Step::Emit(Ok(VoiceInputEvent::Playback(PlaybackReceipt::new(
+            GenerationId::new(1),
+            PlaybackState::Accepted,
+        )))),
+        Step::Sleep(Duration::from_millis(100)),
+        Step::Emit(Ok(capture_frame(2))),
+        Step::Emit(Ok(capture_frame(3))),
+        Step::Sleep(Duration::from_millis(100)),
+    ];
+    let events = run_voice_session(script, Arc::clone(&recorder)).await;
+
+    let failure = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                VoiceSessionEvent::SessionFailed {
+                    recovery: RecoveryDisposition::ContinueSession,
+                    ..
+                }
+            )
+        })
+        .unwrap_or_else(|| {
+            panic!("the loop failure is reported while recording goes on: {events:?}")
+        });
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.is_session_terminal())
+            .count(),
+        1,
+        "{events:?}"
+    );
+    assert!(failure < events.len() - 1);
+    let summary = recorder
+        .lock()
+        .await
+        .finalize()
+        .expect("recording finalizes");
+    let decrypted =
+        read_session_recording(&summary.encrypted_path, key_env).expect("recording decrypts");
+    assert_eq!(
+        recorded_frames(&decrypted.chunks)
+            .into_iter()
+            .map(|(sequence, _)| sequence)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "capture after the voice loop failed is still recorded until stop"
     );
 }
 
@@ -1405,6 +1501,39 @@ async fn run_voice_session(
             Step::Emit(_) => None,
         })
         .sum::<Duration>();
+    let (runtime, mut events) = start_scripted_session(script, recorder).await;
+    let collector = tokio::spawn(async move {
+        let mut observed = Vec::new();
+        while let Some(event) = events.recv().await {
+            let terminal = matches!(
+                event,
+                VoiceSessionEvent::SessionEnded { .. }
+                    | VoiceSessionEvent::SessionFailed {
+                        recovery: RecoveryDisposition::NewSession,
+                        ..
+                    }
+            );
+            observed.push(event);
+            if terminal {
+                break;
+            }
+        }
+        observed
+    });
+
+    // The script plays out, then the session is stopped the way the gateway stops it.
+    tokio::time::sleep(scripted + Duration::from_millis(400)).await;
+    let _ = runtime.shutdown().await;
+    tokio::time::timeout(Duration::from_secs(10), collector)
+        .await
+        .expect("the voice session reaches a terminal event")
+        .expect("the collector task does not panic")
+}
+
+async fn start_scripted_session(
+    script: Vec<Step>,
+    recorder: Arc<Mutex<SessionRecorder>>,
+) -> (VoiceSessionRuntime, VoiceSessionEventStream) {
     let context = ConversationContext::new(ConversationQualityController::new(
         PersonaProfile::default(),
         ResponseControls::default(),
@@ -1443,33 +1572,20 @@ async fn run_voice_session(
     )
     .expect("voice session policy");
 
-    let mut events = runtime.start(policy).await.expect("voice session starts");
-    let collector = tokio::spawn(async move {
-        let mut observed = Vec::new();
-        while let Some(event) = events.recv().await {
-            let terminal = matches!(
-                event,
-                VoiceSessionEvent::SessionEnded { .. }
-                    | VoiceSessionEvent::SessionFailed {
-                        recovery: RecoveryDisposition::NewSession,
-                        ..
-                    }
-            );
-            observed.push(event);
-            if terminal {
-                break;
-            }
-        }
-        observed
-    });
+    let events = runtime.start(policy).await.expect("voice session starts");
+    (runtime, events)
+}
 
-    // The script plays out, then the session is stopped the way the gateway stops it.
-    tokio::time::sleep(scripted + Duration::from_millis(400)).await;
-    let _ = runtime.shutdown().await;
-    tokio::time::timeout(Duration::from_secs(10), collector)
-        .await
-        .expect("the voice session reaches a terminal event")
-        .expect("the collector task does not panic")
+/// Polls the on-disk recording until it holds `expected` frames or two seconds pass.
+async fn wait_for_recorded_frames(path: &Path, key_env: &str, expected: usize) -> usize {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let recorded = recorded_frames_len(path, key_env);
+        if recorded >= expected || tokio::time::Instant::now() >= deadline {
+            return recorded;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 struct ScriptedVoiceIo {

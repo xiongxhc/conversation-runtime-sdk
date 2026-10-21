@@ -5,9 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use conversation_model_adapters::{
-    AdapterError, AudioFrame, CaptureEvent, FinalizedUtterance, GenerationLanguageModel,
-    PlaybackReceipt, RecognitionEvent, StreamingSpeechSynthesizer, VoiceCaptureControl,
-    VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
+    AdapterError, CaptureEvent, FinalizedUtterance, GenerationLanguageModel, PlaybackReceipt,
+    RecognitionEvent, StreamingSpeechSynthesizer, VoiceCaptureControl, VoiceInputEvent,
+    VoiceIoFactory, VoiceIoSession,
 };
 use conversation_protocol::{
     ConversationContextExchange, GenerationId, PlaybackState, PrivacySummary, RecoveryDisposition,
@@ -34,6 +34,11 @@ const MAX_PENDING_PARTIAL_SEGMENTS: usize = SESSION_EVENT_BUFFER_SIZE;
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const LATE_RECOGNITION_SETTLE_MS: u64 = 120;
 const MAX_PENDING_SEGMENTS: usize = 32;
+/// Voice-loop input the capture recorder holds for a loop that is busy. Capture frames are never
+/// held (they are recorded, not forwarded), so this bounds only recognition, activity and
+/// playback events; beyond it the oldest are dropped and the loop is told once.
+const MAX_UNFORWARDED_INPUT_EVENTS: usize = 256;
+const DROPPED_INPUT_MESSAGE: &str = "voice input events were dropped while the session was busy";
 
 #[derive(Clone)]
 pub struct VoiceSessionAdapters {
@@ -533,7 +538,7 @@ struct VoiceLoop {
     reliable_events: VecDeque<VoiceSessionEvent>,
     partials: BTreeMap<u64, String>,
     playback: Option<PlaybackLifecycle>,
-    recorder: Option<Arc<Mutex<SessionRecorder>>>,
+    capture_recorder: Option<CaptureRecorder>,
     response_mode: VoiceResponseMode,
     first_audio_received: bool,
     pending_segments: BTreeMap<u64, PendingSegment>,
@@ -577,6 +582,13 @@ impl VoiceLoop {
             context,
         } = dependencies;
         let final_silence_ms = policy.final_silence_ms();
+        let (input, capture_recorder) = match recorder {
+            Some(recorder) => {
+                let (input, capture_recorder) = CaptureRecorder::spawn(input, recorder);
+                (input, Some(capture_recorder))
+            }
+            None => (input, None),
+        };
         Self {
             session_id: policy.session_id(),
             final_silence_ms,
@@ -601,7 +613,7 @@ impl VoiceLoop {
             reliable_events: VecDeque::new(),
             partials: BTreeMap::new(),
             playback: None,
-            recorder,
+            capture_recorder,
             response_mode,
             first_audio_received: false,
             pending_segments: BTreeMap::new(),
@@ -613,7 +625,16 @@ impl VoiceLoop {
     }
 
     async fn run(mut self) -> VoiceSessionEvent {
-        let exit = self.run_until_exit().await;
+        let mut exit = self.run_until_exit().await;
+        let mut deferred_failure = None;
+        if let LoopExit::Fatal(error) = exit {
+            if self.records_after_failure() {
+                exit = self.record_until_stopped(error.clone()).await;
+                deferred_failure = Some(error);
+            } else {
+                exit = LoopExit::Fatal(error);
+            }
+        }
         let mut cleanup_error = self.cleanup_capture_operation().await.err();
         if !self.automatic_responses.is_empty() {
             cleanup_error.get_or_insert_with(|| {
@@ -624,6 +645,9 @@ impl VoiceLoop {
             cleanup_error.get_or_insert(error);
         }
         self.state = VoiceLoopState::Ending;
+        if let Some(capture_recorder) = self.capture_recorder.take() {
+            capture_recorder.stop().await;
+        }
         self.cancellation.cancel();
         if let Some(completion) = self.completion.take() {
             if let Err(error) = await_completion_cleanup(completion).await {
@@ -634,7 +658,7 @@ impl VoiceLoop {
         match exit {
             LoopExit::Shutdown(completion) => {
                 let _ = completion.send(());
-                match cleanup_error {
+                match cleanup_error.or(deferred_failure) {
                     Some(error) => session_failure(self.session_id, error),
                     None => VoiceSessionEvent::SessionEnded {
                         session_id: self.session_id,
@@ -671,6 +695,8 @@ impl VoiceLoop {
                     if self.capture_operation.is_some() => LoopSignal::Capture(capture),
                 completion = wait_for_completion(&mut self.completion),
                     if self.completion.is_some() => LoopSignal::Completion(completion),
+                failure = wait_for_recording_failure(&mut self.capture_recorder),
+                    if poll_producers => LoopSignal::RecordingFailed(failure),
                 _ = std::future::ready(()),
                     if poll_producers && self.state == VoiceLoopState::Listening
                         && self.turn_events.is_none() && !self.automatic_responses.is_empty()
@@ -697,6 +723,7 @@ impl VoiceLoop {
                     Some(LoopExit::Fatal(completion_failure(completion)))
                 }
                 LoopSignal::Input(input) => self.handle_input(input).await,
+                LoopSignal::RecordingFailed(error) => self.report_recording_failure(error).await,
                 LoopSignal::AutomaticResponse => self
                     .start_queued_automatic_response()
                     .await
@@ -1084,42 +1111,18 @@ impl VoiceLoop {
                 "voice input playback state is unsupported",
             ))),
             Some(Ok(VoiceInputEvent::Capture(CaptureEvent::Discontinuity { .. }))) => {
-                if let Some(exit) = self.record_capture_gap().await {
-                    return Some(exit);
-                }
                 self.deadline.disarm();
                 self.finalization_due = false;
                 self.active_segment_id = None;
                 self.finalizer.observe_discontinuity();
                 None
             }
-            Some(Ok(VoiceInputEvent::Capture(CaptureEvent::Frame(frame)))) => {
-                self.record_frame(&frame).await
-            }
-            Some(Ok(VoiceInputEvent::CaptureMetadata(metadata))) => {
-                let recorder = self.recorder.clone()?;
-                let error = recorder
-                    .lock()
-                    .await
-                    .record_capture_metadata(&metadata)
-                    .err()?;
-                if error.kind() == RuntimeErrorKind::InvalidState {
-                    self.recorder = None;
-                    return None;
-                }
-                self.disable_recorder(recorder, error).await
-            }
+            Some(Ok(VoiceInputEvent::Capture(CaptureEvent::Frame(_)))) => self.observe_audio(),
+            // Recording consumes these before the loop sees its input; reaching here means the
+            // session records nothing.
+            Some(Ok(VoiceInputEvent::CaptureMetadata(_))) => None,
             Some(Ok(VoiceInputEvent::CaptureFinish(finish))) => {
-                let result = if let Some(recorder) = self.recorder.clone() {
-                    recorder
-                        .lock()
-                        .await
-                        .confirm_capture_boundary(finish.boundary())
-                        .map_err(|_| AdapterError::new("recording boundary confirmation failed"))
-                } else {
-                    Err(AdapterError::new("timed recording is unavailable"))
-                };
-                finish.complete(result);
+                finish.complete(Err(AdapterError::new("timed recording is unavailable")));
                 None
             }
             Some(Ok(VoiceInputEvent::Capture(_))) => None,
@@ -1156,46 +1159,25 @@ impl VoiceLoop {
         }
     }
 
-    /// Records one capture frame. This runs before any provider is consulted, so a recording
-    /// keeps its media whatever the recognizer, language model or synthesizer are doing.
-    async fn record_frame(&mut self, frame: &AudioFrame) -> Option<LoopExit> {
-        if !self.first_audio_received {
-            self.first_audio_received = true;
-            if !self.publish_best_effort(VoiceSessionEvent::Timing {
-                session_id: self.session_id,
-                turn_id: None,
-                milestone: VoiceTimingMilestone::AudioReceived,
-                elapsed_ms: self.clock.now_ms(),
-            }) {
-                return Some(LoopExit::ConsumerDropped);
-            }
-        }
-        let recorder = self.recorder.clone()?;
-        let error = recorder.lock().await.record_frame(frame).err()?;
-        if error.kind() == RuntimeErrorKind::InvalidState {
-            self.recorder = None;
+    /// Notes the first capture audio. Recording itself happens in the capture recorder, before
+    /// the loop sees any input, so it never waits on this loop or on any provider.
+    fn observe_audio(&mut self) -> Option<LoopExit> {
+        if self.first_audio_received {
             return None;
         }
-        self.disable_recorder(recorder, error).await
-    }
-
-    async fn record_capture_gap(&mut self) -> Option<LoopExit> {
-        let recorder = self.recorder.clone()?;
-        let error = recorder.lock().await.record_capture_gap().err()?;
-        if error.kind() == RuntimeErrorKind::InvalidState {
-            self.recorder = None;
-            return None;
+        self.first_audio_received = true;
+        if !self.publish_best_effort(VoiceSessionEvent::Timing {
+            session_id: self.session_id,
+            turn_id: None,
+            milestone: VoiceTimingMilestone::AudioReceived,
+            elapsed_ms: self.clock.now_ms(),
+        }) {
+            return Some(LoopExit::ConsumerDropped);
         }
-        self.disable_recorder(recorder, error).await
+        None
     }
 
-    async fn disable_recorder(
-        &mut self,
-        recorder: Arc<Mutex<SessionRecorder>>,
-        error: RuntimeError,
-    ) -> Option<LoopExit> {
-        recorder.lock().await.mark_incomplete();
-        self.recorder = None;
+    async fn report_recording_failure(&mut self, error: RuntimeError) -> Option<LoopExit> {
         if self
             .publish_reliable(VoiceSessionEvent::SessionFailed {
                 session_id: self.session_id,
@@ -1207,6 +1189,103 @@ impl VoiceLoop {
             None
         } else {
             Some(LoopExit::ConsumerDropped)
+        }
+    }
+
+    /// Whether a failed loop should keep the session up for its recording: only while the media
+    /// path itself is still alive. A failure of the I/O session or the end of input is the end
+    /// of the media, and ends the session at once.
+    fn records_after_failure(&self) -> bool {
+        self.completion.is_some()
+            && !self.input.is_closed()
+            && self
+                .capture_recorder
+                .as_ref()
+                .is_some_and(CaptureRecorder::is_running)
+    }
+
+    /// The voice loop has failed but its recording has not: stop speaking, report the failure
+    /// as recoverable, and keep the session — and with it the media path the recorder reads —
+    /// up until the client stops it or the media ends. Responses are refused meanwhile; capture
+    /// pause and resume keep working because they govern what is recorded.
+    async fn record_until_stopped(&mut self, error: RuntimeError) -> LoopExit {
+        let _ = self.cleanup_active_turn().await;
+        self.automatic_responses.clear();
+        self.turn_events = None;
+        self.state = VoiceLoopState::Listening;
+        if !self
+            .publish_reliable(VoiceSessionEvent::SessionFailed {
+                session_id: self.session_id,
+                error: error.clone(),
+                recovery: RecoveryDisposition::ContinueSession,
+            })
+            .await
+        {
+            return LoopExit::ConsumerDropped;
+        }
+        loop {
+            if !self.flush_pending_events() {
+                return LoopExit::ConsumerDropped;
+            }
+            let pending_delivery = self.pending_delivery();
+            let has_pending_delivery = pending_delivery.is_some();
+            let signal = tokio::select! {
+                biased;
+                _ = self.cancellation.cancelled() => LoopSignal::ConsumerDropped,
+                _ = self.events.closed() => LoopSignal::ConsumerDropped,
+                command = self.commands.recv() => LoopSignal::Command(command),
+                capture = wait_for_capture_operation(&mut self.capture_operation),
+                    if self.capture_operation.is_some() => LoopSignal::Capture(capture),
+                completion = wait_for_completion(&mut self.completion),
+                    if self.completion.is_some() => LoopSignal::Completion(completion),
+                failure = wait_for_recording_failure(&mut self.capture_recorder)
+                    => LoopSignal::RecordingFailed(failure),
+                input = self.input.recv() => LoopSignal::Input(input),
+                delivery = deliver_pending_event(
+                    self.events.clone(),
+                    self.session_id,
+                    pending_delivery,
+                ), if has_pending_delivery => LoopSignal::Delivery(delivery),
+            };
+            let exit = match signal {
+                LoopSignal::Command(Some(SessionCommand::BargeIn { completion, .. })) => {
+                    let _ = completion.send(());
+                    None
+                }
+                LoopSignal::Command(Some(SessionCommand::AuthorizeResponse {
+                    completion, ..
+                })) => {
+                    let _ = completion.send(Err(responses_stopped()));
+                    None
+                }
+                LoopSignal::Command(Some(SessionCommand::SkipResponse { completion, .. })) => {
+                    let _ = completion.send(Err(responses_stopped()));
+                    None
+                }
+                LoopSignal::Command(command) => self.handle_command(command).await,
+                LoopSignal::Capture(capture) => self.handle_capture_completion(capture).await,
+                LoopSignal::Completion(_) => {
+                    self.completion.take();
+                    Some(LoopExit::Fatal(error.clone()))
+                }
+                LoopSignal::Input(None) => Some(LoopExit::Fatal(error.clone())),
+                LoopSignal::Input(Some(_)) => None,
+                LoopSignal::RecordingFailed(failure) => {
+                    self.report_recording_failure(failure).await
+                }
+                LoopSignal::Delivery(delivery) => match delivery {
+                    Some(delivery) => {
+                        self.remove_pending_delivery(delivery);
+                        None
+                    }
+                    None => Some(LoopExit::ConsumerDropped),
+                },
+                LoopSignal::ConsumerDropped => Some(LoopExit::ConsumerDropped),
+                LoopSignal::AutomaticResponse | LoopSignal::Turn(_) | LoopSignal::Deadline => None,
+            };
+            if let Some(exit) = exit {
+                return exit;
+            }
         }
     }
 
@@ -2028,6 +2107,7 @@ impl VoiceLoop {
 
 enum LoopSignal {
     AutomaticResponse,
+    RecordingFailed(RuntimeError),
     ConsumerDropped,
     Command(Option<SessionCommand>),
     Capture(Result<Result<(), AdapterError>, JoinError>),
@@ -2044,6 +2124,207 @@ async fn wait_for_capture_operation(
     match operation.as_mut() {
         Some(operation) => (&mut operation.task).await,
         None => pending().await,
+    }
+}
+
+async fn wait_for_recording_failure(recorder: &mut Option<CaptureRecorder>) -> RuntimeError {
+    match recorder.as_mut() {
+        Some(recorder) => match recorder.failures.recv().await {
+            Some(error) => error,
+            None => pending().await,
+        },
+        None => pending().await,
+    }
+}
+
+/// Records the session's capture from its own task. It sits between the voice input and the
+/// voice loop: every capture frame, gap, timing record and finish barrier is recorded here as
+/// it arrives, and only what the loop needs is passed on. Nothing it does waits on the loop —
+/// a busy, stalled or failed loop costs voice responses, never recorded media — and it runs
+/// until the session stops it or the media ends.
+struct CaptureRecorder {
+    stop: CancellationToken,
+    task: JoinHandle<()>,
+    failures: mpsc::Receiver<RuntimeError>,
+}
+
+impl CaptureRecorder {
+    fn spawn(
+        input: mpsc::Receiver<Result<VoiceInputEvent, AdapterError>>,
+        recorder: Arc<Mutex<SessionRecorder>>,
+    ) -> (mpsc::Receiver<Result<VoiceInputEvent, AdapterError>>, Self) {
+        let (forward, loop_input) = mpsc::channel(SESSION_EVENT_BUFFER_SIZE);
+        let (failure, failures) = mpsc::channel(1);
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(
+            CaptureRecording {
+                input,
+                forward,
+                recorder: Some(recorder),
+                failure,
+                unforwarded: VecDeque::new(),
+                dropped: false,
+                audio_forwarded: false,
+            }
+            .run(stop.clone()),
+        );
+        (
+            loop_input,
+            Self {
+                stop,
+                task,
+                failures,
+            },
+        )
+    }
+
+    fn is_running(&self) -> bool {
+        !self.task.is_finished()
+    }
+
+    /// Records whatever capture has already arrived, then stops.
+    async fn stop(mut self) {
+        self.stop.cancel();
+        if cleanup_with_timeout("capture recording", &mut self.task)
+            .await
+            .is_err()
+        {
+            self.task.abort();
+            let _ = self.task.await;
+        }
+    }
+}
+
+struct CaptureRecording {
+    input: mpsc::Receiver<Result<VoiceInputEvent, AdapterError>>,
+    forward: mpsc::Sender<Result<VoiceInputEvent, AdapterError>>,
+    recorder: Option<Arc<Mutex<SessionRecorder>>>,
+    failure: mpsc::Sender<RuntimeError>,
+    unforwarded: VecDeque<Result<VoiceInputEvent, AdapterError>>,
+    dropped: bool,
+    audio_forwarded: bool,
+}
+
+impl CaptureRecording {
+    async fn run(mut self, stop: CancellationToken) {
+        loop {
+            let forwarding =
+                !self.forward.is_closed() && (self.dropped || !self.unforwarded.is_empty());
+            let forward = self.forward.clone();
+            let event = tokio::select! {
+                biased;
+                _ = stop.cancelled() => {
+                    while let Ok(event) = self.input.try_recv() {
+                        self.accept(event).await;
+                    }
+                    return;
+                }
+                event = self.input.recv() => event,
+                permit = forward.reserve_owned(), if forwarding => {
+                    match permit {
+                        Ok(permit) => {
+                            if std::mem::take(&mut self.dropped) {
+                                permit.send(Err(AdapterError::new(DROPPED_INPUT_MESSAGE)
+                                    .with_stage(RuntimeStage::SpeechRecognizer)));
+                            } else if let Some(event) = self.unforwarded.pop_front() {
+                                permit.send(event);
+                            }
+                        }
+                        Err(_) => self.unforwarded.clear(),
+                    }
+                    continue;
+                }
+            };
+            match event {
+                Some(event) => self.accept(event).await,
+                None => return,
+            }
+        }
+    }
+
+    async fn accept(&mut self, event: Result<VoiceInputEvent, AdapterError>) {
+        match event {
+            Ok(VoiceInputEvent::Capture(CaptureEvent::Frame(frame))) => {
+                self.record(|recorder| recorder.record_frame(&frame)).await;
+                if !self.audio_forwarded {
+                    self.audio_forwarded = true;
+                    self.pass_on(Ok(VoiceInputEvent::Capture(CaptureEvent::Frame(frame))));
+                }
+            }
+            Ok(VoiceInputEvent::Capture(CaptureEvent::Discontinuity { at_ms })) => {
+                self.record(SessionRecorder::record_capture_gap).await;
+                if !matches!(
+                    self.unforwarded.back(),
+                    Some(Ok(VoiceInputEvent::Capture(
+                        CaptureEvent::Discontinuity { .. }
+                    )))
+                ) {
+                    self.pass_on(Ok(VoiceInputEvent::Capture(CaptureEvent::Discontinuity {
+                        at_ms,
+                    })));
+                }
+            }
+            Ok(VoiceInputEvent::CaptureMetadata(metadata)) => {
+                self.record(|recorder| recorder.record_capture_metadata(&metadata))
+                    .await;
+            }
+            Ok(VoiceInputEvent::CaptureFinish(finish)) => {
+                let result = match self.recorder.as_ref() {
+                    Some(recorder) => recorder
+                        .lock()
+                        .await
+                        .confirm_capture_boundary(finish.boundary())
+                        .map_err(|_| AdapterError::new("recording boundary confirmation failed")),
+                    None => Err(AdapterError::new("timed recording is unavailable")),
+                };
+                finish.complete(result);
+            }
+            event => self.pass_on(event),
+        }
+    }
+
+    /// Applies one write to the recording. A recording that was finalized under the session is
+    /// simply no longer fed; a failed write marks it incomplete, stops feeding it, and tells the
+    /// loop so the client learns the recording is partial while the meeting goes on.
+    async fn record(
+        &mut self,
+        write: impl FnOnce(&mut SessionRecorder) -> Result<(), RuntimeError>,
+    ) {
+        let Some(recorder) = self.recorder.clone() else {
+            return;
+        };
+        let mut guard = recorder.lock().await;
+        let Err(error) = write(&mut guard) else {
+            return;
+        };
+        self.recorder = None;
+        if error.kind() == RuntimeErrorKind::InvalidState {
+            return;
+        }
+        guard.mark_incomplete();
+        drop(guard);
+        let _ = self.failure.try_send(error);
+    }
+
+    fn pass_on(&mut self, event: Result<VoiceInputEvent, AdapterError>) {
+        if self.forward.is_closed() {
+            return;
+        }
+        if self.unforwarded.is_empty() && !self.dropped {
+            match self.forward.try_send(event) {
+                Ok(()) => return,
+                Err(mpsc::error::TrySendError::Closed(_)) => return,
+                Err(mpsc::error::TrySendError::Full(event)) => {
+                    self.unforwarded.push_back(event);
+                    return;
+                }
+            }
+        }
+        if self.unforwarded.len() >= MAX_UNFORWARDED_INPUT_EVENTS {
+            self.unforwarded.pop_front();
+            self.dropped = true;
+        }
+        self.unforwarded.push_back(event);
     }
 }
 
@@ -2175,6 +2456,10 @@ fn runtime_error(message: impl Into<String>) -> RuntimeError {
         RuntimeStage::Runtime,
         message,
     )
+}
+
+fn responses_stopped() -> RuntimeError {
+    runtime_error("voice responses stopped after the voice session failed")
 }
 
 fn cleanup_timeout_error(operation: &'static str) -> RuntimeError {
@@ -3496,5 +3781,90 @@ mod tests {
         );
         completed.await.expect("the barge-in is answered");
         assert_speaking_degraded(&loop_, &mut events);
+    }
+
+    #[tokio::test]
+    async fn a_busy_loop_bounds_held_input_and_is_told_what_it_missed() {
+        let (_input, input) = mpsc::channel(1);
+        let (forward, mut loop_input) = mpsc::channel(1);
+        let (failure, _failures) = mpsc::channel(1);
+        let mut recording = CaptureRecording {
+            input,
+            forward,
+            recorder: None,
+            failure,
+            unforwarded: VecDeque::new(),
+            dropped: false,
+            audio_forwarded: false,
+        };
+        for at_ms in 0..(MAX_UNFORWARDED_INPUT_EVENTS as u64 + 8) {
+            recording.pass_on(Ok(VoiceInputEvent::Activity(
+                VoiceActivity::SpeechContinued { at_ms },
+            )));
+        }
+        assert_eq!(recording.unforwarded.len(), MAX_UNFORWARDED_INPUT_EVENTS);
+        assert!(recording.dropped);
+
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(recording.run(stop.clone()));
+        assert!(matches!(
+            loop_input.recv().await,
+            Some(Ok(VoiceInputEvent::Activity(
+                VoiceActivity::SpeechContinued { at_ms: 0 }
+            )))
+        ));
+        assert!(matches!(
+            loop_input.recv().await,
+            Some(Err(error)) if error.message() == DROPPED_INPUT_MESSAGE
+                && is_recognition_failure(&error)
+        ));
+        assert!(matches!(
+            loop_input.recv().await,
+            Some(Ok(VoiceInputEvent::Activity(
+                VoiceActivity::SpeechContinued { at_ms: 8 }
+            )))
+        ));
+        stop.cancel();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stopping_the_recorder_records_capture_that_already_arrived() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let key_env = "CONVERSATION_VOICE_SESSION_STOP_DRAIN_KEY";
+        std::env::set_var(key_env, "11".repeat(32));
+        let settings = crate::RecordingSettings::new(directory.path(), key_env).unwrap();
+        let recorder = Arc::new(Mutex::new(
+            SessionRecorder::start(&settings, SessionId::new(1)).unwrap(),
+        ));
+        let (input_sender, input) = mpsc::channel(8);
+        for sequence in 1..=4 {
+            let frame = AudioFrame::new(
+                TurnId::new(1),
+                GenerationId::new(1),
+                UtteranceId::new(1),
+                sequence,
+                PcmFormat::new(24_000, 1, PcmSampleFormat::Signed16LittleEndian).unwrap(),
+                vec![0; 480],
+            )
+            .unwrap();
+            input_sender
+                .send(Ok(VoiceInputEvent::Capture(CaptureEvent::Frame(frame))))
+                .await
+                .unwrap();
+        }
+        let (_loop_input, capture_recorder) = CaptureRecorder::spawn(input, Arc::clone(&recorder));
+        capture_recorder.stop().await;
+
+        let summary = recorder.lock().await.finalize().unwrap();
+        let recorded = crate::read_session_recording(&summary.encrypted_path, key_env).unwrap();
+        assert_eq!(
+            recorded
+                .chunks
+                .iter()
+                .filter(|chunk| matches!(chunk, crate::RecordedChunk::Frame { .. }))
+                .count(),
+            4
+        );
     }
 }

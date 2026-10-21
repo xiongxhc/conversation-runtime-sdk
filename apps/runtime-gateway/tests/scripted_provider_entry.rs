@@ -1170,6 +1170,7 @@ fn is_recognition_failure(message: &Value) -> bool {
 ///
 /// - the recognition failure reaches the client as its own `continue_session` event with the
 ///   `speech_recognizer` stage, and nothing ends the voice session before the client stops it;
+/// - recognition reconnects to the provider within the same voice session;
 /// - capture sent after the failure is still recorded: the exact finish barrier is
 ///   acknowledged for the last frame sent;
 /// - the client's stop ends the session with `voice_session_ended`, and finalization returns
@@ -1444,9 +1445,12 @@ async fn recording_survives_a_recognition_provider_fault(fault: RecognitionFault
     );
     match fault {
         RecognitionFault::ConnectRejected => assert_eq!(appends, 0),
-        _ => assert_eq!(appends, APPENDS_BEFORE_FAULT, "the fault came mid-stream"),
+        _ => assert!(appends >= APPENDS_BEFORE_FAULT, "the fault came mid-stream"),
     }
-    assert!(connections >= 1);
+    assert!(
+        connections >= 2,
+        "{fault:?}: recognition reconnected within the session after the failure"
+    );
     eprintln!(
         "{fault:?}: frames={frames} failure_at_frame={at_failure} connections={connections} appends={appends}"
     );

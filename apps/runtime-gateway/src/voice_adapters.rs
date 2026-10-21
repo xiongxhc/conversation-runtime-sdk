@@ -4,9 +4,10 @@ use std::time::Duration;
 use futures_util::{stream::FuturesUnordered, StreamExt};
 
 use conversation_model_adapters::{
-    AdapterError, AdapterFuture, AudioCapture, CaptureEvent, OpenAiSpeechRecognitionConfig,
-    OpenAiSpeechRecognizer, RecognitionEvent, SpeechRecognizer, StreamingSpeechSynthesizer,
-    VoiceInput, VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
+    AdapterError, AdapterFuture, AudioCapture, CaptureEvent, FinalizedUtterance,
+    OpenAiSpeechRecognitionConfig, OpenAiSpeechRecognizer, RecognitionEvent, RecognitionHypothesis,
+    SpeechRecognizer, StreamingSpeechSynthesizer, VoiceInput, VoiceInputEvent, VoiceIoFactory,
+    VoiceIoSession,
 };
 use conversation_protocol::{
     ComponentDescriptor, PrivacyMode, RuntimeError, RuntimeStage, SessionId, VoiceActivity,
@@ -17,7 +18,12 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 type OwnedWorker = JoinHandle<Result<(), AdapterError>>;
+
+/// Recognition epochs started after the first one fails, before the session gives up on
+/// transcription. Recording is unaffected either way.
+const MAX_RECOGNITION_RESTARTS: usize = 6;
 type RecognitionWorkers = [OwnedWorker; 2];
+type CaptureSender = mpsc::Sender<Result<CaptureEvent, AdapterError>>;
 
 pub struct GatewayVoiceAdapters {
     /// Local voice I/O for the offline profile. An explicit online meeting supplies the Task 6
@@ -94,6 +100,8 @@ impl VoiceIoFactory for OnlineRecognitionVoiceIoFactory {
                     source: self.capture.clone(),
                     cancellation: cancellation.child_token(),
                     completion: Mutex::new(Some(drain_sender)),
+                    epoch: Arc::default(),
+                    draining: Default::default(),
                 }),
             ));
             let completion = tokio::spawn(complete_online_io(
@@ -121,10 +129,14 @@ impl VoiceIoFactory for OnlineRecognitionVoiceIoFactory {
 /// socket lifetime. After ASR closes, only this copy
 /// is discarded; the independent recorder/voice copy keeps flowing unchanged.
 /// One queued frame plus one pending send, each validated <=64 KiB. No replay.
+/// Every later start (a restarted recognition epoch) takes over the same drain from
+/// that point on; capture between epochs is discarded, never buffered.
 struct MediaLifetimeCapture {
     source: Arc<dyn AudioCapture>,
     cancellation: CancellationToken,
     completion: Mutex<Option<oneshot::Sender<OwnedWorker>>>,
+    epoch: Arc<Mutex<Option<CaptureSender>>>,
+    draining: std::sync::atomic::AtomicBool,
 }
 
 impl AudioCapture for MediaLifetimeCapture {
@@ -134,18 +146,34 @@ impl AudioCapture for MediaLifetimeCapture {
         _recognition_cancellation: CancellationToken,
     ) -> AdapterFuture<'a, mpsc::Receiver<Result<CaptureEvent, AdapterError>>> {
         Box::pin(async move {
+            let (sender, receiver) = mpsc::channel(1);
             let completion = self
                 .completion
                 .lock()
                 .map_err(|_| AdapterError::new("online capture ownership lock failed"))?
-                .take()
-                .ok_or_else(|| AdapterError::new("online capture already started"))?;
+                .take();
+            let Some(completion) = completion else {
+                if !self.draining.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err(AdapterError::new("online capture already started"));
+                }
+                *self
+                    .epoch
+                    .lock()
+                    .map_err(|_| AdapterError::new("online capture ownership lock failed"))? =
+                    Some(sender);
+                return Ok(receiver);
+            };
             let mut source = self
                 .source
                 .start(session_id, self.cancellation.clone())
                 .await?;
-            let (sender, receiver) = mpsc::channel(1);
+            *self
+                .epoch
+                .lock()
+                .map_err(|_| AdapterError::new("online capture ownership lock failed"))? =
+                Some(sender);
             let cancellation = self.cancellation.clone();
+            let epoch = Arc::clone(&self.epoch);
             let worker = tokio::spawn(async move {
                 loop {
                     let event = tokio::select! {
@@ -156,7 +184,11 @@ impl AudioCapture for MediaLifetimeCapture {
                             None => return Ok(()),
                         },
                     };
-                    if !sender.is_closed() {
+                    let sender = epoch
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone();
+                    if let Some(sender) = sender.filter(|sender| !sender.is_closed()) {
                         tokio::select! {
                             biased;
                             _ = cancellation.cancelled() => return Ok(()),
@@ -171,6 +203,8 @@ impl AudioCapture for MediaLifetimeCapture {
                 await_owned_worker(worker, self.cancellation.clone()).await?;
                 return Err(AdapterError::new("online capture session already ended"));
             }
+            self.draining
+                .store(true, std::sync::atomic::Ordering::Release);
             Ok(receiver)
         })
     }
@@ -215,6 +249,10 @@ impl VoiceInput for OnlineRecognitionVoiceInput {
                 sender,
                 cancellation,
                 recognition_cancellation,
+                Some(RecognitionRestart {
+                    recognizer: self.recognizer.clone(),
+                    session_id,
+                }),
             ));
             if let Err([relay, actor]) = completion_sender.send([completion, actor]) {
                 // Factory cleanup may win while input.start is awaiting capture.
@@ -235,16 +273,33 @@ impl VoiceInput for OnlineRecognitionVoiceInput {
     }
 }
 
+/// Starts fresh recognition epochs for one session after the current one ends.
+struct RecognitionRestart {
+    recognizer: Arc<dyn SpeechRecognizer>,
+    session_id: SessionId,
+}
+
 async fn relay_online_input(
     mut media: mpsc::Receiver<Result<VoiceInputEvent, AdapterError>>,
-    mut recognition: mpsc::Receiver<Result<RecognitionEvent, AdapterError>>,
+    recognition: mpsc::Receiver<Result<RecognitionEvent, AdapterError>>,
     sender: mpsc::Sender<Result<VoiceInputEvent, AdapterError>>,
     cancellation: CancellationToken,
     recognition_cancellation: CancellationToken,
+    restart: Option<RecognitionRestart>,
 ) -> Result<(), AdapterError> {
     let started = tokio::time::Instant::now();
+    let mut epochs = RecognitionEpochs {
+        events: recognition,
+        open: true,
+        actor: None,
+        delivered: false,
+        reported: false,
+        segment_offset: 0,
+        last_segment: 0,
+        failed_restarts: 0,
+        restart_at: None,
+    };
     let relay = async {
-        let mut recognition_open = true;
         let mut media_due = false;
         loop {
             // Alternate when BOTH ports stay ready: wording must not hide behind
@@ -262,13 +317,15 @@ async fn relay_online_input(
                     Err(mpsc::error::TryRecvError::Empty) => {}
                 }
             }
+            let restart_at = epochs.restart_at;
             tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => return,
-                event = recognition.recv(), if recognition_open => {
+                event = epochs.events.recv(), if epochs.open => {
                     media_due = true;
-                    match event {
+                    let forwarded = match event {
                     Some(Ok(activity @ (RecognitionEvent::SpeechStarted | RecognitionEvent::SpeechEnded))) => {
+                        epochs.delivered = true;
                         // Provider audio offsets locate capture evidence only.
                         // Activity uses this session's local monotonic receipt
                         // clock; VoiceLoop owns its finalizer clock separately.
@@ -277,19 +334,34 @@ async fn relay_online_input(
                             RecognitionEvent::SpeechStarted => VoiceActivity::SpeechStarted { at_ms },
                             _ => VoiceActivity::SpeechEnded { at_ms },
                         };
-                        if sender.send(Ok(VoiceInputEvent::Activity(activity))).await.is_err() { return; }
+                        Ok(VoiceInputEvent::Activity(activity))
                     }
-                    Some(Ok(event @ RecognitionEvent::FinalizedUtterance(_))) => {
-                        if sender.send(Ok(VoiceInputEvent::Recognition(event))).await.is_err() { return; }
+                    Some(Ok(event @ (RecognitionEvent::FinalizedUtterance(_) | RecognitionEvent::Hypothesis(_)))) => {
+                        epochs.delivered = true;
+                        epochs.renumber(event).map(VoiceInputEvent::Recognition)
                     }
-                    Some(Ok(RecognitionEvent::Hypothesis(hypothesis))) => {
-                        if sender.send(Ok(VoiceInputEvent::Recognition(RecognitionEvent::Hypothesis(hypothesis)))).await.is_err() { return; }
+                    Some(Err(error)) => {
+                        epochs.reported = true;
+                        Err(error)
                     }
-                    Some(Err(error)) => if sender.send(Err(error)).await.is_err() { return; },
-                    Some(Ok(_)) => {
-                        if sender.send(Err(AdapterError::new("online recognition event is unsupported"))).await.is_err() { return; }
+                    Some(Ok(_)) => Err(AdapterError::new("online recognition event is unsupported")),
+                    None => {
+                        epochs.open = false;
+                        if !epochs.ended(restart.is_some()).await {
+                            continue;
+                        }
+                        Err(AdapterError::new("online speech recognition ended")
+                            .with_stage(RuntimeStage::SpeechRecognizer))
                     }
-                    None => recognition_open = false,
+                    };
+                    if sender.send(forwarded).await.is_err() { return; }
+                },
+                _ = sleep_until_restart(restart_at), if restart_at.is_some() => {
+                    let Some(restart) = restart.as_ref() else { return };
+                    if let Err(error) = epochs.restart(restart, &recognition_cancellation).await {
+                        if sender.send(Err(error.with_stage(RuntimeStage::SpeechRecognizer))).await.is_err() {
+                            return;
+                        }
                     }
                 },
                 input = media.recv() => match input {
@@ -310,8 +382,125 @@ async fn relay_online_input(
         _ = relay => {},
     }
     recognition_cancellation.cancel();
-    drop(recognition);
+    drop(epochs.events);
+    if let Some(actor) = epochs.actor.take() {
+        reap_worker_until(actor, tokio::time::Instant::now() + Duration::from_secs(1)).await?;
+    }
     Ok(())
+}
+
+async fn sleep_until_restart(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The recognition side of one voice session: the current provider epoch and, after it ends,
+/// a bounded schedule of fresh ones. Each epoch is a new provider connection over the same
+/// media-lifetime capture branch; recording never passes through here.
+struct RecognitionEpochs {
+    events: mpsc::Receiver<Result<RecognitionEvent, AdapterError>>,
+    open: bool,
+    /// Restarted epochs' actors; the first epoch's actor is owned by the I/O completion.
+    actor: Option<OwnedWorker>,
+    delivered: bool,
+    reported: bool,
+    /// Provider segment indices restart at one with every epoch; the session's do not.
+    segment_offset: u64,
+    last_segment: u64,
+    failed_restarts: usize,
+    restart_at: Option<tokio::time::Instant>,
+}
+
+impl RecognitionEpochs {
+    /// Called when the current epoch's stream has ended. Schedules the next attempt, and says
+    /// whether the end still needs reporting (an epoch that already reported its failure does
+    /// not report it twice).
+    async fn ended(&mut self, restartable: bool) -> bool {
+        if let Some(actor) = self.actor.take() {
+            let _ = reap_worker_until(actor, tokio::time::Instant::now() + Duration::from_secs(1))
+                .await;
+        }
+        if !restartable {
+            return false;
+        }
+        if self.delivered {
+            self.failed_restarts = 0;
+        }
+        if self.failed_restarts < MAX_RECOGNITION_RESTARTS {
+            self.restart_at =
+                Some(tokio::time::Instant::now() + restart_delay(self.failed_restarts));
+        }
+        !std::mem::replace(&mut self.reported, false)
+    }
+
+    async fn restart(
+        &mut self,
+        restart: &RecognitionRestart,
+        recognition_cancellation: &CancellationToken,
+    ) -> Result<(), AdapterError> {
+        self.restart_at = None;
+        self.failed_restarts += 1;
+        self.delivered = false;
+        self.reported = false;
+        let stream = match restart
+            .recognizer
+            .start(restart.session_id, recognition_cancellation.child_token())
+            .await
+        {
+            Ok(stream) => stream,
+            Err(error) => {
+                if self.failed_restarts < MAX_RECOGNITION_RESTARTS {
+                    self.restart_at =
+                        Some(tokio::time::Instant::now() + restart_delay(self.failed_restarts));
+                }
+                return Err(error);
+            }
+        };
+        self.events = stream.events;
+        self.actor = Some(stream.completion);
+        self.open = true;
+        self.segment_offset = self.last_segment;
+        Ok(())
+    }
+
+    fn renumber(&mut self, event: RecognitionEvent) -> Result<RecognitionEvent, AdapterError> {
+        let offset = self.segment_offset;
+        let event = match event {
+            RecognitionEvent::FinalizedUtterance(utterance) if offset > 0 => {
+                let renumbered = FinalizedUtterance::new(
+                    utterance.segment_id().saturating_add(offset),
+                    utterance.text(),
+                )?;
+                RecognitionEvent::FinalizedUtterance(match utterance.capture_evidence() {
+                    Some(evidence) => renumbered.with_capture_evidence(evidence.clone())?,
+                    None => renumbered,
+                })
+            }
+            RecognitionEvent::Hypothesis(hypothesis) if offset > 0 => {
+                let segment_id = hypothesis.segment_id().saturating_add(offset);
+                RecognitionEvent::Hypothesis(if hypothesis.is_engine_final() {
+                    RecognitionHypothesis::engine_final(segment_id, hypothesis.text())
+                } else {
+                    RecognitionHypothesis::partial(segment_id, hypothesis.text())
+                })
+            }
+            event => event,
+        };
+        let segment = match &event {
+            RecognitionEvent::FinalizedUtterance(utterance) => utterance.segment_id(),
+            RecognitionEvent::Hypothesis(hypothesis) => hypothesis.segment_id(),
+            _ => 0,
+        };
+        self.last_segment = self.last_segment.max(segment);
+        Ok(event)
+    }
+}
+
+/// 250 ms doubling per consecutive failed attempt, capped at 8 s.
+fn restart_delay(failed_restarts: usize) -> Duration {
+    Duration::from_millis(250 << failed_restarts.min(5))
 }
 
 async fn await_owned_worker(
@@ -495,6 +684,7 @@ mod ownership_tests {
             sender,
             cancellation.clone(),
             recognition_cancellation.clone(),
+            None,
         ));
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_millis(37)).await;
@@ -561,6 +751,7 @@ mod ownership_tests {
                 sender,
                 cancellation.clone(),
                 recognition_cancellation.clone(),
+                None,
             ));
             tokio::time::timeout(Duration::from_secs(2), async {
                 while recognition_sender.capacity() != 2 {
@@ -733,6 +924,7 @@ mod ownership_tests {
             sender,
             cancellation.clone(),
             cancellation.child_token(),
+            None,
         ));
         let first = events.recv().await.unwrap().unwrap();
         let second = events.recv().await.unwrap().unwrap();
@@ -829,6 +1021,8 @@ mod ownership_tests {
             source: Arc::new(ControlledCapture(Mutex::new(Some(receiver)))),
             cancellation: cancellation.clone(),
             completion: Mutex::new(Some(transfer)),
+            epoch: Arc::default(),
+            draining: Default::default(),
         };
         let provider = capture
             .start(SessionId::new(1), CancellationToken::new())
@@ -898,6 +1092,8 @@ mod ownership_tests {
             source: Arc::new(ControlledCapture(Mutex::new(Some(receiver)))),
             cancellation: parent.child_token(),
             completion: Mutex::new(Some(transfer)),
+            epoch: Arc::default(),
+            draining: Default::default(),
         };
         assert!(capture
             .start(SessionId::new(1), CancellationToken::new())
@@ -972,5 +1168,217 @@ mod ownership_tests {
             relay_closed,
             "factory completion returned while its blocked relay still owned the output sender"
         );
+    }
+
+    /// A recognizer whose every restart hands out the next scripted epoch, counting starts.
+    struct ScriptedRestarts {
+        epochs: Mutex<std::collections::VecDeque<Vec<Result<RecognitionEvent, AdapterError>>>>,
+        starts: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SpeechRecognizer for ScriptedRestarts {
+        fn start<'a>(
+            &'a self,
+            _: SessionId,
+            cancellation: CancellationToken,
+        ) -> AdapterFuture<'a, conversation_model_adapters::RecognitionStream> {
+            Box::pin(async move {
+                self.starts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let script = self.epochs.lock().unwrap().pop_front().unwrap_or_else(|| {
+                    vec![Err(AdapterError::new("provider still down")
+                        .with_stage(RuntimeStage::SpeechRecognizer))]
+                });
+                let (events, receiver) = mpsc::channel(script.len().max(1));
+                for event in script {
+                    events.try_send(event).unwrap();
+                }
+                let completion = tokio::spawn(async move {
+                    drop(events);
+                    let _ = cancellation;
+                    Ok(())
+                });
+                Ok(conversation_model_adapters::RecognitionStream {
+                    events: receiver,
+                    completion,
+                })
+            })
+        }
+    }
+
+    fn final_utterance(segment_id: u64, text: &str) -> Result<RecognitionEvent, AdapterError> {
+        Ok(RecognitionEvent::FinalizedUtterance(
+            conversation_model_adapters::FinalizedUtterance::new(segment_id, text).unwrap(),
+        ))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recognition_restarts_after_a_failure_and_keeps_segment_identity_increasing() {
+        let (_media_sender, media) = mpsc::channel(1);
+        let (recognition_sender, recognition) = mpsc::channel(4);
+        recognition_sender
+            .send(final_utterance(1, "before"))
+            .await
+            .unwrap();
+        recognition_sender
+            .send(final_utterance(2, "before too"))
+            .await
+            .unwrap();
+        recognition_sender
+            .send(Err(AdapterError::new("capture discontinuity")
+                .with_stage(RuntimeStage::SpeechRecognizer)))
+            .await
+            .unwrap();
+        drop(recognition_sender);
+        let restarts = Arc::new(ScriptedRestarts {
+            epochs: Mutex::new([vec![final_utterance(1, "after restart")]].into()),
+            starts: Default::default(),
+        });
+        let (sender, mut events) = mpsc::channel(8);
+        let cancellation = CancellationToken::new();
+        let worker = tokio::spawn(relay_online_input(
+            media,
+            recognition,
+            sender,
+            cancellation.clone(),
+            cancellation.child_token(),
+            Some(RecognitionRestart {
+                recognizer: restarts.clone(),
+                session_id: SessionId::new(7),
+            }),
+        ));
+        let mut segments = Vec::new();
+        let mut failures = 0;
+        let observed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match events.recv().await.unwrap() {
+                    Ok(VoiceInputEvent::Recognition(RecognitionEvent::FinalizedUtterance(
+                        utterance,
+                    ))) => {
+                        segments.push((utterance.segment_id(), utterance.text().to_owned()));
+                        if utterance.text() == "after restart" {
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        assert_eq!(error.stage(), Some(RuntimeStage::SpeechRecognizer));
+                        failures += 1;
+                    }
+                    other => panic!("unexpected relay output {other:?}"),
+                }
+            }
+        })
+        .await;
+        cancellation.cancel();
+        await_owned_worker(worker, cancellation).await.unwrap();
+        observed.expect("recognition came back within the session");
+        assert!(failures >= 1, "the failure is still reported");
+        assert_eq!(
+            segments,
+            vec![
+                (1, "before".to_owned()),
+                (2, "before too".to_owned()),
+                (3, "after restart".to_owned())
+            ],
+            "a restarted epoch never reuses a segment identity"
+        );
+        assert_eq!(restarts.starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recognition_restarts_are_bounded_while_the_provider_stays_down() {
+        let (media_sender, media) = mpsc::channel(1);
+        let (recognition_sender, recognition) = mpsc::channel(1);
+        recognition_sender
+            .send(Err(
+                AdapterError::new("provider down").with_stage(RuntimeStage::SpeechRecognizer)
+            ))
+            .await
+            .unwrap();
+        drop(recognition_sender);
+        let restarts = Arc::new(ScriptedRestarts {
+            epochs: Mutex::new(Default::default()),
+            starts: Default::default(),
+        });
+        let (sender, mut events) = mpsc::channel(64);
+        let cancellation = CancellationToken::new();
+        let worker = tokio::spawn(relay_online_input(
+            media,
+            recognition,
+            sender,
+            cancellation.clone(),
+            cancellation.child_token(),
+            Some(RecognitionRestart {
+                recognizer: restarts.clone(),
+                session_id: SessionId::new(7),
+            }),
+        ));
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        assert_eq!(
+            restarts.starts.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_RECOGNITION_RESTARTS
+        );
+        let mut reported = 0;
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                matches!(event, Err(ref error) if error.stage() == Some(RuntimeStage::SpeechRecognizer))
+            );
+            reported += 1;
+        }
+        assert_eq!(
+            reported,
+            1 + MAX_RECOGNITION_RESTARTS,
+            "every failed epoch is reported"
+        );
+        // Media keeps flowing to the session after recognition gave up.
+        media_sender
+            .send(Ok(VoiceInputEvent::Activity(
+                VoiceActivity::SpeechContinued { at_ms: 1 },
+            )))
+            .await
+            .unwrap();
+        assert!(matches!(
+            events.recv().await,
+            Some(Ok(VoiceInputEvent::Activity(
+                VoiceActivity::SpeechContinued { at_ms: 1 }
+            )))
+        ));
+        cancellation.cancel();
+        await_owned_worker(worker, cancellation).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_restarted_recognition_epoch_takes_over_the_media_lifetime_capture() {
+        let (source, receiver) = mpsc::channel(1);
+        let (transfer, completion) = oneshot::channel();
+        let cancellation = CancellationToken::new();
+        let capture = MediaLifetimeCapture {
+            source: Arc::new(ControlledCapture(Mutex::new(Some(receiver)))),
+            cancellation: cancellation.clone(),
+            completion: Mutex::new(Some(transfer)),
+            epoch: Arc::default(),
+            draining: Default::default(),
+        };
+        let first = capture
+            .start(SessionId::new(1), CancellationToken::new())
+            .await
+            .unwrap();
+        let worker = completion.await.unwrap();
+        drop(first);
+        let mut second = capture
+            .start(SessionId::new(1), CancellationToken::new())
+            .await
+            .expect("a later epoch restarts on the same drain");
+        source
+            .send(Ok(CaptureEvent::Discontinuity { at_ms: 7 }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), second.recv()).await,
+            Ok(Some(Ok(CaptureEvent::Discontinuity { at_ms: 7 })))
+        ));
+        cancellation.cancel();
+        await_owned_worker(worker, cancellation).await.unwrap();
+        assert!(source.is_closed());
     }
 }

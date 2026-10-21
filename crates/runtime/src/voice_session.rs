@@ -1216,7 +1216,7 @@ impl VoiceLoop {
         if !self
             .publish_reliable(VoiceSessionEvent::SessionFailed {
                 session_id: self.session_id,
-                error: error.clone(),
+                error: voice_loop_stopped(),
                 recovery: RecoveryDisposition::ContinueSession,
             })
             .await
@@ -2455,6 +2455,18 @@ fn runtime_error(message: impl Into<String>) -> RuntimeError {
         RuntimeErrorKind::InvalidState,
         RuntimeStage::Runtime,
         message,
+    )
+}
+
+/// The recoverable failure published when the voice loop stops while its recording goes on:
+/// no more transcripts or responses in this session, recording continues until stop. Its
+/// pair (invalid state, voice sidecar) is used by no other failure, so a client can tell it
+/// from a provider failure and relaunch the voice session; the stop then reports the cause.
+fn voice_loop_stopped() -> RuntimeError {
+    RuntimeError::new(
+        RuntimeErrorKind::InvalidState,
+        RuntimeStage::VoiceSidecar,
+        "voice loop stopped; transcripts and responses ended, recording continues until stop",
     )
 }
 

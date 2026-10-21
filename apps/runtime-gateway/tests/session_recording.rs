@@ -24,8 +24,8 @@ use conversation_model_adapters::{
 use conversation_protocol::{
     ComponentDescriptor, ComponentKind, ConversationMode, ExecutionLocation, GenerationId,
     PersonaProfile, PlaybackState, PrivacyMode, RecoveryDisposition, ResponseControls,
-    RuntimeErrorKind, RuntimeStage, SessionId, TurnId, UtteranceId, VoiceSessionEvent,
-    VoiceSessionPolicy,
+    RuntimeErrorKind, RuntimeStage, SessionId, TurnId, UtteranceId, VoiceResponseMode,
+    VoiceSessionEvent, VoiceSessionPolicy,
 };
 use conversation_runtime::{
     read_session_recording, reconcile_recording, resolve_recording_handle, ConversationContext,
@@ -328,6 +328,16 @@ async fn recording_outlives_a_failed_voice_loop_until_the_session_is_stopped() {
         .unwrap_or_else(|| {
             panic!("the loop failure is reported while recording goes on: {events:?}")
         });
+    assert!(
+        matches!(
+            &events[failure],
+            VoiceSessionEvent::SessionFailed { error, .. }
+                if error.kind() == RuntimeErrorKind::InvalidState
+                    && error.stage() == RuntimeStage::VoiceSidecar
+        ),
+        "transcripts stopping is its own signal, distinct from a provider failure: {:?}",
+        events[failure]
+    );
     assert_eq!(
         events
             .iter()
@@ -352,6 +362,70 @@ async fn recording_outlives_a_failed_voice_loop_until_the_session_is_stopped() {
         vec![1, 2, 3],
         "capture after the voice loop failed is still recorded until stop"
     );
+}
+
+#[tokio::test]
+async fn responses_are_refused_once_the_voice_loop_has_failed() {
+    let key_env = "CONVERSATION_TEST_RECORDING_KEY_REFUSED_RESPONSES";
+    set_fake_key(key_env);
+    let directory = TempDir::new().expect("temporary recording directory");
+    let settings = RecordingSettings::new(directory.path(), key_env).expect("recording settings");
+    let recorder = Arc::new(Mutex::new(
+        SessionRecorder::start(&settings, SessionId::new(1)).expect("recorder starts"),
+    ));
+    let script = vec![
+        Step::Emit(Ok(capture_frame(1))),
+        // A finalized segment the client could authorize, then a loop failure.
+        Step::Emit(Ok(VoiceInputEvent::Recognition(
+            RecognitionEvent::FinalizedUtterance(
+                conversation_model_adapters::FinalizedUtterance::new(1, "pending wording")
+                    .expect("utterance"),
+            ),
+        ))),
+        Step::Emit(Ok(VoiceInputEvent::Playback(PlaybackReceipt::new(
+            GenerationId::new(1),
+            PlaybackState::Accepted,
+        )))),
+        Step::Emit(Ok(capture_frame(2))),
+    ];
+    let (runtime, mut events) =
+        start_scripted_session_with_mode(script, recorder, VoiceResponseMode::ExternalGate).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await.expect("session stays up") {
+                VoiceSessionEvent::SessionFailed {
+                    recovery: RecoveryDisposition::ContinueSession,
+                    ..
+                } => return,
+                event => assert!(!event.is_session_terminal(), "{event:?}"),
+            }
+        }
+    })
+    .await
+    .expect("the loop failure is reported");
+
+    let authorized = runtime
+        .authorize_response(
+            SessionId::new(1),
+            1,
+            vec![
+                conversation_protocol::ConversationContextExchange::new("prior", "context")
+                    .expect("exchange"),
+            ],
+        )
+        .await;
+    assert!(
+        matches!(&authorized, Err(error) if error.message().contains("voice responses stopped")),
+        "a response must not start on a loop that no longer polls turns: {authorized:?}"
+    );
+    let skipped = runtime
+        .skip_response(SessionId::new(1), 1, "not now".to_owned())
+        .await;
+    assert!(
+        matches!(&skipped, Err(error) if error.message().contains("voice responses stopped")),
+        "{skipped:?}"
+    );
+    runtime.shutdown().await.expect("the client can still stop");
 }
 
 #[tokio::test]
@@ -1544,6 +1618,14 @@ async fn start_scripted_session(
     script: Vec<Step>,
     recorder: Arc<Mutex<SessionRecorder>>,
 ) -> (VoiceSessionRuntime, VoiceSessionEventStream) {
+    start_scripted_session_with_mode(script, recorder, VoiceResponseMode::Automatic).await
+}
+
+async fn start_scripted_session_with_mode(
+    script: Vec<Step>,
+    recorder: Arc<Mutex<SessionRecorder>>,
+    response_mode: VoiceResponseMode,
+) -> (VoiceSessionRuntime, VoiceSessionEventStream) {
     let context = ConversationContext::new(ConversationQualityController::new(
         PersonaProfile::default(),
         ResponseControls::default(),
@@ -1582,7 +1664,10 @@ async fn start_scripted_session(
     )
     .expect("voice session policy");
 
-    let events = runtime.start(policy).await.expect("voice session starts");
+    let events = runtime
+        .start_with_response_mode(policy, response_mode)
+        .await
+        .expect("voice session starts");
     (runtime, events)
 }
 

@@ -259,7 +259,8 @@ export type RuntimeFailure = {
     | "memory_not_found"
     | "memory_unavailable"
     | "memory_conflict"
-    | "persona_invalid";
+    | "persona_invalid"
+    | "media_lease_lost";
   kind: "adapter" | "configuration" | "invalid_state";
   stage:
     | "runtime"
@@ -291,7 +292,8 @@ export type RuntimeCapability =
   | "persona_control"
   | "memory_inspection"
   | "memory_mutation"
-  | "voice_session";
+  | "voice_session"
+  | "media_lease_renewal";
 
 export type RuntimeStatus = {
   profile: RuntimeProfile;
@@ -921,8 +923,9 @@ export function parseGatewayMessage(
         throw new ProtocolError("media lease renewal requires protocol version 3");
       }
       const expiresAtMs = parseBoundedDecimal(object.expires_at_ms, "media lease expiry", MAX_U64.toString(), "invalid media lease");
-      const lifetimeMs = expiresAtMs - BigInt(Date.now());
-      if (lifetimeMs <= 0n || lifetimeMs > MAX_MEDIA_LEASE_LIFETIME_MS) {
+      // Only the upper bound: a reply delayed behind a slow reader may already be past its
+      // expiry, which the caller sees in the value rather than as a client failure.
+      if (expiresAtMs === 0n || expiresAtMs - BigInt(Date.now()) > MAX_MEDIA_LEASE_LIFETIME_MS) {
         throw new ProtocolError("invalid media lease");
       }
       return { type, requestId: requireRequestId(object), expiresAtMs };
@@ -2080,6 +2083,7 @@ function parseRuntimeFailure(value: unknown): RuntimeFailure {
         "memory_unavailable",
         "memory_conflict",
         "persona_invalid",
+        "media_lease_lost",
       ] as const,
     ),
     kind: requireOneOf(object, "kind", ["adapter", "configuration", "invalid_state"] as const),
@@ -2569,6 +2573,7 @@ function requireCapabilities(
     ["memory_inspection", 3],
     ["memory_mutation", 4],
     ["voice_session", 5],
+    ["media_lease_renewal", 6],
   ]);
   let previousRank = -1;
   for (const capability of capabilities) {
@@ -2581,6 +2586,7 @@ function requireCapabilities(
   if (
     capabilities[0] !== "text"
     || (version < CONTEXT_SEED_PROTOCOL_VERSION && capabilities.includes("conversation_context_seed"))
+    || (version < RUNTIME_PROFILE_PROTOCOL_VERSION && capabilities.includes("media_lease_renewal"))
     || (capabilities.includes("memory_mutation") && !capabilities.includes("memory_inspection"))
   ) {
     throw new ProtocolError("capabilities has an unsupported value");

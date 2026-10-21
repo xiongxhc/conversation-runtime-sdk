@@ -1685,10 +1685,25 @@ test("media lease renewal: version three command and bounded expiry reply", () =
   atLeaseTime(LEASE_ISSUED, () => {
     const renewed = (expiry: string, version = 3) => ({ protocol_version: version, type: "media_lease_renewed", request_id: "renew-1", expires_at_ms: expiry });
     assert.deepEqual(parseGatewayMessage(renewed(String(LEASE_ISSUED + 300_000)), 3), { type: "media_lease_renewed", requestId: "renew-1", expiresAtMs: BigInt(LEASE_ISSUED) + 300_000n });
-    for (const expiry of ["0", String(LEASE_ISSUED), String(LEASE_ISSUED + 300_001), "01", (MAX_U64 + 1n).toString()]) {
+    assert.equal(Reflect.get(parseGatewayMessage(renewed(String(LEASE_ISSUED - 1)), 3), "expiresAtMs"), BigInt(LEASE_ISSUED) - 1n);
+    for (const expiry of ["0", String(LEASE_ISSUED + 300_001), "01", (MAX_U64 + 1n).toString()]) {
       assert.throws(() => parseGatewayMessage(renewed(expiry), 3), /invalid media lease|media lease expiry/);
     }
     assert.throws(() => parseGatewayMessage(renewed(String(LEASE_ISSUED + 1_000), 2), 2), /protocol version 3/);
     assert.throws(() => parseGatewayMessage({ ...renewed(String(LEASE_ISSUED + 1_000)), credential: PUBLIC_LEASE_CREDENTIAL }, 3));
   });
+});
+
+test("media lease renewal capability needs version three and a distinct loss code parses", () => {
+  const ready = (version: number, capabilities: string[]) => ({ type: "ready", protocol_version: version,
+    status: { transport: "stdio", privacy_mode: "local_only", language_location: "local", model_id: "local-model", memory_enabled: false, memory_location: null, telemetry_enabled: false,
+      capabilities, components: [{ kind: "language_model", execution_location: "local", provider_label: "Local language" }],
+      ...(version >= 3 ? { profile: "offline", last_context_seed_operation_id: null } : {}),
+      ...(version === 2 ? { last_context_seed_operation_id: null } : {}) } });
+  assert.deepEqual(parseReadyMessage(ready(3, ["text", "media_lease_renewal"])).message.status.capabilities, ["text", "media_lease_renewal"]);
+  assert.throws(() => parseReadyMessage(ready(2, ["text", "media_lease_renewal"])));
+  const failed = parseGatewayMessage({ protocol_version: 3, type: "voice_event", event: { type: "voice_session_failed", session_id: "7",
+    error: { code: "media_lease_lost", kind: "adapter", stage: "audio_capture", message: "lost" }, recovery: "continue_session" } }, 3);
+  assert.equal(failed.type, "voice_event");
+  if (failed.type === "voice_event" && failed.event.type === "voice_session_failed") assert.equal(failed.event.error.code, "media_lease_lost");
 });

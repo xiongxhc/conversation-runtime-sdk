@@ -2482,15 +2482,15 @@ fn validate_gateway_message(
                 ));
             }
             validate_request_id(request_id)?;
+            // Only the upper bound: a reply delayed behind a stalled consumer may already be
+            // past its expiry, and stating that late must not fail the writer.
             let now = unix_now_millis().ok_or(ClientWireError::InvalidMediaLease)?;
-            match expires_at_ms.checked_sub(now) {
-                Some(lifetime_ms)
-                    if lifetime_ms > 0 && lifetime_ms <= MAX_MEDIA_LEASE_LIFETIME_MS =>
-                {
-                    Ok(())
-                }
-                _ => Err(ClientWireError::InvalidMediaLease),
+            if *expires_at_ms == 0
+                || expires_at_ms.saturating_sub(now) > MAX_MEDIA_LEASE_LIFETIME_MS
+            {
+                return Err(ClientWireError::InvalidMediaLease);
             }
+            Ok(())
         }
         GatewayMessage::MemoryExtracted { .. } => Ok(()),
     }
@@ -2562,6 +2562,7 @@ fn validate_runtime_status(
         "memory_inspection" => Some(3),
         "memory_mutation" => Some(4),
         "voice_session" => Some(5),
+        "media_lease_renewal" if protocol_version >= RUNTIME_PROFILE_PROTOCOL_VERSION => Some(6),
         _ => None,
     };
     let mut previous_rank = None;
@@ -2682,6 +2683,7 @@ pub(crate) fn validate_client_runtime_error(
             | "memory_unavailable"
             | "memory_conflict"
             | "persona_invalid"
+            | "media_lease_lost"
     ) || !matches!(
         error.kind.as_str(),
         "adapter" | "configuration" | "invalid_state"

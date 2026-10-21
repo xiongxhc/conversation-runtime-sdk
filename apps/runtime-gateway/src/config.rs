@@ -469,9 +469,9 @@ impl GatewayAdapters {
 
     pub fn text_only_status(&self) -> RuntimeStatus {
         let mut status = self.status.clone();
-        status
-            .capabilities
-            .retain(|capability| capability != "voice_session");
+        status.capabilities.retain(|capability| {
+            capability != "voice_session" && capability != "media_lease_renewal"
+        });
         status.components.retain(|component| {
             !matches!(
                 component.kind.as_str(),
@@ -612,6 +612,9 @@ impl GatewayConfig {
         }
         if voice_configured {
             capabilities.push("voice_session".to_owned());
+            if self.media.is_some() {
+                capabilities.push("media_lease_renewal".to_owned());
+            }
         }
         let status = RuntimeStatus {
             profile: profile.as_str().to_owned(),

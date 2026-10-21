@@ -70,9 +70,24 @@ test("connects, correlates status, and streams an accepted turn", async () => {
 });
 
 test("renews the media lease and correlates its bounded expiry", async () => {
+  const older = new InMemoryTransport();
+  const olderConnecting = RuntimeClient.connect(older);
+  older.push(readyV3());
+  const olderClient = await olderConnecting;
+  await assert.rejects(olderClient.renewMediaLease(), /does not support media lease renewal/);
+  assert.equal(older.sent.some((item) => item.type === "renew_media_lease"), false);
+  const stillAlive = olderClient.status();
+  const statusCommand = older.sent.at(-1);
+  assert.equal(statusCommand?.type, "status");
+  older.push(acceptedForVersion(statusCommand!.requestId, 3));
+  older.push({ type: "status", protocol_version: 3, request_id: statusCommand!.requestId, status: { ...wireStatus(), profile: "offline", last_context_seed_operation_id: null } });
+  assert.equal((await stillAlive).modelId, "local-model");
+  await olderClient.close();
+
   const transport = new InMemoryTransport();
   const connecting = RuntimeClient.connect(transport);
-  transport.push(readyV3());
+  transport.push({ type: "ready", protocol_version: 3,
+    status: { ...wireStatus(), profile: "offline", last_context_seed_operation_id: null, capabilities: ["text", "media_lease_renewal"] } });
   const client = await connecting;
 
   const renewing = client.renewMediaLease();
@@ -82,6 +97,14 @@ test("renews the media lease and correlates its bounded expiry", async () => {
   transport.push(acceptedForVersion(renew.requestId, 3));
   transport.push({ type: "media_lease_renewed", protocol_version: 3, request_id: renew.requestId, expires_at_ms: expiresAtMs.toString() });
   assert.equal(await renewing, expiresAtMs);
+
+  // A reply that arrives after its own expiry still resolves; it never fails the client.
+  const late = client.renewMediaLease();
+  const lateCommand = transport.sent.at(-1);
+  transport.push(acceptedForVersion(lateCommand!.requestId, 3));
+  const pastExpiry = BigInt(Date.now()) - 1n;
+  transport.push({ type: "media_lease_renewed", protocol_version: 3, request_id: lateCommand!.requestId, expires_at_ms: pastExpiry.toString() });
+  assert.equal(await late, pastExpiry);
 
   const refused = client.renewMediaLease();
   const second = transport.sent.at(-1);

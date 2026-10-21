@@ -1791,7 +1791,8 @@ fn a_valid_online_configuration_reports_cloud_privacy_and_remote_components() {
             "text",
             "conversation_context_seed",
             "persona_control",
-            "voice_session"
+            "voice_session",
+            "media_lease_renewal"
         ]
     );
 

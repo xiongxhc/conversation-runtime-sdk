@@ -43,10 +43,14 @@ const URGENT_WRITER_BUFFER_SIZE: usize = 2;
 const NORMAL_WRITER_BUFFER_SIZE: usize = 4;
 const EVENT_WRITER_BUFFER_SIZE: usize = 1;
 const WRITER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
-/// Free normal-lane slots a command needs before it is read: a command sends at most two
-/// replies there. The voice pump's terminal slot is reserved when its session starts, so no
-/// other sender competes for this room.
+/// Free normal-lane slots a command needs before it is read promptly: a command sends at
+/// most two replies there. The voice pump's terminal slot is reserved when its session
+/// starts, so no other sender competes for this room.
 const COMMAND_REPLY_ROOM: usize = 2;
+/// Extra normal-lane capacity for commands read after the bounded wait, so stop, finalize
+/// and input EOF are still handled while stdout is stalled.
+const COMMAND_OVERFLOW_ROOM: usize = 16;
+const COMMAND_REPLY_WAIT: Duration = Duration::from_secs(1);
 const INVALID_COMMAND_REQUEST_ID: &str = "invalid-command";
 #[cfg(not(test))]
 fn next_gateway_session_id() -> SessionId {
@@ -184,7 +188,8 @@ struct WriterLanes {
 impl WriterLanes {
     fn new() -> Self {
         let (urgent_sender, urgent_receiver) = mpsc::channel(URGENT_WRITER_BUFFER_SIZE);
-        let (normal_sender, normal_receiver) = mpsc::channel(NORMAL_WRITER_BUFFER_SIZE);
+        let (normal_sender, normal_receiver) =
+            mpsc::channel(NORMAL_WRITER_BUFFER_SIZE + COMMAND_OVERFLOW_ROOM);
         let (event_sender, event_receiver) = mpsc::channel(EVENT_WRITER_BUFFER_SIZE);
         Self {
             urgent_sender,
@@ -2543,7 +2548,7 @@ fn media_lost_message(session_id: SessionId) -> GatewayMessage {
         event: ClientVoiceSessionEvent::VoiceSessionFailed {
             session_id,
             error: ClientRuntimeError {
-                code: "adapter_failure".to_owned(),
+                code: "media_lease_lost".to_owned(),
                 kind: "adapter".to_owned(),
                 stage: RuntimeStage::AudioCapture.as_str().to_owned(),
                 message: "the media bridge connection was lost and its lease cannot be resumed"
@@ -2670,22 +2675,19 @@ async fn shutdown_active_voice(active_voice: &mut Option<ActiveVoiceSession>) {
     revoke_media_lease(voice_session.media_lease).await;
 }
 
-// A stalled stdout consumer pushes back on stdin instead of overflowing the normal reply
-// lane: the next command is read only once its replies fit, so backpressure never ends the
-// session or the recording it owns. Writer death still ends the session through its own
-// arm. Only queued normal-lane replies delay the next read, never queued voice events or
-// urgent acceptances, so stop and interrupt still reach a session whose output is stalled.
+// A stalled stdout consumer pushes back on stdin instead of failing the session: the next
+// command waits up to `COMMAND_REPLY_WAIT` for its replies to fit in the regular lane, then is
+// read anyway and its replies use the overflow room. Stop, interrupt, finalize and input EOF
+// are therefore reached within that bound; only a client that keeps pipelining past the
+// overflow room during a stall reaches writer backpressure. Writer death ends the session
+// through its own arm.
 async fn read_frame_with_reply_room<R: AsyncRead + Unpin>(
     reader: &mut FrameReader<R>,
     normal: &mpsc::Sender<GatewayMessage>,
 ) -> Result<Option<Vec<u8>>, FrameError> {
     // Permits are released at once: only this loop spends unreserved normal-lane slots.
-    // A closed lane is reported by the writer arm or the next send.
-    drop(
-        normal
-            .reserve_many(COMMAND_REPLY_ROOM.min(normal.max_capacity()))
-            .await,
-    );
+    let room = (COMMAND_REPLY_ROOM + COMMAND_OVERFLOW_ROOM).min(normal.max_capacity());
+    let _ = timeout(COMMAND_REPLY_WAIT, normal.reserve_many(room)).await;
     reader.read_frame().await
 }
 
@@ -3813,6 +3815,7 @@ mod tests {
         let failure: serde_json::Value = serde_json::from_str(messages.last().unwrap()).unwrap();
         assert_eq!(failure["event"]["recovery"], "continue_session");
         assert_eq!(failure["event"]["session_id"], "703");
+        assert_eq!(failure["event"]["error"]["code"], "media_lease_lost");
         assert!(messages.iter().all(|message| !is_voice_terminal(message)));
         assert!(bridge_refused(endpoint, session_id, &credential).await);
 
@@ -3953,6 +3956,111 @@ mod tests {
         );
         assert!(frames.contains(&(1, b"before".to_vec())), "{frames:?}");
         assert!(frames.contains(&(2, b"during".to_vec())), "{frames:?}");
+        media.shutdown().await;
+    }
+
+    /// Test writer whose output can be stalled and resumed at any point.
+    #[derive(Clone, Default)]
+    struct GatedWriter {
+        bytes: Arc<StdMutex<Vec<u8>>>,
+        stalled: Arc<AtomicBool>,
+        waker: Arc<StdMutex<Option<Waker>>>,
+    }
+
+    impl GatedWriter {
+        fn set_stalled(&self, stalled: bool) {
+            self.stalled.store(stalled, Ordering::SeqCst);
+            if let Some(waker) = self.waker.lock().unwrap().take() {
+                waker.wake();
+            }
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.bytes.lock().unwrap()).into_owned()
+        }
+
+        async fn wait_for(&self, expected: &str) {
+            timeout(TEST_TIMEOUT, async {
+                while !self.text().contains(expected) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("gateway never wrote {expected}"));
+        }
+    }
+
+    impl AsyncWrite for GatedWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if self.stalled.load(Ordering::SeqCst) {
+                *self.waker.lock().unwrap() = Some(context.waker().clone());
+                return Poll::Pending;
+            }
+            self.bytes.lock().unwrap().extend_from_slice(bytes);
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A renewal reply that waits behind a stalled consumer for longer than one lifetime
+    /// is still written late; it never fails the writer or ends the session.
+    #[tokio::test]
+    async fn a_renewal_reply_delayed_past_its_lifetime_is_written_without_ending_the_session() {
+        let key_env = "CONVERSATION_SESSION_RECORDING_KEY_LATE_RENEWAL";
+        std::env::set_var(key_env, FAKE_RECORDING_KEY);
+        let directory = TempDir::new().unwrap();
+        let media = Arc::new(
+            MediaServer::bind(
+                MediaServerConfig::loopback()
+                    .with_lifetimes(Duration::from_millis(400), Duration::from_millis(400)),
+            )
+            .await
+            .unwrap(),
+        );
+        let (voice, _guards) = test_voice_adapters();
+        let session = GatewaySession::new(unused_runtime(), status_with_voice())
+            .with_voice(voice, test_language())
+            .with_recording(RecordingSettings::new(directory.path(), key_env).unwrap())
+            .with_media_server(Arc::clone(&media))
+            .with_test_session_id(SessionId::new(705));
+        let (mut input, reader) = duplex(4096);
+        let writer = GatedWriter::default();
+        let session_task = tokio::spawn(session.run(reader, writer.clone()));
+        write_command(
+            &mut input,
+            r#"{"protocol_version":3,"type":"start_voice_session","request_id":"late-start"}"#,
+        )
+        .await;
+        writer.wait_for(r#""type":"voice_session_started""#).await;
+
+        writer.set_stalled(true);
+        write_command(
+            &mut input,
+            r#"{"protocol_version":3,"type":"renew_media_lease","request_id":"late-renew"}"#,
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        writer.set_stalled(false);
+        writer.wait_for(r#""type":"media_lease_renewed""#).await;
+        assert!(!session_task.is_finished());
+
+        drop(input);
+        timeout(TEST_TIMEOUT, session_task)
+            .await
+            .expect("gateway session did not end at input EOF")
+            .unwrap()
+            .unwrap();
         media.shutdown().await;
     }
 
@@ -6504,6 +6612,59 @@ mod tests {
             .contains(r#""type":"turn_completed""#));
 
         gateway.close().await;
+    }
+
+    /// Under a stalled stdout with queued control replies, stop and finalize are still read
+    /// and processed within a bound, and input EOF still ends the session.
+    #[tokio::test]
+    async fn stop_finalize_and_eof_are_processed_within_a_bound_while_replies_are_stalled() {
+        let (_input, input_receiver) = mpsc::channel(8);
+        let language = Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new()));
+        let (session, cancelled) = session_with_interactive_voice_and_cancellation(
+            input_receiver,
+            language,
+            no_speech_frames(),
+        );
+        let (mut client_input, reader) = duplex(4096);
+        let (writer, writer_state) = ReadyFlushBlockingWriter::new();
+        let writer_lanes = super::WriterLanes::new();
+        let session_task =
+            tokio::spawn(session.run_with_writer_lanes(reader, writer, writer_lanes));
+        timeout(TEST_TIMEOUT, writer_state.blocked.wait())
+            .await
+            .expect("gateway writer did not block while flushing ready");
+        write_command(
+            &mut client_input,
+            r#"{"protocol_version":1,"type":"start_voice_session","request_id":"voice-1"}"#,
+        )
+        .await;
+        for id in ["s1", "s2", "s3"] {
+            write_command(
+                &mut client_input,
+                &format!(r#"{{"protocol_version":1,"type":"status","request_id":"{id}"}}"#),
+            )
+            .await;
+        }
+        write_command(
+            &mut client_input,
+            r#"{"protocol_version":1,"type":"stop_voice_session","request_id":"stop-1"}"#,
+        )
+        .await;
+        timeout(TEST_TIMEOUT, cancelled.wait())
+            .await
+            .expect("stop was not processed while replies were stalled");
+        // Commands are handled in input order, so the session ending at the EOF that
+        // follows proves finalize was read and handled too.
+        write_command(
+            &mut client_input,
+            r#"{"protocol_version":3,"type":"finalize_recording","request_id":"fin-1","session_id":"1"}"#,
+        )
+        .await;
+        drop(client_input);
+        let _ = timeout(TEST_TIMEOUT, session_task)
+            .await
+            .expect("input EOF was not observed while replies were stalled");
+        assert!(!writer_state.released.load(Ordering::SeqCst));
     }
 
     #[tokio::test(start_paused = true)]

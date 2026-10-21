@@ -627,10 +627,13 @@ fn media_lease_renewal_is_a_version_three_command_with_a_bounded_expiry_reply() 
         })
     );
     assert!(encode_gateway_message_for_version(&renewed, CONTEXT_SEED_PROTOCOL_VERSION).is_err());
-    for expires_at_ms in [
-        unix_now_millis() - 1,
-        unix_now_millis() + 5 * 60 * 1_000 + 60_000,
-    ] {
+    // A reply delayed past its own expiry is still stated, never a writer failure.
+    let late = GatewayMessage::MediaLeaseRenewed {
+        request_id: "renew-1".to_owned(),
+        expires_at_ms: unix_now_millis() - 1,
+    };
+    assert!(encode_gateway_message_for_version(&late, RUNTIME_PROFILE_PROTOCOL_VERSION).is_ok());
+    for expires_at_ms in [0, unix_now_millis() + 5 * 60 * 1_000 + 60_000] {
         let invalid = GatewayMessage::MediaLeaseRenewed {
             request_id: "renew-1".to_owned(),
             expires_at_ms,
@@ -640,6 +643,59 @@ fn media_lease_renewal_is_a_version_three_command_with_a_bounded_expiry_reply() 
             Err(ClientWireError::InvalidMediaLease)
         ));
     }
+}
+
+#[test]
+fn media_lease_loss_has_its_own_code_and_renewal_is_a_version_three_capability() {
+    let lost = GatewayMessage::VoiceEvent {
+        event: ClientVoiceSessionEvent::VoiceSessionFailed {
+            session_id: SessionId::new(7),
+            error: ClientRuntimeError {
+                code: "media_lease_lost".to_owned(),
+                kind: "adapter".to_owned(),
+                stage: "audio_capture".to_owned(),
+                message: "lost".to_owned(),
+            },
+            recovery: "continue_session".to_owned(),
+        },
+    };
+    assert_eq!(
+        gateway_value_for_version(&lost, RUNTIME_PROFILE_PROTOCOL_VERSION)["event"]["error"]
+            ["code"],
+        "media_lease_lost"
+    );
+    let mut status = RuntimeStatus {
+        profile: "offline".to_owned(),
+        transport: "stdio".to_owned(),
+        privacy_mode: "local_only".to_owned(),
+        language_location: "local".to_owned(),
+        model_id: "local-model".to_owned(),
+        memory_enabled: false,
+        memory_location: None,
+        telemetry_enabled: false,
+        capabilities: vec!["text".to_owned(), "media_lease_renewal".to_owned()],
+        components: vec![ClientComponentDescriptor {
+            kind: "language_model".to_owned(),
+            execution_location: "local".to_owned(),
+            provider_label: "Local language".to_owned(),
+        }],
+        last_context_seed_operation_id: None,
+    };
+    let ready = |status: &RuntimeStatus| GatewayMessage::Ready {
+        status: status.clone(),
+    };
+    assert!(
+        encode_gateway_message_for_version(&ready(&status), RUNTIME_PROFILE_PROTOCOL_VERSION)
+            .is_ok()
+    );
+    assert!(
+        encode_gateway_message_for_version(&ready(&status), CONTEXT_SEED_PROTOCOL_VERSION).is_err()
+    );
+    status.capabilities.reverse();
+    assert!(
+        encode_gateway_message_for_version(&ready(&status), RUNTIME_PROFILE_PROTOCOL_VERSION)
+            .is_err()
+    );
 }
 
 #[test]

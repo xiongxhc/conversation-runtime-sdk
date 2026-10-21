@@ -392,11 +392,15 @@ export class RuntimeClient<Version extends ClientProtocolVersion = ClientProtoco
    * and resolves with its new expiry in Unix milliseconds. The credential itself does not
    * change, so a bridge keeps reconnecting with it. Call this well inside each lifetime for as
    * long as the bridge may need to reconnect; a lapsed lease is refused and never revived.
-   * Version 3 runtimes and later.
+   * Version 3 runtimes that advertise the `media_lease_renewal` capability; otherwise it is
+   * refused locally and nothing is sent. A reply delayed past its own expiry still resolves.
    */
   renewMediaLease(): Promise<bigint> {
     if (this.protocolVersion === undefined || this.protocolVersion < RUNTIME_PROFILE_PROTOCOL_VERSION) {
       return Promise.reject(new Error("media lease renewal requires protocol version 3"));
+    }
+    if (!this.readyStatus?.capabilities.includes("media_lease_renewal")) {
+      return Promise.reject(new Error("connected runtime does not support media lease renewal"));
     }
     const requestId = this.nextRequestId();
     const result = new Deferred<bigint>();

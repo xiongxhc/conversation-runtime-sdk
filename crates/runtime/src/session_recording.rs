@@ -612,6 +612,11 @@ impl SessionRecorder {
         &self.path
     }
 
+    /// Whether the recording is closed and its summary issued.
+    pub fn is_finalized(&self) -> bool {
+        self.summary.is_some()
+    }
+
     /// Marks this recorder incomplete after a sink failure. The caller must stop feeding it;
     /// the final summary retains this bounded fact even when the meeting stays live.
     pub fn mark_incomplete(&mut self) {

@@ -683,6 +683,10 @@ impl GatewaySession {
         shutdown_alignment(&mut self.alignment).await;
         shutdown_active(&self.runtime, &mut active).await;
         shutdown_active_voice(&mut voice.active).await;
+        // A recording the client never finalized is closed rather than left open on disk.
+        if let Some(active) = self.active_recording.as_ref() {
+            let _ = active.recorder.lock().await.finalize();
+        }
         if let Some(message) = exit.fatal_message() {
             let _ = send_urgent(&urgent_sender, fatal_message(message));
         }
@@ -1082,6 +1086,18 @@ impl GatewaySession {
                         command_error("the previous voice session is still finishing"),
                     )
                     .map_err(CommandFailure::response);
+                }
+                // The next recording replaces the only reference to this one's handle, so the
+                // client finalizes it — and learns its handle — first.
+                if let Some(previous) = self.active_recording.as_ref() {
+                    if !previous.recorder.lock().await.is_finalized() {
+                        return send_rejection(
+                            normal,
+                            &request_id,
+                            command_error("the previous recording has not been finalized"),
+                        )
+                        .map_err(CommandFailure::response);
+                    }
                 }
                 if let Some(profile) = profile {
                     if RuntimeProfile::parse(&self.status.profile) != Some(profile) {
@@ -9143,6 +9159,84 @@ max_error_bytes = 65536
         assert_eq!(decrypted.session_id, SessionId::new(1));
 
         gateway.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_start_is_refused_until_the_previous_recording_is_finalized() {
+        let key_env = "CONVERSATION_SESSION_RECORDING_KEY_UNFINALIZED_START";
+        std::env::set_var(key_env, FAKE_RECORDING_KEY);
+        let directory = TempDir::new().unwrap();
+        let (input, input_receiver) = mpsc::channel(8);
+        let mut gateway = recorded_gateway(&directory, key_env, input_receiver).await;
+
+        gateway
+            .write(r#"{"protocol_version":3,"type":"start_voice_session","request_id":"voice-1"}"#)
+            .await;
+        assert_accepted_message(&gateway.read_message().await, "voice-1");
+        send_voice_input(&input, recording_frame(1)).await;
+        wait_for_recording_bytes(directory.path(), 64).await;
+        gateway
+            .write(r#"{"protocol_version":3,"type":"stop_voice_session","request_id":"stop-1"}"#)
+            .await;
+        gateway
+            .read_until(|message| message.contains(r#""request_id":"stop-1""#))
+            .await;
+
+        // Starting again would replace the only reference to the first recording's handle.
+        gateway
+            .write(r#"{"protocol_version":3,"type":"start_voice_session","request_id":"voice-2"}"#)
+            .await;
+        let refused = gateway
+            .read_until(|message| message.contains(r#""request_id":"voice-2""#))
+            .await;
+        let refused = refused
+            .last()
+            .expect("read_until returns the frame it matched");
+        assert_rejected_message(refused, "voice-2", "invalid_state");
+        assert!(
+            refused.contains("the previous recording has not been finalized"),
+            "{refused}"
+        );
+
+        gateway
+            .write(
+                r#"{"protocol_version":3,"type":"finalize_recording","request_id":"fin-1","session_id":"1"}"#,
+            )
+            .await;
+        assert_accepted_message(&gateway.read_message().await, "fin-1");
+        assert!(gateway
+            .read_message()
+            .await
+            .contains(r#""type":"recording_finalized""#));
+        gateway.close().await;
+    }
+
+    #[tokio::test]
+    async fn gateway_exit_finalizes_a_recording_the_client_never_finalized() {
+        let key_env = "CONVERSATION_SESSION_RECORDING_KEY_EXIT_FINALIZE";
+        std::env::set_var(key_env, FAKE_RECORDING_KEY);
+        let directory = TempDir::new().unwrap();
+        let (input, input_receiver) = mpsc::channel(8);
+        let mut gateway = recorded_gateway(&directory, key_env, input_receiver).await;
+
+        gateway
+            .write(r#"{"protocol_version":3,"type":"start_voice_session","request_id":"voice-1"}"#)
+            .await;
+        assert_accepted_message(&gateway.read_message().await, "voice-1");
+        send_voice_input(&input, recording_frame(1)).await;
+        let path = wait_for_recording_bytes(directory.path(), 64).await;
+
+        // The client goes away mid-meeting: no stop, no finalize.
+        gateway.close().await;
+
+        let recorded = read_session_recording(&path, key_env).unwrap();
+        assert!(
+            matches!(
+                recorded.chunks.last(),
+                Some(conversation_runtime::RecordedChunk::Ended { .. })
+            ),
+            "the recording is closed, not left open, when the gateway exits"
+        );
     }
 
     #[tokio::test]

@@ -92,7 +92,8 @@ export type ClientCommand =
       input: string;
       outputSchema: Record<string, unknown>;
       maxOutputBytes: number;
-    };
+    }
+  | { type: "renew_media_lease"; requestId: string };
 
 export type ConversationContextExchange = { user: string; assistant: string };
 
@@ -564,7 +565,8 @@ export type GatewayMessage =
       requestId: string;
       reconciliation: RecordingReconciliation;
     }
-  | { type: "text_processed"; requestId: string; processed: ProcessedText };
+  | { type: "text_processed"; requestId: string; processed: ProcessedText }
+  | { type: "media_lease_renewed"; requestId: string; expiresAtMs: bigint };
 
 export class ProtocolError extends Error {
   constructor(message: string) {
@@ -695,6 +697,12 @@ export function parseClientCommand(value: unknown, expectedVersion?: ClientProto
         throw new ProtocolError("session recording requires protocol version 3");
       }
       return { type, requestId: requireRequestId(object), sessionId: parseIdentifier(object.session_id) };
+    case "renew_media_lease":
+      requireExactKeys(object, ["protocol_version", "type", "request_id"]);
+      if (version < RUNTIME_PROFILE_PROTOCOL_VERSION) {
+        throw new ProtocolError("media lease renewal requires protocol version 3");
+      }
+      return { type, requestId: requireRequestId(object) };
     case "read_recording_alignment":
     case "reconcile_finalized_recording":
       try {
@@ -906,6 +914,19 @@ export function parseGatewayMessage(
         reconciliation,
       };
     }
+    case "media_lease_renewed": {
+      requireExactKeys(object, ["protocol_version", "type", "request_id", "expires_at_ms"]);
+      validateProtocolVersion(object, version);
+      if (version < RUNTIME_PROFILE_PROTOCOL_VERSION) {
+        throw new ProtocolError("media lease renewal requires protocol version 3");
+      }
+      const expiresAtMs = parseBoundedDecimal(object.expires_at_ms, "media lease expiry", MAX_U64.toString(), "invalid media lease");
+      const lifetimeMs = expiresAtMs - BigInt(Date.now());
+      if (lifetimeMs <= 0n || lifetimeMs > MAX_MEDIA_LEASE_LIFETIME_MS) {
+        throw new ProtocolError("invalid media lease");
+      }
+      return { type, requestId: requireRequestId(object), expiresAtMs };
+    }
     case "text_processed":
       requireExactKeys(object, ["protocol_version", "type", "request_id", "processed"]);
       validateProtocolVersion(object, version);
@@ -1020,6 +1041,8 @@ export function encodeClientCommand(
           request_id: command.requestId,
           session_id: command.sessionId.toString(),
         };
+      case "renew_media_lease":
+        return { protocol_version: version, type: command.type, request_id: command.requestId };
       case "read_recording_alignment":
       case "reconcile_finalized_recording":
         return { protocol_version: version, type: command.type, request_id: command.requestId, capability: encodeFinalizedCapability(command.capability) };
@@ -1120,6 +1143,9 @@ export function validateClientCommand(
   }
   if (command.type === "persona_update") {
     validatePersonaState(command.persona);
+  }
+  if (command.type === "renew_media_lease" && version < RUNTIME_PROFILE_PROTOCOL_VERSION) {
+    throw new ProtocolError("media lease renewal requires protocol version 3");
   }
   if (command.type === "finalize_recording") {
     if (version < RUNTIME_PROFILE_PROTOCOL_VERSION) {

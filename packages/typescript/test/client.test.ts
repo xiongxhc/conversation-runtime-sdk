@@ -69,6 +69,37 @@ test("connects, correlates status, and streams an accepted turn", async () => {
   await client.close();
 });
 
+test("renews the media lease and correlates its bounded expiry", async () => {
+  const transport = new InMemoryTransport();
+  const connecting = RuntimeClient.connect(transport);
+  transport.push(readyV3());
+  const client = await connecting;
+
+  const renewing = client.renewMediaLease();
+  const renew = command(transport, "renew_media_lease");
+  assert.equal(transport.sentVersions.at(-1), 3);
+  const expiresAtMs = BigInt(Date.now()) + 60_000n;
+  transport.push(acceptedForVersion(renew.requestId, 3));
+  transport.push({ type: "media_lease_renewed", protocol_version: 3, request_id: renew.requestId, expires_at_ms: expiresAtMs.toString() });
+  assert.equal(await renewing, expiresAtMs);
+
+  const refused = client.renewMediaLease();
+  const second = transport.sent.at(-1);
+  assert.equal(second?.type, "renew_media_lease");
+  transport.push({ type: "command_rejected", protocol_version: 3, request_id: second!.requestId,
+    error: { code: "invalid_state", kind: "invalid_state", stage: "runtime", message: "the media lease can no longer be renewed" } });
+  await assert.rejects(refused, CommandRejectedError);
+  await client.close();
+
+  const legacy = new InMemoryTransport();
+  const legacyConnecting = RuntimeClient.connect(legacy);
+  legacy.push(ready());
+  const legacyClient = await legacyConnecting;
+  await assert.rejects(legacyClient.renewMediaLease(), /protocol version 3/);
+  assert.equal(legacy.sent.some((item) => item.type === "renew_media_lease"), false);
+  await legacyClient.close();
+});
+
 test("stores a version two ready and uses it for existing commands", async () => {
   const transport = new InMemoryTransport();
   const connecting = RuntimeClient.connect(transport);

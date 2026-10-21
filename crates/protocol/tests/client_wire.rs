@@ -592,6 +592,57 @@ fn version_one_voice_controls_decode_without_client_selected_identifiers() {
 }
 
 #[test]
+fn media_lease_renewal_is_a_version_three_command_with_a_bounded_expiry_reply() {
+    let command = decode_client_command(
+        br#"{"protocol_version":3,"type":"renew_media_lease","request_id":"renew-1"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        command,
+        ClientCommand::RenewMediaLease {
+            request_id: "renew-1".to_owned()
+        }
+    );
+    for refused in [
+        br#"{"protocol_version":2,"type":"renew_media_lease","request_id":"renew-1"}"#.as_slice(),
+        br#"{"protocol_version":3,"type":"renew_media_lease","request_id":"renew-1","session_id":"1"}"#,
+        br#"{"protocol_version":3,"type":"renew_media_lease","request_id":""}"#,
+    ] {
+        assert!(decode_client_command(refused).is_err());
+    }
+
+    let expires_at_ms = unix_now_millis() + 60_000;
+    let renewed = GatewayMessage::MediaLeaseRenewed {
+        request_id: "renew-1".to_owned(),
+        expires_at_ms,
+    };
+    let value = gateway_value_for_version(&renewed, RUNTIME_PROFILE_PROTOCOL_VERSION);
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "type": "media_lease_renewed",
+            "protocol_version": 3,
+            "request_id": "renew-1",
+            "expires_at_ms": expires_at_ms.to_string(),
+        })
+    );
+    assert!(encode_gateway_message_for_version(&renewed, CONTEXT_SEED_PROTOCOL_VERSION).is_err());
+    for expires_at_ms in [
+        unix_now_millis() - 1,
+        unix_now_millis() + 5 * 60 * 1_000 + 60_000,
+    ] {
+        let invalid = GatewayMessage::MediaLeaseRenewed {
+            request_id: "renew-1".to_owned(),
+            expires_at_ms,
+        };
+        assert!(matches!(
+            encode_gateway_message_for_version(&invalid, RUNTIME_PROFILE_PROTOCOL_VERSION),
+            Err(ClientWireError::InvalidMediaLease)
+        ));
+    }
+}
+
+#[test]
 fn typed_start_projection_carries_request_correlation_and_exact_final_text() {
     let started = ClientRuntimeEvent::TurnStarted {
         request_id: Some("req-1".to_owned()),

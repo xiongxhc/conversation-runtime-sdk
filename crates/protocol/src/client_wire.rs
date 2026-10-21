@@ -195,6 +195,11 @@ pub enum ClientCommand {
         output_schema: String,
         max_output_bytes: usize,
     },
+    /// Extends the active voice session's media credential by one configured lifetime.
+    /// Version 3 and later.
+    RenewMediaLease {
+        request_id: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -543,6 +548,11 @@ pub enum GatewayMessage {
     TextProcessed {
         request_id: String,
         processed: ClientProcessedText,
+    },
+    /// The renewed wall-clock expiry of the unchanged media credential. Version 3 and later.
+    MediaLeaseRenewed {
+        request_id: String,
+        expires_at_ms: u64,
     },
 }
 
@@ -1196,6 +1206,19 @@ fn decode_wire_client_command(
                 max_output_bytes: max_output_bytes as usize,
             })
         }
+        WireClientCommand::RenewMediaLease {
+            protocol_version,
+            request_id,
+        } => {
+            validate_protocol_version(protocol_version)?;
+            if protocol_version < RUNTIME_PROFILE_PROTOCOL_VERSION {
+                return Err(ClientWireError::UnsupportedProtocolVersion(
+                    protocol_version,
+                ));
+            }
+            validate_request_id(&request_id)?;
+            Ok(ClientCommand::RenewMediaLease { request_id })
+        }
     }
 }
 
@@ -1364,6 +1387,10 @@ enum WireClientCommand {
         output_schema: serde_json::Value,
         max_output_bytes: u32,
     },
+    RenewMediaLease {
+        protocol_version: u64,
+        request_id: String,
+    },
 }
 
 impl WireClientCommand {
@@ -1442,6 +1469,9 @@ impl WireClientCommand {
                 protocol_version, ..
             }
             | Self::ProcessText {
+                protocol_version, ..
+            }
+            | Self::RenewMediaLease {
                 protocol_version, ..
             } => *protocol_version,
         }
@@ -2009,6 +2039,11 @@ enum GatewayMessageEnvelope<'a> {
         request_id: &'a str,
         processed: WireClientProcessedText,
     },
+    MediaLeaseRenewed {
+        protocol_version: u64,
+        request_id: &'a str,
+        expires_at_ms: String,
+    },
 }
 
 impl<'a> GatewayMessageEnvelope<'a> {
@@ -2168,6 +2203,14 @@ impl<'a> GatewayMessageEnvelope<'a> {
                 protocol_version,
                 request_id,
                 processed: WireClientProcessedText::from(processed),
+            },
+            GatewayMessage::MediaLeaseRenewed {
+                request_id,
+                expires_at_ms,
+            } => Self::MediaLeaseRenewed {
+                protocol_version,
+                request_id,
+                expires_at_ms: expires_at_ms.to_string(),
             },
         }
     }
@@ -2428,6 +2471,26 @@ fn validate_gateway_message(
             }
             validate_request_id(request_id)?;
             validate_client_processed_text(processed)
+        }
+        GatewayMessage::MediaLeaseRenewed {
+            request_id,
+            expires_at_ms,
+        } => {
+            if protocol_version < RUNTIME_PROFILE_PROTOCOL_VERSION {
+                return Err(ClientWireError::UnsupportedProtocolVersion(
+                    protocol_version,
+                ));
+            }
+            validate_request_id(request_id)?;
+            let now = unix_now_millis().ok_or(ClientWireError::InvalidMediaLease)?;
+            match expires_at_ms.checked_sub(now) {
+                Some(lifetime_ms)
+                    if lifetime_ms > 0 && lifetime_ms <= MAX_MEDIA_LEASE_LIFETIME_MS =>
+                {
+                    Ok(())
+                }
+                _ => Err(ClientWireError::InvalidMediaLease),
+            }
         }
         GatewayMessage::MemoryExtracted { .. } => Ok(()),
     }

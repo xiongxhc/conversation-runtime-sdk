@@ -223,7 +223,12 @@ do not run it from CI, a developer laptop on a public network, or an untrusted b
    counts, and a bridge-computed checksum for each test frame. Do not capture or retain raw packet
    payloads. The expected result is monotonic capture sequence, one explicit recording gap at the
    disconnect, no fabricated silence, no duplicated pre-disconnect frame after reconnect, and
-   refusal after the reconnect window expires.
+   refusal after the reconnect window expires. For meetings longer than the credential lifetime,
+   the control client sends `renew_media_lease` well inside each lifetime; confirm that a
+   disconnect after the original lifetime still reconnects with the unchanged credential, that a
+   lapsed lease is neither renewed nor admitted, and that a drop that can no longer reconnect
+   produces one non-terminal `voice_session_failed` (stage `audio_capture`, recovery
+   `continue_session`) while the recording stays open until stop.
 
 6. Stop the voice session and finalize its recording through the v3 control client. On the
    authorised agent-box, use the runtime's normal encrypted-recording reader with the service key

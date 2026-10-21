@@ -387,6 +387,29 @@ export class RuntimeClient<Version extends ClientProtocolVersion = ClientProtoco
     return result.promise;
   }
 
+  /**
+   * Extends the active voice session's media credential to one configured lifetime from now
+   * and resolves with its new expiry in Unix milliseconds. The credential itself does not
+   * change, so a bridge keeps reconnecting with it. Call this well inside each lifetime for as
+   * long as the bridge may need to reconnect; a lapsed lease is refused and never revived.
+   * Version 3 runtimes and later.
+   */
+  renewMediaLease(): Promise<bigint> {
+    if (this.protocolVersion === undefined || this.protocolVersion < RUNTIME_PROFILE_PROTOCOL_VERSION) {
+      return Promise.reject(new Error("media lease renewal requires protocol version 3"));
+    }
+    const requestId = this.nextRequestId();
+    const result = new Deferred<bigint>();
+    this.controls.set(requestId, {
+      kind: "renew_media_lease",
+      accepted: false,
+      result,
+      fail: (error) => result.reject(error),
+    });
+    this.send({ type: "renew_media_lease", requestId });
+    return result.promise;
+  }
+
   startTurn(transcript: string): Promise<RuntimeTurn> {
     const requestId = this.nextRequestId();
     validateClientCommand({ type: "start_turn", requestId, transcript });
@@ -718,6 +741,16 @@ export class RuntimeClient<Version extends ClientProtocolVersion = ClientProtoco
       control.result.resolve(message.reconciliation);
       return;
     }
+    if (message.type === "media_lease_renewed") {
+      const control = this.controls.get(message.requestId);
+      if (!control || control.kind !== "renew_media_lease" || !control.accepted) {
+        this.fail(new Error("gateway sent an uncorrelated media lease renewal"));
+        return;
+      }
+      this.controls.delete(message.requestId);
+      control.result.resolve(message.expiresAtMs);
+      return;
+    }
     if (message.type === "text_processed") {
       const control = this.controls.get(message.requestId);
       if (!control || control.kind !== "process_text" || !control.accepted) {
@@ -816,6 +849,7 @@ export class RuntimeClient<Version extends ClientProtocolVersion = ClientProtoco
         }
         return;
       case "status":
+      case "renew_media_lease":
       case "memory_list":
       case "memory_inspect":
       case "persona_get":
@@ -978,6 +1012,7 @@ type PendingControl<Version extends ClientProtocolVersion> =
   | { kind: "start_timed_voice_session"; accepted: boolean; result: Deferred<TimedVoiceSession>; fail(error: Error): void }
   | { kind: "start_drainable_timed_voice_session"; accepted: boolean; result: Deferred<DrainableTimedVoiceSession>; fail(error: Error): void }
   | { kind: "status"; accepted: boolean; result: Deferred<RuntimeStatus>; fail(error: Error): void }
+  | { kind: "renew_media_lease"; accepted: boolean; result: Deferred<bigint>; fail(error: Error): void }
   | { kind: "memory_list"; accepted: boolean; result: Deferred<MemoryPage>; fail(error: Error): void }
   | { kind: "memory_inspect"; accepted: boolean; result: Deferred<MemoryInspection>; fail(error: Error): void }
   | { kind: "persona_get"; accepted: boolean; result: Deferred<PersonaState>; fail(error: Error): void }

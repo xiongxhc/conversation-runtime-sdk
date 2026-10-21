@@ -1,4 +1,6 @@
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -889,6 +891,37 @@ impl GatewaySession {
             | ClientCommand::StartDrainableTimedVoiceSession { .. } => {
                 unreachable!("normalized timed start")
             }
+            ClientCommand::RenewMediaLease { request_id } => {
+                let Some(lease) = voice
+                    .active
+                    .as_ref()
+                    .and_then(|voice_session| voice_session.media_lease.as_ref())
+                else {
+                    return send_rejection(
+                        normal,
+                        &request_id,
+                        command_error("no media lease is active"),
+                    )
+                    .map_err(CommandFailure::response);
+                };
+                match lease.server.renew(lease.session_id).await {
+                    Ok(expires_at_ms) => send_accepted(normal, &request_id).and_then(|()| {
+                        send_normal(
+                            normal,
+                            GatewayMessage::MediaLeaseRenewed {
+                                request_id,
+                                expires_at_ms,
+                            },
+                        )
+                    }),
+                    Err(_) => send_rejection(
+                        normal,
+                        &request_id,
+                        command_error("the media lease can no longer be renewed"),
+                    ),
+                }
+                .map_err(CommandFailure::response)
+            }
             ClientCommand::Status { request_id } => {
                 send_accepted(normal, &request_id).map_err(CommandFailure::response)?;
                 send_normal(
@@ -1363,6 +1396,7 @@ impl GatewaySession {
                     events.clone(),
                     control_event_receiver,
                     control_pending_receiver,
+                    VoiceNotices::new(session_id, media_lease.as_ref()),
                 ));
                 voice.active = Some(ActiveVoiceSession {
                     runtime,
@@ -2185,7 +2219,8 @@ fn command_request_id(command: &ClientCommand) -> &str {
         | ClientCommand::FinalizeRecording { request_id, .. }
         | ClientCommand::ReconcileRecording { request_id, .. }
         | ClientCommand::ReconcileFinalizedRecording { request_id, .. }
-        | ClientCommand::ProcessText { request_id, .. } => request_id,
+        | ClientCommand::ProcessText { request_id, .. }
+        | ClientCommand::RenewMediaLease { request_id } => request_id,
     }
 }
 
@@ -2305,11 +2340,39 @@ async fn pump_voice_events(
     event_writer: mpsc::Sender<GatewayMessage>,
     mut control_events: mpsc::Receiver<VoiceCaptureControlKind>,
     mut control_pending: watch::Receiver<bool>,
+    mut notices: VoiceNotices,
 ) -> Result<(), GatewaySessionError> {
     let mut forwarding = true;
+    let mut started = false;
     let mut terminal_slot = Some(terminal_slot);
     let mut exchange = VoiceExchange::default();
-    while let Some(event) = events.recv().await {
+    loop {
+        // A lost, unresumable media lease is reported once, after the session's first
+        // event and before its terminal, as a non-terminal failure: the voice session
+        // and its recording stay open until the client stops them.
+        let event = tokio::select! {
+            biased;
+            event = events.recv() => event,
+            lost = async { notices.media_lost.as_mut().expect("guarded watch").await },
+                if started && notices.media_lost.is_some() =>
+            {
+                notices.media_lost = None;
+                if lost
+                    && forwarding
+                    && event_writer
+                        .send(media_lost_message(notices.session_id))
+                        .await
+                        .is_err()
+                {
+                    forwarding = false;
+                }
+                continue;
+            }
+        };
+        let Some(event) = event else {
+            break;
+        };
+        started = true;
         if !forwarding {
             continue;
         }
@@ -2345,6 +2408,7 @@ async fn pump_voice_events(
         }
         let terminal = event.is_session_terminal();
         if terminal {
+            notices.media_lost = None;
             while *control_pending.borrow_and_update() {
                 if control_pending.changed().await.is_err() {
                     while events.recv().await.is_some() {}
@@ -2383,6 +2447,42 @@ async fn pump_voice_events(
         }
     }
     Ok(())
+}
+
+/// Degradations the pump reports once, between the session's first event and its terminal,
+/// without ending the session.
+struct VoiceNotices {
+    session_id: SessionId,
+    media_lost: Option<Pin<Box<dyn Future<Output = bool> + Send>>>,
+}
+
+impl VoiceNotices {
+    fn new(session_id: SessionId, media_lease: Option<&ActiveMediaLease>) -> Self {
+        Self {
+            session_id,
+            media_lost: media_lease.map(|lease| {
+                let server = Arc::clone(&lease.server);
+                Box::pin(async move { server.media_lost(session_id).await })
+                    as Pin<Box<dyn Future<Output = bool> + Send>>
+            }),
+        }
+    }
+}
+
+fn media_lost_message(session_id: SessionId) -> GatewayMessage {
+    GatewayMessage::VoiceEvent {
+        event: ClientVoiceSessionEvent::VoiceSessionFailed {
+            session_id,
+            error: ClientRuntimeError {
+                code: "adapter_failure".to_owned(),
+                kind: "adapter".to_owned(),
+                stage: RuntimeStage::AudioCapture.as_str().to_owned(),
+                message: "the media bridge connection was lost and its lease cannot be resumed"
+                    .to_owned(),
+            },
+            recovery: "continue_session".to_owned(),
+        },
+    }
 }
 
 // The voice lane splits one exchange across two events: the recognized utterance
@@ -3349,6 +3449,317 @@ mod tests {
             .unwrap();
         assert_eq!(replay.read(&mut byte).await.unwrap(), 0);
 
+        gateway.close().await;
+        media.shutdown().await;
+    }
+
+    async fn media_lease_gateway(
+        directory: &TempDir,
+        key_env: &str,
+        session_id: SessionId,
+        credential_lifetime: Duration,
+    ) -> (
+        Arc<MediaServer>,
+        InMemoryGateway,
+        String,
+        std::net::SocketAddr,
+        mpsc::Receiver<Result<CaptureEvent, AdapterError>>,
+    ) {
+        std::env::set_var(key_env, FAKE_RECORDING_KEY);
+        let media = Arc::new(
+            MediaServer::bind(
+                MediaServerConfig::loopback()
+                    .with_lifetimes(credential_lifetime, Duration::from_secs(5)),
+            )
+            .await
+            .unwrap(),
+        );
+        let (voice, _guards) = test_voice_adapters();
+        let (recognition_handoff, mut recognition_handoffs) = mpsc::channel(1);
+        let session = GatewaySession::new(unused_runtime(), status_with_voice())
+            .with_voice(voice, test_language())
+            .with_recording(RecordingSettings::new(directory.path(), key_env).unwrap())
+            .with_media_server(Arc::clone(&media))
+            .with_media_capture_handoff(recognition_handoff)
+            .with_test_session_id(session_id);
+        let mut gateway = InMemoryGateway::start(session).await;
+        gateway
+            .write(
+                r#"{"protocol_version":3,"type":"start_voice_session","request_id":"lease-start"}"#,
+            )
+            .await;
+        let accepted: serde_json::Value =
+            serde_json::from_str(&gateway.read_message().await).unwrap();
+        let lease = &accepted["media_lease"];
+        let credential = lease["credential"].as_str().unwrap().to_owned();
+        let endpoint = lease["connect_endpoint"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("tcp://")
+            .unwrap()
+            .parse()
+            .unwrap();
+        gateway
+            .read_until(|message| message.contains(r#""type":"voice_session_started""#))
+            .await;
+        let recognition = timeout(TEST_TIMEOUT, recognition_handoffs.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .start(session_id, CancellationToken::new())
+            .await
+            .unwrap();
+        (media, gateway, credential, endpoint, recognition)
+    }
+
+    async fn authenticated_bridge(
+        endpoint: std::net::SocketAddr,
+        session_id: SessionId,
+        credential: &str,
+    ) -> TcpStream {
+        let mut bridge = TcpStream::connect(endpoint).await.unwrap();
+        bridge
+            .write_all(&media_authentication(session_id, credential))
+            .await
+            .unwrap();
+        bridge
+    }
+
+    async fn bridge_refused(
+        endpoint: std::net::SocketAddr,
+        session_id: SessionId,
+        credential: &str,
+    ) -> bool {
+        let mut bridge = authenticated_bridge(endpoint, session_id, credential).await;
+        let mut byte = [0_u8; 1];
+        matches!(
+            timeout(TEST_TIMEOUT, bridge.read(&mut byte)).await,
+            Ok(Ok(0) | Err(_))
+        )
+    }
+
+    /// Connects a legacy bridge and sends one frame, retrying while an earlier connection
+    /// still holds the admission fence. Admission is proven by the frame reaching the
+    /// session's capture fan-out, which records before it offers recognition.
+    async fn admitted_bridge(
+        endpoint: std::net::SocketAddr,
+        session_id: SessionId,
+        credential: &str,
+        recognition: &mut mpsc::Receiver<Result<CaptureEvent, AdapterError>>,
+        sequence: u64,
+        payload: &[u8],
+    ) -> TcpStream {
+        timeout(TEST_TIMEOUT, async {
+            loop {
+                let mut bridge = authenticated_bridge(endpoint, session_id, credential).await;
+                bridge
+                    .write_all(&media_capture(
+                        session_id,
+                        sequence,
+                        sequence * 1_000,
+                        payload,
+                    ))
+                    .await
+                    .unwrap();
+                let mut byte = [0_u8; 1];
+                loop {
+                    tokio::select! {
+                        _ = bridge.read(&mut byte) => break,
+                        event = recognition.recv() => {
+                            if let Some(Ok(CaptureEvent::Frame(frame))) = event {
+                                if frame.sequence() == sequence {
+                                    return bridge;
+                                }
+                            }
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the bridge was never admitted")
+    }
+
+    fn recorded_frames(path: &std::path::Path, key_env: &str) -> Vec<(u64, Vec<u8>)> {
+        read_session_recording(path, key_env)
+            .unwrap()
+            .chunks
+            .iter()
+            .filter_map(|chunk| match chunk {
+                RecordedChunk::Frame {
+                    sequence, bytes, ..
+                } => Some((*sequence, bytes.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A bridge drop late in a meeting must stay resumable while the control plane keeps
+    /// the lease renewed. The credential is unchanged, only its expiry moves, and the bridge
+    /// reconnects with it after the original lifetime so the recording continues.
+    #[tokio::test]
+    async fn a_renewed_media_lease_lets_a_dropped_bridge_resume_after_its_original_lifetime() {
+        let key_env = "CONVERSATION_SESSION_RECORDING_KEY_MEDIA_RENEWAL";
+        let directory = TempDir::new().unwrap();
+        let session_id = SessionId::new(702);
+        let (media, mut gateway, credential, endpoint, mut recognition) = media_lease_gateway(
+            &directory,
+            key_env,
+            session_id,
+            Duration::from_millis(1_500),
+        )
+        .await;
+        let bridge = admitted_bridge(
+            endpoint,
+            session_id,
+            &credential,
+            &mut recognition,
+            1,
+            b"before",
+        )
+        .await;
+
+        let mut expires_at_ms = 0_u64;
+        for round in 0..4 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let request = format!("renew-{round}");
+            gateway
+                .write(&format!(
+                    r#"{{"protocol_version":3,"type":"renew_media_lease","request_id":"{request}"}}"#
+                ))
+                .await;
+            let needle = format!(r#""request_id":"{request}""#);
+            let reply = gateway
+                .read_until(|message| {
+                    message.contains(&needle) && message_type(message) != "command_accepted"
+                })
+                .await
+                .pop()
+                .unwrap();
+            let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+            assert_eq!(reply["type"], "media_lease_renewed", "{reply}");
+            let renewed: u64 = reply["expires_at_ms"].as_str().unwrap().parse().unwrap();
+            assert!(renewed > expires_at_ms);
+            expires_at_ms = renewed;
+        }
+
+        // Two seconds past admission: the original 1.5 s credential has lapsed.
+        drop(bridge);
+        let _bridge = admitted_bridge(
+            endpoint,
+            session_id,
+            &credential,
+            &mut recognition,
+            2,
+            b"resume",
+        )
+        .await;
+
+        gateway
+            .write(
+                r#"{"protocol_version":3,"type":"stop_voice_session","request_id":"lease-stop"}"#,
+            )
+            .await;
+        gateway
+            .read_until(|message| {
+                message_type(message) == "command_accepted"
+                    && message.contains(r#""request_id":"lease-stop""#)
+            })
+            .await;
+        // The lease ends with the session: neither renewal nor reconnect revives it.
+        gateway
+            .write(r#"{"protocol_version":3,"type":"renew_media_lease","request_id":"renew-after-stop"}"#)
+            .await;
+        assert_rejected_message(
+            &gateway.read_message().await,
+            "renew-after-stop",
+            "invalid_state",
+        );
+        assert!(bridge_refused(endpoint, session_id, &credential).await);
+        let frames = recorded_frames(
+            &wait_for_recording_bytes(directory.path(), 1).await,
+            key_env,
+        );
+        assert!(frames.contains(&(1, b"before".to_vec())), "{frames:?}");
+        assert!(frames.contains(&(2, b"resume".to_vec())), "{frames:?}");
+        gateway.close().await;
+        media.shutdown().await;
+    }
+
+    /// When a dropped bridge can no longer reconnect, the client gets one explicit,
+    /// non-terminal audio-capture failure so it can record the gap and act. The session and
+    /// its recording stay open until the client stops them, and a lapsed lease is not renewed.
+    #[tokio::test]
+    async fn an_unresumable_media_drop_is_reported_without_ending_the_recording() {
+        let key_env = "CONVERSATION_SESSION_RECORDING_KEY_MEDIA_LOSS";
+        let directory = TempDir::new().unwrap();
+        let session_id = SessionId::new(703);
+        let (media, mut gateway, credential, endpoint, mut recognition) =
+            media_lease_gateway(&directory, key_env, session_id, Duration::from_millis(300)).await;
+        let bridge = admitted_bridge(
+            endpoint,
+            session_id,
+            &credential,
+            &mut recognition,
+            1,
+            b"kept",
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        drop(bridge);
+
+        let messages = gateway
+            .read_until(|message| {
+                message.contains(r#""type":"voice_session_failed""#)
+                    && message.contains(r#""stage":"audio_capture""#)
+            })
+            .await;
+        let failure: serde_json::Value = serde_json::from_str(messages.last().unwrap()).unwrap();
+        assert_eq!(failure["event"]["recovery"], "continue_session");
+        assert_eq!(failure["event"]["session_id"], "703");
+        assert!(messages.iter().all(|message| !is_voice_terminal(message)));
+        assert!(bridge_refused(endpoint, session_id, &credential).await);
+
+        gateway
+            .write(
+                r#"{"protocol_version":3,"type":"renew_media_lease","request_id":"renew-lapsed"}"#,
+            )
+            .await;
+        let reply = gateway
+            .read_until(|message| message.contains(r#""request_id":"renew-lapsed""#))
+            .await
+            .pop()
+            .unwrap();
+        assert_rejected_message(&reply, "renew-lapsed", "invalid_state");
+
+        gateway
+            .write(r#"{"protocol_version":3,"type":"stop_voice_session","request_id":"loss-stop"}"#)
+            .await;
+        let stopped = gateway
+            .read_until(|message| {
+                message_type(message) == "command_accepted"
+                    && message.contains(r#""request_id":"loss-stop""#)
+            })
+            .await;
+        assert!(stopped.iter().any(|message| is_voice_terminal(message)));
+        assert!(stopped
+            .iter()
+            .all(|message| !message.contains(r#""stage":"audio_capture""#)));
+        gateway
+            .write(r#"{"protocol_version":3,"type":"finalize_recording","request_id":"loss-finalize","session_id":"703"}"#)
+            .await;
+        assert_accepted_message(&gateway.read_message().await, "loss-finalize");
+        let finalized: serde_json::Value =
+            serde_json::from_str(&gateway.read_message().await).unwrap();
+        assert_eq!(finalized["type"], "recording_finalized");
+        assert_eq!(
+            recorded_frames(
+                &wait_for_recording_bytes(directory.path(), 1).await,
+                key_env
+            ),
+            vec![(1, b"kept".to_vec())]
+        );
         gateway.close().await;
         media.shutdown().await;
     }

@@ -20,7 +20,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use rustls::ServerConfig;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
@@ -332,6 +332,8 @@ struct MediaServerInner {
     max_playback_queue_duration: Duration,
     packet_read_timeout: Duration,
     sessions: Mutex<HashMap<u64, MediaSession>>,
+    /// Woken whenever a reservation's resumability may have changed.
+    lease_changed: Notify,
     connections: Mutex<Vec<JoinHandle<()>>>,
     connection_permits: Arc<Semaphore>,
     cancellation: CancellationToken,
@@ -354,6 +356,8 @@ struct MediaSession {
     frames_in_window: u32,
     timed: Option<TimedMediaState>,
     capture_finished: bool,
+    /// An admitted connection ended without a planned capture finish.
+    released: bool,
     revoked: CancellationToken,
 }
 
@@ -413,6 +417,7 @@ impl MediaServer {
             max_playback_queue_duration: config.max_playback_queue_duration,
             packet_read_timeout: config.packet_read_timeout,
             sessions: Mutex::new(HashMap::new()),
+            lease_changed: Notify::new(),
             connections: Mutex::new(Vec::new()),
             connection_permits: Arc::new(Semaphore::new(MAX_MEDIA_CONNECTIONS)),
             cancellation: CancellationToken::new(),
@@ -497,12 +502,7 @@ impl MediaServer {
         let credential = random_credential()?;
         let now = Instant::now();
         let expires_at = now + self.inner.credential_lifetime;
-        let expires_at_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .ok()
-            .and_then(|now| now.checked_add(self.inner.credential_lifetime))
-            .and_then(|expires_at| u64::try_from(expires_at.as_millis()).ok())
-            .ok_or_else(|| AdapterError::new("media credential expiry could not be calculated"))?;
+        let expires_at_ms = credential_expiry_ms(self.inner.credential_lifetime)?;
         let reconnect_window = self.inner.reconnect_window;
         let previous = self.inner.sessions.lock().await.insert(
             session_id.get(),
@@ -530,6 +530,7 @@ impl MediaServer {
                     metadata_in_window: 0,
                 }),
                 capture_finished: false,
+                released: false,
                 revoked: CancellationToken::new(),
             },
         );
@@ -553,7 +554,69 @@ impl MediaServer {
         if let Some(session) = self.inner.sessions.lock().await.remove(&session_id.get()) {
             session.revoked.cancel();
         }
+        self.inner.lease_changed.notify_waiters();
         self.inner.hub.revoke(session_id).await;
+    }
+
+    /// Extends a live media credential to one configured lifetime from now and returns the
+    /// new wall-clock expiry. Only the control-plane owner of the voice session can call
+    /// this; the credential itself is unchanged, so a bridge keeps reconnecting with it.
+    /// A lapsed credential, a lapsed reconnect window, a finished capture or a revoked
+    /// reservation is never revived, and authentication still refuses an expired credential.
+    pub async fn renew(&self, session_id: SessionId) -> Result<u64, AdapterError> {
+        let mut sessions = self.inner.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id.get())
+            .ok_or_else(|| AdapterError::new("media lease is not reserved"))?;
+        let now = Instant::now();
+        if session.capture_finished
+            || now > session.expires_at
+            || (!session.active && now > session.reconnect_deadline)
+        {
+            return Err(AdapterError::new("media lease can no longer be renewed"));
+        }
+        let expires_at_ms = credential_expiry_ms(self.inner.credential_lifetime)?;
+        session.expires_at = now + self.inner.credential_lifetime;
+        drop(sessions);
+        self.inner.lease_changed.notify_waiters();
+        Ok(expires_at_ms)
+    }
+
+    /// Resolves `true` once an admitted bridge connection was lost and the reservation can
+    /// no longer be resumed, because its credential or reconnect window lapsed while no
+    /// connection was admitted. Resolves `false` when the reservation is revoked. A planned
+    /// capture finish is not a loss.
+    pub async fn media_lost(&self, session_id: SessionId) -> bool {
+        loop {
+            let changed = self.inner.lease_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let deadline = {
+                let sessions = self.inner.sessions.lock().await;
+                let Some(session) = sessions.get(&session_id.get()) else {
+                    return false;
+                };
+                if session.active || !session.released || session.capture_finished {
+                    None
+                } else {
+                    let deadline = session.expires_at.min(session.reconnect_deadline);
+                    if Instant::now() > deadline {
+                        return true;
+                    }
+                    Some(deadline)
+                }
+            };
+            match deadline {
+                Some(deadline) => {
+                    let wait = deadline.saturating_duration_since(Instant::now());
+                    tokio::select! {
+                        () = &mut changed => {}
+                        () = tokio::time::sleep(wait + Duration::from_millis(1)) => {}
+                    }
+                }
+                None => changed.await,
+            }
+        }
     }
 
     pub async fn shutdown(&self) {
@@ -1478,6 +1541,8 @@ impl MediaServerInner {
                 session.active = false;
                 session.active_connection_id = None;
                 session.reconnect_deadline = reconnect_deadline;
+                session.released = true;
+                self.lease_changed.notify_waiters();
                 #[cfg(feature = "media-admission-evidence")]
                 if let Some(journal) = &self.evidence {
                     journal.record(EvidenceRecord::FenceRelease {
@@ -2110,6 +2175,15 @@ where
         .map_err(|_| AdapterError::new("media flush request could not be written"))
 }
 
+fn credential_expiry_ms(lifetime: Duration) -> Result<u64, AdapterError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|now| now.checked_add(lifetime))
+        .and_then(|expires_at| u64::try_from(expires_at.as_millis()).ok())
+        .ok_or_else(|| AdapterError::new("media credential expiry could not be calculated"))
+}
+
 fn random_credential() -> Result<String, AdapterError> {
     let mut bytes = [0_u8; TOKEN_BYTES];
     SystemRandom::new()
@@ -2292,6 +2366,65 @@ mod timing_domain_tests {
             auth_len,
         )
     }
+    /// Lease bounds: renewal moves only the credential expiry, a lapsed credential or
+    /// reconnect window is never revived, loss is reported only after an admitted
+    /// connection, and a revoked reservation is neither renewable nor reported as lost.
+    #[tokio::test]
+    async fn media_lease_renewal_is_bounded_and_loss_needs_an_unresumable_release() {
+        let server = MediaServer::bind(
+            MediaServerConfig::loopback()
+                .with_lifetimes(Duration::from_millis(300), Duration::from_millis(300)),
+        )
+        .await
+        .unwrap();
+        let id = SessionId::new(91);
+        let lease = server.reserve(id).await.unwrap();
+        // Never admitted: no loss is reported even after every deadline lapses.
+        let unadmitted = tokio::time::timeout(Duration::from_millis(450), server.media_lost(id));
+        assert!(unadmitted.await.is_err());
+        assert!(server.renew(id).await.is_err());
+        server.revoke(id).await;
+
+        let lease_two = server.reserve(id).await.unwrap();
+        let connection = server
+            .inner
+            .authenticate(id, lease_two.credential(), None, MediaVersion::Legacy)
+            .await
+            .unwrap();
+        let renewed_at = std::time::Instant::now();
+        let first = server.renew(id).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let second = server.renew(id).await.unwrap();
+        assert!(second > first);
+        {
+            let sessions = server.inner.sessions.lock().await;
+            let session = &sessions[&id.get()];
+            assert!(session.expires_at >= renewed_at + Duration::from_millis(500));
+            assert!(session.expires_at <= std::time::Instant::now() + Duration::from_millis(300));
+        }
+        server.inner.disconnect(id, connection).await.unwrap();
+        // Released but resumable: not lost while the renewed credential and window hold.
+        let resumable = tokio::time::timeout(Duration::from_millis(100), server.media_lost(id));
+        assert!(resumable.await.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), server.media_lost(id))
+                .await
+                .unwrap()
+        );
+        assert!(server.renew(id).await.is_err());
+        assert!(server
+            .inner
+            .authenticate(id, lease_two.credential(), None, MediaVersion::Legacy)
+            .await
+            .is_err());
+
+        server.revoke(id).await;
+        assert!(!server.media_lost(id).await);
+        assert!(server.renew(id).await.is_err());
+        assert_ne!(lease.credential(), lease_two.credential());
+        server.shutdown().await;
+    }
+
     async fn timed_server() -> MediaServer {
         MediaServer::bind(
             MediaServerConfig::loopback()
@@ -3695,6 +3828,7 @@ mod media_evidence_tests {
                 max_playback_queue_duration: config.max_playback_queue_duration,
                 packet_read_timeout: config.packet_read_timeout,
                 sessions: Mutex::new(HashMap::new()),
+                lease_changed: Notify::new(),
                 connections: Mutex::new(Vec::new()),
                 connection_permits: Arc::new(Semaphore::new(MAX_MEDIA_CONNECTIONS)),
                 cancellation: CancellationToken::new(),
@@ -3772,6 +3906,7 @@ max_outbound_queue_ms = 3000
                 max_playback_queue_duration: config.max_playback_queue_duration,
                 packet_read_timeout: config.packet_read_timeout,
                 sessions: Mutex::new(HashMap::new()),
+                lease_changed: Notify::new(),
                 connections: Mutex::new(Vec::new()),
                 connection_permits: Arc::new(Semaphore::new(MAX_MEDIA_CONNECTIONS)),
                 cancellation: CancellationToken::new(),

@@ -107,6 +107,7 @@ struct ActiveAlignmentRead {
 struct ActiveRecording {
     session_id: SessionId,
     recorder: Arc<Mutex<SessionRecorder>>,
+    finalized: bool,
 }
 
 struct MemoryInspectionAdapters {
@@ -411,11 +412,23 @@ impl GatewaySession {
         ) {
             SessionExit::failure(error)
         } else {
+            let mut provider_failed = false;
             loop {
+                // A provider-host exit degrades recognition and synthesis only. The session ends
+                // with it once no voice session is recording and its recording is finalized.
+                if provider_failed
+                    && voice.active.is_none()
+                    && self
+                        .active_recording
+                        .as_ref()
+                        .is_none_or(|recording| recording.finalized)
+                {
+                    break SessionExit::ProviderFailure;
+                }
                 let next = if let Some(alignment) = self.alignment.as_mut() {
                     tokio::select! {biased;
                         writer=&mut writer_task=>SessionInput::Writer(writer),
-                        _=provider_failure.cancelled()=>SessionInput::ProviderFailure,
+                        _=provider_failure.cancelled(),if !provider_failed=>SessionInput::ProviderFailure,
                         result=async {alignment.task.as_mut().expect("guarded task").await},if alignment.task.is_some()=>SessionInput::AlignmentReader(result),
                         item=alignment.receiver.recv(),if alignment.credit=>SessionInput::AlignmentItem(item),
                         frame=read_frame_with_reply_room(&mut reader,&normal_sender)=>SessionInput::Frame(frame),
@@ -428,7 +441,7 @@ impl GatewaySession {
                         biased;
                         terminal = terminal_written_receiver.recv(), if !terminal_written_receiver.is_closed() => SessionInput::VoiceTerminalWritten(terminal),
                         writer = &mut writer_task => SessionInput::Writer(writer),
-                        _ = provider_failure.cancelled() => SessionInput::ProviderFailure,
+                        _ = provider_failure.cancelled(), if !provider_failed => SessionInput::ProviderFailure,
                         forwarding = active_task => SessionInput::Forwarder(forwarding),
                         frame = read_frame_with_reply_room(&mut reader, &normal_sender) => SessionInput::Frame(frame),
                     }
@@ -439,7 +452,7 @@ impl GatewaySession {
                             biased;
                             terminal = terminal_written_receiver.recv(), if !terminal_written_receiver.is_closed() => SessionInput::VoiceTerminalWritten(terminal),
                             writer = &mut writer_task => SessionInput::Writer(writer),
-                        _ = provider_failure.cancelled() => SessionInput::ProviderFailure,
+                        _ = provider_failure.cancelled(), if !provider_failed => SessionInput::ProviderFailure,
                             pumped = voice_task => SessionInput::VoicePump(pumped),
                             controlled = &mut control.task => SessionInput::VoiceControl(controlled),
                             frame = read_frame_with_reply_room(&mut reader, &normal_sender) => SessionInput::Frame(frame),
@@ -449,7 +462,7 @@ impl GatewaySession {
                             biased;
                             terminal = terminal_written_receiver.recv(), if !terminal_written_receiver.is_closed() => SessionInput::VoiceTerminalWritten(terminal),
                             writer = &mut writer_task => SessionInput::Writer(writer),
-                        _ = provider_failure.cancelled() => SessionInput::ProviderFailure,
+                        _ = provider_failure.cancelled(), if !provider_failed => SessionInput::ProviderFailure,
                             pumped = voice_task => SessionInput::VoicePump(pumped),
                             frame = read_frame_with_reply_room(&mut reader, &normal_sender) => SessionInput::Frame(frame),
                         }
@@ -459,7 +472,7 @@ impl GatewaySession {
                         biased;
                         terminal = terminal_written_receiver.recv(), if !terminal_written_receiver.is_closed() => SessionInput::VoiceTerminalWritten(terminal),
                         writer = &mut writer_task => SessionInput::Writer(writer),
-                        _ = provider_failure.cancelled() => SessionInput::ProviderFailure,
+                        _ = provider_failure.cancelled(), if !provider_failed => SessionInput::ProviderFailure,
                         frame = read_frame_with_reply_room(&mut reader, &normal_sender) => SessionInput::Frame(frame),
                     }
                 };
@@ -674,8 +687,14 @@ impl GatewaySession {
                             };
                         }
                     }
-                    SessionInput::Frame(Ok(None)) => break SessionExit::Normal,
-                    SessionInput::ProviderFailure => break SessionExit::ProviderFailure,
+                    SessionInput::Frame(Ok(None)) => {
+                        break if provider_failed {
+                            SessionExit::ProviderFailure
+                        } else {
+                            SessionExit::Normal
+                        };
+                    }
+                    SessionInput::ProviderFailure => provider_failed = true,
                     SessionInput::Frame(Err(error)) => {
                         break SessionExit::fatal(
                             GatewaySessionError::Framing(error),
@@ -697,7 +716,13 @@ impl GatewaySession {
             let _ = send_urgent(&urgent_sender, fatal_message(message));
         }
         if matches!(exit, SessionExit::ProviderFailure) {
-            let _ = send_urgent(&urgent_sender, provider_failure_message());
+            // Behind every reply already queued on the normal lane: a deferred exit follows
+            // the reply that finalized the recording.
+            let _ = timeout(
+                WRITER_SHUTDOWN_TIMEOUT,
+                normal_sender.send(provider_failure_message()),
+            )
+            .await;
         }
         // Cancelled before the lanes close so an in-flight extraction stops instead of
         // running on detached past the session that started it.
@@ -1124,6 +1149,18 @@ impl GatewaySession {
                     )
                     .map_err(CommandFailure::response);
                 }
+                if self
+                    .provider_failure
+                    .as_ref()
+                    .is_some_and(CancellationToken::is_cancelled)
+                {
+                    return send_rejection(
+                        normal,
+                        &request_id,
+                        command_error("a gateway-owned provider process exited"),
+                    )
+                    .map_err(CommandFailure::response);
+                }
                 // The next recording replaces the only reference to this one's handle, so the
                 // client finalizes it — and learns its handle — first.
                 if let Some(previous) = self.active_recording.as_ref() {
@@ -1396,7 +1433,11 @@ impl GatewaySession {
                     events.clone(),
                     control_event_receiver,
                     control_pending_receiver,
-                    VoiceNotices::new(session_id, media_lease.as_ref()),
+                    VoiceNotices::new(
+                        session_id,
+                        media_lease.as_ref(),
+                        self.provider_failure.clone(),
+                    ),
                 ));
                 voice.active = Some(ActiveVoiceSession {
                     runtime,
@@ -1411,6 +1452,7 @@ impl GatewaySession {
                     self.active_recording = Some(ActiveRecording {
                         session_id,
                         recorder,
+                        finalized: false,
                     });
                 }
                 Ok(())
@@ -1519,8 +1561,14 @@ impl GatewaySession {
                 } else {
                     recorder.finalize().map(|summary| (summary, None))
                 };
+                drop(recorder);
                 let (recording, recovery_capability) = match finalized {
-                    Ok((summary, capability)) => (client_recording_summary(&summary), capability),
+                    Ok((summary, capability)) => {
+                        if let Some(active) = self.active_recording.as_mut() {
+                            active.finalized = true;
+                        }
+                        (client_recording_summary(&summary), capability)
+                    }
                     Err(error) => {
                         return send_rejection(
                             normal,
@@ -2368,6 +2416,20 @@ async fn pump_voice_events(
                 }
                 continue;
             }
+            () = async { notices.provider_failure.as_ref().expect("guarded token").cancelled().await },
+                if started && notices.provider_failure.is_some() =>
+            {
+                notices.provider_failure = None;
+                if forwarding
+                    && event_writer
+                        .send(provider_degraded_message(notices.session_id))
+                        .await
+                        .is_err()
+                {
+                    forwarding = false;
+                }
+                continue;
+            }
         };
         let Some(event) = event else {
             break;
@@ -2409,6 +2471,7 @@ async fn pump_voice_events(
         let terminal = event.is_session_terminal();
         if terminal {
             notices.media_lost = None;
+            notices.provider_failure = None;
             while *control_pending.borrow_and_update() {
                 if control_pending.changed().await.is_err() {
                     while events.recv().await.is_some() {}
@@ -2454,12 +2517,18 @@ async fn pump_voice_events(
 struct VoiceNotices {
     session_id: SessionId,
     media_lost: Option<Pin<Box<dyn Future<Output = bool> + Send>>>,
+    provider_failure: Option<CancellationToken>,
 }
 
 impl VoiceNotices {
-    fn new(session_id: SessionId, media_lease: Option<&ActiveMediaLease>) -> Self {
+    fn new(
+        session_id: SessionId,
+        media_lease: Option<&ActiveMediaLease>,
+        provider_failure: Option<CancellationToken>,
+    ) -> Self {
         Self {
             session_id,
+            provider_failure,
             media_lost: media_lease.map(|lease| {
                 let server = Arc::clone(&lease.server);
                 Box::pin(async move { server.media_lost(session_id).await })
@@ -2479,6 +2548,21 @@ fn media_lost_message(session_id: SessionId) -> GatewayMessage {
                 stage: RuntimeStage::AudioCapture.as_str().to_owned(),
                 message: "the media bridge connection was lost and its lease cannot be resumed"
                     .to_owned(),
+            },
+            recovery: "continue_session".to_owned(),
+        },
+    }
+}
+
+fn provider_degraded_message(session_id: SessionId) -> GatewayMessage {
+    GatewayMessage::VoiceEvent {
+        event: ClientVoiceSessionEvent::VoiceSessionFailed {
+            session_id,
+            error: ClientRuntimeError {
+                code: "adapter_failure".to_owned(),
+                kind: "adapter".to_owned(),
+                stage: RuntimeStage::Runtime.as_str().to_owned(),
+                message: "a gateway-owned provider process exited; recording continues".to_owned(),
             },
             recovery: "continue_session".to_owned(),
         },
@@ -3458,6 +3542,7 @@ mod tests {
         key_env: &str,
         session_id: SessionId,
         credential_lifetime: Duration,
+        provider_failure: Option<CancellationToken>,
     ) -> (
         Arc<MediaServer>,
         InMemoryGateway,
@@ -3476,12 +3561,15 @@ mod tests {
         );
         let (voice, _guards) = test_voice_adapters();
         let (recognition_handoff, mut recognition_handoffs) = mpsc::channel(1);
-        let session = GatewaySession::new(unused_runtime(), status_with_voice())
+        let mut session = GatewaySession::new(unused_runtime(), status_with_voice())
             .with_voice(voice, test_language())
             .with_recording(RecordingSettings::new(directory.path(), key_env).unwrap())
             .with_media_server(Arc::clone(&media))
             .with_media_capture_handoff(recognition_handoff)
             .with_test_session_id(session_id);
+        if let Some(provider_failure) = provider_failure {
+            session = session.with_provider_failure(provider_failure);
+        }
         let mut gateway = InMemoryGateway::start(session).await;
         gateway
             .write(
@@ -3608,6 +3696,7 @@ mod tests {
             key_env,
             session_id,
             Duration::from_millis(1_500),
+            None,
         )
         .await;
         let bridge = admitted_bridge(
@@ -3695,8 +3784,14 @@ mod tests {
         let key_env = "CONVERSATION_SESSION_RECORDING_KEY_MEDIA_LOSS";
         let directory = TempDir::new().unwrap();
         let session_id = SessionId::new(703);
-        let (media, mut gateway, credential, endpoint, mut recognition) =
-            media_lease_gateway(&directory, key_env, session_id, Duration::from_millis(300)).await;
+        let (media, mut gateway, credential, endpoint, mut recognition) = media_lease_gateway(
+            &directory,
+            key_env,
+            session_id,
+            Duration::from_millis(300),
+            None,
+        )
+        .await;
         let bridge = admitted_bridge(
             endpoint,
             session_id,
@@ -3761,6 +3856,103 @@ mod tests {
             vec![(1, b"kept".to_vec())]
         );
         gateway.close().await;
+        media.shutdown().await;
+    }
+
+    /// A supervised provider-host exit degrades recognition and synthesis only. The active
+    /// voice session keeps recording, the client is told without a terminal, new work is
+    /// refused, and the gateway session ends with the provider failure only once the recording
+    /// has been stopped and finalized.
+    #[tokio::test]
+    async fn a_provider_host_exit_keeps_the_active_recording_until_it_is_finalized() {
+        let key_env = "CONVERSATION_SESSION_RECORDING_KEY_PROVIDER_EXIT";
+        let directory = TempDir::new().unwrap();
+        let session_id = SessionId::new(704);
+        let provider_failure = CancellationToken::new();
+        let (media, mut gateway, credential, endpoint, mut recognition) = media_lease_gateway(
+            &directory,
+            key_env,
+            session_id,
+            Duration::from_secs(60),
+            Some(provider_failure.clone()),
+        )
+        .await;
+        let mut bridge = admitted_bridge(
+            endpoint,
+            session_id,
+            &credential,
+            &mut recognition,
+            1,
+            b"before",
+        )
+        .await;
+
+        provider_failure.cancel();
+        let messages = gateway
+            .read_until(|message| {
+                message_type(message) == "fatal"
+                    || (message.contains(r#""type":"voice_session_failed""#)
+                        && message.contains(r#""stage":"runtime""#))
+            })
+            .await;
+        let failure: serde_json::Value = serde_json::from_str(messages.last().unwrap()).unwrap();
+        assert_eq!(failure["type"], "voice_event", "{failure}");
+        assert_eq!(failure["event"]["recovery"], "continue_session");
+        assert!(messages.iter().all(|message| !is_voice_terminal(message)));
+
+        bridge
+            .write_all(&media_capture(session_id, 2, 2_000, b"during"))
+            .await
+            .unwrap();
+        timeout(TEST_TIMEOUT, async {
+            loop {
+                if let Some(Ok(CaptureEvent::Frame(frame))) = recognition.recv().await {
+                    if frame.sequence() == 2 {
+                        return;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("capture stopped after the provider host exited");
+
+        gateway
+            .write(r#"{"protocol_version":3,"type":"stop_voice_session","request_id":"degraded-stop"}"#)
+            .await;
+        let stopped = gateway
+            .read_until(|message| {
+                message_type(message) == "command_accepted"
+                    && message.contains(r#""request_id":"degraded-stop""#)
+            })
+            .await;
+        assert!(stopped.iter().any(|message| is_voice_terminal(message)));
+        gateway
+            .write(r#"{"protocol_version":3,"type":"start_voice_session","request_id":"degraded-start"}"#)
+            .await;
+        let refused = gateway.read_message().await;
+        assert_rejected_message(&refused, "degraded-start", "invalid_state");
+        assert!(refused.contains("provider process exited"), "{refused}");
+        gateway
+            .write(r#"{"protocol_version":3,"type":"finalize_recording","request_id":"degraded-finalize","session_id":"704"}"#)
+            .await;
+        assert_accepted_message(&gateway.read_message().await, "degraded-finalize");
+        let finalized: serde_json::Value =
+            serde_json::from_str(&gateway.read_message().await).unwrap();
+        assert_eq!(finalized["type"], "recording_finalized");
+        let fatal = gateway.read_message().await;
+        assert_eq!(message_type(&fatal), "fatal");
+        assert!(fatal.contains(r#""code":"adapter_failure""#), "{fatal}");
+        timeout(TEST_TIMEOUT, &mut gateway.task)
+            .await
+            .expect("the degraded gateway session did not end after finalization")
+            .unwrap()
+            .unwrap();
+        let frames = recorded_frames(
+            &wait_for_recording_bytes(directory.path(), 1).await,
+            key_env,
+        );
+        assert!(frames.contains(&(1, b"before".to_vec())), "{frames:?}");
+        assert!(frames.contains(&(2, b"during".to_vec())), "{frames:?}");
         media.shutdown().await;
     }
 

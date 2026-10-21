@@ -981,3 +981,495 @@ fn scripted_entry_requires_a_scripted_table_and_the_online_profile() {
         "scripted provider entry requires the online profile"
     );
 }
+
+// --- recognition provider faults: the recording is independent of them -------------------------
+
+/// How the transcription provider fails. Every fault happens while capture keeps flowing.
+#[derive(Clone, Copy, Debug)]
+enum RecognitionFault {
+    /// The provider refuses the WebSocket upgrade with HTTP 503.
+    ConnectRejected,
+    /// After audio has flowed, the provider sends a provider `error` event.
+    MidStreamError,
+    /// After audio has flowed, the provider drops the connection without a close frame.
+    MidStreamClose,
+    /// After audio has flowed, the provider stops reading and never answers again.
+    Stall,
+}
+
+/// Appends a faulting provider accepts before a mid-stream fault.
+const APPENDS_BEFORE_FAULT: u64 = 10;
+/// Capture frames the producer keeps sending after the recognition failure is observed.
+const FRAMES_AFTER_FAILURE: u64 = 50;
+/// Upper bound on frames for one run, so a recognition failure that is never reported fails
+/// the test instead of hanging it.
+const MAX_FAULT_FRAMES: u64 = 3_000;
+/// The producer's pace: 100 frames a second, twice real time and half the lease's bound.
+const FAULT_FRAME_INTERVAL: Duration = Duration::from_millis(10);
+/// Stall detection is the recognizer's own send deadline (5 s) after socket buffers fill.
+const FAULT_REPORT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The fault peer's socket receive buffer, in bytes.
+const FAULT_PEER_RECV_BUFFER: u32 = 16 * 1024;
+
+/// Fault runs share one process-wide recording key variable and are timing-sensitive, so they
+/// run one at a time; the variable is written once, before the first run.
+static FAULT_RUNS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static FAULT_KEY: std::sync::Once = std::sync::Once::new();
+
+/// An in-process transcription peer that fails as told. It counts connections and appends.
+struct FaultPeer {
+    endpoint: String,
+    connections: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    appends: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    worker: tokio::task::JoinHandle<()>,
+}
+
+async fn fault_peer(fault: RecognitionFault) -> FaultPeer {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    // A small receive buffer, inherited by accepted sockets, so a stalled peer back-pressures
+    // the recognizer after a bounded amount of audio instead of after however much the host's
+    // loopback autotuning would absorb.
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(FAULT_PEER_RECV_BUFFER).unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let listener = socket.listen(16).unwrap();
+    let endpoint = format!(
+        "ws://{}/v1/realtime?intent=transcription",
+        listener.local_addr().unwrap()
+    );
+    let connections = Arc::new(AtomicU64::new(0));
+    let appends = Arc::new(AtomicU64::new(0));
+    let (counted_connections, counted_appends) = (connections.clone(), appends.clone());
+    let worker = tokio::spawn(async move {
+        // Owned here so aborting the worker also ends every held (stalled) connection.
+        let mut served = tokio::task::JoinSet::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            counted_connections.fetch_add(1, Ordering::SeqCst);
+            served.spawn(serve_fault(stream, fault, counted_appends.clone()));
+        }
+    });
+    FaultPeer {
+        endpoint,
+        connections,
+        appends,
+        worker,
+    }
+}
+
+async fn serve_fault(
+    stream: TcpStream,
+    fault: RecognitionFault,
+    appends: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) {
+    use futures_util::{SinkExt, StreamExt};
+    use std::sync::atomic::Ordering;
+    use tokio_tungstenite::tungstenite::handshake::server::{
+        Callback, ErrorResponse, Request, Response,
+    };
+    use tokio_tungstenite::tungstenite::http::StatusCode;
+    use tokio_tungstenite::tungstenite::Message;
+
+    /// Refuses the WebSocket upgrade the way an unavailable provider does.
+    struct Unavailable;
+    impl Callback for Unavailable {
+        fn on_request(self, _: &Request, _: Response) -> Result<Response, ErrorResponse> {
+            let mut refusal = ErrorResponse::new(None);
+            *refusal.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+            Err(refusal)
+        }
+    }
+
+    if let RecognitionFault::ConnectRejected = fault {
+        let _ = tokio_tungstenite::accept_hdr_async(stream, Unavailable).await;
+        return;
+    }
+    let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
+        return;
+    };
+    let created = json!({"type":"session.created","session":{"type":"transcription"}});
+    if socket
+        .send(Message::Text(created.to_string().into()))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let update: Value = match socket.next().await {
+        Some(Ok(Message::Text(text))) => serde_json::from_str(&text).unwrap(),
+        _ => return,
+    };
+    let updated = json!({"type":"session.updated","session":update["session"].clone()});
+    if socket
+        .send(Message::Text(updated.to_string().into()))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let mut seen = 0_u64;
+    while seen < APPENDS_BEFORE_FAULT {
+        match socket.next().await {
+            Some(Ok(Message::Text(text))) if text.contains("input_audio_buffer.append") => {
+                seen += 1;
+                appends.fetch_add(1, Ordering::SeqCst);
+            }
+            Some(Ok(_)) => {}
+            _ => return,
+        }
+    }
+    match fault {
+        RecognitionFault::ConnectRejected => unreachable!("handled before the upgrade"),
+        RecognitionFault::MidStreamError => {
+            let error = json!({"type":"error","error":{"type":"server_error","message":"scripted provider fault"}});
+            let _ = socket.send(Message::Text(error.to_string().into())).await;
+            // Keep reading so the only fault is the error event itself.
+            while let Some(Ok(_)) = socket.next().await {}
+        }
+        RecognitionFault::MidStreamClose => drop(socket),
+        RecognitionFault::Stall => {
+            let _held = socket;
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+fn voice_event_type(message: &Value) -> &str {
+    message["event"]["type"]
+        .as_str()
+        .unwrap_or_else(|| message_type(message))
+}
+
+fn voice_event(message: &Value) -> &Value {
+    if message["event"].is_object() {
+        &message["event"]
+    } else {
+        message
+    }
+}
+
+fn is_voice_terminal(message: &Value) -> bool {
+    match voice_event_type(message) {
+        "voice_session_ended" => true,
+        "voice_session_failed" => voice_event(message)["recovery"] != "continue_session",
+        _ => false,
+    }
+}
+
+fn is_recognition_failure(message: &Value) -> bool {
+    let event = voice_event(message);
+    voice_event_type(message) == "voice_session_failed"
+        && event["recovery"] == "continue_session"
+        && event["error"]["stage"] == "speech_recognizer"
+}
+
+/// One meeting in which the transcription provider fails while the bridge keeps capturing.
+/// Proves, through the real gateway process, media server, recognizer and recorder:
+///
+/// - the recognition failure reaches the client as its own `continue_session` event with the
+///   `speech_recognizer` stage, and nothing ends the voice session before the client stops it;
+/// - capture sent after the failure is still recorded: the exact finish barrier is
+///   acknowledged for the last frame sent;
+/// - the client's stop ends the session with `voice_session_ended`, and finalization returns
+///   an encrypted recording with no gap whose digest matches the file and which decrypts to
+///   every frame sent, in order, byte for byte.
+async fn recording_survives_a_recognition_provider_fault(fault: RecognitionFault) {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    let _serial = FAULT_RUNS.lock().await;
+    FAULT_KEY.call_once(|| std::env::set_var(KEY_ENV, KEY));
+    let directory = tempfile::tempdir().unwrap();
+    let recordings = directory.path().join("recordings");
+    std::fs::create_dir(&recordings).unwrap();
+    let peers = ScriptedPeers::start(directory.path()).await;
+    let recognition = fault_peer(fault).await;
+    let config = directory.path().join("scripted-online.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "{}\n[scripted_providers]\nlanguage = \"{http}\"\nrecognition = \"{recognition}\"\nspeech = \"{http}\"\ndiarization = \"{http}\"\n",
+            online_deployment(&recordings),
+            http = peers.http,
+            recognition = recognition.endpoint,
+        ),
+    )
+    .unwrap();
+
+    let mut gateway = GatewayProcess::start(
+        env!("CARGO_BIN_EXE_conversation-runtime-gateway-scripted"),
+        &config,
+    )
+    .await;
+    gateway.read().await;
+    gateway
+        .write(&json!({
+            "protocol_version": 4,
+            "type": "start_drainable_timed_voice_session",
+            "request_id": "fault-start",
+            "bridge_session_id": BRIDGE,
+            "profile": "online",
+            "response_mode": "external_gate",
+        }))
+        .await;
+    let mut observed = gateway
+        .read_until(|message| message_type(message) == "timed_voice_session_started")
+        .await;
+    let lease = observed.last().unwrap()["media_lease"].clone();
+    let session_id: u64 = lease["session_id"].as_str().unwrap().parse().unwrap();
+    let endpoint: SocketAddr = lease["connect_endpoint"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("tcp://")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let credential = lease["credential"].as_str().unwrap().to_owned();
+
+    let mut producer = Producer::connect(endpoint, session_id, &credential).await;
+    producer.write(&med3(6, &epoch_body(session_id))).await;
+    producer
+        .write(&med3(
+            7,
+            &pair_body(session_id, 1, 900_000_000, 2_000_000_000),
+        ))
+        .await;
+
+    // Capture flows at a steady pace on its own task while control is read here.
+    // A write error means the gateway closed the media connection: capture is no longer
+    // accepted, which is exactly the coupling under test, so it is reported, not unwrapped.
+    let sent = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (media_closed, mut media_closed_seen) = tokio::sync::watch::channel(false);
+    let sender = {
+        let (sent, stop) = (sent.clone(), stop.clone());
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(FAULT_FRAME_INTERVAL);
+            // Never burst after a scheduler stall: the lease caps frames per second.
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            while !stop.load(Ordering::SeqCst) && sent.load(Ordering::SeqCst) < MAX_FAULT_FRAMES {
+                ticker.tick().await;
+                let index = sent.load(Ordering::SeqCst);
+                let packet = frame_packet(session_id, index);
+                if producer.stream.write_all(&packet).await.is_err() {
+                    let _ = media_closed.send(true);
+                    break;
+                }
+                sent.store(index + 1, Ordering::SeqCst);
+            }
+            producer
+        })
+    };
+    let closed_message = |sent: &AtomicU64| {
+        format!(
+            "{fault:?}: the gateway closed the media connection after {} frames, so capture \
+             stopped being recorded",
+            sent.load(Ordering::SeqCst)
+        )
+    };
+
+    let failure = timeout(FAULT_REPORT_TIMEOUT, async {
+        loop {
+            let frame = tokio::select! {
+                frame = gateway.stdout.read_frame() => frame
+                    .expect("control frame")
+                    .expect("gateway control stayed open"),
+                _ = media_closed_seen.wait_for(|closed| *closed) => panic!("{}", closed_message(&sent)),
+            };
+            let message: Value = serde_json::from_slice(&frame).unwrap();
+            observed.push(message.clone());
+            assert!(
+                !is_voice_terminal(&message),
+                "{fault:?}: the runtime ended the voice session on the recognition failure: {message}"
+            );
+            if is_recognition_failure(&message) {
+                return message;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "{fault:?}: no recognition failure was reported after {} frames; observed {:?}",
+            sent.load(Ordering::SeqCst),
+            observed.iter().map(message_type).collect::<Vec<_>>()
+        )
+    });
+    let at_failure = sent.load(Ordering::SeqCst);
+    timeout(FAULT_REPORT_TIMEOUT, async {
+        while sent.load(Ordering::SeqCst) < at_failure + FRAMES_AFTER_FAILURE {
+            assert!(!*media_closed_seen.borrow(), "{}", closed_message(&sent));
+            tokio::time::sleep(FAULT_FRAME_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("capture kept flowing after the recognition failure");
+    stop.store(true, Ordering::SeqCst);
+    let mut producer = sender.await.unwrap();
+    let frames = sent.load(Ordering::SeqCst);
+    assert!(
+        frames < MAX_FAULT_FRAMES,
+        "{fault:?}: frame budget exhausted"
+    );
+    assert!(
+        !failure.to_string().contains("scripted provider fault"),
+        "provider wording leaked to the client: {failure}"
+    );
+
+    // The exact finish barrier for the last frame sent is acknowledged by the recorder.
+    let boundary = finish_body(session_id, frames, frames * u64::from(SAMPLES_PER_FRAME), 1);
+    producer.write(&med3(FINISH_KIND, &boundary)).await;
+    let acknowledgement = loop {
+        match producer.read_packet().await {
+            MediaPacket::FinishAcknowledgement(body) => break body,
+            MediaPacket::Playback { sequence, .. } => {
+                producer.acknowledge_playback(session_id, sequence).await;
+            }
+        }
+    };
+    assert_eq!(
+        acknowledgement, boundary,
+        "{fault:?}: the recorder did not confirm the last frame sent after the failure"
+    );
+    producer.stream.shutdown().await.unwrap();
+
+    gateway
+        .write(&json!({
+            "protocol_version": 4,
+            "type": "stop_voice_session",
+            "request_id": "fault-stop",
+        }))
+        .await;
+    let before_stop = observed.len();
+    observed.extend(
+        gateway
+            .read_until(|message| is_accepted(message, "fault-stop"))
+            .await,
+    );
+    assert!(
+        !observed[..before_stop].iter().any(is_voice_terminal),
+        "{fault:?}: the voice session ended before the client stopped it: {observed:?}"
+    );
+    let terminals = observed
+        .iter()
+        .filter(|message| is_voice_terminal(message))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        terminals.len(),
+        1,
+        "{fault:?}: exactly one voice terminal: {observed:?}"
+    );
+    assert_eq!(
+        voice_event_type(terminals[0]),
+        "voice_session_ended",
+        "{fault:?}: the client's stop, not the provider, ends the session: {observed:?}"
+    );
+
+    gateway
+        .write(&json!({
+            "protocol_version": 4,
+            "type": "finalize_recording",
+            "request_id": "fault-finalize",
+            "session_id": session_id.to_string(),
+        }))
+        .await;
+    let finalized = gateway
+        .read_until(|message| {
+            message_type(message) == "recording_finalized"
+                || message_type(message) == "command_rejected"
+        })
+        .await;
+    let finalized = finalized.last().unwrap();
+    assert_eq!(
+        message_type(finalized),
+        "recording_finalized",
+        "{fault:?}: {finalized}"
+    );
+    gateway.close().await;
+
+    let recording = &finalized["recording"];
+    assert_eq!(
+        recording["gaps"],
+        json!([]),
+        "{fault:?}: a recognition failure must not leave a recording gap"
+    );
+    let path = PathBuf::from(recording["encrypted_path"].as_str().unwrap());
+    assert!(path.starts_with(&recordings));
+    let file = std::fs::read(&path).unwrap();
+    let digest = ring::digest::digest(&ring::digest::SHA256, &file)
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    assert_eq!(recording["sha256"], digest, "{fault:?}: integrity digest");
+    assert_eq!(finalized["recovery_capability"]["sha256"], digest);
+    assert!(
+        !file
+            .windows(frame_pcm().len())
+            .any(|window| window == frame_pcm().as_slice()),
+        "{fault:?}: plaintext capture reached the recording file"
+    );
+
+    let decrypted = conversation_runtime::read_session_recording(&path, KEY_ENV)
+        .expect("the recording decrypts");
+    assert!(!decrypted.truncated);
+    let mut sequences = Vec::new();
+    for chunk in &decrypted.chunks {
+        match chunk {
+            conversation_runtime::RecordedChunk::TimedFrame { timing, bytes, .. } => {
+                assert_eq!(bytes, &frame_pcm(), "{fault:?}: recorded audio changed");
+                sequences.push(timing.as_ref().expect("timed provenance").sequence);
+            }
+            conversation_runtime::RecordedChunk::GapStarted { reason, .. } => {
+                panic!("{fault:?}: recording gap {reason}")
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        sequences,
+        (1..=frames).collect::<Vec<_>>(),
+        "{fault:?}: every frame sent, before and after the failure, is recorded in order"
+    );
+    assert!(matches!(
+        decrypted.chunks.last(),
+        Some(conversation_runtime::RecordedChunk::Ended { .. })
+    ));
+
+    let (connections, appends) = (
+        recognition.connections.load(Ordering::SeqCst),
+        recognition.appends.load(Ordering::SeqCst),
+    );
+    match fault {
+        RecognitionFault::ConnectRejected => assert_eq!(appends, 0),
+        _ => assert_eq!(appends, APPENDS_BEFORE_FAULT, "the fault came mid-stream"),
+    }
+    assert!(connections >= 1);
+    eprintln!(
+        "{fault:?}: frames={frames} failure_at_frame={at_failure} connections={connections} appends={appends}"
+    );
+    recognition.worker.abort();
+    peers.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recording_survives_a_rejected_recognition_connect() {
+    recording_survives_a_recognition_provider_fault(RecognitionFault::ConnectRejected).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recording_survives_a_mid_stream_recognition_error() {
+    recording_survives_a_recognition_provider_fault(RecognitionFault::MidStreamError).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recording_survives_a_mid_stream_recognition_close() {
+    recording_survives_a_recognition_provider_fault(RecognitionFault::MidStreamClose).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recording_survives_a_stalled_recognition_provider() {
+    recording_survives_a_recognition_provider_fault(RecognitionFault::Stall).await;
+}

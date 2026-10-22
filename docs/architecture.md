@@ -81,6 +81,14 @@ gateway configuration schema version and the private managed-sidecar protocol
 version. Version disagreement fails explicitly; there is no compatibility guess
 or silent fallback.
 
+Ship the gateway and the SDK from the same package. A gateway with a `[media]`
+section advertises the `media_lease_renewal` capability in Ready, and an SDK
+built before that capability refuses such a Ready message as an unsupported
+capability, so an older SDK cannot connect once `[media]` is configured. The
+current SDK accepts Ready with or without the capability and refuses
+`renewMediaLease()` locally when it is absent, so it still talks to an older
+gateway.
+
 ### Online meeting profile and timing evidence
 
 `offline` is the exact default when no profile is supplied. `online` is explicit

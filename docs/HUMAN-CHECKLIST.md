@@ -203,6 +203,10 @@ do not run it from CI, a developer laptop on a public network, or an untrusted b
    reference makes startup fail, and that the listener does not start before the configuration is
    valid.
 
+   Deploy the gateway and the SDK from the same package. Once `[media]` is configured, the gateway
+   advertises `media_lease_renewal` in its ready message, and an older SDK refuses that ready
+   message, so a control client on an older SDK cannot connect.
+
 3. Start the gateway under the normal service manager, then use a protocol-v3 control client to
    start exactly one voice session. Retain the returned `connect_endpoint`, authoritative session
    id, and opaque credential only in the bridge process's volatile memory. Verify that a v1/v2

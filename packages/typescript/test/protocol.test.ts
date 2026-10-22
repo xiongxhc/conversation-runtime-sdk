@@ -119,6 +119,32 @@ test("decodes the literal Meeting Agent online fixture with the built v3 control
   ));
 });
 
+// An older gateway never advertises media lease renewal; a gateway with `[media]` does. The
+// same SDK must accept the Meeting Agent ready message in both shapes.
+test("accepts the Meeting Agent ready message with and without media lease renewal", async () => {
+  const wire = JSON.parse(await readFile(fileURLToPath(meetingOnlineFixture), "utf8")) as {
+    status: { capabilities: string[] };
+  };
+  assert.ok(!wire.status.capabilities.includes("media_lease_renewal"));
+  const withRenewal = {
+    ...wire,
+    status: { ...wire.status, capabilities: [...wire.status.capabilities, "media_lease_renewal"] },
+  };
+
+  const older = parseGatewayMessage(wire, 3);
+  const newer = parseGatewayMessage(withRenewal, 3);
+
+  assert.equal(older.type, "ready");
+  assert.equal(newer.type, "ready");
+  if (older.type !== "ready" || newer.type !== "ready") throw new Error("expected ready messages");
+  assert.ok(!older.status.capabilities.includes("media_lease_renewal"));
+  assert.ok(newer.status.capabilities.includes("media_lease_renewal"));
+  assert.deepEqual(
+    newer.status.capabilities.filter((capability) => capability !== "media_lease_renewal"),
+    older.status.capabilities,
+  );
+});
+
 test("parses every shared v1 command fixture with bigint identifiers", async () => {
   const commands = await fixtureLines("commands.jsonl");
   const parsed = commands.map((command) => parseClientCommand(command, 1));

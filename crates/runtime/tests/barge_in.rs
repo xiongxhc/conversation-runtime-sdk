@@ -427,7 +427,7 @@ async fn stalled_flush_times_out_to_a_recoverable_failure() {
     tokio::time::advance(Duration::from_secs(2)).await;
     let observed = drain_until_recovery(&mut events).await;
 
-    assert_recoverable_cleanup_timeout(&observed);
+    assert_recoverable_playback_timeout(&observed, TurnId::new(1));
     assert!(harness.language.cleanup_finished(GenerationId::new(1)));
     assert!(harness.speech.cleanup_finished(GenerationId::new(1)));
     harness.shutdown(&mut events).await;
@@ -629,6 +629,41 @@ fn assert_recoverable_cleanup_timeout(observed: &[VoiceSessionEvent]) {
             ..
         } if error.stage() == RuntimeStage::Runtime
             && error.message().contains("cleanup timed out")
+    )));
+}
+
+/// An unacknowledged flush costs only the response: the cancelled turn still ends, once, and
+/// the failure is reported as a recoverable playback failure, not a runtime fault.
+fn assert_recoverable_playback_timeout(observed: &[VoiceSessionEvent], turn_id: TurnId) {
+    assert!(!observed.iter().any(VoiceSessionEvent::is_session_terminal));
+    assert!(observed.iter().any(|event| matches!(
+        event,
+        VoiceSessionEvent::SessionFailed {
+            error,
+            recovery: RecoveryDisposition::ContinueSession,
+            ..
+        } if error.stage() == RuntimeStage::ContinuousAudioOutput
+    )));
+    assert!(!observed.iter().any(|event| matches!(
+        event,
+        VoiceSessionEvent::SessionFailed { error, .. } if error.stage() == RuntimeStage::Runtime
+    )));
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|event| matches!(
+                event,
+                VoiceSessionEvent::Turn { event, .. } if event.is_terminal()
+            ))
+            .count(),
+        1
+    );
+    assert!(observed.iter().any(|event| matches!(
+        event,
+        VoiceSessionEvent::Turn {
+            event: RuntimeEvent::TurnCancelled { turn_id: ended },
+            ..
+        } if *ended == turn_id
     )));
 }
 

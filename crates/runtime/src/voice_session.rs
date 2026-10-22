@@ -1671,37 +1671,39 @@ impl VoiceLoop {
             self.turn_runtime.interrupt(turn_id, generation_id),
         )
         .await;
-        match interrupt_result {
-            Ok(Ok(())) => {
-                if !self.publish_best_effort(VoiceSessionEvent::Timing {
-                    session_id: self.session_id,
-                    turn_id: Some(turn_id),
-                    milestone: VoiceTimingMilestone::PlaybackFlushAcknowledged,
-                    elapsed_ms: self.clock.now_ms(),
-                }) {
-                    return Err(runtime_error(
-                        "voice session event stream closed during playback flush timing",
-                    ));
-                }
+        let flush_error = match interrupt_result {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error),
+            // The turn was cancelled before its flush; only the flush went unacknowledged, so
+            // the cancelled turn is still drained to its terminal below.
+            Err(_) => Some(RuntimeError::new(
+                RuntimeErrorKind::Adapter,
+                RuntimeStage::ContinuousAudioOutput,
+                "playback flush was not acknowledged in time",
+            )),
+        };
+        if let Some(error) = flush_error {
+            let drain_result = cleanup_with_timeout(
+                "streaming turn drain",
+                self.drain_interrupted_turn(turn_id, generation_id),
+            )
+            .await;
+            self.state = VoiceLoopState::Listening;
+            if drain_result.is_err() {
+                self.abort_interrupted_turn(turn_id, generation_id).await?;
             }
-            Ok(Err(error)) => {
-                let drain_result = cleanup_with_timeout(
-                    "streaming turn drain",
-                    self.drain_interrupted_turn(turn_id, generation_id),
-                )
-                .await;
-                self.state = VoiceLoopState::Listening;
-                drain_result??;
-                return Err(error);
-            }
-            Err(error) => {
-                let abort_error = self
-                    .abort_interrupted_turn(turn_id, generation_id)
-                    .await
-                    .err();
-                self.state = VoiceLoopState::Listening;
-                return Err(abort_error.unwrap_or(error));
-            }
+            drain_result??;
+            return Err(error);
+        }
+        if !self.publish_best_effort(VoiceSessionEvent::Timing {
+            session_id: self.session_id,
+            turn_id: Some(turn_id),
+            milestone: VoiceTimingMilestone::PlaybackFlushAcknowledged,
+            elapsed_ms: self.clock.now_ms(),
+        }) {
+            return Err(runtime_error(
+                "voice session event stream closed during playback flush timing",
+            ));
         }
 
         let drain_result = cleanup_with_timeout(
@@ -3660,7 +3662,35 @@ mod tests {
         }
     }
 
+    /// A playback transport whose flush is never acknowledged, as a bridge that keeps capture
+    /// running but withholds every flush ACK.
+    struct UnacknowledgedFlushOutput;
+
+    impl ContinuousAudioOutput for UnacknowledgedFlushOutput {
+        fn enqueue<'a>(
+            &'a self,
+            _frame: AudioFrame,
+            _cancellation: CancellationToken,
+        ) -> AdapterFuture<'a, PlaybackReceipt> {
+            Box::pin(async { Err(AdapterError::new("test does not enqueue audio")) })
+        }
+
+        fn flush<'a>(
+            &'a self,
+            _session_id: SessionId,
+            _generation_id: GenerationId,
+        ) -> AdapterFuture<'a, PlaybackReceipt> {
+            Box::pin(std::future::pending())
+        }
+    }
+
     async fn responding_loop_with_disconnected_playback(
+    ) -> (VoiceLoop, mpsc::Receiver<VoiceSessionEvent>, TurnId) {
+        responding_loop_with_playback(Arc::new(DisconnectedOutput)).await
+    }
+
+    async fn responding_loop_with_playback(
+        output: Arc<dyn ContinuousAudioOutput>,
     ) -> (VoiceLoop, mpsc::Receiver<VoiceSessionEvent>, TurnId) {
         let session_id = SessionId::new(1);
         let policy = VoiceSessionPolicy::new(
@@ -3684,7 +3714,7 @@ mod tests {
             context.clone(),
             Arc::new(BlockingLanguage::default()),
             Arc::new(MockStreamingSpeechSynthesizer::new([])),
-            Arc::new(DisconnectedOutput),
+            output,
         );
         let (input, input_receiver) = mpsc::channel(1);
         std::mem::forget(input);
@@ -3722,7 +3752,11 @@ mod tests {
         (loop_, events, turn_id)
     }
 
-    fn assert_speaking_degraded(loop_: &VoiceLoop, events: &mut mpsc::Receiver<VoiceSessionEvent>) {
+    fn assert_speaking_degraded(
+        loop_: &VoiceLoop,
+        events: &mut mpsc::Receiver<VoiceSessionEvent>,
+        turn_id: TurnId,
+    ) {
         assert_eq!(loop_.state, VoiceLoopState::Listening);
         assert!(loop_.turn_events.is_none(), "the failed turn is reaped");
         assert!(loop_.playback.is_none());
@@ -3742,11 +3776,48 @@ mod tests {
             )),
             "the playback failure is reported as recoverable: {published:?}"
         );
+        assert!(
+            !published.iter().any(|event| matches!(
+                event,
+                VoiceSessionEvent::SessionFailed { error, .. }
+                    if error.stage() == RuntimeStage::Runtime
+            )),
+            "a playback failure is not a runtime-stage failure: {published:?}"
+        );
+        let terminals: Vec<_> = published
+            .iter()
+            .filter_map(|event| match event {
+                VoiceSessionEvent::Turn { event, .. } if event.is_terminal() => Some(event),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            matches!(
+                terminals.as_slice(),
+                [RuntimeEvent::TurnCancelled { turn_id: ended }] if *ended == turn_id
+            ),
+            "the interrupted turn ends exactly once, cancelled: {published:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_recognition_failure_whose_playback_flush_times_out_only_degrades_speaking() {
+        let (mut loop_, mut events, turn_id) =
+            responding_loop_with_playback(Arc::new(UnacknowledgedFlushOutput)).await;
+        let exit = loop_
+            .handle_input(Some(Err(AdapterError::new("recognition stream failed")
+                .with_stage(RuntimeStage::SpeechRecognizer))))
+            .await;
+        assert!(
+            exit.is_none(),
+            "the voice session and its recording continue"
+        );
+        assert_speaking_degraded(&loop_, &mut events, turn_id);
     }
 
     #[tokio::test]
     async fn a_recognition_failure_whose_playback_flush_fails_only_degrades_speaking() {
-        let (mut loop_, mut events, _) = responding_loop_with_disconnected_playback().await;
+        let (mut loop_, mut events, turn_id) = responding_loop_with_disconnected_playback().await;
         let exit = loop_
             .handle_input(Some(Err(AdapterError::new("capture discontinuity")
                 .with_stage(RuntimeStage::SpeechRecognizer))))
@@ -3755,12 +3826,12 @@ mod tests {
             exit.is_none(),
             "the voice session and its recording continue"
         );
-        assert_speaking_degraded(&loop_, &mut events);
+        assert_speaking_degraded(&loop_, &mut events, turn_id);
     }
 
     #[tokio::test]
     async fn a_provider_barge_in_whose_playback_flush_fails_only_degrades_speaking() {
-        let (mut loop_, mut events, _) = responding_loop_with_disconnected_playback().await;
+        let (mut loop_, mut events, turn_id) = responding_loop_with_disconnected_playback().await;
         let exit = loop_
             .handle_input(Some(Ok(VoiceInputEvent::Activity(
                 VoiceActivity::SpeechStarted { at_ms: 0 },
@@ -3770,7 +3841,7 @@ mod tests {
             exit.is_none(),
             "the voice session and its recording continue"
         );
-        assert_speaking_degraded(&loop_, &mut events);
+        assert_speaking_degraded(&loop_, &mut events, turn_id);
     }
 
     #[tokio::test]
@@ -3792,7 +3863,7 @@ mod tests {
             "the voice session and its recording continue"
         );
         completed.await.expect("the barge-in is answered");
-        assert_speaking_degraded(&loop_, &mut events);
+        assert_speaking_degraded(&loop_, &mut events, turn_id);
     }
 
     #[tokio::test]

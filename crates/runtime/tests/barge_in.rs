@@ -480,6 +480,27 @@ async fn failed_flush_with_a_stalled_drain_aborts_the_turn_before_recovering() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn shutdown_with_a_stalled_flush_and_a_stalled_drain_aborts_the_turn_before_ending() {
+    let harness = VoiceSessionHarness::speaking_generations([GenerationId::new(1)])
+        .with_stalled_flush_and_stalled_turn_cleanup();
+    let mut events = harness.start().await;
+    harness
+        .start_speaking_generation(&mut events, GenerationId::new(1))
+        .await;
+
+    harness.runtime.shutdown().await.unwrap();
+    assert!(
+        harness.output.stalled_work_stopped(),
+        "the session ended while the undrained turn still ran"
+    );
+    // The timed-out cleanup is reported in the session terminal; the turn is already gone.
+    let terminal = drain_until_session_terminal(&mut events).await;
+    assert!(terminal
+        .last()
+        .is_some_and(VoiceSessionEvent::is_session_terminal));
+}
+
+#[tokio::test(start_paused = true)]
 async fn stalled_sidecar_completion_is_aborted_after_cleanup_timeout() {
     let harness = VoiceSessionHarness::speaking_generations([]).with_stalled_completion();
     let mut events = harness.start().await;
@@ -770,6 +791,15 @@ impl VoiceSessionHarness {
         Self::configured(
             self.language.active_generations.iter().copied(),
             FlushBehavior::Fail,
+            true,
+            false,
+        )
+    }
+
+    fn with_stalled_flush_and_stalled_turn_cleanup(self) -> Self {
+        Self::configured(
+            self.language.active_generations.iter().copied(),
+            FlushBehavior::Stall,
             true,
             false,
         )

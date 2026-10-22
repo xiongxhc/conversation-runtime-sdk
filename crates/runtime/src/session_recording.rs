@@ -457,6 +457,9 @@ pub struct SessionRecorder {
     /// Set once the closing chunk is on disk, so a finalize that fails afterwards retries the
     /// failing step instead of appending a second closing chunk or reporting a wrong error.
     ended: bool,
+    /// Set once an incomplete recorder has written its failure record, which always precedes
+    /// the closing chunk. The file itself then states that it can never authorize recovery.
+    failure_recorded: bool,
     summary: Option<RecordingSummary>,
     recording_failed: bool,
     /// Issuance must describe the exact successfully sealed transcript, not bytes replaced
@@ -589,6 +592,7 @@ impl SessionRecorder {
             open_gap_at_ms: None,
             media_ms: 0,
             ended: false,
+            failure_recorded: false,
             summary: None,
             recording_failed: false,
             sealed_digest,
@@ -788,12 +792,7 @@ impl SessionRecorder {
         }
         let at_ms = self.elapsed_ms();
         let reason = CAPTURE_DISCONTINUITY_REASON;
-        let mut record = Vec::with_capacity(11 + reason.len());
-        record.push(CHUNK_GAP_STARTED);
-        record.extend_from_slice(&at_ms.to_be_bytes());
-        record.push(u8::try_from(reason.len()).expect("gap reasons are short"));
-        record.extend_from_slice(reason.as_bytes());
-        self.append(record)?;
+        self.append(gap_started_record(at_ms, reason))?;
         self.open_gap_at_ms = Some(at_ms);
         if self.gaps.len() < MAX_RECORDING_GAPS {
             self.gaps.push(RecordingGap {
@@ -865,6 +864,15 @@ impl SessionRecorder {
             return Ok(summary.clone());
         }
         if !self.ended {
+            // A recorder that can never be issued a capability says so inside the file, before
+            // the closing chunk, so a closed file cannot later be adopted as complete.
+            if self.is_incomplete() && !self.failure_recorded {
+                self.append(gap_started_record(
+                    self.elapsed_ms(),
+                    RECORDING_FAILURE_REASON,
+                ))?;
+                self.failure_recorded = true;
+            }
             self.append(ended_record(self.elapsed_ms()))?;
             self.ended = true;
         }
@@ -898,17 +906,7 @@ impl SessionRecorder {
             encrypted_path: self.path.clone(),
             sha256,
             duration_ms: self.media_duration_ms(),
-            format: self.format.map_or_else(
-                || EMPTY_RECORDING_FORMAT.to_owned(),
-                |format| {
-                    format!(
-                        "{}/{}/{}",
-                        sample_format_name(format.sample_format()),
-                        format.sample_rate_hz(),
-                        format.channels()
-                    )
-                },
-            ),
+            format: format_label(self.format),
             key_id: self.key.key_id.clone(),
             gaps: self.reported_gaps(),
         };
@@ -958,15 +956,7 @@ impl SessionRecorder {
     /// timeline has no length for a gap to occupy. The file keeps the recorder-relative
     /// timestamps for a consumer that wants arrival times.
     fn reported_gaps(&self) -> Vec<RecordingGap> {
-        let duration = self.media_duration_ms();
-        self.gaps
-            .iter()
-            .map(|gap| RecordingGap {
-                started_at_ms: gap.started_at_ms.min(duration),
-                ended_at_ms: gap.ended_at_ms.map(|ended| ended.min(duration)),
-                reason: gap.reason.clone(),
-            })
-            .collect()
+        clamped_gaps(&self.gaps, self.media_duration_ms())
     }
 
     fn elapsed_ms(&self) -> u64 {
@@ -1355,6 +1345,39 @@ fn decode_chunk(record: &[u8]) -> Result<RecordedChunk, RuntimeError> {
     }
 }
 
+fn format_label(format: Option<PcmFormat>) -> String {
+    format.map_or_else(
+        || EMPTY_RECORDING_FORMAT.to_owned(),
+        |format| {
+            format!(
+                "{}/{}/{}",
+                sample_format_name(format.sample_format()),
+                format.sample_rate_hz(),
+                format.channels()
+            )
+        },
+    )
+}
+
+fn clamped_gaps(gaps: &[RecordingGap], duration: u64) -> Vec<RecordingGap> {
+    gaps.iter()
+        .map(|gap| RecordingGap {
+            started_at_ms: gap.started_at_ms.min(duration),
+            ended_at_ms: gap.ended_at_ms.map(|ended| ended.min(duration)),
+            reason: gap.reason.clone(),
+        })
+        .collect()
+}
+
+fn gap_started_record(at_ms: u64, reason: &str) -> Vec<u8> {
+    let mut record = Vec::with_capacity(10 + reason.len());
+    record.push(CHUNK_GAP_STARTED);
+    record.extend_from_slice(&at_ms.to_be_bytes());
+    record.push(u8::try_from(reason.len()).expect("gap reasons are short"));
+    record.extend_from_slice(reason.as_bytes());
+    record
+}
+
 fn gap_ended_record(at_ms: u64) -> Vec<u8> {
     let mut record = Vec::with_capacity(9);
     record.push(CHUNK_GAP_ENDED);
@@ -1501,12 +1524,22 @@ pub(crate) fn preflight_finalized_recording(
 ) -> Result<RecordedChunks, RuntimeError> {
     let mut chunks = snapshot_finalized_recording(settings, capability, cancellation)?;
     validate_completed_chunks(&mut chunks, cancellation)?;
-    // Verify the snapshot itself too, not just the bytes observed while copying the original.
+    rewind_verified_snapshot(&mut chunks, &capability.sha256, cancellation)?;
+    Ok(chunks)
+}
+
+/// Verifies the snapshot itself too, not just the bytes observed while copying the original,
+/// and rewinds it to the first chunk.
+fn rewind_verified_snapshot(
+    chunks: &mut RecordedChunks,
+    sha256: &str,
+    cancellation: &CancellationToken,
+) -> Result<(), RuntimeError> {
     chunks
         .reader
         .seek(SeekFrom::Start(0))
         .map_err(|_| recovery_error())?;
-    if stream_digest(&mut chunks.reader, None, cancellation)? != capability.sha256 {
+    if stream_digest(&mut chunks.reader, None, cancellation)? != sha256 {
         return Err(recovery_error());
     }
     chunks
@@ -1515,8 +1548,8 @@ pub(crate) fn preflight_finalized_recording(
         .map_err(|_| recovery_error())?;
     chunks.counter = 0;
     chunks.finished = false;
-    check_recovery_cancellation(cancellation)?;
-    Ok(chunks)
+    chunks.truncated = false;
+    check_recovery_cancellation(cancellation)
 }
 
 fn snapshot_finalized_recording(
@@ -1528,10 +1561,29 @@ fn snapshot_finalized_recording(
     let key = RecordingKey::from_environment(settings.key_env())?;
     key.verify(capability)?;
     let binding = decode_handle(&capability.recording_handle).ok_or_else(recovery_error)?;
-    let path = settings.directory().join(format!(
-        "{}.{RECORDING_EXTENSION}",
-        capability.recording_handle
-    ));
+    let (chunks, sha256) =
+        snapshot_recording(settings, key, &capability.recording_handle, cancellation)?;
+    if sha256 != capability.sha256
+        || chunks.session_id != capability.source_session_id
+        || chunks.header[28..44] != binding
+    {
+        return Err(recovery_error());
+    }
+    Ok(chunks)
+}
+
+/// Copies the canonical file for `handle` into a private, already-unlinked snapshot and
+/// returns a strict reader over it plus the digest of exactly the bytes copied. The header is
+/// structurally validated; which identity it must carry is the caller's check.
+fn snapshot_recording(
+    settings: &RecordingSettings,
+    key: RecordingKey,
+    handle: &str,
+    cancellation: &CancellationToken,
+) -> Result<(RecordedChunks, String), RuntimeError> {
+    let path = settings
+        .directory()
+        .join(format!("{handle}.{RECORDING_EXTENSION}"));
     let mut source = open_recovery_source(&path)?;
     let size = admitted_recovery_extent(&source)?;
     #[cfg(test)]
@@ -1579,7 +1631,7 @@ fn snapshot_finalized_recording(
         cancellation,
     )?;
     let mut extra = [0];
-    if source.read(&mut extra).map_err(|_| recovery_error())? != 0 || sha256 != capability.sha256 {
+    if source.read(&mut extra).map_err(|_| recovery_error())? != 0 {
         return Err(recovery_error());
     }
     snapshot
@@ -1590,31 +1642,56 @@ fn snapshot_finalized_recording(
         .read_exact(&mut header)
         .map_err(|_| recovery_error())?;
     let session_id = read_header(&header)?;
-    if session_id != capability.source_session_id || header[28..44] != binding {
-        return Err(recovery_error());
-    }
-    Ok(RecordedChunks {
-        reader: BufReader::new(PositionedFile::new(snapshot, HEADER_LEN as u64)),
-        key: Arc::new(key),
-        header,
-        session_id,
-        counter: 0,
-        truncated: false,
-        finished: false,
-        strict: true,
-        _snapshot: Some(guard),
-    })
+    Ok((
+        RecordedChunks {
+            reader: BufReader::new(PositionedFile::new(snapshot, HEADER_LEN as u64)),
+            key: Arc::new(key),
+            header,
+            session_id,
+            counter: 0,
+            truncated: false,
+            finished: false,
+            strict: true,
+            _snapshot: Some(guard),
+        },
+        sha256,
+    ))
 }
 
 fn validate_completed_chunks(
     chunks: &mut RecordedChunks,
     cancellation: &CancellationToken,
 ) -> Result<(), RuntimeError> {
+    let walk = walk_completed_chunks(chunks, cancellation)?;
+    if walk.incomplete || !walk.ended || chunks.truncated() {
+        return Err(recovery_error());
+    }
+    Ok(())
+}
+
+/// What one authenticated walk over a recording established.
+struct CompletedWalk {
+    /// The closing chunk was read and nothing whole followed it.
+    ended: bool,
+    /// The recorder wrote its failure record; the walk stops there.
+    incomplete: bool,
+    timeline: MediaTimeline,
+}
+
+/// Authenticates and orders every chunk, rebuilding the media timeline the recorder reported.
+/// A chunk after the closing one, a reordered timestamp, a format change or a malformed gap is
+/// an error; a missing closing chunk and a torn tail are reported for the caller to judge.
+fn walk_completed_chunks(
+    chunks: &mut RecordedChunks,
+    cancellation: &CancellationToken,
+) -> Result<CompletedWalk, RuntimeError> {
     let mut ended = false;
     let mut format = None;
     let mut gap = None;
     let mut last_at_ms = 0;
     let mut timed_validation = TimedValidation::default();
+    let timed = chunks.is_timed();
+    let mut timeline = MediaTimeline::default();
     loop {
         check_recovery_cancellation(cancellation)?;
         let Some(chunk) = chunks.next_chunk()? else {
@@ -1623,7 +1700,7 @@ fn validate_completed_chunks(
         if ended {
             return Err(recovery_error());
         }
-        if chunks.is_timed() {
+        if timed {
             timed_validation.accept(&chunk)?;
         }
         let at_ms = match chunk {
@@ -1638,6 +1715,7 @@ fn validate_completed_chunks(
                     return Err(recovery_error());
                 }
                 format = Some(current);
+                timeline.timed_frame(current, bytes.len())?;
                 at_ms
             }
             RecordedChunk::TimingPolicy
@@ -1664,19 +1742,29 @@ fn validate_completed_chunks(
                     return Err(recovery_error());
                 }
                 format = Some(current);
+                timeline.frame(current, bytes.len());
                 at_ms
             }
             RecordedChunk::GapStarted { at_ms, reason } => {
+                if reason == RECORDING_FAILURE_REASON {
+                    return Ok(CompletedWalk {
+                        ended: false,
+                        incomplete: true,
+                        timeline,
+                    });
+                }
                 if gap.is_some() || reason != CAPTURE_DISCONTINUITY_REASON {
                     return Err(recovery_error());
                 }
                 gap = Some(at_ms);
+                timeline.gap_started(at_ms);
                 at_ms
             }
             RecordedChunk::GapEnded { at_ms } => {
                 if gap.take().is_none() {
                     return Err(recovery_error());
                 }
+                timeline.gap_ended(at_ms, timed)?;
                 at_ms
             }
             // A capture discontinuity may legitimately remain open at finalization.
@@ -1690,10 +1778,196 @@ fn validate_completed_chunks(
         }
         last_at_ms = at_ms;
     }
-    if !ended || chunks.truncated() {
-        return Err(recovery_error());
+    Ok(CompletedWalk {
+        ended,
+        incomplete: false,
+        timeline,
+    })
+}
+
+/// The media timeline rebuilt from a recording's chunks by the same rules the recorder applies
+/// while writing them, so a closed file states the summary its recorder would have.
+#[derive(Default)]
+struct MediaTimeline {
+    format: Option<PcmFormat>,
+    media_ms: u64,
+    timed_samples: u64,
+    timed_gap_ms: u64,
+    open_gap_at_ms: Option<u64>,
+    gaps: Vec<RecordingGap>,
+}
+
+impl MediaTimeline {
+    fn frame(&mut self, format: PcmFormat, bytes: usize) {
+        self.format = Some(format);
+        self.media_ms = self.media_ms.saturating_add(pcm_duration_ms(format, bytes));
     }
-    Ok(())
+
+    fn timed_frame(&mut self, format: PcmFormat, bytes: usize) -> Result<(), RuntimeError> {
+        let alignment = format
+            .frame_alignment_bytes()
+            .map_err(|_| recovery_error())?;
+        let samples = u64::try_from(bytes / alignment).map_err(|_| recovery_error())?;
+        let total = self
+            .timed_samples
+            .checked_add(samples)
+            .ok_or_else(recovery_error)?;
+        self.media_ms = exact_media_ms(total, format.sample_rate_hz(), self.timed_gap_ms)?;
+        self.timed_samples = total;
+        self.format = Some(format);
+        Ok(())
+    }
+
+    fn gap_started(&mut self, at_ms: u64) {
+        self.open_gap_at_ms = Some(at_ms);
+        if self.gaps.len() < MAX_RECORDING_GAPS {
+            self.gaps.push(RecordingGap {
+                started_at_ms: self.media_ms,
+                ended_at_ms: None,
+                reason: CAPTURE_DISCONTINUITY_REASON.to_owned(),
+            });
+        } else if let Some(last) = self.gaps.last_mut() {
+            last.ended_at_ms = None;
+        }
+    }
+
+    fn gap_ended(&mut self, at_ms: u64, timed: bool) -> Result<(), RuntimeError> {
+        let Some(opened_at_ms) = self.open_gap_at_ms.take() else {
+            return Err(recovery_error());
+        };
+        if self.format.is_some() {
+            let length = at_ms.saturating_sub(opened_at_ms);
+            if timed {
+                self.timed_gap_ms = self
+                    .timed_gap_ms
+                    .checked_add(length)
+                    .ok_or_else(recovery_error)?;
+            }
+            self.media_ms = self.media_ms.saturating_add(length);
+        }
+        let media_ms = self.media_ms;
+        if let Some(gap) = self.gaps.last_mut() {
+            gap.ended_at_ms = Some(media_ms);
+        }
+        Ok(())
+    }
+
+    fn summary(
+        &self,
+        settings: &RecordingSettings,
+        handle: &str,
+        sha256: String,
+        key_id: String,
+    ) -> RecordingSummary {
+        let duration_ms = if self.format.is_some() {
+            self.media_ms
+        } else {
+            0
+        };
+        RecordingSummary {
+            recording_handle: handle.to_owned(),
+            encrypted_path: settings
+                .directory()
+                .join(format!("{handle}.{RECORDING_EXTENSION}")),
+            sha256,
+            duration_ms,
+            format: format_label(self.format),
+            key_id,
+            gaps: clamped_gaps(&self.gaps, duration_ms),
+        }
+    }
+}
+
+/// Why a closed recording could not be adopted. Every refusal mints nothing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RecordingAdoptionError {
+    /// No recording is filed under that handle.
+    NotFound,
+    /// The file is not a regular recording file, or a whole chunk fails to authenticate, or
+    /// bytes follow its closing chunk.
+    Unreadable,
+    /// The file has no closing chunk: it is still being written, or its writer died.
+    NotClosed,
+    /// The recorder's sink failed, so the file states that it is incomplete.
+    Incomplete,
+    /// The header names another session, or the file answers to another handle.
+    IdentityMismatch,
+    /// The key is not configured, or the adoption was cancelled.
+    Unavailable(RuntimeError),
+}
+
+/// Issues the capability for a recording that was closed on disk without a finalize reply
+/// reaching its client — the close a gateway performs when its control input ends.
+///
+/// The file must answer to `recording_handle`, name `source_session_id` in its header,
+/// authenticate chunk by chunk under the recording key, end in exactly one closing chunk and
+/// carry no failure record. The summary is rebuilt from the chunks by the recorder's own
+/// timeline rules, and the capability covers the same fields under the same key, so both are
+/// exactly what a live `finalize_with_capability` of that recording returned or would have
+/// returned. Adoption is stateless: the same unchanged file always yields the same answer.
+pub fn adopt_closed_recording(
+    settings: &RecordingSettings,
+    source_session_id: SessionId,
+    recording_handle: &str,
+    cancellation: &CancellationToken,
+) -> Result<(RecordingSummary, FinalizedRecordingCapability), RecordingAdoptionError> {
+    use RecordingAdoptionError as Refusal;
+    let unavailable_or = |refusal: Refusal| {
+        move |error: RuntimeError| {
+            if cancellation.is_cancelled() {
+                Refusal::Unavailable(error)
+            } else {
+                refusal
+            }
+        }
+    };
+    let binding = decode_handle(recording_handle).ok_or(Refusal::NotFound)?;
+    check_recovery_cancellation(cancellation).map_err(Refusal::Unavailable)?;
+    let key = RecordingKey::from_environment(settings.key_env()).map_err(Refusal::Unavailable)?;
+    let key_id = key.key_id.clone();
+    let path = settings
+        .directory()
+        .join(format!("{recording_handle}.{RECORDING_EXTENSION}"));
+    if let Err(error) = std::fs::symlink_metadata(&path) {
+        return Err(if error.kind() == std::io::ErrorKind::NotFound {
+            Refusal::NotFound
+        } else {
+            Refusal::Unreadable
+        });
+    }
+    let (mut chunks, sha256) = snapshot_recording(settings, key, recording_handle, cancellation)
+        .map_err(unavailable_or(Refusal::Unreadable))?;
+    if chunks.header[28..44] != binding || chunks.session_id != source_session_id {
+        return Err(Refusal::IdentityMismatch);
+    }
+    let walk = walk_completed_chunks(&mut chunks, cancellation)
+        .map_err(unavailable_or(Refusal::Unreadable))?;
+    if walk.incomplete {
+        return Err(Refusal::Incomplete);
+    }
+    if !walk.ended {
+        return Err(Refusal::NotClosed);
+    }
+    if chunks.truncated() {
+        return Err(Refusal::Unreadable);
+    }
+    rewind_verified_snapshot(&mut chunks, &sha256, cancellation)
+        .map_err(unavailable_or(Refusal::Unreadable))?;
+    let summary = walk
+        .timeline
+        .summary(settings, recording_handle, sha256, key_id);
+    let mut capability = FinalizedRecordingCapability {
+        source_session_id: chunks.session_id,
+        recording_handle: summary.recording_handle.clone(),
+        sha256: summary.sha256.clone(),
+        key_id: summary.key_id.clone(),
+        authorization: String::new(),
+    };
+    chunks
+        .key
+        .authorize(&mut capability)
+        .map_err(Refusal::Unavailable)?;
+    Ok((summary, capability))
 }
 
 #[derive(Clone, Default)]
@@ -1937,6 +2211,10 @@ mod recovery_tests;
 #[cfg(test)]
 #[path = "session_recording_timing_tests.rs"]
 mod timing_tests;
+
+#[cfg(test)]
+#[path = "session_recording_adoption_tests.rs"]
+mod adoption_tests;
 
 fn derive(domain: &[u8], material: &[u8]) -> [u8; 32] {
     let mut input = Vec::with_capacity(domain.len() + material.len());

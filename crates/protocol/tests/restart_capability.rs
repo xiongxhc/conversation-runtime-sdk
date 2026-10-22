@@ -45,3 +45,93 @@ fn finalized_recovery_has_a_v4_only_exact_command_shape() {
         assert!(decode_client_command_with_version(legacy.as_bytes()).is_err());
     }
 }
+
+#[test]
+fn closed_recording_adoption_is_a_v4_only_command_naming_one_exact_recording() {
+    let handle = "0123456789abcdef0123456789abcdef";
+    let wire = |version: u64, session: &str, handle: &str, extra: &str| {
+        format!(
+            r#"{{"protocol_version":{version},"type":"adopt_closed_recording","request_id":"adopt-1","source_session_id":"{session}","recording_handle":"{handle}"{extra}}}"#
+        )
+    };
+    let (version, command) =
+        decode_client_command_with_version(wire(4, "41", handle, "").as_bytes()).unwrap();
+    assert_eq!(version, 4);
+    assert_eq!(
+        command,
+        ClientCommand::AdoptClosedRecording {
+            request_id: "adopt-1".into(),
+            source_session_id: SessionId::new(41),
+            recording_handle: handle.into(),
+        }
+    );
+    for refused in [
+        wire(3, "41", handle, ""),
+        wire(2, "41", handle, ""),
+        wire(4, "0", handle, ""),
+        wire(4, "041", handle, ""),
+        wire(4, "41", "0123456789ABCDEF0123456789abcdef", ""),
+        wire(4, "41", "0123456789abcdef", ""),
+        wire(4, "41", "../../0123456789abcdef0123456789", ""),
+        wire(4, "41", handle, r#","sha256":"00""#),
+    ] {
+        assert!(
+            decode_client_command_with_version(refused.as_bytes()).is_err(),
+            "{refused}"
+        );
+    }
+}
+
+#[test]
+fn adoption_refusals_have_their_own_codes_and_the_capability_needs_version_four() {
+    use conversation_protocol::{
+        encode_gateway_message_for_version, ClientComponentDescriptor, ClientRuntimeError,
+        GatewayMessage, RuntimeStatus,
+    };
+    for code in [
+        "recording_not_found",
+        "recording_unreadable",
+        "recording_not_closed",
+        "recording_incomplete",
+        "recording_identity_mismatch",
+        "recording_in_use",
+    ] {
+        let rejected = GatewayMessage::CommandRejected {
+            request_id: "adopt-1".into(),
+            error: ClientRuntimeError {
+                code: code.into(),
+                kind: "invalid_state".into(),
+                stage: "runtime".into(),
+                message: "refused".into(),
+            },
+        };
+        assert!(
+            encode_gateway_message_for_version(&rejected, 4).is_ok(),
+            "{code}"
+        );
+    }
+    let status = RuntimeStatus {
+        profile: "offline".to_owned(),
+        transport: "stdio".to_owned(),
+        privacy_mode: "local_only".to_owned(),
+        language_location: "local".to_owned(),
+        model_id: "local-model".to_owned(),
+        memory_enabled: false,
+        memory_location: None,
+        telemetry_enabled: false,
+        capabilities: vec!["text".to_owned(), "closed_recording_adoption".to_owned()],
+        components: vec![ClientComponentDescriptor {
+            kind: "language_model".to_owned(),
+            execution_location: "local".to_owned(),
+            provider_label: "Local language".to_owned(),
+        }],
+        last_context_seed_operation_id: None,
+    };
+    let ready = GatewayMessage::ReadyV4 {
+        status: status.clone(),
+        current_session_id: SessionId::new(7),
+    };
+    assert!(encode_gateway_message_for_version(&ready, 4).is_ok());
+    let legacy = GatewayMessage::Ready { status };
+    assert!(encode_gateway_message_for_version(&legacy, 3).is_err());
+}

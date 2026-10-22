@@ -68,6 +68,38 @@ so source rename or same-inode mutation cannot alter its second pass, and proces
 death cannot leave a named extra copy. Cancellation joins recovery cleanup.
 No plaintext audio is written to disk; v3's partial-recording behavior is unchanged.
 
+## Adopting a recording closed without a finalize reply
+
+If the application dies during a meeting, its gateway closes the recording on input EOF,
+but the capability was never sent. On a later explicit-v4 connection that advertises
+`closed_recording_adoption`, name the recording by the session id its voice session
+reported and the 32-character handle its file is named by:
+
+```ts
+const adopted = await client.adoptClosedRecording({ sourceSessionId, recordingHandle });
+// adopted has the finalizeRecording shape, including adopted.recoveryCapability
+```
+
+The handle is not secret: it is the file name in the recording directory, and the session
+id is in the file's plaintext header. What makes the answer trustworthy is the check, not
+the inputs. The gateway copies the file once into a private snapshot under the same size and
+no-follow admission as recovery, requires the header to carry that handle's binding and
+that session, authenticates every chunk, requires exactly one terminal Ended with nothing
+after it and no `recording_failed` record, and rehashes the snapshot. It then rebuilds the
+summary from the chunks by the recorder's timeline rules and authorizes the same capability
+fields under the same key, so the result is byte-for-byte what a live v4 finalize returned or
+would have returned. A recording this connection still has open is refused. Adoption runs
+only while the voice and text lanes are idle and is cancelled only by the control channel
+closing, never by a provider failure.
+
+Refusals carry their own codes and issue nothing: `recording_not_found` (no file under that
+handle), `recording_unreadable` (not a regular file, a chunk fails to authenticate, or bytes
+follow the closing chunk), `recording_not_closed` (no closing chunk: still being written, or
+its writer died before closing it), `recording_incomplete` (the recorder's sink failed),
+`recording_identity_mismatch` (another session, or a file that does not answer to the handle)
+and `recording_in_use`. Repeating an adoption for an unchanged file returns the same summary
+and capability; there is no "already adopted" state to lose or to refuse a retry with.
+
 ## Sample provenance in reconciled v4 segments
 
 `reconcileFinalizedRecording` snapshots the supplied capability at the call boundary.

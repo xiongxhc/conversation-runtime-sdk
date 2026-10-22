@@ -205,7 +205,8 @@ do not run it from CI, a developer laptop on a public network, or an untrusted b
 
    Deploy the gateway and the SDK from the same package. Once `[media]` is configured, the gateway
    advertises `media_lease_renewal` in its ready message, and an older SDK refuses that ready
-   message, so a control client on an older SDK cannot connect.
+   message, so a control client on an older SDK cannot connect. With a `[recording]` section, a v4
+   control client is likewise told `closed_recording_adoption`, which an older SDK refuses.
 
 3. Start the gateway under the normal service manager, then use a protocol-v3 control client to
    start exactly one voice session. Retain the returned `connect_endpoint`, authoritative session
@@ -240,6 +241,15 @@ do not run it from CI, a developer laptop on a public network, or an untrusted b
    available only to that host; confirm its decrypted frame sequence and checksums equal the
    bridge metadata from step 5. Confirm the recording directory contains the encrypted artifact
    only and that no plaintext capture bytes were written to temporary storage.
+
+   Then repeat steps 3 to 5 on a v4 control client and end that client's process during the
+   meeting, without stopping or finalizing. Confirm the gateway closed the recording on input
+   EOF, then start a new v4 control client against the same recording directory and key and
+   adopt the recording by the session id its voice session reported and the handle its file is
+   named by. Confirm the reply carries the summary and a recovery capability, that recovery
+   with that capability succeeds, that a second adoption returns the same capability, and that
+   adopting a recording another gateway is still writing is refused as `recording_not_closed`.
+   Keep the capability in private state only.
 
 7. For the same frames, confirm the recognizer's `AudioCapture` consumer receives the matching
    sequence/byte-count/checksum evidence and, once the separately-authorised online recognizer is

@@ -93,7 +93,8 @@ export type ClientCommand =
       outputSchema: Record<string, unknown>;
       maxOutputBytes: number;
     }
-  | { type: "renew_media_lease"; requestId: string };
+  | { type: "renew_media_lease"; requestId: string }
+  | { type: "adopt_closed_recording"; requestId: string; sourceSessionId: bigint; recordingHandle: string };
 
 export type ConversationContextExchange = { user: string; assistant: string };
 
@@ -260,7 +261,13 @@ export type RuntimeFailure = {
     | "memory_unavailable"
     | "memory_conflict"
     | "persona_invalid"
-    | "media_lease_lost";
+    | "media_lease_lost"
+    | "recording_not_found"
+    | "recording_unreadable"
+    | "recording_not_closed"
+    | "recording_incomplete"
+    | "recording_identity_mismatch"
+    | "recording_in_use";
   kind: "adapter" | "configuration" | "invalid_state";
   stage:
     | "runtime"
@@ -293,7 +300,8 @@ export type RuntimeCapability =
   | "memory_inspection"
   | "memory_mutation"
   | "voice_session"
-  | "media_lease_renewal";
+  | "media_lease_renewal"
+  | "closed_recording_adoption";
 
 export type RuntimeStatus = {
   profile: RuntimeProfile;
@@ -705,6 +713,15 @@ export function parseClientCommand(value: unknown, expectedVersion?: ClientProto
         throw new ProtocolError("media lease renewal requires protocol version 3");
       }
       return { type, requestId: requireRequestId(object) };
+    case "adopt_closed_recording":
+      requireExactKeys(object, ["protocol_version", "type", "request_id", "source_session_id", "recording_handle"]);
+      if (version !== 4) throw new ProtocolError("closed recording adoption requires protocol version 4");
+      return {
+        type,
+        requestId: requireRequestId(object),
+        sourceSessionId: parseIdentifier(object.source_session_id),
+        recordingHandle: requireAdoptableHandle(requireString(object, "recording_handle")),
+      };
     case "read_recording_alignment":
     case "reconcile_finalized_recording":
       try {
@@ -1046,6 +1063,14 @@ export function encodeClientCommand(
         };
       case "renew_media_lease":
         return { protocol_version: version, type: command.type, request_id: command.requestId };
+      case "adopt_closed_recording":
+        return {
+          protocol_version: version,
+          type: command.type,
+          request_id: command.requestId,
+          source_session_id: command.sourceSessionId.toString(),
+          recording_handle: command.recordingHandle,
+        };
       case "read_recording_alignment":
       case "reconcile_finalized_recording":
         return { protocol_version: version, type: command.type, request_id: command.requestId, capability: encodeFinalizedCapability(command.capability) };
@@ -1157,6 +1182,13 @@ export function validateClientCommand(
     if (command.sessionId < 1n || command.sessionId > MAX_U64) {
       throw new ProtocolError("session identifier is outside u64 range");
     }
+  }
+  if (command.type === "adopt_closed_recording") {
+    if (version !== 4) throw new ProtocolError("closed recording adoption requires protocol version 4");
+    if (command.sourceSessionId < 1n || command.sourceSessionId > MAX_U64) {
+      throw new ProtocolError("session identifier is outside u64 range");
+    }
+    requireAdoptableHandle(command.recordingHandle);
   }
   if (command.type === "reconcile_finalized_recording" || command.type === "read_recording_alignment") {
     if (version !== 4) throw new ProtocolError("finalized recording recovery requires protocol version 4");
@@ -1278,6 +1310,12 @@ const DIARIZATION_WARNINGS = [
 ] as const;
 
 /** The handle's charset and length is the runtime's path-traversal guard, mirrored here. */
+/** Exactly the handle a recording file is named by: 32 lowercase hexadecimal characters. */
+function requireAdoptableHandle(handle: string): string {
+  if (!/^[0-9a-f]{32}$/.test(handle)) throw new ProtocolError("invalid recording handle");
+  return handle;
+}
+
 function requireRecordingHandle(handle: string): string {
   if (!/^[a-z0-9]+$/.test(handle)) {
     throw new ProtocolError("recording handle is not a valid handle");
@@ -2084,6 +2122,12 @@ function parseRuntimeFailure(value: unknown): RuntimeFailure {
         "memory_conflict",
         "persona_invalid",
         "media_lease_lost",
+        "recording_not_found",
+        "recording_unreadable",
+        "recording_not_closed",
+        "recording_incomplete",
+        "recording_identity_mismatch",
+        "recording_in_use",
       ] as const,
     ),
     kind: requireOneOf(object, "kind", ["adapter", "configuration", "invalid_state"] as const),
@@ -2574,6 +2618,7 @@ function requireCapabilities(
     ["memory_mutation", 4],
     ["voice_session", 5],
     ["media_lease_renewal", 6],
+    ["closed_recording_adoption", 7],
   ]);
   let previousRank = -1;
   for (const capability of capabilities) {
@@ -2587,6 +2632,7 @@ function requireCapabilities(
     capabilities[0] !== "text"
     || (version < CONTEXT_SEED_PROTOCOL_VERSION && capabilities.includes("conversation_context_seed"))
     || (version < RUNTIME_PROFILE_PROTOCOL_VERSION && capabilities.includes("media_lease_renewal"))
+    || (version < FINALIZED_RECORDING_PROTOCOL_VERSION && capabilities.includes("closed_recording_adoption"))
     || (capabilities.includes("memory_mutation") && !capabilities.includes("memory_inspection"))
   ) {
     throw new ProtocolError("capabilities has an unsupported value");

@@ -88,6 +88,9 @@ capability, so an older SDK cannot connect once `[media]` is configured. The
 current SDK accepts Ready with or without the capability and refuses
 `renewMediaLease()` locally when it is absent, so it still talks to an older
 gateway.
+The same holds for `closed_recording_adoption`, which only a v4 connection with
+a `[recording]` section advertises: an older SDK refuses that Ready message, and
+the current SDK refuses `adoptClosedRecording()` locally when it is absent.
 
 ### Online meeting profile and timing evidence
 
@@ -153,6 +156,28 @@ resolution checks; each meeting session has its own authoritative identifier.
 A recording is closed only after the session feeding it has stopped. Without a
 `[recording]` section nothing is recorded, which is what the default
 configuration produces.
+
+When the control client goes away mid-meeting, the gateway closes the recording
+itself on input EOF, but no finalize reply and therefore no recovery capability
+ever leaves it. A later protocol-v4 connection names that recording by the
+session identifier its voice session reported and the handle its file is named
+by, and `adopt_closed_recording` answers with the same `recording_finalized`
+reply a finalize would have sent. The gateway issues it only for a file that
+answers to that handle, names that session in its header, authenticates chunk by
+chunk under the recording key, ends in exactly one closing chunk with nothing
+after it, and is not the recording this connection still has open. The summary
+is rebuilt from the chunks by the recorder's own timeline rules, and the
+capability covers the same fields under the same key, so an adopted recording
+and a finalized one cannot be told apart. Adoption is stateless: repeating it for
+an unchanged file returns the same summary and capability, which grants nothing
+new and keeps a client that lost the first reply able to retry. A recorder whose
+sink failed writes a `recording_failed` gap record before its closing chunk, so
+a recording that could not be issued a capability live cannot gain one later.
+Each refusal has its own code: `recording_not_found`, `recording_unreadable`,
+`recording_not_closed`, `recording_incomplete`, `recording_identity_mismatch` and
+`recording_in_use`. Adoption consults no provider, so a provider failure never
+blocks or cancels it. A v4 connection that records advertises the
+`closed_recording_adoption` capability in Ready.
 
 ### Post-Meeting Reconciliation
 

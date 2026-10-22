@@ -95,3 +95,77 @@ test("v4 ready exposes an exact bigint current control identity without changing
   assert.equal(current.version, 4);
   assert.equal(Reflect.get(current.message, "currentSessionId"), MAX_U64);
 });
+
+async function adoptingReady(): Promise<Record<string, unknown>> {
+  const wire = await ready();
+  const status = wire.status as Record<string, unknown>;
+  return { ...wire, status: { ...status, capabilities: [...(status.capabilities as string[]), "closed_recording_adoption"] } };
+}
+
+test("adoption command is v4-only and names exactly one recording file", () => {
+  const command: ClientCommand = { type: "adopt_closed_recording", requestId: "adopt-1", sourceSessionId: 41n, recordingHandle: capability.recordingHandle };
+  const wire = JSON.parse(new TextDecoder().decode(encodeClientCommand(command, 4))) as Record<string, unknown>;
+  assert.deepEqual(wire, { protocol_version: 4, type: "adopt_closed_recording", request_id: "adopt-1", source_session_id: "41", recording_handle: capability.recordingHandle });
+  assert.deepEqual(parseClientCommand(wire, 4), command);
+  for (const version of [1, 2, 3] as const) assert.throws(() => encodeClientCommand(command, version), /version 4/);
+  for (const recordingHandle of ["A".repeat(32), "a".repeat(31), "../" + "a".repeat(29), "z".repeat(32)]) {
+    assert.throws(() => encodeClientCommand({ ...command, recordingHandle }, 4), /invalid recording handle/);
+  }
+  assert.throws(() => encodeClientCommand({ ...command, sourceSessionId: 0n }, 4), /outside u64/);
+  assert.throws(() => parseClientCommand({ ...wire, sha256: "0".repeat(64) }, 4));
+});
+
+test("adoption capability is a version four ready capability and refusals carry their own codes", async () => {
+  const adopting = await adoptingReady();
+  assert.ok(parseReadyMessage(adopting).message.status.capabilities.includes("closed_recording_adoption"));
+  const legacy = await ready(3);
+  const legacyStatus = legacy.status as Record<string, unknown>;
+  assert.throws(() => parseReadyMessage({ ...legacy, status: { ...legacyStatus, capabilities: [...(legacyStatus.capabilities as string[]), "closed_recording_adoption"] } }));
+  for (const code of ["recording_not_found", "recording_unreadable", "recording_not_closed", "recording_incomplete", "recording_identity_mismatch", "recording_in_use"]) {
+    const rejected = parseGatewayMessage({ protocol_version: 4, type: "command_rejected", request_id: "adopt-1", error: { code, kind: "invalid_state", stage: "runtime", message: "refused" } }, 4);
+    assert.equal(rejected.type, "command_rejected");
+    if (rejected.type === "command_rejected") assert.equal(rejected.error.code, code);
+  }
+});
+
+test("v4 client adopts a closed recording and correlates the finalized answer to the request", async () => {
+  const transport = new Transport(); transport.push(await adoptingReady());
+  const client = await RuntimeClient.connect(transport, 4);
+  const adopting = client.adoptClosedRecording({ sourceSessionId: 41n, recordingHandle: capability.recordingHandle });
+  const command = transport.commands[0]!;
+  assert.deepEqual(command, { type: "adopt_closed_recording", requestId: command.requestId, sourceSessionId: 41n, recordingHandle: capability.recordingHandle });
+  transport.push({ protocol_version: 4, type: "command_accepted", request_id: command.requestId });
+  transport.push({ ...finalized, request_id: command.requestId });
+  const adopted = await adopting;
+  assert.deepEqual(adopted.recoveryCapability, capability);
+  assert.equal(adopted.recordingHandle, capability.recordingHandle);
+
+  const refused = client.adoptClosedRecording({ sourceSessionId: 41n, recordingHandle: capability.recordingHandle });
+  const second = transport.commands[1]!;
+  transport.push({ protocol_version: 4, type: "command_rejected", request_id: second.requestId, error: { code: "recording_not_closed", kind: "invalid_state", stage: "runtime", message: "the recording has no closing record" } });
+  await assert.rejects(refused, /no closing record/);
+
+  const otherSource = client.adoptClosedRecording({ sourceSessionId: 42n, recordingHandle: capability.recordingHandle });
+  const third = transport.commands[2]!;
+  transport.push({ protocol_version: 4, type: "command_accepted", request_id: third.requestId });
+  transport.push({ ...finalized, request_id: third.requestId });
+  await assert.rejects(otherSource, /different provenance/);
+  await client.close();
+
+  const other = new Transport(); other.push(await adoptingReady());
+  const otherClient = await RuntimeClient.connect(other, 4);
+  const otherHandle = otherClient.adoptClosedRecording({ sourceSessionId: 41n, recordingHandle: "e".repeat(32) });
+  const fourth = other.commands[0]!;
+  other.push({ protocol_version: 4, type: "command_accepted", request_id: fourth.requestId });
+  other.push({ ...finalized, request_id: fourth.requestId });
+  await assert.rejects(otherHandle, /different handle/);
+  await otherClient.close();
+});
+
+test("adoption is refused locally against a runtime that does not advertise it", async () => {
+  const transport = new Transport(); transport.push(await ready());
+  const client = await RuntimeClient.connect(transport, 4);
+  await assert.rejects(client.adoptClosedRecording({ sourceSessionId: 41n, recordingHandle: capability.recordingHandle }), /does not support closed recording adoption/);
+  assert.equal(transport.commands.length, 0);
+  await client.close();
+});

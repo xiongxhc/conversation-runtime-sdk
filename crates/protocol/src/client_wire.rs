@@ -200,6 +200,13 @@ pub enum ClientCommand {
     RenewMediaLease {
         request_id: String,
     },
+    /// Issues the finalized-recording capability for a recording that was closed on disk
+    /// without a finalize reply, answered like `FinalizeRecording`. Version 4 only.
+    AdoptClosedRecording {
+        request_id: String,
+        source_session_id: SessionId,
+        recording_handle: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1206,6 +1213,32 @@ fn decode_wire_client_command(
                 max_output_bytes: max_output_bytes as usize,
             })
         }
+        WireClientCommand::AdoptClosedRecording {
+            protocol_version,
+            request_id,
+            source_session_id,
+            recording_handle,
+        } => {
+            if protocol_version != FINALIZED_RECORDING_PROTOCOL_VERSION {
+                return Err(ClientWireError::UnsupportedProtocolVersion(
+                    protocol_version,
+                ));
+            }
+            validate_request_id(&request_id)?;
+            // Exactly the handle a recording file is named by, which is also the traversal guard.
+            if recording_handle.len() != 32
+                || !recording_handle
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            {
+                return Err(ClientWireError::InvalidRecordingHandle);
+            }
+            Ok(ClientCommand::AdoptClosedRecording {
+                request_id,
+                source_session_id: SessionId::new(source_session_id.0),
+                recording_handle,
+            })
+        }
         WireClientCommand::RenewMediaLease {
             protocol_version,
             request_id,
@@ -1391,6 +1424,12 @@ enum WireClientCommand {
         protocol_version: u64,
         request_id: String,
     },
+    AdoptClosedRecording {
+        protocol_version: u64,
+        request_id: String,
+        source_session_id: DecimalIdentifier,
+        recording_handle: String,
+    },
 }
 
 impl WireClientCommand {
@@ -1472,6 +1511,9 @@ impl WireClientCommand {
                 protocol_version, ..
             }
             | Self::RenewMediaLease {
+                protocol_version, ..
+            }
+            | Self::AdoptClosedRecording {
                 protocol_version, ..
             } => *protocol_version,
         }
@@ -2563,6 +2605,9 @@ fn validate_runtime_status(
         "memory_mutation" => Some(4),
         "voice_session" => Some(5),
         "media_lease_renewal" if protocol_version >= RUNTIME_PROFILE_PROTOCOL_VERSION => Some(6),
+        "closed_recording_adoption" if protocol_version >= FINALIZED_RECORDING_PROTOCOL_VERSION => {
+            Some(7)
+        }
         _ => None,
     };
     let mut previous_rank = None;
@@ -2684,6 +2729,12 @@ pub(crate) fn validate_client_runtime_error(
             | "memory_conflict"
             | "persona_invalid"
             | "media_lease_lost"
+            | "recording_not_found"
+            | "recording_unreadable"
+            | "recording_not_closed"
+            | "recording_incomplete"
+            | "recording_identity_mismatch"
+            | "recording_in_use"
     ) || !matches!(
         error.kind.as_str(),
         "adapter" | "configuration" | "invalid_state"

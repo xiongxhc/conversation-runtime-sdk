@@ -286,6 +286,44 @@ export class RuntimeClient<Version extends ClientProtocolVersion = ClientProtoco
     return result.promise as Promise<FinalizedRecordingForVersion<Version>>;
   }
 
+  /**
+   * Obtains the summary and recovery capability for a recording that was closed on disk
+   * without a finalize reply — what a gateway does when its control client goes away
+   * mid-meeting. Name the recording by the session id its voice session reported and the
+   * handle its file is named by. The answer has exactly the shape and authority of
+   * `finalizeRecording`, and repeating the call for an unchanged file answers identically.
+   * A recording that is still being written, is incomplete, fails authentication or names
+   * another session is refused with its own error code. Version 4 runtimes that advertise the
+   * `closed_recording_adoption` capability; otherwise it is refused locally and nothing is sent.
+   */
+  adoptClosedRecording(
+    this: RuntimeClient<4>,
+    { sourceSessionId, recordingHandle }: { sourceSessionId: bigint; recordingHandle: string },
+  ): Promise<FinalizedRecordingForVersion<4>> {
+    if (this.protocolVersion !== 4) return Promise.reject(new Error("closed recording adoption requires protocol version 4"));
+    if (!this.readyStatus?.capabilities.includes("closed_recording_adoption")) {
+      return Promise.reject(new Error("connected runtime does not support closed recording adoption"));
+    }
+    const requestId = this.nextRequestId();
+    const command: ClientCommand = { type: "adopt_closed_recording", requestId, sourceSessionId, recordingHandle };
+    try {
+      validateClientCommand(command, 4);
+    } catch (error) {
+      return Promise.reject(error as Error);
+    }
+    const result = new Deferred<RecordingSummary & { recoveryCapability?: FinalizedRecordingCapability }>();
+    this.controls.set(requestId, {
+      kind: "finalize_recording",
+      sessionId: sourceSessionId,
+      recordingHandle,
+      accepted: false,
+      result,
+      fail: (error) => result.reject(error),
+    });
+    this.send(command);
+    return result.promise as Promise<FinalizedRecordingForVersion<4>>;
+  }
+
   /** Reconciles a finalized recording after restart; does not change its source identity. */
   reconcileFinalizedRecording({ capability }: { capability: FinalizedRecordingCapability }): Promise<FinalizedRecordingReconciliation> {
     if (this.protocolVersion !== 4) return Promise.reject(new Error("finalized recording recovery requires protocol version 4"));
@@ -731,6 +769,10 @@ export class RuntimeClient<Version extends ClientProtocolVersion = ClientProtoco
         this.fail(new Error("finalized recording capability has different provenance"));
         return;
       }
+      if (control.recordingHandle !== undefined && (message.recoveryCapability === undefined || message.recording.recordingHandle !== control.recordingHandle)) {
+        this.fail(new Error("adopted recording has a different handle"));
+        return;
+      }
       this.controls.delete(message.requestId);
       control.result.resolve(message.recoveryCapability === undefined ? message.recording : { ...message.recording, recoveryCapability: message.recoveryCapability });
       return;
@@ -1032,7 +1074,7 @@ type PendingControl<Version extends ClientProtocolVersion> =
   | { kind: "stop_voice_session"; accepted: boolean; result: Deferred<void>; fail(error: Error): void }
   | { kind: "pause_voice_capture"; accepted: boolean; result: Deferred<void>; fail(error: Error): void }
   | { kind: "resume_voice_capture"; accepted: boolean; result: Deferred<void>; fail(error: Error): void }
-  | { kind: "finalize_recording"; sessionId: bigint; accepted: boolean; result: Deferred<RecordingSummary & { recoveryCapability?: FinalizedRecordingCapability }>; fail(error: Error): void }
+  | { kind: "finalize_recording"; sessionId: bigint; recordingHandle?: string; accepted: boolean; result: Deferred<RecordingSummary & { recoveryCapability?: FinalizedRecordingCapability }>; fail(error: Error): void }
   | {
       kind: "reconcile_recording";
       accepted: boolean;

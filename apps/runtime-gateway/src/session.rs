@@ -22,10 +22,11 @@ use conversation_protocol::{
     RUNTIME_PROFILE_PROTOCOL_VERSION,
 };
 use conversation_runtime::{
-    process_text, read_recording_alignment, reconcile_finalized_recording, reconcile_recording,
-    ConversationContext, ProcessedText, RecordingAlignmentItem, RecordingSettings,
-    RecordingSummary, SessionRecorder, TextProcessingRequest, TextTurnEventStream, TextTurnRuntime,
-    VoiceSessionAdapters, VoiceSessionEventStream, VoiceSessionRuntime,
+    adopt_closed_recording, process_text, read_recording_alignment, reconcile_finalized_recording,
+    reconcile_recording, ConversationContext, ProcessedText, RecordingAdoptionError,
+    RecordingAlignmentItem, RecordingSettings, RecordingSummary, SessionRecorder,
+    TextProcessingRequest, TextTurnEventStream, TextTurnRuntime, VoiceSessionAdapters,
+    VoiceSessionEventStream, VoiceSessionRuntime,
 };
 #[cfg(not(test))]
 use ring::rand::{SecureRandom, SystemRandom};
@@ -381,6 +382,12 @@ impl GatewaySession {
         // Explicit v4 remains pinned. Default startup still announces v3 and preserves the
         // legacy per-command response policy, including the minimum truthful status version.
         let minimum_version = minimum_status_version(&self.status);
+        // Adoption answers with a v4 capability, so only a v4 connection that records says so.
+        if self.protocol_v4 && self.recording.is_some() {
+            self.status
+                .capabilities
+                .push("closed_recording_adoption".to_owned());
+        }
         let initial_version = if self.protocol_v4 {
             CLIENT_PROTOCOL_VERSION
         } else {
@@ -1602,6 +1609,89 @@ impl GatewaySession {
                 )
                 .map_err(CommandFailure::response)
             }
+            ClientCommand::AdoptClosedRecording {
+                request_id,
+                source_session_id,
+                recording_handle,
+            } => {
+                let Some(settings) = self.recording.clone() else {
+                    return send_rejection(
+                        normal,
+                        &request_id,
+                        command_error("this deployment does not record sessions"),
+                    )
+                    .map_err(CommandFailure::response);
+                };
+                // The file is copied, hashed and authenticated while the control channel waits,
+                // so, like recovery, adoption runs only when nothing live could need it.
+                if voice.active.is_some() || active.is_some() {
+                    return send_rejection(
+                        normal,
+                        &request_id,
+                        command_error("recording adoption requires an idle session"),
+                    )
+                    .map_err(CommandFailure::response);
+                }
+                if let Some(live) = self.active_recording.as_ref() {
+                    let recorder = live.recorder.lock().await;
+                    if recorder.handle() == recording_handle && !recorder.is_finalized() {
+                        drop(recorder);
+                        return send_rejection(
+                            normal,
+                            &request_id,
+                            recording_refusal(
+                                "recording_in_use",
+                                "the recording is still open in this session",
+                            ),
+                        )
+                        .map_err(CommandFailure::response);
+                    }
+                }
+                // Adoption consults no provider, so a provider-host exit never cancels it; only
+                // the control channel closing does.
+                let cancellation = CancellationToken::new();
+                let worker_cancellation = cancellation.clone();
+                let adoption = tokio::task::spawn_blocking(move || {
+                    adopt_closed_recording(
+                        &settings,
+                        source_session_id,
+                        &recording_handle,
+                        &worker_cancellation,
+                    )
+                });
+                tokio::pin!(adoption);
+                let joined = tokio::select! {
+                    joined = &mut adoption => joined,
+                    _ = self.control_closed.cancelled() => {
+                        cancellation.cancel();
+                        adoption.await
+                    }
+                };
+                let adopted = joined.unwrap_or_else(|_| {
+                    Err(RecordingAdoptionError::Unavailable(RuntimeError::new(
+                        RuntimeErrorKind::Adapter,
+                        RuntimeStage::Runtime,
+                        "recording adoption did not finish",
+                    )))
+                });
+                let (summary, recovery_capability) = match adopted {
+                    Ok(adopted) => adopted,
+                    Err(refusal) => {
+                        return send_rejection(normal, &request_id, adoption_refusal(refusal))
+                            .map_err(CommandFailure::response);
+                    }
+                };
+                send_accepted(normal, &request_id).map_err(CommandFailure::response)?;
+                send_normal(
+                    normal,
+                    GatewayMessage::RecordingFinalizedV4 {
+                        request_id,
+                        recording: client_recording_summary(&summary),
+                        recovery_capability,
+                    },
+                )
+                .map_err(CommandFailure::response)
+            }
             ClientCommand::ReconcileRecording {
                 request_id,
                 session_id,
@@ -2274,7 +2364,8 @@ fn command_request_id(command: &ClientCommand) -> &str {
         | ClientCommand::ReconcileRecording { request_id, .. }
         | ClientCommand::ReconcileFinalizedRecording { request_id, .. }
         | ClientCommand::ProcessText { request_id, .. }
-        | ClientCommand::RenewMediaLease { request_id } => request_id,
+        | ClientCommand::RenewMediaLease { request_id }
+        | ClientCommand::AdoptClosedRecording { request_id, .. } => request_id,
     }
 }
 
@@ -3141,6 +3232,42 @@ fn client_reconciliation(result: &DiarizationResult) -> ClientRecordingReconcili
             .map(|warning| warning.as_str().to_owned())
             .collect(),
     }
+}
+
+fn recording_refusal(code: &str, message: &str) -> ClientRuntimeError {
+    ClientRuntimeError {
+        code: code.to_owned(),
+        kind: "invalid_state".to_owned(),
+        stage: "runtime".to_owned(),
+        message: message.to_owned(),
+    }
+}
+
+fn adoption_refusal(refusal: RecordingAdoptionError) -> ClientRuntimeError {
+    let (code, message) = match refusal {
+        RecordingAdoptionError::NotFound => (
+            "recording_not_found",
+            "no recording is filed under that handle",
+        ),
+        RecordingAdoptionError::Unreadable => (
+            "recording_unreadable",
+            "the recording could not be authenticated",
+        ),
+        RecordingAdoptionError::NotClosed => (
+            "recording_not_closed",
+            "the recording has no closing record",
+        ),
+        RecordingAdoptionError::Incomplete => (
+            "recording_incomplete",
+            "the recording is incomplete and cannot authorize recovery",
+        ),
+        RecordingAdoptionError::IdentityMismatch => (
+            "recording_identity_mismatch",
+            "the recording does not answer to that session and handle",
+        ),
+        RecordingAdoptionError::Unavailable(error) => return ClientRuntimeError::from(error),
+    };
+    recording_refusal(code, message)
 }
 
 fn command_error(message: &'static str) -> ClientRuntimeError {
@@ -10254,6 +10381,347 @@ max_error_bytes = 65536
             ),
             "the recording is closed, not left open, when the gateway exits"
         );
+    }
+
+    fn adopt_command(request_id: &str, source_session_id: &str, handle: &str) -> String {
+        format!(
+            r#"{{"protocol_version":4,"type":"adopt_closed_recording","request_id":"{request_id}","source_session_id":"{source_session_id}","recording_handle":"{handle}"}}"#
+        )
+    }
+
+    async fn start_and_read_ready(session: GatewaySession) -> (InMemoryGateway, String) {
+        let (input, reader) = duplex(MAX_CLIENT_FRAME_BYTES * 2);
+        let (writer, output) = duplex(MAX_CLIENT_FRAME_BYTES * 2);
+        let task = tokio::spawn(session.run(reader, writer));
+        let mut gateway = InMemoryGateway {
+            input,
+            output: FrameReader::new(output),
+            task,
+        };
+        let ready = gateway.read_message().await;
+        (gateway, ready)
+    }
+
+    async fn adopt(
+        gateway: &mut InMemoryGateway,
+        request_id: &str,
+        source: &str,
+        handle: &str,
+    ) -> Vec<String> {
+        gateway
+            .write(&adopt_command(request_id, source, handle))
+            .await;
+        let marker = format!(r#""request_id":"{request_id}""#);
+        let mut messages = Vec::new();
+        loop {
+            let message = gateway.read_message().await;
+            let done = message.contains(&marker)
+                && (message.contains("recording_finalized")
+                    || message.contains("command_rejected"));
+            messages.push(message);
+            if done {
+                return messages;
+            }
+        }
+    }
+
+    fn recording_handle_of(path: &std::path::Path) -> String {
+        path.file_stem().unwrap().to_str().unwrap().to_owned()
+    }
+
+    /// The client crashed mid-meeting: its gateway's input EOF closed the recording and no
+    /// capability ever left that gateway. A later v4 client adopts the closed file, receives a
+    /// capability recovery accepts, and a replay answers identically.
+    #[tokio::test]
+    async fn a_v4_client_adopts_a_recording_closed_by_input_eof_and_recovers_it() {
+        let key_env = "CONVERSATION_SESSION_RECORDING_KEY_ADOPT_EOF";
+        std::env::set_var(key_env, FAKE_RECORDING_KEY);
+        let directory = TempDir::new().unwrap();
+        let settings = RecordingSettings::new(directory.path(), key_env).unwrap();
+        let (input, input_receiver) = mpsc::channel(8);
+        let session = session_with_interactive_voice(
+            input_receiver,
+            Arc::new(MockGenerationLanguageModel::new(["fixture reply"])),
+            no_speech_frames(),
+        )
+        .with_recording(settings.clone())
+        .with_v4_control();
+        let mut gateway = InMemoryGateway::start(session).await;
+        gateway
+            .write(r#"{"protocol_version":4,"type":"start_voice_session","request_id":"voice-1"}"#)
+            .await;
+        gateway
+            .read_until(|message| message.contains(r#""request_id":"voice-1""#))
+            .await;
+        send_voice_input(&input, recording_frame(1)).await;
+        send_voice_input(&input, recording_frame(2)).await;
+        let path = wait_for_recording_bytes(directory.path(), 128).await;
+        // No stop and no finalize: the control input simply ends.
+        gateway.close().await;
+        drop(input);
+        let handle = recording_handle_of(&path);
+
+        let session = GatewaySession::new(unused_runtime(), status())
+            .with_v4_control()
+            .with_recording(settings)
+            .with_reconciliation(Arc::new(FixtureDiarizer));
+        let (mut gateway, ready) = start_and_read_ready(session).await;
+        assert!(ready.contains(r#""closed_recording_adoption""#), "{ready}");
+
+        let adopted = adopt(&mut gateway, "adopt-1", "1", &handle).await;
+        assert_accepted_message(&adopted[0], "adopt-1");
+        let finalized: serde_json::Value = serde_json::from_str(adopted.last().unwrap()).unwrap();
+        assert_eq!(finalized["type"], "recording_finalized");
+        assert_eq!(finalized["recording"]["recording_handle"], handle.as_str());
+        assert_eq!(
+            finalized["recording"]["encrypted_path"],
+            path.to_str().unwrap()
+        );
+        let capability = &finalized["recovery_capability"];
+        assert_eq!(capability["source_session_id"], "1");
+        assert_eq!(capability["recording_handle"], handle.as_str());
+        assert!(!adopted.last().unwrap().contains(FAKE_RECORDING_KEY));
+
+        let replay = adopt(&mut gateway, "adopt-2", "1", &handle).await;
+        let replayed: serde_json::Value = serde_json::from_str(replay.last().unwrap()).unwrap();
+        assert_eq!(replayed["recording"], finalized["recording"]);
+        assert_eq!(
+            replayed["recovery_capability"],
+            finalized["recovery_capability"]
+        );
+
+        gateway
+            .write(
+                &serde_json::json!({"protocol_version":4,"type":"reconcile_finalized_recording","request_id":"recover-1","capability":capability})
+                    .to_string(),
+            )
+            .await;
+        let recovered = gateway
+            .read_until(|message| {
+                message.contains(r#""request_id":"recover-1""#)
+                    && (message.contains("recording_reconciled")
+                        || message.contains("command_rejected"))
+            })
+            .await;
+        assert!(
+            recovered
+                .last()
+                .unwrap()
+                .contains(r#""type":"recording_reconciled""#),
+            "an adopted capability authorizes recovery: {recovered:?}"
+        );
+        gateway.close().await;
+        std::env::remove_var(key_env);
+    }
+
+    #[tokio::test]
+    async fn adoption_refuses_unknown_mismatched_unclosed_and_tampered_recordings_by_code() {
+        let key_env = "CONVERSATION_SESSION_RECORDING_KEY_ADOPT_REFUSALS";
+        std::env::set_var(key_env, FAKE_RECORDING_KEY);
+        let directory = TempDir::new().unwrap();
+        let settings = RecordingSettings::new(directory.path(), key_env).unwrap();
+        let closed = {
+            let mut recorder =
+                conversation_runtime::SessionRecorder::start(&settings, SessionId::new(1)).unwrap();
+            recorder.finalize().unwrap()
+        };
+        let tampered = {
+            let mut recorder =
+                conversation_runtime::SessionRecorder::start(&settings, SessionId::new(1)).unwrap();
+            let summary = recorder.finalize().unwrap();
+            let mut bytes = std::fs::read(&summary.encrypted_path).unwrap();
+            let last = bytes.len() - 1;
+            bytes[last] ^= 1;
+            std::fs::write(&summary.encrypted_path, bytes).unwrap();
+            summary
+        };
+        // Another gateway process is still writing this one.
+        let open =
+            conversation_runtime::SessionRecorder::start(&settings, SessionId::new(1)).unwrap();
+
+        let session = GatewaySession::new(unused_runtime(), status())
+            .with_v4_control()
+            .with_recording(settings);
+        let mut gateway = InMemoryGateway::start(session).await;
+        for (request, source, handle, code) in [
+            ("unknown", "1", "0".repeat(32), "recording_not_found"),
+            (
+                "mismatch",
+                "2",
+                closed.recording_handle.clone(),
+                "recording_identity_mismatch",
+            ),
+            (
+                "open",
+                "1",
+                open.handle().to_owned(),
+                "recording_not_closed",
+            ),
+            (
+                "tampered",
+                "1",
+                tampered.recording_handle.clone(),
+                "recording_unreadable",
+            ),
+        ] {
+            let refused = adopt(&mut gateway, request, source, &handle).await;
+            assert_eq!(refused.len(), 1, "a refusal mints nothing: {refused:?}");
+            assert_rejected_message(&refused[0], request, code);
+        }
+        let adopted = adopt(&mut gateway, "closed", "1", &closed.recording_handle).await;
+        assert!(adopted
+            .last()
+            .unwrap()
+            .contains(r#""type":"recording_finalized""#));
+        drop(open);
+        gateway.close().await;
+        std::env::remove_var(key_env);
+    }
+
+    /// The session's own recording is refused while it is still open, and once finalized the
+    /// adoption answers with exactly the capability the live finalize issued.
+    #[tokio::test]
+    async fn adoption_refuses_this_sessions_open_recording_and_matches_its_live_finalize() {
+        let key_env = "CONVERSATION_SESSION_RECORDING_KEY_ADOPT_IN_USE";
+        std::env::set_var(key_env, FAKE_RECORDING_KEY);
+        let directory = TempDir::new().unwrap();
+        let (input, input_receiver) = mpsc::channel(8);
+        let session = session_with_interactive_voice(
+            input_receiver,
+            Arc::new(MockGenerationLanguageModel::new(["fixture reply"])),
+            no_speech_frames(),
+        )
+        .with_recording(RecordingSettings::new(directory.path(), key_env).unwrap())
+        .with_v4_control();
+        let mut gateway = InMemoryGateway::start(session).await;
+        gateway
+            .write(r#"{"protocol_version":4,"type":"start_voice_session","request_id":"voice-1"}"#)
+            .await;
+        gateway
+            .read_until(|message| message.contains(r#""request_id":"voice-1""#))
+            .await;
+        send_voice_input(&input, recording_frame(1)).await;
+        let path = wait_for_recording_bytes(directory.path(), 64).await;
+        let handle = recording_handle_of(&path);
+
+        let live = adopt(&mut gateway, "while-live", "1", &handle).await;
+        assert_rejected_message(live.last().unwrap(), "while-live", "invalid_state");
+        assert!(live.last().unwrap().contains("requires an idle session"));
+
+        gateway
+            .write(r#"{"protocol_version":4,"type":"stop_voice_session","request_id":"stop-1"}"#)
+            .await;
+        gateway
+            .read_until(|message| message.contains(r#""request_id":"stop-1""#))
+            .await;
+        let in_use = adopt(&mut gateway, "in-use", "1", &handle).await;
+        assert_rejected_message(in_use.last().unwrap(), "in-use", "recording_in_use");
+
+        gateway
+            .write(
+                r#"{"protocol_version":4,"type":"finalize_recording","request_id":"fin-1","session_id":"1"}"#,
+            )
+            .await;
+        let finalized = gateway
+            .read_until(|message| message.contains(r#""type":"recording_finalized""#))
+            .await;
+        let finalized: serde_json::Value = serde_json::from_str(finalized.last().unwrap()).unwrap();
+        let adopted = adopt(&mut gateway, "after-finalize", "1", &handle).await;
+        let adopted: serde_json::Value = serde_json::from_str(adopted.last().unwrap()).unwrap();
+        assert_eq!(adopted["recording"], finalized["recording"]);
+        assert_eq!(
+            adopted["recovery_capability"],
+            finalized["recovery_capability"]
+        );
+        drop(input);
+        gateway.close().await;
+        std::env::remove_var(key_env);
+    }
+
+    /// A sink flush failure leaves every chunk whole on disk, so the closed file would look
+    /// complete; the close records the failure inside the file and adoption refuses it.
+    #[tokio::test]
+    async fn a_recording_whose_sink_failed_before_input_eof_is_never_adopted() {
+        let key_env = "CONVERSATION_SESSION_RECORDING_KEY_ADOPT_INCOMPLETE";
+        std::env::set_var(key_env, FAKE_RECORDING_KEY);
+        let directory = TempDir::new().unwrap();
+        let settings = RecordingSettings::new(directory.path(), key_env).unwrap();
+        let (input, input_receiver) = mpsc::channel(8);
+        let session = session_with_interactive_voice(
+            input_receiver,
+            Arc::new(MockGenerationLanguageModel::new(["fixture reply"])),
+            no_speech_frames(),
+        )
+        .with_recording(
+            settings
+                .clone()
+                .with_test_sink_fault(conversation_runtime::RecordingSinkFault::Flush),
+        )
+        .with_v4_control();
+        let mut gateway = InMemoryGateway::start(session).await;
+        gateway
+            .write(r#"{"protocol_version":4,"type":"start_voice_session","request_id":"voice-1"}"#)
+            .await;
+        gateway
+            .read_until(|message| message.contains(r#""request_id":"voice-1""#))
+            .await;
+        send_voice_input(&input, recording_frame(1)).await;
+        gateway
+            .read_until(|message| message.contains(r#""type":"voice_session_failed""#))
+            .await;
+        gateway.close().await;
+        drop(input);
+        let path = std::fs::read_dir(directory.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+
+        let session = GatewaySession::new(unused_runtime(), status())
+            .with_v4_control()
+            .with_recording(settings);
+        let mut gateway = InMemoryGateway::start(session).await;
+        let refused = adopt(&mut gateway, "incomplete", "1", &recording_handle_of(&path)).await;
+        assert_rejected_message(
+            refused.last().unwrap(),
+            "incomplete",
+            "recording_incomplete",
+        );
+        gateway.close().await;
+        std::env::remove_var(key_env);
+    }
+
+    #[tokio::test]
+    async fn adoption_is_advertised_and_accepted_only_on_a_v4_connection_that_records() {
+        let key_env = "CONVERSATION_SESSION_RECORDING_KEY_ADOPT_GATING";
+        std::env::set_var(key_env, FAKE_RECORDING_KEY);
+        let directory = TempDir::new().unwrap();
+        let settings = RecordingSettings::new(directory.path(), key_env).unwrap();
+
+        let (mut legacy, ready) = start_and_read_ready(
+            GatewaySession::new(unused_runtime(), status()).with_recording(settings),
+        )
+        .await;
+        assert!(!ready.contains("closed_recording_adoption"), "{ready}");
+        legacy
+            .write(&adopt_command("v3", "1", &"0".repeat(32)))
+            .await;
+        let refused = legacy.read_message().await;
+        assert!(
+            refused.contains("client command could not be decoded"),
+            "{refused}"
+        );
+        legacy.close().await;
+
+        let (mut unrecorded, ready) =
+            start_and_read_ready(GatewaySession::new(unused_runtime(), status()).with_v4_control())
+                .await;
+        assert!(!ready.contains("closed_recording_adoption"), "{ready}");
+        let refused = adopt(&mut unrecorded, "unrecorded", "1", &"0".repeat(32)).await;
+        assert!(refused.last().unwrap().contains("does not record sessions"));
+        unrecorded.close().await;
+        std::env::remove_var(key_env);
     }
 
     #[tokio::test]

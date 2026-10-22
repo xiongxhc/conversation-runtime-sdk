@@ -298,6 +298,37 @@ fn record_fixture(
         .unwrap();
     recorder.finalize_with_capability().unwrap()
 }
+#[test]
+fn a_closed_timed_recording_adopts_with_the_live_summary_and_capability() {
+    let fixture = Fixture::new();
+    let live = record_fixture(&fixture, 3);
+    let adopt = |handle: &str| {
+        adopt_closed_recording(
+            &fixture.settings,
+            SessionId::new(41),
+            handle,
+            &CancellationToken::new(),
+        )
+    };
+    assert_eq!(adopt(&live.0.recording_handle).unwrap(), live);
+
+    let mut recorder = fixture.recorder();
+    recorder
+        .record_capture_metadata(&CaptureMetadata::Epoch(epoch()))
+        .unwrap();
+    recorder
+        .record_capture_metadata(&pair(1, 900_000_000, 2_000_000_000))
+        .unwrap();
+    recorder.record_frame(&timed_frame(0)).unwrap();
+    recorder.record_capture_gap().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    recorder.record_frame(&timed_frame(1)).unwrap();
+    let gapped = recorder.finalize_with_capability().unwrap();
+    assert_eq!(gapped.0.gaps.len(), 1);
+    assert_eq!(adopt(&gapped.0.recording_handle).unwrap(), gapped);
+    fixture.no_snapshot();
+}
+
 async fn alignment(
     fixture: &Fixture,
     capability: FinalizedRecordingCapability,

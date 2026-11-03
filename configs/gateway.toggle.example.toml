@@ -1,0 +1,177 @@
+# One file, two setups. Each part below has a local block and an api block, and
+# `mode` picks which one runs. `mode_overrides` moves single parts to the other
+# side, for example `mode_overrides = { speech = "local" }`.
+#
+# `profile` and `privacy_mode` follow from the selection: every part local is
+# `offline` / `local-only`; any part on api is `online` / `cloud`. Writing them
+# out is allowed only when they agree with the selection.
+#
+# `[media]` carries meeting audio to api ASR. Local ASR listens on this
+# machine's microphone through the voice sidecar: with every part local,
+# `[media]` is dropped; with ASR local and any other part on api, remove it.
+# Provider hosts are started only when a selected block references them.
+#
+# Credentials are never written here; each `credential_env` and `key_env` names
+# an environment variable. Paths, model, and voice identifiers are placeholders.
+schema_version = 3
+mode = "api"
+
+[[provider_hosts]]
+id = "local-language"
+ownership = "external"
+readiness_url = "http://127.0.0.1:11434/api/tags"
+startup_timeout_ms = 5000
+environment = "inherit"
+
+[[provider_hosts]]
+id = "local-speech"
+ownership = "external"
+readiness_url = "http://127.0.0.1:8000/health"
+startup_timeout_ms = 30000
+environment = "inherit"
+
+[language.local]
+backend = "ollama-compatible"
+execution = "local"
+provider = "local-language"
+provider_host = "local-language"
+endpoint = "http://127.0.0.1:11434"
+model = "local-model-id"
+thinking = false
+temperature = 0.7
+seed = 42
+num_predict = 1024
+num_ctx = 8192
+max_assistant_content_bytes = 65536
+
+[language.api]
+backend = "openai-compatible"
+execution = "remote"
+provider = "openai"
+endpoint = "https://api.openai.com/v1"
+model = "operator-supplied-text-model"
+credential_env = "OPENAI_API_KEY"
+thinking = false
+temperature = 0.7
+seed = 42
+num_predict = 1024
+num_ctx = 8192
+max_assistant_content_bytes = 65536
+
+[persona]
+mode = "direct-answer"
+warmth = 80
+humor = 60
+teasing = 40
+initiative = 35
+directness = 80
+intimacy = 30
+verbosity = 20
+follow_up_frequency = 25
+
+[voice]
+response_mode = "external_gate"
+
+[voice.capture]
+device = "system-default"
+
+[voice.turn]
+speech_start_ms = 200
+final_silence_ms = 600
+
+[voice.asr.local]
+backend = "whisperkit"
+execution = "local"
+provider = "local-speech-recognition"
+model_path = "/absolute/path/to/local-asr-model"
+download = false
+
+[voice.asr.api]
+backend = "openai-streaming"
+execution = "remote"
+provider = "openai-streaming"
+endpoint = "wss://api.openai.com/v1/realtime?intent=transcription"
+model = "operator-supplied-transcription-model"
+credential_env = "OPENAI_API_KEY"
+
+[voice.asr.api.server_vad]
+threshold = 0.5
+prefix_padding_ms = 300
+silence_duration_ms = 500
+
+[voice.speech.local]
+backend = "openai-compatible"
+execution = "local"
+provider = "local-speech-synthesis"
+provider_host = "local-speech"
+mode = "streaming"
+streaming_interval = 0.2
+endpoint = "http://127.0.0.1:8000/v1"
+model = "local-speech-model"
+voice = "local-voice"
+speed = 1.0
+language = "auto"
+instructions = "Speak naturally and clearly."
+max_tokens = 128
+repetition_penalty = 1.05
+max_text_bytes = 4096
+max_audio_bytes = 8388608
+
+[voice.speech.api]
+backend = "openai-compatible"
+execution = "remote"
+provider = "openai-compatible-streaming"
+mode = "streaming"
+streaming_interval = 0.2
+endpoint = "https://api.openai.com/v1"
+model = "operator-supplied-tts-model"
+voice = "operator-supplied-voice"
+credential_env = "OPENAI_API_KEY"
+speed = 1.0
+language = "auto"
+instructions = "Speak naturally and clearly."
+max_tokens = 128
+repetition_penalty = 1.05
+max_text_bytes = 4096
+max_audio_bytes = 8388608
+
+# Capture and playback stay on the local sidecar in every mode.
+[voice.audio]
+backend = "managed-sidecar"
+execution = "local"
+provider = "local-audio"
+sidecar_executable = "/absolute/path/to/conversation-voice-sidecar"
+max_error_bytes = 65536
+
+[voice.diarization.local]
+backend = "speechbrain-sidecar"
+execution = "local"
+provider = "speechbrain"
+sidecar_executable = "/absolute/path/to/diarization-sidecar/.venv/bin/diarization-sidecar"
+model = "speechbrain/spkrec-ecapa-voxceleb"
+model_cache_dir = "/absolute/path/to/diarization-model-cache"
+max_speakers = 12
+
+[voice.diarization.api]
+backend = "openai"
+execution = "remote"
+provider = "openai"
+endpoint = "https://api.openai.com/v1"
+model = "operator-supplied-diarization-model"
+credential_env = "OPENAI_API_KEY"
+
+[media]
+bind = "127.0.0.1:9000"
+advertised_endpoint = "tcp://127.0.0.1:9000"
+credential_lifetime_ms = 60000
+reconnect_window_ms = 10000
+max_frames_per_second = 100
+max_payload_bytes = 16384
+max_outbound_queue_bytes = 262144
+max_outbound_queue_ms = 10000
+
+# Encrypted session recording; see gateway.meeting-online.example.toml for the
+# key requirements.
+[recording]
+directory = "/absolute/private/path/recordings"
+key_env = "MEETING_RECORDING_KEY"

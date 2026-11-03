@@ -94,6 +94,10 @@ pub struct GatewayConfig {
     recording: Option<RecordingConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     media: Option<MediaConfig>,
+    /// The side `mode` selected for each part. All `None` in a file without `mode`, where the
+    /// profile alone decides where every part runs.
+    #[serde(skip)]
+    part_modes: PartModes,
 }
 
 pub struct GatewayAdapters {
@@ -424,6 +428,7 @@ impl GatewayDeploymentConfig {
             voice: None,
             recording: None,
             media: None,
+            part_modes: PartModes::default(),
         };
         config
             .provider_hosts
@@ -540,7 +545,7 @@ impl GatewayConfig {
         require_declared_execution(
             self.language.execution,
             language_execution(self.language.backend),
-            profile_execution,
+            self.part_modes.language.unwrap_or(profile_execution),
             "language",
         )?;
         validate_provider_label(&self.language.provider, "language")?;
@@ -577,6 +582,7 @@ impl GatewayConfig {
         let components = match self.voice.as_ref() {
             Some(voice) => voice.validate(
                 profile_execution,
+                self.part_modes,
                 language_component,
                 memory_component.clone(),
             )?,
@@ -589,7 +595,14 @@ impl GatewayConfig {
         if let Some(recording) = self.recording.as_ref() {
             recording.validate()?;
         }
-        if profile == RuntimeProfile::Online && voice_configured && self.media.is_none() {
+        // Remote ASR hears audio only through the media bridge. Local ASR runs inside the voice
+        // sidecar on this machine's microphone, so an online deployment may keep it local.
+        if self
+            .voice
+            .as_ref()
+            .is_some_and(|voice| voice.asr.execution == ExecutionConfig::Remote)
+            && self.media.is_none()
+        {
             return Err(config_error(
                 "online voice requires a media bridge configuration",
             ));
@@ -949,6 +962,7 @@ impl VoiceConfig {
     fn validate(
         &self,
         profile_execution: ExecutionConfig,
+        part_modes: PartModes,
         language: ComponentDescriptor,
         memory: Option<ComponentDescriptor>,
     ) -> Result<Vec<ComponentDescriptor>, GatewayConfigError> {
@@ -960,13 +974,14 @@ impl VoiceConfig {
         require_declared_execution(
             self.asr.execution,
             asr_execution(self.asr.backend),
-            profile_execution,
+            part_modes.asr.unwrap_or(profile_execution),
             "voice ASR",
         )?;
+        let speech_expected = part_modes.speech.unwrap_or(profile_execution);
         require_declared_execution(
             self.speech.execution,
-            speech_execution(self.speech.backend, profile_execution),
-            profile_execution,
+            speech_execution(self.speech.backend, speech_expected),
+            speech_expected,
             "voice speech",
         )?;
         // Audio capture and playback stay on the local sidecar in every
@@ -1075,6 +1090,9 @@ impl VoiceConfig {
         // Diarization ranks after memory, so it is appended last and every existing component
         // keeps the position the wire already expects.
         if let Some(diarization) = self.diarization.as_ref() {
+            if let Some(selected) = part_modes.diarization {
+                require_execution(diarization.execution, selected, "voice diarization")?;
+            }
             components.push(diarization.validate(profile_execution)?);
         }
         Ok(components)
@@ -1253,8 +1271,217 @@ fn load_toml(path: &Path) -> Result<GatewayConfig, GatewayConfigError> {
     }
     let contents = std::str::from_utf8(&contents)
         .map_err(|_| config_error("gateway configuration file was not valid UTF-8"))?;
-    toml::from_str(contents)
-        .map_err(|_| config_error("gateway configuration file was not valid TOML"))
+    let document: toml::Table = toml::from_str(contents).map_err(invalid_toml)?;
+    let Some((document, part_modes)) = resolve_mode(document)? else {
+        // A file without `mode` is read exactly as it always was.
+        return toml::from_str(contents).map_err(invalid_toml);
+    };
+    // The resolved document goes back through the same text deserializer, so a selected block
+    // is read by exactly the rules that read the section a file without `mode` writes directly.
+    let contents = toml::to_string(&document).map_err(invalid_toml)?;
+    let mut config: GatewayConfig = toml::from_str(&contents).map_err(invalid_toml)?;
+    config.part_modes = part_modes;
+    Ok(config)
+}
+
+fn invalid_toml<E>(_: E) -> GatewayConfigError {
+    config_error("gateway configuration file was not valid TOML")
+}
+
+/// Where each switchable part runs, as `mode` and `mode_overrides` selected it.
+#[derive(Clone, Copy, Debug, Default)]
+struct PartModes {
+    language: Option<ExecutionConfig>,
+    asr: Option<ExecutionConfig>,
+    speech: Option<ExecutionConfig>,
+    diarization: Option<ExecutionConfig>,
+}
+
+/// The parts `mode` switches, each named as in `mode_overrides`, with the table it sits under.
+const SWITCHED_PARTS: [(&str, Option<&str>); 4] = [
+    ("language", None),
+    ("asr", Some("voice")),
+    ("speech", Some("voice")),
+    ("diarization", Some("voice")),
+];
+
+/// `mode = "local" | "api"` picks one of two blocks per part, so one file holds a local and an
+/// API setup and one line chooses between them: `[language.local]` / `[language.api]`, and the
+/// same under `[voice.asr]`, `[voice.speech]` and `[voice.diarization]`. `mode_overrides` moves
+/// single parts to the other side. The chosen block replaces its section, `profile` and
+/// `privacy_mode` follow from the selection, `[media]` is kept only for api ASR, and only the
+/// provider hosts a chosen block references are kept. Returns `None` for a file without `mode`.
+fn resolve_mode(
+    mut document: toml::Table,
+) -> Result<Option<(toml::Table, PartModes)>, GatewayConfigError> {
+    let Some(mode) = document.remove("mode") else {
+        if document.contains_key("mode_overrides") {
+            return Err(config_error("mode_overrides requires mode"));
+        }
+        return Ok(None);
+    };
+    let mode =
+        selected_side(&mode).ok_or_else(|| config_error("mode must be \"local\" or \"api\""))?;
+    if document
+        .get("schema_version")
+        .and_then(toml::Value::as_integer)
+        != Some(3)
+    {
+        return Err(config_error("mode requires schema_version 3"));
+    }
+    let mut overrides = match document.remove("mode_overrides") {
+        None => toml::Table::new(),
+        Some(toml::Value::Table(overrides)) => overrides,
+        Some(_) => return Err(config_error("mode_overrides must be a table")),
+    };
+
+    let mut part_modes = PartModes::default();
+    let mut first_api_part = None;
+    for (part, parent) in SWITCHED_PARTS {
+        let section_name =
+            parent.map_or_else(|| part.to_owned(), |parent| format!("{parent}.{part}"));
+        let named = overrides.remove(part);
+        let side = match named.as_ref() {
+            None => mode,
+            Some(value) => selected_side(value).ok_or_else(|| {
+                config_error(format!(
+                    "mode_overrides {part} must be \"local\" or \"api\""
+                ))
+            })?,
+        };
+        let parent_table = match parent {
+            None => Some(&mut document),
+            Some(parent) => document.get_mut(parent).and_then(toml::Value::as_table_mut),
+        };
+        let Some(section) = parent_table.and_then(|table| table.get_mut(part)) else {
+            if named.is_some() {
+                return Err(config_error(format!(
+                    "mode_overrides names {part}, but [{section_name}] is not configured"
+                )));
+            }
+            continue;
+        };
+        let blocks = section
+            .as_table_mut()
+            .filter(|blocks| blocks.keys().all(|name| name == "local" || name == "api"))
+            .ok_or_else(|| {
+                config_error(format!(
+                    "with mode set, [{section_name}] holds only [{section_name}.local] and [{section_name}.api]"
+                ))
+            })?;
+        // Both blocks are read for shape now, so a typo on the side not running fails before
+        // anyone flips to it. Environment, credentials, and paths are checked only for the
+        // side that runs.
+        for (name, block) in blocks.iter() {
+            if !block_shape_is_valid(part, block) {
+                return Err(config_error(format!(
+                    "[{section_name}.{name}] has an unknown, missing, or mistyped key"
+                )));
+            }
+        }
+        let name = side_name(side);
+        *section = blocks.remove(name).ok_or_else(|| {
+            config_error(format!(
+                "mode selects {name} for {part}, but [{section_name}.{name}] is missing"
+            ))
+        })?;
+        if side == ExecutionConfig::Remote && first_api_part.is_none() {
+            first_api_part = Some(part);
+        }
+        *match part {
+            "language" => &mut part_modes.language,
+            "asr" => &mut part_modes.asr,
+            "speech" => &mut part_modes.speech,
+            _ => &mut part_modes.diarization,
+        } = Some(side);
+    }
+    if !overrides.is_empty() {
+        return Err(config_error(
+            "mode_overrides may only name language, asr, speech, or diarization",
+        ));
+    }
+
+    // Any part on the API side makes the deployment online; an explicit value must agree.
+    let (profile, privacy_mode, reason) = match first_api_part {
+        Some(part) => ("online", "cloud", format!("mode selects api for {part}")),
+        None => (
+            "offline",
+            "local-only",
+            "mode selects local for every part".to_owned(),
+        ),
+    };
+    for (key, derived) in [("profile", profile), ("privacy_mode", privacy_mode)] {
+        match document.get(key) {
+            None => {
+                document.insert(key.to_owned(), toml::Value::String(derived.to_owned()));
+            }
+            Some(value) if value.as_str() == Some(derived) => {}
+            Some(_) => {
+                return Err(config_error(format!(
+                    "{key} must be \"{derived}\" because {reason}"
+                )));
+            }
+        }
+    }
+
+    // The media bridge feeds api ASR; local ASR listens on the voice sidecar's microphone. An
+    // all-local file simply drops the bridge. An online one is refused, because it would admit
+    // a meeting through the bridge and then hear the host microphone instead.
+    if part_modes.asr == Some(ExecutionConfig::Local) && document.contains_key("media") {
+        if let Some(part) = first_api_part {
+            return Err(config_error(format!(
+                "asr is local while mode selects api for {part}, and local asr hears the voice sidecar microphone rather than [media]: remove [media] or select api for asr in mode_overrides"
+            )));
+        }
+        document.remove("media");
+    }
+
+    // A host only an unselected block uses is not started.
+    let referenced: BTreeSet<String> = [
+        document.get("language"),
+        document.get("voice").and_then(|voice| voice.get("speech")),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|section| section.get("provider_host")?.as_str().map(str::to_owned))
+    .collect();
+    if let Some(toml::Value::Array(hosts)) = document.get_mut("provider_hosts") {
+        hosts.retain(|host| {
+            host.get("id")
+                .and_then(toml::Value::as_str)
+                .is_some_and(|id| referenced.contains(id))
+        });
+    }
+    Ok(Some((document, part_modes)))
+}
+
+fn selected_side(value: &toml::Value) -> Option<ExecutionConfig> {
+    match value.as_str()? {
+        "local" => Some(ExecutionConfig::Local),
+        "api" => Some(ExecutionConfig::Remote),
+        _ => None,
+    }
+}
+
+/// Whether a block deserializes as the section it would replace. Only the outcome is kept: a
+/// deserializer message can quote the offending value.
+fn block_shape_is_valid(part: &str, block: &toml::Value) -> bool {
+    let Ok(text) = toml::to_string(block) else {
+        return false;
+    };
+    match part {
+        "language" => toml::from_str::<LanguageConfig>(&text).is_ok(),
+        "asr" => toml::from_str::<VoiceAsrConfig>(&text).is_ok(),
+        "speech" => toml::from_str::<VoiceSpeechConfig>(&text).is_ok(),
+        _ => toml::from_str::<VoiceDiarizationConfig>(&text).is_ok(),
+    }
+}
+
+const fn side_name(side: ExecutionConfig) -> &'static str {
+    match side {
+        ExecutionConfig::Local => "local",
+        ExecutionConfig::Remote => "api",
+    }
 }
 
 #[cfg(unix)]
@@ -1464,13 +1691,14 @@ const fn asr_execution(backend: VoiceAsrBackend) -> ExecutionConfig {
 }
 
 /// The OpenAI-compatible synthesizer serves a supervised loopback server and a
-/// remote API alike, so the profile alone decides where it runs.
+/// remote API alike, so the profile, or the side `mode` selected, alone decides
+/// where it runs.
 const fn speech_execution(
     backend: VoiceSpeechBackend,
-    profile: ExecutionConfig,
+    expected: ExecutionConfig,
 ) -> ExecutionConfig {
     match backend {
-        VoiceSpeechBackend::OpenaiCompatible => profile,
+        VoiceSpeechBackend::OpenaiCompatible => expected,
     }
 }
 

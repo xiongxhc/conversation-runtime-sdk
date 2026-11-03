@@ -863,7 +863,7 @@ async fn production_binary_refuses_the_scripted_configuration() {
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stderr).trim(),
-        "gateway configuration failed"
+        "gateway configuration failed: gateway configuration file was not valid TOML"
     );
     peers.stop().await;
 }

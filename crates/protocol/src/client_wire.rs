@@ -2413,6 +2413,17 @@ fn validate_gateway_message(
             Ok(())
         }
         GatewayMessage::VoiceEvent { event } => {
+            if protocol_version < FINALIZED_RECORDING_PROTOCOL_VERSION
+                && matches!(
+                    event,
+                    ClientVoiceSessionEvent::VoiceRecordingLimit { .. }
+                        | ClientVoiceSessionEvent::VoiceCaptureHealth { .. }
+                )
+            {
+                return Err(ClientWireError::UnsupportedProtocolVersion(
+                    protocol_version,
+                ));
+            }
             if protocol_version < RUNTIME_PROFILE_PROTOCOL_VERSION
                 && matches!(
                     event,

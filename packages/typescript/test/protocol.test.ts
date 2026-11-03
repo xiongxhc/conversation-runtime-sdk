@@ -1733,3 +1733,35 @@ test("media lease renewal capability needs version three and a distinct loss cod
   assert.equal(failed.type, "voice_event");
   if (failed.type === "voice_event" && failed.event.type === "voice_session_failed") assert.equal(failed.event.error.code, "media_lease_lost");
 });
+
+test("recording limits and capture health are version four voice events with closed vocabularies", () => {
+  const voiceEvent = (event: Record<string, unknown>, version = 4) => ({ protocol_version: version, type: "voice_event", event });
+  const limit = parseGatewayMessage(voiceEvent({ type: "voice_recording_limit", session_id: "7", limit: "free_disk_space", state: "stopped" }), 4);
+  assert.deepEqual(limit, { type: "voice_event", event: { type: "voice_recording_limit", sessionId: 7n, limit: "free_disk_space", state: "stopped" } });
+  for (const kind of ["free_disk_space", "duration", "size", "silence"]) {
+    for (const state of ["warning", "stopped"]) {
+      const parsed = parseGatewayMessage(voiceEvent({ type: "voice_recording_limit", session_id: "7", limit: kind, state }), 4);
+      if (parsed.type !== "voice_event" || parsed.event.type !== "voice_recording_limit") assert.fail("not a recording limit");
+      assert.equal(parsed.event.limit, kind);
+      assert.equal(parsed.event.state, state);
+    }
+  }
+  const health = parseGatewayMessage(voiceEvent({ type: "voice_capture_health", session_id: "7", mostly_zero: true, longest_gap_ms: 2_500 }), 4);
+  assert.deepEqual(health, { type: "voice_event", event: { type: "voice_capture_health", sessionId: 7n, mostlyZero: true, longestGapMs: 2_500 } });
+
+  for (const version of [1, 2, 3] as const) {
+    assert.throws(() => parseGatewayMessage(voiceEvent({ type: "voice_recording_limit", session_id: "7", limit: "size", state: "warning" }, version), version), /protocol version 4/);
+    assert.throws(() => parseGatewayMessage(voiceEvent({ type: "voice_capture_health", session_id: "7", mostly_zero: false, longest_gap_ms: 0 }, version), version), /protocol version 4/);
+  }
+  for (const event of [
+    { type: "voice_recording_limit", session_id: "7", limit: "disk", state: "stopped" },
+    { type: "voice_recording_limit", session_id: "7", limit: "size", state: "paused" },
+    { type: "voice_recording_limit", session_id: "7", limit: "size", state: "warning", extra: 1 },
+    { type: "voice_capture_health", session_id: "7", mostly_zero: "yes", longest_gap_ms: 0 },
+    { type: "voice_capture_health", session_id: "7", mostly_zero: false, longest_gap_ms: -1 },
+    { type: "voice_capture_health", session_id: "7", mostly_zero: false, longest_gap_ms: "10" },
+    { type: "voice_capture_health", session_id: "7", mostly_zero: false },
+  ]) {
+    assert.throws(() => parseGatewayMessage(voiceEvent(event), 4), JSON.stringify(event));
+  }
+});

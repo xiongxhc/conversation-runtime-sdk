@@ -145,6 +145,14 @@ max_speakers = 12
 # passphrase or any other short value is refused when a session starts: the
 # recording's published key identifier is an unsalted digest of this value, so
 # anything guessable would let a holder of the summary test candidates offline.
+#
+# Safety limits are optional; each absent key keeps the default shown. A limit
+# closes the recording cleanly and leaves the voice session running.
 [recording]
 directory = "/absolute/private/path/recordings"
 key_env = "MEETING_RECORDING_KEY"
+# min_free_disk_mb = 512        # stop when free space falls below this
+# max_duration_minutes = 480    # warn at 90%, stop at the limit
+# max_size_mb = 4096            # warn at 90%, stop just below the limit
+# silence_stop_minutes = 30     # off unless set
+# silence_stop_grace_seconds = 60

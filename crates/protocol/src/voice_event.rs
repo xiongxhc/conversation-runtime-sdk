@@ -42,6 +42,48 @@ pub enum RecoveryDisposition {
     NewSession,
 }
 
+/// A recording safety limit. Each one stops the recording cleanly, never the voice session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum RecordingLimit {
+    /// Free space at the recording directory fell below the configured floor.
+    FreeDiskSpace,
+    /// The recording's media duration reached the configured maximum.
+    Duration,
+    /// The encrypted file reached the configured maximum size.
+    Size,
+    /// The opt-in silence auto-stop: no audio above the level threshold for too long.
+    Silence,
+}
+
+impl RecordingLimit {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FreeDiskSpace => "free_disk_space",
+            Self::Duration => "duration",
+            Self::Size => "size",
+            Self::Silence => "silence",
+        }
+    }
+}
+
+/// Whether a limit is approaching or has stopped the recording.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum RecordingLimitState {
+    Warning,
+    Stopped,
+}
+
+impl RecordingLimitState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Warning => "warning",
+            Self::Stopped => "stopped",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum VoiceSessionEvent {
@@ -114,6 +156,19 @@ pub enum VoiceSessionEvent {
     },
     SessionEnded {
         session_id: SessionId,
+    },
+    /// A recording safety limit warned or stopped the recording. Never terminal.
+    RecordingLimit {
+        session_id: SessionId,
+        limit: RecordingLimit,
+        state: RecordingLimitState,
+    },
+    /// Content-free live capture health: whether recent capture is mostly exact-zero samples,
+    /// and the longest unbroken span without delivered capture audio so far.
+    CaptureHealth {
+        session_id: SessionId,
+        mostly_zero: bool,
+        longest_gap_ms: u64,
     },
 }
 

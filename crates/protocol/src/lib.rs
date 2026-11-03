@@ -89,5 +89,6 @@ pub use quality::{
     MAX_HISTORY_MESSAGE_COUNT,
 };
 pub use voice_event::{
-    PlaybackState, RecoveryDisposition, VoiceActivity, VoiceSessionEvent, VoiceTimingMilestone,
+    PlaybackState, RecordingLimit, RecordingLimitState, RecoveryDisposition, VoiceActivity,
+    VoiceSessionEvent, VoiceTimingMilestone,
 };

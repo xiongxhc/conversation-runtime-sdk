@@ -12,11 +12,12 @@ use conversation_protocol::{
     MemoryId, MemoryInspection, MemoryKind, MemoryProvenance, MemoryProvenanceKind, MemoryRecord,
     MemoryRetention, MemoryRetrievalReason, MemoryRetrievalTrace, MemoryTraceExclusions,
     MemoryTraceItem, PersonaLevel, PersonaProfile, PlaybackState, PrivacyMode, PrivacySummary,
-    QualityDecision, RecoveryDisposition, ResponseControls, RetrievalTraceId, RuntimeError,
-    RuntimeErrorKind, RuntimeEvent, RuntimeStage, RuntimeStatus, SessionId, SilencePolicy,
-    SpeechPace, TurnId, UnixTimestampMillis, VoiceActivity, VoiceSessionEvent,
-    VoiceTimingMilestone, CONTEXT_SEED_PROTOCOL_VERSION,
-    DEFAULT_CLIENT_PROTOCOL_VERSION as CLIENT_PROTOCOL_VERSION, LEGACY_CLIENT_PROTOCOL_VERSION,
+    QualityDecision, RecordingLimit, RecordingLimitState, RecoveryDisposition, ResponseControls,
+    RetrievalTraceId, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage, RuntimeStatus,
+    SessionId, SilencePolicy, SpeechPace, TurnId, UnixTimestampMillis, VoiceActivity,
+    VoiceSessionEvent, VoiceTimingMilestone, CONTEXT_SEED_PROTOCOL_VERSION,
+    DEFAULT_CLIENT_PROTOCOL_VERSION as CLIENT_PROTOCOL_VERSION,
+    FINALIZED_RECORDING_PROTOCOL_VERSION, LEGACY_CLIENT_PROTOCOL_VERSION,
     MAX_CLIENT_COMPONENT_DESCRIPTORS, MAX_CLIENT_DEVICE_LABEL_BYTES, MAX_CLIENT_DIARIZED_SEGMENTS,
     MAX_CLIENT_DIARIZED_SEGMENT_TEXT_BYTES, MAX_CLIENT_FRAME_BYTES,
     MAX_CLIENT_PROCESSED_OUTPUT_BYTES, MAX_CLIENT_PROVIDER_LABEL_BYTES, MAX_CLIENT_RECORDING_GAPS,
@@ -641,6 +642,100 @@ fn media_lease_renewal_is_a_version_three_command_with_a_bounded_expiry_reply() 
         assert!(matches!(
             encode_gateway_message_for_version(&invalid, RUNTIME_PROFILE_PROTOCOL_VERSION),
             Err(ClientWireError::InvalidMediaLease)
+        ));
+    }
+}
+
+#[test]
+fn recording_limits_and_capture_health_are_version_four_voice_events() {
+    let limit = GatewayMessage::VoiceEvent {
+        event: ClientVoiceSessionEvent::try_from(VoiceSessionEvent::RecordingLimit {
+            session_id: SessionId::new(7),
+            limit: RecordingLimit::FreeDiskSpace,
+            state: RecordingLimitState::Stopped,
+        })
+        .unwrap(),
+    };
+    assert_eq!(
+        gateway_value_for_version(&limit, FINALIZED_RECORDING_PROTOCOL_VERSION)["event"],
+        serde_json::json!({
+            "type": "voice_recording_limit",
+            "session_id": "7",
+            "limit": "free_disk_space",
+            "state": "stopped",
+        })
+    );
+    for (limit_kind, name) in [
+        (RecordingLimit::FreeDiskSpace, "free_disk_space"),
+        (RecordingLimit::Duration, "duration"),
+        (RecordingLimit::Size, "size"),
+        (RecordingLimit::Silence, "silence"),
+    ] {
+        for (state, state_name) in [
+            (RecordingLimitState::Warning, "warning"),
+            (RecordingLimitState::Stopped, "stopped"),
+        ] {
+            let event = ClientVoiceSessionEvent::try_from(VoiceSessionEvent::RecordingLimit {
+                session_id: SessionId::new(7),
+                limit: limit_kind,
+                state,
+            })
+            .unwrap();
+            let value = gateway_value_for_version(
+                &GatewayMessage::VoiceEvent { event },
+                FINALIZED_RECORDING_PROTOCOL_VERSION,
+            );
+            assert_eq!(value["event"]["limit"], name);
+            assert_eq!(value["event"]["state"], state_name);
+        }
+    }
+
+    let health = GatewayMessage::VoiceEvent {
+        event: ClientVoiceSessionEvent::try_from(VoiceSessionEvent::CaptureHealth {
+            session_id: SessionId::new(7),
+            mostly_zero: true,
+            longest_gap_ms: 2_500,
+        })
+        .unwrap(),
+    };
+    assert_eq!(
+        gateway_value_for_version(&health, FINALIZED_RECORDING_PROTOCOL_VERSION)["event"],
+        serde_json::json!({
+            "type": "voice_capture_health",
+            "session_id": "7",
+            "mostly_zero": true,
+            "longest_gap_ms": 2_500,
+        })
+    );
+
+    // v1-v3 frames are unchanged: neither event exists there.
+    for version in [
+        LEGACY_CLIENT_PROTOCOL_VERSION,
+        CONTEXT_SEED_PROTOCOL_VERSION,
+        RUNTIME_PROFILE_PROTOCOL_VERSION,
+    ] {
+        assert!(matches!(
+            encode_gateway_message_for_version(&limit, version),
+            Err(ClientWireError::UnsupportedProtocolVersion(_))
+        ));
+        assert!(matches!(
+            encode_gateway_message_for_version(&health, version),
+            Err(ClientWireError::UnsupportedProtocolVersion(_))
+        ));
+    }
+
+    // The vocabulary is closed.
+    for (limit, state) in [("disk", "stopped"), ("size", "paused"), ("", "")] {
+        let invalid = GatewayMessage::VoiceEvent {
+            event: ClientVoiceSessionEvent::VoiceRecordingLimit {
+                session_id: SessionId::new(7),
+                limit: limit.to_owned(),
+                state: state.to_owned(),
+            },
+        };
+        assert!(matches!(
+            encode_gateway_message_for_version(&invalid, FINALIZED_RECORDING_PROTOCOL_VERSION),
+            Err(ClientWireError::InvalidVoiceEvent)
         ));
     }
 }

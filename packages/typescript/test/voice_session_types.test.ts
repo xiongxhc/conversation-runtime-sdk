@@ -55,6 +55,27 @@ async function onlyPinnedFourExposesCaptureEvidence(): Promise<void> {
   }
 }
 
+async function onlyPinnedFourReportsRecordingLimitsAndCaptureHealth(): Promise<void> {
+  const four = await (await RuntimeClient.connect(transport, 4)).startVoiceSession();
+  for await (const event of four.events()) {
+    if (event.type === "voice_recording_limit") {
+      const limit: "free_disk_space" | "duration" | "size" | "silence" = event.limit;
+      const state: "warning" | "stopped" = event.state;
+      assert.ok(limit && state);
+    }
+    if (event.type === "voice_capture_health") {
+      const mostlyZero: boolean = event.mostlyZero;
+      const longestGapMs: number = event.longestGapMs;
+      assert.ok(mostlyZero || longestGapMs >= 0);
+    }
+  }
+  const three = await (await RuntimeClient.connect(transport, 3)).startVoiceSession();
+  for await (const event of three.events()) {
+    // @ts-expect-error recording limits are not part of the v3 public events.
+    if (event.type === "voice_recording_limit") assert.fail();
+  }
+}
+
 async function timedMediaVersionsAndConditionalStopStayExact(): Promise<void> {
   const client = await RuntimeClient.connect(transport, 4);
   const timed = await client.startTimedVoiceSession({
@@ -83,5 +104,6 @@ test("version-typed voice sessions retain final-turn nullability", () => {
   assert.ok(versionThreeFinalTurnIdRequiresNullHandling);
   assert.ok(unpinnedFinalTurnIdRequiresNullHandling);
   assert.ok(onlyPinnedFourExposesCaptureEvidence);
+  assert.ok(onlyPinnedFourReportsRecordingLimitsAndCaptureHealth);
   assert.ok(timedMediaVersionsAndConditionalStopStayExact);
 });

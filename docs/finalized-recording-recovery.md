@@ -100,6 +100,56 @@ its writer died before closing it), `recording_incomplete` (the recorder's sink 
 and `recording_in_use`. Repeating an adoption for an unchanged file returns the same summary
 and capability; there is no "already adopted" state to lose or to refuse a retry with.
 
+## Recording safety limits and live capture health
+
+Every recording runs under four limits. A limit never tears a file and never ends the voice
+session: the recorder appends the same closing chunk a finalize writes first, stops being fed,
+and the conversation continues unrecorded. The client still finalizes (or later adopts) the
+recording as usual, and a stopped recording is issued its summary and capability like any
+other. Until it is finalized, a new voice session is refused as before.
+
+| `[recording]` key | Default | Bounds | Behaviour |
+|---|---|---|---|
+| `min_free_disk_mb` | 512 | 64..=1048576 | stop when free space at the directory falls below it |
+| `max_duration_minutes` | 480 | 1..=1440 | warn at 90% of the media duration, stop at the limit |
+| `max_size_mb` | 4096 | 16..=8191 | warn at 90%, stop with about 256 KiB of room left |
+| `silence_stop_minutes` | absent (off) | 1..=1440 | warn after that much quiet audio |
+| `silence_stop_grace_seconds` | 60 | 10..=3600 | stop after this much more; needs `silence_stop_minutes` |
+
+The keys are optional within the existing schema 3 `[recording]` section, so a file written
+before they existed loads unchanged; unknown keys are still refused. The size bound keeps an
+auto-stopped file under the 8 GiB finalized-recovery admission. Free space is read at most once
+per second of recorded media, from the space available to the gateway's account; where it
+cannot be read (non-Unix hosts, a failing `statvfs`) the floor is not enforced and a full disk
+still surfaces as the existing recording failure. Quiet means every sample of a frame is at or
+below about -50 dBFS; any louder frame re-arms the silence stop. The silence stop is off by
+default because long silences are normal in a conversation with a companion.
+
+While recording, the recorder also judges capture health without reading content. Capture is
+**mostly zero** when fewer than 25% of the samples in a five-second window of audio are nonzero:
+a live input delivers dither even in a quiet room, while a denied permission or a dead device
+often delivers buffers of exact zeros that look like success. The **longest gap** is the
+longest time so far with capture active and no audio delivered, measured on arrival from the
+end of the last frame (or an explicit discontinuity) to the next frame, including a gap that
+is still open. Time before the first frame and deliberate capture pauses are not gaps. A report
+is sent when the mostly-zero state changes, or when the longest gap reaches 2 s and at least
+doubles since the last report, so a long stall is reported a logarithmic number of times.
+
+On an explicit-v4 connection these are two non-terminal voice events:
+
+```json
+{"type":"voice_recording_limit","session_id":"7","limit":"free_disk_space|duration|size|silence","state":"warning|stopped"}
+{"type":"voice_capture_health","session_id":"7","mostly_zero":true,"longest_gap_ms":2500}
+```
+
+Both are exact-key with closed vocabularies; `longest_gap_ms` is a JSON number like other voice
+timing fields. The SDK exposes them as `VoiceRecordingLimitEvent` (`limit`, `state`) and
+`VoiceCaptureHealthEvent` (`mostlyZero`, `longestGapMs`) on `RuntimeClient<4>` voice sessions
+only, and refuses them on any other version. v1–v3 frames are unchanged: a default connection
+receives neither event, and learns of a limit stop only through the frame a failed recording
+write already produces, a non-terminal `voice_session_failed` with code `adapter_failure`,
+stage `audio_capture` and recovery `continue_session`. The encrypted file format is unchanged.
+
 ## Sample provenance in reconciled v4 segments
 
 `reconcileFinalizedRecording` snapshots the supplied capability at the call boundary.

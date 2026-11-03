@@ -2344,6 +2344,81 @@ fn the_recording_section_requires_an_absolute_directory_and_a_present_key() {
 }
 
 #[test]
+fn the_recording_section_takes_bounded_safety_limits_with_conservative_defaults() {
+    use conversation_runtime::{RecordingLimits, SilenceAutoStop};
+
+    std::env::set_var(RECORDING_KEY_ENV, ONLINE_CREDENTIAL_VALUE);
+    let fixture = tempfile::tempdir().unwrap();
+    let recording_directory = tempfile::tempdir().unwrap();
+    let base = schema_v3_offline_config();
+    let section = |extra: &str| {
+        format!(
+            "{base}\n[recording]\ndirectory = \"{}\"\nkey_env = \"{RECORDING_KEY_ENV}\"\n{extra}",
+            recording_directory.path().display()
+        )
+    };
+    let limits = |extra: &str| {
+        let path = write_config(fixture.path(), &section(extra));
+        *GatewayConfig::load(&path)
+            .unwrap()
+            .recording
+            .expect("recording is configured")
+            .limits()
+    };
+    const MIB: u64 = 1024 * 1024;
+
+    // A schema 3 file written before the limits existed loads unchanged, under the defaults.
+    assert_eq!(limits(""), RecordingLimits::default());
+    assert_eq!(limits("").silence_auto_stop(), None);
+
+    assert_eq!(
+        limits(
+            "min_free_disk_mb = 1024\nmax_duration_minutes = 60\nmax_size_mb = 2048\n\
+             silence_stop_minutes = 30\nsilence_stop_grace_seconds = 120\n"
+        ),
+        RecordingLimits::new(
+            1024 * MIB,
+            60 * 60 * 1_000,
+            2048 * MIB,
+            Some(SilenceAutoStop::new(30 * 60 * 1_000, 120_000).unwrap()),
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        limits("silence_stop_minutes = 10\n").silence_auto_stop(),
+        Some(SilenceAutoStop::new(10 * 60 * 1_000, 60_000).unwrap())
+    );
+
+    for (extra, reason) in [
+        ("min_free_disk_mb = 63\n", "below the floor bound"),
+        ("min_free_disk_mb = 1048577\n", "above the floor bound"),
+        ("max_duration_minutes = 0\n", "zero duration"),
+        ("max_duration_minutes = 1441\n", "over a day"),
+        ("max_size_mb = 15\n", "below the size bound"),
+        ("max_size_mb = 8192\n", "beyond finalized recovery"),
+        ("silence_stop_minutes = 0\n", "zero silence"),
+        ("silence_stop_minutes = 1441\n", "silence over a day"),
+        (
+            "silence_stop_minutes = 5\nsilence_stop_grace_seconds = 9\n",
+            "short grace",
+        ),
+        (
+            "silence_stop_minutes = 5\nsilence_stop_grace_seconds = 3601\n",
+            "long grace",
+        ),
+        (
+            "silence_stop_grace_seconds = 60\n",
+            "grace without silence stop",
+        ),
+        ("max_duration_minutes = -1\n", "negative"),
+        ("silence_auto_stop = true\n", "unknown key"),
+    ] {
+        let path = write_config(fixture.path(), &section(extra));
+        assert!(GatewayConfig::validate(&path).is_err(), "accepted {reason}");
+    }
+}
+
+#[test]
 fn model_and_voice_identifiers_are_bounded_in_both_profiles() {
     set_online_credential();
     let fixture = tempfile::tempdir().unwrap();

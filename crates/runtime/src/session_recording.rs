@@ -51,6 +51,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+#[cfg(any(test, feature = "recording-test-support"))]
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use conversation_model_adapters::{
     AudioFrame, CaptureClockPair, CaptureDiscontinuityReason, CaptureDomainHistory, CaptureEpoch,
     CaptureFinishBoundary, CaptureMetadata, FrameProvenance, PcmFormat, PcmSampleFormat,
@@ -58,13 +61,19 @@ use conversation_model_adapters::{
     MAX_CLOCK_RESIDUAL_NS, MAX_RECORDING_TIMING_BYTES, MAX_RECORDING_TIMING_RECORDS,
 };
 use conversation_protocol::{
-    FinalizedRecordingCapability, RuntimeError, RuntimeErrorKind, RuntimeStage, SessionId,
+    FinalizedRecordingCapability, RecordingLimit, RecordingLimitState, RuntimeError,
+    RuntimeErrorKind, RuntimeStage, SessionId,
 };
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LEN};
 use ring::digest::{digest, Context as DigestContext, SHA256};
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::{hkdf, hmac};
 use tokio_util::sync::CancellationToken;
+
+use crate::recording_safety::{
+    available_disk_bytes, frame_is_quiet, FrameObservation, LimitNotice, RecordingLimits,
+    RecordingSafetyGuard,
+};
 
 /// The reason recorded for a gap opened by a break in the capture bridge.
 pub const CAPTURE_DISCONTINUITY_REASON: &str = "capture_discontinuity";
@@ -122,8 +131,42 @@ const MAX_FINALIZED_RECORDING_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 pub struct RecordingSettings {
     directory: PathBuf,
     key_env: String,
+    limits: RecordingLimits,
+    free_space: FreeSpaceSource,
     #[cfg(feature = "recording-test-support")]
     sink_fault: Option<RecordingSinkFault>,
+}
+
+/// Where the recorder reads free disk space. Tests substitute a figure they control.
+#[derive(Clone, Debug)]
+enum FreeSpaceSource {
+    System,
+    #[cfg(any(test, feature = "recording-test-support"))]
+    Fixed(Arc<AtomicU64>),
+}
+
+impl PartialEq for FreeSpaceSource {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::System, Self::System) => true,
+            #[cfg(any(test, feature = "recording-test-support"))]
+            (Self::Fixed(left), Self::Fixed(right)) => Arc::ptr_eq(left, right),
+            #[cfg(any(test, feature = "recording-test-support"))]
+            _ => false,
+        }
+    }
+}
+
+impl Eq for FreeSpaceSource {}
+
+impl FreeSpaceSource {
+    fn available(&self, directory: &Path) -> Option<u64> {
+        match self {
+            Self::System => available_disk_bytes(directory),
+            #[cfg(any(test, feature = "recording-test-support"))]
+            Self::Fixed(free) => Some(free.load(Ordering::SeqCst)),
+        }
+    }
 }
 
 /// The encrypted sink operation an integration test can make fail once.
@@ -157,9 +200,28 @@ impl RecordingSettings {
         Ok(Self {
             directory,
             key_env,
+            limits: RecordingLimits::default(),
+            free_space: FreeSpaceSource::System,
             #[cfg(feature = "recording-test-support")]
             sink_fault: None,
         })
+    }
+
+    /// Replaces the default safety limits.
+    pub fn with_limits(mut self, limits: RecordingLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    pub fn limits(&self) -> &RecordingLimits {
+        &self.limits
+    }
+
+    /// Makes the recorder read free disk space from `free` instead of the file system.
+    #[cfg(any(test, feature = "recording-test-support"))]
+    pub fn with_test_free_disk_bytes(mut self, free: Arc<AtomicU64>) -> Self {
+        self.free_space = FreeSpaceSource::Fixed(free);
+        self
     }
 
     pub fn directory(&self) -> &Path {
@@ -470,6 +532,12 @@ pub struct SessionRecorder {
     timed_samples: u64,
     timed_gap_ms: u64,
     timed_validation: Option<TimedValidation>,
+    directory: PathBuf,
+    free_space: FreeSpaceSource,
+    safety: RecordingSafetyGuard,
+    /// Bytes in the file: the header plus every chunk, length prefix included.
+    written_bytes: u64,
+    limit_notices: Vec<LimitNotice>,
 }
 
 struct TimingBudget {
@@ -601,6 +669,11 @@ impl SessionRecorder {
             timed_samples: 0,
             timed_gap_ms: 0,
             timed_validation: timed.then(TimedValidation::default),
+            directory: settings.directory.clone(),
+            free_space: settings.free_space.clone(),
+            safety: RecordingSafetyGuard::new(settings.limits),
+            written_bytes: HEADER_LEN as u64,
+            limit_notices: Vec::new(),
         })
     }
 
@@ -619,6 +692,47 @@ impl SessionRecorder {
     /// Whether the recording is closed and its summary issued.
     pub fn is_finalized(&self) -> bool {
         self.summary.is_some()
+    }
+
+    /// Whether the closing chunk is on disk: after a finalize, or after a safety limit stopped
+    /// the recording. A closed recorder accepts no more media; `finalize` still issues it.
+    pub fn is_closed(&self) -> bool {
+        self.ended
+    }
+
+    /// The limit warnings and stops reached since the last call, oldest first. A stop is
+    /// always the last notice a recorder ever reports.
+    pub fn take_limit_notices(&mut self) -> Vec<(RecordingLimit, RecordingLimitState)> {
+        std::mem::take(&mut self.limit_notices)
+    }
+
+    /// Applies the safety limits after a successful write. A stop appends the closing chunk —
+    /// exactly what `finalize` would write first — so the file is complete on disk while the
+    /// summary and any capability are still issued by the client's finalize.
+    fn enforce_limits(&mut self, frame: Option<&AudioFrame>) -> Result<(), RuntimeError> {
+        let notices = match frame {
+            Some(frame) => {
+                let observation = FrameObservation {
+                    media_ms: self.media_duration_ms(),
+                    bytes: self.written_bytes,
+                    frame_ms: frame_duration_ms(frame),
+                    quiet: frame_is_quiet(frame),
+                };
+                let (free_space, directory) = (&self.free_space, &self.directory);
+                self.safety
+                    .observe(observation, || free_space.available(directory))
+            }
+            None => self.safety.observe_write(self.written_bytes),
+        };
+        let stop = notices
+            .iter()
+            .any(|(_, state)| *state == RecordingLimitState::Stopped);
+        if stop {
+            self.append(ended_record(self.elapsed_ms()))?;
+            self.ended = true;
+        }
+        self.limit_notices.extend(notices);
+        Ok(())
     }
 
     /// Whether a write failed, so the file can never authorize recovery. Plain `finalize` still
@@ -689,7 +803,8 @@ impl SessionRecorder {
             }
         }
         if self.timing_budget.is_some() {
-            return self.record_timed_frame(frame, at_ms);
+            self.record_timed_frame(frame, at_ms)?;
+            return self.enforce_limits(Some(frame));
         }
         let mut record = Vec::with_capacity(24 + frame.bytes().len());
         record.push(CHUNK_FRAME);
@@ -701,7 +816,7 @@ impl SessionRecorder {
         record.extend_from_slice(frame.bytes());
         self.append(record)?;
         self.media_ms = self.media_ms.saturating_add(frame_duration_ms(frame));
-        Ok(())
+        self.enforce_limits(Some(frame))
     }
 
     fn admit_timing(&mut self, bytes: usize) -> Result<bool, RuntimeError> {
@@ -740,7 +855,7 @@ impl SessionRecorder {
         if self.admit_timing(record.len() - 1)? {
             self.append(record)?;
         }
-        Ok(())
+        self.enforce_limits(None)
     }
 
     fn record_timed_frame(&mut self, frame: &AudioFrame, at_ms: u64) -> Result<(), RuntimeError> {
@@ -804,7 +919,7 @@ impl SessionRecorder {
             // Reopened, not replaced: the closing frame widens it to cover this gap too.
             last.ended_at_ms = None;
         }
-        Ok(())
+        self.enforce_limits(None)
     }
 
     /// Confirms and flushes the exact final timed-capture boundary without appending data.
@@ -971,6 +1086,9 @@ impl SessionRecorder {
         let Some(file) = self.file.as_mut() else {
             return Err(invalid_state_error("recording is already finalized"));
         };
+        if self.ended {
+            return Err(invalid_state_error("recording is closed"));
+        }
         let previously_poisoned = self.capability_poisoned;
         self.capability_poisoned = true;
         let counter = self.counter;
@@ -992,6 +1110,10 @@ impl SessionRecorder {
             .map_err(|_| adapter_error("recording chunk could not be written"))?;
         self.sealed_digest.update(&length.to_be_bytes());
         self.sealed_digest.update(&record);
+        self.written_bytes = self
+            .written_bytes
+            .saturating_add(4)
+            .saturating_add(u64::from(length));
         self.capability_poisoned = previously_poisoned;
         self.timed_validation = timing_state;
         Ok(())
@@ -2215,6 +2337,10 @@ mod timing_tests;
 #[cfg(test)]
 #[path = "session_recording_adoption_tests.rs"]
 mod adoption_tests;
+
+#[cfg(test)]
+#[path = "session_recording_limits_tests.rs"]
+mod limits_tests;
 
 fn derive(domain: &[u8], material: &[u8]) -> [u8; 32] {
     let mut input = Vec::with_capacity(domain.len() + material.len());

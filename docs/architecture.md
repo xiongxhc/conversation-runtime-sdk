@@ -153,9 +153,12 @@ spelling of a random binding identifier the header carries, so a file only
 answers to the handle it was minted with and a copier needs no key at all. The
 session identifier sits beside it as provenance and is deliberately not what
 resolution checks; each meeting session has its own authoritative identifier.
-A recording is closed only after the session feeding it has stopped. Without a
-`[recording]` section nothing is recorded, which is what the default
-configuration produces.
+A recording is closed only after the session feeding it has stopped, or earlier
+by a safety limit (free disk space, duration, size, and an opt-in silence stop),
+which closes the file cleanly and leaves the voice session running; see
+`docs/finalized-recording-recovery.md` for the limits and the v4 capture health
+events. Without a `[recording]` section nothing is recorded, which is what the
+default configuration produces.
 
 When the control client goes away mid-meeting, the gateway closes the recording
 itself on input EOF, but no finalize reply and therefore no recovery capability

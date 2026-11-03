@@ -23,7 +23,11 @@ use conversation_protocol::{
     PrivacyMode as ProtocolPrivacyMode, ResponseControls, RuntimeProfile, RuntimeStatus,
     SilencePolicy, SpeechPace, VoiceResponseMode, MAX_CLIENT_PROVIDER_LABEL_BYTES,
 };
-use conversation_runtime::{ConversationContext, ConversationQualityController, RecordingSettings};
+use conversation_runtime::{
+    ConversationContext, ConversationQualityController, RecordingLimits, RecordingSettings,
+    SilenceAutoStop, DEFAULT_MAX_RECORDING_BYTES, DEFAULT_MAX_RECORDING_DURATION_MS,
+    DEFAULT_MIN_FREE_DISK_BYTES, DEFAULT_SILENCE_GRACE_MS,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::media_server::{
@@ -52,6 +56,16 @@ const MAX_REMOTE_ENDPOINT_BYTES: usize = 2_048;
 /// The longest legal DNS name, so a remote endpoint host stays bounded.
 const MAX_REMOTE_ENDPOINT_HOST_BYTES: usize = 253;
 const MAX_RECORDING_DIRECTORY_BYTES: usize = 1_024;
+const MIB: u64 = 1024 * 1024;
+const MIN_RECORDING_FREE_DISK_MB: u64 = 64;
+const MAX_RECORDING_FREE_DISK_MB: u64 = 1_048_576;
+const MAX_RECORDING_DURATION_MINUTES: u64 = 1_440;
+const MIN_RECORDING_SIZE_MB: u64 = 16;
+/// Stays below finalized recovery's 8 GiB ciphertext admission.
+const MAX_RECORDING_SIZE_MB: u64 = 8_191;
+const MAX_SILENCE_STOP_MINUTES: u64 = 1_440;
+const MIN_SILENCE_STOP_GRACE_SECONDS: u64 = 10;
+const MAX_SILENCE_STOP_GRACE_SECONDS: u64 = 3_600;
 /// The diarization port refuses a result carrying more clusters than this, so a larger
 /// configured maximum would configure a failure.
 const MAX_DIARIZATION_SPEAKERS: u16 = 64;
@@ -2403,11 +2417,25 @@ impl VoiceDiarizationConfig {
 /// Encrypted session recording. `key_env` names the environment variable that
 /// holds the encryption key; the key itself never enters this structure, the
 /// serialized configuration, a status, or an error.
+///
+/// The safety limits are optional keys of this schema 3 section. Each absent key takes its
+/// conservative default, so a file written before they existed keeps its meaning; the silence
+/// auto-stop is off unless `silence_stop_minutes` is present.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RecordingConfig {
     directory: PathBuf,
     key_env: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    min_free_disk_mb: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_duration_minutes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_size_mb: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    silence_stop_minutes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    silence_stop_grace_seconds: Option<u64>,
 }
 
 impl RecordingConfig {
@@ -2427,15 +2455,78 @@ impl RecordingConfig {
                 "recording directory must not traverse parent directories",
             ));
         }
-        validate_environment_reference(&self.key_env, "recording key")
+        validate_environment_reference(&self.key_env, "recording key")?;
+        self.limits().map(|_| ())
+    }
+
+    fn limits(&self) -> Result<RecordingLimits, GatewayConfigError> {
+        let bounded = |value: Option<u64>, range: std::ops::RangeInclusive<u64>, message| {
+            value
+                .map(|value| {
+                    range
+                        .contains(&value)
+                        .then_some(value)
+                        .ok_or_else(|| config_error(message))
+                })
+                .transpose()
+        };
+        let min_free_disk_bytes = bounded(
+            self.min_free_disk_mb,
+            MIN_RECORDING_FREE_DISK_MB..=MAX_RECORDING_FREE_DISK_MB,
+            "recording min_free_disk_mb must be within 64..=1048576",
+        )?
+        .map_or(DEFAULT_MIN_FREE_DISK_BYTES, |megabytes| megabytes * MIB);
+        let max_duration_ms = bounded(
+            self.max_duration_minutes,
+            1..=MAX_RECORDING_DURATION_MINUTES,
+            "recording max_duration_minutes must be within 1..=1440",
+        )?
+        .map_or(DEFAULT_MAX_RECORDING_DURATION_MS, |minutes| {
+            minutes * 60 * 1_000
+        });
+        let max_bytes = bounded(
+            self.max_size_mb,
+            MIN_RECORDING_SIZE_MB..=MAX_RECORDING_SIZE_MB,
+            "recording max_size_mb must be within 16..=8191",
+        )?
+        .map_or(DEFAULT_MAX_RECORDING_BYTES, |megabytes| megabytes * MIB);
+        let grace_seconds = bounded(
+            self.silence_stop_grace_seconds,
+            MIN_SILENCE_STOP_GRACE_SECONDS..=MAX_SILENCE_STOP_GRACE_SECONDS,
+            "recording silence_stop_grace_seconds must be within 10..=3600",
+        )?;
+        let silence = match bounded(
+            self.silence_stop_minutes,
+            1..=MAX_SILENCE_STOP_MINUTES,
+            "recording silence_stop_minutes must be within 1..=1440",
+        )? {
+            Some(minutes) => Some(
+                SilenceAutoStop::new(
+                    minutes * 60 * 1_000,
+                    grace_seconds.map_or(DEFAULT_SILENCE_GRACE_MS, |seconds| seconds * 1_000),
+                )
+                .map_err(|error| config_error(error.message().to_owned()))?,
+            ),
+            None if grace_seconds.is_some() => {
+                return Err(config_error(
+                    "recording silence_stop_grace_seconds requires silence_stop_minutes",
+                ))
+            }
+            None => None,
+        };
+        RecordingLimits::new(min_free_disk_bytes, max_duration_ms, max_bytes, silence)
+            .map_err(|error| config_error(error.message().to_owned()))
     }
 
     /// The runtime's view of this section. The key is not read here — the sink resolves it when
     /// a session starts, so a variable removed after load still fails the session, not the
     /// process.
     fn settings(&self) -> Result<RecordingSettings, GatewayConfigError> {
-        RecordingSettings::new(self.directory.clone(), self.key_env.clone())
-            .map_err(|error| config_error(error.message().to_owned()))
+        Ok(
+            RecordingSettings::new(self.directory.clone(), self.key_env.clone())
+                .map_err(|error| config_error(error.message().to_owned()))?
+                .with_limits(self.limits()?),
+        )
     }
 }
 

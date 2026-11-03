@@ -19,6 +19,8 @@ tokio-util.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+# Already in the lock through tempfile; used for its safe `statvfs` wrapper.
+rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 tempfile.workspace = true

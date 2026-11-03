@@ -135,6 +135,20 @@ pub enum ClientVoiceSessionEvent {
         #[serde(serialize_with = "serialize_session_id")]
         session_id: SessionId,
     },
+    /// Protocol v4 only.
+    VoiceRecordingLimit {
+        #[serde(serialize_with = "serialize_session_id")]
+        session_id: SessionId,
+        limit: String,
+        state: String,
+    },
+    /// Protocol v4 only.
+    VoiceCaptureHealth {
+        #[serde(serialize_with = "serialize_session_id")]
+        session_id: SessionId,
+        mostly_zero: bool,
+        longest_gap_ms: u64,
+    },
 }
 
 impl From<&ComponentDescriptor> for ClientComponentDescriptor {
@@ -295,6 +309,24 @@ impl TryFrom<VoiceSessionEvent> for ClientVoiceSessionEvent {
             VoiceSessionEvent::SessionEnded { session_id } => {
                 Self::VoiceSessionEnded { session_id }
             }
+            VoiceSessionEvent::RecordingLimit {
+                session_id,
+                limit,
+                state,
+            } => Self::VoiceRecordingLimit {
+                session_id,
+                limit: limit.as_str().to_owned(),
+                state: state.as_str().to_owned(),
+            },
+            VoiceSessionEvent::CaptureHealth {
+                session_id,
+                mostly_zero,
+                longest_gap_ms,
+            } => Self::VoiceCaptureHealth {
+                session_id,
+                mostly_zero,
+                longest_gap_ms,
+            },
         };
         validate_client_voice_event(&projected)?;
         Ok(projected)
@@ -398,6 +430,8 @@ pub(crate) fn validate_client_voice_event(
         | ClientVoiceSessionEvent::VoiceTiming { session_id, .. }
         | ClientVoiceSessionEvent::VoicePlayback { session_id, .. }
         | ClientVoiceSessionEvent::VoiceSessionFailed { session_id, .. }
+        | ClientVoiceSessionEvent::VoiceRecordingLimit { session_id, .. }
+        | ClientVoiceSessionEvent::VoiceCaptureHealth { session_id, .. }
         | ClientVoiceSessionEvent::VoiceSessionEnded { session_id } => *session_id,
     };
     validate_identifier(session_id.get())?;
@@ -512,6 +546,17 @@ pub(crate) fn validate_client_voice_event(
         } => {
             crate::client_wire::validate_client_runtime_error(error)?;
             if matches!(recovery.as_str(), "continue_session" | "new_session") {
+                Ok(())
+            } else {
+                Err(ClientWireError::InvalidVoiceEvent)
+            }
+        }
+        ClientVoiceSessionEvent::VoiceRecordingLimit { limit, state, .. } => {
+            if matches!(
+                limit.as_str(),
+                "free_disk_space" | "duration" | "size" | "silence"
+            ) && matches!(state.as_str(), "warning" | "stopped")
+            {
                 Ok(())
             } else {
                 Err(ClientWireError::InvalidVoiceEvent)

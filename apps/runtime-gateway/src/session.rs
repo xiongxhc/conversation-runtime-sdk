@@ -15,11 +15,11 @@ use conversation_protocol::{
     ClientDiarizedSegment, ClientMediaLeaseDescriptor, ClientMemoryCursor, ClientMemoryInspection,
     ClientMemorySummary, ClientPersonaState, ClientProcessedText, ClientRecordingGap,
     ClientRecordingReconciliation, ClientRecordingSummary, ClientRuntimeError, ClientRuntimeEvent,
-    ClientVoiceSessionEvent, GatewayMessage, MemoryApproval, RecoveryDisposition, RuntimeError,
-    RuntimeErrorKind, RuntimeEvent, RuntimeProfile, RuntimeStage, RuntimeStatus, SessionId, TurnId,
-    VoiceResponseMode, VoiceSessionEvent, CLIENT_PROTOCOL_VERSION, CONTEXT_SEED_PROTOCOL_VERSION,
-    DEFAULT_CLIENT_PROTOCOL_VERSION, LEGACY_CLIENT_PROTOCOL_VERSION, MEDIA_PROTOCOL_VERSION,
-    RUNTIME_PROFILE_PROTOCOL_VERSION,
+    ClientVoiceSessionEvent, GatewayMessage, MemoryApproval, RecordingLimitState,
+    RecoveryDisposition, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeProfile,
+    RuntimeStage, RuntimeStatus, SessionId, TurnId, VoiceResponseMode, VoiceSessionEvent,
+    CLIENT_PROTOCOL_VERSION, CONTEXT_SEED_PROTOCOL_VERSION, DEFAULT_CLIENT_PROTOCOL_VERSION,
+    LEGACY_CLIENT_PROTOCOL_VERSION, MEDIA_PROTOCOL_VERSION, RUNTIME_PROFILE_PROTOCOL_VERSION,
 };
 use conversation_runtime::{
     adopt_closed_recording, process_text, read_recording_alignment, reconcile_finalized_recording,
@@ -1450,6 +1450,7 @@ impl GatewaySession {
                         media_lease.as_ref(),
                         self.provider_failure.clone(),
                     ),
+                    self.protocol_v4,
                 ));
                 voice.active = Some(ActiveVoiceSession {
                     runtime,
@@ -2478,6 +2479,7 @@ async fn forward_events(
 // every non-terminal is handed to the event lane before the terminal is handed to the
 // normal lane, `writer_loop` can restore the session's order by draining the event lane
 // before it writes a normal-lane voice message.
+#[allow(clippy::too_many_arguments)]
 async fn pump_voice_events(
     mut events: VoiceSessionEventStream,
     extractor: Option<Arc<MemoryExtractor>>,
@@ -2486,6 +2488,7 @@ async fn pump_voice_events(
     mut control_events: mpsc::Receiver<VoiceCaptureControlKind>,
     mut control_pending: watch::Receiver<bool>,
     mut notices: VoiceNotices,
+    version_four: bool,
 ) -> Result<(), GatewaySessionError> {
     let mut forwarding = true;
     let mut started = false;
@@ -2535,6 +2538,9 @@ async fn pump_voice_events(
         if !forwarding {
             continue;
         }
+        let Some(event) = project_for_connection(event, version_four) else {
+            continue;
+        };
         if let Some(extractor) = extractor.as_ref() {
             match &event {
                 VoiceSessionEvent::Turn {
@@ -2607,6 +2613,46 @@ async fn pump_voice_events(
         }
     }
     Ok(())
+}
+
+/// Recording limits and capture health are protocol v4 events. A v1-v3 connection keeps
+/// exactly the frames it always had: a limit that stopped the recording reaches it as the
+/// existing non-terminal recording failure (the frame a failed recording write produces), and a
+/// warning or a health report does not reach it at all.
+fn project_for_connection(
+    event: VoiceSessionEvent,
+    version_four: bool,
+) -> Option<VoiceSessionEvent> {
+    match event {
+        VoiceSessionEvent::RecordingLimit {
+            limit,
+            state: RecordingLimitState::Stopped,
+            ..
+        } if version_four => {
+            eprintln!("voice recording stopped at its {} limit", limit.as_str());
+            Some(event)
+        }
+        VoiceSessionEvent::RecordingLimit { .. } | VoiceSessionEvent::CaptureHealth { .. }
+            if version_four =>
+        {
+            Some(event)
+        }
+        VoiceSessionEvent::RecordingLimit {
+            session_id,
+            state: RecordingLimitState::Stopped,
+            ..
+        } => Some(VoiceSessionEvent::SessionFailed {
+            session_id,
+            error: RuntimeError::new(
+                RuntimeErrorKind::Adapter,
+                RuntimeStage::AudioCapture,
+                "recording stopped at a safety limit",
+            ),
+            recovery: RecoveryDisposition::ContinueSession,
+        }),
+        VoiceSessionEvent::RecordingLimit { .. } | VoiceSessionEvent::CaptureHealth { .. } => None,
+        event => Some(event),
+    }
 }
 
 /// Degradations the pump reports once, between the session's first event and its terminal,
@@ -10189,6 +10235,187 @@ max_error_bytes = 65536
             .read_message()
             .await
             .contains(r#""type":"recording_finalized""#));
+        gateway.close().await;
+    }
+
+    /// 100 ms of exact-zero 16 kHz mono capture.
+    fn zero_frame(sequence: u64) -> VoiceInputEvent {
+        VoiceInputEvent::Capture(CaptureEvent::Frame(
+            AudioFrame::new(
+                TurnId::new(1),
+                GenerationId::new(1),
+                UtteranceId::new(1),
+                sequence,
+                PcmFormat::new(16_000, 1, PcmSampleFormat::Signed16LittleEndian).unwrap(),
+                vec![0; 3_200],
+            )
+            .unwrap(),
+        ))
+    }
+
+    /// A gateway recording under a six-second duration limit, at protocol v4 or the default.
+    async fn limited_recording_gateway(
+        key_env: &str,
+        directory: &TempDir,
+        version_four: bool,
+    ) -> (
+        InMemoryGateway,
+        mpsc::Sender<Result<VoiceInputEvent, AdapterError>>,
+    ) {
+        std::env::set_var(key_env, FAKE_RECORDING_KEY);
+        let limits = conversation_runtime::RecordingLimits::new(1, 6_000, 1 << 30, None).unwrap();
+        let settings = RecordingSettings::new(directory.path(), key_env)
+            .unwrap()
+            .with_limits(limits);
+        let (input, input_receiver) = mpsc::channel(8);
+        let mut session = session_with_interactive_voice(
+            input_receiver,
+            Arc::new(MockGenerationLanguageModel::new(["fixture reply"])),
+            no_speech_frames(),
+        )
+        .with_recording(settings);
+        if version_four {
+            session = session.with_v4_control();
+        }
+        (InMemoryGateway::start(session).await, input)
+    }
+
+    #[tokio::test]
+    async fn v4_reports_capture_health_and_recording_limits_and_a_limit_stops_only_the_recording() {
+        let key_env = "CONVERSATION_SESSION_RECORDING_KEY_LIMIT_V4";
+        let directory = TempDir::new().unwrap();
+        let (mut gateway, input) = limited_recording_gateway(key_env, &directory, true).await;
+        gateway
+            .write(r#"{"protocol_version":4,"type":"start_voice_session","request_id":"voice-1"}"#)
+            .await;
+        gateway
+            .read_until(|message| message.contains(r#""request_id":"voice-1""#))
+            .await;
+        // Seven seconds of exact zeros: five make a mostly-zero window, 5.4 s warns, 6 s stops.
+        for sequence in 1..=70 {
+            send_voice_input(&input, zero_frame(sequence)).await;
+        }
+        let messages = gateway
+            .read_until(|message| {
+                message.contains(r#""type":"voice_recording_limit""#)
+                    && message.contains(r#""state":"stopped""#)
+            })
+            .await;
+        let events: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|message| serde_json::from_str::<serde_json::Value>(message).unwrap())
+            .filter(|message| message["type"] == "voice_event")
+            .map(|message| message["event"].clone())
+            .collect();
+        assert!(
+            events.contains(&serde_json::json!({
+                "type": "voice_capture_health",
+                "session_id": "1",
+                "mostly_zero": true,
+                "longest_gap_ms": 0,
+            })),
+            "{events:?}"
+        );
+        let limits: Vec<_> = events
+            .iter()
+            .filter(|event| event["type"] == "voice_recording_limit")
+            .collect();
+        assert_eq!(
+            limits,
+            [
+                &serde_json::json!({"type": "voice_recording_limit", "session_id": "1",
+                    "limit": "duration", "state": "warning"}),
+                &serde_json::json!({"type": "voice_recording_limit", "session_id": "1",
+                    "limit": "duration", "state": "stopped"}),
+            ]
+        );
+        assert!(
+            messages
+                .iter()
+                .all(|message| !message.contains("voice_session_failed")),
+            "{messages:?}"
+        );
+
+        gateway
+            .write(r#"{"protocol_version":4,"type":"stop_voice_session","request_id":"stop-1"}"#)
+            .await;
+        let stopped = gateway
+            .read_until(|message| message.contains(r#""request_id":"stop-1""#))
+            .await;
+        assert!(stopped
+            .iter()
+            .any(|message| message.contains("voice_session_ended")));
+        gateway
+            .write(
+                r#"{"protocol_version":4,"type":"finalize_recording","request_id":"fin-1","session_id":"1"}"#,
+            )
+            .await;
+        let finalized = gateway
+            .read_until(|message| message.contains(r#""type":"recording_finalized""#))
+            .await;
+        let finalized: serde_json::Value = serde_json::from_str(finalized.last().unwrap()).unwrap();
+        assert_eq!(finalized["recording"]["duration_ms"], "6000", "{finalized}");
+        assert!(finalized["recovery_capability"].is_object(), "{finalized}");
+        drop(input);
+        gateway.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_default_v3_client_sees_a_limit_stop_only_as_the_existing_recording_failure_frame() {
+        let key_env = "CONVERSATION_SESSION_RECORDING_KEY_LIMIT_V3";
+        let directory = TempDir::new().unwrap();
+        let (mut gateway, input) = limited_recording_gateway(key_env, &directory, false).await;
+        gateway
+            .write(r#"{"protocol_version":3,"type":"start_voice_session","request_id":"voice-1"}"#)
+            .await;
+        gateway
+            .read_until(|message| message.contains(r#""request_id":"voice-1""#))
+            .await;
+        for sequence in 1..=70 {
+            send_voice_input(&input, zero_frame(sequence)).await;
+        }
+        let messages = gateway
+            .read_until(|message| message.contains(r#""type":"voice_session_failed""#))
+            .await;
+        let failure: serde_json::Value = serde_json::from_str(messages.last().unwrap()).unwrap();
+        assert_eq!(
+            failure["event"],
+            serde_json::json!({
+                "type": "voice_session_failed",
+                "session_id": "1",
+                "error": {
+                    "code": "adapter_failure",
+                    "kind": "adapter",
+                    "stage": "audio_capture",
+                    "message": "audio capture operation failed",
+                },
+                "recovery": "continue_session",
+            })
+        );
+        gateway
+            .write(r#"{"protocol_version":3,"type":"stop_voice_session","request_id":"stop-1"}"#)
+            .await;
+        let stopped = gateway
+            .read_until(|message| message.contains(r#""request_id":"stop-1""#))
+            .await;
+        for message in messages.iter().chain(&stopped) {
+            assert!(
+                !message.contains("voice_recording_limit")
+                    && !message.contains("voice_capture_health"),
+                "{message}"
+            );
+        }
+        gateway
+            .write(
+                r#"{"protocol_version":3,"type":"finalize_recording","request_id":"fin-1","session_id":"1"}"#,
+            )
+            .await;
+        let finalized = gateway
+            .read_until(|message| message.contains(r#""type":"recording_finalized""#))
+            .await;
+        let finalized: serde_json::Value = serde_json::from_str(finalized.last().unwrap()).unwrap();
+        assert_eq!(finalized["recording"]["duration_ms"], "6000", "{finalized}");
+        drop(input);
         gateway.close().await;
     }
 

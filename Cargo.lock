@@ -502,6 +502,7 @@ dependencies = [
  "conversation-protocol",
  "libc",
  "ring",
+ "rustix",
  "serde_json",
  "tempfile",
  "tokio",

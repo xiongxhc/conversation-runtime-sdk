@@ -19,6 +19,7 @@ mod generation;
 mod phrase_chunker;
 mod recording_alignment;
 mod recording_reconciliation;
+mod recording_safety;
 mod session_clock;
 mod session_recording;
 mod speech_text;
@@ -40,6 +41,11 @@ pub use phrase_chunker::PhraseChunkingConfig;
 pub use recording_alignment::{read_recording_alignment, RecordingAlignmentItem};
 pub use recording_reconciliation::{
     reconcile_finalized_recording, reconcile_recording, MAX_RECONCILIATION_WINDOW_BYTES,
+};
+pub use recording_safety::{
+    RecordingLimits, SilenceAutoStop, DEFAULT_MAX_RECORDING_BYTES,
+    DEFAULT_MAX_RECORDING_DURATION_MS, DEFAULT_MIN_FREE_DISK_BYTES, DEFAULT_SILENCE_GRACE_MS,
+    MAX_RECORDING_BYTES_LIMIT,
 };
 pub use session_clock::{SessionClock, TurnFinalizationDeadline};
 #[cfg(feature = "recording-test-support")]

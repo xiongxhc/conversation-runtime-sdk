@@ -503,7 +503,19 @@ export type VersionThreeVoiceSessionEvent =
   | { type: "response_authorized"; sessionId: bigint; segmentId: string; turnId: bigint }
   | { type: "response_skipped"; sessionId: bigint; segmentId: string; reason: string };
 
-export type VersionFourVoiceSessionEvent = Exclude<VersionThreeVoiceSessionEvent, VersionThreeVoiceTranscriptFinalEvent> | VersionFourVoiceTranscriptFinalEvent;
+const RECORDING_LIMITS = ["free_disk_space", "duration", "size", "silence"] as const;
+/** The recording safety limit that warned or stopped the recording. */
+export type RecordingLimit = typeof RECORDING_LIMITS[number];
+/** A limit stopped only the recording; the voice session continues unrecorded. */
+export type VoiceRecordingLimitEvent = { type: "voice_recording_limit"; sessionId: bigint; limit: RecordingLimit; state: "warning" | "stopped" };
+/** Content-free live capture health: mostly exact-zero capture and the longest gap so far. */
+export type VoiceCaptureHealthEvent = { type: "voice_capture_health"; sessionId: bigint; mostlyZero: boolean; longestGapMs: number };
+
+export type VersionFourVoiceSessionEvent =
+  | Exclude<VersionThreeVoiceSessionEvent, VersionThreeVoiceTranscriptFinalEvent>
+  | VersionFourVoiceTranscriptFinalEvent
+  | VoiceRecordingLimitEvent
+  | VoiceCaptureHealthEvent;
 
 export type VoiceSessionEvent = LegacyVoiceSessionEvent | VersionThreeVoiceSessionEvent | VersionFourVoiceSessionEvent;
 
@@ -2006,6 +2018,24 @@ function parseVoiceSessionEvent(
         sessionId: sessionId(),
         error: parseRuntimeFailure(object.error),
         recovery: requireOneOf(object, "recovery", ["continue_session", "new_session"] as const),
+      };
+    case "voice_recording_limit":
+      if (version !== 4) throw new ProtocolError("recording limit events require protocol version 4");
+      requireExactKeys(object, ["type", "session_id", "limit", "state"]);
+      return {
+        type,
+        sessionId: sessionId(),
+        limit: requireOneOf(object, "limit", RECORDING_LIMITS),
+        state: requireOneOf(object, "state", ["warning", "stopped"] as const),
+      };
+    case "voice_capture_health":
+      if (version !== 4) throw new ProtocolError("capture health events require protocol version 4");
+      requireExactKeys(object, ["type", "session_id", "mostly_zero", "longest_gap_ms"]);
+      return {
+        type,
+        sessionId: sessionId(),
+        mostlyZero: requireBoolean(object, "mostly_zero"),
+        longestGapMs: requireNonNegativeInteger(object, "longest_gap_ms"),
       };
     default:
       throw new ProtocolError("unsupported voice session event type");

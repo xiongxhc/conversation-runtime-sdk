@@ -762,3 +762,28 @@ signal.signal(signal.SIGTERM, stop)
 http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
 "#
 }
+
+#[test]
+fn latency_command_wire_shape_matches_the_desktop_client() {
+    let start: LocalModelLatencyRequest = serde_json::from_value(serde_json::json!({
+        "action": "start",
+        "request_id": "latency-1",
+        "endpoint": "http://127.0.0.1:11434",
+        "model": "local-model",
+    }))
+    .expect("start request from the desktop client");
+    assert!(matches!(
+        start,
+        LocalModelLatencyRequest::Start { ref request_id, .. } if request_id == "latency-1"
+    ));
+    let cancel: LocalModelLatencyRequest = serde_json::from_value(serde_json::json!({
+        "action": "cancel",
+        "request_id": "latency-1",
+    }))
+    .expect("cancel request from the desktop client");
+    assert!(matches!(cancel, LocalModelLatencyRequest::Cancel { .. }));
+    assert_eq!(
+        serde_json::to_value(LocalModelLatencyResponse::Cancelled).expect("cancelled response"),
+        serde_json::json!({ "status": "cancelled" }),
+    );
+}

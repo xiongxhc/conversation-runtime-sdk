@@ -138,6 +138,101 @@ textarea {
   margin-top: 18px;
 }
 
+.secondary-action {
+  background: transparent;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-control);
+  cursor: pointer;
+  font-weight: 650;
+  justify-self: start;
+  margin-top: 18px;
+  padding: var(--space-3) var(--space-4);
+}
+
+.setup-panel button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.setup-models {
+  display: grid;
+  gap: var(--space-3);
+  margin-top: var(--space-5);
+}
+
+.setup-models fieldset {
+  border: 0;
+  display: grid;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+}
+
+.setup-models legend {
+  font-size: 0.86rem;
+  font-weight: 620;
+  margin-bottom: var(--space-2);
+  padding: 0;
+}
+
+.setup-panel .setup-model-option {
+  align-items: center;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-field);
+  cursor: pointer;
+  display: flex;
+  font-family: var(--type-utility);
+  font-size: 0.86rem;
+  font-weight: 500;
+  gap: var(--space-3);
+  margin-top: 0;
+  overflow-wrap: anywhere;
+  padding: var(--space-3) var(--space-4);
+}
+
+.setup-panel .setup-model-option:has(input:checked) {
+  border-color: var(--signal);
+}
+
+.setup-panel .setup-model-option input {
+  accent-color: var(--signal);
+  flex: none;
+  margin: 0;
+  padding: 0;
+}
+
+.setup-latency {
+  display: grid;
+  gap: var(--space-1);
+  justify-items: start;
+}
+
+.setup-latency-result {
+  font-weight: 620;
+  margin: 0;
+}
+
+.setup-note {
+  color: var(--muted);
+  font-size: 0.86rem;
+  line-height: 1.5;
+  margin: 0;
+}
+
+.setup-panel > .setup-error {
+  margin-top: var(--space-3);
+}
+
+.setup-advanced-title {
+  font-size: 1rem;
+  font-weight: 620;
+  margin: var(--space-7) 0 var(--space-1);
+}
+
+.setup-advanced-title + .setup-note {
+  margin-bottom: var(--space-4);
+}
+
 .workspace-shell {
   background: var(--canvas);
   display: grid;

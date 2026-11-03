@@ -25,6 +25,7 @@ import {
   type CarriedConversationContext,
   type ConversationSessionState,
 } from "./runtime/conversation-session.js";
+import { runtimeSetupClient, type RuntimeSetupClient } from "./runtime/runtime-setup.js";
 import {
   RuntimeOpenError,
   TauriGatewayTransport,
@@ -54,6 +55,7 @@ export interface DesktopSession {
 export interface AppProps {
   connectSession?: (paths: RuntimePaths) => Promise<DesktopSession>;
   historyStore?: ConversationHistoryStore;
+  setupClient?: RuntimeSetupClient;
   storage?: StorageLike;
 }
 
@@ -65,6 +67,7 @@ const defaultConnectSession = async (paths: RuntimePaths): Promise<DesktopSessio
 export function App({
   connectSession = defaultConnectSession,
   historyStore = conversationHistoryStore,
+  setupClient = runtimeSetupClient,
   storage = window.localStorage,
 }: AppProps) {
   const [session, setSession] = useState<DesktopSession>();
@@ -110,6 +113,7 @@ export function App({
         error={setupError}
         initialPaths={setupPaths}
         onConnect={connect}
+        setupClient={setupClient}
       />
     );
   }

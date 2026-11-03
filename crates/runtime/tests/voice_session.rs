@@ -25,8 +25,8 @@ use conversation_protocol::{
 };
 use conversation_runtime::{
     ConversationContext, ConversationQualityController, RecordingSettings, SessionRecorder,
-    TextTurnEventStream, TextTurnRuntime, VoiceSessionAdapters, VoiceSessionEventStream,
-    VoiceSessionRuntime,
+    TextTurnEventStream, TextTurnRuntime, TranscriptCleanupRemovals, TranscriptCleanupStats,
+    VoiceSessionAdapters, VoiceSessionEventStream, VoiceSessionRuntime,
 };
 use tempfile::TempDir;
 use tokio::sync::{mpsc, Notify};
@@ -293,6 +293,49 @@ async fn finalizes_each_utterance_from_the_silence_timer_with_increasing_identit
     assert_eq!(
         harness.language.requests()[1].generation_id(),
         GenerationId::new(2)
+    );
+
+    harness.shutdown(&mut events).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_noise_only_final_is_dropped_and_a_cleaned_final_keeps_its_turn() {
+    let harness = VoiceSessionHarness::new();
+    let mut events = harness.start().await;
+    assert_session_started(events.recv().await);
+
+    harness.engine_final(1, "[BLANK_AUDIO]").await;
+    harness.speech_ended(0).await;
+    tokio::time::advance(Duration::from_millis(600)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        harness.language.requests().is_empty(),
+        "a final with nothing left after cleanup must not start a turn"
+    );
+
+    harness.speech_started(700).await;
+    harness.engine_final(2, "Hello (laughter) there.").await;
+    harness.speech_ended(700).await;
+    tokio::time::advance(Duration::from_millis(600)).await;
+
+    let observed = drain_until_turn_terminal(&mut events).await;
+    assert_final_and_completed(&observed, TurnId::new(1), "Hello there.");
+    assert!(observed.iter().any(|event| matches!(
+        event,
+        VoiceSessionEvent::TranscriptFinal { segment_id: 2, .. }
+    )));
+    assert_eq!(harness.language.requests().len(), 1);
+    assert_eq!(
+        harness.runtime.transcript_cleanup_stats(),
+        TranscriptCleanupStats {
+            finals_cleaned: 1,
+            finals_dropped: 1,
+            removals: TranscriptCleanupRemovals {
+                trailing_noise_units: 1,
+                noise_markers: 1,
+                ..TranscriptCleanupRemovals::default()
+            },
+        }
     );
 
     harness.shutdown(&mut events).await;

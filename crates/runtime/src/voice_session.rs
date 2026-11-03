@@ -20,6 +20,9 @@ use tokio::task::{JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use crate::session_recording::SessionRecorder;
+use crate::transcript_cleanup::{
+    clean_final_transcript, TranscriptCleanup, TranscriptCleanupCounters, TranscriptCleanupStats,
+};
 
 use crate::{
     validate_voice_policy, ConversationContext, ConversationTurnSource, SessionClock,
@@ -76,6 +79,7 @@ pub struct VoiceSessionRuntime {
     context: ConversationContext,
     adapters: VoiceSessionAdapters,
     active: Arc<Mutex<Option<ActiveSession>>>,
+    transcript_cleanup: Arc<TranscriptCleanupCounters>,
 }
 
 #[derive(Clone)]
@@ -90,7 +94,13 @@ impl VoiceSessionRuntime {
             context,
             adapters,
             active: Arc::new(Mutex::new(None)),
+            transcript_cleanup: Arc::default(),
         }
+    }
+
+    /// Content-free totals of what final-transcript cleanup removed or dropped.
+    pub fn transcript_cleanup_stats(&self) -> TranscriptCleanupStats {
+        self.transcript_cleanup.snapshot()
     }
 
     pub async fn start(
@@ -130,6 +140,7 @@ impl VoiceSessionRuntime {
         let context = self.context.clone();
         let adapters = self.adapters.clone();
         let task_cancellation = cancellation.clone();
+        let transcript_cleanup = Arc::clone(&self.transcript_cleanup);
         tokio::spawn(async move {
             let terminal = run_voice_session(VoiceSessionRun {
                 policy,
@@ -140,6 +151,7 @@ impl VoiceSessionRuntime {
                 events: event_sender,
                 cancellation: task_cancellation,
                 response_mode,
+                transcript_cleanup,
             })
             .await;
 
@@ -370,6 +382,7 @@ struct VoiceSessionRun {
     events: mpsc::Sender<VoiceSessionEvent>,
     cancellation: CancellationToken,
     response_mode: VoiceResponseMode,
+    transcript_cleanup: Arc<TranscriptCleanupCounters>,
 }
 
 async fn run_voice_session(run: VoiceSessionRun) -> VoiceSessionEvent {
@@ -382,6 +395,7 @@ async fn run_voice_session(run: VoiceSessionRun) -> VoiceSessionEvent {
         events,
         cancellation,
         response_mode,
+        transcript_cleanup,
     } = run;
     let session_id = policy.session_id();
     let VoiceIoSession {
@@ -461,6 +475,7 @@ async fn run_voice_session(run: VoiceSessionRun) -> VoiceSessionEvent {
             context,
         },
     )
+    .with_transcript_cleanup(transcript_cleanup)
     .run()
     .await
 }
@@ -546,6 +561,7 @@ struct VoiceLoop {
     automatic_responses: VecDeque<(u64, String)>,
     last_finalized_segment: u64,
     context: ConversationContext,
+    transcript_cleanup: Arc<TranscriptCleanupCounters>,
 }
 
 struct VoiceLoopDependencies {
@@ -621,6 +637,25 @@ impl VoiceLoop {
             automatic_responses: VecDeque::new(),
             last_finalized_segment: 0,
             context,
+            transcript_cleanup: Arc::default(),
+        }
+    }
+
+    fn with_transcript_cleanup(mut self, counters: Arc<TranscriptCleanupCounters>) -> Self {
+        self.transcript_cleanup = counters;
+        self
+    }
+
+    /// Every recognized final passes here before it is published or can start a turn.
+    /// `None` means nothing speech-like is left, so the final is dropped. Only
+    /// content-free counts are recorded.
+    fn clean_final(&self, text: String) -> Option<String> {
+        let cleanup = clean_final_transcript(&text);
+        self.transcript_cleanup.record(&cleanup);
+        match cleanup {
+            TranscriptCleanup::Unchanged => Some(text),
+            TranscriptCleanup::Cleaned { text, .. } => Some(text),
+            TranscriptCleanup::Dropped { .. } => None,
         }
     }
 
@@ -1357,9 +1392,11 @@ impl VoiceLoop {
             .active_segment_id
             .take()
             .ok_or_else(|| runtime_error("finalized voice transcript has no segment identifier"))?;
+        let Some(text) = self.clean_final(finalized.text) else {
+            return Ok(());
+        };
         if self.response_mode == VoiceResponseMode::ExternalGate {
-            self.register_pending_segment(segment_id, finalized.text.clone())
-                .await?;
+            self.register_pending_segment(segment_id, text).await?;
             return Ok(());
         }
         let started = self
@@ -1368,7 +1405,7 @@ impl VoiceLoop {
                 ConversationTurnSource::Voice {
                     session_id: self.session_id,
                 },
-                finalized.text.clone(),
+                text.clone(),
             )
             .await?;
         let identity = started.identity();
@@ -1381,7 +1418,7 @@ impl VoiceLoop {
                 session_id: self.session_id,
                 segment_id,
                 turn_id: Some(turn_id),
-                text: finalized.text.clone(),
+                text,
                 capture_evidence: None,
             })
             .await
@@ -1424,7 +1461,9 @@ impl VoiceLoop {
             ));
         }
         self.last_finalized_segment = segment_id;
-        let text = utterance.text().to_owned();
+        let Some(text) = self.clean_final(utterance.text().to_owned()) else {
+            return Ok(());
+        };
         let capture_evidence = utterance.capture_evidence().cloned().map(Box::new);
         if self.response_mode == VoiceResponseMode::ExternalGate {
             return self
@@ -2748,6 +2787,106 @@ mod tests {
                 wire_finals[0]["event"]["live_coverage"]["host_start_ns"],
                 "1000000000"
             );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn finalized_wording_is_cleaned_in_place_or_dropped_in_either_response_mode() {
+        use conversation_model_adapters::FinalizedUtterance;
+        for response_mode in [
+            VoiceResponseMode::Automatic,
+            VoiceResponseMode::ExternalGate,
+        ] {
+            let policy = VoiceSessionPolicy::new(
+                SessionId::new(1),
+                PrivacyMode::Cloud,
+                200,
+                600,
+                [ComponentDescriptor::new(
+                    ComponentKind::SpeechRecognition,
+                    "remote-recognition",
+                    ExecutionLocation::Remote,
+                )],
+            )
+            .unwrap();
+            let context = ConversationContext::new(ConversationQualityController::new(
+                PersonaProfile::default(),
+                ResponseControls::default(),
+                ConversationMode::DirectAnswer,
+            ));
+            let turn_runtime = StreamingTurnRuntime::new(
+                context.clone(),
+                Arc::new(BlockingLanguage::default()),
+                Arc::new(MockStreamingSpeechSynthesizer::new([])),
+                Arc::new(MockContinuousAudioOutput::new()),
+            );
+            let (_input, input_receiver) = mpsc::channel(1);
+            let (_commands, command_receiver) = mpsc::channel(1);
+            let (event_sender, mut events) = mpsc::channel(SESSION_EVENT_BUFFER_SIZE);
+            let mut loop_ = VoiceLoop::new(
+                policy,
+                VoiceLoopDependencies {
+                    input_events: input_receiver,
+                    capture: Arc::new(MockVoiceCaptureControl::new()),
+                    completion: tokio::spawn(async { Ok(()) }),
+                    turn_runtime,
+                    commands: command_receiver,
+                    events: event_sender,
+                    cancellation: CancellationToken::new(),
+                    recorder: None,
+                    response_mode,
+                    context: context.clone(),
+                },
+            );
+            let mut outcomes = Vec::new();
+            for (id, text) in [
+                (1, "Thanks for watching!"),
+                (1, "late"),
+                (2, "[music] Book the room."),
+            ] {
+                outcomes.push(
+                    loop_
+                        .handle_input(Some(Ok(VoiceInputEvent::Recognition(
+                            RecognitionEvent::FinalizedUtterance(
+                                FinalizedUtterance::new(id, text).unwrap(),
+                            ),
+                        ))))
+                        .await
+                        .is_none(),
+                );
+            }
+            assert_eq!(
+                outcomes,
+                [true, false, true],
+                "a dropped final still consumes its ordered identity"
+            );
+            let mut finals = Vec::new();
+            while let Ok(event) = events.try_recv() {
+                if let VoiceSessionEvent::TranscriptFinal {
+                    segment_id, text, ..
+                } = event
+                {
+                    finals.push((segment_id, text));
+                }
+            }
+            assert_eq!(finals, [(2, "Book the room.".to_owned())]);
+            if response_mode == VoiceResponseMode::ExternalGate {
+                assert_eq!(loop_.pending_order, [2]);
+                assert!(context.active_turn().await.is_none());
+            } else {
+                assert!(loop_.automatic_responses.is_empty());
+                assert!(
+                    loop_.turn_events.is_some(),
+                    "the cleaned final starts its turn"
+                );
+            }
+            let stats = loop_.transcript_cleanup.snapshot();
+            assert_eq!((stats.finals_dropped, stats.finals_cleaned), (1, 1));
+            assert_eq!(stats.removals.known_hallucinations, 1);
+            assert_eq!(stats.removals.noise_markers, 1);
+            loop_.cleanup_active_turn().await.unwrap();
+            loop_.cancellation.cancel();
+            loop_.completion.take().unwrap().await.unwrap().unwrap();
         }
     }
 

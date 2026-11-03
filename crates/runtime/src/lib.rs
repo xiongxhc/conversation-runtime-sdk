@@ -26,6 +26,7 @@ mod speech_worker;
 mod streaming_turn;
 mod text_processing;
 mod text_turn;
+mod transcript_cleanup;
 mod turn_finalizer;
 mod utterance_assembler;
 mod voice_privacy;
@@ -58,6 +59,7 @@ pub use text_processing::{
     MIN_TEXT_PROCESSING_TURN_ID,
 };
 pub use text_turn::{TextTurnEventStream, TextTurnRuntime};
+pub use transcript_cleanup::{TranscriptCleanupRemovals, TranscriptCleanupStats};
 pub use turn_finalizer::{FinalizedTranscript, TurnFinalizer};
 pub use utterance_assembler::UtteranceAssembler;
 pub use voice_privacy::validate_voice_policy;

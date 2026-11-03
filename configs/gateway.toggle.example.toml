@@ -6,8 +6,9 @@
 # `offline` / `local-only`; any part on api is `online` / `cloud`. Writing them
 # out is allowed only when they agree with the selection.
 #
-# `[media]` carries meeting audio to api ASR. When ASR is local it listens on
-# this machine's microphone through the voice sidecar and `[media]` is ignored.
+# `[media]` carries meeting audio to api ASR. Local ASR listens on this
+# machine's microphone through the voice sidecar: with every part local,
+# `[media]` is dropped; with ASR local and any other part on api, remove it.
 # Provider hosts are started only when a selected block references them.
 #
 # Credentials are never written here; each `credential_env` and `key_env` names

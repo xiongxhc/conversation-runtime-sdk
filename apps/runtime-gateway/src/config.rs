@@ -1338,6 +1338,16 @@ fn resolve_mode(
                     "with mode set, [{section_name}] holds only [{section_name}.local] and [{section_name}.api]"
                 ))
             })?;
+        // Both blocks are read for shape now, so a typo on the side not running fails before
+        // anyone flips to it. Environment, credentials, and paths are checked only for the
+        // side that runs.
+        for (name, block) in blocks.iter() {
+            if !block_shape_is_valid(part, block) {
+                return Err(config_error(format!(
+                    "[{section_name}.{name}] has an unknown, missing, or mistyped key"
+                )));
+            }
+        }
         let name = side_name(side);
         *section = blocks.remove(name).ok_or_else(|| {
             config_error(format!(
@@ -1383,9 +1393,15 @@ fn resolve_mode(
         }
     }
 
-    // The media bridge feeds api ASR. Local ASR listens through the voice sidecar, which a
-    // bridge would bypass, so the bridge belongs to the api side.
-    if part_modes.asr == Some(ExecutionConfig::Local) {
+    // The media bridge feeds api ASR; local ASR listens on the voice sidecar's microphone. An
+    // all-local file simply drops the bridge. An online one is refused, because it would admit
+    // a meeting through the bridge and then hear the host microphone instead.
+    if part_modes.asr == Some(ExecutionConfig::Local) && document.contains_key("media") {
+        if let Some(part) = first_api_part {
+            return Err(config_error(format!(
+                "asr is local while mode selects api for {part}, and local asr hears the voice sidecar microphone rather than [media]: remove [media] or select api for asr in mode_overrides"
+            )));
+        }
         document.remove("media");
     }
 
@@ -1413,6 +1429,20 @@ fn selected_side(value: &toml::Value) -> Option<ExecutionConfig> {
         "local" => Some(ExecutionConfig::Local),
         "api" => Some(ExecutionConfig::Remote),
         _ => None,
+    }
+}
+
+/// Whether a block deserializes as the section it would replace. Only the outcome is kept: a
+/// deserializer message can quote the offending value.
+fn block_shape_is_valid(part: &str, block: &toml::Value) -> bool {
+    let Ok(text) = toml::to_string(block) else {
+        return false;
+    };
+    match part {
+        "language" => toml::from_str::<LanguageConfig>(&text).is_ok(),
+        "asr" => toml::from_str::<VoiceAsrConfig>(&text).is_ok(),
+        "speech" => toml::from_str::<VoiceSpeechConfig>(&text).is_ok(),
+        _ => toml::from_str::<VoiceDiarizationConfig>(&text).is_ok(),
     }
 }
 

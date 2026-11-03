@@ -175,9 +175,11 @@ parts to the other side. See
 - `profile` and `privacy_mode` are derived: every part local gives `offline` /
   `local-only`, any part on API gives `online` / `cloud`. Explicit values are
   allowed only when they agree.
-- `[media]` serves API ASR. With ASR local, the voice sidecar's microphone is
-  the audio source and `[media]` is ignored, so a meeting bridge cannot feed a
-  local recognizer.
+- `[media]` serves API ASR. Local ASR hears the voice sidecar's microphone, so
+  an all-local file drops `[media]`, and an online file with local ASR must
+  not configure it.
+- Both blocks of a part are checked for unknown, missing, or mistyped keys;
+  environment variables and paths are checked only for the selected one.
 - Only provider hosts referenced by a selected block are started.
 - A file without `mode` is read exactly as before.
 

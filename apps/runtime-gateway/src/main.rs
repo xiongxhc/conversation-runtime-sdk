@@ -23,8 +23,9 @@ async fn run() -> Result<(), ()> {
     let (config_path, protocol_v4) = parse_arguments(env::args_os().skip(1)).ok_or_else(|| {
         eprintln!("gateway arguments are invalid");
     })?;
-    let adapters = GatewayConfig::load(&config_path).map_err(|_| {
-        eprintln!("gateway configuration failed");
+    // Configuration errors name fixed sections and rules, never a configured value or secret.
+    let adapters = GatewayConfig::load(&config_path).map_err(|error| {
+        eprintln!("gateway configuration failed: {error}");
     })?;
     let status = if adapters.voice.is_some() {
         adapters.status.clone()

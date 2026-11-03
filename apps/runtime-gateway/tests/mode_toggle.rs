@@ -312,27 +312,127 @@ fn one_api_part_in_a_local_file_makes_the_deployment_online() {
 }
 
 #[test]
-fn local_asr_listens_through_the_sidecar_so_the_media_bridge_is_dropped() {
+fn an_all_local_file_drops_the_media_bridge() {
+    let fixture = Fixture::new();
+    let path = fixture.write(&fixture.config(r#"mode = "local""#, true));
+
+    let adapters = GatewayConfig::load(&path).unwrap();
+
+    assert_eq!(adapters.status.profile, "offline");
+    assert!(adapters.media.is_none());
+    assert!(!adapters
+        .status
+        .capabilities
+        .iter()
+        .any(|capability| capability == "media_lease_renewal"));
+}
+
+#[test]
+fn online_with_local_asr_uses_the_sidecar_and_refuses_a_media_bridge() {
     let fixture = Fixture::new();
 
-    for header in [
-        "mode = \"api\"\nmode_overrides = { asr = \"local\" }",
-        "mode = \"local\"",
-    ] {
-        let path = fixture.write(&fixture.config(header, true));
-        let adapters = GatewayConfig::load(&path).unwrap();
-        assert_eq!(location(&adapters.status, "speech_recognition"), "local");
-        assert!(adapters.media.is_none(), "{header}");
-        assert!(!adapters
-            .status
-            .capabilities
-            .iter()
-            .any(|capability| capability == "media_lease_renewal"));
-    }
+    // Without [media] the sidecar microphone is the only audio source, which is what was asked.
     let status = fixture
-        .validate("mode = \"api\"\nmode_overrides = { asr = \"local\" }", true)
+        .validate(
+            "mode = \"api\"\nmode_overrides = { asr = \"local\" }",
+            false,
+        )
         .unwrap();
     assert_eq!(status.profile, "online");
+    assert_eq!(location(&status, "speech_recognition"), "local");
+
+    // With [media] the meeting bridge would be silently bypassed for the host microphone.
+    for header in [
+        "mode = \"api\"\nmode_overrides = { asr = \"local\" }",
+        "mode = \"local\"\nmode_overrides = { language = \"api\" }",
+    ] {
+        let error = fixture.validate(header, true).unwrap_err();
+        assert!(
+            error.contains("asr") && error.contains("[media]") && error.contains("mode_overrides"),
+            "{header}: {error}"
+        );
+    }
+}
+
+#[test]
+fn the_unselected_block_is_checked_for_shape_but_not_for_this_machine() {
+    let fixture = Fixture::new();
+
+    // A typo, or a missing key, in the block that is not running still fails, and names it.
+    let local = fixture.config(r#"mode = "local""#, false);
+    for (broken, block) in [
+        (
+            local.replacen(
+                "model = \"operator-supplied-text-model\"",
+                "modle = \"operator-supplied-text-model\"",
+                1,
+            ),
+            "[language.api]",
+        ),
+        (
+            local.replacen("provider = \"openai-streaming\"\n", "", 1),
+            "[voice.asr.api]",
+        ),
+        (
+            local.replacen("voice = \"local-voice\"", "voise = \"local-voice\"", 1),
+            "[voice.speech.local]",
+        ),
+    ] {
+        let error = GatewayConfig::validate(&fixture.write(&broken))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(block), "{block}: {error}");
+        assert!(!error.contains("operator-supplied"), "{error}");
+    }
+
+    // Environment, credentials, and paths belong to the running side only.
+    let api_unchecked = local.replacen(
+        &format!("credential_env = \"{CREDENTIAL_ENV}\""),
+        "credential_env = \"CONVERSATION_TEST_TOGGLE_NEVER_SET\"",
+        1,
+    );
+    assert!(GatewayConfig::validate(&fixture.write(&api_unchecked)).is_ok());
+    let local_unchecked = fixture.config(r#"mode = "api""#, true).replace(
+        &fixture.model_path.display().to_string(),
+        "/nonexistent/asr",
+    );
+    assert!(GatewayConfig::validate(&fixture.write(&local_unchecked)).is_ok());
+}
+
+#[test]
+fn the_gateway_binary_prints_the_configuration_error_without_private_values() {
+    let fixture = Fixture::new();
+    let missing_block = fixture.config(r#"mode = "api""#, true).replacen(
+        "[voice.speech.api]",
+        "[unused_speech_api]",
+        1,
+    );
+    let missing_model = fixture.config(r#"mode = "local""#, false).replace(
+        &fixture.model_path.display().to_string(),
+        "/private/asr/model",
+    );
+
+    for (contents, expected) in [
+        (
+            missing_block,
+            "gateway configuration failed: mode selects api for speech, but [voice.speech.api] is missing",
+        ),
+        (
+            missing_model,
+            "gateway configuration failed: voice ASR model path must be an existing directory",
+        ),
+    ] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_conversation-runtime-gateway"))
+            .arg("--config")
+            .arg(fixture.write(&contents))
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success());
+        assert_eq!(stderr.trim(), expected);
+        assert!(!stderr.contains(CREDENTIAL_VALUE) && !stderr.contains("/private/"));
+    }
 }
 
 #[test]
@@ -375,7 +475,7 @@ fn the_selected_block_must_exist() {
     let fixture = Fixture::new();
     let without_speech_api = fixture.config(r#"mode = "api""#, true).replacen(
         "[voice.speech.api]",
-        "[voice.speech.unused]",
+        "[unused_speech_api]",
         1,
     );
 
@@ -383,7 +483,10 @@ fn the_selected_block_must_exist() {
         .unwrap_err()
         .to_string();
 
-    assert!(error.contains("[voice.speech.api]"), "{error}");
+    assert_eq!(
+        error,
+        "mode selects api for speech, but [voice.speech.api] is missing"
+    );
 }
 
 #[test]

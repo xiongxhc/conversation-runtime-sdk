@@ -4602,13 +4602,8 @@ mod tests {
                 "input": "approved reply.",
                 "voice": "scripted-voice",
                 "speed": 1.0,
-                "lang_code": "auto",
-                "instruct": "Speak clearly.",
-                "max_tokens": 128,
-                "repetition_penalty": 1.0,
+                "instructions": "Speak clearly.",
                 "response_format": "wav",
-                "stream": true,
-                "streaming_interval": 0.2,
             })
         );
 

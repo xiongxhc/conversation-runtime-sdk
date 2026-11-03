@@ -4,8 +4,9 @@ use std::sync::{
 };
 
 use conversation_model_adapters::{
-    AdapterError, AudioFrame, OpenAiCompatibleSpeechConfig, OpenAiCompatibleStreamingSpeechConfig,
-    OpenAiCompatibleStreamingSpeechSynthesizer, StreamingSpeechRequest, StreamingSpeechSynthesizer,
+    AdapterError, AudioFrame, OpenAiCompatibleSpeechConfig, OpenAiCompatibleSpeechDialect,
+    OpenAiCompatibleStreamingSpeechConfig, OpenAiCompatibleStreamingSpeechSynthesizer,
+    StreamingSpeechRequest, StreamingSpeechSynthesizer,
 };
 use conversation_protocol::{GenerationId, TurnId, UtteranceId};
 use serde_json::Value;
@@ -55,6 +56,9 @@ async fn arbitrary_http_chunks_yield_ordered_identity_preserving_pcm_frames() {
     assert_eq!(payload["response_format"], "wav");
     assert_eq!(payload["stream"], true);
     assert_eq!(payload["streaming_interval"], 0.32);
+    assert_eq!(payload["instruct"], "Speak naturally.");
+    assert_eq!(payload["lang_code"], "auto");
+    assert!(payload.get("instructions").is_none());
 }
 
 #[tokio::test]
@@ -500,6 +504,164 @@ async fn cancellation_during_playback_closes_without_a_late_frame_or_error() {
     );
 }
 
+#[tokio::test]
+async fn an_open_ended_wav_streams_pcm_until_eof_across_split_reads() {
+    for unknown_size in [u32::MAX, 0] {
+        let pcm = counting_pcm16(1_000);
+        let mut body = open_ended_wav_header(24_000, 1, unknown_size);
+        body.extend_from_slice(&pcm);
+        let server =
+            StreamingSpeechServer::chunked(split_at(body, &[3, 11, 30, 43, 45, 1_005, 1_544]))
+                .await;
+
+        let frames = drain(
+            configured_streaming_adapter(server.endpoint(), 0.32, 1024 * 1024)
+                .stream(request(), CancellationToken::new()),
+        )
+        .await
+        .unwrap();
+
+        let sizes: Vec<_> = frames.iter().map(|frame| frame.bytes().len()).collect();
+        assert_eq!(sizes, [960, 960, 80], "unknown_size={unknown_size:#x}");
+        assert_eq!(
+            frames.iter().map(AudioFrame::sequence).collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        assert_eq!(frames[0].format().sample_rate_hz(), 24_000);
+        assert_eq!(frames[2].utterance_id(), UtteranceId::new(9));
+        assert_eq!(
+            frames
+                .iter()
+                .flat_map(|frame| frame.bytes().iter().copied())
+                .collect::<Vec<_>>(),
+            pcm
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_open_ended_wav_plays_its_first_frame_before_the_response_completes() {
+    set_credential();
+    let pcm = counting_pcm16(960);
+    let mut before = open_ended_wav_header(24_000, 1, u32::MAX);
+    before.extend_from_slice(&pcm[..960]);
+    let server = StreamingSpeechServer::gated_chunks(vec![before], vec![pcm[960..].to_vec()]).await;
+    let mut frames = online_streaming_adapter(server.endpoint(), CREDENTIAL_ENV)
+        .stream(request(), CancellationToken::new());
+
+    let first = timeout(Duration::from_secs(5), frames.recv())
+        .await
+        .expect("the first open-ended frame did not arrive before the response completed")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(first.bytes(), &pcm[..960]);
+    server.release();
+    let rest = timeout(Duration::from_secs(5), drain(frames))
+        .await
+        .expect("the released remainder never closed the stream")
+        .unwrap();
+    assert_eq!(rest.len(), 1);
+    assert_eq!(rest[0].sequence(), 1);
+    assert_eq!(rest[0].bytes(), &pcm[960..]);
+}
+
+#[tokio::test]
+async fn an_open_ended_wav_is_bounded_by_the_audio_limit() {
+    let mut body = open_ended_wav_header(24_000, 1, u32::MAX);
+    body.extend_from_slice(&counting_pcm16(2_000));
+    let server = StreamingSpeechServer::chunked(split_at(body, &[1_000, 3_000])).await;
+
+    let error = next_error(
+        configured_streaming_adapter(server.endpoint(), 0.32, 44 + 2_000)
+            .stream(request(), CancellationToken::new()),
+    )
+    .await;
+
+    assert_eq!(
+        error.message(),
+        "speech synthesis output exceeded the configured limit"
+    );
+}
+
+#[tokio::test]
+async fn a_truncated_open_ended_wav_is_rejected() {
+    let header = open_ended_wav_header(24_000, 1, u32::MAX);
+    let mut partial_sample = header.clone();
+    partial_sample.extend_from_slice(&counting_pcm16(480));
+    partial_sample.push(0);
+    for body in [header[..20].to_vec(), header[..40].to_vec(), partial_sample] {
+        let len = body.len();
+        let server = StreamingSpeechServer::fixed(body).await;
+
+        let error = next_error(
+            configured_streaming_adapter(server.endpoint(), 0.32, 1024 * 1024)
+                .stream(request(), CancellationToken::new()),
+        )
+        .await;
+
+        assert_eq!(
+            error.message(),
+            "speech synthesis stream ended with an incomplete WAV container",
+            "len={len}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_open_ended_wav_without_pcm_is_empty_output() {
+    let server = StreamingSpeechServer::fixed(open_ended_wav_header(24_000, 1, u32::MAX)).await;
+
+    let error = next_error(
+        configured_streaming_adapter(server.endpoint(), 0.32, 1024 * 1024)
+            .stream(request(), CancellationToken::new()),
+    )
+    .await;
+
+    assert_eq!(error.message(), "speech synthesis output was empty");
+}
+
+#[tokio::test]
+async fn the_openai_dialect_sends_only_openai_speech_fields() {
+    let server = StreamingSpeechServer::fixed(pcm16_wav(8_000, 1, 160, 1)).await;
+    let speech = OpenAiCompatibleSpeechConfig::new("online-speech-model")
+        .unwrap()
+        .with_endpoint(format!("{}/v1", server.endpoint()))
+        .unwrap()
+        .with_voice("online-voice")
+        .unwrap()
+        .with_speed(1.0)
+        .unwrap()
+        .with_language("auto")
+        .unwrap()
+        .with_instructions("Speak naturally.")
+        .unwrap()
+        .with_max_tokens(128)
+        .unwrap()
+        .with_repetition_penalty(1.05)
+        .unwrap()
+        .with_dialect(OpenAiCompatibleSpeechDialect::OpenAi);
+    let synthesizer = OpenAiCompatibleStreamingSpeechSynthesizer::new(
+        OpenAiCompatibleStreamingSpeechConfig::new(speech, 0.32).unwrap(),
+    );
+
+    drain(synthesizer.stream(request(), CancellationToken::new()))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        server.request_json().await,
+        serde_json::json!({
+            "model": "online-speech-model",
+            "input": PRIVATE_TEXT,
+            "voice": "online-voice",
+            "speed": 1.0,
+            "instructions": "Speak naturally.",
+            "response_format": "wav",
+        })
+    );
+}
+
 #[test]
 fn an_online_endpoint_may_not_carry_credentials_in_its_url() {
     let speech = OpenAiCompatibleSpeechConfig::new("local-speech-model")
@@ -692,6 +854,21 @@ fn pcm16_wav(sample_rate_hz: u32, channels: u16, sample_count: usize, sample: i1
     wav.extend_from_slice(&data_bytes.to_le_bytes());
     wav.extend_from_slice(&pcm);
     wav
+}
+
+/// The header OpenAI's streamed speech starts with: one WAV whose RIFF and
+/// data sizes are both the unknown-length marker, then PCM until EOF.
+fn open_ended_wav_header(sample_rate_hz: u32, channels: u16, unknown_size: u32) -> Vec<u8> {
+    let mut header = pcm16_wav(sample_rate_hz, channels, 0, 0);
+    header[4..8].copy_from_slice(&unknown_size.to_le_bytes());
+    header[40..44].copy_from_slice(&unknown_size.to_le_bytes());
+    header
+}
+
+fn counting_pcm16(sample_count: usize) -> Vec<u8> {
+    (0..sample_count)
+        .flat_map(|sample| i16::try_from(sample).unwrap().to_le_bytes())
+        .collect()
 }
 
 fn split_at(bytes: Vec<u8>, offsets: &[usize]) -> Vec<Vec<u8>> {

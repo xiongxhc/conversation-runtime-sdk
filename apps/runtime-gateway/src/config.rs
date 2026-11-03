@@ -10,12 +10,12 @@ use conversation_memory::{SqliteMemoryContextProvider, SqliteMemoryStore, System
 use conversation_model_adapters::{
     BufferedStreamingSpeechSynthesizer, GenerationLanguageModel, MacOsVoiceSidecar,
     MacOsVoiceSidecarConfig, OllamaConfig, OllamaLanguageModel, OpenAiCompatibleSpeechConfig,
-    OpenAiCompatibleSpeechSynthesizer, OpenAiCompatibleStreamingSpeechConfig,
-    OpenAiCompatibleStreamingSpeechSynthesizer, OpenAiDiarizationConfig, OpenAiLanguageConfig,
-    OpenAiLanguageModel, OpenAiSpeechRecognitionConfig, OpenAiTranscriptionDiarizer,
-    SidecarAsrBackend, SpeechSynthesizer, SpeechbrainDiarizationConfig,
-    SpeechbrainTranscriptionDiarizer, StreamingSpeechSynthesizer, SystemDevice,
-    TranscriptionDiarizer, VoiceIoFactory,
+    OpenAiCompatibleSpeechDialect, OpenAiCompatibleSpeechSynthesizer,
+    OpenAiCompatibleStreamingSpeechConfig, OpenAiCompatibleStreamingSpeechSynthesizer,
+    OpenAiDiarizationConfig, OpenAiLanguageConfig, OpenAiLanguageModel,
+    OpenAiSpeechRecognitionConfig, OpenAiTranscriptionDiarizer, SidecarAsrBackend,
+    SpeechSynthesizer, SpeechbrainDiarizationConfig, SpeechbrainTranscriptionDiarizer,
+    StreamingSpeechSynthesizer, SystemDevice, TranscriptionDiarizer, VoiceIoFactory,
 };
 use conversation_protocol::{
     ClientComponentDescriptor, ComponentDescriptor, ComponentKind, ConversationMode,
@@ -1178,7 +1178,12 @@ impl VoiceSpeechConfig {
             .with_max_text_bytes(self.max_text_bytes)
             .map_err(adapter_error)?
             .with_max_audio_bytes(self.max_audio_bytes)
-            .map_err(adapter_error)?;
+            .map_err(adapter_error)?
+            // Remote speech is OpenAI's API; local speech is an mlx-audio host.
+            .with_dialect(match self.execution {
+                ExecutionConfig::Local => OpenAiCompatibleSpeechDialect::MlxAudio,
+                ExecutionConfig::Remote => OpenAiCompatibleSpeechDialect::OpenAi,
+            });
 
         match (self.mode, self.streaming_interval) {
             (VoiceSpeechMode::Buffered, None) => {

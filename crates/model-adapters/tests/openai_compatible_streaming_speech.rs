@@ -622,6 +622,99 @@ async fn an_open_ended_wav_without_pcm_is_empty_output() {
 }
 
 #[tokio::test]
+async fn a_sized_riff_with_an_unknown_data_size_streams_until_eof() {
+    for unknown_size in [u32::MAX, 0] {
+        let pcm = counting_pcm16(1_000);
+        let mut body = wav_header(24_000, 1, 36, &[], unknown_size);
+        body.extend_from_slice(&pcm);
+        let server = StreamingSpeechServer::chunked(split_at(body, &[7, 43, 45, 1_500])).await;
+
+        let frames = drain(
+            configured_streaming_adapter(server.endpoint(), 0.32, 1024 * 1024)
+                .stream(request(), CancellationToken::new()),
+        )
+        .await
+        .unwrap();
+
+        let sizes: Vec<_> = frames.iter().map(|frame| frame.bytes().len()).collect();
+        assert_eq!(sizes, [960, 960, 80], "unknown_size={unknown_size:#x}");
+        assert_eq!(concatenated(&frames), pcm);
+    }
+}
+
+#[tokio::test]
+async fn an_open_ended_wav_skips_list_and_odd_sized_chunks_before_data() {
+    let pcm = counting_pcm16(600);
+    let mut body = wav_header(
+        24_000,
+        1,
+        u32::MAX,
+        &[
+            (b"LIST", b"INFOISFT\x0e\0\0\0Lavf61.7.100\0\0"),
+            (b"junk", b"odd"),
+        ],
+        u32::MAX,
+    );
+    body.extend_from_slice(&pcm);
+    let server = StreamingSpeechServer::chunked(split_every(body, 5)).await;
+
+    let frames = drain(
+        configured_streaming_adapter(server.endpoint(), 0.32, 1024 * 1024)
+            .stream(request(), CancellationToken::new()),
+    )
+    .await
+    .unwrap();
+
+    let sizes: Vec<_> = frames.iter().map(|frame| frame.bytes().len()).collect();
+    assert_eq!(sizes, [960, 240]);
+    assert_eq!(concatenated(&frames), pcm);
+}
+
+#[tokio::test]
+async fn a_48_khz_stereo_open_ended_wav_survives_seven_byte_reads() {
+    let pcm = counting_pcm16(5_000);
+    let mut body = wav_header(48_000, 2, u32::MAX, &[], u32::MAX);
+    body.extend_from_slice(&pcm);
+    let server = StreamingSpeechServer::chunked(split_every(body, 7)).await;
+
+    let frames = drain(
+        configured_streaming_adapter(server.endpoint(), 0.32, 1024 * 1024)
+            .stream(request(), CancellationToken::new()),
+    )
+    .await
+    .unwrap();
+
+    let sizes: Vec<_> = frames.iter().map(|frame| frame.bytes().len()).collect();
+    assert_eq!(sizes, [3_840, 3_840, 2_320]);
+    assert_eq!(frames[0].format().sample_rate_hz(), 48_000);
+    assert_eq!(frames[0].format().channels(), 2);
+    assert_eq!(concatenated(&frames), pcm);
+}
+
+#[tokio::test]
+async fn an_open_ended_wav_after_a_complete_one_continues_the_sequence() {
+    let open_ended_pcm = counting_pcm16(480);
+    let mut body = pcm16_wav(24_000, 1, 480, 1);
+    body.extend_from_slice(&open_ended_wav_header(24_000, 1, u32::MAX));
+    body.extend_from_slice(&open_ended_pcm);
+    let server = StreamingSpeechServer::chunked(split_every(body, 100)).await;
+
+    let frames = drain(
+        configured_streaming_adapter(server.endpoint(), 0.32, 1024 * 1024)
+            .stream(request(), CancellationToken::new()),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        frames.iter().map(AudioFrame::sequence).collect::<Vec<_>>(),
+        [0, 1]
+    );
+    assert_eq!(&frames[0].bytes()[..2], &1_i16.to_le_bytes());
+    assert_eq!(frames[1].bytes(), open_ended_pcm);
+}
+
+#[tokio::test]
 async fn the_openai_dialect_sends_only_openai_speech_fields() {
     let server = StreamingSpeechServer::fixed(pcm16_wav(8_000, 1, 160, 1)).await;
     let speech = OpenAiCompatibleSpeechConfig::new("online-speech-model")
@@ -859,10 +952,43 @@ fn pcm16_wav(sample_rate_hz: u32, channels: u16, sample_count: usize, sample: i1
 /// The header OpenAI's streamed speech starts with: one WAV whose RIFF and
 /// data sizes are both the unknown-length marker, then PCM until EOF.
 fn open_ended_wav_header(sample_rate_hz: u32, channels: u16, unknown_size: u32) -> Vec<u8> {
+    wav_header(sample_rate_hz, channels, unknown_size, &[], unknown_size)
+}
+
+/// A 16-bit PCM WAV header with `extra` chunks (padded to even sizes) between
+/// `fmt ` and `data`, carrying the given RIFF and data sizes verbatim.
+fn wav_header(
+    sample_rate_hz: u32,
+    channels: u16,
+    riff_size: u32,
+    extra: &[(&[u8; 4], &[u8])],
+    data_size: u32,
+) -> Vec<u8> {
     let mut header = pcm16_wav(sample_rate_hz, channels, 0, 0);
-    header[4..8].copy_from_slice(&unknown_size.to_le_bytes());
-    header[40..44].copy_from_slice(&unknown_size.to_le_bytes());
+    header.truncate(36);
+    header[4..8].copy_from_slice(&riff_size.to_le_bytes());
+    for (id, body) in extra {
+        header.extend_from_slice(*id);
+        header.extend_from_slice(&u32::try_from(body.len()).unwrap().to_le_bytes());
+        header.extend_from_slice(body);
+        if body.len() % 2 == 1 {
+            header.push(0);
+        }
+    }
+    header.extend_from_slice(b"data");
+    header.extend_from_slice(&data_size.to_le_bytes());
     header
+}
+
+fn concatenated(frames: &[AudioFrame]) -> Vec<u8> {
+    frames
+        .iter()
+        .flat_map(|frame| frame.bytes().iter().copied())
+        .collect()
+}
+
+fn split_every(bytes: Vec<u8>, size: usize) -> Vec<Vec<u8>> {
+    bytes.chunks(size).map(<[u8]>::to_vec).collect()
 }
 
 fn counting_pcm16(sample_count: usize) -> Vec<u8> {

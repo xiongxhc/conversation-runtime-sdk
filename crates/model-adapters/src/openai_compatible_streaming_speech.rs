@@ -307,45 +307,62 @@ fn take_container(
     }
 
     let riff_size = read_u32_le(&buffer[4..8])?;
-    if UNKNOWN_WAV_SIZES.contains(&riff_size) {
-        return take_open_ended_header(buffer);
-    }
-    let container_bytes = usize::try_from(riff_size)
-        .ok()
-        .and_then(|size| size.checked_add(8))
-        .filter(|size| *size >= RIFF_HEADER_BYTES && *size <= max_audio_bytes)
-        .ok_or_else(output_limit_error)?;
-    if buffer.len() < container_bytes {
-        return Ok(None);
+    if !UNKNOWN_WAV_SIZES.contains(&riff_size) {
+        let container_bytes = usize::try_from(riff_size)
+            .ok()
+            .and_then(|size| size.checked_add(8))
+            .filter(|size| *size >= RIFF_HEADER_BYTES && *size <= max_audio_bytes)
+            .ok_or_else(output_limit_error)?;
+        let header = read_wav_header(&buffer[..buffer.len().min(container_bytes)])?;
+        if !header.is_some_and(|header| UNKNOWN_WAV_SIZES.contains(&header.data_bytes)) {
+            if buffer.len() < container_bytes {
+                return Ok(None);
+            }
+            let remaining = buffer.split_off(container_bytes);
+            return Ok(Some(Container::Complete(std::mem::replace(
+                buffer, remaining,
+            ))));
+        }
     }
 
-    let remaining = buffer.split_off(container_bytes);
-    Ok(Some(Container::Complete(std::mem::replace(
-        buffer, remaining,
-    ))))
+    // An unknown RIFF or data size: the PCM after the header runs to EOF.
+    let Some(header) = read_wav_header(buffer)? else {
+        return Ok(None);
+    };
+    let format = header.format.ok_or_else(invalid_stream_error)?;
+    buffer.drain(..header.data_start);
+    Ok(Some(Container::OpenEnded(format)))
 }
 
-/// Walks the header chunks up to `data`, whose size is ignored: the PCM runs
-/// to EOF. Waits for more bytes while any header chunk is incomplete.
-fn take_open_ended_header(buffer: &mut Vec<u8>) -> Result<Option<Container>, AdapterError> {
+struct WavHeader {
+    format: Option<PcmFormat>,
+    data_start: usize,
+    data_bytes: u32,
+}
+
+/// Walks the chunks before `data`; `None` until the `data` chunk header and
+/// every chunk before it have arrived.
+fn read_wav_header(bytes: &[u8]) -> Result<Option<WavHeader>, AdapterError> {
     let mut format = None;
     let mut offset = RIFF_HEADER_BYTES;
     loop {
         let body_start = offset + CHUNK_HEADER_BYTES;
-        let Some(chunk_header) = buffer.get(offset..body_start) else {
+        let Some(chunk_header) = bytes.get(offset..body_start) else {
             return Ok(None);
         };
+        let declared_bytes = read_u32_le(&chunk_header[4..8])?;
         if &chunk_header[..4] == b"data" {
-            let format = format.ok_or_else(invalid_stream_error)?;
-            buffer.drain(..body_start);
-            return Ok(Some(Container::OpenEnded(format)));
+            return Ok(Some(WavHeader {
+                format,
+                data_start: body_start,
+                data_bytes: declared_bytes,
+            }));
         }
-        let body_bytes = usize::try_from(read_u32_le(&chunk_header[4..8])?)
-            .map_err(|_| invalid_stream_error())?;
+        let body_bytes = usize::try_from(declared_bytes).map_err(|_| invalid_stream_error())?;
         let body_end = body_start
             .checked_add(body_bytes)
             .ok_or_else(invalid_stream_error)?;
-        let Some(body) = buffer.get(body_start..body_end) else {
+        let Some(body) = bytes.get(body_start..body_end) else {
             return Ok(None);
         };
         if &chunk_header[..4] == b"fmt " {

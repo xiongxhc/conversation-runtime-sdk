@@ -1,6 +1,7 @@
 # Online meeting profile. Selecting it is explicit and deliberate: this
 # deployment sends audio and text to third-party providers. Omitting `profile`
-# selects `offline`, and every other example in this directory is offline.
+# selects `offline`, as gateway.example.toml does. gateway.toggle.example.toml
+# holds both setups behind one `mode` line.
 #
 # Credentials are never written here. Each `credential_env` and `key_env` names
 # an environment variable the operator sets before starting the gateway; the

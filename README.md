@@ -162,6 +162,25 @@ settings, and protocol compatibility are documented in
 
 ## Configuration Notes
 
+### Local or API toggle
+
+A schema version 3 gateway file may hold a local and an API setup for each part
+and switch between them with one line. Each of `[language]`, `[voice.asr]`,
+`[voice.speech]` and `[voice.diarization]` becomes a `.local` and an `.api`
+block, written exactly as the plain section would be, and `mode = "local"` or
+`mode = "api"` selects one. `mode_overrides = { speech = "local" }` moves single
+parts to the other side. See
+[`configs/gateway.toggle.example.toml`](configs/gateway.toggle.example.toml).
+
+- `profile` and `privacy_mode` are derived: every part local gives `offline` /
+  `local-only`, any part on API gives `online` / `cloud`. Explicit values are
+  allowed only when they agree.
+- `[media]` serves API ASR. With ASR local, the voice sidecar's microphone is
+  the audio source and `[media]` is ignored, so a meeting bridge cannot feed a
+  local recognizer.
+- Only provider hosts referenced by a selected block are started.
+- A file without `mode` is read exactly as before.
+
 ### Meeting online profile
 
 Omitting `profile` selects `offline`; Meeting Agent explicitly requests the

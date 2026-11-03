@@ -10,12 +10,12 @@ use conversation_memory::{SqliteMemoryContextProvider, SqliteMemoryStore, System
 use conversation_model_adapters::{
     BufferedStreamingSpeechSynthesizer, GenerationLanguageModel, MacOsVoiceSidecar,
     MacOsVoiceSidecarConfig, OllamaConfig, OllamaLanguageModel, OpenAiCompatibleSpeechConfig,
-    OpenAiCompatibleSpeechSynthesizer, OpenAiCompatibleStreamingSpeechConfig,
-    OpenAiCompatibleStreamingSpeechSynthesizer, OpenAiDiarizationConfig, OpenAiLanguageConfig,
-    OpenAiLanguageModel, OpenAiSpeechRecognitionConfig, OpenAiTranscriptionDiarizer,
-    SidecarAsrBackend, SpeechSynthesizer, SpeechbrainDiarizationConfig,
-    SpeechbrainTranscriptionDiarizer, StreamingSpeechSynthesizer, SystemDevice,
-    TranscriptionDiarizer, VoiceIoFactory,
+    OpenAiCompatibleSpeechDialect, OpenAiCompatibleSpeechSynthesizer,
+    OpenAiCompatibleStreamingSpeechConfig, OpenAiCompatibleStreamingSpeechSynthesizer,
+    OpenAiDiarizationConfig, OpenAiLanguageConfig, OpenAiLanguageModel,
+    OpenAiSpeechRecognitionConfig, OpenAiTranscriptionDiarizer, SidecarAsrBackend,
+    SpeechSynthesizer, SpeechbrainDiarizationConfig, SpeechbrainTranscriptionDiarizer,
+    StreamingSpeechSynthesizer, SystemDevice, TranscriptionDiarizer, VoiceIoFactory,
 };
 use conversation_protocol::{
     ClientComponentDescriptor, ComponentDescriptor, ComponentKind, ConversationMode,
@@ -1159,7 +1159,16 @@ impl VoiceSpeechConfig {
         &self,
         endpoint: &str,
     ) -> Result<Arc<dyn StreamingSpeechSynthesizer>, GatewayConfigError> {
-        let speech = OpenAiCompatibleSpeechConfig::new(&self.model)
+        // Unset, remote speech is OpenAI's API and local speech an mlx-audio host.
+        let dialect = match (self.dialect, self.execution) {
+            (Some(VoiceSpeechDialect::Openai), _) | (None, ExecutionConfig::Remote) => {
+                OpenAiCompatibleSpeechDialect::OpenAi
+            }
+            (Some(VoiceSpeechDialect::MlxAudio), _) | (None, ExecutionConfig::Local) => {
+                OpenAiCompatibleSpeechDialect::MlxAudio
+            }
+        };
+        let mut speech = OpenAiCompatibleSpeechConfig::new(&self.model)
             .map_err(adapter_error)?
             .with_endpoint(endpoint)
             .map_err(adapter_error)?
@@ -1167,20 +1176,36 @@ impl VoiceSpeechConfig {
             .map_err(adapter_error)?
             .with_speed(self.speed)
             .map_err(adapter_error)?
-            .with_language(&self.language)
-            .map_err(adapter_error)?
             .with_instructions(&self.instructions)
-            .map_err(adapter_error)?
-            .with_max_tokens(self.max_tokens)
-            .map_err(adapter_error)?
-            .with_repetition_penalty(self.repetition_penalty)
             .map_err(adapter_error)?
             .with_max_text_bytes(self.max_text_bytes)
             .map_err(adapter_error)?
             .with_max_audio_bytes(self.max_audio_bytes)
-            .map_err(adapter_error)?;
+            .map_err(adapter_error)?
+            .with_dialect(dialect);
+        let mut streaming_interval = self.streaming_interval;
+        if dialect == OpenAiCompatibleSpeechDialect::MlxAudio {
+            let required = |field| config_error(format!("mlx-audio voice speech requires {field}"));
+            speech = speech
+                .with_language(
+                    self.language
+                        .as_deref()
+                        .ok_or_else(|| required("language"))?,
+                )
+                .map_err(adapter_error)?
+                .with_max_tokens(self.max_tokens.ok_or_else(|| required("max_tokens"))?)
+                .map_err(adapter_error)?
+                .with_repetition_penalty(
+                    self.repetition_penalty
+                        .ok_or_else(|| required("repetition_penalty"))?,
+                )
+                .map_err(adapter_error)?;
+        } else if self.mode == VoiceSpeechMode::Streaming {
+            // OpenAI streams without an interval; the adapter never sends this one.
+            streaming_interval = streaming_interval.or(Some(OPENAI_UNSENT_STREAMING_INTERVAL));
+        }
 
-        match (self.mode, self.streaming_interval) {
+        match (self.mode, streaming_interval) {
             (VoiceSpeechMode::Buffered, None) => {
                 let buffered: Arc<dyn SpeechSynthesizer> =
                     Arc::new(OpenAiCompatibleSpeechSynthesizer::new(speech));
@@ -1207,6 +1232,12 @@ impl VoiceSpeechConfig {
         }
     }
 }
+
+const OPENAI_UNSENT_STREAMING_INTERVAL: f32 = 0.2;
+
+#[cfg(test)]
+#[path = "config_speech_dialect_tests.rs"]
+mod speech_dialect_tests;
 
 fn load_toml(path: &Path) -> Result<GatewayConfig, GatewayConfigError> {
     if !path.is_absolute() {
@@ -1923,6 +1954,10 @@ struct VoiceSpeechConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     provider_host: Option<String>,
     mode: VoiceSpeechMode,
+    /// The request body to send; unset follows `execution` (remote: openai, local: mlx-audio).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dialect: Option<VoiceSpeechDialect>,
+    /// mlx-audio only, like `language`, `max_tokens` and `repetition_penalty`.
     streaming_interval: Option<f32>,
     endpoint: String,
     model: String,
@@ -1931,12 +1966,22 @@ struct VoiceSpeechConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     credential_env: Option<String>,
     speed: f32,
-    language: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    language: Option<String>,
     instructions: String,
-    max_tokens: usize,
-    repetition_penalty: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repetition_penalty: Option<f32>,
     max_text_bytes: usize,
     max_audio_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum VoiceSpeechDialect {
+    Openai,
+    MlxAudio,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]

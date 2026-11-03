@@ -22,6 +22,17 @@ pub struct OpenAiCompatibleSpeechConfig {
     repetition_penalty: Option<f32>,
     max_text_bytes: usize,
     max_audio_bytes: usize,
+    dialect: OpenAiCompatibleSpeechDialect,
+}
+
+/// Which server's `/audio/speech` request fields the body carries.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum OpenAiCompatibleSpeechDialect {
+    /// mlx-audio: `lang_code`, `instruct`, generation controls and streaming fields.
+    #[default]
+    MlxAudio,
+    /// OpenAI: `instructions` and none of the mlx-audio fields.
+    OpenAi,
 }
 
 #[derive(Clone, Debug)]
@@ -47,6 +58,7 @@ impl OpenAiCompatibleSpeechConfig {
             repetition_penalty: None,
             max_text_bytes: DEFAULT_MAX_TEXT_BYTES,
             max_audio_bytes: DEFAULT_MAX_AUDIO_BYTES,
+            dialect: OpenAiCompatibleSpeechDialect::MlxAudio,
         })
     }
 
@@ -128,6 +140,11 @@ impl OpenAiCompatibleSpeechConfig {
         Ok(self)
     }
 
+    pub fn with_dialect(mut self, dialect: OpenAiCompatibleSpeechDialect) -> Self {
+        self.dialect = dialect;
+        self
+    }
+
     pub(crate) const fn endpoint(&self) -> &reqwest::Url {
         &self.endpoint
     }
@@ -204,7 +221,9 @@ pub(crate) struct OpenAiCompatibleSpeechRequest<'a> {
     speed: Option<f32>,
     #[serde(rename = "lang_code", skip_serializing_if = "Option::is_none")]
     language: Option<&'a str>,
-    #[serde(rename = "instruct", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instruct: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     instructions: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<usize>,
@@ -224,18 +243,35 @@ impl<'a> OpenAiCompatibleSpeechRequest<'a> {
         stream: Option<bool>,
         streaming_interval: Option<f32>,
     ) -> Self {
-        Self {
+        let request = Self {
             model: &config.model,
             input,
             voice: config.voice.as_deref(),
             speed: config.speed,
-            language: config.language.as_deref(),
-            instructions: config.instructions.as_deref(),
-            max_tokens: config.max_tokens,
-            repetition_penalty: config.repetition_penalty,
+            language: None,
+            instruct: None,
+            instructions: None,
+            max_tokens: None,
+            repetition_penalty: None,
             response_format: "wav",
-            stream,
-            streaming_interval,
+            stream: None,
+            streaming_interval: None,
+        };
+        match config.dialect {
+            OpenAiCompatibleSpeechDialect::MlxAudio => Self {
+                language: config.language.as_deref(),
+                instruct: config.instructions.as_deref(),
+                max_tokens: config.max_tokens,
+                repetition_penalty: config.repetition_penalty,
+                stream,
+                streaming_interval,
+                ..request
+            },
+            // OpenAI streams `/audio/speech` without a request flag.
+            OpenAiCompatibleSpeechDialect::OpenAi => Self {
+                instructions: config.instructions.as_deref(),
+                ..request
+            },
         }
     }
 

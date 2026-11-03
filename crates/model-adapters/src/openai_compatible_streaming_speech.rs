@@ -9,6 +9,7 @@ use crate::openai_compatible_speech::{
     cancelled_error, http_error, speech_endpoint, validate_speech_text,
     OpenAiCompatibleSpeechRequest,
 };
+use crate::wav_pcm::parse_format;
 use crate::{
     AdapterError, AudioFormat, OpenAiCompatibleSpeechConfig, PcmFormat, StreamingSpeechRequest,
     StreamingSpeechSynthesizer, SynthesizedAudio, WavPcmDecoder,
@@ -16,6 +17,10 @@ use crate::{
 
 const FRAME_CHANNEL_CAPACITY: usize = 1;
 const RIFF_HEADER_BYTES: usize = 12;
+const CHUNK_HEADER_BYTES: usize = 8;
+const FRAME_DURATION_MILLISECONDS: usize = 20;
+/// RIFF and data sizes a streaming server writes when it cannot know the length.
+const UNKNOWN_WAV_SIZES: [u32; 2] = [0, u32::MAX];
 const DEFAULT_RESPONSE_START_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_STALL_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -198,39 +203,53 @@ async fn decode_response(
     let mut received_bytes = 0_usize;
     let mut next_sequence = 0_u64;
     let mut expected_format = None;
+    let mut open_ended_format = None;
     let mut emitted_frame = false;
 
     loop {
         let chunk = await_transport(response.chunk(), config.stall_timeout, cancellation, sender)
             .await?
             .map_err(|_| AdapterError::new("failed to read speech synthesis output"))?;
-        let Some(chunk) = chunk else {
-            break;
-        };
-
-        ensure_stream_open(cancellation, sender)?;
-        received_bytes = received_bytes
-            .checked_add(chunk.len())
-            .filter(|total| *total <= config.speech.max_audio_bytes())
-            .ok_or_else(output_limit_error)?;
-        buffer.extend_from_slice(&chunk);
+        let at_eof = chunk.is_none();
+        if let Some(chunk) = chunk {
+            ensure_stream_open(cancellation, sender)?;
+            received_bytes = received_bytes
+                .checked_add(chunk.len())
+                .filter(|total| *total <= config.speech.max_audio_bytes())
+                .ok_or_else(output_limit_error)?;
+            buffer.extend_from_slice(&chunk);
+        }
 
         loop {
             ensure_stream_open(cancellation, sender)?;
-            let Some(container_bytes) =
-                take_complete_container(&mut buffer, config.speech.max_audio_bytes())?
-            else {
-                break;
+            let frames = if let Some(format) = open_ended_format {
+                let Some(frames) =
+                    take_open_ended_frames(&mut buffer, format, at_eof, &request, next_sequence)?
+                else {
+                    break;
+                };
+                frames
+            } else {
+                match take_container(&mut buffer, config.speech.max_audio_bytes())? {
+                    None => break,
+                    Some(Container::OpenEnded(format)) => {
+                        require_stable_format(&mut expected_format, format)?;
+                        open_ended_format = Some(format);
+                        continue;
+                    }
+                    Some(Container::Complete(container_bytes)) => {
+                        ensure_stream_open(cancellation, sender)?;
+                        decoder.decode_from_sequence_with_check(
+                            request.turn_id(),
+                            request.generation_id(),
+                            request.utterance_id(),
+                            next_sequence,
+                            &SynthesizedAudio::new(container_bytes, AudioFormat::Wav),
+                            || ensure_stream_open(cancellation, sender),
+                        )?
+                    }
+                }
             };
-            ensure_stream_open(cancellation, sender)?;
-            let frames = decoder.decode_from_sequence_with_check(
-                request.turn_id(),
-                request.generation_id(),
-                request.utterance_id(),
-                next_sequence,
-                &SynthesizedAudio::new(container_bytes, AudioFormat::Wav),
-                || ensure_stream_open(cancellation, sender),
-            )?;
             ensure_stream_open(cancellation, sender)?;
             let format = frames
                 .first()
@@ -252,6 +271,9 @@ async fn decode_response(
                 emitted_frame = true;
             }
         }
+        if at_eof {
+            break;
+        }
     }
 
     if !buffer.is_empty() {
@@ -265,10 +287,18 @@ async fn decode_response(
     Ok(())
 }
 
-fn take_complete_container(
+enum Container {
+    /// A complete RIFF/WAVE file carrying its true size (mlx-audio).
+    Complete(Vec<u8>),
+    /// The header of one WAV of unknown length, already removed from the
+    /// buffer; PCM follows until EOF (OpenAI).
+    OpenEnded(PcmFormat),
+}
+
+fn take_container(
     buffer: &mut Vec<u8>,
     max_audio_bytes: usize,
-) -> Result<Option<Vec<u8>>, AdapterError> {
+) -> Result<Option<Container>, AdapterError> {
     if buffer.len() < RIFF_HEADER_BYTES {
         return Ok(None);
     }
@@ -276,22 +306,115 @@ fn take_complete_container(
         return Err(invalid_stream_error());
     }
 
-    let riff_size = u32::from_le_bytes(
-        buffer[4..8]
-            .try_into()
-            .map_err(|_| invalid_stream_error())?,
-    );
-    let container_bytes = usize::try_from(riff_size)
+    let riff_size = read_u32_le(&buffer[4..8])?;
+    if !UNKNOWN_WAV_SIZES.contains(&riff_size) {
+        let container_bytes = usize::try_from(riff_size)
+            .ok()
+            .and_then(|size| size.checked_add(8))
+            .filter(|size| *size >= RIFF_HEADER_BYTES && *size <= max_audio_bytes)
+            .ok_or_else(output_limit_error)?;
+        let header = read_wav_header(&buffer[..buffer.len().min(container_bytes)])?;
+        if !header.is_some_and(|header| UNKNOWN_WAV_SIZES.contains(&header.data_bytes)) {
+            if buffer.len() < container_bytes {
+                return Ok(None);
+            }
+            let remaining = buffer.split_off(container_bytes);
+            return Ok(Some(Container::Complete(std::mem::replace(
+                buffer, remaining,
+            ))));
+        }
+    }
+
+    // An unknown RIFF or data size: the PCM after the header runs to EOF.
+    let Some(header) = read_wav_header(buffer)? else {
+        return Ok(None);
+    };
+    let format = header.format.ok_or_else(invalid_stream_error)?;
+    buffer.drain(..header.data_start);
+    Ok(Some(Container::OpenEnded(format)))
+}
+
+struct WavHeader {
+    format: Option<PcmFormat>,
+    data_start: usize,
+    data_bytes: u32,
+}
+
+/// Walks the chunks before `data`; `None` until the `data` chunk header and
+/// every chunk before it have arrived.
+fn read_wav_header(bytes: &[u8]) -> Result<Option<WavHeader>, AdapterError> {
+    let mut format = None;
+    let mut offset = RIFF_HEADER_BYTES;
+    loop {
+        let body_start = offset + CHUNK_HEADER_BYTES;
+        let Some(chunk_header) = bytes.get(offset..body_start) else {
+            return Ok(None);
+        };
+        let declared_bytes = read_u32_le(&chunk_header[4..8])?;
+        if &chunk_header[..4] == b"data" {
+            return Ok(Some(WavHeader {
+                format,
+                data_start: body_start,
+                data_bytes: declared_bytes,
+            }));
+        }
+        let body_bytes = usize::try_from(declared_bytes).map_err(|_| invalid_stream_error())?;
+        let body_end = body_start
+            .checked_add(body_bytes)
+            .ok_or_else(invalid_stream_error)?;
+        let Some(body) = bytes.get(body_start..body_end) else {
+            return Ok(None);
+        };
+        if &chunk_header[..4] == b"fmt " {
+            format = Some(parse_format(body)?);
+        }
+        offset = body_end + body_bytes % 2;
+    }
+}
+
+/// Takes whole 20 ms frames of open-ended PCM, and at EOF whatever
+/// sample-aligned remainder is left.
+fn take_open_ended_frames(
+    buffer: &mut Vec<u8>,
+    format: PcmFormat,
+    at_eof: bool,
+    request: &StreamingSpeechRequest,
+    next_sequence: u64,
+) -> Result<Option<Vec<crate::AudioFrame>>, AdapterError> {
+    let alignment = format.frame_alignment_bytes()?;
+    let frame_bytes = usize::try_from(format.sample_rate_hz())
         .ok()
-        .and_then(|size| size.checked_add(8))
-        .filter(|size| *size >= RIFF_HEADER_BYTES && *size <= max_audio_bytes)
-        .ok_or_else(output_limit_error)?;
-    if buffer.len() < container_bytes {
+        .and_then(|rate| rate.checked_mul(FRAME_DURATION_MILLISECONDS))
+        .map(|samples| samples / 1_000)
+        .and_then(|samples| samples.checked_mul(alignment))
+        .filter(|bytes| *bytes > 0)
+        .ok_or_else(invalid_stream_error)?;
+    let unit = if at_eof { alignment } else { frame_bytes };
+    let take = buffer.len() - buffer.len() % unit;
+    if take == 0 {
         return Ok(None);
     }
 
-    let remaining = buffer.split_off(container_bytes);
-    Ok(Some(std::mem::replace(buffer, remaining)))
+    let mut sequence = next_sequence;
+    let mut frames = Vec::new();
+    for bytes in buffer.drain(..take).as_slice().chunks(frame_bytes) {
+        frames.push(crate::AudioFrame::new(
+            request.turn_id(),
+            request.generation_id(),
+            request.utterance_id(),
+            sequence,
+            format,
+            bytes.to_vec(),
+        )?);
+        sequence = sequence.checked_add(1).ok_or_else(invalid_stream_error)?;
+    }
+    Ok(Some(frames))
+}
+
+fn read_u32_le(bytes: &[u8]) -> Result<u32, AdapterError> {
+    Ok(u32::from_le_bytes(
+        bytes.try_into().map_err(|_| invalid_stream_error())?,
+    ))
 }
 
 fn require_stable_format(

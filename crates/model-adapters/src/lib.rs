@@ -80,7 +80,7 @@ pub use ollama::{
     OllamaChatMetrics, OllamaChatStream, OllamaConfig, OllamaLanguageModel, OllamaThinkingLevel,
 };
 pub use openai_compatible_speech::{
-    OpenAiCompatibleSpeechConfig, OpenAiCompatibleSpeechSynthesizer,
+    OpenAiCompatibleSpeechConfig, OpenAiCompatibleSpeechDialect, OpenAiCompatibleSpeechSynthesizer,
 };
 pub use openai_compatible_streaming_speech::{
     OpenAiCompatibleStreamingSpeechConfig, OpenAiCompatibleStreamingSpeechSynthesizer,

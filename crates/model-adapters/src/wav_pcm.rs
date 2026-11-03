@@ -173,7 +173,7 @@ fn parse_wav(
     Ok((format, data_bytes))
 }
 
-fn parse_format(bytes: &[u8]) -> Result<PcmFormat, AdapterError> {
+pub(crate) fn parse_format(bytes: &[u8]) -> Result<PcmFormat, AdapterError> {
     let header = bytes.get(..16).ok_or_else(invalid_wav_error)?;
     let audio_format = read_u16_le(&header[..2])?;
     let channels = read_u16_le(&header[2..4])?;

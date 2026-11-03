@@ -72,6 +72,52 @@ fn mlx_audio_speech_requires_each_mlx_field() {
     }
 }
 
+/// The toggle example's api speech block names `dialect = "openai"` without the mlx-audio
+/// fields, and its local block names `dialect = "mlx-audio"`, which needs every one of them.
+#[tokio::test]
+async fn the_toggle_example_sends_openai_on_api_and_needs_mlx_fields_on_local() {
+    const CREDENTIAL_ENV: &str = "CONVERSATION_TEST_DIALECT_TOGGLE_CREDENTIAL";
+    std::env::set_var(CREDENTIAL_ENV, "fake-not-a-real-credential-0000");
+    let example = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../configs/gateway.toggle.example.toml"
+    ))
+    .unwrap()
+    .replace("OPENAI_API_KEY", CREDENTIAL_ENV);
+    let directory = tempfile::tempdir().unwrap();
+    let speech = |text: &str| {
+        let path = directory.path().join("gateway.toml");
+        std::fs::write(&path, text).unwrap();
+        super::load_toml(&path).unwrap().voice.unwrap().speech
+    };
+
+    let api = speech(&example);
+    assert_eq!(
+        request_body(&api).await,
+        json!({
+            "model": "operator-supplied-tts-model",
+            "input": "spoken reply",
+            "voice": "operator-supplied-voice",
+            "speed": 1.0,
+            "instructions": "Speak naturally and clearly.",
+            "response_format": "wav",
+        })
+    );
+
+    let local = example.replace(r#"mode = "api""#, r#"mode = "local""#);
+    assert!(speech(&local).synthesizer("http://127.0.0.1:9/v1").is_ok());
+    for missing in MLX_FIELDS {
+        let without = local.replacen(&format!("{missing}\n"), "", 1);
+        assert_ne!(without, local, "the local block holds {missing}");
+        assert!(
+            speech(&without)
+                .synthesizer("http://127.0.0.1:9/v1")
+                .is_err(),
+            "missing {missing}"
+        );
+    }
+}
+
 fn speech(lines: &[&str]) -> VoiceSpeechConfig {
     toml::from_str(&format!("{SPEECH}{}\n", lines.join("\n"))).unwrap()
 }

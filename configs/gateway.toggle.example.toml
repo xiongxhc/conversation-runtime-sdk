@@ -105,6 +105,7 @@ execution = "local"
 provider = "local-speech-synthesis"
 provider_host = "local-speech"
 mode = "streaming"
+dialect = "mlx-audio"
 streaming_interval = 0.2
 endpoint = "http://127.0.0.1:8000/v1"
 model = "local-speech-model"
@@ -122,16 +123,15 @@ backend = "openai-compatible"
 execution = "remote"
 provider = "openai-compatible-streaming"
 mode = "streaming"
-streaming_interval = 0.2
+# OpenAI's request body; streaming_interval, language, max_tokens and
+# repetition_penalty are mlx-audio only and stay in the local block.
+dialect = "openai"
 endpoint = "https://api.openai.com/v1"
 model = "operator-supplied-tts-model"
 voice = "operator-supplied-voice"
 credential_env = "OPENAI_API_KEY"
 speed = 1.0
-language = "auto"
 instructions = "Speak naturally and clearly."
-max_tokens = 128
-repetition_penalty = 1.05
 max_text_bytes = 4096
 max_audio_bytes = 8388608
 

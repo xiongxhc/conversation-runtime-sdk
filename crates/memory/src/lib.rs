@@ -1,10 +1,12 @@
 mod error;
+mod people;
 mod provider;
 mod retrieval;
 mod sqlite;
 mod store;
 
 pub use error::{MemoryStoreError, MemoryStoreErrorKind, MemoryStoreResult};
+pub use people::{NewPerson, PeopleStore, Person, PersonMaturity, PersonName, MAX_PEOPLE};
 pub use provider::{
     MemoryClock, MemoryContextProvider, MemoryProviderFuture, SqliteMemoryContextProvider,
     SystemMemoryClock,

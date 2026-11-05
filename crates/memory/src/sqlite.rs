@@ -11,6 +11,8 @@ use conversation_protocol::{
 };
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 
+mod people;
+
 use crate::retrieval::{check_cancellation, select_records};
 use crate::{
     BoundedMemoryInspection, MemoryPage, MemoryRetrieval, MemoryStore, MemoryStoreError,

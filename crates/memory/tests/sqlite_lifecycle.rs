@@ -31,7 +31,7 @@ fn initialization_is_explicit_absolute_and_schema_identified() {
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
     assert_eq!(application_id, SQLITE_APPLICATION_ID);
-    assert_eq!(user_version, 1);
+    assert_eq!(user_version, 2);
     drop(connection);
 
     SqliteMemoryStore::open(&database).unwrap();
@@ -73,7 +73,7 @@ fn open_rejects_foreign_newer_and_modified_schemas() {
     let newer = temporary.path().join("newer.sqlite3");
     SqliteMemoryStore::initialize(&newer).unwrap();
     let connection = Connection::open(&newer).unwrap();
-    connection.pragma_update(None, "user_version", 2).unwrap();
+    connection.pragma_update(None, "user_version", 3).unwrap();
     drop(connection);
     let error = SqliteMemoryStore::open(&newer).unwrap_err();
     assert_eq!(error.kind(), MemoryStoreErrorKind::UnsupportedSchema);

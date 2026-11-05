@@ -6,7 +6,7 @@ use conversation_protocol::{
     MemoryApproval, MemoryApprovalEvidence, MemoryConfidence, MemoryContextItem, MemoryDraft,
     MemoryId, MemoryInspection, MemoryKind, MemoryPatch, MemoryProvenance, MemoryProvenanceKind,
     MemoryRecord, MemoryRetention, MemoryRetrievalReason, MemoryRetrievalRequest,
-    MemoryRetrievalTrace, MemoryState, MemoryTraceItem, RetrievalTraceId, SessionId,
+    MemoryRetrievalTrace, MemoryState, MemoryTraceItem, PersonId, RetrievalTraceId, SessionId,
     UnixTimestampMillis, MAX_MEMORY_INSPECTION_HISTORY_ITEMS, MAX_MEMORY_LIST_PAGE_ITEMS,
 };
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
@@ -18,9 +18,13 @@ use crate::{
 };
 
 pub const SQLITE_APPLICATION_ID: u32 = 0x4352_544d;
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
-const MIGRATION: &str = include_str!("../migrations/0001_controlled_memory.sql");
+/// Every migration in order; entry `n` brings the schema to version `n + 1`.
+const MIGRATIONS: [&str; 2] = [
+    include_str!("../migrations/0001_controlled_memory.sql"),
+    include_str!("../migrations/0002_people.sql"),
+];
 const BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Debug)]
@@ -73,7 +77,12 @@ impl SqliteMemoryStore {
             ));
         }
 
-        let connection = open_connection(&database_path)?;
+        let mut connection = open_connection(&database_path)?;
+        if read_user_version(&connection)? == 1 {
+            validate_file_permissions(&database_path)?;
+            validate_migrations(&connection, 1)?;
+            upgrade_to_version_2(&mut connection)?;
+        }
         validate_database(&connection)?;
         drop(connection);
         validate_file_permissions(&database_path)?;
@@ -102,8 +111,8 @@ impl MemoryStore for SqliteMemoryStore {
             .execute(
                 concat!(
                     "INSERT INTO memories (kind, state, content, confidence, created_at_ms, ",
-                    "updated_at_ms, retention_kind, expires_at_ms, session_id) ",
-                    "VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8)"
+                    "updated_at_ms, retention_kind, expires_at_ms, session_id, subject_person_id) ",
+                    "VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9)"
                 ),
                 params![
                     draft.kind().as_str(),
@@ -114,6 +123,7 @@ impl MemoryStore for SqliteMemoryStore {
                     retention_kind,
                     expires_at,
                     session_id,
+                    sqlite_integer(PersonId::OWNER.get())?,
                 ],
             )
             .map_err(map_sqlite_error)?;
@@ -910,12 +920,12 @@ fn initialize_database(database_path: &Path) -> MemoryStoreResult<()> {
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(map_sqlite_error)?;
     transaction
-        .execute_batch(MIGRATION)
+        .execute_batch(MIGRATIONS[0])
         .map_err(map_sqlite_error)?;
     transaction
         .execute(
-            "INSERT INTO schema_migrations (version, checksum) VALUES (?1, ?2)",
-            params![SCHEMA_VERSION, migration_checksum()],
+            "INSERT INTO schema_migrations (version, checksum) VALUES (1, ?1)",
+            [migration_checksum(MIGRATIONS[0])],
         )
         .map_err(map_sqlite_error)?;
     transaction.commit().map_err(map_sqlite_error)?;
@@ -923,9 +933,53 @@ fn initialize_database(database_path: &Path) -> MemoryStoreResult<()> {
         .pragma_update(None, "application_id", SQLITE_APPLICATION_ID)
         .map_err(map_sqlite_error)?;
     connection
-        .pragma_update(None, "user_version", SCHEMA_VERSION)
+        .pragma_update(None, "user_version", 1)
         .map_err(map_sqlite_error)?;
+    // A new database takes the same upgrade path as an existing version 1 database, so
+    // both end with the same schema.
+    upgrade_to_version_2(&mut connection)?;
     validate_database(&connection)
+}
+
+/// Rebuilds `memories` with a subject column and adds the people tables. SQLite ignores
+/// `foreign_keys` inside a transaction and a table rebuild must run with it off, so it is
+/// switched off around the transaction and the references are checked before commit. Any
+/// failure rolls back and leaves the file at version 1.
+fn upgrade_to_version_2(connection: &mut Connection) -> MemoryStoreResult<()> {
+    connection
+        .pragma_update(None, "foreign_keys", false)
+        .map_err(map_sqlite_error)?;
+    let upgraded = apply_version_2(connection);
+    connection
+        .pragma_update(None, "foreign_keys", true)
+        .map_err(map_sqlite_error)?;
+    upgraded
+}
+
+fn apply_version_2(connection: &mut Connection) -> MemoryStoreResult<()> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(map_sqlite_error)?;
+    // Another process may have upgraded the file while this one waited for the lock.
+    if read_user_version(&transaction)? != 1 {
+        return Ok(());
+    }
+    transaction
+        .execute_batch(MIGRATIONS[1])
+        .map_err(map_sqlite_error)?;
+    transaction
+        .execute(
+            "INSERT INTO schema_migrations (version, checksum) VALUES (2, ?1)",
+            [migration_checksum(MIGRATIONS[1])],
+        )
+        .map_err(map_sqlite_error)?;
+    if foreign_key_failures(&transaction)? != 0 {
+        return Err(invalid_database_error());
+    }
+    transaction
+        .pragma_update(None, "user_version", 2)
+        .map_err(map_sqlite_error)?;
+    transaction.commit().map_err(map_sqlite_error)
 }
 
 fn open_connection(database_path: &Path) -> MemoryStoreResult<Connection> {
@@ -947,6 +1001,15 @@ fn open_connection(database_path: &Path) -> MemoryStoreResult<Connection> {
 }
 
 fn validate_database(connection: &Connection) -> MemoryStoreResult<()> {
+    if read_user_version(connection)? != SCHEMA_VERSION {
+        return Err(invalid_database_error());
+    }
+    validate_migrations(connection, SCHEMA_VERSION)
+}
+
+/// Reads the schema version after checking the file is a memory database at all. A
+/// version newer than this runtime knows is refused here, whatever the caller expects.
+fn read_user_version(connection: &Connection) -> MemoryStoreResult<u32> {
     let application_id: u32 = connection
         .query_row("PRAGMA application_id", [], |row| row.get(0))
         .map_err(map_sqlite_error)?;
@@ -962,35 +1025,50 @@ fn validate_database(connection: &Connection) -> MemoryStoreResult<()> {
             "memory database schema is newer than this runtime",
         ));
     }
-    if user_version != SCHEMA_VERSION {
-        return Err(invalid_database_error());
-    }
-    let checksum = connection
-        .query_row(
-            "SELECT checksum FROM schema_migrations WHERE version = ?1",
-            [SCHEMA_VERSION],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(map_sqlite_error)?;
-    let expected_checksum = migration_checksum();
-    if checksum.as_deref() != Some(expected_checksum.as_str()) {
-        return Err(invalid_database_error());
-    }
-    let foreign_key_failures: i64 = connection
-        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+    Ok(user_version)
+}
+
+/// Checks that exactly the first `version` migrations were applied, each with the
+/// checksum of the migration this runtime ships, and that every reference resolves.
+fn validate_migrations(connection: &Connection, version: u32) -> MemoryStoreResult<()> {
+    let applied: i64 = connection
+        .query_row("SELECT count(*) FROM schema_migrations", [], |row| {
             row.get(0)
         })
         .map_err(map_sqlite_error)?;
-    if foreign_key_failures != 0 {
+    if applied != i64::from(version) {
+        return Err(invalid_database_error());
+    }
+    for (index, migration) in MIGRATIONS.iter().take(version as usize).enumerate() {
+        let checksum = connection
+            .query_row(
+                "SELECT checksum FROM schema_migrations WHERE version = ?1",
+                [i64::try_from(index + 1).map_err(|_| invalid_database_error())?],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(map_sqlite_error)?;
+        if checksum.as_deref() != Some(migration_checksum(migration).as_str()) {
+            return Err(invalid_database_error());
+        }
+    }
+    if foreign_key_failures(connection)? != 0 {
         return Err(invalid_database_error());
     }
     Ok(())
 }
 
-fn migration_checksum() -> String {
+fn foreign_key_failures(connection: &Connection) -> MemoryStoreResult<i64> {
+    connection
+        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .map_err(map_sqlite_error)
+}
+
+fn migration_checksum(migration: &str) -> String {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in MIGRATION.as_bytes() {
+    for byte in migration.as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }

@@ -42,6 +42,13 @@ macro_rules! checked_id {
 
 checked_id!(MemoryId, "memory identifier");
 checked_id!(RetrievalTraceId, "retrieval trace identifier");
+checked_id!(PersonId, "person identifier");
+
+impl PersonId {
+    /// The person who runs the runtime. The memory store creates this person first, so it
+    /// always exists, and it can be neither deleted nor merged into someone else.
+    pub const OWNER: Self = Self(1);
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct UnixTimestampMillis(i64);

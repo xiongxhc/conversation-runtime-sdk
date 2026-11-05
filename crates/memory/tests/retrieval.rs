@@ -340,7 +340,8 @@ fn retrieval_fails_closed_when_the_deterministic_scan_cap_is_exceeded() {
             .execute(
                 concat!(
                     "INSERT INTO memories (kind, state, content, confidence, created_at_ms, ",
-                    "updated_at_ms, retention_kind) VALUES ('semantic', 'active', ?1, 500, 1000, 1000, 'until_deleted')"
+                    "updated_at_ms, retention_kind, subject_person_id) ",
+                    "VALUES ('semantic', 'active', ?1, 500, 1000, 1000, 'until_deleted', 1)"
                 ),
                 [format!("bounded scan record {index}")],
             )

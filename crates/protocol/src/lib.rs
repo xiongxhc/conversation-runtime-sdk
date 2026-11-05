@@ -74,8 +74,8 @@ pub use memory::{
     MemoryApproval, MemoryApprovalEvidence, MemoryConfidence, MemoryContextItem, MemoryDraft,
     MemoryId, MemoryInspection, MemoryKind, MemoryPatch, MemoryProvenance, MemoryProvenanceKind,
     MemoryRecord, MemoryRetention, MemoryRetrievalReason, MemoryRetrievalRequest,
-    MemoryRetrievalTrace, MemoryState, MemoryTraceExclusions, MemoryTraceItem, RetrievalTraceId,
-    UnixTimestampMillis, MAX_MEMORY_CONTENT_BYTES, MAX_MEMORY_QUERY_BYTES,
+    MemoryRetrievalTrace, MemoryState, MemoryTraceExclusions, MemoryTraceItem, PersonId,
+    RetrievalTraceId, UnixTimestampMillis, MAX_MEMORY_CONTENT_BYTES, MAX_MEMORY_QUERY_BYTES,
     MAX_MEMORY_RETRIEVAL_BYTES, MAX_MEMORY_RETRIEVAL_ITEMS, MAX_WORKING_RETENTION_MILLIS,
 };
 pub use privacy::{

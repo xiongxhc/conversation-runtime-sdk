@@ -2,6 +2,7 @@ mod error;
 mod people;
 mod provider;
 mod retrieval;
+mod signatures;
 mod sqlite;
 mod store;
 
@@ -12,6 +13,10 @@ pub use provider::{
     SystemMemoryClock,
 };
 pub use retrieval::{MemoryRetrieval, NeverCancelled, RetrievalCancellation};
+pub use signatures::{
+    SignatureId, SignatureKey, SignatureModel, SignatureRole, VoiceSignature, VoiceSignatureDraft,
+    MAX_SIGNATURES_PER_PERSON,
+};
 pub use sqlite::{SqliteMemoryStore, SCHEMA_VERSION, SQLITE_APPLICATION_ID};
 pub use store::{BoundedMemoryInspection, MemoryPage, MemoryStore};
 

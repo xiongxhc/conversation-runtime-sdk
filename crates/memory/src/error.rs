@@ -14,6 +14,10 @@ pub enum MemoryStoreErrorKind {
     Cancelled,
     LimitExceeded,
     Storage,
+    /// The voice signature key is missing or malformed.
+    KeyUnavailable,
+    /// The voice signature key differs from the one the store was first used with.
+    KeyMismatch,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

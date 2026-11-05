@@ -12,6 +12,7 @@ use conversation_protocol::{
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 
 mod people;
+mod signatures;
 
 use crate::retrieval::{check_cancellation, select_records};
 use crate::{

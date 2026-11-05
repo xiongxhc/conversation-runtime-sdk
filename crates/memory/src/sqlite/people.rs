@@ -7,7 +7,8 @@ use super::{
 };
 use crate::{
     MemoryStoreErrorKind, MemoryStoreResult, NewPerson, PeopleStore, Person, PersonMaturity,
-    PersonName, MAX_PEOPLE,
+    PersonName, SignatureId, SignatureKey, SignatureModel, VoiceSignature, VoiceSignatureDraft,
+    MAX_PEOPLE,
 };
 
 impl PeopleStore for SqliteMemoryStore {
@@ -225,6 +226,31 @@ impl PeopleStore for SqliteMemoryStore {
         let person = read_person(&transaction, into)?;
         transaction.commit().map_err(map_sqlite_error)?;
         Ok(person)
+    }
+
+    fn verify_signature_key(&self, key: &SignatureKey) -> MemoryStoreResult<()> {
+        self.verify_key(key)
+    }
+
+    fn add_signature(
+        &self,
+        key: &SignatureKey,
+        person: PersonId,
+        draft: VoiceSignatureDraft,
+    ) -> MemoryStoreResult<VoiceSignature> {
+        self.insert_signature(key, person, draft)
+    }
+
+    fn signatures(
+        &self,
+        key: &SignatureKey,
+        model: &SignatureModel,
+    ) -> MemoryStoreResult<Vec<VoiceSignature>> {
+        self.read_signatures(key, model)
+    }
+
+    fn remove_signature(&self, id: SignatureId) -> MemoryStoreResult<()> {
+        self.delete_signature(id)
     }
 }
 

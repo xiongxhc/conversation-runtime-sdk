@@ -1,6 +1,9 @@
 use conversation_protocol::{PersonId, UnixTimestampMillis};
 
-use crate::{MemoryStoreError, MemoryStoreErrorKind, MemoryStoreResult};
+use crate::{
+    MemoryStoreError, MemoryStoreErrorKind, MemoryStoreResult, SignatureId, SignatureKey,
+    SignatureModel, VoiceSignature, VoiceSignatureDraft,
+};
 
 /// The most people one store holds, the owner included. Every spoken name claim can
 /// enrol someone, so the bound keeps a room full of claims from growing storage forever.
@@ -181,4 +184,26 @@ pub trait PeopleStore: Send + Sync {
 
     /// Moves `from`'s memories, voice signatures and names onto `into`, then deletes `from`.
     fn merge_people(&self, from: PersonId, into: PersonId) -> MemoryStoreResult<Person>;
+
+    /// Checks the voice signature key, recording it on first use. A different key later
+    /// is `KeyMismatch`.
+    fn verify_signature_key(&self, key: &SignatureKey) -> MemoryStoreResult<()>;
+
+    fn add_signature(
+        &self,
+        key: &SignatureKey,
+        person: PersonId,
+        draft: VoiceSignatureDraft,
+    ) -> MemoryStoreResult<VoiceSignature>;
+
+    /// Every person's signatures from this model and version, ordered by person then
+    /// identifier.
+    fn signatures(
+        &self,
+        key: &SignatureKey,
+        model: &SignatureModel,
+    ) -> MemoryStoreResult<Vec<VoiceSignature>>;
+
+    /// Removes a refinement sample. Anchor and enrolment samples are `Conflict`.
+    fn remove_signature(&self, id: SignatureId) -> MemoryStoreResult<()>;
 }

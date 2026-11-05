@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 conversation-protocol.workspace = true
+ring.workspace = true
 rusqlite.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

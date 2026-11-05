@@ -441,6 +441,7 @@ name = "conversation-memory"
 version = "0.1.0"
 dependencies = [
  "conversation-protocol",
+ "ring",
  "rusqlite",
  "tempfile",
  "tokio",

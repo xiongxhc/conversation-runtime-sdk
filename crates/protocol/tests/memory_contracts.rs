@@ -2,8 +2,8 @@ use conversation_protocol::{
     MemoryApproval, MemoryConfidence, MemoryContextItem, MemoryDraft, MemoryId, MemoryInspection,
     MemoryKind, MemoryPatch, MemoryProvenance, MemoryProvenanceKind, MemoryRecord, MemoryRetention,
     MemoryRetrievalReason, MemoryRetrievalRequest, MemoryRetrievalTrace, MemoryState,
-    MemoryTraceExclusions, MemoryTraceItem, RetrievalTraceId, RuntimeErrorKind, RuntimeEvent,
-    RuntimeStage, TurnId, UnixTimestampMillis, MAX_MEMORY_CONTENT_BYTES,
+    MemoryTraceExclusions, MemoryTraceItem, PersonId, RetrievalTraceId, RuntimeErrorKind,
+    RuntimeEvent, RuntimeStage, TurnId, UnixTimestampMillis, MAX_MEMORY_CONTENT_BYTES,
     MAX_MEMORY_RETRIEVAL_BYTES, MAX_MEMORY_RETRIEVAL_ITEMS,
 };
 
@@ -402,4 +402,30 @@ fn retrieval_trace_metrics_are_content_free_and_strictly_bounded() {
         MemoryTraceExclusions::default(),
     )
     .is_err());
+}
+
+#[test]
+fn drafts_default_to_the_owner_subject() {
+    let draft = MemoryDraft::new(
+        MemoryKind::Semantic,
+        "tea at noon",
+        provenance(MemoryProvenanceKind::UserProvided, "settings"),
+        MemoryConfidence::new(800).unwrap(),
+        timestamp(1_000),
+        MemoryRetention::UntilDeleted,
+    )
+    .unwrap();
+    assert_eq!(PersonId::OWNER.get(), 1);
+    assert_eq!(draft.subject(), PersonId::OWNER);
+    let jack = PersonId::new(7).unwrap();
+    assert_eq!(draft.with_subject(jack).subject(), jack);
+}
+
+#[test]
+fn retrieval_requests_cover_every_subject_unless_scoped() {
+    let request =
+        MemoryRetrievalRequest::new(TurnId::new(1), "tea", timestamp(1_000), 4, 4_096).unwrap();
+    assert_eq!(request.subject(), None);
+    let jack = PersonId::new(7).unwrap();
+    assert_eq!(request.with_subject(jack).subject(), Some(jack));
 }

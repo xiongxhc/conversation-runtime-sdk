@@ -107,6 +107,18 @@ impl MemoryStore for SqliteMemoryStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sqlite_error)?;
         let (retention_kind, expires_at, session_id) = retention_columns(draft.retention())?;
+        let subject_exists = transaction
+            .query_row(
+                "SELECT 1 FROM people WHERE id = ?1",
+                [sqlite_integer(draft.subject().get())?],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(map_sqlite_error)?
+            .is_some();
+        if !subject_exists {
+            return Err(not_found_error());
+        }
         transaction
             .execute(
                 concat!(
@@ -123,7 +135,7 @@ impl MemoryStore for SqliteMemoryStore {
                     retention_kind,
                     expires_at,
                     session_id,
-                    sqlite_integer(PersonId::OWNER.get())?,
+                    sqlite_integer(draft.subject().get())?,
                 ],
             )
             .map_err(map_sqlite_error)?;
@@ -543,11 +555,20 @@ impl MemoryStore for SqliteMemoryStore {
         check_cancellation(cancellation)?;
         let records = {
             let mut statement = transaction
-                .prepare(&format!("{RECORD_QUERY} ORDER BY m.id LIMIT ?1"))
+                .prepare(&format!(
+                    "{RECORD_QUERY} WHERE (?2 IS NULL OR m.subject_person_id = ?2) ORDER BY m.id LIMIT ?1"
+                ))
                 .map_err(map_sqlite_error)?;
+            let subject = request
+                .subject()
+                .map(|subject| sqlite_integer(subject.get()))
+                .transpose()?;
             let records = statement
                 .query_map(
-                    [sqlite_integer((MAX_MEMORY_SCAN_RECORDS + 1) as u64)?],
+                    params![
+                        sqlite_integer((MAX_MEMORY_SCAN_RECORDS + 1) as u64)?,
+                        subject
+                    ],
                     row_to_record,
                 )
                 .map_err(map_sqlite_error)?
@@ -704,7 +725,8 @@ const RECORD_QUERY: &str = concat!(
     "m.updated_at_ms, m.retention_kind, m.expires_at_ms, m.session_id, m.pinned, ",
     "m.revision, m.last_used_at_ms, m.last_retrieval_reason, s.kind, s.source_id, ",
     "s.source_timestamp_ms, s.actor, s.content_digest, a.confirmation_id, a.actor, ",
-    "a.source_timestamp_ms, a.approved_revision, a.content_digest FROM memories m ",
+    "a.source_timestamp_ms, a.approved_revision, a.content_digest, m.subject_person_id ",
+    "FROM memories m ",
     "JOIN memory_sources s ON s.id = (SELECT max(latest.id) FROM memory_sources latest ",
     "WHERE latest.memory_id = m.id AND latest.kind != 'user_approved') ",
     "LEFT JOIN memory_sources a ON a.id = (SELECT max(approval.id) FROM memory_sources approval ",
@@ -747,9 +769,12 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryRecord> {
         retention,
     )
     .map_err(protocol_to_sql_conversion_error)?;
+    let subject =
+        PersonId::new(checked_unsigned(row.get(24)?).map_err(store_to_sql_conversion_error)?)
+            .map_err(protocol_to_sql_conversion_error)?;
     MemoryRecord::new(
         checked_memory_id(row.get(0)?).map_err(store_to_sql_conversion_error)?,
-        draft,
+        draft.with_subject(subject),
         state,
         checked_timestamp(row.get(6)?).map_err(store_to_sql_conversion_error)?,
         row.get::<_, i64>(10)? == 1,

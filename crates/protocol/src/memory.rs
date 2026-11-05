@@ -394,6 +394,7 @@ pub struct MemoryDraft {
     confidence: MemoryConfidence,
     created_at: UnixTimestampMillis,
     retention: MemoryRetention,
+    subject: PersonId,
 }
 
 impl MemoryDraft {
@@ -414,7 +415,19 @@ impl MemoryDraft {
             confidence,
             created_at,
             retention,
+            subject: PersonId::OWNER,
         })
+    }
+
+    /// The person this memory is about. A draft is the owner's unless a caller names
+    /// someone else, so no path creates a memory without a subject.
+    pub const fn with_subject(mut self, subject: PersonId) -> Self {
+        self.subject = subject;
+        self
+    }
+
+    pub const fn subject(&self) -> PersonId {
+        self.subject
     }
 
     pub const fn kind(&self) -> MemoryKind {
@@ -581,6 +594,10 @@ impl MemoryRecord {
         self.draft.kind()
     }
 
+    pub const fn subject(&self) -> PersonId {
+        self.draft.subject()
+    }
+
     pub fn content(&self) -> &str {
         self.draft.content()
     }
@@ -657,6 +674,7 @@ pub struct MemoryRetrievalRequest {
     now: UnixTimestampMillis,
     maximum_items: usize,
     maximum_bytes: usize,
+    subject: Option<PersonId>,
 }
 
 impl MemoryRetrievalRequest {
@@ -689,7 +707,19 @@ impl MemoryRetrievalRequest {
             now,
             maximum_items,
             maximum_bytes,
+            subject: None,
         })
+    }
+
+    /// Limits retrieval to memories about one person. Without it every subject's
+    /// memories are candidates.
+    pub const fn with_subject(mut self, subject: PersonId) -> Self {
+        self.subject = Some(subject);
+        self
+    }
+
+    pub const fn subject(&self) -> Option<PersonId> {
+        self.subject
     }
 
     pub const fn turn_id(&self) -> TurnId {

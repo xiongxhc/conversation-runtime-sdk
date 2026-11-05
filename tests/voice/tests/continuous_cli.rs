@@ -1388,7 +1388,9 @@ fn create_unsupported_memory_database(database_path: &Path) {
         .open(database_path)
         .unwrap();
     database.seek(SeekFrom::Start(60)).unwrap();
-    database.write_all(&2_u32.to_be_bytes()).unwrap();
+    database
+        .write_all(&(conversation_memory::SCHEMA_VERSION + 1).to_be_bytes())
+        .unwrap();
     database.sync_all().unwrap();
 }
 

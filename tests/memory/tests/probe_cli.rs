@@ -22,7 +22,7 @@ fn supports_the_controlled_memory_lifecycle() {
 
     assert_success(
         run(&database, &["init"]),
-        &["status=ok", "command=init", "schema_version=1"],
+        &["status=ok", "command=init", "schema_version=2"],
     );
 
     let added = assert_success(

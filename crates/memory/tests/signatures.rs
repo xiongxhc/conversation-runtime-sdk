@@ -376,3 +376,24 @@ fn merging_moves_signatures_to_the_surviving_person() {
 fn key_debug_output_hides_the_key() {
     assert_eq!(format!("{:?}", key_a()), "SignatureKey(..)");
 }
+
+#[test]
+fn resetting_voice_signatures_lets_a_new_key_start_over() {
+    let (_temporary, _database, store) = store();
+    let jack = person(&store, "Jack");
+    store.add_signature(&key_a(), jack, draft(&[1.0])).unwrap();
+    assert_eq!(
+        store.verify_signature_key(&key_b()).unwrap_err().kind(),
+        MemoryStoreErrorKind::KeyMismatch
+    );
+
+    store.reset_voice_signatures().unwrap();
+
+    store.verify_signature_key(&key_b()).unwrap();
+    assert!(store.signatures(&key_b(), &ecapa()).unwrap().is_empty());
+    assert_eq!(
+        store.verify_signature_key(&key_a()).unwrap_err().kind(),
+        MemoryStoreErrorKind::KeyMismatch
+    );
+    assert_eq!(store.person(jack).unwrap().display_name(), Some("Jack"));
+}

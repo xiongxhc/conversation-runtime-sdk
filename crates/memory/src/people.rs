@@ -9,6 +9,10 @@ use crate::{
 /// enrol someone, so the bound keeps a room full of claims from growing storage forever.
 pub const MAX_PEOPLE: usize = 256;
 
+/// The most names one person holds, the primary name included. Confirmed aliases come
+/// from speech, so they are bounded like people and signatures.
+pub const MAX_NAMES_PER_PERSON: usize = 16;
+
 const MAX_NAME_BYTES: usize = 128;
 
 /// A name as it is shown and the key it is compared by. The caller normalises the key
@@ -170,7 +174,7 @@ pub trait PeopleStore: Send + Sync {
     /// Creates a provisional person who is never the owner.
     fn create_person(&self, person: NewPerson) -> MemoryStoreResult<Person>;
 
-    /// Adds an alias after the person's existing names.
+    /// Adds an alias after the person's existing names, up to `MAX_NAMES_PER_PERSON`.
     fn add_name(&self, id: PersonId, name: PersonName) -> MemoryStoreResult<Person>;
 
     /// Replaces the primary name, dropping an alias with the same key, and clears the
@@ -183,6 +187,8 @@ pub trait PeopleStore: Send + Sync {
     fn delete_person(&self, id: PersonId) -> MemoryStoreResult<()>;
 
     /// Moves `from`'s memories, voice signatures and names onto `into`, then deletes `from`.
+    /// Merging is how the owner resolves a duplicate, so it is not refused when the result
+    /// holds more names or signatures than a person can otherwise gain.
     fn merge_people(&self, from: PersonId, into: PersonId) -> MemoryStoreResult<Person>;
 
     /// Checks the voice signature key, recording it on first use. A different key later
@@ -206,4 +212,8 @@ pub trait PeopleStore: Send + Sync {
 
     /// Removes a refinement sample. Anchor and enrolment samples are `Conflict`.
     fn remove_signature(&self, id: SignatureId) -> MemoryStoreResult<()>;
+
+    /// Deletes every voice signature and forgets the signature key, so voice identity can
+    /// start over under a new key. People and their memories stay.
+    fn reset_voice_signatures(&self) -> MemoryStoreResult<()>;
 }

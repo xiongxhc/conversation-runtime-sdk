@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use conversation_memory::{
     MemoryStore, MemoryStoreErrorKind, NewPerson, PeopleStore, PersonMaturity, PersonName,
-    SqliteMemoryStore, MAX_PEOPLE,
+    SqliteMemoryStore, MAX_NAMES_PER_PERSON, MAX_PEOPLE,
 };
 use conversation_protocol::{
     MemoryConfidence, MemoryDraft, MemoryKind, MemoryProvenance, MemoryProvenanceKind,
@@ -348,4 +348,27 @@ fn blank_or_oversized_names_are_refused() {
         );
     }
     assert!(PersonName::new("x".repeat(128), "k".repeat(128)).is_ok());
+}
+
+#[test]
+fn names_per_person_are_bounded() {
+    let (_temporary, _database, store) = store();
+    let jack = store
+        .create_person(new_person("Jack", "jack", false))
+        .unwrap();
+    for index in 1..MAX_NAMES_PER_PERSON {
+        store
+            .add_name(jack.id(), name("Alias", &format!("alias-{index}")))
+            .unwrap();
+    }
+    assert_eq!(
+        store.person(jack.id()).unwrap().names().len(),
+        MAX_NAMES_PER_PERSON
+    );
+    let error = store
+        .add_name(jack.id(), name("One more", "one-more"))
+        .unwrap_err();
+    assert_eq!(error.kind(), MemoryStoreErrorKind::LimitExceeded);
+    let renamed = store.rename(jack.id(), name("Jake", "jake")).unwrap();
+    assert_eq!(renamed.names().len(), MAX_NAMES_PER_PERSON);
 }

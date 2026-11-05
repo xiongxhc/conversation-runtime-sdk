@@ -133,6 +133,15 @@ impl SqliteMemoryStore {
         Ok(signatures)
     }
 
+    pub(super) fn delete_all_signatures(&self) -> MemoryStoreResult<()> {
+        let mut connection = self.connection()?;
+        let transaction = immediate(&mut connection)?;
+        transaction
+            .execute_batch("DELETE FROM voice_signatures; DELETE FROM signature_key_check;")
+            .map_err(map_sqlite_error)?;
+        transaction.commit().map_err(map_sqlite_error)
+    }
+
     pub(super) fn delete_signature(&self, id: SignatureId) -> MemoryStoreResult<()> {
         let mut connection = self.connection()?;
         let transaction = immediate(&mut connection)?;

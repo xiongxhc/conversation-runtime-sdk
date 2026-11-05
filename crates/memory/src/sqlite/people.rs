@@ -8,7 +8,7 @@ use super::{
 use crate::{
     MemoryStoreErrorKind, MemoryStoreResult, NewPerson, PeopleStore, Person, PersonMaturity,
     PersonName, SignatureId, SignatureKey, SignatureModel, VoiceSignature, VoiceSignatureDraft,
-    MAX_PEOPLE,
+    MAX_NAMES_PER_PERSON, MAX_PEOPLE,
 };
 
 impl PeopleStore for SqliteMemoryStore {
@@ -91,6 +91,19 @@ impl PeopleStore for SqliteMemoryStore {
         require_person(&transaction, id)?;
         if has_name_key(&transaction, id, name.key())? {
             return Err(conflict_error());
+        }
+        let held: i64 = transaction
+            .query_row(
+                "SELECT count(*) FROM person_names WHERE person_id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite_error)?;
+        if held >= MAX_NAMES_PER_PERSON as i64 {
+            return Err(store_error(
+                MemoryStoreErrorKind::LimitExceeded,
+                "person holds the maximum number of names",
+            ));
         }
         let ordinal: i64 = transaction
             .query_row(
@@ -251,6 +264,10 @@ impl PeopleStore for SqliteMemoryStore {
 
     fn remove_signature(&self, id: SignatureId) -> MemoryStoreResult<()> {
         self.delete_signature(id)
+    }
+
+    fn reset_voice_signatures(&self) -> MemoryStoreResult<()> {
+        self.delete_all_signatures()
     }
 }
 

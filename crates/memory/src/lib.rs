@@ -7,7 +7,9 @@ mod sqlite;
 mod store;
 
 pub use error::{MemoryStoreError, MemoryStoreErrorKind, MemoryStoreResult};
-pub use people::{NewPerson, PeopleStore, Person, PersonMaturity, PersonName, MAX_PEOPLE};
+pub use people::{
+    NewPerson, PeopleStore, Person, PersonMaturity, PersonName, MAX_NAMES_PER_PERSON, MAX_PEOPLE,
+};
 pub use provider::{
     MemoryClock, MemoryContextProvider, MemoryProviderFuture, SqliteMemoryContextProvider,
     SystemMemoryClock,

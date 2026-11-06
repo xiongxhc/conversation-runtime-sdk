@@ -677,3 +677,174 @@ fn an_invalid_policy_refuses_to_start() {
     )
     .is_err());
 }
+
+fn owner_with_voice(fixture: &Fixture, name: Option<&str>) {
+    if let Some(name) = name {
+        fixture
+            .store
+            .rename(
+                PersonId::OWNER,
+                PersonName::new(name, name.to_lowercase()).unwrap(),
+            )
+            .unwrap();
+    }
+    fixture.sample(PersonId::OWNER, SignatureRole::Anchor, &CHRIS, 1_500);
+}
+
+#[test]
+fn the_owners_own_voice_is_recognised_without_asking() {
+    let fixture = Fixture::new();
+    owner_with_voice(&fixture, Some("Chris"));
+    let mut session = fixture.session(2);
+
+    let identity = session
+        .observe(turn("hello", None, Some(&CHRIS), 2_000))
+        .unwrap();
+
+    assert_eq!(person_of(&identity), Some(PersonId::OWNER));
+    assert!(identity.label.confirmed);
+    assert_eq!(identity.question, None);
+    assert_eq!(identity.memory_subject, Some(PersonId::OWNER));
+    session.observe(answer("yes")).unwrap();
+    assert_eq!(fixture.named("chris"), vec![PersonId::OWNER]);
+}
+
+#[test]
+fn the_owner_never_gains_a_spoken_alias() {
+    let fixture = Fixture::new();
+    owner_with_voice(&fixture, None);
+    let mut session = fixture.session(2);
+
+    let unnamed = session
+        .observe(turn("I'm Bob", Some("Bob"), Some(&CHRIS), 2_000))
+        .unwrap();
+    assert_eq!(unnamed.question, None);
+    session.observe(answer("yes")).unwrap();
+    assert_eq!(
+        fixture
+            .store
+            .person(PersonId::OWNER)
+            .unwrap()
+            .display_name(),
+        None
+    );
+
+    fixture
+        .store
+        .rename(PersonId::OWNER, PersonName::new("Chris", "chris").unwrap())
+        .unwrap();
+    let mut session = fixture.session(3);
+    let named = session
+        .observe(turn("我是昊辰", Some("昊辰"), Some(&CHRIS), 2_000))
+        .unwrap();
+    assert_eq!(named.question, None);
+    assert!(fixture.named("haochen").is_empty());
+}
+
+#[test]
+fn invalid_embeddings_are_treated_as_missing() {
+    let fixture = Fixture::new();
+    let mut session = fixture.session(1);
+
+    for embedding in [
+        vec![f32::NAN, 0.0, 0.0, 0.0],
+        vec![0.0, 0.0, 0.0, 0.0],
+        vec![f32::INFINITY, 0.0, 0.0, 0.0],
+        Vec::new(),
+    ] {
+        let identity = session
+            .observe(turn("I'm Jack", Some("Jack"), Some(&embedding), 2_000))
+            .unwrap();
+        assert_someone_new(&identity);
+    }
+
+    assert!(fixture.named("jack").is_empty());
+    assert_eq!(fixture.store.people().unwrap().len(), 1);
+}
+
+#[test]
+fn a_person_deleted_mid_session_does_not_fail_later_turns() {
+    let fixture = Fixture::new();
+    let jack = fixture.person("Jack", &JACK, true);
+    let mut session = fixture.session(2);
+    fixture.store.delete_person(jack).unwrap();
+
+    session
+        .observe(turn("talking", None, Some(&JACK), 2_000))
+        .unwrap();
+    let later = session
+        .observe(turn("still talking", None, Some(&JACK), 2_000))
+        .unwrap();
+
+    assert_someone_new(&later);
+}
+
+#[test]
+fn someone_added_mid_session_still_holds_their_name() {
+    let fixture = Fixture::new();
+    let mut session = fixture.session(2);
+    fixture.person("Tom", &JACK, true);
+
+    let identity = session
+        .observe(turn("I'm Tom", Some("Tom"), Some(&NEW), 2_000))
+        .unwrap();
+
+    assert_eq!(
+        identity.question,
+        Some(IdentityQuestion::IsNamed {
+            name: "Tom".to_owned()
+        })
+    );
+    assert_eq!(fixture.named("tom").len(), 1);
+}
+
+#[test]
+fn refresh_picks_up_people_changed_outside_the_session() {
+    let fixture = Fixture::new();
+    let mut session = fixture.session(2);
+    let tom = fixture.person("Tom", &JACK, true);
+
+    session.refresh().unwrap();
+    let identity = session
+        .observe(turn("hello", None, Some(&JACK), 1_000))
+        .unwrap();
+
+    assert_eq!(person_of(&identity), Some(tom));
+    assert!(identity.label.confirmed);
+}
+
+#[test]
+fn playback_overlapped_turn_is_not_an_answer() {
+    let fixture = Fixture::new();
+    let jack = fixture.person("Jack", &JACK, false);
+    let mut session = fixture.session(2);
+    session
+        .observe(turn("hello", None, Some(&JACK), 1_000))
+        .unwrap();
+    let mut echo = answer("嗯");
+    echo.playback_overlap = true;
+
+    let echoed = session.observe(echo).unwrap();
+    assert_ne!(echoed.memory_subject, Some(jack));
+    let real = session.observe(answer("yes")).unwrap();
+
+    assert_eq!(person_of(&real), Some(jack));
+    assert!(real.label.confirmed);
+}
+
+#[test]
+fn someone_confirmed_this_session_is_not_asked_about_again() {
+    let fixture = Fixture::new();
+    fixture.person("Chris", &CHRIS, true);
+    let mut session = fixture.session(2);
+    session
+        .observe(turn("hello", None, Some(&CHRIS), 1_000))
+        .unwrap();
+
+    let coughing = session
+        .observe(turn("sorry", None, Some(&WEAK_CHRIS), 2_000))
+        .unwrap();
+
+    assert_eq!(coughing.question, None);
+    assert_eq!(coughing.memory_subject, None);
+}

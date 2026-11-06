@@ -184,8 +184,19 @@ impl SpeakerIdentitySession {
         Ok(identity)
     }
 
+    /// Reloads people and signatures. Call it after people change outside this session:
+    /// an owner's rename, merge or delete, or another session's enrolment.
+    pub fn refresh(&mut self) -> SpeakerIdentityResult<()> {
+        self.reload()
+    }
+
     pub fn observe(&mut self, turn: VoiceTurn) -> SpeakerIdentityResult<TurnIdentity> {
-        let scores = match &turn.embedding {
+        // An empty, non-finite or silent embedding cannot be compared or enrolled.
+        let embedding = turn
+            .embedding
+            .as_deref()
+            .filter(|embedding| usable(embedding));
+        let scores = match embedding {
             None => None,
             // Before anyone has a signature, every voice is unknown.
             Some(_) if self.directory.dimension().is_none() => Some(Vec::new()),
@@ -195,7 +206,9 @@ impl SpeakerIdentitySession {
             .as_deref()
             .map(|scores| classify(scores, &self.policy));
 
-        if let Some(pending) = self.pending.take() {
+        // The companion's own playback can echo "yes"; such a turn neither answers nor clears.
+        let answerable = !turn.playback_overlap;
+        if let Some(pending) = self.pending.take_if(|_| answerable) {
             let another_voice = matches!(
                 evidence,
                 Some(VoiceEvidence::Confident { person, .. }) if Some(person) != pending.person()
@@ -209,8 +222,7 @@ impl SpeakerIdentitySession {
             }
         }
 
-        let (Some(evidence), Some(scores), Some(embedding)) = (evidence, scores, &turn.embedding)
-        else {
+        let (Some(evidence), Some(scores), Some(embedding)) = (evidence, scores, embedding) else {
             return Ok(TurnIdentity::someone_new());
         };
         // The companion's own voice and interruptions never enrol anyone or raise a question.
@@ -246,7 +258,8 @@ impl SpeakerIdentitySession {
             .store
             .people_named(name.key())?
             .into_iter()
-            .filter_map(|person| self.people.get(&person))
+            // Read each holder from the store: someone may have been added since the snapshot.
+            .filter_map(|person| self.store.person(person).ok())
             .map(|person| ClaimHolder {
                 person: person.id(),
                 mature: person.maturity() == PersonMaturity::Mature,
@@ -259,7 +272,7 @@ impl SpeakerIdentitySession {
             }
             VoiceEvidence::Unknown => None,
         };
-        let matched_is_mature = matched.is_some_and(|person| self.is_mature(person));
+        let matched_is_mature = matched.is_some_and(|person| self.is_trusted(person));
         let mut identity = match decide_claim(evidence, matched_is_mature, &holders) {
             ClaimDecision::Enrol => {
                 let Some(person) =
@@ -286,10 +299,17 @@ impl SpeakerIdentitySession {
             }
             ClaimDecision::PossibleAlias { person } => {
                 let mut identity = self.confirmed_as(person);
-                identity.question = Some(IdentityQuestion::IsNewAlias {
-                    person,
-                    name: name.display().to_owned(),
-                });
+                // The owner's names are set through the SDK, never from speech.
+                let speakable = self
+                    .people
+                    .get(&person)
+                    .is_some_and(|known| !known.is_owner() && known.display_name().is_some());
+                if speakable {
+                    identity.question = Some(IdentityQuestion::IsNewAlias {
+                        person,
+                        name: name.display().to_owned(),
+                    });
+                }
                 identity
             }
             ClaimDecision::AskIsThisPerson { person } => {
@@ -323,8 +343,9 @@ impl SpeakerIdentitySession {
     ) -> TurnIdentity {
         let person = match *evidence {
             VoiceEvidence::Confident { person, .. }
-                if self.is_mature(person) || self.confirmed.contains(&person) =>
+                if self.is_trusted(person) || self.confirmed.contains(&person) =>
             {
+                self.confirmed.insert(person);
                 return self.confirmed_as(person);
             }
             VoiceEvidence::Confident { person, .. } | VoiceEvidence::Possible { person, .. } => {
@@ -333,7 +354,8 @@ impl SpeakerIdentitySession {
             VoiceEvidence::Unknown => return TurnIdentity::someone_new(),
         };
         let mut identity = self.unsure_as(Some(person));
-        if can_ask && self.asked.insert(person) {
+        // Someone already confirmed this session is not asked about again on a weak turn.
+        if can_ask && !self.confirmed.contains(&person) && self.asked.insert(person) {
             identity.question = self
                 .display_name(person)
                 .map(|name| IdentityQuestion::IsThisPerson { person, name });
@@ -366,7 +388,7 @@ impl SpeakerIdentitySession {
                 {
                     match self.store.add_name(person, alias) {
                         Ok(_) => self.reload()?,
-                        Err(error) if is_full_or_duplicate(&error) => {}
+                        Err(error) if is_skippable(&error) => self.reload()?,
                         Err(error) => return Err(error.into()),
                     }
                 }
@@ -424,11 +446,15 @@ impl SpeakerIdentitySession {
             if self.add_sample(person, SignatureRole::Enrolment, embedding, turn)?
                 && self.directory.speech_ms(person) >= u64::from(self.policy.maturity_speech_ms)
             {
-                self.store.mark_mature(person)?;
+                match self.store.mark_mature(person) {
+                    Ok(_) => {}
+                    Err(error) if is_skippable(&error) => {}
+                    Err(error) => return Err(error.into()),
+                }
                 self.collecting.remove(&person);
                 self.reload()?;
             }
-        } else if self.is_mature(person)
+        } else if self.is_trusted(person)
             && self.directory.refinements(person) < self.policy.refinement_cap
         {
             self.add_sample(person, SignatureRole::Refinement, embedding, turn)?;
@@ -451,7 +477,10 @@ impl SpeakerIdentitySession {
                 self.reload()?;
                 Ok(true)
             }
-            Err(error) if error.kind() == MemoryStoreErrorKind::LimitExceeded => Ok(false),
+            Err(error) if is_skippable(&error) => {
+                self.reload()?;
+                Ok(false)
+            }
             Err(error) => Err(error.into()),
         }
     }
@@ -466,6 +495,8 @@ impl SpeakerIdentitySession {
         speech_ms: u32,
         at: UnixTimestampMillis,
     ) -> SpeakerIdentityResult<Option<PersonId>> {
+        // Build the anchor first, so a refused embedding never leaves a person without one.
+        let draft = self.draft(SignatureRole::Anchor, embedding, speech_ms, at)?;
         let person = match self
             .store
             .create_person(NewPerson::new(name, needs_review, at))
@@ -474,7 +505,6 @@ impl SpeakerIdentitySession {
             Err(error) if error.kind() == MemoryStoreErrorKind::LimitExceeded => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        let draft = self.draft(SignatureRole::Anchor, embedding, speech_ms, at)?;
         self.store.add_signature(&self.key, person, draft)?;
         self.reload()?;
         self.confirm(person);
@@ -553,6 +583,16 @@ impl SpeakerIdentitySession {
             .map(str::to_owned)
     }
 
+    /// A mature person's voice, or the owner's: the owner's signatures only ever come from
+    /// the owner's own SDK action, so a confident match to them needs no question.
+    fn is_trusted(&self, person: PersonId) -> bool {
+        self.is_mature(person)
+            || self
+                .people
+                .get(&person)
+                .is_some_and(|known| known.is_owner())
+    }
+
     fn is_mature(&self, person: PersonId) -> bool {
         self.people
             .get(&person)
@@ -573,9 +613,19 @@ impl SpeakerIdentitySession {
     }
 }
 
-fn is_full_or_duplicate(error: &MemoryStoreError) -> bool {
+/// Store refusals that leave the turn's label standing: a full store, a name the person
+/// already has, or a person removed outside this session since the last reload.
+fn is_skippable(error: &MemoryStoreError) -> bool {
     matches!(
         error.kind(),
-        MemoryStoreErrorKind::LimitExceeded | MemoryStoreErrorKind::Conflict
+        MemoryStoreErrorKind::LimitExceeded
+            | MemoryStoreErrorKind::Conflict
+            | MemoryStoreErrorKind::NotFound
     )
+}
+
+fn usable(embedding: &[f32]) -> bool {
+    !embedding.is_empty()
+        && embedding.iter().all(|value| value.is_finite())
+        && embedding.iter().any(|value| *value != 0.0)
 }

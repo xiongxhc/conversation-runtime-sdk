@@ -165,7 +165,8 @@ These come from the product owner and are not open to the builder:
 - **Provisional people across conversations.** A person whose signature never
   reached the minimum speech stays stored, but in a later conversation a match to
   them counts as unsure: the companion asks ("Jack, is that you?") and a yes
-  matures the signature. Only mature people are greeted outright.
+  lets sample collection continue towards maturity. Only mature people are
+  greeted outright.
 - **Identity questions are runtime state.** Whenever the companion is told to
   ask (unsure, alias, provisional match), the runtime records one pending identity
   question for that voice session: the voice signature of the asked turn and the

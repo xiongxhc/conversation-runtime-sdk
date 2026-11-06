@@ -22,6 +22,7 @@ mod recording_reconciliation;
 mod recording_safety;
 mod session_clock;
 mod session_recording;
+mod speaker_names;
 mod speech_text;
 mod speech_worker;
 mod streaming_turn;
@@ -57,6 +58,7 @@ pub use session_recording::{
     CAPTURE_DISCONTINUITY_REASON, EMPTY_RECORDING_FORMAT, MAX_RECORDING_GAPS,
     RECORDING_FAILURE_REASON,
 };
+pub use speaker_names::{has_name_claim_cue, identity_answer, name_key, IdentityAnswer};
 pub use streaming_turn::{StartedStreamingTurn, StreamingTurnEventStream, StreamingTurnRuntime};
 pub use text_processing::{
     process_text, ProcessedText, TextProcessingRequest, TextProcessingWarning,

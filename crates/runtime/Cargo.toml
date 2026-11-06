@@ -12,6 +12,7 @@ recording-test-support = []
 conversation-model-adapters.workspace = true
 conversation-memory.workspace = true
 conversation-protocol.workspace = true
+pinyin.workspace = true
 ring.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

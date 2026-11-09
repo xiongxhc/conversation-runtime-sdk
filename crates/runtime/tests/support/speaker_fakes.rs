@@ -141,6 +141,8 @@ pub struct FakeClaims {
     pub name: Mutex<Option<String>>,
     pub calls: AtomicUsize,
     pub fail: AtomicBool,
+    /// Cancelled when the detector is called, to land a cancellation right after gathering.
+    pub cancel_on_call: Mutex<Option<CancellationToken>>,
 }
 
 impl FakeClaims {
@@ -149,6 +151,7 @@ impl FakeClaims {
             name: Mutex::new(None),
             calls: AtomicUsize::new(0),
             fail: AtomicBool::new(false),
+            cancel_on_call: Mutex::new(None),
         }
     }
 }
@@ -160,6 +163,9 @@ impl NameClaimDetector for FakeClaims {
         _cancellation: CancellationToken,
     ) -> SpeakerFuture<'_, Result<Option<String>, RuntimeError>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(token) = self.cancel_on_call.lock().unwrap().as_ref() {
+            token.cancel();
+        }
         let name = self.name.lock().unwrap().clone();
         let fail = self.fail.load(Ordering::SeqCst);
         Box::pin(async move {

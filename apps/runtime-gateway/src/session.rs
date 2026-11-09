@@ -2552,35 +2552,10 @@ async fn pump_voice_events(
         // Extraction sees every event before the connection's projection: a v1-v3 client never
         // receives the speaker label, but extraction still needs it.
         if let Some(extractor) = extractor.as_ref() {
-            match &event {
-                VoiceSessionEvent::Turn {
-                    event: RuntimeEvent::TranscriptFinal { turn_id, text },
-                    ..
-                }
-                | VoiceSessionEvent::TranscriptFinal {
-                    turn_id: Some(turn_id),
-                    text,
-                    ..
-                } => {
-                    exchange.recognized(*turn_id, text);
-                }
-                VoiceSessionEvent::SpeakerIdentified {
-                    turn_id,
-                    person,
-                    confirmed,
-                    ..
-                } => {
-                    exchange.identified(*turn_id, *person, *confirmed);
-                }
-                VoiceSessionEvent::Turn {
-                    event: RuntimeEvent::TextCompleted { turn_id, text },
-                    ..
-                } => {
-                    if let Some((spoken, subject)) = exchange.completed(*turn_id) {
-                        extractor.observe_exchange(*turn_id, subject, &spoken, text);
-                    }
-                }
-                _ => {}
+            if let Some((turn_id, subject, spoken, reply)) =
+                exchange_observation(&mut exchange, &event)
+            {
+                extractor.observe_exchange(turn_id, subject, &spoken, &reply);
             }
         }
         let Some(event) = project_for_connection(event, version_four) else {
@@ -2742,6 +2717,44 @@ fn provider_degraded_message(session_id: SessionId) -> GatewayMessage {
 // The voice lane splits one exchange across two events: the recognized utterance
 // arrives as `TranscriptFinal`, the completed reply as `TextCompleted`. This buffers
 // the utterance until its own reply completes.
+/// Feeds one voice event to the exchange pairing; returns the exchange to extract, with its
+/// subject, when a reply completes one.
+fn exchange_observation(
+    exchange: &mut VoiceExchange,
+    event: &VoiceSessionEvent,
+) -> Option<(TurnId, PersonId, String, String)> {
+    match event {
+        VoiceSessionEvent::Turn {
+            event: RuntimeEvent::TranscriptFinal { turn_id, text },
+            ..
+        }
+        | VoiceSessionEvent::TranscriptFinal {
+            turn_id: Some(turn_id),
+            text,
+            ..
+        } => {
+            exchange.recognized(*turn_id, text);
+            None
+        }
+        VoiceSessionEvent::SpeakerIdentified {
+            turn_id,
+            person,
+            confirmed,
+            ..
+        } => {
+            exchange.identified(*turn_id, *person, *confirmed);
+            None
+        }
+        VoiceSessionEvent::Turn {
+            event: RuntimeEvent::TextCompleted { turn_id, text },
+            ..
+        } => exchange
+            .completed(*turn_id)
+            .map(|(spoken, subject)| (*turn_id, subject, spoken, text.clone())),
+        _ => None,
+    }
+}
+
 #[derive(Default)]
 struct VoiceExchange {
     spoken: Option<(TurnId, String)>,
@@ -12018,6 +12031,68 @@ mod voice_exchange_tests {
         exchange.identified(TurnId::new(1), Some(jack()), true);
         exchange.recognized(TurnId::new(2), "hello");
         assert_eq!(exchange.completed(TurnId::new(2)), None);
+    }
+
+    #[test]
+    fn identity_events_reach_v4_connections_only() {
+        use conversation_protocol::{SessionId, VoiceSessionEvent};
+        let speaker = VoiceSessionEvent::SpeakerIdentified {
+            session_id: SessionId::new(1),
+            turn_id: TurnId::new(1),
+            person: Some(jack()),
+            confirmed: true,
+        };
+        let late = VoiceSessionEvent::IdentityLate {
+            session_id: SessionId::new(1),
+            turn_id: TurnId::new(2),
+        };
+        assert!(super::project_for_connection(speaker.clone(), true).is_some());
+        assert!(super::project_for_connection(late.clone(), true).is_some());
+        assert!(super::project_for_connection(speaker, false).is_none());
+        assert!(super::project_for_connection(late, false).is_none());
+    }
+
+    #[test]
+    fn extraction_pairs_labels_that_a_v3_connection_never_receives() {
+        use conversation_protocol::{GenerationId, RuntimeEvent, SessionId, VoiceSessionEvent};
+        let mut exchange = VoiceExchange::new(true);
+        let session_id = SessionId::new(1);
+        let events = [
+            VoiceSessionEvent::TranscriptFinal {
+                session_id,
+                segment_id: 1,
+                turn_id: Some(TurnId::new(1)),
+                text: "i ship rust".to_owned(),
+                capture_evidence: None,
+            },
+            VoiceSessionEvent::SpeakerIdentified {
+                session_id,
+                turn_id: TurnId::new(1),
+                person: Some(jack()),
+                confirmed: true,
+            },
+            VoiceSessionEvent::Turn {
+                session_id,
+                generation_id: GenerationId::new(1),
+                event: RuntimeEvent::TextCompleted {
+                    turn_id: TurnId::new(1),
+                    text: "noted".to_owned(),
+                },
+            },
+        ];
+        let observed: Vec<_> = events
+            .iter()
+            .filter_map(|event| super::exchange_observation(&mut exchange, event))
+            .collect();
+        assert_eq!(
+            observed,
+            vec![(
+                TurnId::new(1),
+                jack(),
+                "i ship rust".to_owned(),
+                "noted".to_owned()
+            )]
+        );
     }
 
     #[test]

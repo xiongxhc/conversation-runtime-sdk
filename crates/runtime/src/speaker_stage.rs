@@ -165,6 +165,11 @@ impl SessionSpeakerIdentity {
                 work.cancel();
                 return StageOutcome::Late;
             };
+            // A cancellation that lands as the inputs finish must still keep the turn away
+            // from the engine.
+            if cancellation.is_cancelled() {
+                return StageOutcome::Cancelled;
+            }
             let (embedding, speech_ms, playback_overlap, single_segment) = match voice {
                 Some((audio, embedding)) => (
                     embedding,
@@ -185,13 +190,18 @@ impl SessionSpeakerIdentity {
                 at: request.at,
             };
             let engine = Arc::clone(&self.engine);
+            let observing = cancellation.clone();
             let observed = tokio::task::spawn_blocking(move || {
                 let mut engine = engine.lock().ok()?;
-                engine.observe(turn).ok()
+                if observing.is_cancelled() {
+                    return Some(None);
+                }
+                engine.observe(turn).ok().map(Some)
             })
             .await;
             match observed {
-                Ok(Some(identity)) => StageOutcome::Identified(identity),
+                Ok(Some(Some(identity))) => StageOutcome::Identified(identity),
+                Ok(Some(None)) => StageOutcome::Cancelled,
                 _ => StageOutcome::Late,
             }
         })

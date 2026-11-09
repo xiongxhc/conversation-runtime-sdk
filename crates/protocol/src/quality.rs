@@ -335,7 +335,7 @@ impl SpeakerTag {
     /// A person, by display name; `None` is the owner before they have set a name.
     pub fn person(name: Option<&str>, confirmed: bool) -> Self {
         Self {
-            name: name.map(|name| bounded_name(name.trim()).to_owned()),
+            name: name.map(tag_name),
             confirmed,
             known: true,
         }
@@ -358,6 +358,23 @@ impl SpeakerTag {
         let doubt = if self.confirmed { "" } else { "?" };
         format!("[{name}{doubt}] ")
     }
+}
+
+/// A name as a tag carries it: one line, no brackets of its own, at most 128 bytes, so a
+/// name can never close its tag or open another.
+fn tag_name(name: &str) -> String {
+    let flat: String = name
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .filter(|character| !matches!(character, '[' | ']'))
+        .collect();
+    bounded_name(flat.trim()).to_owned()
 }
 
 fn bounded_name(name: &str) -> &str {

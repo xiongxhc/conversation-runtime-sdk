@@ -331,3 +331,21 @@ fn tags_follow_the_label() {
         SpeakerTag::person(Some("Jack"), true)
     );
 }
+
+#[tokio::test]
+async fn a_cancellation_after_gathering_never_reaches_the_engine() {
+    let fixture = StageFixture::new();
+    let session = fixture
+        .stage(WAIT)
+        .start_session(SessionId::new(1))
+        .unwrap();
+    fixture.audio.speak(1, 2.0, 1_000);
+    *fixture.claims.name.lock().unwrap() = Some("Jack".to_owned());
+    let cancellation = CancellationToken::new();
+    *fixture.claims.cancel_on_call.lock().unwrap() = Some(cancellation.clone());
+
+    let outcome = session.identify(request(1, "I'm Jack"), cancellation).await;
+
+    assert!(matches!(outcome, StageOutcome::Cancelled));
+    assert!(fixture.store.people_named("jack").unwrap().is_empty());
+}

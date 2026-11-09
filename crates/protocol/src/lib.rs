@@ -85,7 +85,7 @@ pub use privacy::{
 pub use quality::{
     ContextSource, ConversationMessage, ConversationMode, ConversationRole, ConversationSignal,
     FollowUpPolicy, PersonaLevel, PersonaProfile, QualityDecision, ResponseControls, SilencePolicy,
-    SpeechPace, VoiceResponseMode, MAX_CONVERSATION_MESSAGE_BYTES, MAX_HISTORY_BYTES,
+    SpeakerTag, SpeechPace, VoiceResponseMode, MAX_CONVERSATION_MESSAGE_BYTES, MAX_HISTORY_BYTES,
     MAX_HISTORY_MESSAGE_COUNT,
 };
 pub use voice_event::{

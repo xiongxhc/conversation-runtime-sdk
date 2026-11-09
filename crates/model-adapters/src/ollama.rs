@@ -5,8 +5,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    AdapterError, GenerationLanguageModel, GenerationLanguageRequest, GenerationTextDelta,
-    LanguageModel, LanguageModelRequest,
+    tagged_user_text, AdapterError, GenerationLanguageModel, GenerationLanguageRequest,
+    GenerationTextDelta, LanguageModel, LanguageModelRequest,
 };
 
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:11434";
@@ -634,7 +634,10 @@ impl<'a> ChatRequest<'a> {
         }
         for message in input.recent_messages() {
             messages.push(match message.role() {
-                conversation_protocol::ConversationRole::User => ChatMessage::user(message.text()),
+                conversation_protocol::ConversationRole::User => ChatMessage {
+                    role: "user",
+                    content: tagged_user_text(message.text(), message.speaker()),
+                },
                 conversation_protocol::ConversationRole::Assistant => {
                     ChatMessage::assistant(message.text())
                 }
@@ -648,7 +651,10 @@ impl<'a> ChatRequest<'a> {
         if !input.memory_items().is_empty() {
             messages.push(ChatMessage::memory(input.memory_items())?);
         }
-        messages.push(ChatMessage::user(input.transcript()));
+        messages.push(ChatMessage {
+            role: "user",
+            content: tagged_user_text(input.transcript(), input.speaker()),
+        });
 
         let format = match input.response_schema() {
             Some(schema) => Some(
@@ -708,13 +714,6 @@ impl<'a> ChatMessage<'a> {
         Self {
             role: "system",
             content: Cow::Owned(content),
-        }
-    }
-
-    fn user(content: &'a str) -> Self {
-        Self {
-            role: "user",
-            content: Cow::Borrowed(content),
         }
     }
 

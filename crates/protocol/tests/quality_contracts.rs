@@ -159,3 +159,41 @@ fn quality_event_serialization_is_content_free_and_nonterminal() {
 fn level(value: u8) -> PersonaLevel {
     PersonaLevel::new(value).unwrap()
 }
+
+#[test]
+fn speaker_tags_render_confirmed_unsure_new_and_unnamed_owner() {
+    use conversation_protocol::SpeakerTag;
+    assert_eq!(SpeakerTag::person(Some("Jack"), true).prefix(), "[Jack] ");
+    assert_eq!(SpeakerTag::person(Some("Jack"), false).prefix(), "[Jack?] ");
+    assert_eq!(SpeakerTag::someone_new().prefix(), "[someone new] ");
+    assert_eq!(SpeakerTag::person(None, true).prefix(), "[owner] ");
+}
+
+#[test]
+fn long_names_are_trimmed_on_a_character_boundary() {
+    use conversation_protocol::SpeakerTag;
+    let name = "昊".repeat(60);
+    let prefix = SpeakerTag::person(Some(&name), true).prefix();
+    assert!(prefix.len() <= 128 + 3, "{}", prefix.len());
+    assert!(prefix.starts_with('[') && prefix.ends_with("] "));
+}
+
+#[test]
+fn a_message_carries_its_speaker_outside_the_text_budget() {
+    use conversation_protocol::SpeakerTag;
+    let text = "a".repeat(MAX_CONVERSATION_MESSAGE_BYTES);
+    let message = ConversationMessage::new(ConversationRole::User, text.clone())
+        .unwrap()
+        .with_speaker(SpeakerTag::person(Some("Jack"), true));
+    assert_eq!(message.text(), text);
+    assert_eq!(
+        message.speaker(),
+        Some(&SpeakerTag::person(Some("Jack"), true))
+    );
+    assert_eq!(
+        ConversationMessage::new(ConversationRole::User, "hi")
+            .unwrap()
+            .speaker(),
+        None
+    );
+}

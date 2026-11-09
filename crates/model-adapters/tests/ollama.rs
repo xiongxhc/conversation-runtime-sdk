@@ -413,6 +413,54 @@ async fn serializes_runtime_guidance_history_and_current_input_in_order() {
 }
 
 #[tokio::test]
+async fn tagged_history_and_turn_render_with_prefixes() {
+    let server = FakeOllamaServer::streaming([
+        r#"{"message":{"role":"assistant","content":""},"done":true}"#,
+    ])
+    .await;
+    let model = OllamaLanguageModel::new(
+        OllamaConfig::new("test-model")
+            .unwrap()
+            .with_endpoint(server.endpoint())
+            .unwrap(),
+    );
+    let turn_id = TurnId::new(1);
+    let jack = conversation_protocol::SpeakerTag::person(Some("Jack"), true);
+    let input = LanguageModelInput::with_quality(
+        "I'm Chris",
+        [
+            ConversationMessage::new(ConversationRole::User, "hi")
+                .unwrap()
+                .with_speaker(jack.clone()),
+            ConversationMessage::new(ConversationRole::Assistant, "hello").unwrap(),
+        ],
+        QualityDecision::new(
+            turn_id,
+            ConversationMode::DirectAnswer,
+            ResponseControls::default(),
+            [],
+            2,
+            [ContextSource::SavedPersona, ContextSource::RecentHistory],
+        )
+        .unwrap(),
+        "Runtime quality guidance.",
+    )
+    .unwrap()
+    .with_speaker(jack);
+    let mut output = model.stream(
+        LanguageModelRequest::from_input(turn_id, input).unwrap(),
+        CancellationToken::new(),
+    );
+
+    assert!(output.recv().await.is_none());
+    let request = server.request_json().await;
+    let messages = request["messages"].as_array().unwrap();
+    assert_eq!(messages[1]["content"], "[Jack] hi");
+    assert_eq!(messages[2]["content"], "hello");
+    assert_eq!(messages[3]["content"], "[Jack] I'm Chris");
+}
+
+#[tokio::test]
 async fn serializes_memory_as_separate_untrusted_data_before_current_input() {
     let server = FakeOllamaServer::streaming([
         r#"{"message":{"role":"assistant","content":""},"done":true}"#,

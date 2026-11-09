@@ -1,5 +1,7 @@
+use std::borrow::Cow;
+
 use conversation_protocol::{
-    ConversationMessage, MemoryContextItem, QualityDecision, TurnId,
+    ConversationMessage, MemoryContextItem, QualityDecision, SpeakerTag, TurnId,
     MAX_CONVERSATION_MESSAGE_BYTES, MAX_HISTORY_BYTES, MAX_HISTORY_MESSAGE_COUNT,
     MAX_MEMORY_RETRIEVAL_BYTES, MAX_MEMORY_RETRIEVAL_ITEMS,
 };
@@ -24,6 +26,7 @@ pub struct LanguageModelInput {
     runtime_guidance: Option<String>,
     memory_items: Vec<MemoryContextItem>,
     response_schema: Option<String>,
+    speaker: Option<SpeakerTag>,
 }
 
 impl LanguageModelInput {
@@ -35,7 +38,41 @@ impl LanguageModelInput {
             runtime_guidance: None,
             memory_items: Vec::new(),
             response_schema: None,
+            speaker: None,
         }
+    }
+
+    /// Records who said the current turn.
+    pub fn with_speaker(mut self, speaker: SpeakerTag) -> Self {
+        self.speaker = Some(speaker);
+        self
+    }
+
+    pub const fn speaker(&self) -> Option<&SpeakerTag> {
+        self.speaker.as_ref()
+    }
+
+    /// Appends speaker identity guidance to the turn's runtime guidance, within the same
+    /// guidance and aggregate limits.
+    pub fn with_identity_guidance(self, guidance: &str) -> Result<Self, AdapterError> {
+        let quality_decision = self
+            .quality_decision
+            .ok_or_else(|| AdapterError::new("identity guidance requires quality input"))?;
+        let runtime_guidance = self
+            .runtime_guidance
+            .ok_or_else(|| AdapterError::new("identity guidance requires runtime guidance"))?;
+        let rebuilt = Self::with_quality_and_memory(
+            self.transcript,
+            self.recent_messages,
+            quality_decision,
+            format!("{runtime_guidance}\n\n{guidance}"),
+            self.memory_items,
+        )?;
+        Ok(Self {
+            response_schema: self.response_schema,
+            speaker: self.speaker,
+            ..rebuilt
+        })
     }
 
     /// One instructed request with no conversation behind it: `instructions` become the
@@ -68,6 +105,7 @@ impl LanguageModelInput {
             runtime_guidance: Some(instructions),
             memory_items: Vec::new(),
             response_schema: None,
+            speaker: None,
         })
     }
 
@@ -176,6 +214,7 @@ impl LanguageModelInput {
             runtime_guidance: Some(runtime_guidance),
             memory_items,
             response_schema: None,
+            speaker: None,
         })
     }
 
@@ -190,6 +229,7 @@ impl LanguageModelInput {
             .runtime_guidance
             .ok_or_else(|| AdapterError::new("language-model memory requires runtime guidance"))?;
         let response_schema = self.response_schema;
+        let speaker = self.speaker;
         let rebuilt = Self::with_quality_and_memory(
             self.transcript,
             self.recent_messages,
@@ -199,6 +239,7 @@ impl LanguageModelInput {
         )?;
         Ok(Self {
             response_schema,
+            speaker,
             ..rebuilt
         })
     }
@@ -226,6 +267,14 @@ impl LanguageModelInput {
     /// The JSON Schema the answer must match, as JSON text, when one was asked for.
     pub fn response_schema(&self) -> Option<&str> {
         self.response_schema.as_deref()
+    }
+}
+
+/// A user message as the model reads it: prefixed with its speaker tag when it has one.
+pub fn tagged_user_text<'a>(text: &'a str, speaker: Option<&SpeakerTag>) -> Cow<'a, str> {
+    match speaker {
+        Some(speaker) => Cow::Owned(format!("{}{text}", speaker.prefix())),
+        None => Cow::Borrowed(text),
     }
 }
 

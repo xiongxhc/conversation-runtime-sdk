@@ -401,6 +401,55 @@ async fn a_missing_credential_fails_closed_before_any_request() {
 }
 
 #[tokio::test]
+async fn tagged_history_and_turn_render_with_prefixes() {
+    use conversation_model_adapters::LanguageModelInput;
+    use conversation_protocol::{
+        ContextSource, ConversationMessage, ConversationMode, ConversationRole, QualityDecision,
+        ResponseControls, SpeakerTag,
+    };
+    set_credential();
+    let server = LanguageServer::start([Reply::sse([content("ok"), done()])]).await;
+    let new_voice = SpeakerTag::someone_new();
+    let input = LanguageModelInput::with_quality(
+        "I'm Jack",
+        [
+            ConversationMessage::new(ConversationRole::User, "hello")
+                .unwrap()
+                .with_speaker(SpeakerTag::person(Some("Chris"), false)),
+            ConversationMessage::new(ConversationRole::Assistant, "hi").unwrap(),
+        ],
+        QualityDecision::new(
+            TURN,
+            ConversationMode::DirectAnswer,
+            ResponseControls::default(),
+            [],
+            2,
+            [ContextSource::SavedPersona, ContextSource::RecentHistory],
+        )
+        .unwrap(),
+        "Runtime quality guidance.",
+    )
+    .unwrap()
+    .with_speaker(new_voice);
+    let request = GenerationLanguageRequest::from_input(TURN, GENERATION, input).unwrap();
+
+    collect(model(server.endpoint()).stream(request, CancellationToken::new())).await;
+
+    let messages = server.request(0).await.payload["messages"].clone();
+    let contents: Vec<&str> = messages
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] != "system")
+        .map(|message| message["content"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        contents,
+        vec!["[Chris?] hello", "hi", "[someone new] I'm Jack"]
+    );
+}
+
+#[tokio::test]
 async fn the_credential_travels_only_in_the_authorization_header() {
     set_credential();
     let server = LanguageServer::start([Reply::sse([content("ok"), done()])]).await;

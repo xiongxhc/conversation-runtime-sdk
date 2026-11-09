@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::credential::{validate_credential_env_name, Credential};
-use crate::language_model::memory_context_content;
+use crate::language_model::{memory_context_content, tagged_user_text};
 use crate::{
     AdapterError, GenerationLanguageModel, GenerationLanguageRequest, GenerationTextDelta,
 };
@@ -495,7 +495,15 @@ impl<'a> ChatCompletionRequest<'a> {
                     ));
                 }
             };
-            messages.push(ChatMessage::borrowed(role, message.text()));
+            messages.push(ChatMessage {
+                role,
+                content: match message.role() {
+                    conversation_protocol::ConversationRole::User => {
+                        tagged_user_text(message.text(), message.speaker())
+                    }
+                    _ => Cow::Borrowed(message.text()),
+                },
+            });
         }
         if !input.memory_items().is_empty() {
             messages.push(ChatMessage::owned(
@@ -503,7 +511,10 @@ impl<'a> ChatCompletionRequest<'a> {
                 memory_context_content(input.memory_items())?,
             ));
         }
-        messages.push(ChatMessage::borrowed("user", input.transcript()));
+        messages.push(ChatMessage {
+            role: "user",
+            content: tagged_user_text(input.transcript(), input.speaker()),
+        });
 
         Ok(Self {
             model: &config.model,

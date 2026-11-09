@@ -319,10 +319,63 @@ impl ConversationRole {
     }
 }
 
+/// The longest speaker name a tag carries, the people store's own limit.
+const MAX_SPEAKER_TAG_NAME_BYTES: usize = 128;
+
+/// Who said a user message, as the language model sees it: a recognised person, a person
+/// the voice match is not certain of, or someone the companion does not know.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SpeakerTag {
+    name: Option<String>,
+    confirmed: bool,
+    known: bool,
+}
+
+impl SpeakerTag {
+    /// A person, by display name; `None` is the owner before they have set a name.
+    pub fn person(name: Option<&str>, confirmed: bool) -> Self {
+        Self {
+            name: name.map(|name| bounded_name(name.trim()).to_owned()),
+            confirmed,
+            known: true,
+        }
+    }
+
+    pub const fn someone_new() -> Self {
+        Self {
+            name: None,
+            confirmed: false,
+            known: false,
+        }
+    }
+
+    /// `[Jack] `, `[Jack?] `, `[someone new] `, or `[owner] `.
+    pub fn prefix(&self) -> String {
+        if !self.known {
+            return "[someone new] ".to_owned();
+        }
+        let name = self.name.as_deref().unwrap_or("owner");
+        let doubt = if self.confirmed { "" } else { "?" };
+        format!("[{name}{doubt}] ")
+    }
+}
+
+fn bounded_name(name: &str) -> &str {
+    if name.len() <= MAX_SPEAKER_TAG_NAME_BYTES {
+        return name;
+    }
+    let mut end = MAX_SPEAKER_TAG_NAME_BYTES;
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    &name[..end]
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConversationMessage {
     role: ConversationRole,
     text: String,
+    speaker: Option<SpeakerTag>,
 }
 
 impl ConversationMessage {
@@ -334,7 +387,17 @@ impl ConversationMessage {
         if text.len() > MAX_CONVERSATION_MESSAGE_BYTES {
             return Err(quality_error("conversation message exceeds 16 KiB"));
         }
-        Ok(Self { role, text })
+        Ok(Self {
+            role,
+            text,
+            speaker: None,
+        })
+    }
+
+    /// Records who said a user message. The tag sits outside the text and its byte limit.
+    pub fn with_speaker(mut self, speaker: SpeakerTag) -> Self {
+        self.speaker = Some(speaker);
+        self
     }
 
     pub const fn role(&self) -> ConversationRole {
@@ -343,6 +406,10 @@ impl ConversationMessage {
 
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    pub const fn speaker(&self) -> Option<&SpeakerTag> {
+        self.speaker.as_ref()
     }
 }
 

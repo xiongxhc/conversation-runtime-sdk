@@ -55,6 +55,7 @@ async fn sqlite_provider_runs_bounded_retrieval_on_an_async_boundary() {
         .retrieve(
             TurnId::new(4),
             "local project".to_owned(),
+            None,
             CancellationToken::new(),
         )
         .await
@@ -74,7 +75,12 @@ async fn sqlite_provider_waits_for_cancelled_retrieval_cleanup() {
     cancellation.cancel();
 
     let error = provider
-        .retrieve(TurnId::new(5), "private query".to_owned(), cancellation)
+        .retrieve(
+            TurnId::new(5),
+            "private query".to_owned(),
+            None,
+            cancellation,
+        )
         .await
         .unwrap_err();
     assert_eq!(error.kind(), MemoryStoreErrorKind::Cancelled);
@@ -86,4 +92,65 @@ async fn sqlite_provider_waits_for_cancelled_retrieval_cleanup() {
         })
         .unwrap();
     assert_eq!(traces, 0);
+}
+
+#[tokio::test]
+async fn provider_scopes_retrieval_to_one_subject() {
+    use conversation_memory::{NewPerson, PeopleStore, PersonName};
+    use conversation_protocol::PersonId;
+    let temporary = tempdir().unwrap();
+    let store = SqliteMemoryStore::initialize(temporary.path().join("runtime.sqlite3")).unwrap();
+    let jack = store
+        .create_person(NewPerson::new(
+            PersonName::new("Jack", "jack").unwrap(),
+            false,
+            timestamp(1_000),
+        ))
+        .unwrap()
+        .id();
+    let draft = |content: &str, subject: PersonId| {
+        MemoryDraft::new(
+            MemoryKind::Semantic,
+            content,
+            MemoryProvenance::new(
+                MemoryProvenanceKind::UserProvided,
+                "settings",
+                timestamp(900),
+                "local-user",
+                None,
+            )
+            .unwrap(),
+            MemoryConfidence::new(900).unwrap(),
+            timestamp(1_000),
+            MemoryRetention::UntilDeleted,
+        )
+        .unwrap()
+        .with_subject(subject)
+    };
+    store.create(draft("tea at noon", PersonId::OWNER)).unwrap();
+    let jacks = store.create(draft("tea with lemon", jack)).unwrap();
+    let provider = SqliteMemoryContextProvider::new(store, Arc::new(FixedClock(timestamp(2_000))));
+
+    let scoped = provider
+        .retrieve(
+            TurnId::new(6),
+            "tea".to_owned(),
+            Some(jack),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let everyone = provider
+        .retrieve(
+            TurnId::new(7),
+            "tea".to_owned(),
+            None,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(scoped.items().len(), 1);
+    assert_eq!(scoped.items()[0].memory_id(), jacks.id());
+    assert_eq!(everyone.items().len(), 2);
 }

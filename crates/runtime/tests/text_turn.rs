@@ -762,6 +762,7 @@ impl MemoryContextProvider for FailingMemoryProvider {
         &self,
         _turn_id: TurnId,
         _query: String,
+        _subject: Option<conversation_protocol::PersonId>,
         _cancellation: CancellationToken,
     ) -> MemoryProviderFuture<'_> {
         Box::pin(async { Err(MemoryStoreError::cancelled()) })
@@ -794,6 +795,7 @@ impl MemoryContextProvider for PanicOnceMemoryProvider {
         &self,
         turn_id: TurnId,
         query: String,
+        subject: Option<conversation_protocol::PersonId>,
         cancellation: CancellationToken,
     ) -> MemoryProviderFuture<'_> {
         if !self.panicked.swap(true, Ordering::AcqRel) {
@@ -802,6 +804,76 @@ impl MemoryContextProvider for PanicOnceMemoryProvider {
                 panic!("scripted async memory panic");
             });
         }
-        self.inner.retrieve(turn_id, query, cancellation)
+        self.inner.retrieve(turn_id, query, subject, cancellation)
     }
+}
+
+struct SubjectRecordingProvider {
+    inner: SqliteMemoryContextProvider,
+    subjects: StdMutex<Vec<Option<conversation_protocol::PersonId>>>,
+}
+
+impl MemoryContextProvider for SubjectRecordingProvider {
+    fn execution_location(&self) -> ExecutionLocation {
+        ExecutionLocation::Local
+    }
+
+    fn retrieve(
+        &self,
+        turn_id: TurnId,
+        query: String,
+        subject: Option<conversation_protocol::PersonId>,
+        cancellation: CancellationToken,
+    ) -> MemoryProviderFuture<'_> {
+        self.subjects.lock().unwrap().push(subject);
+        self.inner.retrieve(turn_id, query, subject, cancellation)
+    }
+}
+
+fn subject_recording_runtime(
+    identity: bool,
+) -> (
+    tempfile::TempDir,
+    Arc<SubjectRecordingProvider>,
+    TextTurnRuntime,
+) {
+    let temporary = tempdir().unwrap();
+    let store = SqliteMemoryStore::initialize(temporary.path().join("runtime.sqlite3")).unwrap();
+    let provider = Arc::new(SubjectRecordingProvider {
+        inner: SqliteMemoryContextProvider::new(
+            store,
+            Arc::new(FixedClock(UnixTimestampMillis::new(2_000).unwrap())),
+        ),
+        subjects: StdMutex::new(Vec::new()),
+    });
+    let mut context = context()
+        .with_memory_provider(provider.clone(), ExecutionLocation::Local)
+        .unwrap();
+    if identity {
+        context = context.with_speaker_identity();
+    }
+    let runtime = TextTurnRuntime::new(
+        context,
+        Arc::new(MockGenerationLanguageModel::new(["answer"])),
+    );
+    (temporary, provider, runtime)
+}
+
+#[tokio::test]
+async fn text_turns_retrieve_only_the_owners_memories_with_identity_enabled() {
+    let (_temporary, provider, runtime) = subject_recording_runtime(true);
+    let mut events = start_turn(&runtime, "question").await;
+    drain_with_timeout(&mut events).await;
+    assert_eq!(
+        *provider.subjects.lock().unwrap(),
+        vec![Some(conversation_protocol::PersonId::OWNER)]
+    );
+}
+
+#[tokio::test]
+async fn text_turns_without_identity_retrieve_every_subject() {
+    let (_temporary, provider, runtime) = subject_recording_runtime(false);
+    let mut events = start_turn(&runtime, "question").await;
+    drain_with_timeout(&mut events).await;
+    assert_eq!(*provider.subjects.lock().unwrap(), vec![None]);
 }

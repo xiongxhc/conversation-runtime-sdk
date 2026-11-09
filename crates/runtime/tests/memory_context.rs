@@ -177,6 +177,7 @@ impl MemoryContextProvider for BlockingProvider {
         &self,
         _turn_id: TurnId,
         _query: String,
+        _subject: Option<conversation_protocol::PersonId>,
         cancellation: CancellationToken,
     ) -> MemoryProviderFuture<'_> {
         let started = Arc::clone(&self.started);
@@ -234,6 +235,7 @@ impl MemoryContextProvider for RemoteProvider {
         &self,
         _turn_id: TurnId,
         _query: String,
+        _subject: Option<conversation_protocol::PersonId>,
         _cancellation: CancellationToken,
     ) -> MemoryProviderFuture<'_> {
         unreachable!()

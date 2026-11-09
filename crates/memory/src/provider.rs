@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use conversation_protocol::{
-    ExecutionLocation, MemoryRetrievalRequest, TurnId, UnixTimestampMillis,
+    ExecutionLocation, MemoryRetrievalRequest, PersonId, TurnId, UnixTimestampMillis,
     MAX_MEMORY_RETRIEVAL_BYTES, MAX_MEMORY_RETRIEVAL_ITEMS,
 };
 use tokio_util::sync::CancellationToken;
@@ -40,10 +40,12 @@ impl MemoryClock for SystemMemoryClock {
 pub trait MemoryContextProvider: Send + Sync {
     fn execution_location(&self) -> ExecutionLocation;
 
+    /// `subject` limits retrieval to memories about one person; `None` covers everyone.
     fn retrieve(
         &self,
         turn_id: TurnId,
         query: String,
+        subject: Option<PersonId>,
         cancellation: CancellationToken,
     ) -> MemoryProviderFuture<'_>;
 }
@@ -94,6 +96,7 @@ impl MemoryContextProvider for SqliteMemoryContextProvider {
         &self,
         turn_id: TurnId,
         query: String,
+        subject: Option<PersonId>,
         cancellation: CancellationToken,
     ) -> MemoryProviderFuture<'_> {
         let store = self.store.clone();
@@ -115,6 +118,10 @@ impl MemoryContextProvider for SqliteMemoryContextProvider {
                         "memory retrieval request is invalid",
                     )
                 })?;
+                let request = match subject {
+                    Some(subject) => request.with_subject(subject),
+                    None => request,
+                };
                 store.retrieve(request, &TokenCancellation(cancellation))
             });
             operation.await.map_err(|_| storage_error())?

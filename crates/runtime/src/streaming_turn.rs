@@ -540,6 +540,7 @@ async fn run_streaming_turn(
         let mut retrieval = memory_provider.retrieve(
             turn_id,
             language_input.transcript().to_owned(),
+            None,
             memory_cancellation.clone(),
         );
         let retrieval = tokio::select! {

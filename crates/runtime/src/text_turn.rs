@@ -8,7 +8,7 @@ use conversation_model_adapters::{
     LanguageModelInput,
 };
 use conversation_protocol::{
-    GenerationId, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage,
+    GenerationId, PersonId, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage,
     RuntimeTimingMilestone, TurnId, MAX_CONVERSATION_MESSAGE_BYTES,
 };
 #[cfg(test)]
@@ -195,6 +195,10 @@ impl TextTurnRuntime {
             language_input,
             language_model: Arc::clone(&self.language_model),
             memory_provider: self.context.memory_provider(),
+            memory_subject: self
+                .context
+                .speaker_identity_enabled()
+                .then_some(PersonId::OWNER),
             started_at: Instant::now(),
             external_interruption: external_interruption.clone(),
             work_cancellation: work_cancellation.clone(),
@@ -338,6 +342,7 @@ struct TextTurnTask {
     language_input: LanguageModelInput,
     language_model: Arc<dyn GenerationLanguageModel>,
     memory_provider: Option<Arc<dyn MemoryContextProvider>>,
+    memory_subject: Option<PersonId>,
     started_at: Instant,
     external_interruption: CancellationToken,
     work_cancellation: CancellationToken,
@@ -356,6 +361,7 @@ async fn run_text_turn(task: TextTurnTask, events: &mpsc::Sender<RuntimeEvent>) 
         mut language_input,
         language_model,
         memory_provider,
+        memory_subject,
         started_at,
         external_interruption,
         work_cancellation,
@@ -390,7 +396,12 @@ async fn run_text_turn(task: TextTurnTask, events: &mpsc::Sender<RuntimeEvent>) 
         let retrieval_cancellation = memory_cancellation.clone();
         let mut retrieval = tokio::spawn(async move {
             memory_provider
-                .retrieve(turn_id, retrieval_query, retrieval_cancellation)
+                .retrieve(
+                    turn_id,
+                    retrieval_query,
+                    memory_subject,
+                    retrieval_cancellation,
+                )
                 .await
         });
         let retrieval = tokio::select! {

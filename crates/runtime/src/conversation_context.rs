@@ -14,6 +14,7 @@ pub struct ConversationContext {
     lifecycle: Arc<Mutex<ConversationLifecycle>>,
     quality: Arc<Mutex<ConversationQualityController>>,
     memory: Option<Arc<dyn MemoryContextProvider>>,
+    speaker_identity: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -83,7 +84,19 @@ impl ConversationContext {
             lifecycle: Arc::new(Mutex::new(ConversationLifecycle::default())),
             quality: Arc::new(Mutex::new(quality)),
             memory: None,
+            speaker_identity: false,
         }
+    }
+
+    /// Marks speaker identity as on. Typed turns then count as the owner speaking: they
+    /// retrieve only the owner's memories.
+    pub fn with_speaker_identity(mut self) -> Self {
+        self.speaker_identity = true;
+        self
+    }
+
+    pub const fn speaker_identity_enabled(&self) -> bool {
+        self.speaker_identity
     }
 
     pub fn with_memory_provider(

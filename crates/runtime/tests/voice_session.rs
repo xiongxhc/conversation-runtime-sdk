@@ -1104,6 +1104,7 @@ impl MemoryContextProvider for RemoteMemoryProvider {
         &self,
         _turn_id: TurnId,
         _query: String,
+        _subject: Option<conversation_protocol::PersonId>,
         _cancellation: CancellationToken,
     ) -> MemoryProviderFuture<'_> {
         unreachable!()

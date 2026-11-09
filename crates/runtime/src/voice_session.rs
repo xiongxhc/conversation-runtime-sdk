@@ -12,8 +12,8 @@ use conversation_model_adapters::{
 use conversation_protocol::{
     ConversationContextExchange, GenerationId, PlaybackState, PrivacySummary, RecordingLimit,
     RecordingLimitState, RecoveryDisposition, RuntimeError, RuntimeErrorKind, RuntimeEvent,
-    RuntimeStage, RuntimeTimingMilestone, SessionId, TurnId, VoiceActivity, VoiceResponseMode,
-    VoiceSessionEvent, VoiceSessionPolicy, VoiceTimingMilestone,
+    RuntimeStage, RuntimeTimingMilestone, SessionId, TurnId, UnixTimestampMillis, VoiceActivity,
+    VoiceResponseMode, VoiceSessionEvent, VoiceSessionPolicy, VoiceTimingMilestone,
 };
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio::task::{JoinError, JoinHandle};
@@ -27,7 +27,8 @@ use crate::transcript_cleanup::{
 
 use crate::{
     validate_voice_policy, ConversationContext, ConversationTurnSource, SessionClock,
-    StreamingTurnEventStream, StreamingTurnRuntime, TurnFinalizationDeadline, TurnFinalizer,
+    SessionSpeakerIdentity, SpeakerIdentityStage, StreamingTurnEventStream, StreamingTurnRuntime,
+    TurnFinalizationDeadline, TurnFinalizer, TurnVoiceRequest,
 };
 
 const SESSION_EVENT_BUFFER_SIZE: usize = 32;
@@ -56,6 +57,7 @@ pub struct VoiceSessionAdapters {
     language_model: Arc<dyn GenerationLanguageModel>,
     speech_synthesizer: Arc<dyn StreamingSpeechSynthesizer>,
     recorder: Option<Arc<Mutex<SessionRecorder>>>,
+    speaker_identity: Option<Arc<SpeakerIdentityStage>>,
 }
 
 impl VoiceSessionAdapters {
@@ -69,7 +71,15 @@ impl VoiceSessionAdapters {
             language_model,
             speech_synthesizer,
             recorder: None,
+            speaker_identity: None,
         }
+    }
+
+    /// Identifies each voice turn's speaker before memory retrieval. Starting a session
+    /// refuses when its identity cannot start.
+    pub fn with_speaker_identity(mut self, stage: Arc<SpeakerIdentityStage>) -> Self {
+        self.speaker_identity = Some(stage);
+        self
     }
 
     /// Records this session's capture media. The recorder is created before the session starts
@@ -405,6 +415,24 @@ async fn run_voice_session(run: VoiceSessionRun) -> VoiceSessionEvent {
         transcript_cleanup,
     } = run;
     let session_id = policy.session_id();
+    let speaker_identity = match adapters
+        .speaker_identity
+        .as_ref()
+        .map(|stage| stage.start_session(session_id))
+        .transpose()
+    {
+        Ok(identity) => identity,
+        Err(_) => {
+            return session_failure(
+                session_id,
+                RuntimeError::new(
+                    RuntimeErrorKind::Configuration,
+                    RuntimeStage::Memory,
+                    "speaker identity could not start for this voice session",
+                ),
+            );
+        }
+    };
     let VoiceIoSession {
         input,
         capture,
@@ -480,6 +508,7 @@ async fn run_voice_session(run: VoiceSessionRun) -> VoiceSessionEvent {
             recorder,
             response_mode,
             context,
+            speaker_identity,
         },
     )
     .with_transcript_cleanup(transcript_cleanup)
@@ -569,6 +598,9 @@ struct VoiceLoop {
     last_finalized_segment: u64,
     context: ConversationContext,
     transcript_cleanup: Arc<TranscriptCleanupCounters>,
+    speaker_identity: Option<SessionSpeakerIdentity>,
+    /// The companion was interrupted, so the next turn's speech began during a response.
+    barge_in_pending: bool,
 }
 
 struct VoiceLoopDependencies {
@@ -582,6 +614,7 @@ struct VoiceLoopDependencies {
     recorder: Option<Arc<Mutex<SessionRecorder>>>,
     response_mode: VoiceResponseMode,
     context: ConversationContext,
+    speaker_identity: Option<SessionSpeakerIdentity>,
 }
 
 enum PendingSegment {
@@ -603,6 +636,7 @@ impl VoiceLoop {
             recorder,
             response_mode,
             context,
+            speaker_identity,
         } = dependencies;
         let final_silence_ms = policy.final_silence_ms();
         let (input, capture_recorder) = match recorder {
@@ -645,7 +679,28 @@ impl VoiceLoop {
             last_finalized_segment: 0,
             context,
             transcript_cleanup: Arc::default(),
+            speaker_identity,
+            barge_in_pending: false,
         }
+    }
+
+    /// The identity request for a turn starting now, when this session identifies speakers.
+    fn voice_request(
+        &mut self,
+        segment_id: u64,
+        text: &str,
+    ) -> Option<(SessionSpeakerIdentity, TurnVoiceRequest)> {
+        let barge_in = std::mem::take(&mut self.barge_in_pending);
+        let identity = self.speaker_identity.clone()?;
+        Some((
+            identity,
+            TurnVoiceRequest {
+                segment_id,
+                transcript: text.to_owned(),
+                barge_in,
+                at: wall_clock_now(),
+            },
+        ))
     }
 
     fn with_transcript_cleanup(mut self, counters: Arc<TranscriptCleanupCounters>) -> Self {
@@ -877,13 +932,15 @@ impl VoiceLoop {
                 "voice response cannot replace an active response",
             ));
         }
+        let voice = self.voice_request(segment_id, &text);
         let started = self
             .turn_runtime
-            .start_turn(
+            .start_turn_with_voice(
                 ConversationTurnSource::Voice {
                     session_id: self.session_id,
                 },
                 text.clone(),
+                voice,
             )
             .await?;
         let identity = started.identity();
@@ -1428,13 +1485,15 @@ impl VoiceLoop {
             self.register_pending_segment(segment_id, text).await?;
             return Ok(());
         }
+        let voice = self.voice_request(segment_id, &text);
         let started = self
             .turn_runtime
-            .start_turn(
+            .start_turn_with_voice(
                 ConversationTurnSource::Voice {
                     session_id: self.session_id,
                 },
                 text.clone(),
+                voice,
             )
             .await?;
         let identity = started.identity();
@@ -1678,6 +1737,7 @@ impl VoiceLoop {
         {
             return None;
         }
+        self.barge_in_pending = true;
         if !self
             .publish_reliable(VoiceSessionEvent::BargeIn {
                 session_id: self.session_id,
@@ -2025,6 +2085,31 @@ impl VoiceLoop {
                 self.playback = Some(PlaybackLifecycle::Rendered { generation_id });
             }
             return true;
+        }
+        match event {
+            RuntimeEvent::SpeakerIdentified {
+                turn_id,
+                person,
+                confirmed,
+            } => {
+                return self
+                    .publish_reliable(VoiceSessionEvent::SpeakerIdentified {
+                        session_id: self.session_id,
+                        turn_id,
+                        person,
+                        confirmed,
+                    })
+                    .await;
+            }
+            RuntimeEvent::IdentityLate { turn_id } => {
+                return self
+                    .publish_reliable(VoiceSessionEvent::IdentityLate {
+                        session_id: self.session_id,
+                        turn_id,
+                    })
+                    .await;
+            }
+            _ => {}
         }
         let reliable = matches!(
             event,
@@ -2589,6 +2674,16 @@ fn is_recognition_failure(error: &AdapterError) -> bool {
     error.stage() == Some(RuntimeStage::SpeechRecognizer)
 }
 
+fn wall_clock_now() -> UnixTimestampMillis {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+        });
+    UnixTimestampMillis::new(millis)
+        .unwrap_or_else(|_| UnixTimestampMillis::new(0).expect("zero is a valid timestamp"))
+}
+
 fn session_failure(session_id: SessionId, error: RuntimeError) -> VoiceSessionEvent {
     VoiceSessionEvent::SessionFailed {
         session_id,
@@ -2802,6 +2897,7 @@ mod tests {
                     recorder: None,
                     response_mode,
                     context,
+                    speaker_identity: None,
                 },
             );
             tokio::time::advance(Duration::from_millis(9000)).await;
@@ -2950,6 +3046,7 @@ mod tests {
                     recorder: None,
                     response_mode,
                     context: context.clone(),
+                    speaker_identity: None,
                 },
             );
             let mut outcomes = Vec::new();
@@ -3054,6 +3151,7 @@ mod tests {
                     recorder: None,
                     response_mode,
                     context,
+                    speaker_identity: None,
                 },
             );
             let mut observed = Vec::new();
@@ -3196,6 +3294,7 @@ mod tests {
                     recorder: None,
                     response_mode: mode,
                     context: context.clone(),
+                    speaker_identity: None,
                 },
             );
             loop_
@@ -3284,6 +3383,7 @@ mod tests {
                     recorder: None,
                     response_mode: VoiceResponseMode::Automatic,
                     context: context.clone(),
+                    speaker_identity: None,
                 },
             );
             let occupied = if blocked_start {
@@ -3379,6 +3479,7 @@ mod tests {
                 recorder: None,
                 response_mode: VoiceResponseMode::Automatic,
                 context,
+                speaker_identity: None,
             },
         );
         let running = tokio::spawn(loop_.run());
@@ -3513,6 +3614,7 @@ mod tests {
                 recorder: None,
                 response_mode: VoiceResponseMode::Automatic,
                 context: context.clone(),
+                speaker_identity: None,
             },
         );
         voice_loop
@@ -3582,6 +3684,7 @@ mod tests {
                 recorder: None,
                 response_mode: VoiceResponseMode::ExternalGate,
                 context,
+                speaker_identity: None,
             },
         );
         loop_
@@ -3668,6 +3771,7 @@ mod tests {
                 recorder: None,
                 response_mode: VoiceResponseMode::ExternalGate,
                 context,
+                speaker_identity: None,
             },
         );
         let frame = AudioFrame::new(
@@ -3810,6 +3914,7 @@ mod tests {
                 recorder: None,
                 response_mode: VoiceResponseMode::ExternalGate,
                 context: context.clone(),
+                speaker_identity: None,
             },
         );
         for segment_id in 1..=10 {
@@ -3987,6 +4092,7 @@ mod tests {
                 recorder: None,
                 response_mode: VoiceResponseMode::ExternalGate,
                 context,
+                speaker_identity: None,
             },
         );
         loop_

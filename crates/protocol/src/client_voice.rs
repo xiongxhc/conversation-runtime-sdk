@@ -327,6 +327,10 @@ impl TryFrom<VoiceSessionEvent> for ClientVoiceSessionEvent {
                 mostly_zero,
                 longest_gap_ms,
             },
+            VoiceSessionEvent::SpeakerIdentified { .. }
+            | VoiceSessionEvent::IdentityLate { .. } => {
+                return Err(ClientWireError::InvalidVoiceEvent);
+            }
         };
         validate_client_voice_event(&projected)?;
         Ok(projected)

@@ -1,3 +1,5 @@
+mod support;
+
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1569,6 +1571,8 @@ async fn flushed_receipt_before_acceptance_is_published_and_ends_the_lifecycle()
 enum LanguageOutcome {
     Text(&'static str),
     Failure(&'static str),
+    /// Never answers, so the turn stays responding until it is interrupted.
+    Hang,
 }
 
 struct PerTurnSpeech;
@@ -1621,7 +1625,7 @@ impl GenerationLanguageModel for MultiTurnLanguage {
     fn stream(
         &self,
         request: GenerationLanguageRequest,
-        _cancellation: CancellationToken,
+        cancellation: CancellationToken,
     ) -> mpsc::Receiver<Result<GenerationTextDelta, AdapterError>> {
         self.requests
             .lock()
@@ -1635,6 +1639,14 @@ impl GenerationLanguageModel for MultiTurnLanguage {
             .expect("multi-turn language outcome missing");
         let (sender, receiver) = mpsc::channel(1);
         let result = match outcome {
+            LanguageOutcome::Hang => {
+                // Holds the stream open until the turn is cancelled, as a real model would.
+                tokio::spawn(async move {
+                    cancellation.cancelled().await;
+                    drop(sender);
+                });
+                return receiver;
+            }
             LanguageOutcome::Text(text) => Ok(GenerationTextDelta::new(
                 request.turn_id(),
                 request.generation_id(),
@@ -2500,4 +2512,268 @@ async fn drain_until_session_terminal(
     })
     .await
     .expect("session terminal timed out")
+}
+
+fn identity_runtime(
+    fixture: &support::speaker_fakes::StageFixture,
+    language: Arc<dyn GenerationLanguageModel>,
+) -> (
+    VoiceSessionRuntime,
+    Arc<TestVoiceIoFactory>,
+    mpsc::Sender<Result<VoiceInputEvent, AdapterError>>,
+) {
+    let (input, input_receiver) = mpsc::channel(32);
+    let output = Arc::new(MockContinuousAudioOutput::new());
+    let factory = Arc::new(TestVoiceIoFactory::new(input_receiver, output));
+    let stage = Arc::new(fixture.stage(Duration::from_secs(2)));
+    let runtime = VoiceSessionRuntime::new(
+        conversation_context().with_speaker_identity(),
+        VoiceSessionAdapters::new(factory.clone(), language, Arc::new(PerTurnSpeech))
+            .with_speaker_identity(stage),
+    );
+    (runtime, factory, input)
+}
+
+async fn say(
+    input: &mpsc::Sender<Result<VoiceInputEvent, AdapterError>>,
+    segment_id: u64,
+    text: &str,
+    at_ms: u64,
+) {
+    input
+        .send(Ok(VoiceInputEvent::Activity(
+            VoiceActivity::SpeechStarted { at_ms },
+        )))
+        .await
+        .unwrap();
+    input
+        .send(Ok(VoiceInputEvent::Recognition(
+            conversation_model_adapters::RecognitionEvent::Hypothesis(
+                conversation_model_adapters::RecognitionHypothesis::engine_final(segment_id, text),
+            ),
+        )))
+        .await
+        .unwrap();
+    input
+        .send(Ok(VoiceInputEvent::Activity(VoiceActivity::SpeechEnded {
+            at_ms,
+        })))
+        .await
+        .unwrap();
+}
+
+async fn next_matching(
+    events: &mut VoiceSessionEventStream,
+    predicate: impl Fn(&VoiceSessionEvent) -> bool,
+) -> VoiceSessionEvent {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let event = events.recv().await.expect("voice session ended early");
+            if predicate(&event) {
+                return event;
+            }
+        }
+    })
+    .await
+    .expect("expected voice event never arrived")
+}
+
+fn refinements(
+    fixture: &support::speaker_fakes::StageFixture,
+    person: conversation_protocol::PersonId,
+) -> usize {
+    use conversation_memory::{PeopleStore, SignatureModel, SignatureRole};
+    fixture
+        .store
+        .signatures(&fixture.key, &SignatureModel::new("ecapa", "1").unwrap())
+        .unwrap()
+        .iter()
+        .filter(|signature| {
+            signature.person() == person && signature.role() == SignatureRole::Refinement
+        })
+        .count()
+}
+
+#[tokio::test]
+async fn voice_turns_publish_who_spoke() {
+    let fixture = support::speaker_fakes::StageFixture::new();
+    let chris = fixture.person("Chris", &support::speaker_fakes::CHRIS);
+    let language = Arc::new(MultiTurnLanguage::new([LanguageOutcome::Text("hi")]));
+    let (runtime, factory, input) = identity_runtime(&fixture, language);
+    let mut events = runtime.start(policy()).await.unwrap();
+    timeout(Duration::from_secs(1), factory.wait_for_input_start())
+        .await
+        .unwrap();
+    fixture.audio.speak(1, 1.0, 2_000);
+
+    say(&input, 1, "hello", 0).await;
+    let identified = next_matching(&mut events, |event| {
+        matches!(event, VoiceSessionEvent::SpeakerIdentified { .. })
+            || matches!(
+                event,
+                VoiceSessionEvent::Turn {
+                    event: RuntimeEvent::SpeakerIdentified { .. },
+                    ..
+                }
+            )
+    })
+    .await;
+
+    assert!(matches!(
+        identified,
+        VoiceSessionEvent::SpeakerIdentified { person, confirmed: true, .. } if person == Some(chris)
+    ));
+    next_matching(
+        &mut events,
+        |event| matches!(event, VoiceSessionEvent::Turn { event, .. } if event.is_terminal()),
+    )
+    .await;
+    assert_eq!(refinements(&fixture, chris), 1);
+}
+
+#[tokio::test]
+async fn a_turn_that_barged_in_is_marked_for_the_engine() {
+    let fixture = support::speaker_fakes::StageFixture::new();
+    let chris = fixture.person("Chris", &support::speaker_fakes::CHRIS);
+    let language = Arc::new(MultiTurnLanguage::new([
+        LanguageOutcome::Hang,
+        LanguageOutcome::Text("sure"),
+    ]));
+    let (runtime, factory, input) = identity_runtime(&fixture, language);
+    let mut events = runtime.start(policy()).await.unwrap();
+    timeout(Duration::from_secs(1), factory.wait_for_input_start())
+        .await
+        .unwrap();
+    fixture.audio.speak(1, 1.0, 2_000);
+    fixture.audio.speak(2, 1.0, 2_000);
+
+    say(&input, 1, "tell me a story", 0).await;
+    let started = next_matching(&mut events, |event| {
+        matches!(
+            event,
+            VoiceSessionEvent::Turn {
+                event: RuntimeEvent::TranscriptFinal { .. },
+                ..
+            }
+        )
+    })
+    .await;
+    let VoiceSessionEvent::Turn {
+        generation_id,
+        event: RuntimeEvent::TranscriptFinal { turn_id, .. },
+        ..
+    } = started
+    else {
+        unreachable!()
+    };
+    next_matching(&mut events, |event| {
+        matches!(event, VoiceSessionEvent::SpeakerIdentified { .. })
+    })
+    .await;
+    runtime.barge_in(turn_id, generation_id).await.unwrap();
+    next_matching(&mut events, |event| {
+        matches!(
+            event,
+            VoiceSessionEvent::Turn {
+                event: RuntimeEvent::TurnCancelled { .. },
+                ..
+            }
+        )
+    })
+    .await;
+
+    say(&input, 2, "wait, stop", 2_000).await;
+    next_matching(&mut events, |event| {
+        matches!(
+            event,
+            VoiceSessionEvent::Turn {
+                event: RuntimeEvent::TurnCompleted { .. },
+                ..
+            }
+        )
+    })
+    .await;
+
+    // The first turn refined Chris's voice; the barge-in turn did not.
+    assert_eq!(refinements(&fixture, chris), 1);
+}
+
+#[tokio::test]
+async fn sessions_without_identity_are_unchanged() {
+    let fixture = support::speaker_fakes::StageFixture::new();
+    let (input, input_receiver) = mpsc::channel(32);
+    let output = Arc::new(MockContinuousAudioOutput::new());
+    let factory = Arc::new(TestVoiceIoFactory::new(input_receiver, output));
+    let runtime = VoiceSessionRuntime::new(
+        conversation_context(),
+        VoiceSessionAdapters::new(
+            factory.clone(),
+            Arc::new(MultiTurnLanguage::new([LanguageOutcome::Text("hi")])),
+            Arc::new(PerTurnSpeech),
+        ),
+    );
+    let mut events = runtime.start(policy()).await.unwrap();
+    timeout(Duration::from_secs(1), factory.wait_for_input_start())
+        .await
+        .unwrap();
+    fixture.audio.speak(1, 1.0, 2_000);
+
+    say(&input, 1, "hello", 0).await;
+    let mut observed = Vec::new();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            let terminal =
+                matches!(&event, VoiceSessionEvent::Turn { event, .. } if event.is_terminal());
+            observed.push(event);
+            if terminal {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+
+    assert!(!observed.iter().any(|event| matches!(
+        event,
+        VoiceSessionEvent::SpeakerIdentified { .. } | VoiceSessionEvent::IdentityLate { .. }
+    )));
+}
+
+#[tokio::test]
+async fn an_identity_store_failure_refuses_the_session() {
+    let fixture = support::speaker_fakes::StageFixture::new();
+    let stage = Arc::new(conversation_runtime::SpeakerIdentityStage::new(
+        fixture.store.clone(),
+        Arc::new(conversation_memory::SignatureKey::from_hex(&"22".repeat(32)).unwrap()),
+        support::speaker_fakes::policy(),
+        Duration::from_secs(1),
+        fixture.audio.clone(),
+        fixture.embedder.clone(),
+        fixture.claims.clone(),
+    ));
+    // The store was first used with another key, so starting the engine fails.
+    fixture.person("Chris", &support::speaker_fakes::CHRIS);
+    let (_input, input_receiver) = mpsc::channel(32);
+    let output = Arc::new(MockContinuousAudioOutput::new());
+    let factory = Arc::new(TestVoiceIoFactory::new(input_receiver, output));
+    let runtime = VoiceSessionRuntime::new(
+        conversation_context().with_speaker_identity(),
+        VoiceSessionAdapters::new(
+            factory,
+            Arc::new(MultiTurnLanguage::new([])),
+            Arc::new(PerTurnSpeech),
+        )
+        .with_speaker_identity(stage),
+    );
+
+    let mut events = runtime.start(policy()).await.unwrap();
+    let first = timeout(Duration::from_secs(2), events.recv())
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        first,
+        Some(VoiceSessionEvent::SessionFailed { .. })
+    ));
 }

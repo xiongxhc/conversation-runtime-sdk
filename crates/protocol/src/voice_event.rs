@@ -1,4 +1,6 @@
-use crate::{GenerationId, PrivacySummary, RuntimeError, RuntimeEvent, SessionId, TurnId};
+use crate::{
+    GenerationId, PersonId, PrivacySummary, RuntimeError, RuntimeEvent, SessionId, TurnId,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -169,6 +171,18 @@ pub enum VoiceSessionEvent {
         session_id: SessionId,
         mostly_zero: bool,
         longest_gap_ms: u64,
+    },
+    /// Who spoke a voice turn: a person id and whether the voice confirmed them, never a name.
+    SpeakerIdentified {
+        session_id: SessionId,
+        turn_id: TurnId,
+        person: Option<PersonId>,
+        confirmed: bool,
+    },
+    /// Identification of a turn missed its wait; the turn proceeded as unsure.
+    IdentityLate {
+        session_id: SessionId,
+        turn_id: TurnId,
     },
 }
 

@@ -125,10 +125,13 @@ impl VoiceEmbedder for FakeEmbedder {
                     "fake embedder failed",
                 ));
             }
-            Ok(match samples.first().copied() {
-                Some(value) if value == 1.0 => CHRIS.to_vec(),
-                Some(value) if value == 2.0 => JACK.to_vec(),
-                _ => NEW.to_vec(),
+            let voice = samples.first().copied().unwrap_or_default();
+            Ok(if voice == 1.0 {
+                CHRIS.to_vec()
+            } else if voice == 2.0 {
+                JACK.to_vec()
+            } else {
+                NEW.to_vec()
             })
         })
     }

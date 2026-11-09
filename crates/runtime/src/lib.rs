@@ -26,6 +26,7 @@ mod speaker_claims;
 mod speaker_identity;
 mod speaker_matching;
 mod speaker_names;
+mod speaker_stage;
 mod speech_text;
 mod speech_worker;
 mod streaming_turn;
@@ -68,6 +69,11 @@ pub use speaker_identity::{
 };
 pub use speaker_matching::{classify, cosine, IdentityPolicy, VoiceDirectory, VoiceEvidence};
 pub use speaker_names::{has_name_claim_cue, identity_answer, name_key, IdentityAnswer};
+pub use speaker_stage::{
+    identity_guidance, speaker_tag, NameClaimDetector, SessionSpeakerIdentity, SpeakerFuture,
+    SpeakerIdentityStage, StageOutcome, TurnAudio, TurnAudioSource, TurnVoiceRequest,
+    VoiceEmbedder,
+};
 pub use streaming_turn::{StartedStreamingTurn, StreamingTurnEventStream, StreamingTurnRuntime};
 pub use text_processing::{
     process_text, ProcessedText, TextProcessingRequest, TextProcessingWarning,

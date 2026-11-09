@@ -3,7 +3,7 @@ use std::sync::Arc;
 use conversation_memory::MemoryContextProvider;
 use conversation_protocol::{
     ConversationContextExchange, ConversationMode, ExecutionLocation, GenerationId, PersonaProfile,
-    RuntimeError, RuntimeErrorKind, RuntimeStage, SessionId, TurnId,
+    RuntimeError, RuntimeErrorKind, RuntimeStage, SessionId, SpeakerTag, TurnId,
 };
 use tokio::sync::Mutex;
 
@@ -223,6 +223,18 @@ impl ConversationContext {
             quality.complete_turn(identity.turn_id, assistant)
         };
         self.finish_outcome(identity, result).await
+    }
+
+    /// Records who said a pending turn, so later turns see the tag in history.
+    pub async fn label_turn(
+        &self,
+        identity: ConversationTurnIdentity,
+        speaker: SpeakerTag,
+    ) -> Result<(), RuntimeError> {
+        self.quality
+            .lock()
+            .await
+            .label_pending_turn(identity.turn_id, speaker)
     }
 
     pub async fn discard_turn(

@@ -1,5 +1,6 @@
 use crate::{
-    GenerationId, MemoryRetrievalTrace, PlaybackState, QualityDecision, RuntimeError, TurnId,
+    GenerationId, MemoryRetrievalTrace, PersonId, PlaybackState, QualityDecision, RuntimeError,
+    TurnId,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,6 +51,16 @@ pub enum RuntimeEvent {
     MemoryRetrieved {
         trace: MemoryRetrievalTrace,
     },
+    /// Who spoke a voice turn. Carries the person id only, never a name.
+    SpeakerIdentified {
+        turn_id: TurnId,
+        person: Option<PersonId>,
+        confirmed: bool,
+    },
+    /// Identification missed its wait or failed; the turn proceeds as unsure.
+    IdentityLate {
+        turn_id: TurnId,
+    },
     TurnCompleted {
         turn_id: TurnId,
     },
@@ -75,7 +86,9 @@ impl RuntimeEvent {
             | Self::Playback { turn_id, .. }
             | Self::TurnCompleted { turn_id }
             | Self::TurnCancelled { turn_id }
-            | Self::TurnFailed { turn_id, .. } => *turn_id,
+            | Self::TurnFailed { turn_id, .. }
+            | Self::SpeakerIdentified { turn_id, .. }
+            | Self::IdentityLate { turn_id } => *turn_id,
             Self::QualityResolved { decision } => decision.turn_id(),
             Self::MemoryRetrieved { trace } => trace.turn_id(),
         }

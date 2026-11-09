@@ -3,8 +3,8 @@ use std::collections::VecDeque;
 use conversation_protocol::{
     ContextSource, ConversationContextExchange, ConversationMessage, ConversationMode,
     ConversationRole, ConversationSignal, FollowUpPolicy, PersonaProfile, QualityDecision,
-    ResponseControls, RuntimeError, RuntimeErrorKind, RuntimeStage, SilencePolicy, SpeechPace,
-    TurnId, MAX_HISTORY_BYTES, MAX_HISTORY_MESSAGE_COUNT,
+    ResponseControls, RuntimeError, RuntimeErrorKind, RuntimeStage, SilencePolicy, SpeakerTag,
+    SpeechPace, TurnId, MAX_HISTORY_BYTES, MAX_HISTORY_MESSAGE_COUNT,
 };
 
 const _: () = assert!(MAX_HISTORY_MESSAGE_COUNT.is_multiple_of(2));
@@ -268,6 +268,21 @@ impl ConversationQualityController {
 
     pub fn discard_turn(&mut self, turn_id: TurnId) -> Result<(), RuntimeError> {
         self.take_pending(turn_id).map(|_| ())
+    }
+
+    /// Records who said the pending turn, so its exchange keeps the tag in history.
+    pub fn label_pending_turn(
+        &mut self,
+        turn_id: TurnId,
+        speaker: SpeakerTag,
+    ) -> Result<(), RuntimeError> {
+        match self.pending_turn.as_mut() {
+            Some(pending) if pending.turn_id == turn_id => {
+                pending.user = pending.user.clone().with_speaker(speaker);
+                Ok(())
+            }
+            _ => Err(state_error("no pending turn to label")),
+        }
     }
 
     pub fn interrupt_turn(&mut self, turn_id: TurnId) -> Result<(), RuntimeError> {

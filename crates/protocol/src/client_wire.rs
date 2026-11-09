@@ -769,6 +769,9 @@ impl TryFrom<RuntimeEvent> for ClientRuntimeEvent {
             RuntimeEvent::SpeechStarted { .. } => Err(unsupported_event("speech_started")),
             RuntimeEvent::SpeechCompleted { .. } => Err(unsupported_event("speech_completed")),
             RuntimeEvent::Playback { .. } => Err(unsupported_event("playback")),
+            // Voice sessions republish these as their own protocol-4 voice events.
+            RuntimeEvent::SpeakerIdentified { .. } => Err(unsupported_event("speaker_identified")),
+            RuntimeEvent::IdentityLate { .. } => Err(unsupported_event("identity_late")),
         }
     }
 }

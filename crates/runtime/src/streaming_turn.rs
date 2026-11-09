@@ -12,8 +12,8 @@ use conversation_model_adapters::{
     StreamingSpeechRequest, StreamingSpeechSynthesizer,
 };
 use conversation_protocol::{
-    GenerationId, PlaybackState, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeStage,
-    RuntimeTimingMilestone, TurnId, UtteranceId,
+    GenerationId, PersonId, PlaybackState, RuntimeError, RuntimeErrorKind, RuntimeEvent,
+    RuntimeStage, RuntimeTimingMilestone, SpeakerTag, TurnId, UtteranceId,
 };
 use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 use tokio::task::{AbortHandle, JoinError, JoinHandle};
@@ -22,7 +22,9 @@ use tokio_util::sync::CancellationToken;
 use crate::generation::GenerationGuard;
 use crate::speech_text::normalize_speech_text;
 use crate::{
-    ConversationContext, ConversationTurnIdentity, ConversationTurnSource, UtteranceAssembler,
+    identity_guidance, speaker_tag, ConversationContext, ConversationTurnIdentity,
+    ConversationTurnSource, SessionSpeakerIdentity, Speaker, StageOutcome, TurnVoiceRequest,
+    UtteranceAssembler,
 };
 
 const EVENT_BUFFER_SIZE: usize = 32;
@@ -215,6 +217,17 @@ impl StreamingTurnRuntime {
         source: ConversationTurnSource,
         transcript: impl Into<String>,
     ) -> Result<StartedStreamingTurn, RuntimeError> {
+        self.start_turn_with_voice(source, transcript, None).await
+    }
+
+    /// Starts a turn that first identifies its speaker, when `voice` is given, before memory
+    /// retrieval and generation.
+    pub async fn start_turn_with_voice(
+        &self,
+        source: ConversationTurnSource,
+        transcript: impl Into<String>,
+        voice: Option<(SessionSpeakerIdentity, TurnVoiceRequest)>,
+    ) -> Result<StartedStreamingTurn, RuntimeError> {
         let prepared = self.context.begin_turn(source, transcript).await?;
         let identity = prepared.identity();
         let turn_id = identity.turn_id();
@@ -296,12 +309,15 @@ impl StreamingTurnRuntime {
             tasks: tasks.clone(),
             generated_text: Arc::new(StdMutex::new(String::new())),
             memory_provider: self.context.memory_provider(),
+            voice,
+            speaker: Arc::new(StdMutex::new(None)),
         };
         let active = Arc::clone(&self.active);
         let context = self.context.clone();
         let generation_guard = self.generation_guard.clone();
         let terminal_interruption = external_interruption;
         let generated_text = Arc::clone(&task.generated_text);
+        let speaker = Arc::clone(&task.speaker);
 
         let task = tasks.spawn(async move {
             let mut terminal_event = run_streaming_turn(task, &event_sender).await;
@@ -316,12 +332,22 @@ impl StreamingTurnRuntime {
                 .clone();
             let context_result = match &terminal_event {
                 RuntimeEvent::TurnCompleted { .. } => {
+                    let speaker = speaker.lock().expect("speaker tag lock poisoned").take();
                     if generated_text.trim().is_empty() {
                         context.discard_turn(identity, false).await
                     } else {
-                        context
-                            .complete_turn(identity, generated_text.clone())
-                            .await
+                        let labelled = match speaker {
+                            Some(speaker) => context.label_turn(identity, speaker).await,
+                            None => Ok(()),
+                        };
+                        match labelled {
+                            Ok(()) => {
+                                context
+                                    .complete_turn(identity, generated_text.clone())
+                                    .await
+                            }
+                            Err(error) => Err(error),
+                        }
                     }
                 }
                 RuntimeEvent::TurnCancelled { .. } => context.discard_turn(identity, true).await,
@@ -455,6 +481,9 @@ struct StreamingTurnTask {
     tasks: TurnTaskGroup,
     generated_text: Arc<StdMutex<String>>,
     memory_provider: Option<Arc<dyn MemoryContextProvider>>,
+    voice: Option<(SessionSpeakerIdentity, TurnVoiceRequest)>,
+    /// The tag the completed exchange keeps in history.
+    speaker: Arc<StdMutex<Option<SpeakerTag>>>,
 }
 
 #[derive(Debug)]
@@ -481,6 +510,8 @@ async fn run_streaming_turn(
         tasks,
         generated_text,
         memory_provider,
+        voice,
+        speaker,
     } = task;
 
     match send_event(
@@ -535,12 +566,82 @@ async fn run_streaming_turn(
         }
     }
 
-    if let Some(memory_provider) = memory_provider {
+    // Without identity every subject's memories are candidates; with it, only the identified
+    // speaker's, and none at all on a turn whose speaker is someone new or unsure.
+    let mut memory_scope = Some(None);
+    if let Some((identity, request)) = voice {
+        let identity_cancellation = work_cancellation.child_token();
+        let mut identification = identity.identify(request, identity_cancellation.clone());
+        let outcome = tokio::select! {
+            biased;
+            _ = external_interruption.cancelled() => {
+                identity_cancellation.cancel();
+                let _ = identification.await;
+                return RuntimeEvent::TurnCancelled { turn_id };
+            }
+            _ = work_cancellation.cancelled() => {
+                identity_cancellation.cancel();
+                let _ = identification.await;
+                return RuntimeEvent::TurnCancelled { turn_id };
+            }
+            _ = events.closed() => {
+                identity_cancellation.cancel();
+                let _ = identification.await;
+                return runtime_failure(
+                    turn_id,
+                    "streaming event consumer closed during speaker identification",
+                );
+            }
+            outcome = &mut identification => outcome,
+        };
+        let identified = match outcome {
+            StageOutcome::Identified(identified) => Some(identified),
+            StageOutcome::Late => None,
+            StageOutcome::Cancelled => return RuntimeEvent::TurnCancelled { turn_id },
+        };
+        let event = match &identified {
+            Some(identified) => RuntimeEvent::SpeakerIdentified {
+                turn_id,
+                person: match identified.label.speaker {
+                    Speaker::Person { person, .. } => Some(person),
+                    Speaker::SomeoneNew => None,
+                },
+                confirmed: identified.label.confirmed,
+            },
+            None => RuntimeEvent::IdentityLate { turn_id },
+        };
+        match send_event(events, event, &external_interruption, &work_cancellation).await {
+            SendOutcome::Sent => {}
+            SendOutcome::Interrupted | SendOutcome::Stale => {
+                return RuntimeEvent::TurnCancelled { turn_id };
+            }
+            SendOutcome::Closed => {
+                return runtime_failure(
+                    turn_id,
+                    "streaming event consumer closed during speaker publication",
+                );
+            }
+        }
+        let tag = speaker_tag(identified.as_ref());
+        language_input = match language_input
+            .with_speaker(tag.clone())
+            .with_identity_guidance(&identity_guidance(identified.as_ref()))
+        {
+            Ok(input) => input,
+            Err(error) => return adapter_failure(turn_id, RuntimeStage::Memory, error),
+        };
+        *speaker.lock().expect("speaker tag lock poisoned") = Some(tag);
+        memory_scope = identified
+            .and_then(|identified| identified.memory_subject)
+            .map(Some::<PersonId>);
+    }
+
+    if let (Some(memory_provider), Some(subject)) = (memory_provider, memory_scope) {
         let memory_cancellation = work_cancellation.child_token();
         let mut retrieval = memory_provider.retrieve(
             turn_id,
             language_input.transcript().to_owned(),
-            None,
+            subject,
             memory_cancellation.clone(),
         );
         let retrieval = tokio::select! {

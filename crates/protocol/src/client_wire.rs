@@ -2421,6 +2421,8 @@ fn validate_gateway_message(
                     event,
                     ClientVoiceSessionEvent::VoiceRecordingLimit { .. }
                         | ClientVoiceSessionEvent::VoiceCaptureHealth { .. }
+                        | ClientVoiceSessionEvent::VoiceSpeaker { .. }
+                        | ClientVoiceSessionEvent::VoiceIdentityLate { .. }
                 )
             {
                 return Err(ClientWireError::UnsupportedProtocolVersion(

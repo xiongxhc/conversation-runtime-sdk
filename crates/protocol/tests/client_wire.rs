@@ -4351,3 +4351,67 @@ fn processed_text_fails_closed_on_values_the_runtime_cannot_produce() {
         ));
     }
 }
+
+#[test]
+fn speaker_events_are_version_four_only() {
+    let speaker = GatewayMessage::VoiceEvent {
+        event: ClientVoiceSessionEvent::try_from(VoiceSessionEvent::SpeakerIdentified {
+            session_id: SessionId::new(7),
+            turn_id: TurnId::new(3),
+            person: Some(conversation_protocol::PersonId::new(2).unwrap()),
+            confirmed: true,
+        })
+        .unwrap(),
+    };
+    assert_eq!(
+        gateway_value_for_version(&speaker, FINALIZED_RECORDING_PROTOCOL_VERSION)["event"],
+        serde_json::json!({
+            "type": "voice_speaker",
+            "session_id": "7",
+            "turn_id": "3",
+            "person_id": "2",
+            "confirmed": true,
+        })
+    );
+    let someone_new = GatewayMessage::VoiceEvent {
+        event: ClientVoiceSessionEvent::try_from(VoiceSessionEvent::SpeakerIdentified {
+            session_id: SessionId::new(7),
+            turn_id: TurnId::new(4),
+            person: None,
+            confirmed: false,
+        })
+        .unwrap(),
+    };
+    assert_eq!(
+        gateway_value_for_version(&someone_new, FINALIZED_RECORDING_PROTOCOL_VERSION)["event"]
+            ["person_id"],
+        serde_json::Value::Null
+    );
+    let late = GatewayMessage::VoiceEvent {
+        event: ClientVoiceSessionEvent::try_from(VoiceSessionEvent::IdentityLate {
+            session_id: SessionId::new(7),
+            turn_id: TurnId::new(5),
+        })
+        .unwrap(),
+    };
+    assert_eq!(
+        gateway_value_for_version(&late, FINALIZED_RECORDING_PROTOCOL_VERSION)["event"],
+        serde_json::json!({
+            "type": "voice_identity_late",
+            "session_id": "7",
+            "turn_id": "5",
+        })
+    );
+    for version in [
+        LEGACY_CLIENT_PROTOCOL_VERSION,
+        CONTEXT_SEED_PROTOCOL_VERSION,
+        RUNTIME_PROFILE_PROTOCOL_VERSION,
+    ] {
+        for message in [&speaker, &late] {
+            assert!(matches!(
+                encode_gateway_message_for_version(message, version),
+                Err(ClientWireError::UnsupportedProtocolVersion(_))
+            ));
+        }
+    }
+}

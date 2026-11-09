@@ -55,6 +55,26 @@ async function onlyPinnedFourExposesCaptureEvidence(): Promise<void> {
   }
 }
 
+async function onlyPinnedFourReportsSpeakers(): Promise<void> {
+  const four = await (await RuntimeClient.connect(transport, 4)).startVoiceSession();
+  for await (const event of four.events()) {
+    if (event.type === "voice_speaker") {
+      const personId: bigint | null = event.personId;
+      const confirmed: boolean = event.confirmed;
+      assert.ok(personId === null || confirmed || !confirmed);
+    }
+    if (event.type === "voice_identity_late") {
+      const turnId: bigint = event.turnId;
+      assert.ok(turnId >= 0n);
+    }
+  }
+  const three = await (await RuntimeClient.connect(transport, 3)).startVoiceSession();
+  for await (const event of three.events()) {
+    // @ts-expect-error protocol 3 never reports speakers
+    if (event.type === "voice_speaker") assert.fail("unreachable");
+  }
+}
+
 async function onlyPinnedFourReportsRecordingLimitsAndCaptureHealth(): Promise<void> {
   const four = await (await RuntimeClient.connect(transport, 4)).startVoiceSession();
   for await (const event of four.events()) {
@@ -105,5 +125,6 @@ test("version-typed voice sessions retain final-turn nullability", () => {
   assert.ok(unpinnedFinalTurnIdRequiresNullHandling);
   assert.ok(onlyPinnedFourExposesCaptureEvidence);
   assert.ok(onlyPinnedFourReportsRecordingLimitsAndCaptureHealth);
+  assert.ok(onlyPinnedFourReportsSpeakers);
   assert.ok(timedMediaVersionsAndConditionalStopStayExact);
 });

@@ -2632,7 +2632,10 @@ fn project_for_connection(
             eprintln!("voice recording stopped at its {} limit", limit.as_str());
             Some(event)
         }
-        VoiceSessionEvent::RecordingLimit { .. } | VoiceSessionEvent::CaptureHealth { .. }
+        VoiceSessionEvent::RecordingLimit { .. }
+        | VoiceSessionEvent::CaptureHealth { .. }
+        | VoiceSessionEvent::SpeakerIdentified { .. }
+        | VoiceSessionEvent::IdentityLate { .. }
             if version_four =>
         {
             Some(event)
@@ -2650,7 +2653,10 @@ fn project_for_connection(
             ),
             recovery: RecoveryDisposition::ContinueSession,
         }),
-        VoiceSessionEvent::RecordingLimit { .. } | VoiceSessionEvent::CaptureHealth { .. } => None,
+        VoiceSessionEvent::RecordingLimit { .. }
+        | VoiceSessionEvent::CaptureHealth { .. }
+        | VoiceSessionEvent::SpeakerIdentified { .. }
+        | VoiceSessionEvent::IdentityLate { .. } => None,
         event => Some(event),
     }
 }

@@ -1765,3 +1765,27 @@ test("recording limits and capture health are version four voice events with clo
     assert.throws(() => parseGatewayMessage(voiceEvent(event), 4), JSON.stringify(event));
   }
 });
+
+test("speaker and identity-late events are version four voice events", () => {
+  const voiceEvent = (event: Record<string, unknown>, version = 4) => ({ protocol_version: version, type: "voice_event", event });
+  const speaker = parseGatewayMessage(voiceEvent({ type: "voice_speaker", session_id: "7", turn_id: "3", person_id: "2", confirmed: true }), 4);
+  assert.deepEqual(speaker, { type: "voice_event", event: { type: "voice_speaker", sessionId: 7n, turnId: 3n, personId: 2n, confirmed: true } });
+  const someoneNew = parseGatewayMessage(voiceEvent({ type: "voice_speaker", session_id: "7", turn_id: "4", person_id: null, confirmed: false }), 4);
+  assert.deepEqual(someoneNew, { type: "voice_event", event: { type: "voice_speaker", sessionId: 7n, turnId: 4n, personId: null, confirmed: false } });
+  const late = parseGatewayMessage(voiceEvent({ type: "voice_identity_late", session_id: "7", turn_id: "5" }), 4);
+  assert.deepEqual(late, { type: "voice_event", event: { type: "voice_identity_late", sessionId: 7n, turnId: 5n } });
+
+  for (const version of [1, 2, 3] as const) {
+    assert.throws(() => parseGatewayMessage(voiceEvent({ type: "voice_speaker", session_id: "7", turn_id: "3", person_id: null, confirmed: false }, version), version), /protocol version 4/);
+    assert.throws(() => parseGatewayMessage(voiceEvent({ type: "voice_identity_late", session_id: "7", turn_id: "3" }, version), version), /protocol version 4/);
+  }
+  for (const event of [
+    { type: "voice_speaker", session_id: "7", turn_id: "3", person_id: "2", confirmed: true, name: "Jack" },
+    { type: "voice_speaker", session_id: "7", turn_id: "3", person_id: "2" },
+    { type: "voice_speaker", session_id: "7", turn_id: "3", person_id: 2, confirmed: true },
+    { type: "voice_speaker", session_id: "7", turn_id: "3", person_id: "2", confirmed: "yes" },
+    { type: "voice_identity_late", session_id: "7", turn_id: "3", extra: 1 },
+  ]) {
+    assert.throws(() => parseGatewayMessage(voiceEvent(event), 4), JSON.stringify(event));
+  }
+});

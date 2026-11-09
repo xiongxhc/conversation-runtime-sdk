@@ -77,6 +77,8 @@ export {
   type RecordingLimit,
   type VoiceRecordingLimitEvent,
   type VoiceCaptureHealthEvent,
+  type VoiceIdentityLateEvent,
+  type VoiceSpeakerEvent,
   type SourceSampleRange,
   type WholeFrameNominalEnvelope,
   type CaptureUnavailableReason,

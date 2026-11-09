@@ -149,6 +149,23 @@ pub enum ClientVoiceSessionEvent {
         mostly_zero: bool,
         longest_gap_ms: u64,
     },
+    /// Protocol v4 only. Who spoke a turn, by person id; `null` is someone new.
+    VoiceSpeaker {
+        #[serde(serialize_with = "serialize_session_id")]
+        session_id: SessionId,
+        #[serde(serialize_with = "serialize_turn_id")]
+        turn_id: TurnId,
+        #[serde(serialize_with = "serialize_optional_person_id")]
+        person_id: Option<crate::PersonId>,
+        confirmed: bool,
+    },
+    /// Protocol v4 only. Identification missed its wait; the turn proceeded as unsure.
+    VoiceIdentityLate {
+        #[serde(serialize_with = "serialize_session_id")]
+        session_id: SessionId,
+        #[serde(serialize_with = "serialize_turn_id")]
+        turn_id: TurnId,
+    },
 }
 
 impl From<&ComponentDescriptor> for ClientComponentDescriptor {
@@ -327,10 +344,24 @@ impl TryFrom<VoiceSessionEvent> for ClientVoiceSessionEvent {
                 mostly_zero,
                 longest_gap_ms,
             },
-            VoiceSessionEvent::SpeakerIdentified { .. }
-            | VoiceSessionEvent::IdentityLate { .. } => {
-                return Err(ClientWireError::InvalidVoiceEvent);
-            }
+            VoiceSessionEvent::SpeakerIdentified {
+                session_id,
+                turn_id,
+                person,
+                confirmed,
+            } => Self::VoiceSpeaker {
+                session_id,
+                turn_id,
+                person_id: person,
+                confirmed,
+            },
+            VoiceSessionEvent::IdentityLate {
+                session_id,
+                turn_id,
+            } => Self::VoiceIdentityLate {
+                session_id,
+                turn_id,
+            },
         };
         validate_client_voice_event(&projected)?;
         Ok(projected)
@@ -436,6 +467,8 @@ pub(crate) fn validate_client_voice_event(
         | ClientVoiceSessionEvent::VoiceSessionFailed { session_id, .. }
         | ClientVoiceSessionEvent::VoiceRecordingLimit { session_id, .. }
         | ClientVoiceSessionEvent::VoiceCaptureHealth { session_id, .. }
+        | ClientVoiceSessionEvent::VoiceSpeaker { session_id, .. }
+        | ClientVoiceSessionEvent::VoiceIdentityLate { session_id, .. }
         | ClientVoiceSessionEvent::VoiceSessionEnded { session_id } => *session_id,
     };
     validate_identifier(session_id.get())?;
@@ -750,6 +783,19 @@ where
     S: Serializer,
 {
     serialize_identifier(&generation_id.get(), serializer)
+}
+
+fn serialize_optional_person_id<S>(
+    person: &Option<crate::PersonId>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match person {
+        Some(person) => serializer.serialize_some(&person.get().to_string()),
+        None => serializer.serialize_none(),
+    }
 }
 
 fn serialize_optional_turn_id<S>(turn_id: &Option<TurnId>, serializer: S) -> Result<S::Ok, S::Error>

@@ -510,12 +510,18 @@ export type RecordingLimit = typeof RECORDING_LIMITS[number];
 export type VoiceRecordingLimitEvent = { type: "voice_recording_limit"; sessionId: bigint; limit: RecordingLimit; state: "warning" | "stopped" };
 /** Content-free live capture health: mostly exact-zero capture and the longest gap so far. */
 export type VoiceCaptureHealthEvent = { type: "voice_capture_health"; sessionId: bigint; mostlyZero: boolean; longestGapMs: number };
+/** Who spoke a voice turn, by person id; `null` is someone new. Names never travel here. */
+export type VoiceSpeakerEvent = { type: "voice_speaker"; sessionId: bigint; turnId: bigint; personId: bigint | null; confirmed: boolean };
+/** Identification of a turn missed its wait; the turn proceeded as unsure. */
+export type VoiceIdentityLateEvent = { type: "voice_identity_late"; sessionId: bigint; turnId: bigint };
 
 export type VersionFourVoiceSessionEvent =
   | Exclude<VersionThreeVoiceSessionEvent, VersionThreeVoiceTranscriptFinalEvent>
   | VersionFourVoiceTranscriptFinalEvent
   | VoiceRecordingLimitEvent
-  | VoiceCaptureHealthEvent;
+  | VoiceCaptureHealthEvent
+  | VoiceSpeakerEvent
+  | VoiceIdentityLateEvent;
 
 export type VoiceSessionEvent = LegacyVoiceSessionEvent | VersionThreeVoiceSessionEvent | VersionFourVoiceSessionEvent;
 
@@ -2037,6 +2043,20 @@ function parseVoiceSessionEvent(
         mostlyZero: requireBoolean(object, "mostly_zero"),
         longestGapMs: requireNonNegativeInteger(object, "longest_gap_ms"),
       };
+    case "voice_speaker":
+      if (version !== 4) throw new ProtocolError("speaker events require protocol version 4");
+      requireExactKeys(object, ["type", "session_id", "turn_id", "person_id", "confirmed"]);
+      return {
+        type,
+        sessionId: sessionId(),
+        turnId: parseIdentifier(object.turn_id),
+        personId: object.person_id === null ? null : parseIdentifier(object.person_id),
+        confirmed: requireBoolean(object, "confirmed"),
+      };
+    case "voice_identity_late":
+      if (version !== 4) throw new ProtocolError("identity late events require protocol version 4");
+      requireExactKeys(object, ["type", "session_id", "turn_id"]);
+      return { type, sessionId: sessionId(), turnId: parseIdentifier(object.turn_id) };
     default:
       throw new ProtocolError("unsupported voice session event type");
   }

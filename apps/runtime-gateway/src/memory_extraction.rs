@@ -16,7 +16,7 @@ use conversation_model_adapters::{
 };
 use conversation_protocol::{
     GenerationId, MemoryConfidence, MemoryDraft, MemoryKind, MemoryProvenance,
-    MemoryProvenanceKind, MemoryRetention, MemoryState, TurnId, UnixTimestampMillis,
+    MemoryProvenanceKind, MemoryRetention, MemoryState, PersonId, TurnId, UnixTimestampMillis,
     MAX_MEMORY_CONTENT_BYTES,
 };
 use tokio::sync::mpsc;
@@ -123,9 +123,11 @@ impl MemoryExtractor {
     /// The single-flight slot is claimed on the caller's thread, so an exchange that
     /// arrives while an earlier extraction is still running is dropped rather than
     /// queued: a slow model must never build a backlog behind live conversation.
+    /// `subject` is the person the user side was spoken by; every stored fact is about them.
     pub fn observe_exchange(
         self: &Arc<Self>,
         turn_id: TurnId,
+        subject: PersonId,
         user_text: &str,
         assistant_text: &str,
     ) {
@@ -150,7 +152,7 @@ impl MemoryExtractor {
                 () = cancelled.cancelled() => {
                     eprintln!("memory extraction dropped: the session is shutting down");
                 }
-                () = extractor.extract(turn_id, &user_text, &assistant_text) => {}
+                () = extractor.extract(turn_id, subject, &user_text, &assistant_text) => {}
             }
         });
     }
@@ -160,7 +162,13 @@ impl MemoryExtractor {
         self.extracting.load(Ordering::Acquire)
     }
 
-    async fn extract(&self, turn_id: TurnId, user_text: &str, assistant_text: &str) {
+    async fn extract(
+        &self,
+        turn_id: TurnId,
+        subject: PersonId,
+        user_text: &str,
+        assistant_text: &str,
+    ) {
         let Ok(now) = self.clock.now() else {
             eprintln!("memory extraction dropped: the clock is unavailable");
             return;
@@ -179,7 +187,7 @@ impl MemoryExtractor {
         let store = Arc::clone(&self.store);
         let settings = self.settings;
         let written = tokio::task::spawn_blocking(move || {
-            write_items(store.as_ref(), items, turn_id, now, settings)
+            write_items(store.as_ref(), items, turn_id, subject, now, settings)
         })
         .await;
         let Ok(Some(counts)) = written else {
@@ -334,6 +342,7 @@ fn write_items(
     store: &dyn MemoryStore,
     items: Vec<ExtractedItem>,
     turn_id: TurnId,
+    subject: PersonId,
     now: UnixTimestampMillis,
     settings: MemoryExtractionSettings,
 ) -> Option<MemoryExtractedCounts> {
@@ -346,7 +355,10 @@ fn write_items(
         if !existing.insert(item.content.clone()) {
             continue;
         }
-        let Some(draft) = item.into_draft(turn_id, now, settings) else {
+        let Some(draft) = item
+            .into_draft(turn_id, now, settings)
+            .map(|draft| draft.with_subject(subject))
+        else {
             continue;
         };
         match store.create(draft) {
@@ -401,13 +413,37 @@ mod tests {
 
     use conversation_memory::{MemoryStoreResult, SqliteMemoryStore};
     use conversation_model_adapters::MockGenerationLanguageModel;
-    use conversation_protocol::MemoryRecord;
+    use conversation_protocol::{MemoryRecord, PersonId};
     use tempfile::TempDir;
 
     use super::*;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
     const NOW: i64 = 1_700_000_000_000;
+
+    #[tokio::test]
+    async fn extracted_drafts_carry_the_subject() {
+        use conversation_memory::{NewPerson, PeopleStore, PersonName};
+        let (_temporary, store) = initialized_store();
+        let jack = store
+            .create_person(NewPerson::new(
+                PersonName::new("Jack", "jack").unwrap(),
+                false,
+                timestamp(NOW),
+            ))
+            .unwrap()
+            .id();
+        let model = MockGenerationLanguageModel::new([
+            r#"[{"kind":"semantic","content":"jack ships rust","explicit":false,"confidence":800}]"#,
+        ]);
+        let (extractor, mut counts) = extractor_for(&store, Arc::new(model), settings(3, 90));
+
+        extractor.observe_exchange(TurnId::new(7), jack, "i ship rust", "noted");
+
+        assert_eq!(next_counts(&mut counts).await.created, 1);
+        let records = store.list(timestamp(NOW)).unwrap();
+        assert_eq!(records[0].subject(), jack);
+    }
 
     #[tokio::test]
     async fn extracted_items_become_records_with_mapped_kind_state_and_provenance() {
@@ -418,7 +454,12 @@ mod tests {
         ]);
         let (extractor, mut counts) = extractor_for(&store, Arc::new(model), settings(3, 90));
 
-        extractor.observe_exchange(TurnId::new(7), "i am ada and i ship rust", "noted");
+        extractor.observe_exchange(
+            TurnId::new(7),
+            PersonId::OWNER,
+            "i am ada and i ship rust",
+            "noted",
+        );
 
         let counts = next_counts(&mut counts).await;
         assert_eq!(counts.created, 2);
@@ -453,7 +494,12 @@ mod tests {
         ]);
         let (extractor, mut counts) = extractor_for(&store, Arc::new(model), settings(3, 2));
 
-        extractor.observe_exchange(TurnId::new(3), "i shipped on friday", "nice");
+        extractor.observe_exchange(
+            TurnId::new(3),
+            PersonId::OWNER,
+            "i shipped on friday",
+            "nice",
+        );
 
         assert_eq!(next_counts(&mut counts).await.created, 1);
         let records = store.list(timestamp(NOW)).unwrap();
@@ -469,7 +515,7 @@ mod tests {
         let model = MockGenerationLanguageModel::new(["I'm sorry, I cannot help with that."]);
         let (extractor, mut counts) = extractor_for(&store, Arc::new(model), settings(3, 90));
 
-        extractor.observe_exchange(TurnId::new(1), "hello", "hi");
+        extractor.observe_exchange(TurnId::new(1), PersonId::OWNER, "hello", "hi");
 
         wait_for_idle(&extractor).await;
         assert!(store.list(timestamp(NOW)).unwrap().is_empty());
@@ -490,7 +536,7 @@ mod tests {
         )]);
         let (extractor, mut counts) = extractor_for(&store, Arc::new(model), settings(3, 90));
 
-        extractor.observe_exchange(TurnId::new(4), "a long story", "noted");
+        extractor.observe_exchange(TurnId::new(4), PersonId::OWNER, "a long story", "noted");
 
         assert_eq!(next_counts(&mut counts).await.created, 1);
         let records = store.list(timestamp(NOW)).unwrap();
@@ -508,7 +554,12 @@ mod tests {
         )]);
         let (extractor, mut counts) = extractor_for(&store, Arc::new(model), settings(3, 90));
 
-        extractor.observe_exchange(TurnId::new(5), "i ship rust and review on fridays", "noted");
+        extractor.observe_exchange(
+            TurnId::new(5),
+            PersonId::OWNER,
+            "i ship rust and review on fridays",
+            "noted",
+        );
 
         assert_eq!(next_counts(&mut counts).await.created, 1);
         let records = store.list(timestamp(NOW)).unwrap();
@@ -524,7 +575,7 @@ mod tests {
         )]);
         let (extractor, mut counts) = extractor_for(&store, Arc::new(model), settings(1, 90));
 
-        extractor.observe_exchange(TurnId::new(6), "first and second", "noted");
+        extractor.observe_exchange(TurnId::new(6), PersonId::OWNER, "first and second", "noted");
 
         assert_eq!(next_counts(&mut counts).await.created, 1);
         assert_eq!(store.list(timestamp(NOW)).unwrap().len(), 1);
@@ -539,8 +590,8 @@ mod tests {
         let probe = model.clone();
         let (extractor, mut counts) = extractor_for(&store, Arc::new(model), settings(3, 90));
 
-        extractor.observe_exchange(TurnId::new(8), "i ship rust", "noted");
-        extractor.observe_exchange(TurnId::new(9), "i also review", "noted");
+        extractor.observe_exchange(TurnId::new(8), PersonId::OWNER, "i ship rust", "noted");
+        extractor.observe_exchange(TurnId::new(9), PersonId::OWNER, "i also review", "noted");
 
         assert_eq!(next_counts(&mut counts).await.created, 1);
         wait_for_idle(&extractor).await;
@@ -558,7 +609,12 @@ mod tests {
         let (extractor, mut counts) = extractor_for(&store, Arc::new(model), settings(3, 90));
 
         tokio::time::pause();
-        extractor.observe_exchange(TurnId::new(1), "the stalled exchange", "noted");
+        extractor.observe_exchange(
+            TurnId::new(1),
+            PersonId::OWNER,
+            "the stalled exchange",
+            "noted",
+        );
         tokio::task::yield_now().await;
         tokio::time::advance(EXTRACTION_TIMEOUT + Duration::from_secs(1)).await;
         tokio::time::resume();
@@ -569,7 +625,12 @@ mod tests {
             "the timed-out generation request was not torn down"
         );
 
-        extractor.observe_exchange(TurnId::new(2), "the next exchange", "noted");
+        extractor.observe_exchange(
+            TurnId::new(2),
+            PersonId::OWNER,
+            "the next exchange",
+            "noted",
+        );
 
         assert_eq!(next_counts(&mut counts).await.created, 1);
         assert_eq!(store.list(timestamp(NOW)).unwrap().len(), 1);
@@ -582,7 +643,12 @@ mod tests {
         let tokens = Arc::clone(&model.tokens);
         let (extractor, mut counts) = extractor_for(&store, Arc::new(model), settings(3, 90));
 
-        extractor.observe_exchange(TurnId::new(1), "the stalled exchange", "noted");
+        extractor.observe_exchange(
+            TurnId::new(1),
+            PersonId::OWNER,
+            "the stalled exchange",
+            "noted",
+        );
         wait_for_generation(&tokens).await;
         extractor.cancel();
 

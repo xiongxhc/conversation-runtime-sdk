@@ -15,7 +15,7 @@ use conversation_protocol::{
     ClientDiarizedSegment, ClientMediaLeaseDescriptor, ClientMemoryCursor, ClientMemoryInspection,
     ClientMemorySummary, ClientPersonaState, ClientProcessedText, ClientRecordingGap,
     ClientRecordingReconciliation, ClientRecordingSummary, ClientRuntimeError, ClientRuntimeEvent,
-    ClientVoiceSessionEvent, GatewayMessage, MemoryApproval, RecordingLimitState,
+    ClientVoiceSessionEvent, GatewayMessage, MemoryApproval, PersonId, RecordingLimitState,
     RecoveryDisposition, RuntimeError, RuntimeErrorKind, RuntimeEvent, RuntimeProfile,
     RuntimeStage, RuntimeStatus, SessionId, TurnId, VoiceResponseMode, VoiceSessionEvent,
     CLIENT_PROTOCOL_VERSION, CONTEXT_SEED_PROTOCOL_VERSION, DEFAULT_CLIENT_PROTOCOL_VERSION,
@@ -79,6 +79,8 @@ fn next_gateway_session_id() -> SessionId {
 
 pub struct GatewaySession {
     protocol_v4: bool,
+    /// Speaker identity is configured: voice facts go to the identified speaker only.
+    speaker_identity: bool,
     control_closed: CancellationToken,
     session_id: SessionId,
     runtime: TextTurnRuntime,
@@ -220,6 +222,7 @@ impl GatewaySession {
     ) -> Self {
         Self {
             protocol_v4: false,
+            speaker_identity: false,
             control_closed: CancellationToken::new(),
             session_id,
             runtime,
@@ -290,6 +293,12 @@ impl GatewaySession {
     /// Enables extraction of durable memories from completed exchanges. The
     /// extractor reports what it wrote through a channel the session forwards as
     /// `MemoryExtracted` on the event lane; nothing it does can delay a turn.
+    /// Marks speaker identity as on for this session's voice exchanges.
+    pub fn with_speaker_identity(mut self) -> Self {
+        self.speaker_identity = true;
+        self
+    }
+
     pub fn with_memory_extraction(
         mut self,
         store: Arc<dyn MemoryStore>,
@@ -1451,6 +1460,7 @@ impl GatewaySession {
                         self.provider_failure.clone(),
                     ),
                     self.protocol_v4,
+                    self.speaker_identity,
                 ));
                 voice.active = Some(ActiveVoiceSession {
                     runtime,
@@ -2442,7 +2452,7 @@ async fn forward_events(
         if let (Some(extractor), RuntimeEvent::TextCompleted { turn_id, text }) =
             (extractor.as_ref(), &event)
         {
-            extractor.observe_exchange(*turn_id, &transcript, text);
+            extractor.observe_exchange(*turn_id, PersonId::OWNER, &transcript, text);
         }
         let event = match event {
             RuntimeEvent::TurnStarted { turn_id } => ClientRuntimeEvent::TurnStarted {
@@ -2489,11 +2499,12 @@ async fn pump_voice_events(
     mut control_pending: watch::Receiver<bool>,
     mut notices: VoiceNotices,
     version_four: bool,
+    speaker_identity: bool,
 ) -> Result<(), GatewaySessionError> {
     let mut forwarding = true;
     let mut started = false;
     let mut terminal_slot = Some(terminal_slot);
-    let mut exchange = VoiceExchange::default();
+    let mut exchange = VoiceExchange::new(speaker_identity);
     loop {
         // A lost, unresumable media lease is reported once, after the session's first
         // event and before its terminal, as a non-terminal failure: the voice session
@@ -2538,9 +2549,8 @@ async fn pump_voice_events(
         if !forwarding {
             continue;
         }
-        let Some(event) = project_for_connection(event, version_four) else {
-            continue;
-        };
+        // Extraction sees every event before the connection's projection: a v1-v3 client never
+        // receives the speaker label, but extraction still needs it.
         if let Some(extractor) = extractor.as_ref() {
             match &event {
                 VoiceSessionEvent::Turn {
@@ -2554,17 +2564,28 @@ async fn pump_voice_events(
                 } => {
                     exchange.recognized(*turn_id, text);
                 }
+                VoiceSessionEvent::SpeakerIdentified {
+                    turn_id,
+                    person,
+                    confirmed,
+                    ..
+                } => {
+                    exchange.identified(*turn_id, *person, *confirmed);
+                }
                 VoiceSessionEvent::Turn {
                     event: RuntimeEvent::TextCompleted { turn_id, text },
                     ..
                 } => {
-                    if let Some(spoken) = exchange.completed(*turn_id) {
-                        extractor.observe_exchange(*turn_id, &spoken, text);
+                    if let Some((spoken, subject)) = exchange.completed(*turn_id) {
+                        extractor.observe_exchange(*turn_id, subject, &spoken, text);
                     }
                 }
                 _ => {}
             }
         }
+        let Some(event) = project_for_connection(event, version_four) else {
+            continue;
+        };
         if let VoiceSessionEvent::SessionFailed {
             error, recovery, ..
         } = &event
@@ -2724,9 +2745,23 @@ fn provider_degraded_message(session_id: SessionId) -> GatewayMessage {
 #[derive(Default)]
 struct VoiceExchange {
     spoken: Option<(TurnId, String)>,
+    /// Speaker identity is on: only a turn whose own label confirmed a person is extracted.
+    identity: bool,
+    speaker: Option<(TurnId, Option<PersonId>, bool)>,
 }
 
 impl VoiceExchange {
+    fn new(identity: bool) -> Self {
+        Self {
+            identity,
+            ..Self::default()
+        }
+    }
+
+    fn identified(&mut self, turn_id: TurnId, person: Option<PersonId>, confirmed: bool) {
+        self.speaker = Some((turn_id, person, confirmed));
+    }
+
     fn recognized(&mut self, turn_id: TurnId, text: &str) {
         self.spoken = Some((turn_id, text.to_owned()));
     }
@@ -2736,10 +2771,22 @@ impl VoiceExchange {
     // so the buffered utterance belongs to a turn that has *not* completed yet: it is
     // kept for that turn rather than discarded along with this reply, which would
     // otherwise cost two exchanges instead of one.
-    fn completed(&mut self, turn_id: TurnId) -> Option<String> {
-        self.spoken
+    // With identity on, the subject is the person this same turn's label confirmed; an
+    // unsure, late or someone-new turn, or a label from another turn, extracts nothing.
+    fn completed(&mut self, turn_id: TurnId) -> Option<(String, PersonId)> {
+        let text = self
+            .spoken
             .take_if(|(spoken_turn, _)| *spoken_turn == turn_id)
-            .map(|(_, text)| text)
+            .map(|(_, text)| text)?;
+        if !self.identity {
+            return Some((text, PersonId::OWNER));
+        }
+        match self.speaker.take() {
+            Some((labelled_turn, Some(person), true)) if labelled_turn == turn_id => {
+                Some((text, person))
+            }
+            _ => None,
+        }
     }
 }
 
@@ -7661,7 +7708,10 @@ mod tests {
 
         assert_eq!(
             exchange.completed(TurnId::new(1)),
-            Some("i ship rust".to_owned())
+            Some((
+                "i ship rust".to_owned(),
+                conversation_protocol::PersonId::OWNER
+            ))
         );
         assert_eq!(exchange.completed(TurnId::new(1)), None);
     }
@@ -7676,7 +7726,10 @@ mod tests {
         assert_eq!(exchange.completed(TurnId::new(1)), None);
         assert_eq!(
             exchange.completed(TurnId::new(2)),
-            Some("and i review on fridays".to_owned()),
+            Some((
+                "and i review on fridays".to_owned(),
+                conversation_protocol::PersonId::OWNER
+            )),
             "the mismatched reply discarded an utterance that was still waiting for its own turn"
         );
     }
@@ -11922,5 +11975,58 @@ max_error_bytes = 65536
             }
         }
         std::env::remove_var(key_env);
+    }
+}
+
+#[cfg(test)]
+mod voice_exchange_tests {
+    use conversation_protocol::{PersonId, TurnId};
+
+    use super::VoiceExchange;
+
+    fn jack() -> PersonId {
+        PersonId::new(2).unwrap()
+    }
+
+    #[test]
+    fn extraction_follows_the_confirmed_speaker_of_the_same_turn() {
+        let mut exchange = VoiceExchange::new(true);
+        exchange.recognized(TurnId::new(1), "i ship rust");
+        exchange.identified(TurnId::new(1), Some(jack()), true);
+        assert_eq!(
+            exchange.completed(TurnId::new(1)),
+            Some(("i ship rust".to_owned(), jack()))
+        );
+    }
+
+    #[test]
+    fn unsure_late_or_someone_new_turns_are_not_extracted() {
+        for (person, confirmed) in [(Some(jack()), false), (None, false), (None, true)] {
+            let mut exchange = VoiceExchange::new(true);
+            exchange.recognized(TurnId::new(1), "hello");
+            exchange.identified(TurnId::new(1), person, confirmed);
+            assert_eq!(exchange.completed(TurnId::new(1)), None);
+        }
+        let mut late = VoiceExchange::new(true);
+        late.recognized(TurnId::new(1), "hello");
+        assert_eq!(late.completed(TurnId::new(1)), None);
+    }
+
+    #[test]
+    fn a_label_from_another_turn_never_attaches() {
+        let mut exchange = VoiceExchange::new(true);
+        exchange.identified(TurnId::new(1), Some(jack()), true);
+        exchange.recognized(TurnId::new(2), "hello");
+        assert_eq!(exchange.completed(TurnId::new(2)), None);
+    }
+
+    #[test]
+    fn extraction_without_identity_stores_against_the_owner() {
+        let mut exchange = VoiceExchange::new(false);
+        exchange.recognized(TurnId::new(1), "hello");
+        assert_eq!(
+            exchange.completed(TurnId::new(1)),
+            Some(("hello".to_owned(), PersonId::OWNER))
+        );
     }
 }

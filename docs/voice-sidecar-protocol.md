@@ -67,3 +67,19 @@ discontinuity, or a version 1 session.
 
 Standard output preserves frame order, so a turn's `TurnAudio` frame follows the
 finals of that turn.
+
+## Segment ids in a version 2 session
+
+The sidecar restarts segment ids at 1 on every turn and numbers them from 1.
+In a version 2 session the gateway gives every hypothesis and every `TurnAudio`
+frame a session-unique id: the sidecar's id plus the highest id used by the
+turns before it, partial hypotheses included. A turn ends at a `TurnAudio`
+frame, at a capture discontinuity, or when a hypothesis arrives with an id at or
+below one already final in the same turn; that hypothesis begins the next turn.
+A segment id of 0 is malformed in a version 2 session. Version 1 sessions keep
+the sidecar's ids.
+
+The gateway keeps at most one turn's audio, replaced by the next `TurnAudio`. A
+request for a segment takes the audio only when the ids match, gets nothing once
+that segment's turn or the session has ended without that audio, and otherwise
+waits.

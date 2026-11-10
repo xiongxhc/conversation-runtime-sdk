@@ -23,8 +23,9 @@ use super::codec::{
 };
 use crate::{
     AdapterError, AdapterFuture, AudioDeviceStatus, AudioFrame, CaptureEvent, CapturedTurnAudio,
-    ContinuousAudioOutput, PlaybackReceipt, RecognitionEvent, SidecarTurnAudio,
-    VoiceCaptureControl, VoiceInput, VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
+    ContinuousAudioOutput, PlaybackReceipt, RecognitionEvent, RecognitionHypothesis,
+    SidecarTurnAudio, VoiceCaptureControl, VoiceInput, VoiceInputEvent, VoiceIoFactory,
+    VoiceIoSession,
 };
 
 const SPEECH_START_MS: std::ops::RangeInclusive<u64> = 100..=1_000;
@@ -1276,11 +1277,9 @@ async fn run_stdout_reader<R>(
     R: AsyncRead + Unpin,
 {
     let version = session_version(turn_audio.as_ref());
-    // Turn audio never outlives the session, however the reader stops.
-    let _end_turn_audio = EndTurnAudio {
-        turn_audio: turn_audio.clone(),
-        session_id,
-    };
+    // Dropped however the reader stops, which ends the session's turn audio.
+    let mut collector =
+        turn_audio.map(|turn_audio| TurnAudioCollector::begin(turn_audio, session_id));
     let mut ready = false;
     let mut capture_started = false;
     loop {
@@ -1319,8 +1318,11 @@ async fn run_stdout_reader<R>(
                 }
                 // Only a version 2 session reads this frame, and only a
                 // session with a handle runs at version 2.
-                if let Some(turn_audio) = &turn_audio {
-                    turn_audio.offer(session_id, frame.segment_id, captured_turn_audio(&frame));
+                if let Some(collector) = collector.as_mut() {
+                    if let Err(error) = collector.turn_audio(&frame) {
+                        let _ = supervisor_sender.send(SupervisorEvent::Fatal(error));
+                        return;
+                    }
                 }
                 continue;
             }
@@ -1372,20 +1374,33 @@ async fn run_stdout_reader<R>(
             SidecarControl::VoiceActivity {
                 activity: VoiceActivity::CaptureDiscontinuity { at_ms },
                 ..
-            } => Some((
-                VoiceInputEvent::Capture(CaptureEvent::Discontinuity { at_ms }),
-                true,
-            )),
+            } => {
+                if let Some(collector) = collector.as_mut() {
+                    collector.end_turn();
+                }
+                Some((
+                    VoiceInputEvent::Capture(CaptureEvent::Discontinuity { at_ms }),
+                    true,
+                ))
+            }
             SidecarControl::VoiceActivity { activity, .. } => {
                 Some((VoiceInputEvent::Activity(activity), true))
             }
             SidecarControl::TranscriptHypothesis { hypothesis, .. } => {
-                if let Some(turn_audio) = &turn_audio {
-                    turn_audio.clear(session_id);
-                }
+                let hypothesis = match collector.as_mut() {
+                    Some(collector) => match collector.hypothesis(&hypothesis) {
+                        Ok(renumbered) => renumbered,
+                        Err(error) => {
+                            let _ = supervisor_sender.send(SupervisorEvent::Fatal(error));
+                            return;
+                        }
+                    },
+                    None => hypothesis,
+                };
+                let engine_final = hypothesis.is_engine_final();
                 Some((
-                    VoiceInputEvent::Recognition(RecognitionEvent::Hypothesis(hypothesis.clone())),
-                    hypothesis.is_engine_final(),
+                    VoiceInputEvent::Recognition(RecognitionEvent::Hypothesis(hypothesis)),
+                    engine_final,
                 ))
             }
             SidecarControl::PlaybackAccepted {
@@ -1527,16 +1542,89 @@ async fn resolve_media_ack(
     }
 }
 
-struct EndTurnAudio {
-    turn_audio: Option<SidecarTurnAudio>,
+/// A version 2 session's turn audio. The sidecar restarts segment ids at 1 on
+/// every turn; this gives each hypothesis and turn audio frame a session-unique
+/// id (the sidecar's id plus the highest id the earlier turns used) and tells
+/// the handle about each turn's audio and end. Dropping it ends the session.
+struct TurnAudioCollector {
+    turn_audio: SidecarTurnAudio,
     session_id: SessionId,
+    /// The highest session-unique id used by the turns before this one.
+    earlier: u64,
+    /// The highest sidecar id this turn used, partial or final; zero if none.
+    used: u64,
+    /// The highest sidecar id final in this turn.
+    final_through: Option<u64>,
 }
 
-impl Drop for EndTurnAudio {
-    fn drop(&mut self) {
-        if let Some(turn_audio) = &self.turn_audio {
-            turn_audio.end(self.session_id);
+impl TurnAudioCollector {
+    fn begin(turn_audio: SidecarTurnAudio, session_id: SessionId) -> Self {
+        turn_audio.begin(session_id);
+        Self {
+            turn_audio,
+            session_id,
+            earlier: 0,
+            used: 0,
+            final_through: None,
         }
+    }
+
+    /// A hypothesis at or below an id already final in this turn starts the
+    /// next turn.
+    fn hypothesis(
+        &mut self,
+        hypothesis: &RecognitionHypothesis,
+    ) -> Result<RecognitionHypothesis, AdapterError> {
+        let segment_id = hypothesis.segment_id();
+        if self
+            .final_through
+            .is_some_and(|final_through| segment_id <= final_through)
+        {
+            self.end_turn();
+        }
+        let unique = self.unique(segment_id)?;
+        Ok(if hypothesis.is_engine_final() {
+            self.final_through = Some(self.final_through.unwrap_or(0).max(segment_id));
+            RecognitionHypothesis::engine_final(unique, hypothesis.text())
+        } else {
+            RecognitionHypothesis::partial(unique, hypothesis.text())
+        })
+    }
+
+    /// A turn audio frame carries its turn's audio and ends the turn.
+    fn turn_audio(&mut self, frame: &SidecarTurnAudioFrame) -> Result<(), AdapterError> {
+        let unique = self.unique(frame.segment_id)?;
+        self.turn_audio
+            .offer(self.session_id, unique, captured_turn_audio(frame));
+        self.end_turn();
+        Ok(())
+    }
+
+    fn end_turn(&mut self) {
+        if self.used == 0 {
+            return;
+        }
+        // `unique` already proved this sum fits.
+        self.earlier += self.used;
+        self.used = 0;
+        self.final_through = None;
+        self.turn_audio.turn_ended(self.session_id, self.earlier);
+    }
+
+    fn unique(&mut self, segment_id: u64) -> Result<u64, AdapterError> {
+        // Ids start at 1; a zero would collide with the previous turn's last id.
+        let unique = (segment_id != 0)
+            .then(|| self.earlier.checked_add(segment_id))
+            .flatten()
+            .ok_or_else(|| AdapterError::new("voice sidecar event frame was malformed"))?;
+        self.used = self.used.max(segment_id);
+        Ok(unique)
+    }
+}
+
+impl Drop for TurnAudioCollector {
+    fn drop(&mut self) {
+        self.turn_audio.end(self.session_id);
     }
 }
 
@@ -2655,7 +2743,7 @@ fn configuration_error(message: impl AsRef<str>) -> AdapterError {
 mod process_tests {
     use super::super::codec::{HEADER_BYTES, MAX_TURN_AUDIO_SAMPLES};
     use super::*;
-    use crate::RecognitionHypothesis;
+    use futures_util::FutureExt;
 
     fn sidecar_config_fixture() -> (tempfile::TempDir, MacOsVoiceSidecarConfig) {
         use std::os::unix::fs::PermissionsExt;
@@ -2889,157 +2977,301 @@ mod process_tests {
         }
     }
 
+    const READER_SESSION: SessionId = SessionId::new(1);
+    const READER_TIMEOUT: Duration = Duration::from_secs(1);
+
+    fn hypothesis(segment_id: u64, engine_final: bool) -> SidecarFrame {
+        let hypothesis = if engine_final {
+            RecognitionHypothesis::engine_final(segment_id, "hello")
+        } else {
+            RecognitionHypothesis::partial(segment_id, "hel")
+        };
+        SidecarFrame::control(SidecarControl::TranscriptHypothesis {
+            session_id: READER_SESSION,
+            hypothesis,
+        })
+    }
+
+    fn discontinuity() -> SidecarFrame {
+        SidecarFrame::control(SidecarControl::VoiceActivity {
+            session_id: READER_SESSION,
+            activity: VoiceActivity::CaptureDiscontinuity { at_ms: 30 },
+        })
+    }
+
+    fn turn_audio_for(segment_id: u64, samples: Vec<i16>) -> SidecarFrame {
+        SidecarFrame::turn_audio(SidecarTurnAudioFrame {
+            session_id: READER_SESSION,
+            segment_id,
+            final_segments: 2,
+            playback_overlap: true,
+            samples,
+        })
+    }
+
+    /// A stdout reader fed through an open stream, so the handle can be
+    /// queried while the reader is still running.
+    struct ReaderHarness {
+        sidecar: tokio::io::DuplexStream,
+        version: u16,
+        reliable: mpsc::Receiver<InputDelivery>,
+        nonterminal: mpsc::Receiver<InputDelivery>,
+        supervisor: mpsc::UnboundedReceiver<SupervisorEvent>,
+        reader: JoinHandle<()>,
+    }
+
+    impl ReaderHarness {
+        async fn ready(turn_audio: Option<SidecarTurnAudio>) -> Self {
+            let version = session_version(turn_audio.as_ref());
+            let (sidecar, gateway) = tokio::io::duplex(1 << 20);
+            let (reliable_sender, reliable) = mpsc::channel(RELIABLE_INPUT_QUEUE_CAPACITY);
+            // Roomier than the session's lossy lane, so no partial is dropped.
+            let (nonterminal_sender, nonterminal) = mpsc::channel(RELIABLE_INPUT_QUEUE_CAPACITY);
+            let (supervisor_sender, supervisor) = mpsc::unbounded_channel();
+            let reader = tokio::spawn(run_stdout_reader(
+                gateway,
+                MAX_CONTROL_PAYLOAD_BYTES,
+                turn_audio,
+                READER_SESSION,
+                Arc::new(SessionShared::new(READER_SESSION)),
+                InputPublisher {
+                    reliable: reliable_sender,
+                    nonterminal: nonterminal_sender,
+                    supervisor: supervisor_sender.clone(),
+                },
+                CancellationToken::new(),
+                supervisor_sender,
+            ));
+            let mut harness = Self {
+                sidecar,
+                version,
+                reliable,
+                nonterminal,
+                supervisor,
+                reader,
+            };
+            harness
+                .send(SidecarFrame::control(SidecarControl::Ready {
+                    session_id: READER_SESSION,
+                }))
+                .await;
+            assert!(matches!(
+                harness.next_supervisor_event().await,
+                SupervisorEvent::Ready
+            ));
+            harness
+        }
+
+        async fn send(&mut self, frame: SidecarFrame) {
+            let bytes = encode_frame(&frame.at_version(self.version)).unwrap();
+            self.sidecar.write_all(&bytes).await.unwrap();
+        }
+
+        async fn next_supervisor_event(&mut self) -> SupervisorEvent {
+            tokio::time::timeout(READER_TIMEOUT, self.supervisor.recv())
+                .await
+                .expect("supervisor event timeout")
+                .expect("supervisor closed")
+        }
+
+        /// The next published final's segment id; other reliable events are skipped.
+        async fn next_final(&mut self) -> u64 {
+            loop {
+                let event = tokio::time::timeout(READER_TIMEOUT, self.reliable.recv())
+                    .await
+                    .expect("final hypothesis timeout")
+                    .expect("reliable input closed")
+                    .expect("reliable input failed");
+                if let VoiceInputEvent::Recognition(RecognitionEvent::Hypothesis(value)) = event {
+                    assert!(value.is_engine_final());
+                    return value.segment_id();
+                }
+            }
+        }
+
+        async fn next_partial(&mut self) -> u64 {
+            let event = tokio::time::timeout(READER_TIMEOUT, self.nonterminal.recv())
+                .await
+                .expect("partial hypothesis timeout")
+                .expect("nonterminal input closed")
+                .expect("nonterminal input failed");
+            let VoiceInputEvent::Recognition(RecognitionEvent::Hypothesis(value)) = event else {
+                panic!("a nonterminal event was not a hypothesis");
+            };
+            assert!(!value.is_engine_final());
+            value.segment_id()
+        }
+
+        async fn stop(self) -> mpsc::Receiver<InputDelivery> {
+            drop(self.sidecar);
+            tokio::time::timeout(READER_TIMEOUT, self.reader)
+                .await
+                .expect("reader did not stop")
+                .unwrap();
+            self.reliable
+        }
+    }
+
+    /// The answer a take gives without waiting, or `None` when it would wait.
+    fn answer_now(
+        turn_audio: &SidecarTurnAudio,
+        segment_id: u64,
+    ) -> Option<Option<CapturedTurnAudio>> {
+        turn_audio
+            .take(READER_SESSION, segment_id, CancellationToken::new())
+            .now_or_never()
+    }
+
     #[tokio::test]
     async fn turn_audio_is_offered_to_the_handle_and_never_published() {
-        let at_two = |frame: SidecarFrame| {
-            encode_frame(&frame.at_version(TURN_AUDIO_PROTOCOL_VERSION)).unwrap()
-        };
-        let stdout = [
-            at_two(SidecarFrame::control(SidecarControl::Ready {
-                session_id: SessionId::new(1),
-            })),
-            at_two(SidecarFrame::control(
-                SidecarControl::TranscriptHypothesis {
-                    session_id: SessionId::new(1),
-                    hypothesis: RecognitionHypothesis::engine_final(3, "hello"),
-                },
-            )),
-            encode_frame(&turn_audio_frame(vec![-32_768, 0, 16_384])).unwrap(),
-        ]
-        .concat();
-        let (reliable_sender, mut reliable) = mpsc::channel(RELIABLE_INPUT_QUEUE_CAPACITY);
-        let (nonterminal_sender, _nonterminal) = mpsc::channel(NONTERMINAL_INPUT_QUEUE_CAPACITY);
-        let (supervisor_sender, mut supervisor) = mpsc::unbounded_channel();
         let turn_audio = SidecarTurnAudio::new();
-        // The stream stays open until the audio is taken, so the reader is
-        // still running when the take is answered.
-        let (mut sidecar, gateway) = tokio::io::duplex(stdout.len());
-        sidecar.write_all(&stdout).await.unwrap();
-        let reader = tokio::spawn(run_stdout_reader(
-            gateway,
-            MAX_CONTROL_PAYLOAD_BYTES,
-            Some(turn_audio.clone()),
-            SessionId::new(1),
-            Arc::new(SessionShared::new(SessionId::new(1))),
-            InputPublisher {
-                reliable: reliable_sender,
-                nonterminal: nonterminal_sender,
-                supervisor: supervisor_sender.clone(),
-            },
-            CancellationToken::new(),
-            supervisor_sender,
-        ));
+        let mut reader = ReaderHarness::ready(Some(turn_audio.clone())).await;
+        reader.send(hypothesis(3, true)).await;
+        reader
+            .send(turn_audio_for(3, vec![-32_768, 0, 16_384]))
+            .await;
+        assert_eq!(reader.next_final().await, 3);
 
+        let taken = tokio::time::timeout(
+            READER_TIMEOUT,
+            turn_audio.take(READER_SESSION, 3, CancellationToken::new()),
+        )
+        .await
+        .expect("turn audio timeout");
         assert_eq!(
-            turn_audio
-                .take(SessionId::new(1), 3, CancellationToken::new())
-                .await,
+            taken,
             Some(CapturedTurnAudio {
                 samples: vec![-1.0, 0.0, 0.5],
                 playback_overlap: true,
                 single_segment: false,
             })
         );
-        drop(sidecar);
-        reader.await.unwrap();
-
-        assert!(matches!(
-            reliable.try_recv(),
-            Ok(Ok(VoiceInputEvent::Recognition(
-                RecognitionEvent::Hypothesis(_)
-            )))
-        ));
+        let mut reliable = reader.stop().await;
         assert!(reliable.try_recv().is_err());
-        assert!(matches!(supervisor.try_recv(), Ok(SupervisorEvent::Ready)));
-        assert!(matches!(supervisor.try_recv(), Ok(SupervisorEvent::Eof)));
+    }
+
+    #[tokio::test]
+    async fn turn_audio_ends_a_turn_and_the_next_turn_is_renumbered() {
+        let turn_audio = SidecarTurnAudio::new();
+        let mut reader = ReaderHarness::ready(Some(turn_audio.clone())).await;
+        reader.send(hypothesis(1, true)).await;
+        reader.send(turn_audio_for(1, vec![1])).await;
+        reader.send(hypothesis(1, true)).await;
+        assert_eq!(reader.next_final().await, 1);
+        assert_eq!(reader.next_final().await, 2);
+
+        assert!(matches!(answer_now(&turn_audio, 1), Some(Some(_))));
+        // The second turn has not ended, so its request waits.
+        assert_eq!(answer_now(&turn_audio, 2), None);
+        reader.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_capture_discontinuity_ends_a_turn() {
+        let turn_audio = SidecarTurnAudio::new();
+        let mut reader = ReaderHarness::ready(Some(turn_audio.clone())).await;
+        reader.send(hypothesis(1, false)).await;
+        reader.send(hypothesis(1, true)).await;
+        reader.send(discontinuity()).await;
+        reader.send(hypothesis(1, true)).await;
+        assert_eq!(reader.next_partial().await, 1);
+        assert_eq!(reader.next_final().await, 1);
+        assert_eq!(reader.next_final().await, 2);
+
+        // The first turn ended without audio, so its request answers at once.
+        assert_eq!(answer_now(&turn_audio, 1), Some(None));
+        assert_eq!(answer_now(&turn_audio, 2), None);
+        reader.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_repeated_segment_id_starts_a_turn_and_partials_count_as_used() {
+        let turn_audio = SidecarTurnAudio::new();
+        let mut reader = ReaderHarness::ready(Some(turn_audio.clone())).await;
+        reader.send(hypothesis(1, true)).await;
+        reader.send(hypothesis(3, false)).await;
+        reader.send(hypothesis(2, true)).await;
+        reader.send(hypothesis(1, true)).await;
+        assert_eq!(reader.next_final().await, 1);
+        assert_eq!(reader.next_partial().await, 3);
+        assert_eq!(reader.next_final().await, 2);
+        // Segment 1 is at or below the turn's final 2, so a new turn begins
+        // after the highest id the first turn used, the partial's 3.
+        assert_eq!(reader.next_final().await, 4);
+
+        for ended in 1..=3 {
+            assert_eq!(answer_now(&turn_audio, ended), Some(None));
+        }
+        assert_eq!(answer_now(&turn_audio, 4), None);
+        reader.stop().await;
+    }
+
+    #[tokio::test]
+    async fn version_one_keeps_the_sidecars_segment_ids() {
+        let mut reader = ReaderHarness::ready(None).await;
+        reader.send(hypothesis(1, true)).await;
+        reader.send(hypothesis(3, false)).await;
+        reader.send(hypothesis(2, true)).await;
+        reader.send(discontinuity()).await;
+        reader.send(hypothesis(1, true)).await;
+        assert_eq!(reader.next_final().await, 1);
+        assert_eq!(reader.next_partial().await, 3);
+        assert_eq!(reader.next_final().await, 2);
+        assert_eq!(reader.next_final().await, 1);
+        reader.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_zero_segment_id_is_malformed_in_a_version_two_session() {
+        let mut reader = ReaderHarness::ready(Some(SidecarTurnAudio::new())).await;
+        reader.send(hypothesis(0, true)).await;
+        assert!(matches!(
+            reader.next_supervisor_event().await,
+            SupervisorEvent::Fatal(error)
+                if error.message() == "voice sidecar event frame was malformed"
+        ));
+        reader.stop().await;
     }
 
     #[tokio::test]
     async fn turn_audio_is_dropped_when_the_reader_stops() {
-        let stdout = [
-            encode_frame(
-                &SidecarFrame::control(SidecarControl::Ready {
-                    session_id: SessionId::new(1),
-                })
-                .at_version(TURN_AUDIO_PROTOCOL_VERSION),
-            )
-            .unwrap(),
-            encode_frame(&turn_audio_frame(vec![1])).unwrap(),
-        ]
-        .concat();
-        let (reliable_sender, _reliable) = mpsc::channel(RELIABLE_INPUT_QUEUE_CAPACITY);
-        let (nonterminal_sender, _nonterminal) = mpsc::channel(NONTERMINAL_INPUT_QUEUE_CAPACITY);
-        let (supervisor_sender, _supervisor) = mpsc::unbounded_channel();
         let turn_audio = SidecarTurnAudio::new();
-
-        run_stdout_reader(
-            stdout.as_slice(),
-            MAX_CONTROL_PAYLOAD_BYTES,
-            Some(turn_audio.clone()),
-            SessionId::new(1),
-            Arc::new(SessionShared::new(SessionId::new(1))),
-            InputPublisher {
-                reliable: reliable_sender,
-                nonterminal: nonterminal_sender,
-                supervisor: supervisor_sender.clone(),
-            },
-            CancellationToken::new(),
-            supervisor_sender,
-        )
-        .await;
+        let mut reader = ReaderHarness::ready(Some(turn_audio.clone())).await;
+        reader.send(hypothesis(3, true)).await;
+        reader.send(turn_audio_for(3, vec![1])).await;
+        assert_eq!(reader.next_final().await, 3);
+        reader.stop().await;
 
         // Not cancelled: an ended session answers at once rather than waiting.
-        assert_eq!(
-            turn_audio
-                .take(SessionId::new(1), 3, CancellationToken::new())
-                .await,
-            None
-        );
+        let taken = tokio::time::timeout(
+            READER_TIMEOUT,
+            turn_audio.take(READER_SESSION, 3, CancellationToken::new()),
+        )
+        .await
+        .expect("a take outlived its session");
+        assert_eq!(taken, None);
     }
 
     #[tokio::test]
     async fn turn_audio_for_another_session_is_fatal() {
-        let stdout = [
-            encode_frame(
-                &SidecarFrame::control(SidecarControl::Ready {
-                    session_id: SessionId::new(2),
-                })
-                .at_version(TURN_AUDIO_PROTOCOL_VERSION),
-            )
-            .unwrap(),
-            encode_frame(&turn_audio_frame(vec![1])).unwrap(),
-        ]
-        .concat();
-        let (reliable_sender, _reliable) = mpsc::channel(RELIABLE_INPUT_QUEUE_CAPACITY);
-        let (nonterminal_sender, _nonterminal) = mpsc::channel(NONTERMINAL_INPUT_QUEUE_CAPACITY);
-        let (supervisor_sender, mut supervisor) = mpsc::unbounded_channel();
         let turn_audio = SidecarTurnAudio::new();
-
-        run_stdout_reader(
-            stdout.as_slice(),
-            MAX_CONTROL_PAYLOAD_BYTES,
-            Some(turn_audio.clone()),
-            SessionId::new(2),
-            Arc::new(SessionShared::new(SessionId::new(2))),
-            InputPublisher {
-                reliable: reliable_sender,
-                nonterminal: nonterminal_sender,
-                supervisor: supervisor_sender.clone(),
-            },
-            CancellationToken::new(),
-            supervisor_sender,
-        )
-        .await;
-
-        assert!(matches!(supervisor.try_recv(), Ok(SupervisorEvent::Ready)));
+        let mut reader = ReaderHarness::ready(Some(turn_audio.clone())).await;
+        reader
+            .send(SidecarFrame::turn_audio(SidecarTurnAudioFrame {
+                session_id: SessionId::new(2),
+                segment_id: 3,
+                final_segments: 1,
+                playback_overlap: false,
+                samples: vec![1],
+            }))
+            .await;
         assert!(matches!(
-            supervisor.try_recv(),
-            Ok(SupervisorEvent::Fatal(error))
+            reader.next_supervisor_event().await,
+            SupervisorEvent::Fatal(error)
                 if error.message() == "voice sidecar session identity mismatch"
         ));
-        let cancelled = CancellationToken::new();
-        cancelled.cancel();
-        assert_eq!(turn_audio.take(SessionId::new(1), 3, cancelled).await, None);
+        reader.stop().await;
+        assert_eq!(answer_now(&turn_audio, 3), Some(None));
     }
 
     #[tokio::test]

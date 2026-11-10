@@ -1272,7 +1272,7 @@ async fn turn_audio_does_not_outlive_its_session() {
 }
 
 #[tokio::test]
-async fn a_later_turn_never_receives_an_earlier_turns_audio() {
+async fn segment_ids_are_unique_across_turns_in_a_version_two_session() {
     let turn_audio = SidecarTurnAudio::new();
     let harness =
         FakeSidecarHarness::new("two-turns-one-audio").with_turn_audio(turn_audio.clone());
@@ -1284,27 +1284,79 @@ async fn a_later_turn_never_receives_an_earlier_turns_audio() {
         .await
         .unwrap();
 
-    let mut finals = Vec::new();
-    while finals.len() < 2 {
-        if let VoiceInputEvent::Recognition(RecognitionEvent::Hypothesis(value)) =
-            recv_with_timeout(&mut input).await
-        {
-            assert!(value.is_engine_final());
-            assert_eq!(value.segment_id(), 1);
-            finals.push(value.text().to_owned());
-        }
-    }
-    assert_eq!(finals, ["first", "second"]);
+    // The sidecar numbers both finals 1; the session renumbers the second.
+    assert_eq!(
+        final_hypotheses(&mut input, 2).await,
+        [(1, "first".to_owned()), (2, "second".to_owned())]
+    );
 
-    // The first turn's audio was read before the second final, and the second
-    // final discarded it: segment 1 has no audio now.
-    let cancelled = CancellationToken::new();
-    cancelled.cancel();
-    assert_eq!(turn_audio.take(SESSION_ID, 1, cancelled).await, None);
+    let first = tokio::time::timeout(
+        Duration::from_secs(1),
+        turn_audio.take(SESSION_ID, 1, CancellationToken::new()),
+    )
+    .await
+    .expect("first turn audio timeout");
+    assert_eq!(
+        first,
+        Some(CapturedTurnAudio {
+            samples: vec![1000.0 / 32768.0; 16_000],
+            playback_overlap: false,
+            single_segment: true,
+        })
+    );
+    // The second turn has no audio and has not ended: its request waits.
+    let second = CancellationToken::new();
+    assert!(tokio::time::timeout(
+        Duration::from_millis(100),
+        turn_audio.take(SESSION_ID, 2, second.clone()),
+    )
+    .await
+    .is_err());
+    second.cancel();
+    assert_eq!(turn_audio.take(SESSION_ID, 2, second).await, None);
 
     cancellation.cancel();
     assert!(await_completion(session.completion).await.is_ok());
     harness.assert_process_gone().await;
+}
+
+#[tokio::test]
+async fn version_one_sessions_keep_the_sidecars_segment_ids() {
+    let harness = FakeSidecarHarness::new("two-turns-one-audio");
+    let cancellation = CancellationToken::new();
+    let session = harness.start(cancellation.clone()).await.unwrap();
+    let mut input = session
+        .input
+        .start(SESSION_ID, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        final_hypotheses(&mut input, 2).await,
+        [(1, "first".to_owned()), (1, "second".to_owned())]
+    );
+
+    cancellation.cancel();
+    assert!(await_completion(session.completion).await.is_ok());
+    harness.assert_process_gone().await;
+}
+
+async fn final_hypotheses(
+    input: &mut tokio::sync::mpsc::Receiver<
+        Result<VoiceInputEvent, conversation_model_adapters::AdapterError>,
+    >,
+    count: usize,
+) -> Vec<(u64, String)> {
+    let mut finals = Vec::new();
+    while finals.len() < count {
+        if let VoiceInputEvent::Recognition(RecognitionEvent::Hypothesis(value)) =
+            recv_with_timeout(input).await
+        {
+            assert!(value.is_engine_final());
+            finals.push((value.segment_id(), value.text().to_owned()));
+        }
+    }
+    finals
 }
 
 #[tokio::test]

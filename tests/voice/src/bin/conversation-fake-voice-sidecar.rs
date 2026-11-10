@@ -309,7 +309,8 @@ fn run() -> Result<(), String> {
                             "at_ms": 20
                         }),
                     )?;
-                    if scenario == "turn-audio" {
+                    if scenario == "turn-audio" && session_version() == TURN_AUDIO_PROTOCOL_VERSION
+                    {
                         write_turn_audio_frame(
                             &mut stdout,
                             session_version(),
@@ -911,7 +912,8 @@ fn write_turn_audio_frame(
         .map_err(|_| "failed to flush fake turn audio".to_owned())
 }
 
-/// Two turns whose segment ids both restart at 1: only the first has audio.
+/// Two turns whose segment ids both restart at 1: only the first has audio,
+/// and only in a version 2 session.
 fn write_two_turns_one_audio(writer: &mut impl Write, session: u64) -> Result<(), String> {
     for (turn, text) in [(0_u64, "first"), (1, "second")] {
         write_json_frame(
@@ -942,7 +944,7 @@ fn write_two_turns_one_audio(writer: &mut impl Write, session: u64) -> Result<()
                 "at_ms": 20 + turn * 100
             }),
         )?;
-        if turn == 0 {
+        if turn == 0 && session_version() == TURN_AUDIO_PROTOCOL_VERSION {
             write_turn_audio_frame(
                 writer,
                 session_version(),

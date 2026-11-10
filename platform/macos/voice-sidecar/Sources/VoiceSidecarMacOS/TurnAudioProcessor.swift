@@ -1,6 +1,7 @@
 @preconcurrency import AVFoundation
 import CoreML
 import Foundation
+import VoiceSidecarCore
 @preconcurrency import WhisperKit
 
 enum TurnAudioProcessorError: Error, Equatable {
@@ -277,6 +278,29 @@ final class TurnAudioProcessor: AudioProcessing, @unchecked Sendable {
             state.isRecording = false
             state.isPaused = true
         }
+    }
+
+    /// The turn that a final-silence reset ends, as a backend hands it on:
+    /// only what the snapshot reads, and the earliest time on the voice
+    /// window clock that the next turn's audio can begin. The next turn
+    /// starts with the pre-roll; a voice window's time is when it was
+    /// processed, never before its samples arrived, and capture arrives in
+    /// buffers of up to 8,192 frames (512 ms at 16 kHz), so one second more
+    /// than the pre-roll covers every window that can hold its audio.
+    func turnEnd(
+        configuration: SidecarConfiguration,
+        atMilliseconds now: UInt64,
+        discontinuities: UInt64
+    ) -> RecognitionTurnEnd {
+        let lead = UInt64(preRollSampleLimit / 16) + 1_000
+        return RecognitionTurnEnd(
+            samples: TurnAudioSnapshot.retainedSamples(
+                of: audioSamples,
+                finalSilenceMilliseconds: configuration.finalSilenceMilliseconds
+            ),
+            nextTurnFromMilliseconds: now > lead ? now - lead : 0,
+            discontinuities: discontinuities
+        )
     }
 
     func setFailureHandler(_ handler: FailureHandler?) {

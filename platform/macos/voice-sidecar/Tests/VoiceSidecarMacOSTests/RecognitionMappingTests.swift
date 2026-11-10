@@ -484,8 +484,8 @@ func aTurnEndIsPublishedAfterItsTurnsQueuedHypothesesAndBeforeTheNextTurns() asy
                 "\(hypothesis.engineFinal ? "final" : "partial").\(hypothesis.segmentID)"
             )
         }
-    } onTurnEnded: { samples in
-        await log.append("turnEnded.\(samples.count)")
+    } onTurnEnded: { end in
+        await log.append("turnEnded.\(end.samples.count)")
     }
 
     pipeline.enqueue([
@@ -495,7 +495,7 @@ func aTurnEndIsPublishedAfterItsTurnsQueuedHypothesesAndBeforeTheNextTurns() asy
     pipeline.enqueue([
         RecognitionHypothesis(segmentID: 1, text: "one", engineFinal: true)
     ])
-    #expect(pipeline.enqueueTurnEnded(samples: [0.1, 0.2, 0.3]) == .queued)
+    #expect(pipeline.enqueueTurnEnded(turnEnd([0.1, 0.2, 0.3])) == .queued)
     // The next turn's partial must not coalesce into the ended turn.
     pipeline.enqueue([
         RecognitionHypothesis(segmentID: 1, text: "next", engineFinal: false)
@@ -522,8 +522,8 @@ func aFullRecognitionMailboxStillQueuesATurnEnd() async {
             await gate.wait()
         }
         await log.append("final.\(batch.first?.segmentID ?? 0)")
-    } onTurnEnded: { samples in
-        await log.append("turnEnded.\(samples.count)")
+    } onTurnEnded: { end in
+        await log.append("turnEnded.\(end.samples.count)")
     }
 
     pipeline.enqueue([
@@ -535,7 +535,7 @@ func aFullRecognitionMailboxStillQueuesATurnEnd() async {
             RecognitionHypothesis(segmentID: 1, text: "one", engineFinal: true)
         ]) == .queued
     )
-    #expect(pipeline.enqueueTurnEnded(samples: [0.5]) == .queued)
+    #expect(pipeline.enqueueTurnEnded(turnEnd([0.5])) == .queued)
     await gate.open()
 
     #expect(await pipeline.finish() == .stopped)
@@ -1411,6 +1411,14 @@ private actor AsyncGate {
             waiter.resume()
         }
     }
+}
+
+private func turnEnd(_ samples: ContiguousArray<Float>) -> RecognitionTurnEnd {
+    RecognitionTurnEnd(
+        samples: samples,
+        nextTurnFromMilliseconds: 0,
+        discontinuities: 0
+    )
 }
 
 private actor PipelineLog {

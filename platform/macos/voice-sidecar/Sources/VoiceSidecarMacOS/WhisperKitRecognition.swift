@@ -223,7 +223,7 @@ public enum RecognitionBatchEnqueueResult: Equatable, Sendable {
 
 private enum RecognitionPipelineItem {
     case batch([RecognitionHypothesis])
-    case turnEnded(ContiguousArray<Float>)
+    case turnEnded(RecognitionTurnEnd)
 
     var isPartialBatch: Bool {
         guard case .batch(let batch) = self else {
@@ -308,13 +308,13 @@ private final class RecognitionBatchMailbox: @unchecked Sendable {
     /// A turn end is never dropped and does not count against the capacity,
     /// which bounds hypothesis batches: at most one is queued per turn.
     func enqueueTurnEnded(
-        _ samples: ContiguousArray<Float>
+        _ end: RecognitionTurnEnd
     ) -> RecognitionBatchEnqueueResult {
         let result = lock.withLock {
             guard terminal == nil else {
                 return RecognitionBatchEnqueueResult.terminated
             }
-            append(.turnEnded(samples))
+            append(.turnEnded(end))
             return .queued
         }
         continuation.yield()
@@ -375,7 +375,7 @@ public final class OrderedRecognitionBatchPipeline: @unchecked Sendable {
     public typealias Handler =
         @Sendable ([RecognitionHypothesis]) async throws -> Void
     public typealias TurnEndedHandler =
-        @Sendable (ContiguousArray<Float>) async throws -> Void
+        @Sendable (RecognitionTurnEnd) async throws -> Void
 
     private let mailbox: RecognitionBatchMailbox
     private let stateLock = NSLock()
@@ -407,8 +407,8 @@ public final class OrderedRecognitionBatchPipeline: @unchecked Sendable {
                 switch $0 {
                 case .batch(let batch):
                     try await handler(batch)
-                case .turnEnded(let samples):
-                    try await turnEndedHandler(samples)
+                case .turnEnded(let end):
+                    try await turnEndedHandler(end)
                 }
             }
             let task = Task<RecognitionWorkerCompletion, Never> {
@@ -462,9 +462,9 @@ public final class OrderedRecognitionBatchPipeline: @unchecked Sendable {
     /// published after them and before any enqueued later.
     @discardableResult
     public func enqueueTurnEnded(
-        samples: ContiguousArray<Float>
+        _ end: RecognitionTurnEnd
     ) -> RecognitionBatchEnqueueResult {
-        mailbox.enqueueTurnEnded(samples)
+        mailbox.enqueueTurnEnded(end)
     }
 
     public func fail(_ failure: SidecarServiceFailure) {
@@ -794,10 +794,10 @@ public enum WhisperKitRecognitionEvent: Sendable {
     )
     case activity(VoiceActivity)
     case captureDiscontinuity(atMilliseconds: UInt64)
-    /// A final-silence reset ended the turn. Published after every
-    /// hypothesis of the turn, with the turn's buffer as it stood before the
-    /// reset cleared it.
-    case turnEnded(samples: ContiguousArray<Float>)
+    /// A final-silence reset ended the turn, or a discontinuity closed it.
+    /// Published after every hypothesis of the turn; only in a session that
+    /// collects turn audio.
+    case turnEnded(RecognitionTurnEnd)
     case failure(
         sessionID: UInt64,
         failure: SidecarServiceFailure
@@ -892,10 +892,8 @@ public struct SidecarRecognitionEventPublisher: Sendable {
                     atMilliseconds: atMilliseconds
                 )
             return false
-        case .turnEnded(let samples):
-            try await session.publishTurnEndedFromRecognitionWorker(
-                samples: samples
-            )
+        case .turnEnded(let end):
+            try await session.publishTurnEndedFromRecognitionWorker(end)
             return false
         case .failure(_, let failure):
             throw failure
@@ -1056,6 +1054,9 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
     private var speechGate = RecognitionSpeechGate(
         thresholdMilliseconds: 200
     )
+    /// Capture discontinuities published to the session, which counts them
+    /// too; a turn end carries the count it was taken at.
+    private var discontinuityCount: UInt64 = 0
 
     public init(
         modelPath: String,
@@ -1199,8 +1200,8 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
                     .hypothesis(hypothesis)
                 )
             }
-        } onTurnEnded: { samples in
-            _ = try await eventRelay.emit(.turnEnded(samples: samples))
+        } onTurnEnded: { end in
+            _ = try await eventRelay.emit(.turnEnded(end))
         }
         monitorTasks.append(
             monitorRecognitionWorker(hypothesisWorker) { failure in
@@ -1403,14 +1404,29 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
         }
         recognitionResetTask = nil
         // Stopping the transcriber clears the turn buffer, so a turn ended by
-        // final silence is snapshotted first.
-        let endedTurn: ContiguousArray<Float>?
+        // final silence is snapshotted first. A discontinuity's reset closes
+        // the dropped turn with an end from before the gap and no audio, so
+        // the session discards that turn's last finals instead of letting a
+        // later turn claim them.
+        let endedTurn: RecognitionTurnEnd?
         if discardingBufferedAudio {
             turnAudioProcessor.beginDiscontinuityTransition()
-            endedTurn = nil
+            endedTurn = configuration.collectsTurnAudio
+                ? RecognitionTurnEnd(
+                    samples: [],
+                    nextTurnFromMilliseconds: 0,
+                    discontinuities: discontinuityCount &- 1
+                )
+                : nil
         } else {
             turnAudioProcessor.beginTransition()
-            endedTurn = turnAudioProcessor.audioSamples
+            endedTurn = configuration.collectsTurnAudio
+                ? turnAudioProcessor.turnEnd(
+                    configuration: configuration,
+                    atMilliseconds: elapsedMilliseconds(),
+                    discontinuities: discontinuityCount
+                )
+                : nil
         }
         await transcriber.stopStreamTranscription()
         _ = await transcriptionTask.value
@@ -1430,7 +1446,7 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
         // The old transcriber has published its last hypothesis; the turn
         // end queues behind it and ahead of the replacement's first.
         if let endedTurn {
-            pipeline.enqueueTurnEnded(samples: endedTurn)
+            pipeline.enqueueTurnEnded(endedTurn)
         }
         let replacement = Self.makeTranscriber(
             components: components,
@@ -1460,6 +1476,9 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
                     atMilliseconds: elapsedMilliseconds()
                 )
             )
+            // Counted once the session has it: a reset that ran during the
+            // emit took the pre-gap buffer and must carry the older count.
+            discontinuityCount += 1
             speechGate.resetForDiscontinuity()
             if let configuration = preparedConfiguration {
                 // Discard the stitched pre-gap audio immediately, but run the

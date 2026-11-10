@@ -1406,6 +1406,23 @@ private func speechWindow(
     )
 }
 
+/// Ends the current turn the way a backend does. By default the next turn's
+/// audio starts after every overlap the tests produce, so none carries over.
+private func endTurn(
+    _ session: SidecarSession,
+    samples: ContiguousArray<Float> = turnSamples,
+    nextTurnFrom: UInt64 = .max,
+    discontinuities: UInt64 = 0
+) async throws {
+    try await session.publishTurnEndedFromRecognitionWorker(
+        RecognitionTurnEnd(
+            samples: samples,
+            nextTurnFromMilliseconds: nextTurnFrom,
+            discontinuities: discontinuities
+        )
+    )
+}
+
 private func turnAudioFrames(_ events: RecordingEventSink) async -> [ChildFrame] {
     await events.frames.filter { $0.turnAudio != nil }
 }
@@ -1416,7 +1433,7 @@ func versionTwoSessionSendsTurnAudioAfterTheTurnsFinals() async throws {
 
     try await session.publishRecognitionHypothesisFromWorker(partial(1))
     try await session.publishRecognitionHypothesisFromWorker(final(1))
-    try await session.publishTurnEndedFromRecognitionWorker(samples: turnSamples)
+    try await endTurn(session)
     // The next turn's first hypothesis restarts at segment 1.
     try await session.publishRecognitionHypothesisFromWorker(partial(1))
 
@@ -1441,9 +1458,9 @@ func versionOneSessionNeverSendsTurnAudio() async throws {
     try await speechWindow(session, at: 10)
 
     try await session.publishRecognitionHypothesisFromWorker(final(1))
-    try await session.publishTurnEndedFromRecognitionWorker(samples: turnSamples)
+    try await endTurn(session)
     try await session.publishRecognitionHypothesisFromWorker(final(1))
-    try await session.publishTurnEndedFromRecognitionWorker(samples: turnSamples)
+    try await endTurn(session)
 
     let frames = await events.frames
     #expect(frames.allSatisfy { $0.version == 1 })
@@ -1473,19 +1490,20 @@ func aTurnWithoutAFinalSendsNoTurnAudio() async throws {
 
     try await session.publishRecognitionHypothesisFromWorker(partial(1))
     try await session.publishRecognitionHypothesisFromWorker(partial(2))
-    try await session.publishTurnEndedFromRecognitionWorker(samples: turnSamples)
+    try await endTurn(session)
     #expect(await turnAudioFrames(events).isEmpty)
 
     // A turn whose buffer is all closing silence has an empty result.
     try await session.publishRecognitionHypothesisFromWorker(final(1))
-    try await session.publishTurnEndedFromRecognitionWorker(
+    try await endTurn(
+        session,
         samples: ContiguousArray(repeating: 0.25, count: 9_600)
     )
     #expect(await turnAudioFrames(events).isEmpty)
 
     // Neither turn leaks into the next one.
     try await session.publishRecognitionHypothesisFromWorker(final(1))
-    try await session.publishTurnEndedFromRecognitionWorker(samples: turnSamples)
+    try await endTurn(session)
     #expect(
         await turnAudioFrames(events)
             == [turnAudioFrame(segmentID: 1, finalSegments: 1, playbackOverlap: false)]
@@ -1501,7 +1519,7 @@ func aJoinedTurnReportsItsFinalSegmentCount() async throws {
     try await session.publishRecognitionHypothesisFromWorker(final(2))
     // A repeated final of the same segment is still one segment.
     try await session.publishRecognitionHypothesisFromWorker(final(2))
-    try await session.publishTurnEndedFromRecognitionWorker(samples: turnSamples)
+    try await endTurn(session)
 
     #expect(
         await events.frames.last
@@ -1517,7 +1535,7 @@ func playbackDuringSpeechMarksTheTurn() async throws {
     try await speechWindow(session, at: 10)
 
     try await session.publishRecognitionHypothesisFromWorker(final(1))
-    try await session.publishTurnEndedFromRecognitionWorker(samples: turnSamples)
+    try await endTurn(session)
 
     #expect(
         await turnAudioFrames(events)
@@ -1534,7 +1552,7 @@ func aSpeechStartDuringPlaybackMarksTheTurn() async throws {
         .speechStarted(atMilliseconds: 10)
     )
     try await session.publishRecognitionHypothesisFromWorker(final(1))
-    try await session.publishTurnEndedFromRecognitionWorker(samples: turnSamples)
+    try await endTurn(session)
 
     #expect(
         await turnAudioFrames(events)
@@ -1559,7 +1577,7 @@ func aBargeInMarksTheTurn() async throws {
     )
 
     try await session.publishRecognitionHypothesisFromWorker(final(1))
-    try await session.publishTurnEndedFromRecognitionWorker(samples: turnSamples)
+    try await endTurn(session)
 
     #expect(
         await turnAudioFrames(events)
@@ -1584,7 +1602,7 @@ func playbackThatEndedBeforeSpeechDoesNotMarkTheTurn() async throws {
     try await session.publishVoiceActivityFromRecognitionWorker(
         .speechEnded(atMilliseconds: 900)
     )
-    try await session.publishTurnEndedFromRecognitionWorker(samples: turnSamples)
+    try await endTurn(session)
 
     #expect(
         await turnAudioFrames(events)
@@ -1605,7 +1623,9 @@ func theNextTurnStartsUnmarked() async throws {
         .speechEnded(atMilliseconds: 900)
     )
     try await session.playbackRendered(frame.identity)
-    try await session.publishTurnEndedFromRecognitionWorker(samples: turnSamples)
+    // The reset ended the turn at 1,500 ms; the next turn's audio can start
+    // at 900 ms, after the overlap at 10 ms.
+    try await endTurn(session, nextTurnFrom: 900)
 
     try await speechWindow(session, at: 2_000)
     try await session.publishVoiceActivityFromRecognitionWorker(
@@ -1615,7 +1635,7 @@ func theNextTurnStartsUnmarked() async throws {
     try await session.publishVoiceActivityFromRecognitionWorker(
         .speechEnded(atMilliseconds: 2_900)
     )
-    try await session.publishTurnEndedFromRecognitionWorker(samples: turnSamples)
+    try await endTurn(session)
 
     #expect(
         await turnAudioFrames(events)
@@ -1627,8 +1647,8 @@ func theNextTurnStartsUnmarked() async throws {
 }
 
 @Test
-func speechOverPlaybackAfterATurnsSpeechEndedAlsoMarksTheNextTurn() async throws {
-    // The backend ends a turn some time after its speech ended. Speech that
+func speechOverPlaybackBeforeAnEarlierTurnsEndMarksTheNextTurn() async throws {
+    // A backend ends a turn some time after its reset began. Speech that
     // starts in between, over the companion's playback, can reach the
     // session before the turn end does; it belongs to the next turn.
     let (session, events) = try await capturingSession(version: 2)
@@ -1640,18 +1660,18 @@ func speechOverPlaybackAfterATurnsSpeechEndedAlsoMarksTheNextTurn() async throws
         .speechEnded(atMilliseconds: 900)
     )
     let frame = try await startPlayback(session)
-    try await speechWindow(session, at: 1_000)
+    try await speechWindow(session, at: 1_600)
     try await session.playbackRendered(frame.identity)
-    try await session.publishTurnEndedFromRecognitionWorker(samples: turnSamples)
+    try await endTurn(session, nextTurnFrom: 900)
 
     try await session.publishVoiceActivityFromRecognitionWorker(
-        .speechStarted(atMilliseconds: 1_100)
+        .speechStarted(atMilliseconds: 1_700)
     )
     try await session.publishRecognitionHypothesisFromWorker(final(1))
     try await session.publishVoiceActivityFromRecognitionWorker(
         .speechEnded(atMilliseconds: 2_000)
     )
-    try await session.publishTurnEndedFromRecognitionWorker(samples: turnSamples)
+    try await endTurn(session, nextTurnFrom: 2_000)
 
     #expect(
         await turnAudioFrames(events)
@@ -1659,6 +1679,66 @@ func speechOverPlaybackAfterATurnsSpeechEndedAlsoMarksTheNextTurn() async throws
                 turnAudioFrame(segmentID: 1, finalSegments: 1, playbackOverlap: true),
                 turnAudioFrame(segmentID: 1, finalSegments: 1, playbackOverlap: true),
             ]
+    )
+}
+
+@Test
+func aShortTurnOverPlaybackThatEndsBeforeTheEarlierTurnEndsIsMarked() async throws {
+    // Turn B starts and ends over playback while turn A's end is still on
+    // its way; B's own speech end must not clear what B carries.
+    let (session, events) = try await capturingSession(version: 2)
+    try await session.publishVoiceActivityFromRecognitionWorker(
+        .speechStarted(atMilliseconds: 10)
+    )
+    try await session.publishRecognitionHypothesisFromWorker(final(1))
+    try await session.publishVoiceActivityFromRecognitionWorker(
+        .speechEnded(atMilliseconds: 900)
+    )
+    let frame = try await startPlayback(session)
+    try await speechWindow(session, at: 1_600)
+    try await speechWindow(session, at: 1_700)
+    try await session.publishVoiceActivityFromRecognitionWorker(
+        .speechStarted(atMilliseconds: 1_700)
+    )
+    try await speechWindow(session, isSpeech: false, at: 1_800)
+    try await session.publishVoiceActivityFromRecognitionWorker(
+        .speechEnded(atMilliseconds: 1_800)
+    )
+    try await session.playbackRendered(frame.identity)
+    // A's turn end arrives only now; A's reset began at 1,500 ms.
+    try await endTurn(session, nextTurnFrom: 900)
+
+    try await session.publishRecognitionHypothesisFromWorker(final(1))
+    try await endTurn(session, nextTurnFrom: 1_800)
+
+    #expect(
+        await turnAudioFrames(events)
+            == [
+                turnAudioFrame(segmentID: 1, finalSegments: 1, playbackOverlap: true),
+                turnAudioFrame(segmentID: 1, finalSegments: 1, playbackOverlap: true),
+            ]
+    )
+}
+
+@Test
+func overlapThatOvertakesTwoTurnEndsStillMarksItsTurn() async throws {
+    let (session, events) = try await capturingSession(version: 2)
+    let frame = try await startPlayback(session)
+    try await speechWindow(session, at: 3_000)
+    try await session.playbackRendered(frame.identity)
+
+    for nextTurnFrom: UInt64 in [900, 2_500, 4_000, 5_000] {
+        try await session.publishRecognitionHypothesisFromWorker(final(1))
+        try await endTurn(session, nextTurnFrom: nextTurnFrom)
+    }
+
+    // The overlap at 3,000 ms reaches the session while the first turn is
+    // current. It marks the first turn (to be safe), the turn whose audio
+    // holds it (from 2,500 ms), and every turn between; the turn whose audio
+    // begins at 4,000 ms is clear of it.
+    #expect(
+        await turnAudioFrames(events).map { $0.turnAudio?.playbackOverlap }
+            == [true, true, true, false]
     )
 }
 
@@ -1687,11 +1767,111 @@ func aCaptureDiscontinuityDropsTheTurn() async throws {
 
     // Nothing of the dropped turn — its finals or its overlap — carries on.
     try await session.publishRecognitionHypothesisFromWorker(final(1))
-    try await session.publishTurnEndedFromRecognitionWorker(samples: turnSamples)
+    try await endTurn(session, discontinuities: 1)
     #expect(
         await turnAudioFrames(events)
             == [turnAudioFrame(segmentID: 1, finalSegments: 1, playbackOverlap: false)]
     )
+}
+
+@Test
+func aTurnEndFromBeforeADiscontinuitySendsNothing() async throws {
+    let (session, events) = try await capturingSession(version: 2)
+    let frame = try await startPlayback(session)
+    try await speechWindow(session, at: 10)
+    try await session.playbackRendered(frame.identity)
+    try await session.observeCaptureDiscontinuityFromRecognitionWorker(
+        atMilliseconds: 500
+    )
+    // The turn's last final and its end were still queued in the backend.
+    try await session.publishRecognitionHypothesisFromWorker(final(1))
+    try await endTurn(session, discontinuities: 0)
+    #expect(await turnAudioFrames(events).isEmpty)
+
+    // The next turn ends after the discontinuity and is sent.
+    try await session.publishRecognitionHypothesisFromWorker(final(1))
+    try await endTurn(session, discontinuities: 1)
+    #expect(
+        await turnAudioFrames(events)
+            == [turnAudioFrame(segmentID: 1, finalSegments: 1, playbackOverlap: false)]
+    )
+}
+
+@Test
+func aStaleTurnEndDropsTheFinalsThatPrecededItButKeepsTheOverlap() async throws {
+    let (session, events) = try await capturingSession(version: 2)
+    try await session.observeCaptureDiscontinuityFromRecognitionWorker(
+        atMilliseconds: 500
+    )
+    // Speech after the gap, over playback.
+    let frame = try await startPlayback(session)
+    try await speechWindow(session, at: 600)
+    try await session.playbackRendered(frame.identity)
+    // A final of the turn before the gap, then the backend closes that turn
+    // with a turn end from before the gap (a discontinuity's own closing
+    // end carries no audio).
+    try await session.publishRecognitionHypothesisFromWorker(final(3))
+    try await endTurn(session, samples: [], discontinuities: 0)
+
+    // A turn after the gap with no final of its own sends nothing: the old
+    // turn's final is not its segment.
+    try await endTurn(session, discontinuities: 1)
+    #expect(await turnAudioFrames(events).isEmpty)
+
+    try await session.publishRecognitionHypothesisFromWorker(final(1))
+    try await endTurn(session, discontinuities: 1)
+    #expect(
+        await turnAudioFrames(events)
+            == [turnAudioFrame(segmentID: 1, finalSegments: 1, playbackOverlap: false)]
+    )
+}
+
+@Test
+func overlapAfterADiscontinuitySurvivesAStaleTurnEnd() async throws {
+    let (session, events) = try await capturingSession(version: 2)
+    try await session.observeCaptureDiscontinuityFromRecognitionWorker(
+        atMilliseconds: 500
+    )
+    let frame = try await startPlayback(session)
+    try await speechWindow(session, at: 600)
+    try await session.playbackRendered(frame.identity)
+    try await endTurn(session, samples: [], discontinuities: 0)
+
+    try await session.publishRecognitionHypothesisFromWorker(final(1))
+    try await endTurn(session, discontinuities: 1)
+    #expect(
+        await turnAudioFrames(events)
+            == [turnAudioFrame(segmentID: 1, finalSegments: 1, playbackOverlap: true)]
+    )
+}
+
+@Test
+func onlyAVersionTwoSessionAsksForTurnAudio() async throws {
+    for (version, collects) in [(UInt16(1), false), (UInt16(2), true)] {
+        let recognition = RecordingRecognitionService()
+        let session = SidecarSession(
+            audioService: RecordingAudioService(),
+            recognitionService: recognition,
+            playbackService: RecordingPlaybackService(),
+            eventSink: RecordingEventSink()
+        )
+        try await session.handleControl(
+            ChildFrame(
+                control: .startSession(
+                    sessionID: 7,
+                    speechStartMilliseconds: 200,
+                    finalSilenceMilliseconds: 600
+                )
+            ).atVersion(version)
+        )
+        try await session.handleControl(
+            ChildFrame(control: .startCapture(sessionID: 7, operationID: 1))
+                .atVersion(version)
+        )
+        #expect(
+            await recognition.configurations.map(\.collectsTurnAudio) == [collects]
+        )
+    }
 }
 
 @Test
@@ -1707,7 +1887,7 @@ func everyFrameCarriesTheSessionsVersion() async throws {
         .speechStarted(atMilliseconds: 10)
     )
     try await session.publishRecognitionHypothesisFromWorker(final(1))
-    try await session.publishTurnEndedFromRecognitionWorker(samples: turnSamples)
+    try await endTurn(session)
     try await session.playbackRendered(frame.identity)
     _ = try await startPlayback(session, generationID: 6)
     try await session.handleControl(

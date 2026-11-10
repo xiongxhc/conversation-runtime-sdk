@@ -72,3 +72,24 @@ func aTurnShorterThanItsClosingSilenceIsEmpty() {
         ).isEmpty
     )
 }
+
+@Test
+func aBackendKeepsOnlyWhatTheSnapshotReads() {
+    let turn = ContiguousArray((0..<500_000).map { exactSample($0 % 30_000) })
+
+    let retained = TurnAudioSnapshot.retainedSamples(
+        of: turn,
+        finalSilenceMilliseconds: 700
+    )
+
+    #expect(retained.count == 171_200)
+    #expect(
+        TurnAudioSnapshot.pcm16(turnSamples: retained, finalSilenceMilliseconds: 700)
+            == TurnAudioSnapshot.pcm16(turnSamples: turn, finalSilenceMilliseconds: 700)
+    )
+    let short = ContiguousArray<Float>(repeating: 0.5, count: 1_000)
+    #expect(
+        TurnAudioSnapshot.retainedSamples(of: short, finalSilenceMilliseconds: 700)
+            == short
+    )
+}

@@ -197,6 +197,9 @@ public actor SenseVoiceRecognition: SidecarRecognitionService {
     )
     private var tracker = SenseVoiceSegmentTracker()
     private var turnEpoch: UInt64 = 0
+    /// Capture discontinuities published to the session, which counts them
+    /// too; a turn end carries the count it was taken at.
+    private var discontinuityCount: UInt64 = 0
     private var lastPartialRequestMilliseconds: UInt64 = 0
 
     public init(
@@ -307,8 +310,8 @@ public actor SenseVoiceRecognition: SidecarRecognitionService {
                     .hypothesis(hypothesis)
                 )
             }
-        } onTurnEnded: { samples in
-            _ = try await eventRelay.emit(.turnEnded(samples: samples))
+        } onTurnEnded: { end in
+            _ = try await eventRelay.emit(.turnEnded(end))
         }
         monitorTasks.append(
             monitorRecognitionWorker(hypothesisWorker) { failure in
@@ -498,15 +501,21 @@ public actor SenseVoiceRecognition: SidecarRecognitionService {
     // numbering begins again at 1. The turn's finals were queued by earlier
     // decode requests on this worker, so its end queues behind them.
     private func resetTurnBuffer() throws {
-        guard preparedConfiguration != nil,
+        guard let configuration = preparedConfiguration,
             !speechGate.isSpeaking,
             !workerStopState.isStopping
         else {
             return
         }
-        hypothesisPipeline?.enqueueTurnEnded(
-            samples: turnAudioProcessor.audioSamples
-        )
+        if configuration.collectsTurnAudio {
+            hypothesisPipeline?.enqueueTurnEnded(
+                turnAudioProcessor.turnEnd(
+                    configuration: configuration,
+                    atMilliseconds: elapsedMilliseconds(),
+                    discontinuities: discontinuityCount
+                )
+            )
+        }
         turnEpoch += 1
         tracker.resetForNewTurn()
         lastPartialRequestMilliseconds = 0
@@ -555,11 +564,25 @@ public actor SenseVoiceRecognition: SidecarRecognitionService {
                     atMilliseconds: elapsedMilliseconds()
                 )
             )
+            // Counted once the session has it: a reset that ran during the
+            // emit took the pre-gap buffer and must carry the older count.
+            discontinuityCount += 1
             speechGate.resetForDiscontinuity()
             turnEpoch += 1
             tracker.resetForNewTurn()
             lastPartialRequestMilliseconds = 0
             decodeMailbox?.clear()
+            // Close the dropped turn behind its finals already queued; decodes
+            // still in flight carry the old epoch and are discarded.
+            if preparedConfiguration?.collectsTurnAudio == true {
+                hypothesisPipeline?.enqueueTurnEnded(
+                    RecognitionTurnEnd(
+                        samples: [],
+                        nextTurnFromMilliseconds: 0,
+                        discontinuities: discontinuityCount - 1
+                    )
+                )
+            }
             turnAudioProcessor.beginDiscontinuityTransition()
             try turnAudioProcessor.startRecordingLive(
                 inputDeviceID: nil,

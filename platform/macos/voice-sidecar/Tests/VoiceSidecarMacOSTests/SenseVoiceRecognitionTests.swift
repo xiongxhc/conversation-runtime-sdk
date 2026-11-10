@@ -212,6 +212,16 @@ private actor TurnAudioTestSink: SidecarEventSink {
     }
 }
 
+private actor TurnEndRecorder {
+    private(set) var sampleCounts: [Int] = []
+
+    func record(_ event: WhisperKitRecognitionEvent) {
+        if case .turnEnded(let end) = event {
+            sampleCounts.append(end.samples.count)
+        }
+    }
+}
+
 private struct IdleAudioService: SidecarAudioService {
     func start(configuration _: SidecarConfiguration) async throws {}
     func pauseCapture() async throws {}
@@ -248,8 +258,8 @@ private func captureBuffer(_ samples: ArraySlice<Float>) throws -> AVAudioPCMBuf
     return buffer
 }
 
-@Test(.enabled(if: senseVoiceModelAvailable()))
-func finalSilencePublishesTheTurnBeforeItsBufferIsCleared() async throws {
+@Test(.enabled(if: senseVoiceModelAvailable()), arguments: [UInt16(1), UInt16(2)])
+func finalSilencePublishesTheTurnBeforeItsBufferIsCleared(version: UInt16) async throws {
     let audioProcessor = VoiceProcessingAudioProcessor(
         engine: VoiceProcessingEngine()
     )
@@ -265,8 +275,10 @@ func finalSilencePublishesTheTurnBeforeItsBufferIsCleared() async throws {
         eventSink: sink
     )
     let publisher = SidecarRecognitionEventPublisher(session: session)
+    let turnEnds = TurnEndRecorder()
     await recognition.setEventHandler { event in
-        try await publisher.publish(event)
+        await turnEnds.record(event)
+        return try await publisher.publish(event)
     }
     try await session.handleControl(
         ChildFrame(
@@ -275,11 +287,11 @@ func finalSilencePublishesTheTurnBeforeItsBufferIsCleared() async throws {
                 speechStartMilliseconds: 200,
                 finalSilenceMilliseconds: 1_000
             )
-        ).atVersion(2)
+        ).atVersion(version)
     )
     try await session.handleControl(
         ChildFrame(control: .startCapture(sessionID: 7, operationID: 1))
-            .atVersion(2)
+            .atVersion(version)
     )
 
     // The clip goes in five times faster than real time, so pauses inside
@@ -287,16 +299,21 @@ func finalSilencePublishesTheTurnBeforeItsBufferIsCleared() async throws {
     // It stops after its first 4.4 s, which end in speech: past that, a lone
     // window the VAD takes for speech follows the speech end and cancels the
     // final-silence reset without a later speech end to schedule another.
+    // Three times over, 13.2 s, is longer than the 10 s a turn keeps.
     let clip = Array(try loadTestWavSamples("zh.wav").prefix(70_400))
-    for start in stride(from: 0, to: clip.count, by: 1_600) {
+    let speech = clip + clip + clip
+    for start in stride(from: 0, to: speech.count, by: 1_600) {
         audioProcessor.consumeCaptureEvent(
-            .buffer(try captureBuffer(clip[start..<min(start + 1_600, clip.count)]))
+            .buffer(try captureBuffer(speech[start..<min(start + 1_600, speech.count)]))
         )
         try await Task.sleep(for: .milliseconds(20))
     }
-    // Silence twice as fast as real time, until the turn ends.
+    // Silence twice as fast as real time, until the turn ends. A version 1
+    // session never sends turn audio, so it gets 3 s: three final silences.
     let silence = [Float](repeating: 0, count: 1_600)
-    let deadline = ContinuousClock.now.advanced(by: .seconds(30))
+    let deadline = ContinuousClock.now.advanced(
+        by: version == 2 ? .seconds(30) : .seconds(3)
+    )
     while await !sink.hasTurnAudio, ContinuousClock.now < deadline {
         audioProcessor.consumeCaptureEvent(
             .buffer(try captureBuffer(silence[...]))
@@ -304,10 +321,23 @@ func finalSilencePublishesTheTurnBeforeItsBufferIsCleared() async throws {
         try await Task.sleep(for: .milliseconds(50))
     }
     try await session.handleControl(
-        ChildFrame(control: .shutdown(sessionID: 7)).atVersion(2)
+        ChildFrame(control: .shutdown(sessionID: 7)).atVersion(version)
     )
 
     let frames = await sink.frames
+    guard version == 2 else {
+        // A version 1 session's backend copies and publishes no turn audio.
+        #expect(await turnEnds.sampleCounts.isEmpty)
+        #expect(!frames.contains { $0.turnAudio != nil })
+        #expect(frames.contains {
+            guard case .transcriptHypothesis(_, let hypothesis) = $0.control else {
+                return false
+            }
+            return hypothesis.engineFinal
+        })
+        #expect(frames.allSatisfy { $0.version == 1 })
+        return
+    }
     let turnAudioIndex = try #require(frames.firstIndex { $0.turnAudio != nil })
     let turnAudio = try #require(frames[turnAudioIndex].turnAudio)
     let finals = frames[..<turnAudioIndex].compactMap { frame -> UInt64? in
@@ -323,10 +353,13 @@ func finalSilencePublishesTheTurnBeforeItsBufferIsCleared() async throws {
     #expect(turnAudio.segmentID == finals.last)
     #expect(turnAudio.finalSegments == UInt16(Set(finals).count))
     #expect(!turnAudio.playbackOverlap)
-    // The audio is the clip's turn, not the pre-roll left after the reset.
-    #expect(turnAudio.samples.count >= clip.count - 16_000)
-    #expect(turnAudio.samples.count <= 160_000)
+    // The audio is the turn's last 10 s, not the pre-roll left after the
+    // reset.
+    #expect(turnAudio.samples.count == 160_000)
     #expect(turnAudio.samples.contains { abs(Int($0)) > 1_000 })
     #expect(frames.filter { $0.turnAudio != nil }.count == 1)
     #expect(frames.allSatisfy { $0.version == 2 })
+    // The backend handed over only what the snapshot reads: 10 s plus the
+    // 1 s final silence.
+    #expect(await turnEnds.sampleCounts == [176_000])
 }

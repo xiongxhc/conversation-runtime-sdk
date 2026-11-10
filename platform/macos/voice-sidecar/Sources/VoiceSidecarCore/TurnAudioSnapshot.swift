@@ -26,4 +26,22 @@ public enum TurnAudioSnapshot {
             return Int16((min(max(sample, -1), 1) * 32_767).rounded())
         }
     }
+
+    /// The end of a turn buffer that `pcm16` reads: at most the last
+    /// 160,000 samples plus the final silence. A backend copies only this.
+    public static func retainedSamples(
+        of turnSamples: ContiguousArray<Float>,
+        finalSilenceMilliseconds: UInt64
+    ) -> ContiguousArray<Float> {
+        let silence = finalSilenceMilliseconds
+            .multipliedReportingOverflow(by: UInt64(samplesPerMillisecond))
+        let kept = UInt64(ChildProtocol.maximumTurnAudioSamples)
+            .addingReportingOverflow(silence.partialValue)
+        guard !silence.overflow, !kept.overflow,
+            kept.partialValue < UInt64(turnSamples.count)
+        else {
+            return turnSamples
+        }
+        return ContiguousArray(turnSamples.suffix(Int(kept.partialValue)))
+    }
 }

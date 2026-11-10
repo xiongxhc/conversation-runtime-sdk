@@ -67,15 +67,22 @@ last 160,000 samples, clamped to [-1, 1], scaled by 32,767 and rounded to the
 nearest integer.
 
 Nothing is sent for a turn with no engine final, an empty result, a capture
-discontinuity, or a version 1 session. Pausing capture, or restarting
+discontinuity, or a version 1 session. A turn that ended before a capture
+discontinuity but whose end reaches the session after it sends nothing, and its
+remaining finals count for no later turn. Pausing capture, or restarting
 recognition after a recoverable recognition failure, discards the turn in
-progress, which then sends nothing either.
+progress, which then sends nothing either. In a version 1 session the
+recognition backend copies no turn audio at all.
 
 The playback flag is set when playback was active in any voice window in which
 the person was speaking, or when a speech start was sent while playback was
-active. The recognition backend ends a turn some time after its speech ended,
-so speech over playback that the sidecar sees between a turn's speech end and
-its `TurnAudio` frame marks both that turn and the next one.
+active. Voice windows reach the session sooner than the turn end, which follows
+the turn's last hypothesis, so a window can arrive before the end of the turn
+before its own. Each turn end therefore names the earliest time the next turn's
+audio can begin (the backend's 300 ms pre-roll plus one second for capture
+buffering), and any overlap seen at or after that time also marks the next turn.
+A turn can be marked for overlap that falls just outside its audio; it is never
+left unmarked for overlap inside it that reached the session before its end.
 
 Both recognition backends queue the turn's end behind the turn's last
 hypothesis and ahead of the next turn's first, and standard output preserves

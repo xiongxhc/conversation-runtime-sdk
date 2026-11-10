@@ -261,21 +261,24 @@ do not run it from CI, a developer laptop on a public network, or an untrusted b
 
 ## 8. Turn audio from the voice sidecar on real hardware
 
-Not yet performed. The automated tests drive the sidecar session with fakes and, for
-SenseVoice only, feed a recorded clip from the installed model's `test_wavs` through the real
-backend; none uses a microphone, a speaker or a person. The WhisperKit final-silence reset path
-has no automated test. The SenseVoice test is skipped when the SenseVoice model is not
-installed.
+Not yet performed, and it cannot be performed yet. The gateway does not record turn-audio
+frames in any content-free form today. A record of each frame's segment id, final-segment
+count and playback flag, never its samples or the words, has to exist first.
 
-Run this once per recognition backend (`--asr-backend whisperkit` and
-`--asr-backend sensevoice`), each with a version 2 session, which the gateway selects when
+The automated tests drive the sidecar session with fakes. For SenseVoice only, a test also
+feeds a recorded clip from the installed model's `test_wavs` through the real backend. No test
+uses a microphone, a speaker or a person. The WhisperKit final-silence reset path has no
+automated test. The SenseVoice test is skipped when the SenseVoice model is not installed.
+
+When that record exists, run this once per recognition backend (`--asr-backend whisperkit` and
+`--asr-backend sensevoice`), each in a version 2 session, which the gateway selects when
 speaker identity is configured:
 
 1. One person speaks a short turn (about two seconds) and then a long turn (more than ten
-   seconds), pausing past the configured final silence after each.
+   seconds), pausing past the configured final silence after each and starting each turn only
+   once the companion's reply has finished playing.
 2. The same person speaks one more turn while the companion's reply is playing.
-3. From the session's content-free trace, record for each turn only the frame kinds, segment
-   ids, final-segment counts and playback flags; never the samples or the words. Expected: each
-   finished turn produced exactly one turn-audio frame, after that turn's finals and before the
-   next turn's hypotheses; the long turn's frame holds 160,000 samples; and only the turn spoken
-   over playback has the playback flag set.
+3. The person must observe that each finished turn produced exactly one turn-audio frame,
+   after that turn's finals and before the next turn's hypotheses; that the long turn's frame
+   holds 160,000 samples; and that the turn spoken over playback has the playback flag set
+   while the short and long turns do not.

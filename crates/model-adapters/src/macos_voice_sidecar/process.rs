@@ -1503,7 +1503,9 @@ where
     }
     let decoded = decode_frame(&frame)
         .map_err(|_| AdapterError::new("voice sidecar event frame was malformed"))?;
-    debug_assert_eq!(decoded.version(), PROTOCOL_VERSION);
+    if decoded.version() != PROTOCOL_VERSION {
+        return Err(AdapterError::new("voice sidecar event frame was malformed"));
+    }
     if decoded.as_audio().is_some() {
         return Err(AdapterError::new(
             "voice sidecar emitted media on standard output",

@@ -3,8 +3,10 @@ use std::path::{Path, PathBuf};
 
 use super::codec::{
     decode_audio_payload, decode_frame, decode_frame_at_eof, encode_frame, SidecarCodecError,
-    SidecarControl, SidecarFailureCode, SidecarFrame, SidecarFrameKind, AUDIO_METADATA_BYTES,
-    HEADER_BYTES, MAX_AUDIO_PAYLOAD_BYTES, MAX_CONTROL_PAYLOAD_BYTES, PROTOCOL_VERSION,
+    SidecarControl, SidecarFailureCode, SidecarFrame, SidecarFrameKind, SidecarTurnAudioFrame,
+    AUDIO_METADATA_BYTES, HEADER_BYTES, MAX_AUDIO_PAYLOAD_BYTES, MAX_CONTROL_PAYLOAD_BYTES,
+    MAX_TURN_AUDIO_PAYLOAD_BYTES, MAX_TURN_AUDIO_SAMPLES, PROTOCOL_VERSION,
+    TURN_AUDIO_METADATA_BYTES, TURN_AUDIO_PROTOCOL_VERSION,
 };
 use crate::{AudioFrame, PcmFormat, PcmSampleFormat, RecognitionHypothesis};
 use conversation_protocol::{
@@ -12,6 +14,7 @@ use conversation_protocol::{
 };
 
 const FIXTURE_ROOT: &str = "../../tests/fixtures/voice-sidecar-v1";
+const FIXTURE_ROOT_V2: &str = "../../tests/fixtures/voice-sidecar-v2";
 
 #[test]
 fn version_one_capture_kind_codes_are_pinned() {
@@ -789,6 +792,277 @@ fn write_version_one_fixtures() {
             &format!("control/{name}"),
             &encode_frame(&SidecarFrame::control(control)).unwrap(),
         );
+    }
+}
+
+fn turn_audio_sample_frame() -> SidecarFrame {
+    SidecarFrame::turn_audio(SidecarTurnAudioFrame {
+        session_id: SessionId::new(7),
+        segment_id: 4,
+        final_segments: 1,
+        playback_overlap: true,
+        samples: vec![0, 1, -1, 32767, -32768],
+    })
+}
+
+fn turn_audio_payload(sample_count: u32, final_segments: u16, flags: u16, bytes: usize) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&7_u64.to_be_bytes());
+    payload.extend_from_slice(&4_u64.to_be_bytes());
+    payload.extend_from_slice(&sample_count.to_be_bytes());
+    payload.extend_from_slice(&final_segments.to_be_bytes());
+    payload.extend_from_slice(&flags.to_be_bytes());
+    payload.resize(TURN_AUDIO_METADATA_BYTES + bytes, 0);
+    payload
+}
+
+fn turn_audio_raw(payload: &[u8]) -> Vec<u8> {
+    raw_frame(
+        TURN_AUDIO_PROTOCOL_VERSION,
+        SidecarFrameKind::TurnAudio.code(),
+        payload,
+    )
+}
+
+#[test]
+fn version_two_kind_code_and_limits_are_pinned() {
+    assert_eq!(TURN_AUDIO_PROTOCOL_VERSION, 2);
+    assert_eq!(PROTOCOL_VERSION, 1);
+    assert_eq!(SidecarFrameKind::TurnAudio.code(), 0x800b);
+    assert_eq!(MAX_TURN_AUDIO_PAYLOAD_BYTES, 320_024);
+}
+
+#[test]
+fn turn_audio_fixture_round_trips_exactly() {
+    let bytes: &[u8] =
+        include_bytes!("../../../../tests/fixtures/voice-sidecar-v2/turn-audio/turn-audio.bin");
+    let frame = turn_audio_sample_frame();
+
+    assert_eq!(encode_frame(&frame).unwrap(), bytes);
+    let decoded = decode_frame(bytes).unwrap();
+    assert_eq!(decoded, frame);
+    assert_eq!(decoded.version(), 2);
+    let audio = decoded.as_turn_audio().unwrap();
+    assert_eq!(audio.samples, [0, 1, -1, 32767, -32768]);
+    assert!(audio.playback_overlap);
+}
+
+#[test]
+fn turn_audio_is_not_a_version_one_frame() {
+    let mut bytes = encode_frame(&turn_audio_sample_frame()).unwrap();
+    bytes[0..2].copy_from_slice(&1_u16.to_be_bytes());
+    assert_eq!(
+        decode_frame(&bytes),
+        Err(SidecarCodecError::UnknownKind(0x800b))
+    );
+    assert_eq!(
+        encode_frame(&turn_audio_sample_frame().at_version(1)),
+        Err(SidecarCodecError::UnknownKind(0x800b))
+    );
+}
+
+#[test]
+fn turn_audio_rejects_wrong_lengths_counts_and_flags() {
+    let invalid = |bytes: Vec<u8>| {
+        assert!(
+            matches!(
+                decode_frame(&turn_audio_raw(&bytes)),
+                Err(SidecarCodecError::InvalidTurnAudio(_))
+            ),
+            "{bytes:?}"
+        );
+    };
+    invalid(turn_audio_payload(0, 1, 0, 0));
+    invalid(turn_audio_payload(2, 1, 0, 3));
+    invalid(turn_audio_payload(2, 1, 0, 5));
+    invalid(turn_audio_payload(2, 0, 0, 4));
+    invalid(turn_audio_payload(2, 1, 0x0002, 4));
+    invalid(turn_audio_payload(2, 1, 0x8001, 4));
+    invalid(vec![0; TURN_AUDIO_METADATA_BYTES - 1]);
+
+    let over = MAX_TURN_AUDIO_SAMPLES + 1;
+    invalid(turn_audio_payload(
+        u32::try_from(over).unwrap(),
+        1,
+        0,
+        2 * MAX_TURN_AUDIO_SAMPLES,
+    ));
+    assert!(matches!(
+        decode_frame(&turn_audio_raw(&turn_audio_payload(
+            u32::try_from(over).unwrap(),
+            1,
+            0,
+            2 * over,
+        ))),
+        Err(SidecarCodecError::PayloadTooLarge { .. })
+    ));
+    // A valid maximum-size frame still passes.
+    let maximum = turn_audio_payload(
+        u32::try_from(MAX_TURN_AUDIO_SAMPLES).unwrap(),
+        1,
+        0,
+        2 * MAX_TURN_AUDIO_SAMPLES,
+    );
+    assert_eq!(maximum.len(), MAX_TURN_AUDIO_PAYLOAD_BYTES);
+    assert!(decode_frame(&turn_audio_raw(&maximum)).is_ok());
+
+    let encode_invalid = |frame: SidecarTurnAudioFrame| {
+        assert!(matches!(
+            encode_frame(&SidecarFrame::turn_audio(frame)),
+            Err(SidecarCodecError::InvalidTurnAudio(_))
+        ));
+    };
+    let base = SidecarTurnAudioFrame {
+        session_id: SessionId::new(7),
+        segment_id: 4,
+        final_segments: 1,
+        playback_overlap: false,
+        samples: vec![1],
+    };
+    encode_invalid(SidecarTurnAudioFrame {
+        samples: Vec::new(),
+        ..base.clone()
+    });
+    encode_invalid(SidecarTurnAudioFrame {
+        samples: vec![0; MAX_TURN_AUDIO_SAMPLES + 1],
+        ..base.clone()
+    });
+    encode_invalid(SidecarTurnAudioFrame {
+        final_segments: 0,
+        ..base
+    });
+}
+
+#[test]
+fn every_version_one_control_round_trips_at_version_two() {
+    let session_id = SessionId::new(1);
+    let controls = [
+        SidecarControl::StartSession {
+            session_id,
+            speech_start_ms: 200,
+            final_silence_ms: 700,
+        },
+        SidecarControl::StartCapture {
+            session_id,
+            operation_id: 1,
+        },
+        SidecarControl::PauseCapture {
+            session_id,
+            operation_id: 2,
+        },
+        SidecarControl::ResumeCapture {
+            session_id,
+            operation_id: 3,
+        },
+        SidecarControl::FlushGeneration {
+            session_id,
+            generation_id: GenerationId::new(2),
+            operation_id: 3,
+        },
+        SidecarControl::Shutdown { session_id },
+        SidecarControl::Ready { session_id },
+        SidecarControl::VoiceActivity {
+            session_id,
+            activity: VoiceActivity::SpeechStarted { at_ms: 1 },
+        },
+        SidecarControl::TranscriptHypothesis {
+            session_id,
+            hypothesis: RecognitionHypothesis::engine_final(4, "hello"),
+        },
+        SidecarControl::PlaybackAccepted {
+            session_id,
+            turn_id: TurnId::new(2),
+            generation_id: GenerationId::new(2),
+            utterance_id: UtteranceId::new(4),
+            sequence: 5,
+        },
+        SidecarControl::PlaybackRendered {
+            session_id,
+            turn_id: TurnId::new(2),
+            generation_id: GenerationId::new(2),
+            utterance_id: UtteranceId::new(4),
+            sequence: 5,
+        },
+        SidecarControl::PlaybackFlushed {
+            session_id,
+            generation_id: GenerationId::new(2),
+            operation_id: 3,
+        },
+        SidecarControl::CaptureStarted {
+            session_id,
+            operation_id: 1,
+        },
+        SidecarControl::CapturePaused {
+            session_id,
+            operation_id: 2,
+        },
+        SidecarControl::CaptureResumed {
+            session_id,
+            operation_id: 3,
+        },
+        SidecarControl::AudioDeviceStatus {
+            session_id,
+            input_label: "Microphone".to_owned(),
+            output_label: "Speakers".to_owned(),
+        },
+        SidecarControl::Failure {
+            session_id,
+            stage: RuntimeStage::AudioOutput,
+            code: SidecarFailureCode::PlaybackFailed,
+        },
+        SidecarControl::ShutdownComplete { session_id },
+    ];
+
+    for control in controls {
+        let v1 = SidecarFrame::control(control);
+        let v2 = v1.clone().at_version(TURN_AUDIO_PROTOCOL_VERSION);
+        let v1_bytes = encode_frame(&v1).unwrap();
+        let v2_bytes = encode_frame(&v2).unwrap();
+        assert_eq!(v2_bytes[0..2], 2_u16.to_be_bytes());
+        assert_eq!(v2_bytes[2..], v1_bytes[2..]);
+        let decoded = decode_frame(&v2_bytes).unwrap();
+        assert_eq!(decoded, v2);
+        assert_eq!(decoded.version(), 2);
+    }
+}
+
+#[test]
+fn version_three_is_rejected_explicitly() {
+    let bytes = raw_frame(3, 0x0002, br#"{"session_id":7,"operation_id":1}"#);
+    assert_eq!(
+        decode_frame(&bytes),
+        Err(SidecarCodecError::UnknownVersion(3))
+    );
+    assert_eq!(
+        encode_frame(&turn_audio_sample_frame().at_version(3)),
+        Err(SidecarCodecError::UnknownVersion(3))
+    );
+}
+
+#[test]
+#[ignore = "writes the immutable version-two cross-language fixtures once"]
+fn write_version_two_fixtures() {
+    let start_session = SidecarFrame::control(SidecarControl::StartSession {
+        session_id: SessionId::new(7),
+        speech_start_ms: 200,
+        final_silence_ms: 700,
+    })
+    .at_version(TURN_AUDIO_PROTOCOL_VERSION);
+    let transcript_final = SidecarFrame::control(SidecarControl::TranscriptHypothesis {
+        session_id: SessionId::new(7),
+        hypothesis: RecognitionHypothesis::engine_final(4, "hello"),
+    })
+    .at_version(TURN_AUDIO_PROTOCOL_VERSION);
+    for (name, frame) in [
+        ("control/start-session.bin", start_session),
+        ("control/transcript-final.bin", transcript_final),
+        ("turn-audio/turn-audio.bin", turn_audio_sample_frame()),
+    ] {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(FIXTURE_ROOT_V2)
+            .join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, encode_frame(&frame).unwrap()).unwrap();
     }
 }
 

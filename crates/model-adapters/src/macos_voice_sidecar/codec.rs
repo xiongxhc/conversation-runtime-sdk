@@ -10,10 +10,16 @@ use serde::{Deserialize, Serialize};
 use crate::{AudioFrame, PcmFormat, PcmSampleFormat, RecognitionHypothesis, MAX_PCM_FRAME_BYTES};
 
 pub(crate) const PROTOCOL_VERSION: u16 = 1;
+pub(crate) const TURN_AUDIO_PROTOCOL_VERSION: u16 = 2;
 pub(crate) const HEADER_BYTES: usize = 8;
 pub(crate) const AUDIO_METADATA_BYTES: usize = 48;
 pub(crate) const MAX_CONTROL_PAYLOAD_BYTES: usize = 65_536;
 pub(crate) const MAX_AUDIO_PAYLOAD_BYTES: usize = AUDIO_METADATA_BYTES + MAX_PCM_FRAME_BYTES;
+pub(crate) const TURN_AUDIO_METADATA_BYTES: usize = 24;
+pub(crate) const MAX_TURN_AUDIO_SAMPLES: usize = 160_000;
+pub(crate) const MAX_TURN_AUDIO_PAYLOAD_BYTES: usize =
+    TURN_AUDIO_METADATA_BYTES + 2 * MAX_TURN_AUDIO_SAMPLES;
+const TURN_AUDIO_PLAYBACK_OVERLAP_FLAG: u16 = 0x0001;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SidecarFrameKind {
@@ -34,6 +40,7 @@ pub(crate) enum SidecarFrameKind {
     CapturePaused,
     CaptureResumed,
     AudioDeviceStatus,
+    TurnAudio,
     Failure,
     ShutdownComplete,
 }
@@ -58,6 +65,7 @@ impl SidecarFrameKind {
             Self::CapturePaused => 0x8008,
             Self::CaptureResumed => 0x8009,
             Self::AudioDeviceStatus => 0x800a,
+            Self::TurnAudio => 0x800b,
             Self::Failure => 0x80fe,
             Self::ShutdownComplete => 0x80ff,
         }
@@ -66,6 +74,7 @@ impl SidecarFrameKind {
     const fn maximum_payload_bytes(self) -> usize {
         match self {
             Self::AudioFrame => MAX_AUDIO_PAYLOAD_BYTES,
+            Self::TurnAudio => MAX_TURN_AUDIO_PAYLOAD_BYTES,
             _ => MAX_CONTROL_PAYLOAD_BYTES,
         }
     }
@@ -93,6 +102,7 @@ impl TryFrom<u16> for SidecarFrameKind {
             0x8008 => Ok(Self::CapturePaused),
             0x8009 => Ok(Self::CaptureResumed),
             0x800a => Ok(Self::AudioDeviceStatus),
+            0x800b => Ok(Self::TurnAudio),
             0x80fe => Ok(Self::Failure),
             0x80ff => Ok(Self::ShutdownComplete),
             _ => Err(SidecarCodecError::UnknownKind(value)),
@@ -228,6 +238,17 @@ enum SidecarFramePayload {
         session_id: SessionId,
         frame: AudioFrame,
     },
+    TurnAudio(SidecarTurnAudioFrame),
+}
+
+/// A finished voice turn's audio: 16 kHz mono signed 16-bit samples.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SidecarTurnAudioFrame {
+    pub session_id: SessionId,
+    pub segment_id: u64,
+    pub final_segments: u16,
+    pub playback_overlap: bool,
+    pub samples: Vec<i16>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -251,6 +272,21 @@ impl SidecarFrame {
         }
     }
 
+    #[allow(dead_code)] // first used by the process layer
+    pub(crate) const fn turn_audio(frame: SidecarTurnAudioFrame) -> Self {
+        Self {
+            version: TURN_AUDIO_PROTOCOL_VERSION,
+            payload: SidecarFramePayload::TurnAudio(frame),
+        }
+    }
+
+    #[allow(dead_code)] // first used by the process layer
+    #[must_use]
+    pub(crate) const fn at_version(mut self, version: u16) -> Self {
+        self.version = version;
+        self
+    }
+
     pub(crate) const fn version(&self) -> u16 {
         self.version
     }
@@ -259,20 +295,29 @@ impl SidecarFrame {
         match &self.payload {
             SidecarFramePayload::Control(control) => control.kind(),
             SidecarFramePayload::Audio { .. } => SidecarFrameKind::AudioFrame,
+            SidecarFramePayload::TurnAudio(_) => SidecarFrameKind::TurnAudio,
         }
     }
 
     pub(crate) const fn as_control(&self) -> Option<&SidecarControl> {
         match &self.payload {
             SidecarFramePayload::Control(control) => Some(control),
-            SidecarFramePayload::Audio { .. } => None,
+            SidecarFramePayload::Audio { .. } | SidecarFramePayload::TurnAudio(_) => None,
         }
     }
 
     pub(crate) const fn as_audio(&self) -> Option<(SessionId, &AudioFrame)> {
         match &self.payload {
-            SidecarFramePayload::Control(_) => None,
+            SidecarFramePayload::Control(_) | SidecarFramePayload::TurnAudio(_) => None,
             SidecarFramePayload::Audio { session_id, frame } => Some((*session_id, frame)),
+        }
+    }
+
+    #[allow(dead_code)] // first used by the process layer
+    pub(crate) const fn as_turn_audio(&self) -> Option<&SidecarTurnAudioFrame> {
+        match &self.payload {
+            SidecarFramePayload::TurnAudio(frame) => Some(frame),
+            SidecarFramePayload::Control(_) | SidecarFramePayload::Audio { .. } => None,
         }
     }
 }
@@ -302,6 +347,7 @@ pub(crate) enum SidecarCodecError {
     InvalidControlUtf8,
     InvalidControlJson,
     InvalidAudioMetadata(&'static str),
+    InvalidTurnAudio(&'static str),
     UnknownSampleFormat(u16),
     UnsupportedFailureStage,
     TrailingBytes(usize),
@@ -350,6 +396,9 @@ impl fmt::Display for SidecarCodecError {
             Self::InvalidAudioMetadata(message) => {
                 write!(formatter, "invalid sidecar audio metadata: {message}")
             }
+            Self::InvalidTurnAudio(message) => {
+                write!(formatter, "invalid sidecar turn audio: {message}")
+            }
             Self::UnknownSampleFormat(format) => {
                 write!(formatter, "unknown sidecar PCM sample format {format}")
             }
@@ -366,11 +415,14 @@ impl Error for SidecarCodecError {}
 
 pub(crate) fn encode_frame(frame: &SidecarFrame) -> Result<Vec<u8>, SidecarCodecError> {
     let kind = frame.kind();
+    validate_version(frame.version)?;
+    validate_kind_version(kind, frame.version)?;
     let payload = match &frame.payload {
         SidecarFramePayload::Control(control) => encode_control(control)?,
         SidecarFramePayload::Audio { session_id, frame } => {
             encode_audio_payload(*session_id, frame)?
         }
+        SidecarFramePayload::TurnAudio(frame) => encode_turn_audio_payload(frame)?,
     };
     validate_payload_length(kind, payload.len())?;
     let payload_length =
@@ -395,10 +447,9 @@ pub(crate) fn decode_frame(bytes: &[u8]) -> Result<SidecarFrame, SidecarCodecErr
     }
 
     let version = u16::from_be_bytes([bytes[0], bytes[1]]);
-    if version != PROTOCOL_VERSION {
-        return Err(SidecarCodecError::UnknownVersion(version));
-    }
+    validate_version(version)?;
     let kind = SidecarFrameKind::try_from(u16::from_be_bytes([bytes[2], bytes[3]]))?;
+    validate_kind_version(kind, version)?;
     let declared_u32 = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
     let declared =
         usize::try_from(declared_u32).map_err(|_| SidecarCodecError::PayloadLengthOverflow)?;
@@ -423,6 +474,13 @@ pub(crate) fn decode_frame(bytes: &[u8]) -> Result<SidecarFrame, SidecarCodecErr
         return Ok(SidecarFrame {
             version,
             payload: SidecarFramePayload::Audio { session_id, frame },
+        });
+    }
+
+    if kind == SidecarFrameKind::TurnAudio {
+        return Ok(SidecarFrame {
+            version,
+            payload: SidecarFramePayload::TurnAudio(decode_turn_audio_payload(payload)?),
         });
     }
 
@@ -514,6 +572,97 @@ pub(crate) fn decode_audio_payload(
     )
     .map_err(|_| SidecarCodecError::InvalidAudioMetadata("PCM frame validation failed"))?;
     Ok((session_id, frame))
+}
+
+fn validate_version(version: u16) -> Result<(), SidecarCodecError> {
+    if version == PROTOCOL_VERSION || version == TURN_AUDIO_PROTOCOL_VERSION {
+        Ok(())
+    } else {
+        Err(SidecarCodecError::UnknownVersion(version))
+    }
+}
+
+fn validate_kind_version(kind: SidecarFrameKind, version: u16) -> Result<(), SidecarCodecError> {
+    if kind == SidecarFrameKind::TurnAudio && version < TURN_AUDIO_PROTOCOL_VERSION {
+        Err(SidecarCodecError::UnknownKind(kind.code()))
+    } else {
+        Ok(())
+    }
+}
+
+fn encode_turn_audio_payload(frame: &SidecarTurnAudioFrame) -> Result<Vec<u8>, SidecarCodecError> {
+    if frame.samples.is_empty() || frame.samples.len() > MAX_TURN_AUDIO_SAMPLES {
+        return Err(SidecarCodecError::InvalidTurnAudio(
+            "sample count must be within 1..=160000",
+        ));
+    }
+    if frame.final_segments == 0 {
+        return Err(SidecarCodecError::InvalidTurnAudio(
+            "final segment count must be at least one",
+        ));
+    }
+    let sample_count =
+        u32::try_from(frame.samples.len()).map_err(|_| SidecarCodecError::PayloadLengthOverflow)?;
+    let flags = if frame.playback_overlap {
+        TURN_AUDIO_PLAYBACK_OVERLAP_FLAG
+    } else {
+        0
+    };
+    let mut payload = Vec::with_capacity(TURN_AUDIO_METADATA_BYTES + 2 * frame.samples.len());
+    payload.extend_from_slice(&frame.session_id.get().to_be_bytes());
+    payload.extend_from_slice(&frame.segment_id.to_be_bytes());
+    payload.extend_from_slice(&sample_count.to_be_bytes());
+    payload.extend_from_slice(&frame.final_segments.to_be_bytes());
+    payload.extend_from_slice(&flags.to_be_bytes());
+    for sample in &frame.samples {
+        payload.extend_from_slice(&sample.to_le_bytes());
+    }
+    Ok(payload)
+}
+
+fn decode_turn_audio_payload(payload: &[u8]) -> Result<SidecarTurnAudioFrame, SidecarCodecError> {
+    if payload.len() < TURN_AUDIO_METADATA_BYTES {
+        return Err(SidecarCodecError::InvalidTurnAudio(
+            "payload is shorter than 24-byte metadata",
+        ));
+    }
+    let session_id = SessionId::new(read_u64(payload, 0));
+    let segment_id = read_u64(payload, 8);
+    let sample_count = usize::try_from(read_u32(payload, 16))
+        .map_err(|_| SidecarCodecError::PayloadLengthOverflow)?;
+    let final_segments = read_u16(payload, 20);
+    let flags = read_u16(payload, 22);
+    if sample_count == 0 || sample_count > MAX_TURN_AUDIO_SAMPLES {
+        return Err(SidecarCodecError::InvalidTurnAudio(
+            "sample count must be within 1..=160000",
+        ));
+    }
+    if payload.len() - TURN_AUDIO_METADATA_BYTES != 2 * sample_count {
+        return Err(SidecarCodecError::InvalidTurnAudio(
+            "payload length does not match the sample count",
+        ));
+    }
+    if final_segments == 0 {
+        return Err(SidecarCodecError::InvalidTurnAudio(
+            "final segment count must be at least one",
+        ));
+    }
+    if flags & !TURN_AUDIO_PLAYBACK_OVERLAP_FLAG != 0 {
+        return Err(SidecarCodecError::InvalidTurnAudio(
+            "reserved flag bits must be zero",
+        ));
+    }
+    let samples = payload[TURN_AUDIO_METADATA_BYTES..]
+        .chunks_exact(2)
+        .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
+        .collect();
+    Ok(SidecarTurnAudioFrame {
+        session_id,
+        segment_id,
+        final_segments,
+        playback_overlap: flags & TURN_AUDIO_PLAYBACK_OVERLAP_FLAG != 0,
+        samples,
+    })
 }
 
 fn validate_payload_length(
@@ -848,7 +997,9 @@ fn decode_control(
                 code: value.code,
             })
         }
-        SidecarFrameKind::AudioFrame => Err(SidecarCodecError::InvalidControlJson),
+        SidecarFrameKind::AudioFrame | SidecarFrameKind::TurnAudio => {
+            Err(SidecarCodecError::InvalidControlJson)
+        }
     }
 }
 

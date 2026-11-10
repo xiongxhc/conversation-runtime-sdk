@@ -848,6 +848,36 @@ fn turn_audio_fixture_round_trips_exactly() {
 }
 
 #[test]
+fn version_two_control_fixtures_round_trip_exactly() {
+    let start_session: &[u8] =
+        include_bytes!("../../../../tests/fixtures/voice-sidecar-v2/control/start-session.bin");
+    let frame = decode_frame(start_session).unwrap();
+    assert_eq!(frame.version(), TURN_AUDIO_PROTOCOL_VERSION);
+    assert_eq!(
+        frame.as_control(),
+        Some(&SidecarControl::StartSession {
+            session_id: SessionId::new(7),
+            speech_start_ms: 200,
+            final_silence_ms: 700,
+        })
+    );
+    assert_eq!(encode_frame(&frame).unwrap(), start_session);
+
+    let transcript_final: &[u8] =
+        include_bytes!("../../../../tests/fixtures/voice-sidecar-v2/control/transcript-final.bin");
+    let frame = decode_frame(transcript_final).unwrap();
+    assert_eq!(frame.version(), TURN_AUDIO_PROTOCOL_VERSION);
+    assert_eq!(
+        frame.as_control(),
+        Some(&SidecarControl::TranscriptHypothesis {
+            session_id: SessionId::new(7),
+            hypothesis: RecognitionHypothesis::engine_final(4, "hello"),
+        })
+    );
+    assert_eq!(encode_frame(&frame).unwrap(), transcript_final);
+}
+
+#[test]
 fn turn_audio_is_not_a_version_one_frame() {
     let mut bytes = encode_frame(&turn_audio_sample_frame()).unwrap();
     bytes[0..2].copy_from_slice(&1_u16.to_be_bytes());

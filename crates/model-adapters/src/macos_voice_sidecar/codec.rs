@@ -280,7 +280,6 @@ impl SidecarFrame {
         }
     }
 
-    #[allow(dead_code)] // first used by the process layer
     #[must_use]
     pub(crate) const fn at_version(mut self, version: u16) -> Self {
         self.version = version;
@@ -313,7 +312,6 @@ impl SidecarFrame {
         }
     }
 
-    #[allow(dead_code)] // first used by the process layer
     pub(crate) const fn as_turn_audio(&self) -> Option<&SidecarTurnAudioFrame> {
         match &self.payload {
             SidecarFramePayload::TurnAudio(frame) => Some(frame),

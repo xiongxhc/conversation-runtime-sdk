@@ -25,6 +25,7 @@ mod speech;
 #[cfg(unix)]
 mod speechbrain_diarization;
 mod streaming_speech;
+mod turn_audio;
 mod voice_capture_control;
 mod voice_input;
 mod voice_io;
@@ -98,6 +99,7 @@ pub use speech::{AudioFormat, SpeechRequest, SpeechSynthesizer, SynthesizedAudio
 #[cfg(unix)]
 pub use speechbrain_diarization::{SpeechbrainDiarizationConfig, SpeechbrainTranscriptionDiarizer};
 pub use streaming_speech::{StreamingSpeechRequest, StreamingSpeechSynthesizer};
+pub use turn_audio::{CapturedTurnAudio, SidecarTurnAudio};
 pub use voice_capture_control::VoiceCaptureControl;
 pub use voice_input::{AudioDeviceStatus, CaptureFinish, VoiceInput, VoiceInputEvent};
 pub use voice_io::{VoiceIoFactory, VoiceIoSession};

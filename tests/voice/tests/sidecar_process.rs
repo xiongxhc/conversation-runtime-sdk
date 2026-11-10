@@ -9,8 +9,9 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use conversation_model_adapters::{
-    AudioFrame, MacOsVoiceSidecar, MacOsVoiceSidecarConfig, PcmFormat, PcmSampleFormat,
-    PlaybackReceipt, RecognitionEvent, SystemDevice, VoiceInputEvent, VoiceIoFactory,
+    AudioFrame, CapturedTurnAudio, MacOsVoiceSidecar, MacOsVoiceSidecarConfig, PcmFormat,
+    PcmSampleFormat, PlaybackReceipt, RecognitionEvent, SidecarTurnAudio, SystemDevice,
+    VoiceInputEvent, VoiceIoFactory,
 };
 use conversation_protocol::{
     GenerationId, PlaybackState, RuntimeStage, SessionId, TurnId, UtteranceId, VoiceActivity,
@@ -1147,6 +1148,182 @@ async fn permission_failure_uses_closed_sidecar_code() {
     harness.assert_process_gone().await;
 }
 
+#[tokio::test]
+async fn turn_audio_reaches_the_handle_at_protocol_version_two() {
+    let turn_audio = SidecarTurnAudio::new();
+    let harness = FakeSidecarHarness::new("turn-audio").with_turn_audio(turn_audio.clone());
+    let cancellation = CancellationToken::new();
+    let session = harness.start(cancellation.clone()).await.unwrap();
+    let mut input = session
+        .input
+        .start(SESSION_ID, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        recv_with_timeout(&mut input).await,
+        VoiceInputEvent::Activity(VoiceActivity::SpeechStarted { at_ms: 10 })
+    ));
+    // The partial travels on the lossy lane and may arrive after the final.
+    let mut saw_partial = false;
+    let mut saw_final = false;
+    let mut saw_ended = false;
+    for _ in 0..3 {
+        match recv_with_timeout(&mut input).await {
+            VoiceInputEvent::Recognition(RecognitionEvent::Hypothesis(value))
+                if value.is_engine_final() =>
+            {
+                assert_eq!(value.segment_id(), 4);
+                assert_eq!(value.text(), "hello");
+                saw_final = true;
+            }
+            VoiceInputEvent::Recognition(RecognitionEvent::Hypothesis(value)) => {
+                assert_eq!(value.segment_id(), 4);
+                assert_eq!(value.text(), "hel");
+                saw_partial = true;
+            }
+            VoiceInputEvent::Activity(VoiceActivity::SpeechEnded { at_ms: 20 }) => {
+                saw_ended = true;
+            }
+            event => panic!("unexpected voice input event: {event:?}"),
+        }
+    }
+    assert!(saw_partial && saw_final && saw_ended);
+
+    let audio = tokio::time::timeout(
+        Duration::from_secs(1),
+        turn_audio.take(SESSION_ID, 4, CancellationToken::new()),
+    )
+    .await
+    .expect("turn audio timeout")
+    .expect("turn audio missing");
+    assert_eq!(
+        audio,
+        CapturedTurnAudio {
+            samples: vec![1000.0 / 32768.0; 16_000],
+            playback_overlap: false,
+            single_segment: true,
+        }
+    );
+    // The turn audio frame is consumed by the handle, never published as input.
+    let late = tokio::time::timeout(Duration::from_millis(100), input.recv()).await;
+    assert!(late.is_err(), "unexpected late event: {late:?}");
+
+    // Media and the shutdown controls are written at version 2 too: the fake
+    // fails any frame that does not carry the session's version.
+    let accepted = session
+        .output
+        .enqueue(frame(GenerationId::new(4), 0), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        accepted,
+        PlaybackReceipt::new(GenerationId::new(4), PlaybackState::Accepted)
+    );
+    cancellation.cancel();
+    assert!(await_completion(session.completion).await.is_ok());
+    harness.assert_process_gone().await;
+    assert!(harness.shutdown_marker().exists());
+}
+
+#[tokio::test]
+async fn a_later_turn_never_receives_an_earlier_turns_audio() {
+    let turn_audio = SidecarTurnAudio::new();
+    let harness =
+        FakeSidecarHarness::new("two-turns-one-audio").with_turn_audio(turn_audio.clone());
+    let cancellation = CancellationToken::new();
+    let session = harness.start(cancellation.clone()).await.unwrap();
+    let mut input = session
+        .input
+        .start(SESSION_ID, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let mut finals = Vec::new();
+    while finals.len() < 2 {
+        if let VoiceInputEvent::Recognition(RecognitionEvent::Hypothesis(value)) =
+            recv_with_timeout(&mut input).await
+        {
+            assert!(value.is_engine_final());
+            assert_eq!(value.segment_id(), 1);
+            finals.push(value.text().to_owned());
+        }
+    }
+    assert_eq!(finals, ["first", "second"]);
+
+    // The first turn's audio was read before the second final, and the second
+    // final discarded it: segment 1 has no audio now.
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    assert_eq!(turn_audio.take(SESSION_ID, 1, cancelled).await, None);
+
+    cancellation.cancel();
+    assert!(await_completion(session.completion).await.is_ok());
+    harness.assert_process_gone().await;
+}
+
+#[tokio::test]
+async fn turn_audio_in_a_version_one_session_fails_the_session() {
+    let harness = FakeSidecarHarness::new("turn-audio-at-version-one");
+    let session = harness.start(CancellationToken::new()).await.unwrap();
+    let _input = session
+        .input
+        .start(SESSION_ID, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let error = await_completion(session.completion)
+        .await
+        .expect_err("turn audio in a version 1 session kept completion alive");
+    assert_eq!(error.message(), "voice sidecar event frame was malformed");
+    harness.assert_process_gone().await;
+}
+
+#[tokio::test]
+async fn oversized_turn_audio_is_refused() {
+    let harness =
+        FakeSidecarHarness::new("oversized-turn-audio").with_turn_audio(SidecarTurnAudio::new());
+    let session = harness.start(CancellationToken::new()).await.unwrap();
+    let _input = session
+        .input
+        .start(SESSION_ID, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let error = await_completion(session.completion)
+        .await
+        .expect_err("oversized turn audio kept completion alive");
+    assert_eq!(
+        error.message(),
+        "voice sidecar event exceeded the configured limit"
+    );
+    harness.assert_process_gone().await;
+}
+
+#[tokio::test]
+async fn a_version_one_only_sidecar_refuses_a_version_two_session() {
+    let harness =
+        FakeSidecarHarness::new("version-one-only").with_turn_audio(SidecarTurnAudio::new());
+    assert!(harness.start(CancellationToken::new()).await.is_err());
+    harness.assert_process_gone().await;
+}
+
+#[tokio::test]
+async fn a_version_one_only_sidecar_runs_a_version_one_session() {
+    let harness = FakeSidecarHarness::new("version-one-only");
+    let cancellation = CancellationToken::new();
+    let session = harness.start(cancellation.clone()).await.unwrap();
+    let _input = session
+        .input
+        .start(SESSION_ID, CancellationToken::new())
+        .await
+        .unwrap();
+
+    cancellation.cancel();
+    assert!(await_completion(session.completion).await.is_ok());
+    harness.assert_process_gone().await;
+}
+
 fn valid_config(model_path: &Path) -> MacOsVoiceSidecarConfig {
     MacOsVoiceSidecarConfig::new(
         fake_sidecar_executable(),
@@ -1240,6 +1417,7 @@ struct FakeSidecarHarness {
     input_flood_marker: PathBuf,
     order_marker: PathBuf,
     descendant_pid_marker: Option<PathBuf>,
+    turn_audio: Option<SidecarTurnAudio>,
 }
 
 impl FakeSidecarHarness {
@@ -1258,9 +1436,15 @@ impl FakeSidecarHarness {
             input_flood_marker: fixture.path().join("input-flood"),
             order_marker: fixture.path().join("order"),
             descendant_pid_marker: None,
+            turn_audio: None,
             fixture,
             scenario,
         }
+    }
+
+    fn with_turn_audio(mut self, turn_audio: SidecarTurnAudio) -> Self {
+        self.turn_audio = Some(turn_audio);
+        self
     }
 
     fn with_stderr_descendant(mut self) -> Self {
@@ -1294,7 +1478,11 @@ impl FakeSidecarHarness {
             values.push((DESCENDANT_PID_MARKER_ENV, marker.as_os_str()));
         }
         let _environment = ScopedEnvironment::set(values);
-        MacOsVoiceSidecar::new(valid_config(&self.model_path))
+        let mut config = valid_config(&self.model_path);
+        if let Some(turn_audio) = &self.turn_audio {
+            config = config.with_turn_audio(turn_audio.clone());
+        }
+        MacOsVoiceSidecar::new(config)
             .start(SESSION_ID, cancellation)
             .await
     }

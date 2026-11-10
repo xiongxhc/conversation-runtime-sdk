@@ -18,12 +18,13 @@ use tokio_util::sync::CancellationToken;
 
 use super::codec::{
     decode_frame, decode_frame_at_eof, encode_frame, SidecarControl, SidecarFailureCode,
-    SidecarFrame, MAX_CONTROL_PAYLOAD_BYTES, PROTOCOL_VERSION,
+    SidecarFrame, SidecarFrameKind, SidecarTurnAudioFrame, MAX_CONTROL_PAYLOAD_BYTES,
+    MAX_TURN_AUDIO_PAYLOAD_BYTES, PROTOCOL_VERSION, TURN_AUDIO_PROTOCOL_VERSION,
 };
 use crate::{
-    AdapterError, AdapterFuture, AudioDeviceStatus, AudioFrame, CaptureEvent,
-    ContinuousAudioOutput, PlaybackReceipt, RecognitionEvent, VoiceCaptureControl, VoiceInput,
-    VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
+    AdapterError, AdapterFuture, AudioDeviceStatus, AudioFrame, CaptureEvent, CapturedTurnAudio,
+    ContinuousAudioOutput, PlaybackReceipt, RecognitionEvent, SidecarTurnAudio,
+    VoiceCaptureControl, VoiceInput, VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
 };
 
 const SPEECH_START_MS: std::ops::RangeInclusive<u64> = 100..=1_000;
@@ -65,6 +66,7 @@ pub struct MacOsVoiceSidecarConfig {
     final_silence_ms: u64,
     max_payload_bytes: usize,
     max_stderr_bytes: usize,
+    turn_audio: Option<SidecarTurnAudio>,
 }
 
 impl MacOsVoiceSidecarConfig {
@@ -112,7 +114,16 @@ impl MacOsVoiceSidecarConfig {
             final_silence_ms,
             max_payload_bytes: MAX_CONTROL_PAYLOAD_BYTES,
             max_stderr_bytes: DEFAULT_MAX_STDERR_BYTES,
+            turn_audio: None,
         })
+    }
+
+    /// Runs the session at protocol version 2 and delivers each finished
+    /// turn's audio to `turn_audio`.
+    #[must_use]
+    pub fn with_turn_audio(mut self, turn_audio: SidecarTurnAudio) -> Self {
+        self.turn_audio = Some(turn_audio);
+        self
     }
 
     pub const fn with_asr_backend(mut self, asr_backend: SidecarAsrBackend) -> Self {
@@ -195,6 +206,15 @@ impl MacOsVoiceSidecarConfig {
     }
 }
 
+/// A session collecting turn audio runs at version 2; any other at version 1.
+const fn session_version(turn_audio: Option<&SidecarTurnAudio>) -> u16 {
+    if turn_audio.is_some() {
+        TURN_AUDIO_PROTOCOL_VERSION
+    } else {
+        PROTOCOL_VERSION
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct MacOsVoiceSidecar {
     config: MacOsVoiceSidecarConfig,
@@ -234,6 +254,7 @@ async fn start_sidecar(
         stderr,
         media,
     } = spawn_process(&config).await?;
+    let version = session_version(config.turn_audio.as_ref());
     let shared = Arc::new(SessionShared::new(session_id));
     let media_budget = Arc::new(MediaBudget::new());
     let frame_capacity = Arc::new(Semaphore::new(MEDIA_QUEUE_CAPACITY));
@@ -256,6 +277,7 @@ async fn start_sidecar(
     let tasks = ProcessTasks {
         control: tokio::spawn(run_control_writer(
             stdin,
+            version,
             control_receiver,
             io_cancellation.clone(),
             supervisor_sender.clone(),
@@ -271,6 +293,7 @@ async fn start_sidecar(
         stdout: tokio::spawn(run_stdout_reader(
             stdout,
             config.max_payload_bytes(),
+            config.turn_audio.clone(),
             session_id,
             Arc::clone(&shared),
             input_publisher.clone(),
@@ -343,6 +366,7 @@ async fn start_sidecar(
             });
             let output = Arc::new(MacOsContinuousAudioOutput {
                 session_id,
+                version,
                 control_sender: control_sender.clone(),
                 media_sender,
                 shared: Arc::clone(&shared),
@@ -656,6 +680,7 @@ async fn wait_for_capture_acknowledgement(
 
 struct MacOsContinuousAudioOutput {
     session_id: SessionId,
+    version: u16,
     control_sender: mpsc::Sender<SidecarFrame>,
     media_sender: mpsc::Sender<MediaWrite>,
     shared: Arc<SessionShared>,
@@ -676,8 +701,10 @@ impl ContinuousAudioOutput for MacOsContinuousAudioOutput {
             }
             self.shared.validate_enqueue(frame.generation_id())?;
             let identity = MediaIdentity::from(&frame);
-            let encoded = encode_frame(&SidecarFrame::audio(self.session_id, frame.clone()))
-                .map_err(|_| AdapterError::new("failed to encode voice sidecar media frame"))?;
+            let encoded = encode_frame(
+                &SidecarFrame::audio(self.session_id, frame.clone()).at_version(self.version),
+            )
+            .map_err(|_| AdapterError::new("failed to encode voice sidecar media frame"))?;
             let duration_nanos = frame_duration_nanos(&frame)?;
             let frame_permit = tokio::select! {
                 biased;
@@ -1161,6 +1188,7 @@ async fn run_input_dispatcher(
 
 async fn run_control_writer(
     mut stdin: ChildStdin,
+    version: u16,
     mut receiver: mpsc::Receiver<SidecarFrame>,
     cancellation: CancellationToken,
     supervisor_sender: mpsc::UnboundedSender<SupervisorEvent>,
@@ -1174,7 +1202,7 @@ async fn run_control_writer(
                 None => return,
             }
         };
-        let bytes = match encode_frame(&frame) {
+        let bytes = match encode_frame(&frame.at_version(version)) {
             Ok(bytes) => bytes,
             Err(_) => {
                 send_fatal(
@@ -1234,9 +1262,11 @@ async fn run_media_writer(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_stdout_reader<R>(
     mut stdout: R,
     max_payload_bytes: usize,
+    turn_audio: Option<SidecarTurnAudio>,
     session_id: SessionId,
     shared: Arc<SessionShared>,
     input_publisher: InputPublisher,
@@ -1245,14 +1275,15 @@ async fn run_stdout_reader<R>(
 ) where
     R: AsyncRead + Unpin,
 {
+    let version = session_version(turn_audio.as_ref());
     let mut ready = false;
     let mut capture_started = false;
     loop {
-        let control = tokio::select! {
+        let frame = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return,
-            frame = read_control_frame(&mut stdout, max_payload_bytes) => match frame {
-                Ok(Some(control)) => control,
+            frame = read_control_frame(&mut stdout, max_payload_bytes, version) => match frame {
+                Ok(Some(frame)) => frame,
                 Ok(None) => {
                     let _ = supervisor_sender.send(SupervisorEvent::Eof);
                     return;
@@ -1261,6 +1292,32 @@ async fn run_stdout_reader<R>(
                     let _ = supervisor_sender.send(SupervisorEvent::Fatal(error));
                     return;
                 }
+            }
+        };
+
+        let control = match frame {
+            StdoutFrame::Control(control) => control,
+            StdoutFrame::TurnAudio(frame) => {
+                if frame.session_id != session_id {
+                    send_fatal(
+                        &supervisor_sender,
+                        "voice sidecar session identity mismatch",
+                    );
+                    return;
+                }
+                if !ready {
+                    send_fatal(
+                        &supervisor_sender,
+                        "voice sidecar event arrived before readiness",
+                    );
+                    return;
+                }
+                // Only a version 2 session reads this frame, and only a
+                // session with a handle runs at version 2.
+                if let Some(turn_audio) = &turn_audio {
+                    turn_audio.offer(session_id, frame.segment_id, captured_turn_audio(&frame));
+                }
+                continue;
             }
         };
 
@@ -1317,10 +1374,15 @@ async fn run_stdout_reader<R>(
             SidecarControl::VoiceActivity { activity, .. } => {
                 Some((VoiceInputEvent::Activity(activity), true))
             }
-            SidecarControl::TranscriptHypothesis { hypothesis, .. } => Some((
-                VoiceInputEvent::Recognition(RecognitionEvent::Hypothesis(hypothesis.clone())),
-                hypothesis.is_engine_final(),
-            )),
+            SidecarControl::TranscriptHypothesis { hypothesis, .. } => {
+                if let Some(turn_audio) = &turn_audio {
+                    turn_audio.clear(session_id);
+                }
+                Some((
+                    VoiceInputEvent::Recognition(RecognitionEvent::Hypothesis(hypothesis.clone())),
+                    hypothesis.is_engine_final(),
+                ))
+            }
             SidecarControl::PlaybackAccepted {
                 turn_id,
                 generation_id,
@@ -1460,10 +1522,32 @@ async fn resolve_media_ack(
     }
 }
 
+fn captured_turn_audio(frame: &SidecarTurnAudioFrame) -> CapturedTurnAudio {
+    CapturedTurnAudio {
+        samples: frame
+            .samples
+            .iter()
+            .map(|sample| f32::from(*sample) / 32_768.0)
+            .collect(),
+        playback_overlap: frame.playback_overlap,
+        single_segment: frame.final_segments == 1,
+    }
+}
+
+enum StdoutFrame {
+    Control(SidecarControl),
+    TurnAudio(SidecarTurnAudioFrame),
+}
+
+/// Reads one frame from standard output. Every frame must carry the session's
+/// `version`. The declared length is checked on the header, before any
+/// allocation, against the limit of the frame's kind: turn audio has its own
+/// limit in a version 2 session; every other frame has the control limit.
 async fn read_control_frame<R>(
     reader: &mut R,
     max_payload_bytes: usize,
-) -> Result<Option<SidecarControl>, AdapterError>
+    version: u16,
+) -> Result<Option<StdoutFrame>, AdapterError>
 where
     R: AsyncRead + Unpin,
 {
@@ -1481,7 +1565,14 @@ where
     let declared = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
     let declared = usize::try_from(declared)
         .map_err(|_| AdapterError::new("voice sidecar event length overflowed"))?;
-    if declared > max_payload_bytes || declared > MAX_CONTROL_PAYLOAD_BYTES {
+    let kind = u16::from_be_bytes([header[2], header[3]]);
+    let maximum =
+        if version == TURN_AUDIO_PROTOCOL_VERSION && kind == SidecarFrameKind::TurnAudio.code() {
+            MAX_TURN_AUDIO_PAYLOAD_BYTES
+        } else {
+            max_payload_bytes.min(MAX_CONTROL_PAYLOAD_BYTES)
+        };
+    if declared > maximum {
         return Err(AdapterError::new(
             "voice sidecar event exceeded the configured limit",
         ));
@@ -1503,7 +1594,7 @@ where
     }
     let decoded = decode_frame(&frame)
         .map_err(|_| AdapterError::new("voice sidecar event frame was malformed"))?;
-    if decoded.version() != PROTOCOL_VERSION {
+    if decoded.version() != version {
         return Err(AdapterError::new("voice sidecar event frame was malformed"));
     }
     if decoded.as_audio().is_some() {
@@ -1511,11 +1602,14 @@ where
             "voice sidecar emitted media on standard output",
         ));
     }
+    if let Some(turn_audio) = decoded.as_turn_audio() {
+        return Ok(Some(StdoutFrame::TurnAudio(turn_audio.clone())));
+    }
     decoded
         .as_control()
         .cloned()
         .ok_or_else(|| AdapterError::new("voice sidecar event frame was malformed"))
-        .map(Some)
+        .map(|control| Some(StdoutFrame::Control(control)))
 }
 
 async fn read_until_eof<R>(reader: &mut R, buffer: &mut [u8]) -> std::io::Result<usize>
@@ -2541,7 +2635,9 @@ fn configuration_error(message: impl AsRef<str>) -> AdapterError {
 
 #[cfg(test)]
 mod process_tests {
+    use super::super::codec::{HEADER_BYTES, MAX_TURN_AUDIO_SAMPLES};
     use super::*;
+    use crate::RecognitionHypothesis;
 
     fn sidecar_config_fixture() -> (tempfile::TempDir, MacOsVoiceSidecarConfig) {
         use std::os::unix::fs::PermissionsExt;
@@ -2692,6 +2788,7 @@ mod process_tests {
         run_stdout_reader(
             stdout.as_slice(),
             MAX_CONTROL_PAYLOAD_BYTES,
+            None,
             SessionId::new(1),
             Arc::new(SessionShared::new(SessionId::new(1))),
             InputPublisher {
@@ -2714,6 +2811,169 @@ mod process_tests {
         assert!(reliable.try_recv().is_err());
         assert!(matches!(supervisor.try_recv(), Ok(SupervisorEvent::Ready)));
         assert!(matches!(supervisor.try_recv(), Ok(SupervisorEvent::Eof)));
+    }
+
+    fn turn_audio_frame(samples: Vec<i16>) -> SidecarFrame {
+        SidecarFrame::turn_audio(SidecarTurnAudioFrame {
+            session_id: SessionId::new(1),
+            segment_id: 3,
+            final_segments: 2,
+            playback_overlap: true,
+            samples,
+        })
+    }
+
+    #[tokio::test]
+    async fn turn_audio_is_held_to_the_limit_of_its_kind_only_at_version_two() {
+        let largest = encode_frame(&turn_audio_frame(vec![1; MAX_TURN_AUDIO_SAMPLES])).unwrap();
+        assert_eq!(largest.len(), HEADER_BYTES + MAX_TURN_AUDIO_PAYLOAD_BYTES);
+
+        let read = read_control_frame(&mut largest.as_slice(), 1_024, TURN_AUDIO_PROTOCOL_VERSION)
+            .await
+            .unwrap();
+        assert!(matches!(
+            read,
+            Some(StdoutFrame::TurnAudio(frame)) if frame.samples.len() == MAX_TURN_AUDIO_SAMPLES
+        ));
+
+        let Err(error) = read_control_frame(&mut largest.as_slice(), 1_024, PROTOCOL_VERSION).await
+        else {
+            panic!("a version 1 session read an oversized turn audio frame");
+        };
+        assert_eq!(
+            error.message(),
+            "voice sidecar event exceeded the configured limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_frame_in_another_version_than_the_session_is_malformed() {
+        let ready = SidecarFrame::control(SidecarControl::Ready {
+            session_id: SessionId::new(1),
+        });
+        let version_one = encode_frame(&ready).unwrap();
+        let version_two = encode_frame(&ready.at_version(TURN_AUDIO_PROTOCOL_VERSION)).unwrap();
+
+        for (bytes, session_version) in [
+            (version_one, TURN_AUDIO_PROTOCOL_VERSION),
+            (version_two, PROTOCOL_VERSION),
+        ] {
+            let Err(error) = read_control_frame(
+                &mut bytes.as_slice(),
+                MAX_CONTROL_PAYLOAD_BYTES,
+                session_version,
+            )
+            .await
+            else {
+                panic!("a frame in another version was read");
+            };
+            assert_eq!(error.message(), "voice sidecar event frame was malformed");
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_audio_is_offered_to_the_handle_and_never_published() {
+        let at_two = |frame: SidecarFrame| {
+            encode_frame(&frame.at_version(TURN_AUDIO_PROTOCOL_VERSION)).unwrap()
+        };
+        let stdout = [
+            at_two(SidecarFrame::control(SidecarControl::Ready {
+                session_id: SessionId::new(1),
+            })),
+            at_two(SidecarFrame::control(
+                SidecarControl::TranscriptHypothesis {
+                    session_id: SessionId::new(1),
+                    hypothesis: RecognitionHypothesis::engine_final(3, "hello"),
+                },
+            )),
+            encode_frame(&turn_audio_frame(vec![-32_768, 0, 16_384])).unwrap(),
+        ]
+        .concat();
+        let (reliable_sender, mut reliable) = mpsc::channel(RELIABLE_INPUT_QUEUE_CAPACITY);
+        let (nonterminal_sender, _nonterminal) = mpsc::channel(NONTERMINAL_INPUT_QUEUE_CAPACITY);
+        let (supervisor_sender, mut supervisor) = mpsc::unbounded_channel();
+        let turn_audio = SidecarTurnAudio::new();
+
+        run_stdout_reader(
+            stdout.as_slice(),
+            MAX_CONTROL_PAYLOAD_BYTES,
+            Some(turn_audio.clone()),
+            SessionId::new(1),
+            Arc::new(SessionShared::new(SessionId::new(1))),
+            InputPublisher {
+                reliable: reliable_sender,
+                nonterminal: nonterminal_sender,
+                supervisor: supervisor_sender.clone(),
+            },
+            CancellationToken::new(),
+            supervisor_sender,
+        )
+        .await;
+
+        assert!(matches!(
+            reliable.try_recv(),
+            Ok(Ok(VoiceInputEvent::Recognition(
+                RecognitionEvent::Hypothesis(_)
+            )))
+        ));
+        assert!(reliable.try_recv().is_err());
+        assert!(matches!(supervisor.try_recv(), Ok(SupervisorEvent::Ready)));
+        assert!(matches!(supervisor.try_recv(), Ok(SupervisorEvent::Eof)));
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert_eq!(
+            turn_audio.take(SessionId::new(1), 3, cancelled).await,
+            Some(CapturedTurnAudio {
+                samples: vec![-1.0, 0.0, 0.5],
+                playback_overlap: true,
+                single_segment: false,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_audio_for_another_session_is_fatal() {
+        let stdout = [
+            encode_frame(
+                &SidecarFrame::control(SidecarControl::Ready {
+                    session_id: SessionId::new(2),
+                })
+                .at_version(TURN_AUDIO_PROTOCOL_VERSION),
+            )
+            .unwrap(),
+            encode_frame(&turn_audio_frame(vec![1])).unwrap(),
+        ]
+        .concat();
+        let (reliable_sender, _reliable) = mpsc::channel(RELIABLE_INPUT_QUEUE_CAPACITY);
+        let (nonterminal_sender, _nonterminal) = mpsc::channel(NONTERMINAL_INPUT_QUEUE_CAPACITY);
+        let (supervisor_sender, mut supervisor) = mpsc::unbounded_channel();
+        let turn_audio = SidecarTurnAudio::new();
+
+        run_stdout_reader(
+            stdout.as_slice(),
+            MAX_CONTROL_PAYLOAD_BYTES,
+            Some(turn_audio.clone()),
+            SessionId::new(2),
+            Arc::new(SessionShared::new(SessionId::new(2))),
+            InputPublisher {
+                reliable: reliable_sender,
+                nonterminal: nonterminal_sender,
+                supervisor: supervisor_sender.clone(),
+            },
+            CancellationToken::new(),
+            supervisor_sender,
+        )
+        .await;
+
+        assert!(matches!(supervisor.try_recv(), Ok(SupervisorEvent::Ready)));
+        assert!(matches!(
+            supervisor.try_recv(),
+            Ok(SupervisorEvent::Fatal(error))
+                if error.message() == "voice sidecar session identity mismatch"
+        ));
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert_eq!(turn_audio.take(SessionId::new(1), 3, cancelled).await, None);
     }
 
     #[tokio::test]

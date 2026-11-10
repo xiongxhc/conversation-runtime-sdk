@@ -2,6 +2,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -9,6 +10,7 @@ use std::time::Duration;
 use serde_json::json;
 
 const PROTOCOL_VERSION: u16 = 1;
+const TURN_AUDIO_PROTOCOL_VERSION: u16 = 2;
 const HEADER_BYTES: usize = 8;
 const AUDIO_METADATA_BYTES: usize = 48;
 const MAX_CONTROL_PAYLOAD_BYTES: usize = 65_536;
@@ -29,6 +31,7 @@ const PLAYBACK_FLUSHED: u16 = 0x8006;
 const CAPTURE_STARTED: u16 = 0x8007;
 const CAPTURE_PAUSED: u16 = 0x8008;
 const CAPTURE_RESUMED: u16 = 0x8009;
+const TURN_AUDIO: u16 = 0x800b;
 const FAILURE: u16 = 0x80fe;
 const SHUTDOWN_COMPLETE: u16 = 0x80ff;
 
@@ -43,6 +46,10 @@ const HELD_MARKER_ENV: &str = "CONVERSATION_FAKE_VOICE_SIDECAR_HELD_MARKER";
 const INPUT_FLOOD_MARKER_ENV: &str = "CONVERSATION_FAKE_VOICE_SIDECAR_INPUT_FLOOD_MARKER";
 const ORDER_MARKER_ENV: &str = "CONVERSATION_FAKE_VOICE_SIDECAR_ORDER_MARKER";
 const PLAYBACK_MARKER_ENV: &str = "CONVERSATION_FAKE_VOICE_SIDECAR_PLAYBACK_MARKER";
+
+/// The version stamped on `StartSession`; zero until it arrives. Every later
+/// frame, read or written, carries it.
+static SESSION_VERSION: AtomicU16 = AtomicU16::new(0);
 
 fn main() {
     let result = run();
@@ -77,7 +84,11 @@ fn run() -> Result<(), String> {
     })?;
 
     let (event_sender, event_receiver) = mpsc::channel();
-    spawn_control_reader(event_sender.clone(), scenario == "slow-stdin");
+    spawn_control_reader(
+        event_sender.clone(),
+        scenario == "slow-stdin",
+        scenario == "version-one-only",
+    );
 
     if scenario == "barge-in" {
         write_marker_from_env(MEDIA_BLOCKED_MARKER_ENV, "blocked", false)?;
@@ -258,6 +269,7 @@ fn run() -> Result<(), String> {
                 } else if scenario == "partial-final"
                     || scenario.starts_with("partial-final-hold-")
                     || scenario == "partial-final-render-under-partial-pressure"
+                    || scenario == "turn-audio"
                 {
                     write_json_frame(
                         &mut stdout,
@@ -297,6 +309,41 @@ fn run() -> Result<(), String> {
                             "at_ms": 20
                         }),
                     )?;
+                    if scenario == "turn-audio" {
+                        write_turn_audio_frame(
+                            &mut stdout,
+                            session_version(),
+                            TurnAudio {
+                                session,
+                                segment: 4,
+                                final_segments: 1,
+                                playback_overlap: false,
+                                samples: &[1000; 16_000],
+                            },
+                        )?;
+                    }
+                } else if scenario == "two-turns-one-audio" {
+                    write_two_turns_one_audio(&mut stdout, session)?;
+                } else if scenario == "turn-audio-at-version-one" {
+                    write_turn_audio_frame(
+                        &mut stdout,
+                        TURN_AUDIO_PROTOCOL_VERSION,
+                        TurnAudio {
+                            session,
+                            segment: 4,
+                            final_segments: 1,
+                            playback_overlap: false,
+                            samples: &[1000; 16_000],
+                        },
+                    )?;
+                } else if scenario == "oversized-turn-audio" {
+                    write_header(&mut stdout, TURN_AUDIO, 320_025)?;
+                    stdout
+                        .flush()
+                        .map_err(|_| "failed to flush oversized turn audio header".to_owned())?;
+                    loop {
+                        thread::sleep(Duration::from_secs(60));
+                    }
                 } else if scenario == "barge-in" {
                     write_json_frame(
                         &mut stdout,
@@ -600,11 +647,15 @@ fn validate_arguments() -> Result<(), String> {
     Ok(())
 }
 
-fn spawn_control_reader(sender: mpsc::Sender<FakeEvent>, stop_after_start: bool) {
+fn spawn_control_reader(
+    sender: mpsc::Sender<FakeEvent>,
+    stop_after_start: bool,
+    version_one_only: bool,
+) {
     thread::spawn(move || {
         let mut stdin = BufReader::new(io::stdin());
         loop {
-            match read_frame(&mut stdin) {
+            match read_frame(&mut stdin, version_one_only) {
                 Ok(Some((kind, payload))) => {
                     let control =
                         decode_control(kind, &payload).unwrap_or(ControlFrame::Unexpected);
@@ -638,7 +689,7 @@ fn spawn_media_reader(media: File, sender: mpsc::Sender<FakeEvent>) {
     thread::spawn(move || {
         let mut media = BufReader::new(media);
         loop {
-            match read_frame(&mut media) {
+            match read_frame(&mut media, false) {
                 Ok(Some((AUDIO_FRAME, payload))) if payload.len() >= AUDIO_METADATA_BYTES => {
                     let identity = MediaFrame {
                         session: read_u64(&payload, 0),
@@ -664,14 +715,32 @@ fn spawn_media_reader(media: File, sender: mpsc::Sender<FakeEvent>) {
     });
 }
 
-fn read_frame(reader: &mut impl Read) -> io::Result<Option<(u16, Vec<u8>)>> {
+/// Reads one frame. The first frame of the session (`StartSession`) may be at
+/// version 1 or 2, or only 1 for a sidecar built before version 2; it fixes the
+/// session's version, and every later frame must carry it.
+fn read_frame(
+    reader: &mut impl Read,
+    version_one_only: bool,
+) -> io::Result<Option<(u16, Vec<u8>)>> {
     let mut header = [0_u8; HEADER_BYTES];
     let first = reader.read(&mut header[..1])?;
     if first == 0 {
         return Ok(None);
     }
     reader.read_exact(&mut header[1..])?;
-    if u16::from_be_bytes([header[0], header[1]]) != PROTOCOL_VERSION {
+    let version = u16::from_be_bytes([header[0], header[1]]);
+    let accepted = match SESSION_VERSION.load(Ordering::SeqCst) {
+        0 if version_one_only => version == PROTOCOL_VERSION,
+        0 => {
+            let supported = version == PROTOCOL_VERSION || version == TURN_AUDIO_PROTOCOL_VERSION;
+            if supported {
+                SESSION_VERSION.store(version, Ordering::SeqCst);
+            }
+            supported
+        }
+        session => version == session,
+    };
+    if !accepted {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "unexpected protocol version",
@@ -784,13 +853,110 @@ fn write_media_event(
     )
 }
 
+fn session_version() -> u16 {
+    match SESSION_VERSION.load(Ordering::SeqCst) {
+        0 => PROTOCOL_VERSION,
+        version => version,
+    }
+}
+
 fn write_header(writer: &mut impl Write, kind: u16, length: usize) -> Result<(), String> {
+    write_header_at(writer, session_version(), kind, length)
+}
+
+fn write_header_at(
+    writer: &mut impl Write,
+    version: u16,
+    kind: u16,
+    length: usize,
+) -> Result<(), String> {
     let length = u32::try_from(length).map_err(|_| "fake payload length overflowed".to_owned())?;
     writer
-        .write_all(&PROTOCOL_VERSION.to_be_bytes())
+        .write_all(&version.to_be_bytes())
         .and_then(|()| writer.write_all(&kind.to_be_bytes()))
         .and_then(|()| writer.write_all(&length.to_be_bytes()))
         .map_err(|_| "failed to write fake frame header".to_owned())
+}
+
+struct TurnAudio<'a> {
+    session: u64,
+    segment: u64,
+    final_segments: u16,
+    playback_overlap: bool,
+    samples: &'a [i16],
+}
+
+fn write_turn_audio_frame(
+    writer: &mut impl Write,
+    version: u16,
+    audio: TurnAudio<'_>,
+) -> Result<(), String> {
+    let sample_count = u32::try_from(audio.samples.len())
+        .map_err(|_| "fake sample count overflowed".to_owned())?;
+    let mut payload = Vec::with_capacity(24 + 2 * audio.samples.len());
+    payload.extend_from_slice(&audio.session.to_be_bytes());
+    payload.extend_from_slice(&audio.segment.to_be_bytes());
+    payload.extend_from_slice(&sample_count.to_be_bytes());
+    payload.extend_from_slice(&audio.final_segments.to_be_bytes());
+    payload.extend_from_slice(&u16::from(audio.playback_overlap).to_be_bytes());
+    for sample in audio.samples {
+        payload.extend_from_slice(&sample.to_le_bytes());
+    }
+    write_header_at(writer, version, TURN_AUDIO, payload.len())?;
+    writer
+        .write_all(&payload)
+        .map_err(|_| "failed to write fake turn audio".to_owned())?;
+    writer
+        .flush()
+        .map_err(|_| "failed to flush fake turn audio".to_owned())
+}
+
+/// Two turns whose segment ids both restart at 1: only the first has audio.
+fn write_two_turns_one_audio(writer: &mut impl Write, session: u64) -> Result<(), String> {
+    for (turn, text) in [(0_u64, "first"), (1, "second")] {
+        write_json_frame(
+            writer,
+            VOICE_ACTIVITY,
+            json!({
+                "session_id": session,
+                "activity": "speech_started",
+                "at_ms": 10 + turn * 100
+            }),
+        )?;
+        write_json_frame(
+            writer,
+            TRANSCRIPT_HYPOTHESIS,
+            json!({
+                "session_id": session,
+                "segment_id": 1,
+                "text": text,
+                "engine_final": true
+            }),
+        )?;
+        write_json_frame(
+            writer,
+            VOICE_ACTIVITY,
+            json!({
+                "session_id": session,
+                "activity": "speech_ended",
+                "at_ms": 20 + turn * 100
+            }),
+        )?;
+        if turn == 0 {
+            write_turn_audio_frame(
+                writer,
+                session_version(),
+                TurnAudio {
+                    session,
+                    segment: 1,
+                    final_segments: 1,
+                    playback_overlap: false,
+                    samples: &[1000; 16_000],
+                },
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn read_u64(payload: &[u8], offset: usize) -> u64 {

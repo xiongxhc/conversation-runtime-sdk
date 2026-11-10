@@ -11,6 +11,16 @@ func fixture(_ relativePath: String) throws -> URL {
     return root.appendingPathComponent(relativePath)
 }
 
+func fixtureV2(_ relativePath: String) throws -> URL {
+    let root = ProcessInfo.processInfo.environment["VOICE_SIDECAR_V2_FIXTURES_DIR"]
+        .map { URL(fileURLWithPath: $0, isDirectory: true) }
+        ?? URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .appendingPathComponent("../../../../../tests/fixtures/voice-sidecar-v2")
+        .standardizedFileURL
+    return root.appendingPathComponent(relativePath)
+}
+
 enum TestSupportError: Error {
     case missingFixtureDirectory
     case unexpectedRead

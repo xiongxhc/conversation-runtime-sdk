@@ -713,9 +713,13 @@ private func rawFrame(
     return data
 }
 
-private func header(kind: ChildFrameKind, payloadLength: UInt32) -> Data {
+private func header(
+    kind: ChildFrameKind,
+    version: UInt16 = ChildProtocol.version,
+    payloadLength: UInt32
+) -> Data {
     var data = Data()
-    data.appendBigEndian(ChildProtocol.version)
+    data.appendBigEndian(version)
     data.appendBigEndian(kind.rawValue)
     data.appendBigEndian(payloadLength)
     return data
@@ -733,4 +737,247 @@ private func validAudioPayload() -> Data {
     data.appendBigEndian(UInt16(1))
     data.append(Data([0x00, 0x80, 0xFF, 0x7F]))
     return data
+}
+
+// MARK: - Protocol version 2
+
+private func turnAudioPayload(
+    sessionID: UInt64 = 7,
+    segmentID: UInt64 = 4,
+    declaredSamples: UInt32,
+    finalSegments: UInt16 = 1,
+    flags: UInt16 = 0,
+    sampleBytes: Int
+) -> Data {
+    var data = Data()
+    data.appendBigEndian(sessionID)
+    data.appendBigEndian(segmentID)
+    data.appendBigEndian(declaredSamples)
+    data.appendBigEndian(finalSegments)
+    data.appendBigEndian(flags)
+    data.append(Data(count: sampleBytes))
+    return data
+}
+
+@Test
+func versionTwoKindCodeAndLimitsArePinned() {
+    #expect(ChildProtocol.version == 1)
+    #expect(ChildProtocol.turnAudioVersion == 2)
+    #expect(ChildProtocol.supportedVersions == 1...2)
+    #expect(ChildFrameKind.turnAudio.rawValue == 0x800B)
+    #expect(ChildProtocol.turnAudioMetadataBytes == 24)
+    #expect(ChildProtocol.maximumTurnAudioSamples == 160_000)
+    #expect(ChildProtocol.maximumTurnAudioPayloadBytes == 320_024)
+    #expect(ChildFrameKind.turnAudio.maximumPayloadBytes == 320_024)
+}
+
+@Test
+func turnAudioFixtureRoundTrips() throws {
+    let data = try Data(contentsOf: fixtureV2("turn-audio/turn-audio.bin"))
+    let frame = try ChildProtocol.decode(data)
+
+    #expect(frame.version == 2)
+    #expect(frame.kind == .turnAudio)
+    #expect(frame.control == nil)
+    #expect(frame.audio == nil)
+    #expect(
+        frame.turnAudio
+            == TurnAudioFrame(
+                sessionID: 7,
+                segmentID: 4,
+                finalSegments: 1,
+                playbackOverlap: true,
+                samples: [0, 1, -1, 32767, -32768]
+            )
+    )
+    #expect(try ChildProtocol.encode(frame) == data)
+}
+
+@Test
+func versionTwoControlFixturesRoundTrip() throws {
+    let start = try Data(contentsOf: fixtureV2("control/start-session.bin"))
+    let startFrame = try ChildProtocol.decode(start)
+    #expect(startFrame.version == 2)
+    #expect(
+        startFrame.control
+            == .startSession(
+                sessionID: 7,
+                speechStartMilliseconds: 200,
+                finalSilenceMilliseconds: 700
+            )
+    )
+    #expect(try ChildProtocol.encode(startFrame) == start)
+
+    let final = try Data(contentsOf: fixtureV2("control/transcript-final.bin"))
+    let finalFrame = try ChildProtocol.decode(final)
+    #expect(finalFrame.version == 2)
+    #expect(
+        finalFrame.control
+            == .transcriptHypothesis(
+                sessionID: 7,
+                hypothesis: RecognitionHypothesis(segmentID: 4, text: "hello", engineFinal: true)
+            )
+    )
+    #expect(try ChildProtocol.encode(finalFrame) == final)
+}
+
+@Test
+func turnAudioIsNotAVersionOneFrame() throws {
+    let data = try Data(contentsOf: fixtureV2("turn-audio/turn-audio.bin"))
+    var versionOne = data
+    versionOne[0] = 0
+    versionOne[1] = 1
+    #expect(throws: ChildProtocolError.unknownKind(0x800B)) {
+        try ChildProtocol.decode(versionOne)
+    }
+
+    let frame = try ChildProtocol.decode(data).atVersion(1)
+    #expect(frame.version == 1)
+    #expect(throws: ChildProtocolError.unknownKind(0x800B)) {
+        try ChildProtocol.encode(frame)
+    }
+}
+
+@Test
+func turnAudioRejectsWrongLengthsCountsAndFlags() throws {
+    func decode(_ payload: Data) throws -> ChildFrame {
+        try ChildProtocol.decode(rawFrame(version: 2, kind: .turnAudio, payload: payload))
+    }
+    func expectInvalid(_ payload: Data) {
+        do {
+            _ = try decode(payload)
+            Issue.record("expected invalidTurnAudio")
+        } catch let error as ChildProtocolError {
+            guard case .invalidTurnAudio = error else {
+                Issue.record("unexpected error \(error)")
+                return
+            }
+        } catch {
+            Issue.record("unexpected error \(error)")
+        }
+    }
+
+    // shorter than metadata
+    expectInvalid(Data(count: 23))
+    // zero samples
+    expectInvalid(turnAudioPayload(declaredSamples: 0, sampleBytes: 0))
+    // more samples declared than the maximum, within the payload limit
+    expectInvalid(turnAudioPayload(declaredSamples: 160_001, sampleBytes: 320_000))
+    // length disagrees with count, both directions
+    expectInvalid(turnAudioPayload(declaredSamples: 3, sampleBytes: 4))
+    expectInvalid(turnAudioPayload(declaredSamples: 3, sampleBytes: 8))
+    expectInvalid(turnAudioPayload(declaredSamples: 3, sampleBytes: 5))
+    // zero final segments
+    expectInvalid(turnAudioPayload(declaredSamples: 1, finalSegments: 0, sampleBytes: 2))
+    // reserved flag bits
+    expectInvalid(turnAudioPayload(declaredSamples: 1, flags: 0x0002, sampleBytes: 2))
+    expectInvalid(turnAudioPayload(declaredSamples: 1, flags: 0x8001, sampleBytes: 2))
+
+    // exactly the maximum is accepted and round-trips
+    let maximum = try decode(
+        turnAudioPayload(declaredSamples: 160_000, sampleBytes: 320_000)
+    )
+    #expect(maximum.turnAudio?.samples.count == 160_000)
+    #expect(try ChildProtocol.encode(maximum).count == 8 + 320_024)
+
+    // over the maximum payload fails at the header
+    #expect(throws: ChildProtocolError.payloadTooLarge(
+        kind: .turnAudio,
+        declared: 320_026,
+        maximum: 320_024
+    )) {
+        try ChildProtocol.decode(
+            header(kind: .turnAudio, version: 2, payloadLength: 320_026)
+        )
+    }
+
+    // encode refuses the same malformed frames
+    let valid = TurnAudioFrame(
+        sessionID: 7, segmentID: 4, finalSegments: 1, playbackOverlap: false, samples: [1]
+    )
+    for bad in [
+        TurnAudioFrame(
+            sessionID: 7, segmentID: 4, finalSegments: 1, playbackOverlap: false, samples: []
+        ),
+        TurnAudioFrame(
+            sessionID: 7, segmentID: 4, finalSegments: 0, playbackOverlap: false, samples: [1]
+        ),
+        TurnAudioFrame(
+            sessionID: 7,
+            segmentID: 4,
+            finalSegments: 1,
+            playbackOverlap: false,
+            samples: [Int16](repeating: 0, count: 160_001)
+        ),
+    ] {
+        do {
+            _ = try ChildProtocol.encode(ChildFrame(turnAudio: bad))
+            Issue.record("expected invalidTurnAudio")
+        } catch let error as ChildProtocolError {
+            guard case .invalidTurnAudio = error else {
+                Issue.record("unexpected error \(error)")
+                continue
+            }
+        }
+    }
+    #expect(try ChildProtocol.decode(ChildProtocol.encode(ChildFrame(turnAudio: valid))).turnAudio == valid)
+}
+
+@Test
+func everyVersionOneControlRoundTripsAtVersionTwo() throws {
+    let controls: [ChildControl] = [
+        .startSession(sessionID: 7, speechStartMilliseconds: 200, finalSilenceMilliseconds: 600),
+        .startCapture(sessionID: 7, operationID: 1),
+        .pauseCapture(sessionID: 7, operationID: 2),
+        .resumeCapture(sessionID: 7, operationID: 3),
+        .flushGeneration(sessionID: 7, generationID: 2, operationID: 4),
+        .shutdown(sessionID: 7),
+        .ready(sessionID: 7),
+        .voiceActivity(sessionID: 7, activity: .speechStarted(atMilliseconds: 120)),
+        .transcriptHypothesis(
+            sessionID: 7,
+            hypothesis: RecognitionHypothesis(segmentID: 3, text: "hel", engineFinal: false)
+        ),
+        .playbackAccepted(sessionID: 7, turnID: 1, generationID: 2, utteranceID: 3, sequence: 4),
+        .playbackRendered(sessionID: 7, turnID: 1, generationID: 2, utteranceID: 3, sequence: 4),
+        .playbackFlushed(sessionID: 7, generationID: 2, operationID: 4),
+        .captureStarted(sessionID: 7, operationID: 1),
+        .capturePaused(sessionID: 7, operationID: 2),
+        .captureResumed(sessionID: 7, operationID: 3),
+        .audioDeviceStatus(sessionID: 7, inputLabel: "in", outputLabel: "out"),
+        .failure(sessionID: 7, stage: .speechRecognizer, code: .recognitionFailed),
+        .shutdownComplete(sessionID: 7),
+    ]
+    for control in controls {
+        let v1 = try ChildProtocol.encode(ChildFrame(control: control))
+        let v2Frame = ChildFrame(control: control).atVersion(2)
+        let v2 = try ChildProtocol.encode(v2Frame)
+        #expect(v2.dropFirst(2) == v1.dropFirst(2))
+        #expect(v2.prefix(2) == Data([0, 2]))
+        let decoded = try ChildProtocol.decode(v2)
+        #expect(decoded == v2Frame)
+        #expect(decoded.version == 2)
+    }
+}
+
+@Test
+func versionThreeIsRejectedExplicitly() throws {
+    let data = rawFrame(
+        version: 3,
+        kind: .startCapture,
+        payload: Data(#"{"session_id":7,"operation_id":1}"#.utf8)
+    )
+    #expect(throws: ChildProtocolError.unknownVersion(3)) {
+        try ChildProtocol.decode(data)
+    }
+    #expect(throws: ChildProtocolError.unknownVersion(0)) {
+        try ChildProtocol.decode(
+            rawFrame(version: 0, kind: .startCapture, payload: Data())
+        )
+    }
+    #expect(throws: ChildProtocolError.unknownVersion(3)) {
+        try ChildProtocol.encode(
+            ChildFrame(control: .shutdown(sessionID: 7)).atVersion(3)
+        )
+    }
 }

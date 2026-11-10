@@ -18,13 +18,19 @@ public enum ChildFrameKind: UInt16, CaseIterable, Equatable, Sendable {
     case capturePaused = 0x8008
     case captureResumed = 0x8009
     case audioDeviceStatus = 0x800A
+    case turnAudio = 0x800B
     case failure = 0x80FE
     case shutdownComplete = 0x80FF
 
     var maximumPayloadBytes: Int {
-        self == .audioFrame
-            ? ChildProtocol.maximumAudioPayloadBytes
-            : ChildProtocol.maximumControlPayloadBytes
+        switch self {
+        case .audioFrame:
+            ChildProtocol.maximumAudioPayloadBytes
+        case .turnAudio:
+            ChildProtocol.maximumTurnAudioPayloadBytes
+        default:
+            ChildProtocol.maximumControlPayloadBytes
+        }
     }
 }
 
@@ -144,37 +150,98 @@ public struct ChildAudio: Equatable, Sendable {
     }
 }
 
+/// The last part of a finished turn's audio: 16 kHz mono signed 16-bit
+/// samples, sent only on protocol version 2.
+public struct TurnAudioFrame: Equatable, Sendable {
+    public let sessionID: UInt64
+    public let segmentID: UInt64
+    public let finalSegments: UInt16
+    public let playbackOverlap: Bool
+    public let samples: [Int16]
+
+    public init(
+        sessionID: UInt64,
+        segmentID: UInt64,
+        finalSegments: UInt16,
+        playbackOverlap: Bool,
+        samples: [Int16]
+    ) {
+        self.sessionID = sessionID
+        self.segmentID = segmentID
+        self.finalSegments = finalSegments
+        self.playbackOverlap = playbackOverlap
+        self.samples = samples
+    }
+}
+
 public struct ChildFrame: Equatable, Sendable {
     public let version: UInt16
     public let control: ChildControl?
     public let audio: ChildAudio?
+    public let turnAudio: TurnAudioFrame?
 
     public init(control: ChildControl) {
         version = ChildProtocol.version
         self.control = control
         audio = nil
+        turnAudio = nil
     }
 
     public init(audioSessionID: UInt64, frame: PCMFrame) {
         version = ChildProtocol.version
         control = nil
         audio = ChildAudio(sessionID: audioSessionID, frame: frame)
+        turnAudio = nil
+    }
+
+    public init(turnAudio: TurnAudioFrame) {
+        version = ChildProtocol.turnAudioVersion
+        control = nil
+        audio = nil
+        self.turnAudio = turnAudio
     }
 
     init(version: UInt16, control: ChildControl) {
         self.version = version
         self.control = control
         audio = nil
+        turnAudio = nil
     }
 
     init(version: UInt16, audio: ChildAudio) {
         self.version = version
         control = nil
         self.audio = audio
+        turnAudio = nil
+    }
+
+    init(version: UInt16, turnAudio: TurnAudioFrame) {
+        self.version = version
+        control = nil
+        audio = nil
+        self.turnAudio = turnAudio
+    }
+
+    /// The same frame carried at another protocol version. Encoding refuses
+    /// a version the frame's kind does not exist in.
+    public func atVersion(_ version: UInt16) -> ChildFrame {
+        if let control {
+            return ChildFrame(version: version, control: control)
+        }
+        if let audio {
+            return ChildFrame(version: version, audio: audio)
+        }
+        if let turnAudio {
+            return ChildFrame(version: version, turnAudio: turnAudio)
+        }
+        return self
     }
 
     public var kind: ChildFrameKind {
-        control?.kind ?? .audioFrame
+        if let control {
+            return control.kind
+        }
+        return turnAudio != nil ? .turnAudio : .audioFrame
     }
 }
 
@@ -189,23 +256,35 @@ public enum ChildProtocolError: Error, Equatable, Sendable {
     case invalidControlUTF8
     case invalidControlJSON
     case invalidAudioMetadata(String)
+    case invalidTurnAudio(String)
     case unknownSampleFormat(UInt16)
     case trailingBytes(Int)
 }
 
 public enum ChildProtocol {
     public static let version: UInt16 = 1
+    public static let turnAudioVersion: UInt16 = 2
+    public static let supportedVersions: ClosedRange<UInt16> = 1...2
     public static let headerBytes = 8
     public static let audioMetadataBytes = 48
     public static let maximumControlPayloadBytes = 65_536
     public static let maximumAudioPayloadBytes = audioMetadataBytes + PCMFrame.maximumBytes
+    public static let turnAudioMetadataBytes = 24
+    public static let maximumTurnAudioSamples = 160_000
+    public static let maximumTurnAudioPayloadBytes =
+        turnAudioMetadataBytes + 2 * maximumTurnAudioSamples
+    private static let turnAudioPlaybackOverlapFlag: UInt16 = 0x0001
 
     public static func encode(_ frame: ChildFrame) throws -> Data {
+        try validateVersion(frame.version)
+        try validateKindVersion(frame.kind, version: frame.version)
         let payload: Data
         if let control = frame.control {
             payload = try encodeControl(control)
         } else if let audio = frame.audio {
             payload = try encodeAudioPayload(audio)
+        } else if let turnAudio = frame.turnAudio {
+            payload = try encodeTurnAudioPayload(turnAudio)
         } else {
             throw ChildProtocolError.invalidControlJSON
         }
@@ -237,6 +316,12 @@ public enum ChildProtocol {
         if header.kind == .audioFrame {
             return ChildFrame(version: header.version, audio: try decodeAudioPayload(payload))
         }
+        if header.kind == .turnAudio {
+            return ChildFrame(
+                version: header.version,
+                turnAudio: try decodeTurnAudioPayload(payload)
+            )
+        }
         return ChildFrame(
             version: header.version,
             control: try decodeControl(kind: header.kind, payload: payload)
@@ -260,13 +345,12 @@ public enum ChildProtocol {
         }
         let bytes = [UInt8](data.prefix(headerBytes))
         let decodedVersion = readUInt16(bytes, at: 0)
-        guard decodedVersion == version else {
-            throw ChildProtocolError.unknownVersion(decodedVersion)
-        }
+        try validateVersion(decodedVersion)
         let kindCode = readUInt16(bytes, at: 2)
         guard let kind = ChildFrameKind(rawValue: kindCode) else {
             throw ChildProtocolError.unknownKind(kindCode)
         }
+        try validateKindVersion(kind, version: decodedVersion)
         let payloadLength = Int(readUInt32(bytes, at: 4))
         try validatePayloadLength(kind: kind, declared: payloadLength)
         return DecodedHeader(
@@ -344,6 +428,93 @@ public enum ChildProtocol {
         } catch {
             throw ChildProtocolError.invalidAudioMetadata("PCM frame validation failed")
         }
+    }
+
+    private static func validateVersion(_ candidate: UInt16) throws {
+        guard supportedVersions.contains(candidate) else {
+            throw ChildProtocolError.unknownVersion(candidate)
+        }
+    }
+
+    private static func validateKindVersion(
+        _ kind: ChildFrameKind,
+        version candidate: UInt16
+    ) throws {
+        if kind == .turnAudio, candidate < turnAudioVersion {
+            throw ChildProtocolError.unknownKind(kind.rawValue)
+        }
+    }
+
+    static func decodeTurnAudioPayload(_ payload: Data) throws -> TurnAudioFrame {
+        guard payload.count >= turnAudioMetadataBytes else {
+            throw ChildProtocolError.invalidTurnAudio(
+                "payload is shorter than 24-byte metadata"
+            )
+        }
+        let bytes = [UInt8](payload)
+        let sessionID = readUInt64(bytes, at: 0)
+        let segmentID = readUInt64(bytes, at: 8)
+        let sampleCount = Int(readUInt32(bytes, at: 16))
+        let finalSegments = readUInt16(bytes, at: 20)
+        let flags = readUInt16(bytes, at: 22)
+        guard sampleCount > 0, sampleCount <= maximumTurnAudioSamples else {
+            throw ChildProtocolError.invalidTurnAudio(
+                "sample count must be within 1..=160000"
+            )
+        }
+        guard payload.count - turnAudioMetadataBytes == 2 * sampleCount else {
+            throw ChildProtocolError.invalidTurnAudio(
+                "payload length does not match the sample count"
+            )
+        }
+        guard finalSegments > 0 else {
+            throw ChildProtocolError.invalidTurnAudio(
+                "final segment count must be at least one"
+            )
+        }
+        guard flags & ~turnAudioPlaybackOverlapFlag == 0 else {
+            throw ChildProtocolError.invalidTurnAudio("reserved flag bits must be zero")
+        }
+        var samples = [Int16]()
+        samples.reserveCapacity(sampleCount)
+        var offset = turnAudioMetadataBytes
+        for _ in 0..<sampleCount {
+            let raw = UInt16(bytes[offset]) | UInt16(bytes[offset + 1]) << 8
+            samples.append(Int16(bitPattern: raw))
+            offset += 2
+        }
+        return TurnAudioFrame(
+            sessionID: sessionID,
+            segmentID: segmentID,
+            finalSegments: finalSegments,
+            playbackOverlap: flags & turnAudioPlaybackOverlapFlag != 0,
+            samples: samples
+        )
+    }
+
+    private static func encodeTurnAudioPayload(_ frame: TurnAudioFrame) throws -> Data {
+        guard !frame.samples.isEmpty, frame.samples.count <= maximumTurnAudioSamples else {
+            throw ChildProtocolError.invalidTurnAudio(
+                "sample count must be within 1..=160000"
+            )
+        }
+        guard frame.finalSegments > 0 else {
+            throw ChildProtocolError.invalidTurnAudio(
+                "final segment count must be at least one"
+            )
+        }
+        var payload = Data(capacity: turnAudioMetadataBytes + 2 * frame.samples.count)
+        payload.appendBigEndian(frame.sessionID)
+        payload.appendBigEndian(frame.segmentID)
+        payload.appendBigEndian(UInt32(frame.samples.count))
+        payload.appendBigEndian(frame.finalSegments)
+        payload.appendBigEndian(frame.playbackOverlap ? turnAudioPlaybackOverlapFlag : 0)
+        for sample in frame.samples {
+            let raw = UInt16(bitPattern: sample)
+            payload.append(UInt8(truncatingIfNeeded: raw))
+            payload.append(UInt8(truncatingIfNeeded: raw >> 8))
+        }
+        return payload
     }
 
     private static func validatePayloadLength(
@@ -813,7 +984,7 @@ public enum ChildProtocol {
                     stage: value.stage,
                     code: value.code
                 )
-            case .audioFrame:
+            case .audioFrame, .turnAudio:
                 throw ChildProtocolError.invalidControlJSON
             }
         } catch is ChildProtocolError {

@@ -17,6 +17,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::speaker_audio::MediaTurnAudio;
+
 type OwnedWorker = JoinHandle<Result<(), AdapterError>>;
 
 /// Recognition restarts allowed in any rolling `RECOGNITION_RESTART_WINDOW`. Past it the next
@@ -44,17 +46,21 @@ impl GatewayVoiceAdapters {
     }
 
     /// Binds the selected online recognizer to the one capture branch Task 6 attached before the
-    /// media lease was disclosed. There is no alternate capture or offline fallback path.
+    /// media lease was disclosed. There is no alternate capture or offline fallback path. With
+    /// `turn_audio`, every final is noted there under its session-wide segment id before it is
+    /// forwarded.
     pub fn online_media_io(
         &self,
         media_io: Arc<dyn VoiceIoFactory>,
         capture: Arc<dyn AudioCapture>,
+        turn_audio: Option<Arc<MediaTurnAudio>>,
     ) -> Option<Arc<dyn VoiceIoFactory>> {
         self.online_recognition.as_ref().map(|config| {
             Arc::new(OnlineRecognitionVoiceIoFactory {
                 media_io,
                 config: config.clone(),
                 capture,
+                turn_audio,
             }) as Arc<dyn VoiceIoFactory>
         })
     }
@@ -80,6 +86,7 @@ struct OnlineRecognitionVoiceIoFactory {
     media_io: Arc<dyn VoiceIoFactory>,
     config: OpenAiSpeechRecognitionConfig,
     capture: Arc<dyn AudioCapture>,
+    turn_audio: Option<Arc<MediaTurnAudio>>,
 }
 
 impl VoiceIoFactory for OnlineRecognitionVoiceIoFactory {
@@ -116,6 +123,7 @@ impl VoiceIoFactory for OnlineRecognitionVoiceIoFactory {
                     media_input: session.input,
                     recognizer,
                     relay_completion: Mutex::new(Some(relay_sender)),
+                    turn_audio: self.turn_audio.clone(),
                 }),
                 capture: session.capture,
                 output: session.output,
@@ -215,6 +223,7 @@ struct OnlineRecognitionVoiceInput {
     media_input: Arc<dyn VoiceInput>,
     recognizer: Arc<OpenAiSpeechRecognizer>,
     relay_completion: Mutex<Option<oneshot::Sender<RecognitionWorkers>>>,
+    turn_audio: Option<Arc<MediaTurnAudio>>,
 }
 
 impl VoiceInput for OnlineRecognitionVoiceInput {
@@ -254,6 +263,7 @@ impl VoiceInput for OnlineRecognitionVoiceInput {
                     recognizer: self.recognizer.clone(),
                     session_id,
                 }),
+                self.turn_audio.clone(),
             ));
             if let Err([relay, actor]) = completion_sender.send([completion, actor]) {
                 // Factory cleanup may win while input.start is awaiting capture.
@@ -287,6 +297,7 @@ async fn relay_online_input(
     cancellation: CancellationToken,
     recognition_cancellation: CancellationToken,
     restart: Option<RecognitionRestart>,
+    turn_audio: Option<Arc<MediaTurnAudio>>,
 ) -> Result<(), AdapterError> {
     let started = tokio::time::Instant::now();
     let mut epochs = RecognitionEpochs::new(recognition);
@@ -329,7 +340,11 @@ async fn relay_online_input(
                         Ok(VoiceInputEvent::Activity(activity))
                     }
                     Some(Ok(event @ (RecognitionEvent::FinalizedUtterance(_) | RecognitionEvent::Hypothesis(_)))) => {
-                        epochs.renumber(event).map(VoiceInputEvent::Recognition)
+                        let event = epochs.renumber(event);
+                        if let (Some(turn_audio), Ok(RecognitionEvent::FinalizedUtterance(utterance))) = (&turn_audio, &event) {
+                            turn_audio.note_final(utterance.segment_id(), utterance.capture_evidence());
+                        }
+                        event.map(VoiceInputEvent::Recognition)
                     }
                     Some(Err(error)) => {
                         epochs.reported = true;
@@ -749,6 +764,7 @@ mod ownership_tests {
             cancellation.clone(),
             recognition_cancellation.clone(),
             None,
+            None,
         ));
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_millis(37)).await;
@@ -815,6 +831,7 @@ mod ownership_tests {
                 sender,
                 cancellation.clone(),
                 recognition_cancellation.clone(),
+                None,
                 None,
             ));
             tokio::time::timeout(Duration::from_secs(2), async {
@@ -909,6 +926,7 @@ mod ownership_tests {
                 .with_server_vad(0.5, 300, 500)
                 .unwrap(),
             capture: Arc::new(ControlledCapture(Mutex::new(Some(capture)))),
+            turn_audio: None,
         };
         let cancellation = CancellationToken::new();
         let session = factory
@@ -988,6 +1006,7 @@ mod ownership_tests {
             sender,
             cancellation.clone(),
             cancellation.child_token(),
+            None,
             None,
         ));
         let first = events.recv().await.unwrap().unwrap();
@@ -1193,6 +1212,7 @@ mod ownership_tests {
             ))))),
             config,
             capture: Arc::new(MockAudioCapture::new([])),
+            turn_audio: None,
         };
         let cancellation = CancellationToken::new();
         let session = factory
@@ -1334,6 +1354,7 @@ mod ownership_tests {
                 recognizer: restarts,
                 session_id: SessionId::new(7),
             }),
+            None,
         ));
         (media_sender, events, cancellation, worker)
     }
@@ -1391,6 +1412,7 @@ mod ownership_tests {
                 recognizer: restarts.clone(),
                 session_id: SessionId::new(7),
             }),
+            None,
         ));
         let mut segments = Vec::new();
         let mut failures = 0;
@@ -1563,6 +1585,109 @@ mod ownership_tests {
         assert_media_relayed_promptly(&media, &mut events).await;
         cancellation.cancel();
         await_owned_worker(worker, cancellation).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_relay_notes_each_renumbered_final_before_forwarding_it() {
+        use crate::speaker_audio::test_frames::{evidence, timed_run};
+        use crate::speaker_audio::MediaTurnAudio;
+        use conversation_model_adapters::CaptureObserver;
+
+        let near = |samples: &[f32], value: f32| {
+            samples
+                .iter()
+                .all(|sample| (sample - value / 32_768.0).abs() < 1e-4)
+        };
+        let turn_audio = Arc::new(MediaTurnAudio::new());
+        // 2 s of capture: 1000 for the first second, -2000 for the second.
+        for frame in timed_run(1, 0, 50, 1000)
+            .iter()
+            .chain(&timed_run(51, 24_000, 50, -2000))
+        {
+            turn_audio.observe(frame, false);
+        }
+        let with_range = |segment_id, start, end| {
+            Ok(RecognitionEvent::FinalizedUtterance(
+                FinalizedUtterance::new(segment_id, "words")
+                    .unwrap()
+                    .with_capture_evidence(evidence(start, end))
+                    .unwrap(),
+            ))
+        };
+        let (media_sender, media) = mpsc::channel(1);
+        let (recognition_sender, recognition) = mpsc::channel(4);
+        // The restarted epoch's segment 1 is the session's segment 2.
+        let restarts = Arc::new(ScriptedRestarts::new([vec![with_range(1, 24_000, 36_000)]]));
+        // A one-event queue: a final the relay has taken waits behind an unread event.
+        let (sender, mut events) = mpsc::channel(1);
+        let cancellation = CancellationToken::new();
+        let worker = tokio::spawn(relay_online_input(
+            media,
+            recognition,
+            sender,
+            cancellation.clone(),
+            cancellation.child_token(),
+            Some(RecognitionRestart {
+                recognizer: restarts.clone(),
+                session_id: SessionId::new(7),
+            }),
+            Some(turn_audio.clone()),
+        ));
+        media_sender
+            .send(Ok(VoiceInputEvent::Activity(
+                VoiceActivity::SpeechContinued { at_ms: 1 },
+            )))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        recognition_sender
+            .send(with_range(1, 0, 12_000))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(events.len(), 1, "the final has not been forwarded yet");
+        let first = turn_audio
+            .turn_audio(1)
+            .expect("the final was noted before it was forwarded");
+        assert_eq!(first.samples.len(), 8_000);
+        assert!(near(&first.samples, 1000.0));
+        assert!(matches!(
+            events.recv().await,
+            Some(Ok(VoiceInputEvent::Activity(_)))
+        ));
+        assert!(matches!(
+            events.recv().await,
+            Some(Ok(VoiceInputEvent::Recognition(RecognitionEvent::FinalizedUtterance(utterance))))
+                if utterance.segment_id() == 1
+        ));
+
+        recognition_sender
+            .send(Err(AdapterError::new("capture discontinuity")
+                .with_stage(RuntimeStage::SpeechRecognizer)))
+            .await
+            .unwrap();
+        drop(recognition_sender);
+        let renumbered = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(Ok(VoiceInputEvent::Recognition(
+                    RecognitionEvent::FinalizedUtterance(utterance),
+                ))) = events.recv().await
+                {
+                    return utterance.segment_id();
+                }
+            }
+        })
+        .await
+        .expect("the restarted epoch's final was forwarded");
+        cancellation.cancel();
+        await_owned_worker(worker, cancellation).await.unwrap();
+        assert_eq!(renumbered, 2);
+        let second = turn_audio
+            .turn_audio(2)
+            .expect("the final was noted under its session-wide id");
+        assert_eq!(second.samples.len(), 8_000);
+        assert!(near(&second.samples, -2000.0));
+        assert!(near(&turn_audio.turn_audio(1).unwrap().samples, 1000.0));
     }
 
     #[tokio::test]

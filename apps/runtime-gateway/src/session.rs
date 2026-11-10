@@ -1330,10 +1330,11 @@ impl GatewaySession {
                         let online_profile = RuntimeProfile::parse(&self.status.profile)
                             == Some(RuntimeProfile::Online);
                         let io = if online_profile {
-                            match lane
-                                .adapters
-                                .online_media_io(media_io.clone(), Arc::clone(&recognition_capture))
-                            {
+                            match lane.adapters.online_media_io(
+                                media_io.clone(),
+                                Arc::clone(&recognition_capture),
+                                None,
+                            ) {
                                 Some(io) => io,
                                 None => {
                                     media_server.revoke(session_id).await;

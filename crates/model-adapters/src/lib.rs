@@ -74,8 +74,8 @@ pub use macos_voice_sidecar::{
 };
 pub use mock::{MockAudioOutput, MockLanguageModel, MockSpeechSynthesizer};
 pub use network_voice_io::{
-    frame_for_network_capture, NetworkBridgeRequest, NetworkFlushRequest, NetworkMediaHub,
-    NetworkPlaybackAck, NetworkPlaybackRequest, NetworkVoiceIoFactory,
+    frame_for_network_capture, CaptureObserver, NetworkBridgeRequest, NetworkFlushRequest,
+    NetworkMediaHub, NetworkPlaybackAck, NetworkPlaybackRequest, NetworkVoiceIoFactory,
 };
 pub use ollama::{
     OllamaChatMetrics, OllamaChatStream, OllamaConfig, OllamaLanguageModel, OllamaThinkingLevel,

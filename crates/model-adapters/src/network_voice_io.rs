@@ -21,6 +21,15 @@ use crate::{
 
 const MEDIA_QUEUE_CAPACITY: usize = 16;
 
+/// A synchronous copy of capture taken after the recording lane has accepted each frame.
+///
+/// `observe` must not block, wait or fail: it runs on the capture path, after recording and
+/// before recognition. `playback_pending` says whether any playback was queued or awaiting
+/// acknowledgement in the hub when the frame arrived.
+pub trait CaptureObserver: Send + Sync {
+    fn observe(&self, frame: &AudioFrame, playback_pending: bool);
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NetworkPlaybackAck {
     Accepted,
@@ -91,6 +100,7 @@ struct NetworkSession {
     finish_delivered: bool,
     waiting_playback: VecDeque<WaitingPlayback>,
     waiting_playback_bytes: usize,
+    capture_observer: Option<Arc<dyn CaptureObserver>>,
 }
 
 impl NetworkSession {
@@ -116,6 +126,7 @@ impl NetworkSession {
             finish_delivered: false,
             waiting_playback: VecDeque::new(),
             waiting_playback_bytes: 0,
+            capture_observer: None,
         }
     }
 }
@@ -322,15 +333,36 @@ impl NetworkMediaHub {
         Ok(receiver)
     }
 
+    /// Attaches the one capture observer of a reserved session. It lives as long as the
+    /// reservation.
+    pub async fn observe_capture(
+        &self,
+        session_id: SessionId,
+        observer: Arc<dyn CaptureObserver>,
+    ) -> Result<(), AdapterError> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id.get())
+            .ok_or_else(|| AdapterError::new("network media session is not reserved"))?;
+        if session.capture_observer.is_some() {
+            return Err(AdapterError::new(
+                "network media capture observer is already attached",
+            ));
+        }
+        session.capture_observer = Some(observer);
+        Ok(())
+    }
+
     /// Delivers one validated bridge capture frame to both consumers. A missing consumer is a
     /// failed-closed condition: the socket layer must not call this an accepted media frame.
-    /// Only recording is awaited; recognition is offered afterwards and never delays it.
+    /// Only recording is awaited; an attached observer and then recognition see the frame only
+    /// after recording has accepted it, and neither can delay or refuse it.
     pub async fn deliver_capture(
         &self,
         session_id: SessionId,
         frame: AudioFrame,
     ) -> Result<(), AdapterError> {
-        let (voice, recognition) = {
+        let (voice, recognition, observer) = {
             let sessions = self.sessions.lock().await;
             let session = sessions
                 .get(&session_id.get())
@@ -342,6 +374,11 @@ impl NetworkMediaHub {
                 session.recognition.clone().ok_or_else(|| {
                     AdapterError::new("network media recognition input is not attached")
                 })?,
+                session.capture_observer.clone().map(|observer| {
+                    let playback_pending = !session.pending_playback.is_empty()
+                        || !session.waiting_playback.is_empty();
+                    (observer, playback_pending)
+                }),
             )
         };
         recognition.ensure_open()?;
@@ -352,6 +389,9 @@ impl NetworkMediaHub {
         voice_permit.send(Ok(VoiceInputEvent::Capture(CaptureEvent::Frame(
             frame.clone(),
         ))));
+        if let Some((observer, playback_pending)) = observer {
+            observer.observe(&frame, playback_pending);
+        }
         recognition.offer(CaptureEvent::Frame(frame));
         Ok(())
     }

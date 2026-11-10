@@ -1,11 +1,12 @@
 //! Recording must remain independent of recognition capacity and recognition consumer failure.
 use conversation_model_adapters::{
     frame_for_network_capture, AdapterError, AdapterFuture, AudioCapture, AudioFrame,
-    CaptureDiscontinuityReason, CaptureEvent, CaptureMetadata, NetworkMediaHub,
-    NetworkVoiceIoFactory, OpenAiSpeechRecognitionConfig, OpenAiSpeechRecognizer, PcmFormat,
-    PcmSampleFormat, VoiceInputEvent, VoiceIoFactory, VoiceIoSession, MAX_PCM_FRAME_BYTES,
+    CaptureDiscontinuityReason, CaptureEvent, CaptureMetadata, CaptureObserver,
+    NetworkBridgeRequest, NetworkMediaHub, NetworkPlaybackAck, NetworkVoiceIoFactory,
+    OpenAiSpeechRecognitionConfig, OpenAiSpeechRecognizer, PcmFormat, PcmSampleFormat,
+    VoiceInputEvent, VoiceIoFactory, VoiceIoSession, MAX_PCM_FRAME_BYTES,
 };
-use conversation_protocol::SessionId;
+use conversation_protocol::{GenerationId, PlaybackState, SessionId, TurnId, UtteranceId};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -327,6 +328,171 @@ async fn an_owed_gap_and_a_fitting_live_discontinuity_collapse_into_one() {
         other => panic!("the collapsed gap was reported twice: {other:?}"),
     }
     assert!(recognition.try_recv().is_err());
+    finish(hub, io, cancellation).await;
+}
+
+// ---- Capture observers: a synchronous copy taken only after recording accepted the frame. ----
+
+/// Records each observed frame's sequence and the playback state it was observed with.
+#[derive(Default)]
+struct SeenFrames(std::sync::Mutex<Vec<(u64, bool)>>);
+
+impl CaptureObserver for SeenFrames {
+    fn observe(&self, frame: &AudioFrame, playback_pending: bool) {
+        self.0
+            .lock()
+            .unwrap()
+            .push((frame.sequence(), playback_pending));
+    }
+}
+
+impl SeenFrames {
+    fn seen(&self) -> Vec<(u64, bool)> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+async fn observed(hub: &NetworkMediaHub) -> Arc<SeenFrames> {
+    let seen = Arc::new(SeenFrames::default());
+    hub.observe_capture(SOURCE, seen.clone()).await.unwrap();
+    seen
+}
+
+fn playback_frame() -> AudioFrame {
+    AudioFrame::new(
+        TurnId::new(1),
+        GenerationId::new(3),
+        UtteranceId::new(1),
+        1,
+        PcmFormat::new(24000, 1, PcmSampleFormat::Signed16LittleEndian).unwrap(),
+        vec![0, 0],
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_capture_observer_is_attached_once_to_a_reserved_session() {
+    let cancellation = CancellationToken::new();
+    let (hub, io, recording, recognition) = ports(Duration::from_secs(10), &cancellation).await;
+    let _seen = observed(&hub).await;
+    let second = hub
+        .observe_capture(SOURCE, Arc::new(SeenFrames::default()))
+        .await;
+    assert_eq!(
+        second.unwrap_err().message(),
+        "network media capture observer is already attached"
+    );
+    let unreserved = hub
+        .observe_capture(SessionId::new(99), Arc::new(SeenFrames::default()))
+        .await;
+    assert_eq!(
+        unreserved.unwrap_err().message(),
+        "network media session is not reserved"
+    );
+    drop((recording, recognition));
+    finish(hub, io, cancellation).await;
+}
+
+#[tokio::test]
+async fn a_capture_observer_sees_each_recorded_frame_and_the_playback_state() {
+    let cancellation = CancellationToken::new();
+    let (hub, io, mut recording, _recognition) =
+        ports(Duration::from_secs(10), &cancellation).await;
+    let seen = observed(&hub).await;
+    let mut transport = hub.attach_playback_transport(SOURCE, 5).await.unwrap();
+
+    hub.deliver_capture(SOURCE, frame(1)).await.unwrap();
+    assert_eq!(seen.seen(), [(1, false)]);
+
+    // A playback frame is pending from the moment it is queued until it is rendered.
+    let output = io.output.clone();
+    let playback_cancellation = cancellation.clone();
+    let playback = tokio::spawn(async move {
+        output
+            .enqueue(playback_frame(), playback_cancellation)
+            .await
+    });
+    let sequence = match timeout(PROMPT, transport.recv()).await.unwrap().unwrap() {
+        NetworkBridgeRequest::Playback(request) => request.sequence(),
+        other => panic!("expected a playback request, got {other:?}"),
+    };
+    hub.deliver_capture(SOURCE, frame(2)).await.unwrap();
+    hub.acknowledge_playback(SOURCE, 5, sequence, NetworkPlaybackAck::Accepted)
+        .await
+        .unwrap();
+    playback.await.unwrap().unwrap();
+    hub.deliver_capture(SOURCE, frame(3)).await.unwrap();
+    hub.acknowledge_playback(SOURCE, 5, sequence, NetworkPlaybackAck::Rendered)
+        .await
+        .unwrap();
+    hub.deliver_capture(SOURCE, frame(4)).await.unwrap();
+
+    assert_eq!(seen.seen(), [(1, false), (2, true), (3, true), (4, false)]);
+    let mut recorded = Vec::new();
+    while let Ok(event) = recording.try_recv() {
+        match event.unwrap() {
+            VoiceInputEvent::Capture(CaptureEvent::Frame(frame)) => recorded.push(frame.sequence()),
+            VoiceInputEvent::Playback(receipt) => {
+                assert_eq!(receipt.state(), PlaybackState::Rendered)
+            }
+            other => panic!("unexpected recording event {other:?}"),
+        }
+    }
+    assert_eq!(recorded, [1, 2, 3, 4]);
+    finish(hub, io, cancellation).await;
+}
+
+#[tokio::test]
+async fn a_capture_observer_never_sees_a_frame_recording_refused() {
+    let cancellation = CancellationToken::new();
+    let (hub, io, recording, mut recognition) =
+        ports(Duration::from_millis(100), &cancellation).await;
+    let seen = observed(&hub).await;
+    let capacity = recording.max_capacity() as u64;
+    for sequence in 1..=capacity {
+        hub.deliver_capture(SOURCE, frame(sequence)).await.unwrap();
+        recognition.recv().await.unwrap().unwrap();
+    }
+    // The voice lane is full: the fan-out times out and the frame is refused.
+    assert!(hub
+        .deliver_capture(SOURCE, frame(capacity + 1))
+        .await
+        .is_err());
+    let expected: Vec<_> = (1..=capacity).map(|sequence| (sequence, false)).collect();
+    assert_eq!(seen.seen(), expected);
+
+    // A closed recognition consumer refuses the frame before recording; nothing is observed.
+    drop(recognition);
+    assert!(hub
+        .deliver_capture(SOURCE, frame(capacity + 2))
+        .await
+        .is_err());
+    assert_eq!(seen.seen(), expected);
+    drop(recording);
+    finish(hub, io, cancellation).await;
+}
+
+#[tokio::test]
+async fn recording_is_unaffected_by_an_attached_observer() {
+    let cancellation = CancellationToken::new();
+    let (hub, io, mut recording, recognition) = ports(Duration::from_secs(10), &cancellation).await;
+    let seen = observed(&hub).await;
+    let filled = stall_recognition(&hub, &mut recording, &recognition).await;
+    for sequence in filled + 1..=filled + 4 {
+        let delivered = timeout(PROMPT, hub.deliver_capture(SOURCE, frame(sequence))).await;
+        assert!(
+            matches!(delivered, Ok(Ok(()))),
+            "recording frame {sequence} was blocked or refused: {delivered:?}"
+        );
+        let recorded = timeout(PROMPT, recording.recv())
+            .await
+            .expect("recording frame was not delivered");
+        assert_eq!(recorded_sequence(recorded.unwrap().unwrap()), sequence);
+    }
+    let expected: Vec<_> = (1..=filled + 4).map(|sequence| (sequence, false)).collect();
+    assert_eq!(seen.seen(), expected);
+    assert_eq!(recognition.len(), filled as usize);
+    drop(recognition);
     finish(hub, io, cancellation).await;
 }
 

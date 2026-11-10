@@ -1276,6 +1276,11 @@ async fn run_stdout_reader<R>(
     R: AsyncRead + Unpin,
 {
     let version = session_version(turn_audio.as_ref());
+    // Turn audio never outlives the session, however the reader stops.
+    let _end_turn_audio = EndTurnAudio {
+        turn_audio: turn_audio.clone(),
+        session_id,
+    };
     let mut ready = false;
     let mut capture_started = false;
     loop {
@@ -1518,6 +1523,19 @@ async fn resolve_media_ack(
                     () = written.notified() => {}
                 }
             }
+        }
+    }
+}
+
+struct EndTurnAudio {
+    turn_audio: Option<SidecarTurnAudio>,
+    session_id: SessionId,
+}
+
+impl Drop for EndTurnAudio {
+    fn drop(&mut self) {
+        if let Some(turn_audio) = &self.turn_audio {
+            turn_audio.end(self.session_id);
         }
     }
 }
@@ -2893,6 +2911,66 @@ mod process_tests {
         let (nonterminal_sender, _nonterminal) = mpsc::channel(NONTERMINAL_INPUT_QUEUE_CAPACITY);
         let (supervisor_sender, mut supervisor) = mpsc::unbounded_channel();
         let turn_audio = SidecarTurnAudio::new();
+        // The stream stays open until the audio is taken, so the reader is
+        // still running when the take is answered.
+        let (mut sidecar, gateway) = tokio::io::duplex(stdout.len());
+        sidecar.write_all(&stdout).await.unwrap();
+        let reader = tokio::spawn(run_stdout_reader(
+            gateway,
+            MAX_CONTROL_PAYLOAD_BYTES,
+            Some(turn_audio.clone()),
+            SessionId::new(1),
+            Arc::new(SessionShared::new(SessionId::new(1))),
+            InputPublisher {
+                reliable: reliable_sender,
+                nonterminal: nonterminal_sender,
+                supervisor: supervisor_sender.clone(),
+            },
+            CancellationToken::new(),
+            supervisor_sender,
+        ));
+
+        assert_eq!(
+            turn_audio
+                .take(SessionId::new(1), 3, CancellationToken::new())
+                .await,
+            Some(CapturedTurnAudio {
+                samples: vec![-1.0, 0.0, 0.5],
+                playback_overlap: true,
+                single_segment: false,
+            })
+        );
+        drop(sidecar);
+        reader.await.unwrap();
+
+        assert!(matches!(
+            reliable.try_recv(),
+            Ok(Ok(VoiceInputEvent::Recognition(
+                RecognitionEvent::Hypothesis(_)
+            )))
+        ));
+        assert!(reliable.try_recv().is_err());
+        assert!(matches!(supervisor.try_recv(), Ok(SupervisorEvent::Ready)));
+        assert!(matches!(supervisor.try_recv(), Ok(SupervisorEvent::Eof)));
+    }
+
+    #[tokio::test]
+    async fn turn_audio_is_dropped_when_the_reader_stops() {
+        let stdout = [
+            encode_frame(
+                &SidecarFrame::control(SidecarControl::Ready {
+                    session_id: SessionId::new(1),
+                })
+                .at_version(TURN_AUDIO_PROTOCOL_VERSION),
+            )
+            .unwrap(),
+            encode_frame(&turn_audio_frame(vec![1])).unwrap(),
+        ]
+        .concat();
+        let (reliable_sender, _reliable) = mpsc::channel(RELIABLE_INPUT_QUEUE_CAPACITY);
+        let (nonterminal_sender, _nonterminal) = mpsc::channel(NONTERMINAL_INPUT_QUEUE_CAPACITY);
+        let (supervisor_sender, _supervisor) = mpsc::unbounded_channel();
+        let turn_audio = SidecarTurnAudio::new();
 
         run_stdout_reader(
             stdout.as_slice(),
@@ -2910,24 +2988,12 @@ mod process_tests {
         )
         .await;
 
-        assert!(matches!(
-            reliable.try_recv(),
-            Ok(Ok(VoiceInputEvent::Recognition(
-                RecognitionEvent::Hypothesis(_)
-            )))
-        ));
-        assert!(reliable.try_recv().is_err());
-        assert!(matches!(supervisor.try_recv(), Ok(SupervisorEvent::Ready)));
-        assert!(matches!(supervisor.try_recv(), Ok(SupervisorEvent::Eof)));
-        let cancelled = CancellationToken::new();
-        cancelled.cancel();
+        // Not cancelled: an ended session answers at once rather than waiting.
         assert_eq!(
-            turn_audio.take(SessionId::new(1), 3, cancelled).await,
-            Some(CapturedTurnAudio {
-                samples: vec![-1.0, 0.0, 0.5],
-                playback_overlap: true,
-                single_segment: false,
-            })
+            turn_audio
+                .take(SessionId::new(1), 3, CancellationToken::new())
+                .await,
+            None
         );
     }
 

@@ -1227,6 +1227,51 @@ async fn turn_audio_reaches_the_handle_at_protocol_version_two() {
 }
 
 #[tokio::test]
+async fn turn_audio_does_not_outlive_its_session() {
+    let turn_audio = SidecarTurnAudio::new();
+    let harness = FakeSidecarHarness::new("turn-audio").with_turn_audio(turn_audio.clone());
+    let cancellation = CancellationToken::new();
+    let session = harness.start(cancellation.clone()).await.unwrap();
+    let _input = session
+        .input
+        .start(SESSION_ID, CancellationToken::new())
+        .await
+        .unwrap();
+    // The pause acknowledgement follows the turn audio on standard output, so
+    // once it resolves the audio for segment 4 has been offered to the handle.
+    session
+        .capture
+        .pause(SESSION_ID, CancellationToken::new())
+        .await
+        .unwrap();
+    let waiting = tokio::spawn({
+        let turn_audio = turn_audio.clone();
+        async move {
+            turn_audio
+                .take(SESSION_ID, 5, CancellationToken::new())
+                .await
+        }
+    });
+
+    cancellation.cancel();
+    assert!(await_completion(session.completion).await.is_ok());
+    harness.assert_process_gone().await;
+
+    let waited = tokio::time::timeout(Duration::from_secs(1), waiting)
+        .await
+        .expect("a take outlived its session")
+        .unwrap();
+    assert_eq!(waited, None);
+    let after = tokio::time::timeout(
+        Duration::from_secs(1),
+        turn_audio.take(SESSION_ID, 4, CancellationToken::new()),
+    )
+    .await
+    .expect("a take after the session ended waited");
+    assert_eq!(after, None);
+}
+
+#[tokio::test]
 async fn a_later_turn_never_receives_an_earlier_turns_audio() {
     let turn_audio = SidecarTurnAudio::new();
     let harness =

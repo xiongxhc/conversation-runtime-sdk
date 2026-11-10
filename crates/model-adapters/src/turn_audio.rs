@@ -28,7 +28,8 @@ impl fmt::Debug for CapturedTurnAudio {
 ///
 /// Sidecar segment ids restart on every turn, so the handle holds at most one
 /// turn: a transcript hypothesis discards it, a later turn's audio replaces it,
-/// and a request takes it only when the session and segment match.
+/// and a request takes it only when the session and segment match. When the
+/// session ends its audio is dropped and its requests return `None`.
 #[derive(Clone, Default)]
 pub struct SidecarTurnAudio {
     inner: Arc<TurnAudioSlot>,
@@ -36,14 +37,20 @@ pub struct SidecarTurnAudio {
 
 #[derive(Default)]
 struct TurnAudioSlot {
-    held: Mutex<Option<HeldTurnAudio>>,
-    offered: Notify,
+    state: Mutex<SlotState>,
+    changed: Notify,
 }
 
-struct HeldTurnAudio {
-    session_id: SessionId,
-    segment_id: u64,
-    audio: CapturedTurnAudio,
+#[derive(Default)]
+enum SlotState {
+    #[default]
+    Empty,
+    Held {
+        session_id: SessionId,
+        segment_id: u64,
+        audio: CapturedTurnAudio,
+    },
+    Ended(SessionId),
 }
 
 impl SidecarTurnAudio {
@@ -51,8 +58,8 @@ impl SidecarTurnAudio {
         Self::default()
     }
 
-    /// Waits for the audio of `segment_id` and takes it, or returns `None`
-    /// once `cancellation` fires.
+    /// Waits for the audio of `segment_id` and takes it. Returns `None` once
+    /// `cancellation` fires or the session has ended.
     pub async fn take(
         &self,
         session_id: SessionId,
@@ -60,56 +67,75 @@ impl SidecarTurnAudio {
         cancellation: CancellationToken,
     ) -> Option<CapturedTurnAudio> {
         loop {
-            let offered = self.inner.offered.notified();
-            tokio::pin!(offered);
-            offered.as_mut().enable();
-            if let Some(audio) = self.take_held(session_id, segment_id) {
-                return Some(audio);
+            let changed = self.inner.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let mut state = self.state();
+                match &*state {
+                    SlotState::Held {
+                        session_id: held_session,
+                        segment_id: held_segment,
+                        ..
+                    } if *held_session == session_id && *held_segment == segment_id => {
+                        if let SlotState::Held { audio, .. } = std::mem::take(&mut *state) {
+                            return Some(audio);
+                        }
+                    }
+                    SlotState::Ended(ended) if *ended == session_id => return None,
+                    _ => {}
+                }
             }
             tokio::select! {
                 biased;
                 () = cancellation.cancelled() => return None,
-                () = &mut offered => {}
+                () = &mut changed => {}
             }
         }
     }
 
     pub(crate) fn offer(&self, session_id: SessionId, segment_id: u64, audio: CapturedTurnAudio) {
-        *self.held() = Some(HeldTurnAudio {
+        *self.state() = SlotState::Held {
             session_id,
             segment_id,
             audio,
-        });
-        self.inner.offered.notify_waiters();
+        };
+        self.inner.changed.notify_waiters();
     }
 
+    /// A transcript hypothesis: the session's earlier audio is no longer the
+    /// current turn's. It also starts a session id afresh after an end.
     pub(crate) fn clear(&self, session_id: SessionId) {
-        let mut held = self.held();
-        if held
-            .as_ref()
-            .is_some_and(|held| held.session_id == session_id)
-        {
-            *held = None;
+        let mut state = self.state();
+        if state.belongs_to(session_id) {
+            *state = SlotState::Empty;
         }
     }
 
-    fn take_held(&self, session_id: SessionId, segment_id: u64) -> Option<CapturedTurnAudio> {
-        let mut held = self.held();
-        if held
-            .as_ref()
-            .is_some_and(|held| held.session_id == session_id && held.segment_id == segment_id)
-        {
-            held.take().map(|held| held.audio)
-        } else {
-            None
+    /// The session's reader has stopped: drop its audio and end its requests.
+    pub(crate) fn end(&self, session_id: SessionId) {
+        let mut state = self.state();
+        if !matches!(&*state, SlotState::Held { .. }) || state.belongs_to(session_id) {
+            *state = SlotState::Ended(session_id);
         }
+        drop(state);
+        self.inner.changed.notify_waiters();
     }
 
-    fn held(&self) -> std::sync::MutexGuard<'_, Option<HeldTurnAudio>> {
+    fn state(&self) -> std::sync::MutexGuard<'_, SlotState> {
         self.inner
-            .held
+            .state
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl SlotState {
+    fn belongs_to(&self, session: SessionId) -> bool {
+        match self {
+            Self::Empty => false,
+            Self::Held { session_id, .. } | Self::Ended(session_id) => *session_id == session,
+        }
     }
 }
 
@@ -250,6 +276,48 @@ mod tests {
         let handle = SidecarTurnAudio::new();
         let reader = handle.clone();
         reader.offer(SESSION, 1, audio(0.25));
+        assert_eq!(
+            handle.take(SESSION, 1, CancellationToken::new()).await,
+            Some(audio(0.25))
+        );
+    }
+
+    #[tokio::test]
+    async fn ending_a_session_drops_its_audio_and_ends_its_takes() {
+        let handle = SidecarTurnAudio::new();
+        handle.offer(SESSION, 1, audio(0.25));
+        let waiting = handle.take(SESSION, 2, CancellationToken::new());
+        tokio::pin!(waiting);
+        assert!(waiting.as_mut().now_or_never().is_none());
+
+        handle.end(SESSION);
+        assert_eq!(waiting.as_mut().now_or_never(), Some(None));
+        assert_eq!(
+            handle
+                .take(SESSION, 1, CancellationToken::new())
+                .now_or_never(),
+            Some(None)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hypothesis_after_the_end_starts_the_session_id_afresh() {
+        let handle = SidecarTurnAudio::new();
+        handle.end(SESSION);
+        handle.clear(SESSION);
+
+        let take = handle.take(SESSION, 1, CancellationToken::new());
+        tokio::pin!(take);
+        assert!(take.as_mut().now_or_never().is_none());
+        handle.offer(SESSION, 1, audio(0.5));
+        assert_eq!(take.await, Some(audio(0.5)));
+    }
+
+    #[tokio::test]
+    async fn ending_another_session_keeps_this_sessions_audio() {
+        let handle = SidecarTurnAudio::new();
+        handle.offer(SESSION, 1, audio(0.25));
+        handle.end(SessionId::new(8));
         assert_eq!(
             handle.take(SESSION, 1, CancellationToken::new()).await,
             Some(audio(0.25))

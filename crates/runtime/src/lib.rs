@@ -22,6 +22,7 @@ mod recording_reconciliation;
 mod recording_safety;
 mod session_clock;
 mod session_recording;
+mod speaker_claim_detector;
 mod speaker_claims;
 mod speaker_identity;
 mod speaker_matching;
@@ -62,6 +63,7 @@ pub use session_recording::{
     CAPTURE_DISCONTINUITY_REASON, EMPTY_RECORDING_FORMAT, MAX_RECORDING_GAPS,
     RECORDING_FAILURE_REASON,
 };
+pub use speaker_claim_detector::LanguageModelNameClaimDetector;
 pub use speaker_claims::{decide_claim, ClaimDecision, ClaimHolder};
 pub use speaker_identity::{
     ClaimOutcome, IdentityQuestion, Speaker, SpeakerIdentityError, SpeakerIdentityResult,

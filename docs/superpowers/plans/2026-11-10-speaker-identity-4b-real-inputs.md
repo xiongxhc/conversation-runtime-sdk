@@ -90,12 +90,16 @@ media path is covered by Task 5's tests and Task 8's unit tests only.
 
   The payload limit for this kind is 320,024 bytes. Standard output keeps frame
   order with the finals, which the matching rule below depends on.
-- **Sidecar segment ids restart at 1 on every turn, so audio is matched by
-  order, not by id alone.** The gateway keeps at most one turn's audio per
-  sidecar session. Any transcript hypothesis read from the sidecar discards it;
-  a `TurnAudio` frame replaces it; a request takes it only when the segment id
-  matches, and waits for it otherwise. A turn's request is caused by that turn's
-  own final, so by the time a later turn asks, the earlier audio is gone.
+- **Sidecar segment ids restart at 1 on every turn, so a version 2 session
+  renumbers them.** The gateway's reader gives every hypothesis and every
+  `TurnAudio` frame of a version 2 session a session-unique segment id: the
+  sidecar's id plus the highest id used by the turns before it. A sidecar turn
+  ends at a `TurnAudio` frame, at a capture discontinuity, or when a hypothesis
+  arrives with an id at or below one already final in the same turn. The gateway
+  keeps at most one turn's audio per session, replaced by the next `TurnAudio`.
+  A request takes the audio only when its segment id is the audio's; a request
+  for a segment whose turn has already ended without that audio gets nothing at
+  once; any other request waits. Version 1 sessions keep the sidecar's ids.
 - **What the sidecar sends.** At the final-silence reset that ends a turn: the
   turn buffer without its last `final_silence_ms` of samples (the silence that
   ended the turn), then at most the last 160,000 samples, clamped to [-1, 1],
@@ -156,7 +160,8 @@ media path is covered by Task 5's tests and Task 8's unit tests only.
 
 1. **A second turn ends with the same sidecar segment id as the first, and its
    audio never arrives.** It must come out late, never with the first turn's
-   voice. Tests: `a_hypothesis_makes_earlier_audio_unavailable` (Task 2),
+   voice. Tests: `segment_ids_are_unique_across_turns_in_a_version_two_session`,
+   `a_late_request_never_receives_a_later_turns_audio` (Task 2),
    `a_second_turn_never_reuses_the_first_turns_audio` (Task 8).
 2. **Turn audio arrives a moment after the turn has started.** The request waits
    and uses it. Test: `take_returns_audio_offered_before_or_after_the_request`
@@ -290,15 +295,19 @@ git commit -m "feat(sidecar): protocol version 2 carries a finished turn's audio
   - `#[derive(Clone, Default)] pub struct SidecarTurnAudio` with
     `pub fn new() -> Self` and
     `pub async fn take(&self, session_id: SessionId, segment_id: u64, cancellation: CancellationToken) -> Option<CapturedTurnAudio>`;
-    crate-private `fn offer(&self, session_id: SessionId, segment_id: u64, audio: CapturedTurnAudio)` and `fn clear(&self, session_id: SessionId)`.
+    crate-private `fn offer(&self, session_id: SessionId, segment_id: u64, audio: CapturedTurnAudio)`,
+    `fn turn_ended(&self, session_id: SessionId, through_segment_id: u64)` and `fn end(&self, session_id: SessionId)`.
   - `MacOsVoiceSidecarConfig::with_turn_audio(self, turn_audio: SidecarTurnAudio) -> Self`
 
 A config with turn audio starts its session at version 2: every frame the
 gateway writes on either channel carries 2, and every frame read must carry the
-session's version or the session fails as a malformed frame. The reader calls
-`clear` for every `TranscriptHypothesis` before publishing it, and `offer` for a
-`TurnAudio` frame with `samples` as `i16 / 32768.0` and
-`single_segment = final_segments == 1`. `TurnAudio` is never published as a
+session's version or the session fails as a malformed frame. In a version 2
+session the reader renumbers segment ids as "Decisions this plan makes" states,
+on every hypothesis it publishes and on every `TurnAudio` frame; it calls
+`offer` for a `TurnAudio` frame with `samples` as `i16 / 32768.0` and
+`single_segment = final_segments == 1`, `turn_ended` with the highest id the
+ended turn used at every turn end, and `end` when the reader stops for any
+reason. `TurnAudio` is never published as a
 voice input event. In a version 1 session the reader's size check and behaviour
 are exactly today's. The size check runs on the header, before allocation,
 against the limit of the frame's kind.
@@ -324,9 +333,17 @@ sidecar built before this plan does).
 async fn take_returns_audio_offered_before_or_after_the_request() {}
 
 #[tokio::test]
-async fn a_hypothesis_makes_earlier_audio_unavailable() {
-    // offer(session, 1, a); clear(session); take(session, 1) stays pending until offer(session, 1, b) → b
+async fn a_late_request_never_receives_a_later_turns_audio() {
+    // offer(session, 1, a); offer(session, 2, b) → take(session, 1) is None at once; take(session, 2) → b
 }
+
+#[tokio::test]
+async fn a_request_for_a_turn_that_ended_without_audio_gets_nothing_at_once() {
+    // turn_ended(session, 3) with no offer for 3 → take(session, 3) is None without waiting
+}
+
+#[tokio::test]
+async fn audio_does_not_outlive_its_session() {} // end(session) → waiting and later takes are None
 
 #[tokio::test]
 async fn a_different_segment_or_session_is_never_returned() {}
@@ -343,6 +360,15 @@ async fn turn_audio_reaches_the_handle_at_protocol_version_two() {
     // turn-audio; take(session, 4) → 16_000 samples each 1000.0 / 32768.0, single_segment, no overlap;
     // the input stream carried the partial and the final and nothing else for the audio
 }
+
+#[tokio::test]
+async fn segment_ids_are_unique_across_turns_in_a_version_two_session() {
+    // two-turns-one-audio: the finals arrive as segments 1 and 2; take(session, 1) → the first turn's audio;
+    // take(session, 2) stays pending until cancelled
+}
+
+#[tokio::test]
+async fn version_one_sessions_keep_the_sidecars_segment_ids() {}
 
 #[tokio::test]
 async fn turn_audio_in_a_version_one_session_fails_the_session() {} // turn-audio-at-version-one, no with_turn_audio

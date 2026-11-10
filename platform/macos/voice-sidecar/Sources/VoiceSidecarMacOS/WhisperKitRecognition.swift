@@ -221,12 +221,25 @@ public enum RecognitionBatchEnqueueResult: Equatable, Sendable {
     case terminated
 }
 
+private enum RecognitionPipelineItem {
+    case batch([RecognitionHypothesis])
+    case turnEnded(ContiguousArray<Float>)
+
+    var isPartialBatch: Bool {
+        guard case .batch(let batch) = self else {
+            return false
+        }
+        return batch.allSatisfy { !$0.engineFinal }
+    }
+}
+
 private final class RecognitionBatchMailbox: @unchecked Sendable {
     private let capacity: Int
     private let lock = NSLock()
     private let notifications: AsyncStream<Void>
     private let continuation: AsyncStream<Void>.Continuation
-    private var batches: [[RecognitionHypothesis]] = []
+    private var items: [RecognitionPipelineItem] = []
+    private var batchCount = 0
     private var terminal: RecognitionWorkerCompletion?
     private var maximumCount = 0
 
@@ -235,7 +248,7 @@ private final class RecognitionBatchMailbox: @unchecked Sendable {
     }
 
     var pendingCount: Int {
-        lock.withLock { batches.count }
+        lock.withLock { items.count }
     }
 
     var maximumPendingCount: Int {
@@ -260,27 +273,21 @@ private final class RecognitionBatchMailbox: @unchecked Sendable {
                 return RecognitionBatchEnqueueResult.terminated
             }
             let containsFinal = batch.contains(where: \.engineFinal)
-            if !containsFinal,
-                batches.last?.allSatisfy({
-                    !$0.engineFinal
-                }) == true
-            {
-                batches[batches.count - 1] = batch
+            if !containsFinal, items.last?.isPartialBatch == true {
+                items[items.count - 1] = .batch(batch)
                 return .coalescedPartial
             }
-            if batches.count < capacity {
-                batches.append(batch)
-                maximumCount = max(maximumCount, batches.count)
+            if batchCount < capacity {
+                append(.batch(batch))
                 return .queued
             }
             if !containsFinal {
                 return .droppedPartial
             }
-            if let partialIndex = batches.firstIndex(where: {
-                $0.allSatisfy { !$0.engineFinal }
-            }) {
-                batches.remove(at: partialIndex)
-                batches.append(batch)
+            if let partialIndex = items.firstIndex(where: \.isPartialBatch) {
+                items.remove(at: partialIndex)
+                batchCount -= 1
+                append(.batch(batch))
                 return .evictedPartial
             }
             terminal = .failed(
@@ -298,18 +305,38 @@ private final class RecognitionBatchMailbox: @unchecked Sendable {
         return result
     }
 
-    func dequeue() -> [RecognitionHypothesis]? {
+    /// A turn end is never dropped and does not count against the capacity,
+    /// which bounds hypothesis batches: at most one is queued per turn.
+    func enqueueTurnEnded(
+        _ samples: ContiguousArray<Float>
+    ) -> RecognitionBatchEnqueueResult {
+        let result = lock.withLock {
+            guard terminal == nil else {
+                return RecognitionBatchEnqueueResult.terminated
+            }
+            append(.turnEnded(samples))
+            return .queued
+        }
+        continuation.yield()
+        return result
+    }
+
+    func dequeue() -> RecognitionPipelineItem? {
         lock.withLock {
-            guard !batches.isEmpty else {
+            guard !items.isEmpty else {
                 return nil
             }
-            return batches.removeFirst()
+            let item = items.removeFirst()
+            if case .batch = item {
+                batchCount -= 1
+            }
+            return item
         }
     }
 
     func completionIfDrained() -> RecognitionWorkerCompletion? {
         lock.withLock {
-            batches.isEmpty ? terminal : nil
+            items.isEmpty ? terminal : nil
         }
     }
 
@@ -326,16 +353,29 @@ private final class RecognitionBatchMailbox: @unchecked Sendable {
 
     func cancel() {
         lock.withLock {
-            batches.removeAll(keepingCapacity: true)
+            items.removeAll(keepingCapacity: true)
+            batchCount = 0
             terminal = .stopped
         }
         continuation.finish()
     }
+
+    private func append(_ item: RecognitionPipelineItem) {
+        items.append(item)
+        if case .batch = item {
+            batchCount += 1
+        }
+        maximumCount = max(maximumCount, items.count)
+    }
 }
 
+/// Publishes recognition hypotheses, and the turn ends between them, in the
+/// order they were enqueued.
 public final class OrderedRecognitionBatchPipeline: @unchecked Sendable {
     public typealias Handler =
         @Sendable ([RecognitionHypothesis]) async throws -> Void
+    public typealias TurnEndedHandler =
+        @Sendable (ContiguousArray<Float>) async throws -> Void
 
     private let mailbox: RecognitionBatchMailbox
     private let stateLock = NSLock()
@@ -355,21 +395,30 @@ public final class OrderedRecognitionBatchPipeline: @unchecked Sendable {
 
     @discardableResult
     public func start(
-        _ handler: @escaping Handler
+        _ handler: @escaping Handler,
+        onTurnEnded turnEndedHandler: @escaping TurnEndedHandler = { _ in }
     ) -> Task<RecognitionWorkerCompletion, Never> {
         stateLock.withLock {
             if let consumer {
                 return consumer
             }
             let mailbox = mailbox
+            let deliver: @Sendable (RecognitionPipelineItem) async throws -> Void = {
+                switch $0 {
+                case .batch(let batch):
+                    try await handler(batch)
+                case .turnEnded(let samples):
+                    try await turnEndedHandler(samples)
+                }
+            }
             let task = Task<RecognitionWorkerCompletion, Never> {
                 for await _ in mailbox.stream {
-                    while let batch = mailbox.dequeue() {
+                    while let item = mailbox.dequeue() {
                         guard !Task.isCancelled else {
                             return .stopped
                         }
                         do {
-                            try await handler(batch)
+                            try await deliver(item)
                         } catch {
                             let failure = SidecarServiceFailure(
                                 stage: .speechRecognizer,
@@ -383,9 +432,9 @@ public final class OrderedRecognitionBatchPipeline: @unchecked Sendable {
                         return completion
                     }
                 }
-                while let batch = mailbox.dequeue() {
+                while let item = mailbox.dequeue() {
                     do {
-                        try await handler(batch)
+                        try await deliver(item)
                     } catch {
                         let failure = SidecarServiceFailure(
                             stage: .speechRecognizer,
@@ -407,6 +456,15 @@ public final class OrderedRecognitionBatchPipeline: @unchecked Sendable {
         _ batch: [RecognitionHypothesis]
     ) -> RecognitionBatchEnqueueResult {
         mailbox.enqueue(batch)
+    }
+
+    /// Queues a turn end behind every hypothesis already enqueued, so it is
+    /// published after them and before any enqueued later.
+    @discardableResult
+    public func enqueueTurnEnded(
+        samples: ContiguousArray<Float>
+    ) -> RecognitionBatchEnqueueResult {
+        mailbox.enqueueTurnEnded(samples)
     }
 
     public func fail(_ failure: SidecarServiceFailure) {
@@ -736,6 +794,10 @@ public enum WhisperKitRecognitionEvent: Sendable {
     )
     case activity(VoiceActivity)
     case captureDiscontinuity(atMilliseconds: UInt64)
+    /// A final-silence reset ended the turn. Published after every
+    /// hypothesis of the turn, with the turn's buffer as it stood before the
+    /// reset cleared it.
+    case turnEnded(samples: ContiguousArray<Float>)
     case failure(
         sessionID: UInt64,
         failure: SidecarServiceFailure
@@ -829,6 +891,11 @@ public struct SidecarRecognitionEventPublisher: Sendable {
                 .observeCaptureDiscontinuityFromRecognitionWorker(
                     atMilliseconds: atMilliseconds
                 )
+            return false
+        case .turnEnded(let samples):
+            try await session.publishTurnEndedFromRecognitionWorker(
+                samples: samples
+            )
             return false
         case .failure(_, let failure):
             throw failure
@@ -1132,6 +1199,8 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
                     .hypothesis(hypothesis)
                 )
             }
+        } onTurnEnded: { samples in
+            _ = try await eventRelay.emit(.turnEnded(samples: samples))
         }
         monitorTasks.append(
             monitorRecognitionWorker(hypothesisWorker) { failure in
@@ -1333,10 +1402,15 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
             return
         }
         recognitionResetTask = nil
+        // Stopping the transcriber clears the turn buffer, so a turn ended by
+        // final silence is snapshotted first.
+        let endedTurn: ContiguousArray<Float>?
         if discardingBufferedAudio {
             turnAudioProcessor.beginDiscontinuityTransition()
+            endedTurn = nil
         } else {
             turnAudioProcessor.beginTransition()
+            endedTurn = turnAudioProcessor.audioSamples
         }
         await transcriber.stopStreamTranscription()
         _ = await transcriptionTask.value
@@ -1352,6 +1426,11 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
             turnAudioProcessor.cancelTransition()
             workerStopState.finishRestart()
             return
+        }
+        // The old transcriber has published its last hypothesis; the turn
+        // end queues behind it and ahead of the replacement's first.
+        if let endedTurn {
+            pipeline.enqueueTurnEnded(samples: endedTurn)
         }
         let replacement = Self.makeTranscriber(
             components: components,

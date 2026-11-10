@@ -199,3 +199,134 @@ func senseVoiceDecodesBundledChineseAndEnglishClips() throws {
         "expected latin words, got: \(english)"
     )
 }
+
+private actor TurnAudioTestSink: SidecarEventSink {
+    private(set) var frames: [ChildFrame] = []
+
+    var hasTurnAudio: Bool {
+        frames.contains { $0.turnAudio != nil }
+    }
+
+    func send(_ frame: ChildFrame) async throws {
+        frames.append(frame)
+    }
+}
+
+private struct IdleAudioService: SidecarAudioService {
+    func start(configuration _: SidecarConfiguration) async throws {}
+    func pauseCapture() async throws {}
+    func resumeCapture() async throws {}
+    func stop() async {}
+}
+
+private struct IdlePlaybackService: SidecarPlaybackService {
+    func enqueue(_: PCMFrame) async throws {}
+    func flush(throughGenerationID _: UInt64) async throws {}
+    func stop() async {}
+}
+
+private func captureBuffer(_ samples: ArraySlice<Float>) throws -> AVAudioPCMBuffer {
+    let format = try #require(
+        AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: 16_000,
+            channels: 1,
+            interleaved: false
+        )
+    )
+    let buffer = try #require(
+        AVAudioPCMBuffer(
+            pcmFormat: format,
+            frameCapacity: AVAudioFrameCount(samples.count)
+        )
+    )
+    buffer.frameLength = AVAudioFrameCount(samples.count)
+    let channel = try #require(buffer.floatChannelData?[0])
+    for (offset, sample) in samples.enumerated() {
+        channel[offset] = sample
+    }
+    return buffer
+}
+
+@Test(.enabled(if: senseVoiceModelAvailable()))
+func finalSilencePublishesTheTurnBeforeItsBufferIsCleared() async throws {
+    let audioProcessor = VoiceProcessingAudioProcessor(
+        engine: VoiceProcessingEngine()
+    )
+    let recognition = SenseVoiceRecognition(
+        modelPath: senseVoiceModelDirectory.path,
+        audioProcessor: audioProcessor
+    )
+    let sink = TurnAudioTestSink()
+    let session = SidecarSession(
+        audioService: IdleAudioService(),
+        recognitionService: recognition,
+        playbackService: IdlePlaybackService(),
+        eventSink: sink
+    )
+    let publisher = SidecarRecognitionEventPublisher(session: session)
+    await recognition.setEventHandler { event in
+        try await publisher.publish(event)
+    }
+    try await session.handleControl(
+        ChildFrame(
+            control: .startSession(
+                sessionID: 7,
+                speechStartMilliseconds: 200,
+                finalSilenceMilliseconds: 1_000
+            )
+        ).atVersion(2)
+    )
+    try await session.handleControl(
+        ChildFrame(control: .startCapture(sessionID: 7, operationID: 1))
+            .atVersion(2)
+    )
+
+    // The clip goes in five times faster than real time, so pauses inside
+    // it stay far shorter than the final silence and the clip is one turn.
+    // It stops after its first 4.4 s, which end in speech: past that, a lone
+    // window the VAD takes for speech follows the speech end and cancels the
+    // final-silence reset without a later speech end to schedule another.
+    let clip = Array(try loadTestWavSamples("zh.wav").prefix(70_400))
+    for start in stride(from: 0, to: clip.count, by: 1_600) {
+        audioProcessor.consumeCaptureEvent(
+            .buffer(try captureBuffer(clip[start..<min(start + 1_600, clip.count)]))
+        )
+        try await Task.sleep(for: .milliseconds(20))
+    }
+    // Silence twice as fast as real time, until the turn ends.
+    let silence = [Float](repeating: 0, count: 1_600)
+    let deadline = ContinuousClock.now.advanced(by: .seconds(30))
+    while await !sink.hasTurnAudio, ContinuousClock.now < deadline {
+        audioProcessor.consumeCaptureEvent(
+            .buffer(try captureBuffer(silence[...]))
+        )
+        try await Task.sleep(for: .milliseconds(50))
+    }
+    try await session.handleControl(
+        ChildFrame(control: .shutdown(sessionID: 7)).atVersion(2)
+    )
+
+    let frames = await sink.frames
+    let turnAudioIndex = try #require(frames.firstIndex { $0.turnAudio != nil })
+    let turnAudio = try #require(frames[turnAudioIndex].turnAudio)
+    let finals = frames[..<turnAudioIndex].compactMap { frame -> UInt64? in
+        guard case .transcriptHypothesis(_, let hypothesis) = frame.control,
+            hypothesis.engineFinal
+        else {
+            return nil
+        }
+        return hypothesis.segmentID
+    }
+    // Every final of the turn was written before its audio.
+    #expect(!finals.isEmpty)
+    #expect(turnAudio.segmentID == finals.last)
+    #expect(turnAudio.finalSegments == UInt16(Set(finals).count))
+    #expect(!turnAudio.playbackOverlap)
+    // The audio is the clip's turn, not the pre-roll left after the reset.
+    #expect(turnAudio.samples.count >= clip.count - 16_000)
+    #expect(turnAudio.samples.count <= 160_000)
+    #expect(turnAudio.samples.contains { abs(Int($0)) > 1_000 })
+    #expect(frames.filter { $0.turnAudio != nil }.count == 1)
+    #expect(frames.allSatisfy { $0.version == 2 })
+}

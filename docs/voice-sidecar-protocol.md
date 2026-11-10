@@ -28,9 +28,13 @@ its version 1 payload exactly.
 
 The gateway selects the version for a session by stamping it on the first
 frame, `StartSession`. The sidecar accepts 1 or 2 there, answers every frame in
-that same version, and treats a later frame in a different version as a failure.
-The gateway does the same for frames it reads. A disagreement fails the session;
-there is no fallback to another version. Any other version number is refused.
+that same version (including the failure that refuses the `StartSession`
+itself), and treats a later frame in a different version, on either channel, as
+a failure: it sends a `malformed_frame` failure in the session's version, as
+for an unknown version. A failure sent before any `StartSession` is at
+version 1. The gateway does the same for frames it reads. A disagreement fails
+the session; there is no fallback to another version. Any other version number
+is refused.
 
 `TurnAudio` is not a version 1 frame. Kind `0x800b` at version 1 is an unknown
 kind, on decode and on encode.
@@ -63,10 +67,20 @@ last 160,000 samples, clamped to [-1, 1], scaled by 32,767 and rounded to the
 nearest integer.
 
 Nothing is sent for a turn with no engine final, an empty result, a capture
-discontinuity, or a version 1 session.
+discontinuity, or a version 1 session. Pausing capture, or restarting
+recognition after a recoverable recognition failure, discards the turn in
+progress, which then sends nothing either.
 
-Standard output preserves frame order, so a turn's `TurnAudio` frame follows the
-finals of that turn.
+The playback flag is set when playback was active in any voice window in which
+the person was speaking, or when a speech start was sent while playback was
+active. The recognition backend ends a turn some time after its speech ended,
+so speech over playback that the sidecar sees between a turn's speech end and
+its `TurnAudio` frame marks both that turn and the next one.
+
+Both recognition backends queue the turn's end behind the turn's last
+hypothesis and ahead of the next turn's first, and standard output preserves
+frame order, so a turn's `TurnAudio` frame follows every hypothesis of that turn
+and precedes every hypothesis of the next.
 
 ## Segment ids in a version 2 session
 

@@ -1313,3 +1313,519 @@ private func startAndCapture(
         ChildFrame(control: .startCapture(sessionID: 7, operationID: 1))
     )
 }
+
+// MARK: - Turn audio
+
+/// 25,600 samples at a quarter of full scale: 1.6 s, of which the closing
+/// 600 ms is the final silence the snapshot drops.
+private let turnSamples = ContiguousArray<Float>(repeating: 0.25, count: 25_600)
+private let turnPCM = [Int16](repeating: 8_192, count: 16_000)
+
+private func partial(_ segmentID: UInt64) -> RecognitionHypothesis {
+    RecognitionHypothesis(segmentID: segmentID, text: "partial", engineFinal: false)
+}
+
+private func final(_ segmentID: UInt64) -> RecognitionHypothesis {
+    RecognitionHypothesis(segmentID: segmentID, text: "final", engineFinal: true)
+}
+
+private func hypothesisFrame(
+    _ hypothesis: RecognitionHypothesis,
+    version: UInt16
+) -> ChildFrame {
+    ChildFrame(
+        control: .transcriptHypothesis(sessionID: 7, hypothesis: hypothesis)
+    ).atVersion(version)
+}
+
+private func turnAudioFrame(
+    segmentID: UInt64,
+    finalSegments: UInt16,
+    playbackOverlap: Bool,
+    samples: [Int16] = turnPCM
+) -> ChildFrame {
+    ChildFrame(
+        turnAudio: TurnAudioFrame(
+            sessionID: 7,
+            segmentID: segmentID,
+            finalSegments: finalSegments,
+            playbackOverlap: playbackOverlap,
+            samples: samples
+        )
+    )
+}
+
+private func capturingSession(
+    version: UInt16,
+    audioService: any SidecarAudioService = RecordingAudioService()
+) async throws -> (SidecarSession, RecordingEventSink) {
+    let events = RecordingEventSink()
+    let session = SidecarSession(
+        audioService: audioService,
+        recognitionService: RecordingRecognitionService(),
+        playbackService: RecordingPlaybackService(),
+        eventSink: events
+    )
+    try await session.handleControl(
+        ChildFrame(
+            control: .startSession(
+                sessionID: 7,
+                speechStartMilliseconds: 200,
+                finalSilenceMilliseconds: 600
+            )
+        ).atVersion(version)
+    )
+    try await session.handleControl(
+        ChildFrame(control: .startCapture(sessionID: 7, operationID: 1))
+            .atVersion(version)
+    )
+    return (session, events)
+}
+
+private func startPlayback(
+    _ session: SidecarSession,
+    generationID: UInt64 = 5,
+    version: UInt16 = 2
+) async throws -> PCMFrame {
+    let frame = try pcmFrame(generationID: generationID)
+    try await session.handleMedia(
+        ChildFrame(audioSessionID: 7, frame: frame).atVersion(version)
+    )
+    return frame
+}
+
+private func speechWindow(
+    _ session: SidecarSession,
+    isSpeech: Bool = true,
+    at atMilliseconds: UInt64
+) async throws {
+    try await session.observeBargeInFromRecognitionWorker(
+        isSpeech: isSpeech,
+        frameMilliseconds: 100,
+        atMilliseconds: atMilliseconds
+    )
+}
+
+private func turnAudioFrames(_ events: RecordingEventSink) async -> [ChildFrame] {
+    await events.frames.filter { $0.turnAudio != nil }
+}
+
+@Test
+func versionTwoSessionSendsTurnAudioAfterTheTurnsFinals() async throws {
+    let (session, events) = try await capturingSession(version: 2)
+
+    try await session.publishRecognitionHypothesisFromWorker(partial(1))
+    try await session.publishRecognitionHypothesisFromWorker(final(1))
+    try await session.publishTurnEndedFromRecognitionWorker(samples: turnSamples)
+    // The next turn's first hypothesis restarts at segment 1.
+    try await session.publishRecognitionHypothesisFromWorker(partial(1))
+
+    #expect(
+        await events.frames
+            == [
+                ChildFrame(control: .ready(sessionID: 7)).atVersion(2),
+                ChildFrame(control: .captureStarted(sessionID: 7, operationID: 1))
+                    .atVersion(2),
+                hypothesisFrame(partial(1), version: 2),
+                hypothesisFrame(final(1), version: 2),
+                turnAudioFrame(segmentID: 1, finalSegments: 1, playbackOverlap: false),
+                hypothesisFrame(partial(1), version: 2),
+            ]
+    )
+}
+
+@Test
+func versionOneSessionNeverSendsTurnAudio() async throws {
+    let (session, events) = try await capturingSession(version: 1)
+    _ = try await startPlayback(session, version: 1)
+    try await speechWindow(session, at: 10)
+
+    try await session.publishRecognitionHypothesisFromWorker(final(1))
+    try await session.publishTurnEndedFromRecognitionWorker(samples: turnSamples)
+    try await session.publishRecognitionHypothesisFromWorker(final(1))
+    try await session.publishTurnEndedFromRecognitionWorker(samples: turnSamples)
+
+    let frames = await events.frames
+    #expect(frames.allSatisfy { $0.version == 1 })
+    #expect(
+        frames
+            == [
+                ChildFrame(control: .ready(sessionID: 7)),
+                ChildFrame(control: .captureStarted(sessionID: 7, operationID: 1)),
+                ChildFrame(
+                    control: .playbackAccepted(
+                        sessionID: 7,
+                        turnID: 5,
+                        generationID: 5,
+                        utteranceID: 1,
+                        sequence: 0
+                    )
+                ),
+                hypothesisFrame(final(1), version: 1),
+                hypothesisFrame(final(1), version: 1),
+            ]
+    )
+}
+
+@Test
+func aTurnWithoutAFinalSendsNoTurnAudio() async throws {
+    let (session, events) = try await capturingSession(version: 2)
+
+    try await session.publishRecognitionHypothesisFromWorker(partial(1))
+    try await session.publishRecognitionHypothesisFromWorker(partial(2))
+    try await session.publishTurnEndedFromRecognitionWorker(samples: turnSamples)
+    #expect(await turnAudioFrames(events).isEmpty)
+
+    // A turn whose buffer is all closing silence has an empty result.
+    try await session.publishRecognitionHypothesisFromWorker(final(1))
+    try await session.publishTurnEndedFromRecognitionWorker(
+        samples: ContiguousArray(repeating: 0.25, count: 9_600)
+    )
+    #expect(await turnAudioFrames(events).isEmpty)
+
+    // Neither turn leaks into the next one.
+    try await session.publishRecognitionHypothesisFromWorker(final(1))
+    try await session.publishTurnEndedFromRecognitionWorker(samples: turnSamples)
+    #expect(
+        await turnAudioFrames(events)
+            == [turnAudioFrame(segmentID: 1, finalSegments: 1, playbackOverlap: false)]
+    )
+}
+
+@Test
+func aJoinedTurnReportsItsFinalSegmentCount() async throws {
+    let (session, events) = try await capturingSession(version: 2)
+
+    try await session.publishRecognitionHypothesisFromWorker(final(1))
+    try await session.publishRecognitionHypothesisFromWorker(partial(2))
+    try await session.publishRecognitionHypothesisFromWorker(final(2))
+    // A repeated final of the same segment is still one segment.
+    try await session.publishRecognitionHypothesisFromWorker(final(2))
+    try await session.publishTurnEndedFromRecognitionWorker(samples: turnSamples)
+
+    #expect(
+        await events.frames.last
+            == turnAudioFrame(segmentID: 2, finalSegments: 2, playbackOverlap: false)
+    )
+}
+
+@Test
+func playbackDuringSpeechMarksTheTurn() async throws {
+    let (session, events) = try await capturingSession(version: 2)
+    _ = try await startPlayback(session)
+    // One speech window is below the barge-in threshold: playback continues.
+    try await speechWindow(session, at: 10)
+
+    try await session.publishRecognitionHypothesisFromWorker(final(1))
+    try await session.publishTurnEndedFromRecognitionWorker(samples: turnSamples)
+
+    #expect(
+        await turnAudioFrames(events)
+            == [turnAudioFrame(segmentID: 1, finalSegments: 1, playbackOverlap: true)]
+    )
+}
+
+@Test
+func aSpeechStartDuringPlaybackMarksTheTurn() async throws {
+    let (session, events) = try await capturingSession(version: 2)
+    _ = try await startPlayback(session)
+
+    try await session.publishVoiceActivityFromRecognitionWorker(
+        .speechStarted(atMilliseconds: 10)
+    )
+    try await session.publishRecognitionHypothesisFromWorker(final(1))
+    try await session.publishTurnEndedFromRecognitionWorker(samples: turnSamples)
+
+    #expect(
+        await turnAudioFrames(events)
+            == [turnAudioFrame(segmentID: 1, finalSegments: 1, playbackOverlap: true)]
+    )
+}
+
+@Test
+func aBargeInMarksTheTurn() async throws {
+    let (session, events) = try await capturingSession(version: 2)
+    _ = try await startPlayback(session)
+    try await speechWindow(session, at: 10)
+    try await speechWindow(session, at: 110)
+    #expect(
+        await events.frames.last
+            == ChildFrame(
+                control: .voiceActivity(
+                    sessionID: 7,
+                    activity: .speechStarted(atMilliseconds: 110)
+                )
+            ).atVersion(2)
+    )
+
+    try await session.publishRecognitionHypothesisFromWorker(final(1))
+    try await session.publishTurnEndedFromRecognitionWorker(samples: turnSamples)
+
+    #expect(
+        await turnAudioFrames(events)
+            == [turnAudioFrame(segmentID: 1, finalSegments: 1, playbackOverlap: true)]
+    )
+}
+
+@Test
+func playbackThatEndedBeforeSpeechDoesNotMarkTheTurn() async throws {
+    let (session, events) = try await capturingSession(version: 2)
+    let frame = try await startPlayback(session)
+    // Silence during playback is not speech over it.
+    try await speechWindow(session, isSpeech: false, at: 10)
+    try await session.playbackRendered(frame.identity)
+
+    try await speechWindow(session, at: 110)
+    try await speechWindow(session, at: 210)
+    try await session.publishVoiceActivityFromRecognitionWorker(
+        .speechStarted(atMilliseconds: 210)
+    )
+    try await session.publishRecognitionHypothesisFromWorker(final(1))
+    try await session.publishVoiceActivityFromRecognitionWorker(
+        .speechEnded(atMilliseconds: 900)
+    )
+    try await session.publishTurnEndedFromRecognitionWorker(samples: turnSamples)
+
+    #expect(
+        await turnAudioFrames(events)
+            == [turnAudioFrame(segmentID: 1, finalSegments: 1, playbackOverlap: false)]
+    )
+}
+
+@Test
+func theNextTurnStartsUnmarked() async throws {
+    let (session, events) = try await capturingSession(version: 2)
+    let frame = try await startPlayback(session)
+    try await speechWindow(session, at: 10)
+    try await session.publishVoiceActivityFromRecognitionWorker(
+        .speechStarted(atMilliseconds: 10)
+    )
+    try await session.publishRecognitionHypothesisFromWorker(final(1))
+    try await session.publishVoiceActivityFromRecognitionWorker(
+        .speechEnded(atMilliseconds: 900)
+    )
+    try await session.playbackRendered(frame.identity)
+    try await session.publishTurnEndedFromRecognitionWorker(samples: turnSamples)
+
+    try await speechWindow(session, at: 2_000)
+    try await session.publishVoiceActivityFromRecognitionWorker(
+        .speechStarted(atMilliseconds: 2_000)
+    )
+    try await session.publishRecognitionHypothesisFromWorker(final(1))
+    try await session.publishVoiceActivityFromRecognitionWorker(
+        .speechEnded(atMilliseconds: 2_900)
+    )
+    try await session.publishTurnEndedFromRecognitionWorker(samples: turnSamples)
+
+    #expect(
+        await turnAudioFrames(events)
+            == [
+                turnAudioFrame(segmentID: 1, finalSegments: 1, playbackOverlap: true),
+                turnAudioFrame(segmentID: 1, finalSegments: 1, playbackOverlap: false),
+            ]
+    )
+}
+
+@Test
+func speechOverPlaybackAfterATurnsSpeechEndedAlsoMarksTheNextTurn() async throws {
+    // The backend ends a turn some time after its speech ended. Speech that
+    // starts in between, over the companion's playback, can reach the
+    // session before the turn end does; it belongs to the next turn.
+    let (session, events) = try await capturingSession(version: 2)
+    try await session.publishVoiceActivityFromRecognitionWorker(
+        .speechStarted(atMilliseconds: 10)
+    )
+    try await session.publishRecognitionHypothesisFromWorker(final(1))
+    try await session.publishVoiceActivityFromRecognitionWorker(
+        .speechEnded(atMilliseconds: 900)
+    )
+    let frame = try await startPlayback(session)
+    try await speechWindow(session, at: 1_000)
+    try await session.playbackRendered(frame.identity)
+    try await session.publishTurnEndedFromRecognitionWorker(samples: turnSamples)
+
+    try await session.publishVoiceActivityFromRecognitionWorker(
+        .speechStarted(atMilliseconds: 1_100)
+    )
+    try await session.publishRecognitionHypothesisFromWorker(final(1))
+    try await session.publishVoiceActivityFromRecognitionWorker(
+        .speechEnded(atMilliseconds: 2_000)
+    )
+    try await session.publishTurnEndedFromRecognitionWorker(samples: turnSamples)
+
+    #expect(
+        await turnAudioFrames(events)
+            == [
+                turnAudioFrame(segmentID: 1, finalSegments: 1, playbackOverlap: true),
+                turnAudioFrame(segmentID: 1, finalSegments: 1, playbackOverlap: true),
+            ]
+    )
+}
+
+@Test
+func aCaptureDiscontinuityDropsTheTurn() async throws {
+    let (session, events) = try await capturingSession(version: 2)
+    let frame = try await startPlayback(session)
+    try await speechWindow(session, at: 10)
+    try await session.publishRecognitionHypothesisFromWorker(final(1))
+    try await session.publishRecognitionHypothesisFromWorker(final(2))
+    try await session.playbackRendered(frame.identity)
+
+    try await session.observeCaptureDiscontinuityFromRecognitionWorker(
+        atMilliseconds: 500
+    )
+    #expect(await turnAudioFrames(events).isEmpty)
+    #expect(
+        await events.frames.last
+            == ChildFrame(
+                control: .voiceActivity(
+                    sessionID: 7,
+                    activity: .captureDiscontinuity(atMilliseconds: 500)
+                )
+            ).atVersion(2)
+    )
+
+    // Nothing of the dropped turn — its finals or its overlap — carries on.
+    try await session.publishRecognitionHypothesisFromWorker(final(1))
+    try await session.publishTurnEndedFromRecognitionWorker(samples: turnSamples)
+    #expect(
+        await turnAudioFrames(events)
+            == [turnAudioFrame(segmentID: 1, finalSegments: 1, playbackOverlap: false)]
+    )
+}
+
+@Test
+func everyFrameCarriesTheSessionsVersion() async throws {
+    let (session, events) = try await capturingSession(
+        version: 2,
+        audioService: RecordingDeviceAudioService(
+            status: AudioDeviceStatus(inputLabel: "Microphone", outputLabel: "Speakers")
+        )
+    )
+    let frame = try await startPlayback(session)
+    try await session.publishVoiceActivityFromRecognitionWorker(
+        .speechStarted(atMilliseconds: 10)
+    )
+    try await session.publishRecognitionHypothesisFromWorker(final(1))
+    try await session.publishTurnEndedFromRecognitionWorker(samples: turnSamples)
+    try await session.playbackRendered(frame.identity)
+    _ = try await startPlayback(session, generationID: 6)
+    try await session.handleControl(
+        ChildFrame(
+            control: .flushGeneration(sessionID: 7, generationID: 6, operationID: 2)
+        ).atVersion(2)
+    )
+    try await session.recoverFromRecognitionFailure(
+        SidecarServiceFailure(stage: .speechRecognizer, code: .recognitionFailed),
+        fallbackSessionID: 7
+    )
+    try await session.handleControl(
+        ChildFrame(control: .pauseCapture(sessionID: 7, operationID: 3)).atVersion(2)
+    )
+    try await session.handleControl(
+        ChildFrame(control: .resumeCapture(sessionID: 7, operationID: 4)).atVersion(2)
+    )
+    try await session.handleControl(
+        ChildFrame(control: .shutdown(sessionID: 7)).atVersion(2)
+    )
+
+    let frames = await events.frames
+    #expect(
+        Set(frames.map(\.kind))
+            == [
+                .ready, .audioDeviceStatus, .captureStarted, .playbackAccepted,
+                .voiceActivity, .transcriptHypothesis, .turnAudio,
+                .playbackRendered, .playbackFlushed, .failure, .capturePaused,
+                .captureResumed, .shutdownComplete,
+            ]
+    )
+    #expect(frames.allSatisfy { $0.version == 2 })
+}
+
+@Test(arguments: [(UInt16(2), UInt16(1)), (UInt16(1), UInt16(2))])
+func aFrameAtAnotherVersionFailsTheSession(
+    sessionVersion: UInt16,
+    frameVersion: UInt16
+) async throws {
+    let malformed = ChildFrame(
+        control: .failure(sessionID: 7, stage: .voiceSidecar, code: .malformedFrame)
+    ).atVersion(sessionVersion)
+
+    let (controlSession, controlEvents) = try await capturingSession(
+        version: sessionVersion
+    )
+    await #expect(throws: (any Error).self) {
+        try await controlSession.handleControl(
+            ChildFrame(control: .pauseCapture(sessionID: 7, operationID: 2))
+                .atVersion(frameVersion)
+        )
+    }
+    #expect(await controlEvents.frames.last == malformed)
+    #expect(await controlEvents.frames.allSatisfy { $0.version == sessionVersion })
+
+    let (mediaSession, mediaEvents) = try await capturingSession(
+        version: sessionVersion
+    )
+    await #expect(throws: (any Error).self) {
+        try await mediaSession.handleMedia(
+            ChildFrame(audioSessionID: 7, frame: try pcmFrame(generationID: 5))
+                .atVersion(frameVersion)
+        )
+    }
+    #expect(await mediaEvents.frames.last == malformed)
+    #expect(await mediaEvents.frames.allSatisfy { $0.version == sessionVersion })
+}
+
+@Test
+func aSessionAnswersInTheVersionOfItsStartSession() async throws {
+    // A failure before any StartSession has no session version yet.
+    let unstarted = RecordingEventSink()
+    let unstartedSession = SidecarSession(
+        audioService: RecordingAudioService(),
+        recognitionService: RecordingRecognitionService(),
+        playbackService: RecordingPlaybackService(),
+        eventSink: unstarted
+    )
+    await #expect(throws: (any Error).self) {
+        try await unstartedSession.handleControl(
+            ChildFrame(control: .startCapture(sessionID: 7, operationID: 1))
+                .atVersion(2)
+        )
+    }
+    #expect(
+        await unstarted.frames
+            == [
+                ChildFrame(
+                    control: .failure(sessionID: 7, stage: .voiceSidecar, code: .invalidState)
+                )
+            ]
+    )
+
+    // A StartSession the sidecar refuses is still answered in its version.
+    let refused = RecordingEventSink()
+    let refusedSession = SidecarSession(
+        audioService: RecordingAudioService(),
+        recognitionService: RecordingRecognitionService(),
+        playbackService: RecordingPlaybackService(),
+        eventSink: refused
+    )
+    await #expect(throws: (any Error).self) {
+        try await refusedSession.handleControl(
+            ChildFrame(
+                control: .startSession(
+                    sessionID: 7,
+                    speechStartMilliseconds: 50,
+                    finalSilenceMilliseconds: 600
+                )
+            ).atVersion(2)
+        )
+    }
+    #expect(
+        await refused.frames
+            == [
+                ChildFrame(
+                    control: .failure(sessionID: 7, stage: .voiceSidecar, code: .invalidState)
+                ).atVersion(2)
+            ]
+    )
+}

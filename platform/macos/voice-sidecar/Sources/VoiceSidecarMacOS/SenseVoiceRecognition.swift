@@ -307,6 +307,8 @@ public actor SenseVoiceRecognition: SidecarRecognitionService {
                     .hypothesis(hypothesis)
                 )
             }
+        } onTurnEnded: { samples in
+            _ = try await eventRelay.emit(.turnEnded(samples: samples))
         }
         monitorTasks.append(
             monitorRecognitionWorker(hypothesisWorker) { failure in
@@ -493,7 +495,8 @@ public actor SenseVoiceRecognition: SidecarRecognitionService {
 
     // Mirrors WhisperKitRecognition's transcriber replacement after final
     // silence: the turn buffer restarts from bounded pre-roll and segment
-    // numbering begins again at 1.
+    // numbering begins again at 1. The turn's finals were queued by earlier
+    // decode requests on this worker, so its end queues behind them.
     private func resetTurnBuffer() throws {
         guard preparedConfiguration != nil,
             !speechGate.isSpeaking,
@@ -501,6 +504,9 @@ public actor SenseVoiceRecognition: SidecarRecognitionService {
         else {
             return
         }
+        hypothesisPipeline?.enqueueTurnEnded(
+            samples: turnAudioProcessor.audioSamples
+        )
         turnEpoch += 1
         tracker.resetForNewTurn()
         lastPartialRequestMilliseconds = 0

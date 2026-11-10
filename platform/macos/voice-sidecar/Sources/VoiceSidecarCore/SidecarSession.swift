@@ -118,6 +118,10 @@ public actor SidecarSession {
     private var voiceActivityActive = false
     private var deferredMedia: [ChildFrame] = []
     private var stablePhaseWaiters: [CheckedContinuation<Void, Never>] = []
+    /// The version of the session's `StartSession`; every frame sent and
+    /// received after it carries this version.
+    private var protocolVersion: UInt16?
+    private var turn = VoiceTurn()
 
     public var isTerminated: Bool {
         phase == .terminated
@@ -144,6 +148,12 @@ public actor SidecarSession {
                 fallbackSessionID: configuration?.sessionID ?? 0
             )
         }
+        if protocolVersion == nil, phase == .awaitingSession,
+            case .startSession = control
+        {
+            protocolVersion = frame.version
+        }
+        try await requireSessionVersion(frame, fallbackSessionID: control.sessionID)
 
         do {
             try await process(control)
@@ -153,6 +163,10 @@ public actor SidecarSession {
     }
 
     public func handleMedia(_ frame: ChildFrame) async throws {
+        try await requireSessionVersion(
+            frame,
+            fallbackSessionID: configuration?.sessionID ?? 0
+        )
         // The media channel is independent of the control channel, so a
         // frame of an already-flushed generation can land while a flush or
         // barge-in still holds the session in a transient phase. Such a
@@ -211,7 +225,7 @@ public actor SidecarSession {
             else {
                 return
             }
-            try await eventSink.send(
+            try await send(
                 ChildFrame(
                     control: .playbackAccepted(
                         sessionID: configuration.sessionID,
@@ -241,7 +255,7 @@ public actor SidecarSession {
             // strictly ordered, so resolve the prefix through the completed
             // frame and report each acknowledgement in order.
             for rendered in playbackBuffer.markRenderedThrough(identity) {
-                try await eventSink.send(
+                try await send(
                     ChildFrame(
                         control: .playbackRendered(
                             sessionID: configuration.sessionID,
@@ -281,6 +295,7 @@ public actor SidecarSession {
         }
         recognitionState = .stopped
         await recognitionService.stop()
+        turn = VoiceTurn()
         guard phase == .capturing else {
             return
         }
@@ -298,7 +313,7 @@ public actor SidecarSession {
         }
         recognitionState = .started
         let sessionID = self.configuration?.sessionID ?? fallbackSessionID
-        try await eventSink.send(
+        try await send(
             ChildFrame(
                 control: .failure(
                     sessionID: sessionID,
@@ -345,6 +360,42 @@ public actor SidecarSession {
         await awaitStablePhase()
         try requireAvailableOperation()
         try await sendRecognitionHypothesis(hypothesis)
+    }
+
+    /// A recognition backend ended a turn at its final-silence reset, after
+    /// publishing every hypothesis of the turn. `samples` is the turn's
+    /// 16 kHz mono buffer as it stood before the reset cleared it.
+    public func publishTurnEndedFromRecognitionWorker(
+        samples: ContiguousArray<Float>
+    ) async throws {
+        await awaitStablePhase()
+        try requireAvailableOperation()
+        let configuration = try requireCapturing()
+        let ended = turn
+        turn = ended.next()
+        guard protocolVersion == ChildProtocol.turnAudioVersion,
+            let segmentID = ended.lastFinalSegmentID
+        else {
+            return
+        }
+        let pcm = TurnAudioSnapshot.pcm16(
+            turnSamples: samples,
+            finalSilenceMilliseconds: configuration.finalSilenceMilliseconds
+        )
+        guard !pcm.isEmpty else {
+            return
+        }
+        try await send(
+            ChildFrame(
+                turnAudio: TurnAudioFrame(
+                    sessionID: configuration.sessionID,
+                    segmentID: segmentID,
+                    finalSegments: UInt16(clamping: ended.finalSegmentIDs.count),
+                    playbackOverlap: ended.playbackOverlap,
+                    samples: pcm
+                )
+            )
+        )
     }
 
     @discardableResult
@@ -396,6 +447,7 @@ public actor SidecarSession {
             .captureDiscontinuity(atMilliseconds: atMilliseconds)
         )
         bargeInGate?.reset()
+        turn = VoiceTurn()
     }
 
     private func sendVoiceActivity(_ activity: VoiceActivity) async throws {
@@ -413,7 +465,7 @@ public actor SidecarSession {
         if case .speechStarted = activity, voiceActivityActive {
             return
         }
-        try await eventSink.send(
+        try await send(
             ChildFrame(
                 control: .voiceActivity(
                     sessionID: sessionID,
@@ -421,11 +473,15 @@ public actor SidecarSession {
                 )
             )
         )
+        if case .speechStarted = activity, playbackBuffer.isPlaybackActive {
+            turn.markPlaybackOverlap(speaking: voiceActivityActive)
+        }
         switch activity {
         case .speechStarted, .speechContinued:
             voiceActivityActive = true
         case .speechEnded:
             voiceActivityActive = false
+            turn.speechEnded()
         case .captureDiscontinuity:
             return
         }
@@ -435,7 +491,10 @@ public actor SidecarSession {
         _ hypothesis: RecognitionHypothesis
     ) async throws {
         let configuration = try requireCapturing()
-        try await eventSink.send(
+        if hypothesis.engineFinal {
+            turn.recordFinal(segmentID: hypothesis.segmentID)
+        }
+        try await send(
             ChildFrame(
                 control: .transcriptHypothesis(
                     sessionID: configuration.sessionID,
@@ -451,6 +510,9 @@ public actor SidecarSession {
         atMilliseconds: UInt64
     ) async throws -> Bool {
         let configuration = try requireCapturing()
+        if isSpeech, playbackBuffer.isPlaybackActive {
+            turn.markPlaybackOverlap(speaking: voiceActivityActive)
+        }
         guard playbackBuffer.isPlaybackActive,
             let generationID = playbackBuffer.activeGenerationID
         else {
@@ -527,7 +589,7 @@ public actor SidecarSession {
                 speechStartMilliseconds: speechStartMilliseconds
             )
             phase = .configuring
-            try await eventSink.send(ChildFrame(control: .ready(sessionID: sessionID)))
+            try await send(ChildFrame(control: .ready(sessionID: sessionID)))
             phase = .ready
 
         case let .startCapture(sessionID, operationID):
@@ -544,7 +606,7 @@ public actor SidecarSession {
             recognitionState = .started
             try await emitAudioDeviceStatus(configuration)
             phase = .capturing
-            try await eventSink.send(
+            try await send(
                 ChildFrame(
                     control: .captureStarted(
                         sessionID: configuration.sessionID,
@@ -561,8 +623,10 @@ public actor SidecarSession {
             phase = .pausing
             recognitionState = .stopped
             await recognitionService.stop()
+            // Stopping recognition discards the turn in progress.
+            turn = VoiceTurn()
             try await audioService.pauseCapture()
-            try await eventSink.send(
+            try await send(
                 ChildFrame(
                     control: .capturePaused(
                         sessionID: configuration.sessionID,
@@ -588,7 +652,7 @@ public actor SidecarSession {
             // The default device can change while capture is paused, so the
             // resumed session reports the devices it actually came back on.
             try await emitAudioDeviceStatus(configuration)
-            try await eventSink.send(
+            try await send(
                 ChildFrame(
                     control: .captureResumed(
                         sessionID: configuration.sessionID,
@@ -618,7 +682,7 @@ public actor SidecarSession {
                 )
                 bargeInGate?.reset()
             }
-            try await eventSink.send(
+            try await send(
                 ChildFrame(
                     control: .playbackFlushed(
                         sessionID: configuration.sessionID,
@@ -639,7 +703,7 @@ public actor SidecarSession {
             }
             phase = .terminating
             await cleanupServices()
-            try await eventSink.send(
+            try await send(
                 ChildFrame(control: .shutdownComplete(sessionID: configuration.sessionID))
             )
             phase = .terminated
@@ -673,7 +737,7 @@ public actor SidecarSession {
         else {
             return
         }
-        try await eventSink.send(
+        try await send(
             ChildFrame(
                 control: .audioDeviceStatus(
                     sessionID: configuration.sessionID,
@@ -681,6 +745,29 @@ public actor SidecarSession {
                     outputLabel: devices.outputLabel
                 )
             )
+        )
+    }
+
+    /// Every frame the session sends leaves through here, in the session's
+    /// version. A frame sent before any `StartSession` is at version 1.
+    private func send(_ frame: ChildFrame) async throws {
+        try await eventSink.send(
+            frame.atVersion(protocolVersion ?? ChildProtocol.version)
+        )
+    }
+
+    /// A frame in another version than the session's `StartSession` fails the
+    /// session as a malformed frame, as an unknown version does.
+    private func requireSessionVersion(
+        _ frame: ChildFrame,
+        fallbackSessionID: UInt64
+    ) async throws {
+        guard let protocolVersion, frame.version != protocolVersion else {
+            return
+        }
+        try await fail(
+            ChildProtocolError.unknownVersion(frame.version),
+            fallbackSessionID: fallbackSessionID
         )
     }
 
@@ -842,7 +929,7 @@ public actor SidecarSession {
         phase = .failing
         resumeStablePhaseWaiters()
         await cleanupServices()
-        try await eventSink.send(
+        try await send(
             ChildFrame(
                 control: .failure(
                     sessionID: sessionID,
@@ -877,5 +964,39 @@ public actor SidecarSession {
             playbackStopped = true
             await playbackService.stop()
         }
+    }
+}
+
+/// What the session knows about the voice turn in progress.
+private struct VoiceTurn {
+    private(set) var finalSegmentIDs: Set<UInt64> = []
+    private(set) var lastFinalSegmentID: UInt64?
+    private(set) var playbackOverlap = false
+    /// Overlap seen since the turn's speech last ended. A backend ends the
+    /// turn some time after that, so this can be the next turn's speech
+    /// reaching the session first; it marks the next turn too.
+    private var overlapSinceSpeechEnded = false
+
+    mutating func recordFinal(segmentID: UInt64) {
+        finalSegmentIDs.insert(segmentID)
+        lastFinalSegmentID = segmentID
+    }
+
+    mutating func markPlaybackOverlap(speaking: Bool) {
+        playbackOverlap = true
+        if !speaking {
+            overlapSinceSpeechEnded = true
+        }
+    }
+
+    mutating func speechEnded() {
+        overlapSinceSpeechEnded = false
+    }
+
+    func next() -> VoiceTurn {
+        var next = VoiceTurn()
+        next.playbackOverlap = overlapSinceSpeechEnded
+        next.overlapSinceSpeechEnded = overlapSinceSpeechEnded
+        return next
     }
 }

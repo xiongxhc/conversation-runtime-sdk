@@ -471,6 +471,78 @@ func allFinalMailboxSaturationFailsTypedWithoutSilentLoss() async {
 }
 
 @Test
+func aTurnEndIsPublishedAfterItsTurnsQueuedHypothesesAndBeforeTheNextTurns() async {
+    let gate = AsyncGate()
+    let log = PipelineLog()
+    let pipeline = OrderedRecognitionBatchPipeline(capacity: 8)
+    pipeline.start { batch in
+        if batch.first?.segmentID == 0 {
+            await gate.wait()
+        }
+        for hypothesis in batch {
+            await log.append(
+                "\(hypothesis.engineFinal ? "final" : "partial").\(hypothesis.segmentID)"
+            )
+        }
+    } onTurnEnded: { samples in
+        await log.append("turnEnded.\(samples.count)")
+    }
+
+    pipeline.enqueue([
+        RecognitionHypothesis(segmentID: 0, text: "zero", engineFinal: false)
+    ])
+    await gate.waitUntilWaiting()
+    pipeline.enqueue([
+        RecognitionHypothesis(segmentID: 1, text: "one", engineFinal: true)
+    ])
+    #expect(pipeline.enqueueTurnEnded(samples: [0.1, 0.2, 0.3]) == .queued)
+    // The next turn's partial must not coalesce into the ended turn.
+    pipeline.enqueue([
+        RecognitionHypothesis(segmentID: 1, text: "next", engineFinal: false)
+    ])
+    pipeline.enqueue([
+        RecognitionHypothesis(segmentID: 1, text: "next", engineFinal: true)
+    ])
+    await gate.open()
+    _ = await pipeline.finish()
+
+    #expect(
+        await log.entries
+            == ["partial.0", "final.1", "turnEnded.3", "partial.1", "final.1"]
+    )
+}
+
+@Test
+func aFullRecognitionMailboxStillQueuesATurnEnd() async {
+    let gate = AsyncGate()
+    let log = PipelineLog()
+    let pipeline = OrderedRecognitionBatchPipeline(capacity: 1)
+    pipeline.start { batch in
+        if batch.first?.segmentID == 0 {
+            await gate.wait()
+        }
+        await log.append("final.\(batch.first?.segmentID ?? 0)")
+    } onTurnEnded: { samples in
+        await log.append("turnEnded.\(samples.count)")
+    }
+
+    pipeline.enqueue([
+        RecognitionHypothesis(segmentID: 0, text: "zero", engineFinal: true)
+    ])
+    await gate.waitUntilWaiting()
+    #expect(
+        pipeline.enqueue([
+            RecognitionHypothesis(segmentID: 1, text: "one", engineFinal: true)
+        ]) == .queued
+    )
+    #expect(pipeline.enqueueTurnEnded(samples: [0.5]) == .queued)
+    await gate.open()
+
+    #expect(await pipeline.finish() == .stopped)
+    #expect(await log.entries == ["final.0", "final.1", "turnEnded.1"])
+}
+
+@Test
 func voiceWindowPublicationFailureIsReportedAfterWorkerExit() async {
     let relay = RecognitionEventRelay()
     await relay.setHandler { event in
@@ -1338,6 +1410,14 @@ private actor AsyncGate {
         for waiter in values {
             waiter.resume()
         }
+    }
+}
+
+private actor PipelineLog {
+    private(set) var entries: [String] = []
+
+    func append(_ entry: String) {
+        entries.append(entry)
     }
 }
 

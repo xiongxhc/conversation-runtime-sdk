@@ -263,22 +263,29 @@ do not run it from CI, a developer laptop on a public network, or an untrusted b
 
 Not yet performed, and it cannot be performed yet. The gateway does not record turn-audio
 frames in any content-free form today. A record of each frame's segment id, final-segment
-count and playback flag, never its samples or the words, has to exist first.
+count, sample count and playback flag, never its samples or the words, has to exist first.
 
-The automated tests drive the sidecar session with fakes. For SenseVoice only, a test also
-feeds a recorded clip from the installed model's `test_wavs` through the real backend. No test
-uses a microphone, a speaker or a person. The WhisperKit final-silence reset path has no
-automated test. The SenseVoice test is skipped when the SenseVoice model is not installed.
+The automated tests drive the sidecar session with fakes, and drive the turn buffer and speech
+gate with synthetic windows. For SenseVoice only, two tests also feed a recorded clip from the
+installed model's `test_wavs` through the real backend, one of them after twelve seconds of
+silence. No test uses a microphone, a speaker or a person. The WhisperKit final-silence reset
+path has no automated test. The SenseVoice tests are skipped when the SenseVoice model is not
+installed.
+
+A turn's frame holds only that turn's speech: from its first speech start, moved earlier by the
+speech-start threshold and the 300 ms pre-roll, to its last speech end, and at most 160,000
+samples. The silence before the turn and the companion's reply are not in it.
 
 When that record exists, run this once per recognition backend (`--asr-backend whisperkit` and
 `--asr-backend sensevoice`), each in a version 2 session, which the gateway selects when
 speaker identity is configured:
 
-1. One person speaks a short turn (about two seconds) and then a long turn (more than ten
-   seconds), pausing past the configured final silence after each and starting each turn only
-   once the companion's reply has finished playing.
+1. After more than ten seconds of silence, one person speaks a short turn (about two seconds).
+   Then, after the companion's reply has finished playing, the person speaks a long turn (more
+   than ten seconds). The person pauses past the configured final silence after each turn.
 2. The same person speaks one more turn while the companion's reply is playing.
-3. The person must observe that each finished turn produced exactly one turn-audio frame,
-   after that turn's finals and before the next turn's hypotheses; that the long turn's frame
-   holds 160,000 samples; and that the turn spoken over playback has the playback flag set
-   while the short and long turns do not.
+3. The person must observe, from the record, that each finished turn produced exactly one
+   turn-audio frame, after that turn's finals and before the next turn's hypotheses; that the
+   short turn's sample count is close to its own length plus under half a second, far below
+   160,000; that the long turn's frame holds 160,000 samples; and that the turn spoken over
+   playback has the playback flag set while the short and long turns do not.

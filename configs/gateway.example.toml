@@ -102,3 +102,21 @@ follow_up_frequency = 25
 # model = "speechbrain/spkrec-ecapa-voxceleb"
 # model_cache_dir = "/absolute/path/to/diarization-model-cache"
 # max_speakers = 12
+
+# Optional speaker identification, which requires schema_version = 3 and a
+# [memory] section; voice signatures are kept in that memory database,
+# encrypted with the key named by `key_env`. The key follows the recording
+# key's format and is never written here. Every other value comes from this
+# deployment's own measurement on real recordings: none has a default and none
+# is suggested here. This build validates the section and then refuses it,
+# because it does not include a voice embedding model yet.
+# [speaker_identity]
+# key_env = "SPEAKER_IDENTITY_KEY"
+# wait_ms =
+# confident_score =
+# possible_score =
+# margin =
+# anchor_score =
+# min_sample_ms =
+# maturity_speech_ms =
+# refinement_cap =

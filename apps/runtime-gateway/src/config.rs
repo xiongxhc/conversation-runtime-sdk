@@ -5,8 +5,12 @@ use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
-use conversation_memory::{SqliteMemoryContextProvider, SqliteMemoryStore, SystemMemoryClock};
+use conversation_memory::{
+    MemoryStoreErrorKind, PeopleStore, SignatureKey, SqliteMemoryContextProvider,
+    SqliteMemoryStore, SystemMemoryClock,
+};
 use conversation_model_adapters::{
     BufferedStreamingSpeechSynthesizer, GenerationLanguageModel, MacOsVoiceSidecar,
     MacOsVoiceSidecarConfig, OllamaConfig, OllamaLanguageModel, OpenAiCompatibleSpeechConfig,
@@ -24,9 +28,9 @@ use conversation_protocol::{
     SilencePolicy, SpeechPace, VoiceResponseMode, MAX_CLIENT_PROVIDER_LABEL_BYTES,
 };
 use conversation_runtime::{
-    ConversationContext, ConversationQualityController, RecordingLimits, RecordingSettings,
-    SilenceAutoStop, DEFAULT_MAX_RECORDING_BYTES, DEFAULT_MAX_RECORDING_DURATION_MS,
-    DEFAULT_MIN_FREE_DISK_BYTES, DEFAULT_SILENCE_GRACE_MS,
+    ConversationContext, ConversationQualityController, IdentityPolicy, RecordingLimits,
+    RecordingSettings, SilenceAutoStop, VoiceEmbedder, DEFAULT_MAX_RECORDING_BYTES,
+    DEFAULT_MAX_RECORDING_DURATION_MS, DEFAULT_MIN_FREE_DISK_BYTES, DEFAULT_SILENCE_GRACE_MS,
 };
 use serde::{Deserialize, Serialize};
 
@@ -70,6 +74,8 @@ const MAX_SILENCE_STOP_GRACE_SECONDS: u64 = 3_600;
 /// configured maximum would configure a failure.
 const MAX_DIARIZATION_SPEAKERS: u16 = 64;
 const MIN_DIARIZATION_SPEAKERS: u16 = 2;
+const MIN_SPEAKER_IDENTITY_WAIT_MS: u64 = 100;
+const MAX_SPEAKER_IDENTITY_WAIT_MS: u64 = 5_000;
 
 #[derive(Debug)]
 pub struct GatewayConfigError(String);
@@ -108,6 +114,9 @@ pub struct GatewayConfig {
     recording: Option<RecordingConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     media: Option<MediaConfig>,
+    /// Schema 3 only, and only with `[memory]`, whose store keeps the voice signatures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    speaker_identity: Option<SpeakerIdentityConfig>,
     /// The side `mode` selected for each part. All `None` in a file without `mode`, where the
     /// profile alone decides where every part runs.
     #[serde(skip)]
@@ -442,6 +451,7 @@ impl GatewayDeploymentConfig {
             voice: None,
             recording: None,
             media: None,
+            speaker_identity: None,
             part_modes: PartModes::default(),
         };
         config
@@ -512,11 +522,24 @@ impl GatewayConfig {
         endpoints: GatewayTestProviderEndpoints,
     ) -> Result<GatewayAdapters, GatewayConfigError> {
         let parsed = load_toml(path)?;
-        parsed.build_adapters_with_provider_endpoints(Some(ProviderEndpointOverrides {
-            language: &endpoints.language,
-            recognition: &endpoints.recognition,
-            speech: &endpoints.speech,
-        }))
+        parsed.build_adapters_with_provider_endpoints(
+            Some(ProviderEndpointOverrides {
+                language: &endpoints.language,
+                recognition: &endpoints.recognition,
+                speech: &endpoints.speech,
+            }),
+            None,
+        )
+    }
+
+    /// Loads with a stand-in for the voice embedding model this build does not include, so
+    /// a configured `[speaker_identity]` gets past its final check.
+    #[cfg(test)]
+    pub(crate) fn load_with_test_voice_embedder(
+        path: &Path,
+        embedder: Arc<dyn VoiceEmbedder>,
+    ) -> Result<GatewayAdapters, GatewayConfigError> {
+        load_toml(path)?.build_adapters_with_provider_endpoints(None, Some(embedder))
     }
 
     /// Parse and fully validate a configuration file, returning the runtime
@@ -524,7 +547,13 @@ impl GatewayConfig {
     /// constructed: an online deployment names remote providers whose adapters
     /// are wired by the runtime, not by this loader.
     pub fn validate(path: &Path) -> Result<RuntimeStatus, GatewayConfigError> {
-        Ok(load_toml(path)?.deployment_plan()?.status)
+        let plan = load_toml(path)?.deployment_plan()?;
+        // `validate` never has a voice embedding model, so it refuses the section with the
+        // same final check `load` applies.
+        if plan.speaker_identity.is_some() {
+            return Err(voice_embedding_model_unavailable());
+        }
+        Ok(plan.status)
     }
 
     const fn profile(&self) -> RuntimeProfile {
@@ -626,6 +655,20 @@ impl GatewayConfig {
             .as_ref()
             .map(MediaConfig::server_config)
             .transpose()?;
+        // Checked against the memory store opened above, which keeps the voice signatures.
+        let speaker_identity = self
+            .speaker_identity
+            .as_ref()
+            .map(|section| {
+                if self.schema_version != 3 {
+                    return Err(config_error("speaker_identity requires schema_version 3"));
+                }
+                let (_, store) = memory
+                    .as_ref()
+                    .ok_or_else(|| config_error("speaker identity requires a memory section"))?;
+                section.settings(store)
+            })
+            .transpose()?;
 
         let memory_enabled = memory.is_some();
         let mut capabilities = vec![
@@ -666,17 +709,19 @@ impl GatewayConfig {
             memory,
             quality,
             media,
+            speaker_identity,
             status,
         })
     }
 
     fn build_adapters(&self) -> Result<GatewayAdapters, GatewayConfigError> {
-        self.build_adapters_with_provider_endpoints(None)
+        self.build_adapters_with_provider_endpoints(None, None)
     }
 
     fn build_adapters_with_provider_endpoints(
         &self,
         provider_endpoints: Option<ProviderEndpointOverrides<'_>>,
+        voice_embedder: Option<Arc<dyn VoiceEmbedder>>,
     ) -> Result<GatewayAdapters, GatewayConfigError> {
         let DeploymentPlan {
             provider_hosts,
@@ -684,6 +729,7 @@ impl GatewayConfig {
             memory,
             quality,
             media,
+            speaker_identity,
             status,
         } = self.deployment_plan()?;
         let language: Arc<dyn GenerationLanguageModel> = match self.language.backend {
@@ -750,6 +796,10 @@ impl GatewayConfig {
             .and_then(|voice| voice.diarization.as_ref())
             .map(VoiceDiarizationConfig::diarizer)
             .transpose()?;
+        // Last, so a configuration refused here has passed every other rule.
+        if speaker_identity.is_some() && voice_embedder.is_none() {
+            return Err(voice_embedding_model_unavailable());
+        }
 
         Ok(GatewayAdapters {
             context,
@@ -1270,6 +1320,10 @@ const OPENAI_UNSENT_STREAMING_INTERVAL: f32 = 0.2;
 #[cfg(test)]
 #[path = "config_speech_dialect_tests.rs"]
 mod speech_dialect_tests;
+
+#[cfg(test)]
+#[path = "config_speaker_identity_tests.rs"]
+mod speaker_identity_tests;
 
 fn load_toml(path: &Path) -> Result<GatewayConfig, GatewayConfigError> {
     if !path.is_absolute() {
@@ -2530,6 +2584,84 @@ impl RecordingConfig {
     }
 }
 
+/// Speaker identification. `key_env` names the environment variable holding the key voice
+/// signatures are encrypted with, in the recording key's format; the key itself never enters
+/// this structure, the serialized configuration, a status, or an error. Every other value comes
+/// from the deployment's own measurement, so none has a default.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SpeakerIdentityConfig {
+    key_env: String,
+    wait_ms: u64,
+    confident_score: f32,
+    possible_score: f32,
+    margin: f32,
+    anchor_score: f32,
+    min_sample_ms: u32,
+    maturity_speech_ms: u32,
+    refinement_cap: usize,
+}
+
+/// The validated `[speaker_identity]` section.
+pub struct SpeakerIdentitySettings {
+    pub key: Arc<SignatureKey>,
+    pub policy: IdentityPolicy,
+    /// The bound on identifying one turn; a turn not identified within it proceeds as unsure.
+    pub wait: Duration,
+}
+
+impl SpeakerIdentityConfig {
+    /// Reads and checks the key, binds `store` to it on first use, then checks the values.
+    fn settings(
+        &self,
+        store: &SqliteMemoryStore,
+    ) -> Result<SpeakerIdentitySettings, GatewayConfigError> {
+        validate_environment_reference(&self.key_env, "speaker identity key")?;
+        let key = SignatureKey::from_environment(&self.key_env).map_err(|_| {
+            config_error(
+                "speaker identity key must hold a 256-bit key as 64 hexadecimal characters",
+            )
+        })?;
+        store
+            .verify_signature_key(&key)
+            .map_err(|error| match error.kind() {
+                MemoryStoreErrorKind::KeyMismatch => config_error(
+                    "speaker identity key does not match the key this memory store was first used with",
+                ),
+                _ => memory_error(error),
+            })?;
+        if !(MIN_SPEAKER_IDENTITY_WAIT_MS..=MAX_SPEAKER_IDENTITY_WAIT_MS).contains(&self.wait_ms) {
+            return Err(config_error(
+                "speaker identity wait_ms must be within 100..=5000",
+            ));
+        }
+        let policy = IdentityPolicy {
+            confident_score: self.confident_score,
+            possible_score: self.possible_score,
+            margin: self.margin,
+            anchor_score: self.anchor_score,
+            min_sample_ms: self.min_sample_ms,
+            maturity_speech_ms: self.maturity_speech_ms,
+            refinement_cap: self.refinement_cap,
+        };
+        policy
+            .validate()
+            .map_err(|_| config_error("speaker identity thresholds are not valid"))?;
+        Ok(SpeakerIdentitySettings {
+            key: Arc::new(key),
+            policy,
+            wait: Duration::from_millis(self.wait_ms),
+        })
+    }
+}
+
+/// The final `[speaker_identity]` check, which a later build removes by supplying the model.
+fn voice_embedding_model_unavailable() -> GatewayConfigError {
+    config_error(
+        "speaker identity needs a voice embedding model, which this build does not include",
+    )
+}
+
 /// Everything decided from the configuration file before any adapter exists.
 struct DeploymentPlan {
     provider_hosts: Vec<ProviderHost>,
@@ -2537,6 +2669,7 @@ struct DeploymentPlan {
     memory: Option<(SqliteMemoryContextProvider, SqliteMemoryStore)>,
     quality: ConversationQualityController,
     media: Option<MediaServerConfig>,
+    speaker_identity: Option<SpeakerIdentitySettings>,
     status: RuntimeStatus,
 }
 
@@ -2626,12 +2759,14 @@ impl ScriptedGatewayConfig {
     /// language, recognition, speech and diarization transports at loopback plaintext peers.
     pub fn load(path: &Path) -> Result<GatewayAdapters, GatewayConfigError> {
         let (parsed, scripted) = Self::parse(path)?;
-        let mut adapters =
-            parsed.build_adapters_with_provider_endpoints(Some(ProviderEndpointOverrides {
+        let mut adapters = parsed.build_adapters_with_provider_endpoints(
+            Some(ProviderEndpointOverrides {
                 language: &scripted.language,
                 recognition: &scripted.recognition,
                 speech: &scripted.speech,
-            }))?;
+            }),
+            None,
+        )?;
         if let Some(endpoint) = scripted.diarization.as_deref() {
             let diarization = parsed
                 .voice

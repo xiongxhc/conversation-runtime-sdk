@@ -15,7 +15,7 @@ pub use config::ScriptedGatewayConfig;
 pub use config::{
     GatewayAdapters, GatewayConfig, GatewayConfigError, GatewayDeploymentConfig,
     GatewayMemoryExtraction, LanguageDeployment, ProviderEnvironmentPolicy, ProviderHost,
-    ProviderHostOwnership,
+    ProviderHostOwnership, SpeakerIdentitySettings,
 };
 pub use framing::{FrameError, FrameReader, FrameWriter};
 pub use input_relay::{input_relay, InputRelay};

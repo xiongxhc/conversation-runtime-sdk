@@ -2525,3 +2525,348 @@ fn the_online_profile_constructs_remote_adapters_without_a_local_fallback() {
         .any(|component| component.kind == "language_model"
             && component.execution_location == "remote"));
 }
+
+// ---------------------------------------------------------------------------
+// [speaker_identity]: validated completely, then refused, because this build
+// has no voice embedding model.
+// ---------------------------------------------------------------------------
+
+/// Deliberately fake signature keys: 64 hexadecimal characters, nothing more.
+const SPEAKER_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const OTHER_SPEAKER_KEY: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+const MISSING_VOICE_MODEL: &str =
+    "speaker identity needs a voice embedding model, which this build does not include";
+
+/// A complete section naming `key_env`. The values follow the runtime's own test policy.
+fn speaker_identity_section(key_env: &str) -> String {
+    format!(
+        "\n[speaker_identity]\nkey_env = \"{key_env}\"\nwait_ms = 1000\nconfident_score = 0.80\npossible_score = 0.60\nmargin = 0.10\nanchor_score = 0.85\nmin_sample_ms = 1500\nmaturity_speech_ms = 5000\nrefinement_cap = 3\n"
+    )
+}
+
+/// A fresh, initialized memory database inside `directory`.
+fn initialized_database(directory: &Path) -> PathBuf {
+    let database = directory.join("runtime.sqlite3");
+    SqliteMemoryStore::initialize(&database).unwrap();
+    database
+}
+
+/// Schema 3, offline, with `[memory]` on `database` and a complete `[speaker_identity]`.
+fn speaker_identity_config(database: &Path, key_env: &str) -> String {
+    format!(
+        "{}\n[memory]\ndatabase = \"{}\"\nmaximum_items = 4\nmaximum_bytes = 4096\n{}",
+        schema_v3_offline_config(),
+        toml_path(database),
+        speaker_identity_section(key_env)
+    )
+}
+
+fn validate_error(path: &Path) -> String {
+    GatewayConfig::validate(path).unwrap_err().to_string()
+}
+
+fn load_error(path: &Path) -> String {
+    GatewayConfig::load(path).unwrap_err().to_string()
+}
+
+#[test]
+fn a_complete_speaker_identity_section_stops_only_at_the_missing_voice_model() {
+    let key_env = "CONVERSATION_TEST_SPEAKER_IDENTITY_KEY_COMPLETE";
+    std::env::set_var(key_env, SPEAKER_KEY);
+    let fixture = tempfile::tempdir().unwrap();
+    let database = initialized_database(fixture.path());
+    let path = write_config(fixture.path(), &speaker_identity_config(&database, key_env));
+
+    assert_eq!(validate_error(&path), MISSING_VOICE_MODEL);
+    assert_eq!(load_error(&path), MISSING_VOICE_MODEL);
+
+    // Neither the key's value nor the database path reaches the message.
+    let error = validate_error(&path);
+    assert!(!error.contains(SPEAKER_KEY));
+    assert!(!error.contains(&database.display().to_string()));
+
+    // The same file without the section is an ordinary, loadable deployment.
+    let without = write_config(
+        fixture.path(),
+        speaker_identity_config(&database, key_env)
+            .split("\n[speaker_identity]")
+            .next()
+            .unwrap(),
+    );
+    GatewayConfig::validate(&without).unwrap();
+    assert!(GatewayConfig::load(&without)
+        .unwrap()
+        .memory_store
+        .is_some());
+}
+
+#[test]
+fn speaker_identity_requires_schema_three_and_a_memory_section() {
+    let key_env = "CONVERSATION_TEST_SPEAKER_IDENTITY_KEY_SCHEMA";
+    std::env::set_var(key_env, SPEAKER_KEY);
+    let fixture = tempfile::tempdir().unwrap();
+    let database = initialized_database(fixture.path());
+    let memory = format!(
+        "\n[memory]\ndatabase = \"{}\"\nmaximum_items = 4\nmaximum_bytes = 4096\n",
+        toml_path(&database)
+    );
+    let section = speaker_identity_section(key_env);
+
+    for legacy in [
+        VALID_CONFIG.to_owned(),
+        schema_v2_config(EXTERNAL_HOST, "language-host"),
+    ] {
+        // With and without [memory]: the schema is checked first.
+        for contents in [
+            format!("{legacy}{memory}{section}"),
+            format!("{legacy}{section}"),
+        ] {
+            let path = write_config(fixture.path(), &contents);
+            assert_eq!(
+                validate_error(&path),
+                "speaker_identity requires schema_version 3"
+            );
+            assert_eq!(
+                load_error(&path),
+                "speaker_identity requires schema_version 3"
+            );
+        }
+    }
+
+    // Schema 3 without [memory], even with the key unset: memory is checked before the key.
+    std::env::remove_var("CONVERSATION_TEST_SPEAKER_IDENTITY_KEY_SCHEMA_UNSET");
+    for key in [
+        key_env,
+        "CONVERSATION_TEST_SPEAKER_IDENTITY_KEY_SCHEMA_UNSET",
+    ] {
+        let path = write_config(
+            fixture.path(),
+            &format!(
+                "{}{}",
+                schema_v3_offline_config(),
+                speaker_identity_section(key)
+            ),
+        );
+        assert_eq!(
+            validate_error(&path),
+            "speaker identity requires a memory section"
+        );
+        assert_eq!(
+            load_error(&path),
+            "speaker identity requires a memory section"
+        );
+    }
+}
+
+#[test]
+fn the_speaker_identity_key_must_be_present_and_well_formed() {
+    let fixture = tempfile::tempdir().unwrap();
+    let database = initialized_database(fixture.path());
+
+    // Check 3: the environment reference itself.
+    let unset = "CONVERSATION_TEST_SPEAKER_IDENTITY_KEY_UNSET";
+    std::env::remove_var(unset);
+    let empty = "CONVERSATION_TEST_SPEAKER_IDENTITY_KEY_EMPTY";
+    std::env::set_var(empty, "  ");
+    for (key_env, expected) in [
+        (
+            unset.to_owned(),
+            format!("speaker identity key environment variable {unset} is not set"),
+        ),
+        (
+            empty.to_owned(),
+            format!("speaker identity key environment variable {empty} is not set"),
+        ),
+        (
+            String::new(),
+            "speaker identity key environment variable name must be within 1..=128 bytes"
+                .to_owned(),
+        ),
+        (
+            "lowercase_key".to_owned(),
+            "speaker identity key environment variable name must be uppercase ASCII letters, digits, and underscores".to_owned(),
+        ),
+    ] {
+        let path = write_config(fixture.path(), &speaker_identity_config(&database, &key_env));
+        assert_eq!(validate_error(&path), expected, "key_env {key_env:?}");
+        assert_eq!(load_error(&path), expected, "key_env {key_env:?}");
+    }
+
+    // Check 4: the value is set but is not a 256-bit key as 64 hexadecimal characters.
+    let malformed_env = "CONVERSATION_TEST_SPEAKER_IDENTITY_KEY_MALFORMED";
+    for malformed in [
+        "fake-not-a-real-key",
+        &SPEAKER_KEY[..63],
+        &format!("{SPEAKER_KEY}0"),
+    ] {
+        std::env::set_var(malformed_env, malformed);
+        let path = write_config(
+            fixture.path(),
+            &speaker_identity_config(&database, malformed_env),
+        );
+        let expected = "speaker identity key must hold a 256-bit key as 64 hexadecimal characters";
+        assert_eq!(validate_error(&path), expected);
+        assert_eq!(load_error(&path), expected);
+        assert!(!validate_error(&path).contains(malformed));
+
+        // The key is checked before the values.
+        let path = write_config(
+            fixture.path(),
+            &speaker_identity_config(&database, malformed_env).replacen(
+                "wait_ms = 1000",
+                "wait_ms = 99",
+                1,
+            ),
+        );
+        assert_eq!(validate_error(&path), expected);
+    }
+}
+
+#[test]
+fn a_different_speaker_identity_key_is_refused_for_a_store_already_bound() {
+    let key_env = "CONVERSATION_TEST_SPEAKER_IDENTITY_KEY_BOUND";
+    let fixture = tempfile::tempdir().unwrap();
+    let database = initialized_database(fixture.path());
+    let path = write_config(fixture.path(), &speaker_identity_config(&database, key_env));
+
+    // The first use binds the fresh store to this key.
+    std::env::set_var(key_env, SPEAKER_KEY);
+    assert_eq!(validate_error(&path), MISSING_VOICE_MODEL);
+
+    let mismatch =
+        "speaker identity key does not match the key this memory store was first used with";
+    std::env::set_var(key_env, OTHER_SPEAKER_KEY);
+    assert_eq!(validate_error(&path), mismatch);
+    assert_eq!(load_error(&path), mismatch);
+    // The refused key did not replace the bound one, and the mismatch outranks the values.
+    let invalid_wait = write_config(
+        fixture.path(),
+        &speaker_identity_config(&database, key_env).replacen("wait_ms = 1000", "wait_ms = 99", 1),
+    );
+    assert_eq!(validate_error(&invalid_wait), mismatch);
+
+    std::env::set_var(key_env, SPEAKER_KEY);
+    let path = write_config(fixture.path(), &speaker_identity_config(&database, key_env));
+    assert_eq!(validate_error(&path), MISSING_VOICE_MODEL);
+    assert_eq!(load_error(&path), MISSING_VOICE_MODEL);
+}
+
+#[test]
+fn speaker_identity_values_are_required_and_bounded() {
+    let key_env = "CONVERSATION_TEST_SPEAKER_IDENTITY_KEY_VALUES";
+    std::env::set_var(key_env, SPEAKER_KEY);
+    let fixture = tempfile::tempdir().unwrap();
+    let database = initialized_database(fixture.path());
+    let complete = speaker_identity_config(&database, key_env);
+
+    for line in [
+        format!("key_env = \"{key_env}\""),
+        "wait_ms = 1000".to_owned(),
+        "confident_score = 0.80".to_owned(),
+        "possible_score = 0.60".to_owned(),
+        "margin = 0.10".to_owned(),
+        "anchor_score = 0.85".to_owned(),
+        "min_sample_ms = 1500".to_owned(),
+        "maturity_speech_ms = 5000".to_owned(),
+        "refinement_cap = 3".to_owned(),
+    ] {
+        assert!(complete.contains(&format!("\n{line}\n")), "{line}");
+        let path = write_config(
+            fixture.path(),
+            &complete.replacen(&format!("\n{line}\n"), "\n", 1),
+        );
+        let expected = "gateway configuration file was not valid TOML";
+        assert_eq!(validate_error(&path), expected, "without {line}");
+        assert_eq!(load_error(&path), expected, "without {line}");
+    }
+
+    let wait_error = "speaker identity wait_ms must be within 100..=5000";
+    for wait in ["wait_ms = 99", "wait_ms = 5001", "wait_ms = 0"] {
+        let path = write_config(
+            fixture.path(),
+            &complete.replacen("wait_ms = 1000", wait, 1),
+        );
+        assert_eq!(validate_error(&path), wait_error, "{wait}");
+        assert_eq!(load_error(&path), wait_error, "{wait}");
+    }
+    for wait in ["wait_ms = 100", "wait_ms = 5000"] {
+        let path = write_config(
+            fixture.path(),
+            &complete.replacen("wait_ms = 1000", wait, 1),
+        );
+        assert_eq!(validate_error(&path), MISSING_VOICE_MODEL, "{wait}");
+    }
+
+    let thresholds_error = "speaker identity thresholds are not valid";
+    for (from, to) in [
+        ("possible_score = 0.60", "possible_score = 0.90"),
+        ("anchor_score = 0.85", "anchor_score = 1.5"),
+        ("margin = 0.10", "margin = -0.10"),
+        ("possible_score = 0.60", "possible_score = nan"),
+        ("min_sample_ms = 1500", "min_sample_ms = 1499"),
+        ("maturity_speech_ms = 5000", "maturity_speech_ms = 1000"),
+        ("refinement_cap = 3", "refinement_cap = 1000"),
+    ] {
+        let path = write_config(fixture.path(), &complete.replacen(from, to, 1));
+        assert_eq!(validate_error(&path), thresholds_error, "{to}");
+        assert_eq!(load_error(&path), thresholds_error, "{to}");
+    }
+
+    // wait_ms is checked before the thresholds.
+    let path = write_config(
+        fixture.path(),
+        &complete
+            .replacen("wait_ms = 1000", "wait_ms = 99", 1)
+            .replacen("possible_score = 0.60", "possible_score = 0.90", 1),
+    );
+    assert_eq!(validate_error(&path), wait_error);
+}
+
+#[test]
+fn rejects_unknown_speaker_identity_fields() {
+    let key_env = "CONVERSATION_TEST_SPEAKER_IDENTITY_KEY_UNKNOWN";
+    std::env::set_var(key_env, SPEAKER_KEY);
+    let fixture = tempfile::tempdir().unwrap();
+    let database = initialized_database(fixture.path());
+    let path = write_config(
+        fixture.path(),
+        &format!(
+            "{}enrolment_score = 0.9\n",
+            speaker_identity_config(&database, key_env)
+        ),
+    );
+
+    let expected = "gateway configuration file was not valid TOML";
+    assert_eq!(validate_error(&path), expected);
+    assert_eq!(load_error(&path), expected);
+}
+
+#[test]
+fn configurations_without_the_section_are_unchanged() {
+    std::env::set_var("OPENAI_API_KEY", ONLINE_CREDENTIAL_VALUE);
+    std::env::set_var("MEETING_RECORDING_KEY", ONLINE_CREDENTIAL_VALUE);
+    let configs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+
+    for (name, profile) in [
+        ("gateway.example.toml", "offline"),
+        ("gateway.meeting-online.example.toml", "online"),
+        ("gateway.toggle.example.toml", "online"),
+    ] {
+        let path = configs.join(name).canonicalize().unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !contents
+                .lines()
+                .any(|line| line.trim_start().starts_with("[speaker_identity]")),
+            "{name} enables speaker identity"
+        );
+        let status =
+            GatewayConfig::validate(&path).unwrap_or_else(|error| panic!("{name}: {error}"));
+        assert_eq!(status.profile, profile, "{name}");
+    }
+
+    let offline = configs.join("gateway.example.toml").canonicalize().unwrap();
+    let adapters = GatewayConfig::load(&offline).unwrap();
+    assert_eq!(adapters.status.profile, "offline");
+    assert!(adapters.memory_store.is_none());
+}

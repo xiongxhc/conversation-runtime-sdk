@@ -100,14 +100,25 @@ media path is covered by Task 5's tests and Task 8's unit tests only.
   A request takes the audio only when its segment id is the audio's; a request
   for a segment whose turn has already ended without that audio gets nothing at
   once; any other request waits. Version 1 sessions keep the sidecar's ids.
-- **What the sidecar sends.** At the final-silence reset that ends a turn: the
-  turn buffer without its last `final_silence_ms` of samples (the silence that
-  ended the turn), then at most the last 160,000 samples, clamped to [-1, 1],
-  scaled by 32,767 and rounded to the nearest integer. Nothing is sent for a turn with no engine final, an empty
-  result, a capture discontinuity, or a version 1 session.
+- **What the sidecar sends.** At the final-silence reset that ends a turn: only
+  the person's speech in that turn, which is the turn buffer from the turn's
+  first speech start (moved earlier by the speech-start threshold and the
+  pre-roll, so the onset is kept) to its last speech end; then at most the last
+  160,000 samples of that span, clamped to [-1, 1], scaled by 32,767 and rounded
+  to the nearest integer. The buffer between resets also holds silence and the
+  companion's reply, which are never sent. Nothing is sent for a turn with no
+  speech start, no engine final, an empty result, a capture discontinuity, or a
+  version 1 session.
 - **Playback overlap in the sidecar** is true when playback was active in any
-  voice window in which the person was speaking, or when a speech start was
-  published while playback was active.
+  voice window between the turn's first speech start and its last speech end,
+  speech or not, or when a speech start was published while playback was active.
+- **A turn's audio is used only when it covers exactly the turn's words.** The
+  runtime's request carries how many engine-final segments its turn joined, and
+  the audio carries how many final segments its sidecar turn held (always 1 on
+  the media bridge). The stage uses the audio only when the two counts are
+  equal; otherwise the turn has no voice and is unsure. Equal counts with the
+  same last segment id mean the same segments, because finals are one ordered
+  stream. Audio is a single segment only when both counts are 1.
 - **Media bridge.** The buffer holds one contiguous run of timed capture, at
   most 30 s (720,000 samples at 24 kHz), in the format the online recogniser
   already requires: 24 kHz mono signed 16-bit. A frame without capture timing,

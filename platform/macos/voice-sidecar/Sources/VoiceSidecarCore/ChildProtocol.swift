@@ -174,6 +174,34 @@ public struct TurnAudioFrame: Equatable, Sendable {
     }
 }
 
+/// Printing a frame never prints the voice it carries.
+extension TurnAudioFrame: CustomStringConvertible, CustomDebugStringConvertible,
+    CustomReflectable
+{
+    public var description: String {
+        "TurnAudioFrame(sessionID: \(sessionID), segmentID: \(segmentID), "
+            + "finalSegments: \(finalSegments), playbackOverlap: \(playbackOverlap), "
+            + "sampleCount: \(samples.count))"
+    }
+
+    public var debugDescription: String {
+        description
+    }
+
+    public var customMirror: Mirror {
+        Mirror(
+            self,
+            children: [
+                "sessionID": sessionID,
+                "segmentID": segmentID,
+                "finalSegments": finalSegments,
+                "playbackOverlap": playbackOverlap,
+                "sampleCount": samples.count,
+            ]
+        )
+    }
+}
+
 public struct ChildFrame: Equatable, Sendable {
     public let version: UInt16
     public let control: ChildControl?

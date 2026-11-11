@@ -23,6 +23,18 @@ final class TurnAudioProcessor: AudioProcessing, @unchecked Sendable {
         var isPaused = true
         var isTransitioning = false
         var hasFailed = false
+        /// Samples appended since the processor was created or reset; the
+        /// clock the turn's speech marks are on.
+        var capturePosition: UInt64 = 0
+        /// The capture position of `audioSamples`' first sample.
+        var audioStartPosition: UInt64 = 0
+        /// Capture skipped while the turn buffer held samples, so positions
+        /// past the gap no longer map onto it.
+        var audioHasGap = false
+        /// The voice window that published the turn's first speech start.
+        var firstSpeechStart: UInt64?
+        /// The voice window that published the turn's last speech end.
+        var lastSpeechEnd: UInt64?
     }
 
     private let preRollSampleLimit: Int
@@ -134,6 +146,7 @@ final class TurnAudioProcessor: AudioProcessing, @unchecked Sendable {
 
         let delivery = stateLock.withLock {
             let relativeEnergyWindow = state.relativeEnergyWindow
+            state.capturePosition &+= UInt64(samples.count)
             append(samples, to: &state.preRoll, limit: preRollSampleLimit)
 
             var failure: FailureHandler?
@@ -174,6 +187,8 @@ final class TurnAudioProcessor: AudioProcessing, @unchecked Sendable {
                     state.callback = nil
                     failure = state.failureHandler
                 }
+            } else if !state.audioSamples.isEmpty {
+                state.audioHasGap = true
             }
             return (callback: callback, failure: failure)
         }
@@ -185,9 +200,9 @@ final class TurnAudioProcessor: AudioProcessing, @unchecked Sendable {
         stateLock.withLock {
             let retained = max(0, keep)
             if state.audioSamples.count > retained {
-                state.audioSamples.removeFirst(
-                    state.audioSamples.count - retained
-                )
+                let removed = state.audioSamples.count - retained
+                state.audioSamples.removeFirst(removed)
+                state.audioStartPosition &+= UInt64(removed)
             }
         }
     }
@@ -205,6 +220,10 @@ final class TurnAudioProcessor: AudioProcessing, @unchecked Sendable {
             } else {
                 state.audioSamples = state.preRoll
             }
+            // Pre-roll and transition audio both run up to the latest sample.
+            state.audioStartPosition = state.capturePosition
+                &- UInt64(state.audioSamples.count)
+            state.audioHasGap = false
             state.energy = energyEntries(
                 for: state.audioSamples,
                 relativeEnergyWindow: state.relativeEnergyWindow
@@ -273,6 +292,8 @@ final class TurnAudioProcessor: AudioProcessing, @unchecked Sendable {
     func stopRecording() {
         stateLock.withLock {
             state.audioSamples = []
+            state.audioStartPosition = state.capturePosition
+            state.audioHasGap = false
             state.energy = []
             state.callback = nil
             state.isRecording = false
@@ -280,10 +301,44 @@ final class TurnAudioProcessor: AudioProcessing, @unchecked Sendable {
         }
     }
 
+    /// The capture position just past the latest appended sample. A voice
+    /// window that ends `n` samples before the latest one ends at this
+    /// position minus `n`.
+    var capturePosition: UInt64 {
+        stateLock.withLock {
+            state.capturePosition
+        }
+    }
+
+    /// Records where the turn's speech lies, from the speech gate's
+    /// transition at a voice window that ended at `capturePosition`: the
+    /// turn's first speech start and its last speech end.
+    func observe(
+        _ transition: RecognitionSpeechTransition,
+        windowEndingAt capturePosition: UInt64
+    ) {
+        stateLock.withLock {
+            switch transition {
+            case .started:
+                if state.firstSpeechStart == nil {
+                    state.firstSpeechStart = capturePosition
+                }
+            case .ended:
+                state.lastSpeechEnd = capturePosition
+            case .none, .continued:
+                break
+            }
+        }
+    }
+
     /// The turn that a final-silence reset ends, as a backend hands it on:
-    /// only what the snapshot reads, and the earliest time on the voice
-    /// window clock that the next turn's audio can begin. The next turn
-    /// starts with the pre-roll; a voice window's time is when it was
+    /// only the turn's speech, and the earliest time on the voice window
+    /// clock that the next turn's audio can begin. The speech runs from the
+    /// turn's first speech start, moved earlier by the speech-start
+    /// threshold and the pre-roll so the onset is kept, to its last speech
+    /// end; a turn without both has none. The marks are consumed: what the
+    /// speech gate reports from here on belongs to the next turn. The next
+    /// turn starts with the pre-roll; a voice window's time is when it was
     /// processed, never before its samples arrived, and capture arrives in
     /// buffers of up to 8,192 frames (512 ms at 16 kHz), so one second more
     /// than the pre-roll covers every window that can hold its audio.
@@ -293,11 +348,29 @@ final class TurnAudioProcessor: AudioProcessing, @unchecked Sendable {
         discontinuities: UInt64
     ) -> RecognitionTurnEnd {
         let lead = UInt64(preRollSampleLimit / 16) + 1_000
+        // The gate starts after whole 100 ms windows of speech.
+        let thresholdSamples = (configuration.speechStartMilliseconds + 99)
+            / 100 * 1_600
+        let speech = stateLock.withLock {
+            defer {
+                state.firstSpeechStart = nil
+                state.lastSpeechEnd = nil
+            }
+            guard !state.audioHasGap,
+                let range = TurnAudioSnapshot.speechRange(
+                    bufferStart: state.audioStartPosition,
+                    bufferCount: state.audioSamples.count,
+                    firstSpeechStart: state.firstSpeechStart,
+                    lastSpeechEnd: state.lastSpeechEnd,
+                    leadSamples: thresholdSamples + UInt64(preRollSampleLimit)
+                )
+            else {
+                return ContiguousArray<Float>()
+            }
+            return ContiguousArray(state.audioSamples[range])
+        }
         return RecognitionTurnEnd(
-            samples: TurnAudioSnapshot.retainedSamples(
-                of: audioSamples,
-                finalSilenceMilliseconds: configuration.finalSilenceMilliseconds
-            ),
+            samples: speech,
             nextTurnFromMilliseconds: now > lead ? now - lead : 0,
             discontinuities: discontinuities
         )
@@ -327,6 +400,10 @@ final class TurnAudioProcessor: AudioProcessing, @unchecked Sendable {
             state.preRoll = []
             state.transitionSamples = []
             state.audioSamples = []
+            state.audioStartPosition = state.capturePosition
+            state.audioHasGap = false
+            state.firstSpeechStart = nil
+            state.lastSpeechEnd = nil
             state.energy = []
             state.isTransitioning = true
         }

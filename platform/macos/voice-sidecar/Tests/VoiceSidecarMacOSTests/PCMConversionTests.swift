@@ -443,7 +443,7 @@ func captureDiscontinuityPreventsVoiceWindowBridging() throws {
     )
     let processor = VoiceProcessingAudioProcessor(engine: engine)
     let recorder = VoiceWindowRecorder()
-    processor.setVoiceWindowHandler { window in
+    processor.setVoiceWindowHandler { window, _ in
         recorder.record(window)
     }
     try processor.startRecordingLive(inputDeviceID: nil, callback: nil)
@@ -482,7 +482,7 @@ func continuousCaptureSurvivesLogicalTurnRotation() throws {
     let source = VoiceProcessingAudioProcessor(engine: engine)
     let turn = TurnAudioProcessor()
     let recorder = VoiceWindowRecorder()
-    source.setVoiceWindowHandler { window in
+    source.setVoiceWindowHandler { window, _ in
         recorder.record(window)
     }
     let format = try #require(

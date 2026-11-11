@@ -1,47 +1,51 @@
 /// The audio a `TurnAudio` frame carries for a finished turn.
 public enum TurnAudioSnapshot {
-    private static let samplesPerMillisecond = 16
-
-    /// The turn's 16 kHz mono buffer without the final silence that ended it,
-    /// limited to its last 160,000 samples, clamped to [-1, 1], scaled by
-    /// 32,767 and rounded to the nearest integer.
-    public static func pcm16(
-        turnSamples: ContiguousArray<Float>,
-        finalSilenceMilliseconds: UInt64
-    ) -> [Int16] {
-        let silence = finalSilenceMilliseconds
-            .multipliedReportingOverflow(by: UInt64(samplesPerMillisecond))
-        guard !silence.overflow,
-            silence.partialValue < UInt64(turnSamples.count)
+    /// The part of a turn buffer that holds the turn's speech: from the
+    /// turn's first speech start, moved earlier by `leadSamples`, to its last
+    /// speech end, then at most the last 160,000 samples of that span.
+    /// Positions count samples on one capture clock, and `bufferStart` is the
+    /// position of the buffer's first sample. Nil when the turn has no speech
+    /// start, no speech end after it, or no buffered sample in the span.
+    public static func speechRange(
+        bufferStart: UInt64,
+        bufferCount: Int,
+        firstSpeechStart: UInt64?,
+        lastSpeechEnd: UInt64?,
+        leadSamples: UInt64
+    ) -> Range<Int>? {
+        guard let start = firstSpeechStart,
+            let end = lastSpeechEnd,
+            end > start
         else {
-            return []
+            return nil
         }
-        let end = turnSamples.count - Int(silence.partialValue)
-        let start = max(0, end - ChildProtocol.maximumTurnAudioSamples)
-        return turnSamples[start..<end].map { sample in
+        func index(_ position: UInt64) -> Int {
+            guard position > bufferStart else {
+                return 0
+            }
+            return Int(min(position - bufferStart, UInt64(max(0, bufferCount))))
+        }
+        let upper = index(end)
+        let lower = max(
+            index(start > leadSamples ? start - leadSamples : 0),
+            upper - ChildProtocol.maximumTurnAudioSamples
+        )
+        guard lower < upper else {
+            return nil
+        }
+        return lower..<upper
+    }
+
+    /// A turn's speech as a backend cut it, limited to its last 160,000
+    /// samples, clamped to [-1, 1], scaled by 32,767 and rounded to the
+    /// nearest integer.
+    public static func pcm16(_ speech: ContiguousArray<Float>) -> [Int16] {
+        speech.suffix(ChildProtocol.maximumTurnAudioSamples).map { sample in
             // Capture never yields NaN; if it did, silence is the safe sample.
             guard !sample.isNaN else {
                 return 0
             }
             return Int16((min(max(sample, -1), 1) * 32_767).rounded())
         }
-    }
-
-    /// The end of a turn buffer that `pcm16` reads: at most the last
-    /// 160,000 samples plus the final silence. A backend copies only this.
-    public static func retainedSamples(
-        of turnSamples: ContiguousArray<Float>,
-        finalSilenceMilliseconds: UInt64
-    ) -> ContiguousArray<Float> {
-        let silence = finalSilenceMilliseconds
-            .multipliedReportingOverflow(by: UInt64(samplesPerMillisecond))
-        let kept = UInt64(ChildProtocol.maximumTurnAudioSamples)
-            .addingReportingOverflow(silence.partialValue)
-        guard !silence.overflow, !kept.overflow,
-            kept.partialValue < UInt64(turnSamples.count)
-        else {
-            return turnSamples
-        }
-        return ContiguousArray(turnSamples.suffix(Int(kept.partialValue)))
     }
 }

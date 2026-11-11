@@ -939,7 +939,8 @@ actor RecognitionEventRelay {
 }
 
 enum RecognitionVoiceInput: Sendable {
-    case window([Float])
+    /// A voice window and the turn buffer's capture position at its end.
+    case window([Float], endingAt: UInt64)
     case discontinuity
 }
 
@@ -1217,8 +1218,17 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
 
         let voiceMailbox = RecognitionVoiceMailbox(capacity: 8)
         self.voiceMailbox = voiceMailbox
-        audioProcessor.setVoiceWindowHandler { window in
-            voiceMailbox.enqueue(.window(window))
+        audioProcessor.setVoiceWindowHandler { [turnAudioProcessor] window, samplesAfter in
+            // The capture callback fed the turn buffer before the window
+            // handler runs, so the window ends `samplesAfter` samples before
+            // the turn buffer's latest position.
+            voiceMailbox.enqueue(
+                .window(
+                    window,
+                    endingAt: turnAudioProcessor.capturePosition
+                        &- UInt64(samplesAfter)
+                )
+            )
         }
         audioProcessor.setDiscontinuityHandler {
             voiceMailbox.enqueue(.discontinuity)
@@ -1494,8 +1504,8 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
                     )
                 }
             }
-        case .window(let window):
-            try await processVoiceWindow(window)
+        case .window(let window, let capturePosition):
+            try await processVoiceWindow(window, endingAt: capturePosition)
         }
     }
 
@@ -1521,7 +1531,10 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
         try? handle.close()
     }
 
-    private func processVoiceWindow(_ window: [Float]) async throws {
+    private func processVoiceWindow(
+        _ window: [Float],
+        endingAt capturePosition: UInt64
+    ) async throws {
         let isSpeech = vad.voiceActivity(in: window).last == true
         logVadDiagnostic(window: window, isSpeech: isSpeech)
         if isSpeech {
@@ -1537,7 +1550,14 @@ public actor WhisperKitRecognition: SidecarRecognitionService {
             )
         )
 
-        switch speechGate.observe(isSpeech: isSpeech) {
+        let transition = speechGate.observe(isSpeech: isSpeech)
+        if preparedConfiguration?.collectsTurnAudio == true {
+            turnAudioProcessor.observe(
+                transition,
+                windowEndingAt: capturePosition
+            )
+        }
+        switch transition {
         case .none:
             break
         case .started:

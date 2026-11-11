@@ -327,8 +327,17 @@ public actor SenseVoiceRecognition: SidecarRecognitionService {
 
         let voiceMailbox = RecognitionVoiceMailbox(capacity: 8)
         self.voiceMailbox = voiceMailbox
-        audioProcessor.setVoiceWindowHandler { window in
-            voiceMailbox.enqueue(.window(window))
+        audioProcessor.setVoiceWindowHandler { [turnAudioProcessor] window, samplesAfter in
+            // The capture callback fed the turn buffer before the window
+            // handler runs, so the window ends `samplesAfter` samples before
+            // the turn buffer's latest position.
+            voiceMailbox.enqueue(
+                .window(
+                    window,
+                    endingAt: turnAudioProcessor.capturePosition
+                        &- UInt64(samplesAfter)
+                )
+            )
         }
         audioProcessor.setDiscontinuityHandler {
             voiceMailbox.enqueue(.discontinuity)
@@ -588,12 +597,15 @@ public actor SenseVoiceRecognition: SidecarRecognitionService {
                 inputDeviceID: nil,
                 callback: nil
             )
-        case .window(let window):
-            try await processVoiceWindow(window)
+        case .window(let window, let capturePosition):
+            try await processVoiceWindow(window, endingAt: capturePosition)
         }
     }
 
-    private func processVoiceWindow(_ window: [Float]) async throws {
+    private func processVoiceWindow(
+        _ window: [Float],
+        endingAt capturePosition: UInt64
+    ) async throws {
         let isSpeech = vad.voiceActivity(in: window).last == true
         if isSpeech {
             recognitionResetTask?.cancel()
@@ -608,7 +620,14 @@ public actor SenseVoiceRecognition: SidecarRecognitionService {
             )
         )
 
-        switch speechGate.observe(isSpeech: isSpeech) {
+        let transition = speechGate.observe(isSpeech: isSpeech)
+        if preparedConfiguration?.collectsTurnAudio == true {
+            turnAudioProcessor.observe(
+                transition,
+                windowEndingAt: capturePosition
+            )
+        }
+        switch transition {
         case .none:
             break
         case .started:

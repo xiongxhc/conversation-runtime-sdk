@@ -23,8 +23,10 @@ public struct SidecarConfiguration: Equatable, Sendable {
 
 /// A recognition backend's end of a voice turn, at its final-silence reset.
 public struct RecognitionTurnEnd: Equatable, Sendable {
-    /// The turn's 16 kHz mono buffer as it stood before the reset cleared it,
-    /// cut to what `TurnAudioSnapshot.pcm16` uses.
+    /// The turn's speech in its 16 kHz mono buffer, as it stood before the
+    /// reset cleared it: from the first speech start, moved earlier by the
+    /// speech-start threshold and the pre-roll, to the last speech end, and
+    /// at most 160,000 samples. Empty for a turn with no speech start.
     public let samples: ContiguousArray<Float>
     /// On the clock of the backend's voice windows and voice activity: the
     /// earliest time the next turn's audio can begin. Playback overlap seen
@@ -43,6 +45,32 @@ public struct RecognitionTurnEnd: Equatable, Sendable {
         self.samples = samples
         self.nextTurnFromMilliseconds = nextTurnFromMilliseconds
         self.discontinuities = discontinuities
+    }
+}
+
+/// Printing a turn end never prints the voice it carries.
+extension RecognitionTurnEnd: CustomStringConvertible, CustomDebugStringConvertible,
+    CustomReflectable
+{
+    public var description: String {
+        "RecognitionTurnEnd(sampleCount: \(samples.count), "
+            + "nextTurnFromMilliseconds: \(nextTurnFromMilliseconds), "
+            + "discontinuities: \(discontinuities))"
+    }
+
+    public var debugDescription: String {
+        description
+    }
+
+    public var customMirror: Mirror {
+        Mirror(
+            self,
+            children: [
+                "sampleCount": samples.count,
+                "nextTurnFromMilliseconds": nextTurnFromMilliseconds,
+                "discontinuities": discontinuities,
+            ]
+        )
     }
 }
 
@@ -155,6 +183,8 @@ public actor SidecarSession {
     /// The latest voice window or speech start that overlapped playback, on
     /// the recognition backend's clock.
     private var latestOverlapMilliseconds: UInt64?
+    /// The latest speech start, on the same clock.
+    private var latestSpeechStartMilliseconds: UInt64?
     private var captureDiscontinuities: UInt64 = 0
 
     public var isTerminated: Bool {
@@ -398,7 +428,7 @@ public actor SidecarSession {
 
     /// A recognition backend ended a turn at its final-silence reset, after
     /// publishing every hypothesis of the turn. `samples` is the turn's
-    /// 16 kHz mono buffer as it stood before the reset cleared it.
+    /// speech, as `RecognitionTurnEnd` describes.
     public func publishTurnEndedFromRecognitionWorker(
         _ end: RecognitionTurnEnd
     ) async throws {
@@ -409,25 +439,32 @@ public actor SidecarSession {
             // The turn ended before a discontinuity the session has already
             // dropped it for. What reached the session since then is the
             // old turn's last finals, which no later turn may claim, and
-            // overlap after the gap, which stays.
-            turn = VoiceTurn(playbackOverlap: turn.playbackOverlap)
+            // speech and overlap after the gap, which stay.
+            turn.dropFinals()
             return
         }
         let ended = turn
+        // What reached the session at or after the time the next turn's
+        // audio can begin may belong to the next turn, so it carries over:
+        // overlap, a speech start (or speech still going on), and playback
+        // in a pause after it.
+        let nextFrom = end.nextTurnFromMilliseconds
         turn = VoiceTurn(
-            playbackOverlap: latestOverlapMilliseconds.map {
-                $0 >= end.nextTurnFromMilliseconds
-            } ?? false
+            playbackOverlap: latestOverlapMilliseconds.map { $0 >= nextFrom } ?? false
         )
+        if voiceActivityActive
+            || latestSpeechStartMilliseconds.map({ $0 >= nextFrom }) == true
+        {
+            turn.speechStarted = true
+            turn.pausePlaybackMilliseconds = ended.pausePlaybackMilliseconds
+                .flatMap { $0 >= nextFrom ? $0 : nil }
+        }
         guard protocolVersion == ChildProtocol.turnAudioVersion,
             let segmentID = ended.lastFinalSegmentID
         else {
             return
         }
-        let pcm = TurnAudioSnapshot.pcm16(
-            turnSamples: end.samples,
-            finalSilenceMilliseconds: configuration.finalSilenceMilliseconds
-        )
+        let pcm = TurnAudioSnapshot.pcm16(end.samples)
         guard !pcm.isEmpty else {
             return
         }
@@ -527,9 +564,18 @@ public actor SidecarSession {
         switch activity {
         case .speechStarted(let atMilliseconds):
             voiceActivityActive = true
-            if startsOverPlayback {
+            // Playback in a pause after an earlier speech start of the turn
+            // lies between the turn's first speech start and a later speech
+            // end, inside the turn's audio.
+            if startsOverPlayback || turn.pausePlaybackMilliseconds != nil {
                 markPlaybackOverlap(atMilliseconds: atMilliseconds)
             }
+            turn.speechStarted = true
+            turn.pausePlaybackMilliseconds = nil
+            latestSpeechStartMilliseconds = max(
+                latestSpeechStartMilliseconds ?? atMilliseconds,
+                atMilliseconds
+            )
         case .speechContinued:
             voiceActivityActive = true
         case .speechEnded:
@@ -564,8 +610,14 @@ public actor SidecarSession {
         atMilliseconds: UInt64
     ) async throws -> Bool {
         let configuration = try requireCapturing()
-        if isSpeech, playbackBuffer.isPlaybackActive {
-            markPlaybackOverlap(atMilliseconds: atMilliseconds)
+        if playbackBuffer.isPlaybackActive {
+            if isSpeech || voiceActivityActive {
+                markPlaybackOverlap(atMilliseconds: atMilliseconds)
+            } else if turn.speechStarted {
+                // A pause inside the turn, or its closing silence: only a
+                // later speech start of the same turn tells them apart.
+                turn.pausePlaybackMilliseconds = atMilliseconds
+            }
         }
         guard playbackBuffer.isPlaybackActive,
             let generationID = playbackBuffer.activeGenerationID
@@ -815,6 +867,7 @@ public actor SidecarSession {
     private func dropTurnForRecognitionRestart() {
         turn = VoiceTurn()
         latestOverlapMilliseconds = nil
+        latestSpeechStartMilliseconds = nil
     }
 
     /// Every frame the session sends leaves through here, in the session's
@@ -1041,6 +1094,11 @@ private struct VoiceTurn {
     private(set) var finalSegmentIDs: Set<UInt64> = []
     private(set) var lastFinalSegmentID: UInt64?
     var playbackOverlap = false
+    /// The turn has published a speech start.
+    var speechStarted = false
+    /// Playback was active in a voice window after the turn's latest speech
+    /// end; it marks the turn if the turn speaks again.
+    var pausePlaybackMilliseconds: UInt64?
 
     init(playbackOverlap: Bool = false) {
         self.playbackOverlap = playbackOverlap
@@ -1049,5 +1107,10 @@ private struct VoiceTurn {
     mutating func recordFinal(segmentID: UInt64) {
         finalSegmentIDs.insert(segmentID)
         lastFinalSegmentID = segmentID
+    }
+
+    mutating func dropFinals() {
+        finalSegmentIDs = []
+        lastFinalSegmentID = nil
     }
 }

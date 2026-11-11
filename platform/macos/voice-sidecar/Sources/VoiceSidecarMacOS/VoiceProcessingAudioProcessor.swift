@@ -8,7 +8,12 @@ public final class VoiceProcessingAudioProcessor:
     AudioProcessing,
     @unchecked Sendable
 {
-    public typealias VoiceWindowHandler = @Sendable ([Float]) -> Void
+    /// A 100 ms voice window, and how many samples the capture callback
+    /// received after the window's last sample by the time it is handed on.
+    public typealias VoiceWindowHandler = @Sendable (
+        _ window: [Float],
+        _ samplesAfter: Int
+    ) -> Void
     public typealias DiscontinuityHandler = @Sendable () -> Void
     public typealias ConversionFailureHandler =
         @Sendable (SidecarServiceFailure) -> Void
@@ -287,7 +292,8 @@ public final class VoiceProcessingAudioProcessor:
                 return (
                     callback: Optional<(([Float]) -> Void)>.none,
                     handler: Optional<VoiceWindowHandler>.none,
-                    windows: [[Float]]()
+                    windows: [[Float]](),
+                    remainder: 0
                 )
             }
             state.audioSamples.append(contentsOf: samples)
@@ -328,13 +334,18 @@ public final class VoiceProcessingAudioProcessor:
             return (
                 callback: state.callback,
                 handler: state.voiceWindowHandler,
-                windows: windows
+                windows: windows,
+                remainder: state.windowSamples.count
             )
         }
 
         delivery.callback?(samples)
-        for window in delivery.windows {
-            delivery.handler?(window)
+        for (index, window) in delivery.windows.enumerated() {
+            delivery.handler?(
+                window,
+                delivery.remainder
+                    + (delivery.windows.count - 1 - index) * Self.voiceWindowSamples
+            )
         }
     }
 }

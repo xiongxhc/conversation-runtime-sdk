@@ -1316,9 +1316,8 @@ private func startAndCapture(
 
 // MARK: - Turn audio
 
-/// 25,600 samples at a quarter of full scale: 1.6 s, of which the closing
-/// 600 ms is the final silence the snapshot drops.
-private let turnSamples = ContiguousArray<Float>(repeating: 0.25, count: 25_600)
+/// A turn's speech as a backend cuts it: 1 s at a quarter of full scale.
+private let turnSamples = ContiguousArray<Float>(repeating: 0.25, count: 16_000)
 private let turnPCM = [Int16](repeating: 8_192, count: 16_000)
 
 private func partial(_ segmentID: UInt64) -> RecognitionHypothesis {
@@ -1493,12 +1492,9 @@ func aTurnWithoutAFinalSendsNoTurnAudio() async throws {
     try await endTurn(session)
     #expect(await turnAudioFrames(events).isEmpty)
 
-    // A turn whose buffer is all closing silence has an empty result.
+    // A turn with no speech start hands over no speech.
     try await session.publishRecognitionHypothesisFromWorker(final(1))
-    try await endTurn(
-        session,
-        samples: ContiguousArray(repeating: 0.25, count: 9_600)
-    )
+    try await endTurn(session, samples: [])
     #expect(await turnAudioFrames(events).isEmpty)
 
     // Neither turn leaks into the next one.
@@ -1607,6 +1603,77 @@ func playbackThatEndedBeforeSpeechDoesNotMarkTheTurn() async throws {
     #expect(
         await turnAudioFrames(events)
             == [turnAudioFrame(segmentID: 1, finalSegments: 1, playbackOverlap: false)]
+    )
+}
+
+@Test
+func playbackInAPauseBetweenTwoSpeechStretchesMarksTheTurn() async throws {
+    let (session, events) = try await capturingSession(version: 2)
+    try await session.publishVoiceActivityFromRecognitionWorker(
+        .speechStarted(atMilliseconds: 10)
+    )
+    try await speechWindow(session, isSpeech: false, at: 500)
+    try await session.publishVoiceActivityFromRecognitionWorker(
+        .speechEnded(atMilliseconds: 500)
+    )
+    // The companion plays only while the person pauses; no speech window
+    // and no speech start falls on it.
+    let frame = try await startPlayback(session)
+    try await speechWindow(session, isSpeech: false, at: 600)
+    try await session.playbackRendered(frame.identity)
+    try await speechWindow(session, isSpeech: false, at: 700)
+    try await session.publishVoiceActivityFromRecognitionWorker(
+        .speechStarted(atMilliseconds: 900)
+    )
+    try await session.publishRecognitionHypothesisFromWorker(final(1))
+    try await session.publishVoiceActivityFromRecognitionWorker(
+        .speechEnded(atMilliseconds: 1_500)
+    )
+    try await endTurn(session)
+
+    #expect(
+        await turnAudioFrames(events)
+            == [turnAudioFrame(segmentID: 1, finalSegments: 1, playbackOverlap: true)]
+    )
+}
+
+@Test
+func playbackInTheClosingSilenceDoesNotMarkTheTurn() async throws {
+    let (session, events) = try await capturingSession(version: 2)
+    try await session.publishVoiceActivityFromRecognitionWorker(
+        .speechStarted(atMilliseconds: 10)
+    )
+    try await session.publishRecognitionHypothesisFromWorker(final(1))
+    try await speechWindow(session, isSpeech: false, at: 500)
+    try await session.publishVoiceActivityFromRecognitionWorker(
+        .speechEnded(atMilliseconds: 500)
+    )
+    // The reply starts after the turn's last speech end, before its reset.
+    let frame = try await startPlayback(session)
+    try await speechWindow(session, isSpeech: false, at: 600)
+    try await endTurn(session)
+    try await speechWindow(session, isSpeech: false, at: 1_200)
+    try await session.playbackRendered(frame.identity)
+
+    // The next turn starts after the reply has finished.
+    try await speechWindow(session, at: 3_000)
+    try await speechWindow(session, at: 3_100)
+    try await session.publishVoiceActivityFromRecognitionWorker(
+        .speechStarted(atMilliseconds: 3_100)
+    )
+    try await session.publishRecognitionHypothesisFromWorker(final(1))
+    try await speechWindow(session, isSpeech: false, at: 3_600)
+    try await session.publishVoiceActivityFromRecognitionWorker(
+        .speechEnded(atMilliseconds: 3_600)
+    )
+    try await endTurn(session)
+
+    #expect(
+        await turnAudioFrames(events)
+            == [
+                turnAudioFrame(segmentID: 1, finalSegments: 1, playbackOverlap: false),
+                turnAudioFrame(segmentID: 1, finalSegments: 1, playbackOverlap: false),
+            ]
     )
 }
 

@@ -359,7 +359,73 @@ func finalSilencePublishesTheTurnBeforeItsBufferIsCleared(version: UInt16) async
     #expect(turnAudio.samples.contains { abs(Int($0)) > 1_000 })
     #expect(frames.filter { $0.turnAudio != nil }.count == 1)
     #expect(frames.allSatisfy { $0.version == 2 })
-    // The backend handed over only what the snapshot reads: 10 s plus the
-    // 1 s final silence.
-    #expect(await turnEnds.sampleCounts == [176_000])
+    // The backend handed over only the turn's speech, already cut to 10 s.
+    #expect(await turnEnds.sampleCounts == [160_000])
+}
+
+@Test(.enabled(if: senseVoiceModelAvailable()))
+func senseVoiceSendsOnlyTheSpeechOfAShortTurnAfterALongSilence() async throws {
+    let audioProcessor = VoiceProcessingAudioProcessor(
+        engine: VoiceProcessingEngine()
+    )
+    let recognition = SenseVoiceRecognition(
+        modelPath: senseVoiceModelDirectory.path,
+        audioProcessor: audioProcessor
+    )
+    let sink = TurnAudioTestSink()
+    let session = SidecarSession(
+        audioService: IdleAudioService(),
+        recognitionService: recognition,
+        playbackService: IdlePlaybackService(),
+        eventSink: sink
+    )
+    let publisher = SidecarRecognitionEventPublisher(session: session)
+    await recognition.setEventHandler { event in
+        try await publisher.publish(event)
+    }
+    try await session.handleControl(
+        ChildFrame(
+            control: .startSession(
+                sessionID: 7,
+                speechStartMilliseconds: 200,
+                finalSilenceMilliseconds: 1_000
+            )
+        ).atVersion(2)
+    )
+    try await session.handleControl(
+        ChildFrame(control: .startCapture(sessionID: 7, operationID: 1))
+            .atVersion(2)
+    )
+
+    // 12 s of silence, five times faster than real time: no speech, so no
+    // reset, and the turn buffer holds all of it.
+    let silence = [Float](repeating: 0, count: 1_600)
+    for _ in 0..<120 {
+        audioProcessor.consumeCaptureEvent(.buffer(try captureBuffer(silence[...])))
+        try await Task.sleep(for: .milliseconds(20))
+    }
+    // Then 4.4 s of speech, as in the test above.
+    let speech = Array(try loadTestWavSamples("zh.wav").prefix(70_400))
+    for start in stride(from: 0, to: speech.count, by: 1_600) {
+        audioProcessor.consumeCaptureEvent(
+            .buffer(try captureBuffer(speech[start..<min(start + 1_600, speech.count)]))
+        )
+        try await Task.sleep(for: .milliseconds(20))
+    }
+    let deadline = ContinuousClock.now.advanced(by: .seconds(30))
+    while await !sink.hasTurnAudio, ContinuousClock.now < deadline {
+        audioProcessor.consumeCaptureEvent(.buffer(try captureBuffer(silence[...])))
+        try await Task.sleep(for: .milliseconds(50))
+    }
+    try await session.handleControl(
+        ChildFrame(control: .shutdown(sessionID: 7)).atVersion(2)
+    )
+
+    let turnAudio = try #require(await sink.frames.compactMap(\.turnAudio).first)
+    // The speech and its lead (the 200 ms speech-start threshold and the
+    // 300 ms pre-roll), not the silence before it: well under 10 s.
+    #expect(turnAudio.samples.count > 32_000)
+    #expect(turnAudio.samples.count <= 70_400 + 8_000 + 16_000)
+    #expect(turnAudio.samples.contains { abs(Int($0)) > 1_000 })
+    #expect(!turnAudio.playbackOverlap)
 }

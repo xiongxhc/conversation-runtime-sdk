@@ -21,6 +21,7 @@ use super::codec::{
     SidecarFrame, SidecarFrameKind, SidecarTurnAudioFrame, MAX_CONTROL_PAYLOAD_BYTES,
     MAX_TURN_AUDIO_PAYLOAD_BYTES, PROTOCOL_VERSION, TURN_AUDIO_PROTOCOL_VERSION,
 };
+use crate::turn_audio::TurnAudioRun;
 use crate::{
     AdapterError, AdapterFuture, AudioDeviceStatus, AudioFrame, CaptureEvent, CapturedTurnAudio,
     ContinuousAudioOutput, PlaybackReceipt, RecognitionEvent, RecognitionHypothesis,
@@ -1548,7 +1549,7 @@ async fn resolve_media_ack(
 /// the handle about each turn's audio and end. Dropping it ends the session.
 struct TurnAudioCollector {
     turn_audio: SidecarTurnAudio,
-    session_id: SessionId,
+    run: TurnAudioRun,
     /// The highest session-unique id used by the turns before this one.
     earlier: u64,
     /// The highest sidecar id this turn used, partial or final; zero if none.
@@ -1559,10 +1560,10 @@ struct TurnAudioCollector {
 
 impl TurnAudioCollector {
     fn begin(turn_audio: SidecarTurnAudio, session_id: SessionId) -> Self {
-        turn_audio.begin(session_id);
+        let run = turn_audio.begin(session_id);
         Self {
             turn_audio,
-            session_id,
+            run,
             earlier: 0,
             used: 0,
             final_through: None,
@@ -1591,11 +1592,16 @@ impl TurnAudioCollector {
         })
     }
 
-    /// A turn audio frame carries its turn's audio and ends the turn.
+    /// A turn audio frame carries its turn's audio and ends the turn. Audio
+    /// that does not name the turn's latest final is never offered, so no
+    /// request can receive another turn's audio whatever order the frames
+    /// arrive in.
     fn turn_audio(&mut self, frame: &SidecarTurnAudioFrame) -> Result<(), AdapterError> {
         let unique = self.unique(frame.segment_id)?;
-        self.turn_audio
-            .offer(self.session_id, unique, captured_turn_audio(frame));
+        if self.final_through == Some(frame.segment_id) {
+            self.turn_audio
+                .offer(self.run, unique, captured_turn_audio(frame));
+        }
         self.end_turn();
         Ok(())
     }
@@ -1608,7 +1614,7 @@ impl TurnAudioCollector {
         self.earlier += self.used;
         self.used = 0;
         self.final_through = None;
-        self.turn_audio.turn_ended(self.session_id, self.earlier);
+        self.turn_audio.turn_ended(self.run, self.earlier);
     }
 
     fn unique(&mut self, segment_id: u64) -> Result<u64, AdapterError> {
@@ -1624,7 +1630,7 @@ impl TurnAudioCollector {
 
 impl Drop for TurnAudioCollector {
     fn drop(&mut self) {
-        self.turn_audio.end(self.session_id);
+        self.turn_audio.end(self.run);
     }
 }
 
@@ -1636,7 +1642,7 @@ fn captured_turn_audio(frame: &SidecarTurnAudioFrame) -> CapturedTurnAudio {
             .map(|sample| f32::from(*sample) / 32_768.0)
             .collect(),
         playback_overlap: frame.playback_overlap,
-        single_segment: frame.final_segments == 1,
+        final_segments: usize::from(frame.final_segments),
     }
 }
 
@@ -3143,7 +3149,7 @@ mod process_tests {
             Some(CapturedTurnAudio {
                 samples: vec![-1.0, 0.0, 0.5],
                 playback_overlap: true,
-                single_segment: false,
+                final_segments: 2,
             })
         );
         let mut reliable = reader.stop().await;
@@ -3231,6 +3237,70 @@ mod process_tests {
                 if error.message() == "voice sidecar event frame was malformed"
         ));
         reader.stop().await;
+    }
+
+    #[tokio::test]
+    async fn turn_audio_that_is_not_for_the_turns_latest_final_is_dropped() {
+        let turn_audio = SidecarTurnAudio::new();
+        let mut reader = ReaderHarness::ready(Some(turn_audio.clone())).await;
+        // Audio naming an earlier final of its turn.
+        reader.send(hypothesis(1, true)).await;
+        reader.send(hypothesis(2, true)).await;
+        reader.send(turn_audio_for(1, vec![1])).await;
+        reader.send(hypothesis(1, true)).await;
+        assert_eq!(reader.next_final().await, 1);
+        assert_eq!(reader.next_final().await, 2);
+        assert_eq!(reader.next_final().await, 3);
+        assert_eq!(answer_now(&turn_audio, 1), Some(None));
+        assert_eq!(answer_now(&turn_audio, 2), Some(None));
+
+        // Audio naming a segment of its turn that never became final.
+        reader.send(hypothesis(2, false)).await;
+        reader.send(turn_audio_for(2, vec![1])).await;
+        reader.send(hypothesis(1, true)).await;
+        assert_eq!(reader.next_final().await, 5);
+        assert_eq!(answer_now(&turn_audio, 3), Some(None));
+        assert_eq!(answer_now(&turn_audio, 4), Some(None));
+
+        // Audio naming a segment its turn never used.
+        reader.send(turn_audio_for(3, vec![1])).await;
+        reader.send(hypothesis(1, true)).await;
+        assert_eq!(reader.next_final().await, 8);
+        assert_eq!(answer_now(&turn_audio, 5), Some(None));
+        assert_eq!(answer_now(&turn_audio, 7), Some(None));
+        reader.stop().await;
+    }
+
+    #[tokio::test]
+    async fn an_earlier_readers_end_leaves_a_newer_run_with_the_same_id_alone() {
+        let turn_audio = SidecarTurnAudio::new();
+        let earlier = TurnAudioCollector::begin(turn_audio.clone(), READER_SESSION);
+        let mut newer = TurnAudioCollector::begin(turn_audio.clone(), READER_SESSION);
+        // The earlier reader's cleanup outlived its stop.
+        drop(earlier);
+
+        // The newer run's request still waits for its audio, and gets it.
+        assert_eq!(answer_now(&turn_audio, 1), None);
+        newer
+            .hypothesis(&RecognitionHypothesis::engine_final(1, "hello"))
+            .unwrap();
+        newer
+            .turn_audio(&SidecarTurnAudioFrame {
+                session_id: READER_SESSION,
+                segment_id: 1,
+                final_segments: 1,
+                playback_overlap: false,
+                samples: vec![16_384],
+            })
+            .unwrap();
+        assert_eq!(
+            answer_now(&turn_audio, 1),
+            Some(Some(CapturedTurnAudio {
+                samples: vec![0.5],
+                playback_overlap: false,
+                final_segments: 1,
+            }))
+        );
     }
 
     #[tokio::test]

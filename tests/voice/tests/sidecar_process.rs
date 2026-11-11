@@ -1202,7 +1202,7 @@ async fn turn_audio_reaches_the_handle_at_protocol_version_two() {
         CapturedTurnAudio {
             samples: vec![1000.0 / 32768.0; 16_000],
             playback_overlap: false,
-            single_segment: true,
+            final_segments: 1,
         }
     );
     // The turn audio frame is consumed by the handle, never published as input.
@@ -1301,7 +1301,7 @@ async fn segment_ids_are_unique_across_turns_in_a_version_two_session() {
         Some(CapturedTurnAudio {
             samples: vec![1000.0 / 32768.0; 16_000],
             playback_overlap: false,
-            single_segment: true,
+            final_segments: 1,
         })
     );
     // The second turn has no audio and has not ended: its request waits.
@@ -1401,7 +1401,14 @@ async fn oversized_turn_audio_is_refused() {
 async fn a_version_one_only_sidecar_refuses_a_version_two_session() {
     let harness =
         FakeSidecarHarness::new("version-one-only").with_turn_audio(SidecarTurnAudio::new());
-    assert!(harness.start(CancellationToken::new()).await.is_err());
+    let Err(error) = harness.start(CancellationToken::new()).await else {
+        panic!("a version one only sidecar started a version two session");
+    };
+    // The old sidecar refuses the version 2 StartSession and exits without answering.
+    assert_eq!(
+        error.message(),
+        "voice sidecar event stream ended before readiness"
+    );
     harness.assert_process_gone().await;
 }
 

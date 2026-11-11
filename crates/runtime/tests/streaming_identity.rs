@@ -130,6 +130,7 @@ fn voice(
         TurnVoiceRequest {
             segment_id,
             transcript: transcript.to_owned(),
+            final_segments: 1,
             barge_in: false,
             at: at(),
         },

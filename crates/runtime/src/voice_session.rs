@@ -618,7 +618,8 @@ struct VoiceLoopDependencies {
 }
 
 enum PendingSegment {
-    Pending(String),
+    /// The turn's words, and how many engine-final segments they join.
+    Pending(String, usize),
     Authorized(TurnId),
     Skipped,
 }
@@ -689,6 +690,7 @@ impl VoiceLoop {
         &mut self,
         segment_id: u64,
         text: &str,
+        final_segments: usize,
     ) -> Option<(SessionSpeakerIdentity, TurnVoiceRequest)> {
         let barge_in = std::mem::take(&mut self.barge_in_pending);
         let identity = self.speaker_identity.clone()?;
@@ -697,6 +699,7 @@ impl VoiceLoop {
             TurnVoiceRequest {
                 segment_id,
                 transcript: text.to_owned(),
+                final_segments,
                 barge_in,
                 at: wall_clock_now(),
             },
@@ -908,23 +911,27 @@ impl VoiceLoop {
                 "voice response authorization cannot replace an active response",
             ));
         }
-        let Some(PendingSegment::Pending(text)) = self.pending_segments.get(&segment_id) else {
+        let Some(PendingSegment::Pending(text, final_segments)) =
+            self.pending_segments.get(&segment_id)
+        else {
             return Err(runtime_error("voice response segment is not pending"));
         };
-        let text = text.clone();
+        let (text, final_segments) = (text.clone(), *final_segments);
         self.context
             .seed_completed_history(
                 &format!("voice-authorize-{}-{segment_id}", self.session_id.get()),
                 &context_exchanges,
             )
             .await?;
-        self.start_segment_response(segment_id, text, true).await
+        self.start_segment_response(segment_id, text, final_segments, true)
+            .await
     }
 
     async fn start_segment_response(
         &mut self,
         segment_id: u64,
         text: String,
+        final_segments: usize,
         external_gate: bool,
     ) -> Result<TurnId, RuntimeError> {
         if self.state != VoiceLoopState::Listening || self.turn_events.is_some() {
@@ -932,7 +939,7 @@ impl VoiceLoop {
                 "voice response cannot replace an active response",
             ));
         }
-        let voice = self.voice_request(segment_id, &text);
+        let voice = self.voice_request(segment_id, &text, final_segments);
         let started = self
             .turn_runtime
             .start_turn_with_voice(
@@ -965,7 +972,7 @@ impl VoiceLoop {
                 .await;
             if external_gate {
                 self.pending_segments
-                    .insert(segment_id, PendingSegment::Pending(text));
+                    .insert(segment_id, PendingSegment::Pending(text, final_segments));
             }
             return Err(runtime_error(
                 "voice session event stream closed during authorization",
@@ -1006,7 +1013,7 @@ impl VoiceLoop {
                 "voice response authorization is not available for this session",
             ));
         }
-        let Some(PendingSegment::Pending(_)) = self.pending_segments.get(&segment_id) else {
+        let Some(PendingSegment::Pending(..)) = self.pending_segments.get(&segment_id) else {
             return Err(runtime_error("voice response segment is not pending"));
         };
         self.pending_segments
@@ -1478,14 +1485,16 @@ impl VoiceLoop {
             .active_segment_id
             .take()
             .ok_or_else(|| runtime_error("finalized voice transcript has no segment identifier"))?;
+        let final_segments = finalized.final_segments;
         let Some(text) = self.clean_final(finalized.text) else {
             return Ok(());
         };
         if self.response_mode == VoiceResponseMode::ExternalGate {
-            self.register_pending_segment(segment_id, text).await?;
+            self.register_pending_segment(segment_id, text, final_segments)
+                .await?;
             return Ok(());
         }
-        let voice = self.voice_request(segment_id, &text);
+        let voice = self.voice_request(segment_id, &text, final_segments);
         let started = self
             .turn_runtime
             .start_turn_with_voice(
@@ -1554,8 +1563,9 @@ impl VoiceLoop {
         };
         let capture_evidence = utterance.capture_evidence().cloned().map(Box::new);
         if self.response_mode == VoiceResponseMode::ExternalGate {
+            // A finalized utterance is one recognised segment.
             return self
-                .register_pending_segment_with_capture(segment_id, text, capture_evidence)
+                .register_pending_segment_with_capture(segment_id, text, 1, capture_evidence)
                 .await;
         }
         if !self
@@ -1598,7 +1608,11 @@ impl VoiceLoop {
             return Ok(());
         }
         if let Some((segment_id, text)) = self.automatic_responses.pop_front() {
-            if let Err(error) = self.start_segment_response(segment_id, text, false).await {
+            // Queued automatic responses come from finalized utterances: one segment each.
+            if let Err(error) = self
+                .start_segment_response(segment_id, text, 1, false)
+                .await
+            {
                 self.publish_reliable(VoiceSessionEvent::ResponseSkipped {
                     session_id: self.session_id,
                     segment_id,
@@ -1615,8 +1629,9 @@ impl VoiceLoop {
         &mut self,
         segment_id: u64,
         text: String,
+        final_segments: usize,
     ) -> Result<(), RuntimeError> {
-        self.register_pending_segment_with_capture(segment_id, text, None)
+        self.register_pending_segment_with_capture(segment_id, text, final_segments, None)
             .await
     }
 
@@ -1624,6 +1639,7 @@ impl VoiceLoop {
         &mut self,
         segment_id: u64,
         text: String,
+        final_segments: usize,
         capture_evidence: Option<Box<conversation_protocol::UtteranceCaptureEvidence>>,
     ) -> Result<(), RuntimeError> {
         while self.pending_order.len() >= MAX_PENDING_SEGMENTS {
@@ -1632,7 +1648,7 @@ impl VoiceLoop {
             };
             if matches!(
                 self.pending_segments.remove(&expired),
-                Some(PendingSegment::Pending(_))
+                Some(PendingSegment::Pending(..))
             ) && !self
                 .publish_reliable(VoiceSessionEvent::ResponseSkipped {
                     session_id: self.session_id,
@@ -1647,8 +1663,10 @@ impl VoiceLoop {
             }
         }
         self.pending_order.push_back(segment_id);
-        self.pending_segments
-            .insert(segment_id, PendingSegment::Pending(text.clone()));
+        self.pending_segments.insert(
+            segment_id,
+            PendingSegment::Pending(text.clone(), final_segments),
+        );
         if !self
             .publish_reliable(VoiceSessionEvent::TranscriptFinal {
                 session_id: self.session_id,
@@ -3177,7 +3195,7 @@ mod tests {
                     .await
                     .is_err());
                 assert!(
-                    matches!(loop_.pending_segments.get(&2),Some(PendingSegment::Pending(text)) if text=="second")
+                    matches!(loop_.pending_segments.get(&2),Some(PendingSegment::Pending(text, _)) if text=="second")
                 );
                 assert!(
                     matches!(loop_.state,VoiceLoopState::Responding {turn_id,..} if turn_id==TurnId::new(1))
@@ -3688,7 +3706,7 @@ mod tests {
             },
         );
         loop_
-            .register_pending_segment(9, "agenda".to_owned())
+            .register_pending_segment(9, "agenda".to_owned(), 1)
             .await
             .unwrap();
         let turn_id = loop_
@@ -3795,7 +3813,7 @@ mod tests {
             )))))
             .await;
         loop_
-            .register_pending_segment(9, "agenda".to_owned())
+            .register_pending_segment(9, "agenda".to_owned(), 1)
             .await
             .unwrap();
         assert_eq!(
@@ -3919,7 +3937,7 @@ mod tests {
         );
         for segment_id in 1..=10 {
             loop_
-                .register_pending_segment(segment_id, format!("segment {segment_id}"))
+                .register_pending_segment(segment_id, format!("segment {segment_id}"), 1)
                 .await
                 .unwrap();
         }
@@ -3935,7 +3953,7 @@ mod tests {
         let exchanges = vec![ConversationContextExchange::new("earlier", "context").unwrap()];
         for segment_id in 11..=33 {
             loop_
-                .register_pending_segment(segment_id, format!("segment {segment_id}"))
+                .register_pending_segment(segment_id, format!("segment {segment_id}"), 1)
                 .await
                 .unwrap();
         }
@@ -3967,7 +3985,7 @@ mod tests {
             .is_err());
         assert!(matches!(
             loop_.pending_segments.get(&3),
-            Some(PendingSegment::Pending(text)) if text == "segment 3"
+            Some(PendingSegment::Pending(text, _)) if text == "segment 3"
         ));
         loop_.interrupt_current_turn().await.unwrap();
         let retried_turn_id = loop_
@@ -3989,12 +4007,12 @@ mod tests {
             .await
             .is_none());
         loop_
-            .register_pending_segment(34, "after skip and provider recovery".to_owned())
+            .register_pending_segment(34, "after skip and provider recovery".to_owned(), 1)
             .await
             .unwrap();
         assert!(matches!(
             loop_.pending_segments.get(&34),
-            Some(PendingSegment::Pending(text)) if text == "after skip and provider recovery"
+            Some(PendingSegment::Pending(text, _)) if text == "after skip and provider recovery"
         ));
     }
 
@@ -4096,7 +4114,7 @@ mod tests {
             },
         );
         loop_
-            .register_pending_segment(9, "agenda".to_owned())
+            .register_pending_segment(9, "agenda".to_owned(), 1)
             .await
             .unwrap();
         let turn_id = loop_

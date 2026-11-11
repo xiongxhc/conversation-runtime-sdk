@@ -40,7 +40,7 @@ pub fn at() -> UnixTimestampMillis {
 
 /// Audio whose first sample names the voice the fake embedder returns.
 pub struct FakeAudio {
-    voices: Mutex<std::collections::HashMap<u64, (f32, u32)>>,
+    voices: Mutex<std::collections::HashMap<u64, (f32, u32, usize)>>,
     pub barge_in_seen: Mutex<Vec<u64>>,
 }
 
@@ -54,10 +54,21 @@ impl FakeAudio {
 
     /// Segment `segment_id` sounds like `voice` (1 = Chris, 2 = Jack, 3 = new) for `speech_ms`.
     pub fn speak(&self, segment_id: u64, voice: f32, speech_ms: u32) {
+        self.speak_segments(segment_id, voice, speech_ms, 1);
+    }
+
+    /// As `speak`, for audio whose turn held `final_segments` engine-final segments.
+    pub fn speak_segments(
+        &self,
+        segment_id: u64,
+        voice: f32,
+        speech_ms: u32,
+        final_segments: usize,
+    ) {
         self.voices
             .lock()
             .unwrap()
-            .insert(segment_id, (voice, speech_ms));
+            .insert(segment_id, (voice, speech_ms, final_segments));
     }
 }
 
@@ -70,11 +81,11 @@ impl TurnAudioSource for FakeAudio {
     ) -> SpeakerFuture<'_, Option<TurnAudio>> {
         let voice = self.voices.lock().unwrap().get(&segment_id).copied();
         Box::pin(async move {
-            let (voice, speech_ms) = voice?;
+            let (voice, speech_ms, final_segments) = voice?;
             Some(TurnAudio {
                 samples: vec![voice; (speech_ms as usize) * 16],
                 playback_overlap: false,
-                single_segment: true,
+                final_segments,
             })
         })
     }

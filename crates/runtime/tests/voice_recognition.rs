@@ -52,6 +52,7 @@ fn whitespace_segments_do_not_replace_or_reset_a_valid_pending_segment() {
         Some(conversation_runtime::FinalizedTranscript {
             segment_id: 20,
             text: "hello".to_owned(),
+            final_segments: 1,
         })
     );
     assert_eq!(finalizer.finalize_ready(u64::MAX), None);

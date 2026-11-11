@@ -30,8 +30,9 @@ pub struct TurnAudio {
     pub samples: Vec<f32>,
     /// The companion's playback was active at some point during the turn.
     pub playback_overlap: bool,
-    /// False when the turn joins several recognised segments, which may hold two voices.
-    pub single_segment: bool,
+    /// How many engine-final segments the audio's turn held. The stage uses the audio only
+    /// when this is the request's own count.
+    pub final_segments: usize,
 }
 
 pub trait TurnAudioSource: Send + Sync {
@@ -132,6 +133,8 @@ pub struct SessionSpeakerIdentity {
 pub struct TurnVoiceRequest {
     pub segment_id: u64,
     pub transcript: String,
+    /// How many engine-final segments the turn's words join.
+    pub final_segments: usize,
     /// The turn's speech began while the companion was responding.
     pub barge_in: bool,
     pub at: UnixTimestampMillis,
@@ -175,7 +178,8 @@ impl SessionSpeakerIdentity {
                     embedding,
                     u32::try_from(audio.samples.len() * 1_000 / SAMPLE_RATE_HZ).unwrap_or(u32::MAX),
                     audio.playback_overlap,
-                    audio.single_segment,
+                    // Equal to the request's count, which `gather` checked.
+                    audio.final_segments == 1,
                 ),
                 None => (None, 0, false, false),
             };
@@ -208,7 +212,10 @@ impl SessionSpeakerIdentity {
     }
 
     /// The turn's audio and embedding, alongside the claimed name; a failure of either input
-    /// leaves that part out rather than failing the turn.
+    /// leaves that part out rather than failing the turn. Audio is the turn's only when it
+    /// holds as many engine-final segments as the turn's words: its last segment is the
+    /// turn's, and finals arrive as one ordered stream, so equal counts mean the same
+    /// segments. Any other audio is left out, so the turn proceeds with no voice.
     async fn gather(
         &self,
         request: &TurnVoiceRequest,
@@ -219,7 +226,8 @@ impl SessionSpeakerIdentity {
                 .inputs
                 .audio
                 .turn_audio(self.session, request.segment_id, work.clone())
-                .await?;
+                .await
+                .filter(|audio| audio.final_segments == request.final_segments)?;
             let embedding = self
                 .inputs
                 .embedder

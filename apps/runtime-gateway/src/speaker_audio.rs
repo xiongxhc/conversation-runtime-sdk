@@ -94,7 +94,7 @@ impl TurnAudioSource for GatewayTurnAudio {
             Some(TurnAudio {
                 samples: captured.samples,
                 playback_overlap: captured.playback_overlap,
-                single_segment: captured.single_segment,
+                final_segments: captured.final_segments,
             })
         })
     }
@@ -177,7 +177,7 @@ impl MediaTurnAudio {
         Some(CapturedTurnAudio {
             samples,
             playback_overlap,
-            single_segment: true,
+            final_segments: 1,
         })
     }
 
@@ -262,7 +262,8 @@ impl CaptureRun {
     }
 
     /// The last 10 s of `range` as 24 kHz samples, and whether playback was pending during any
-    /// buffered frame of the range; `None` unless that last 10 s is fully buffered.
+    /// buffered frame of the range or the range began before the buffer, where nothing says
+    /// whether it was; `None` unless that last 10 s is fully buffered.
     fn cut(&self, range: &SourceSampleRange) -> Option<(Vec<i16>, bool)> {
         if range.sample_rate_hz != CAPTURE_RATE_HZ
             || range.clock_domain_id != self.clock_domain_id
@@ -275,11 +276,12 @@ impl CaptureRun {
         let start = range
             .source_start_sample
             .max(end.saturating_sub(MAX_TURN_SOURCE_SAMPLES));
-        if start < self.frames.front()?.start || end > self.end {
+        let buffered_from = self.frames.front()?.start;
+        if start < buffered_from || end > self.end {
             return None;
         }
         let mut samples = Vec::with_capacity(usize::try_from(end - start).ok()?);
-        let mut playback_overlap = false;
+        let mut playback_overlap = range.source_start_sample < buffered_from;
         for frame in &self.frames {
             if frame.end <= range.source_start_sample || frame.start >= end {
                 continue;
@@ -494,7 +496,7 @@ mod gateway_turn_audio_tests {
             .expect("media audio is answered without waiting")
             .expect("the segment is buffered");
         assert_eq!(turn.samples.len(), 16_000);
-        assert!(turn.single_segment);
+        assert_eq!(turn.final_segments, 1);
         assert!(!turn.playback_overlap);
         let expected = 1000.0 / 32_768.0;
         assert!(turn
@@ -615,7 +617,7 @@ mod tests {
             .turn_audio(4)
             .expect("the utterance is fully buffered");
         assert_eq!(turn.samples.len(), 16_000);
-        assert!(turn.single_segment);
+        assert_eq!(turn.final_segments, 1);
         assert!(!turn.playback_overlap);
         // The cut is the utterance's own half second of each value, in order.
         assert_all_near(&turn.samples[..7_000], 1000);
@@ -786,6 +788,25 @@ mod tests {
         );
         assert!(audio.turn_audio(1).unwrap().playback_overlap);
         assert!(audio.turn_audio(2).unwrap().playback_overlap);
+    }
+
+    #[test]
+    fn an_utterance_whose_start_was_never_buffered_is_marked() {
+        // 35 s of capture without playback: the 30 s buffer no longer holds the first 5 s.
+        let audio = MediaTurnAudio::new();
+        observe_all(&audio, &timed_run(1, BASE, 1_750, 500), false);
+        audio.note_final(1, Some(&evidence(BASE, BASE + 35 * SECOND)));
+        // Started before the buffer began, which a restart after a gap also causes.
+        audio.note_final(2, Some(&evidence(BASE + 3 * SECOND, BASE + 16 * SECOND)));
+        // Fully buffered, though longer than the 10 s served.
+        audio.note_final(3, Some(&evidence(BASE + 10 * SECOND, BASE + 25 * SECOND)));
+        let long = audio.turn_audio(1).expect("the last 10 s are buffered");
+        let early = audio.turn_audio(2).expect("the last 10 s are buffered");
+        let buffered = audio.turn_audio(3).expect("the last 10 s are buffered");
+        // What was never seen may have held playback.
+        assert!(long.playback_overlap);
+        assert!(early.playback_overlap);
+        assert!(!buffered.playback_overlap);
     }
 
     #[test]

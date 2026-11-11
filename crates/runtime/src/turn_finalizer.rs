@@ -5,6 +5,8 @@ use conversation_protocol::{RuntimeError, RuntimeErrorKind, RuntimeStage, VoiceA
 pub struct FinalizedTranscript {
     pub segment_id: u64,
     pub text: String,
+    /// How many engine-final segments the text joins.
+    pub final_segments: usize,
 }
 
 #[derive(Debug)]
@@ -132,7 +134,11 @@ impl TurnFinalizer {
         }
 
         self.finalized = true;
-        Some(FinalizedTranscript { segment_id, text })
+        Some(FinalizedTranscript {
+            segment_id,
+            text,
+            final_segments: self.committed.len() + 1,
+        })
     }
 }
 
@@ -158,6 +164,22 @@ mod tests {
         let finalized = finalizer.finalize_ready(700).expect("utterance finalizes");
         assert_eq!(finalized.text, " first half second half.");
         assert_eq!(finalized.segment_id, 2);
+        assert_eq!(finalized.final_segments, 2);
+    }
+
+    #[test]
+    fn counts_only_the_engine_final_segments_it_joins() {
+        let mut finalizer = finalizer();
+        // A segment that never became final adds no words and is not counted; a repeated
+        // final of one segment is one segment.
+        finalizer.observe_hypothesis(RecognitionHypothesis::partial(1, " lost"), 0);
+        finalizer.observe_hypothesis(RecognitionHypothesis::engine_final(2, " kept"), 100);
+        finalizer.observe_hypothesis(RecognitionHypothesis::engine_final(2, " kept."), 200);
+        ended(&mut finalizer, 200);
+
+        let finalized = finalizer.finalize_ready(800).expect("utterance finalizes");
+        assert_eq!(finalized.text, " kept.");
+        assert_eq!(finalized.final_segments, 1);
     }
 
     #[test]

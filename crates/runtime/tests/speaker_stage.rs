@@ -7,7 +7,7 @@ use conversation_memory::{PeopleStore, PersonMaturity};
 use conversation_protocol::{SessionId, SpeakerTag};
 use conversation_runtime::{
     identity_guidance, speaker_tag, ClaimOutcome, IdentityQuestion, StageOutcome, TurnIdentity,
-    TurnVoiceRequest,
+    TurnVoiceRequest, VoiceEmbedder,
 };
 use support::speaker_fakes::{at, StageFixture, CHRIS, JACK};
 use tokio_util::sync::CancellationToken;
@@ -15,9 +15,14 @@ use tokio_util::sync::CancellationToken;
 const WAIT: Duration = Duration::from_millis(500);
 
 fn request(segment_id: u64, transcript: &str) -> TurnVoiceRequest {
+    joined_request(segment_id, transcript, 1)
+}
+
+fn joined_request(segment_id: u64, transcript: &str, final_segments: usize) -> TurnVoiceRequest {
     TurnVoiceRequest {
         segment_id,
         transcript: transcript.to_owned(),
+        final_segments,
         barge_in: false,
         at: at(),
     }
@@ -218,6 +223,88 @@ async fn missing_audio_is_an_unsure_turn() {
 
     assert!(!identity.label.confirmed);
     assert_eq!(identity.memory_subject, None);
+}
+
+#[tokio::test]
+async fn audio_whose_segment_count_matches_the_turn_is_used() {
+    let fixture = StageFixture::new();
+    let chris = fixture.person("Chris", &CHRIS);
+    let signatures = || {
+        fixture
+            .store
+            .signatures(&fixture.key, fixture.embedder.model())
+            .unwrap()
+            .into_iter()
+            .filter(|signature| signature.person() == chris)
+            .count()
+    };
+    let session = fixture
+        .stage(WAIT)
+        .start_session(SessionId::new(1))
+        .unwrap();
+    let stored = signatures();
+
+    // Two and two: the voice is used, but the turn is not a single segment, so it adds no
+    // sample.
+    fixture.audio.speak_segments(1, 1.0, 2_000, 2);
+    let joined = identified(
+        session
+            .identify(joined_request(1, "hello", 2), CancellationToken::new())
+            .await,
+    );
+    assert!(joined.label.confirmed);
+    assert_eq!(joined.memory_subject, Some(chris));
+    assert_eq!(signatures(), stored);
+
+    // One and one: a single segment, which refines the mature voice.
+    fixture.audio.speak_segments(2, 1.0, 2_000, 1);
+    let single = identified(
+        session
+            .identify(joined_request(2, "hello", 1), CancellationToken::new())
+            .await,
+    );
+    assert!(single.label.confirmed);
+    assert_eq!(single.memory_subject, Some(chris));
+    assert_eq!(signatures(), stored + 1);
+}
+
+#[tokio::test]
+async fn audio_whose_segment_count_differs_from_the_turn_is_never_used() {
+    for (turn_segments, audio_segments) in [(2, 1), (1, 2)] {
+        let fixture = StageFixture::new();
+        fixture.person("Chris", &CHRIS);
+        let session = fixture
+            .stage(WAIT)
+            .start_session(SessionId::new(1))
+            .unwrap();
+
+        fixture.audio.speak_segments(1, 1.0, 2_000, audio_segments);
+        let unsure = identified(
+            session
+                .identify(
+                    joined_request(1, "hello", turn_segments),
+                    CancellationToken::new(),
+                )
+                .await,
+        );
+        assert!(!unsure.label.confirmed);
+        assert_eq!(unsure.memory_subject, None);
+
+        *fixture.claims.name.lock().unwrap() = Some("Jack".to_owned());
+        fixture.audio.speak_segments(2, 3.0, 2_000, audio_segments);
+        let claimed = identified(
+            session
+                .identify(
+                    joined_request(2, "I'm Jack", turn_segments),
+                    CancellationToken::new(),
+                )
+                .await,
+        );
+        assert_ne!(claimed.claim, Some(ClaimOutcome::Enrolled));
+        assert!(fixture.store.people_named("jack").unwrap().is_empty());
+        // The mismatched audio was never embedded.
+        assert!(fixture.embedder.tokens.lock().unwrap().is_empty());
+    }
 }
 
 #[tokio::test]

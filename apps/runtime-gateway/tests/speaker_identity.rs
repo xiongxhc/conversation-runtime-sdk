@@ -155,6 +155,138 @@ async fn a_second_turn_never_reuses_the_first_turns_audio() {
     gateway.stop().await;
 }
 
+/// `(type, turn_id, person_id, confirmed)` of every identity event, in order.
+fn identities(events: &[Value]) -> Vec<(String, String, Value, Value)> {
+    events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event["type"].as_str(),
+                Some("voice_speaker" | "voice_identity_late")
+            )
+        })
+        .map(|event| {
+            (
+                event["type"].as_str().unwrap_or_default().to_owned(),
+                event["turn_id"].as_str().unwrap_or_default().to_owned(),
+                event["person_id"].clone(),
+                event["confirmed"].clone(),
+            )
+        })
+        .collect()
+}
+
+fn finals(events: &[Value]) -> Vec<(String, String, String)> {
+    events
+        .iter()
+        .filter(|event| event["type"] == "voice_transcript_final")
+        .map(|event| {
+            (
+                event["turn_id"].as_str().unwrap_or_default().to_owned(),
+                event["segment_id"].as_str().unwrap_or_default().to_owned(),
+                event["text"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_turn_joining_two_sidecar_turns_is_never_identified_from_one_of_them() {
+    // Each sidecar turn ends with its own one-segment audio, but the runtime joins both into
+    // one turn of two segments: the second sidecar turn's audio covers only its last segment.
+    let mut gateway = Gateway::start("two-turns-two-audio", Duration::from_secs(2)).await;
+    gateway.start_voice().await;
+
+    let events = gateway.voice_events_through_turn_terminal(1).await;
+    assert_eq!(
+        finals(&events),
+        [("1".to_owned(), "2".to_owned(), "firstsecond".to_owned())],
+        "{events:?}"
+    );
+    // Decided at once, without the voice: someone new and unsure, not Jack.
+    assert_eq!(
+        identities(&events),
+        [(
+            "voice_speaker".to_owned(),
+            "1".to_owned(),
+            Value::Null,
+            Value::Bool(false)
+        )],
+        "{events:?}"
+    );
+
+    gateway.stop().await;
+}
+
+#[tokio::test]
+async fn a_joined_turn_whose_last_sidecar_turn_has_no_audio_is_late() {
+    let mut gateway = Gateway::start("two-turns-one-audio", Duration::from_millis(300)).await;
+    gateway.start_voice().await;
+
+    let events = gateway.voice_events_through_turn_terminal(1).await;
+    assert_eq!(
+        finals(&events),
+        [("1".to_owned(), "2".to_owned(), "firstsecond".to_owned())],
+        "{events:?}"
+    );
+    assert_eq!(
+        identities(&events),
+        [(
+            "voice_identity_late".to_owned(),
+            "1".to_owned(),
+            Value::Null,
+            Value::Null
+        )],
+        "{events:?}"
+    );
+
+    gateway.stop().await;
+}
+
+#[tokio::test]
+async fn a_turn_covering_part_of_a_sidecar_turn_is_never_identified_from_all_of_it() {
+    // One sidecar turn holds two finals, but the runtime ended a turn after the first: the
+    // sidecar's audio covers both segments while the second runtime turn has only one.
+    let mut gateway = Gateway::start(
+        "one-sidecar-turn-two-runtime-turns",
+        Duration::from_millis(300),
+    )
+    .await;
+    gateway.start_voice().await;
+
+    let events = gateway.voice_events_through_turn_terminal(2).await;
+    assert_eq!(
+        finals(&events),
+        [
+            ("1".to_owned(), "1".to_owned(), "first".to_owned()),
+            ("2".to_owned(), "2".to_owned(), "second".to_owned())
+        ],
+        "{events:?}"
+    );
+    // The first turn's segment has no audio of its own while its wait runs; the second turn
+    // is decided without the voice that also holds the first.
+    assert_eq!(
+        identities(&events),
+        [
+            (
+                "voice_identity_late".to_owned(),
+                "1".to_owned(),
+                Value::Null,
+                Value::Null
+            ),
+            (
+                "voice_speaker".to_owned(),
+                "2".to_owned(),
+                Value::Null,
+                Value::Bool(false)
+            )
+        ],
+        "{events:?}"
+    );
+
+    gateway.stop().await;
+}
+
 /// The index of the first voice event of `kind`.
 fn position(events: &[Value], kind: &str) -> Option<usize> {
     events.iter().position(|event| event["type"] == kind)

@@ -10,7 +10,8 @@ use tokio_util::sync::CancellationToken;
 pub struct CapturedTurnAudio {
     pub samples: Vec<f32>,
     pub playback_overlap: bool,
-    pub single_segment: bool,
+    /// How many engine-final segments the audio's turn held.
+    pub final_segments: usize,
 }
 
 impl fmt::Debug for CapturedTurnAudio {
@@ -19,7 +20,7 @@ impl fmt::Debug for CapturedTurnAudio {
             .debug_struct("CapturedTurnAudio")
             .field("sample_count", &self.samples.len())
             .field("playback_overlap", &self.playback_overlap)
-            .field("single_segment", &self.single_segment)
+            .field("final_segments", &self.final_segments)
             .finish()
     }
 }
@@ -31,6 +32,10 @@ impl fmt::Debug for CapturedTurnAudio {
 /// replaced by the next turn's. A request takes the audio when its segment id is
 /// the audio's; it gets nothing at once when that segment's turn, or the
 /// session, has already ended without that audio; otherwise it waits.
+///
+/// Each reader run gets its own generation from `begin`, and its calls name
+/// it, so a reader that outlives its stop cannot touch a newer run that reuses
+/// the session id.
 #[derive(Clone, Default)]
 pub struct SidecarTurnAudio {
     inner: Arc<TurnAudioSlot>,
@@ -39,11 +44,18 @@ pub struct SidecarTurnAudio {
 #[derive(Default)]
 struct TurnAudioSlot {
     state: Mutex<Option<SessionTurnAudio>>,
+    /// The generation the latest `begin` handed out.
+    generations: Mutex<u64>,
     changed: Notify,
 }
 
+/// One reader run, as `begin` started it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TurnAudioRun(u64);
+
 /// The current session's state; `None` before any session begins.
 struct SessionTurnAudio {
+    run: TurnAudioRun,
     session_id: SessionId,
     held: Option<(u64, CapturedTurnAudio)>,
     /// Every segment id at or below this belongs to a turn that has ended.
@@ -89,48 +101,56 @@ impl SidecarTurnAudio {
     }
 
     /// A sidecar session's reader has started; anything held for an earlier
-    /// session, including one with the same id, is dropped.
-    pub(crate) fn begin(&self, session_id: SessionId) {
+    /// session, including one with the same id, is dropped. The returned run
+    /// names this reader in its later calls.
+    pub(crate) fn begin(&self, session_id: SessionId) -> TurnAudioRun {
+        let run = {
+            let mut generations = self
+                .inner
+                .generations
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            *generations = generations.wrapping_add(1);
+            TurnAudioRun(*generations)
+        };
         *self.state() = Some(SessionTurnAudio {
+            run,
             session_id,
             held: None,
             ended_through: 0,
             session_ended: false,
         });
         self.inner.changed.notify_waiters();
+        run
     }
 
     /// A finished turn's audio, replacing the previous turn's. Its turn has
     /// ended, so every earlier segment id has too.
-    pub(crate) fn offer(&self, session_id: SessionId, segment_id: u64, audio: CapturedTurnAudio) {
-        self.update(session_id, |current| {
+    pub(crate) fn offer(&self, run: TurnAudioRun, segment_id: u64, audio: CapturedTurnAudio) {
+        self.update(run, |current| {
             current.ended_through = current.ended_through.max(segment_id);
             current.held = Some((segment_id, audio));
         });
     }
 
     /// A turn ended; it used segment ids up to `through_segment_id`.
-    pub(crate) fn turn_ended(&self, session_id: SessionId, through_segment_id: u64) {
-        self.update(session_id, |current| {
+    pub(crate) fn turn_ended(&self, run: TurnAudioRun, through_segment_id: u64) {
+        self.update(run, |current| {
             current.ended_through = current.ended_through.max(through_segment_id);
         });
     }
 
     /// The session's reader has stopped: drop its audio and end its requests.
-    pub(crate) fn end(&self, session_id: SessionId) {
-        self.update(session_id, |current| {
+    pub(crate) fn end(&self, run: TurnAudioRun) {
+        self.update(run, |current| {
             current.held = None;
             current.session_ended = true;
         });
     }
 
-    /// Applies `change` only to the current session's state.
-    fn update(&self, session_id: SessionId, change: impl FnOnce(&mut SessionTurnAudio)) {
-        if let Some(current) = self
-            .state()
-            .as_mut()
-            .filter(|current| current.session_id == session_id)
-        {
+    /// Applies `change` only to the current run's state.
+    fn update(&self, run: TurnAudioRun, change: impl FnOnce(&mut SessionTurnAudio)) {
+        if let Some(current) = self.state().as_mut().filter(|current| current.run == run) {
             change(current);
         }
         self.inner.changed.notify_waiters();
@@ -192,7 +212,7 @@ mod tests {
     use futures_util::FutureExt;
     use tokio_util::sync::CancellationToken;
 
-    use super::{CapturedTurnAudio, SidecarTurnAudio};
+    use super::{CapturedTurnAudio, SidecarTurnAudio, TurnAudioRun};
 
     const SESSION: SessionId = SessionId::new(7);
     const OTHER: SessionId = SessionId::new(8);
@@ -201,14 +221,14 @@ mod tests {
         CapturedTurnAudio {
             samples: vec![value; 4],
             playback_overlap: false,
-            single_segment: true,
+            final_segments: 1,
         }
     }
 
-    fn session() -> SidecarTurnAudio {
+    fn session() -> (SidecarTurnAudio, TurnAudioRun) {
         let handle = SidecarTurnAudio::new();
-        handle.begin(SESSION);
-        handle
+        let run = handle.begin(SESSION);
+        (handle, run)
     }
 
     /// The answer a take gives without waiting, or `None` when it would wait.
@@ -224,22 +244,22 @@ mod tests {
 
     #[tokio::test]
     async fn take_returns_audio_offered_before_or_after_the_request() {
-        let handle = session();
-        handle.offer(SESSION, 1, audio(0.25));
+        let (handle, run) = session();
+        handle.offer(run, 1, audio(0.25));
         assert_eq!(answer_now(&handle, SESSION, 1), Some(Some(audio(0.25))));
 
         let take = handle.take(SESSION, 2, CancellationToken::new());
         tokio::pin!(take);
         assert!(take.as_mut().now_or_never().is_none());
-        handle.offer(SESSION, 2, audio(0.5));
+        handle.offer(run, 2, audio(0.5));
         assert_eq!(take.now_or_never(), Some(Some(audio(0.5))));
     }
 
     #[tokio::test]
     async fn a_late_request_never_receives_a_later_turns_audio() {
-        let handle = session();
-        handle.offer(SESSION, 1, audio(0.25));
-        handle.offer(SESSION, 2, audio(0.5));
+        let (handle, run) = session();
+        handle.offer(run, 1, audio(0.25));
+        handle.offer(run, 2, audio(0.5));
         assert_eq!(answer_now(&handle, SESSION, 1), Some(None));
         assert_eq!(answer_now(&handle, SESSION, 2), Some(Some(audio(0.5))));
 
@@ -247,19 +267,19 @@ mod tests {
         let waiting = handle.take(SESSION, 3, CancellationToken::new());
         tokio::pin!(waiting);
         assert!(waiting.as_mut().now_or_never().is_none());
-        handle.offer(SESSION, 4, audio(0.75));
+        handle.offer(run, 4, audio(0.75));
         assert_eq!(waiting.now_or_never(), Some(None));
         assert_eq!(answer_now(&handle, SESSION, 4), Some(Some(audio(0.75))));
     }
 
     #[tokio::test]
     async fn a_request_for_a_turn_that_ended_without_audio_gets_nothing_at_once() {
-        let handle = session();
+        let (handle, run) = session();
         let waiting = handle.take(SESSION, 3, CancellationToken::new());
         tokio::pin!(waiting);
         assert!(waiting.as_mut().now_or_never().is_none());
 
-        handle.turn_ended(SESSION, 3);
+        handle.turn_ended(run, 3);
         assert_eq!(waiting.now_or_never(), Some(None));
         assert_eq!(answer_now(&handle, SESSION, 3), Some(None));
         assert_eq!(answer_now(&handle, SESSION, 1), Some(None));
@@ -269,21 +289,21 @@ mod tests {
 
     #[tokio::test]
     async fn the_end_of_a_turn_keeps_that_turns_audio() {
-        let handle = session();
-        handle.offer(SESSION, 2, audio(0.25));
-        handle.turn_ended(SESSION, 3);
+        let (handle, run) = session();
+        handle.offer(run, 2, audio(0.25));
+        handle.turn_ended(run, 3);
         assert_eq!(answer_now(&handle, SESSION, 2), Some(Some(audio(0.25))));
     }
 
     #[tokio::test]
     async fn audio_does_not_outlive_its_session() {
-        let handle = session();
-        handle.offer(SESSION, 1, audio(0.25));
+        let (handle, run) = session();
+        handle.offer(run, 1, audio(0.25));
         let waiting = handle.take(SESSION, 2, CancellationToken::new());
         tokio::pin!(waiting);
         assert!(waiting.as_mut().now_or_never().is_none());
 
-        handle.end(SESSION);
+        handle.end(run);
         assert_eq!(waiting.now_or_never(), Some(None));
         assert_eq!(answer_now(&handle, SESSION, 1), Some(None));
         assert_eq!(answer_now(&handle, SESSION, 5), Some(None));
@@ -291,38 +311,61 @@ mod tests {
 
     #[tokio::test]
     async fn a_new_session_with_the_same_id_starts_afresh() {
-        let handle = session();
-        handle.offer(SESSION, 3, audio(0.25));
-        handle.end(SESSION);
-        handle.begin(SESSION);
+        let (handle, run) = session();
+        handle.offer(run, 3, audio(0.25));
+        handle.end(run);
+        let run = handle.begin(SESSION);
 
         let take = handle.take(SESSION, 1, CancellationToken::new());
         tokio::pin!(take);
         assert!(take.as_mut().now_or_never().is_none());
-        handle.offer(SESSION, 1, audio(0.5));
+        handle.offer(run, 1, audio(0.5));
         assert_eq!(take.now_or_never(), Some(Some(audio(0.5))));
     }
 
     #[tokio::test]
-    async fn a_stale_sessions_end_leaves_the_current_session_alone() {
-        let handle = session();
-        handle.offer(SESSION, 1, audio(0.25));
-        handle.end(OTHER);
-        handle.turn_ended(OTHER, 9);
+    async fn a_stale_runs_calls_leave_the_current_run_alone() {
+        let handle = SidecarTurnAudio::new();
+        let other = handle.begin(OTHER);
+        let run = handle.begin(SESSION);
+        handle.offer(run, 1, audio(0.25));
+        handle.end(other);
+        handle.turn_ended(other, 9);
         assert_eq!(answer_now(&handle, SESSION, 1), Some(Some(audio(0.25))));
     }
 
     #[tokio::test]
+    async fn an_earlier_run_with_the_same_id_cannot_touch_the_newer_run() {
+        let handle = SidecarTurnAudio::new();
+        let earlier = handle.begin(SESSION);
+        let newer = handle.begin(SESSION);
+
+        let waiting = handle.take(SESSION, 1, CancellationToken::new());
+        tokio::pin!(waiting);
+        assert!(waiting.as_mut().now_or_never().is_none());
+        handle.offer(earlier, 1, audio(0.25));
+        handle.turn_ended(earlier, 9);
+        handle.end(earlier);
+        // The newer run's request still waits, and takes only the newer run's audio.
+        assert!(waiting.as_mut().now_or_never().is_none());
+        handle.offer(newer, 1, audio(0.5));
+        assert_eq!(waiting.now_or_never(), Some(Some(audio(0.5))));
+    }
+
+    #[tokio::test]
     async fn a_different_segment_or_session_is_never_returned() {
-        let handle = session();
+        let handle = SidecarTurnAudio::new();
+        let other = handle.begin(OTHER);
+        let run = handle.begin(SESSION);
         let cancellation = CancellationToken::new();
         let take = handle.take(SESSION, 3, cancellation.clone());
         tokio::pin!(take);
         assert!(take.as_mut().now_or_never().is_none());
 
-        handle.offer(SESSION, 2, audio(0.25));
+        handle.offer(run, 2, audio(0.25));
         assert!(take.as_mut().now_or_never().is_none());
-        handle.offer(OTHER, 3, audio(0.5));
+        // A run that has been replaced offers nothing.
+        handle.offer(other, 3, audio(0.5));
         assert!(take.as_mut().now_or_never().is_none());
         // Only the current session's audio is ever held.
         assert_eq!(answer_now(&handle, OTHER, 3), Some(None));
@@ -334,15 +377,15 @@ mod tests {
 
     #[tokio::test]
     async fn audio_is_taken_once() {
-        let handle = session();
-        handle.offer(SESSION, 1, audio(0.25));
+        let (handle, run) = session();
+        handle.offer(run, 1, audio(0.25));
         assert_eq!(answer_now(&handle, SESSION, 1), Some(Some(audio(0.25))));
         assert_eq!(answer_now(&handle, SESSION, 1), Some(None));
     }
 
     #[tokio::test]
     async fn cancellation_ends_a_waiting_take() {
-        let handle = session();
+        let (handle, run) = session();
         let cancellation = CancellationToken::new();
         let take = handle.take(SESSION, 1, cancellation.clone());
         tokio::pin!(take);
@@ -352,15 +395,15 @@ mod tests {
         assert_eq!(take.now_or_never(), Some(None));
 
         // A cancelled take left nothing behind: later audio reaches a new take.
-        handle.offer(SESSION, 1, audio(0.25));
+        handle.offer(run, 1, audio(0.25));
         assert_eq!(answer_now(&handle, SESSION, 1), Some(Some(audio(0.25))));
     }
 
     #[tokio::test]
     async fn a_clone_shares_the_slot() {
-        let handle = session();
+        let (handle, run) = session();
         let reader = handle.clone();
-        reader.offer(SESSION, 1, audio(0.25));
+        reader.offer(run, 1, audio(0.25));
         assert_eq!(answer_now(&handle, SESSION, 1), Some(Some(audio(0.25))));
     }
 

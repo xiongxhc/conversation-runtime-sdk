@@ -326,6 +326,15 @@ fn run() -> Result<(), String> {
                     }
                 } else if scenario == "two-turns-one-audio" {
                     write_two_turns_one_audio(&mut stdout, session)?;
+                } else if scenario == "two-turns-two-audio" {
+                    // Two sidecar turns, each with its own one-segment audio, close enough
+                    // together for the runtime to join them into one turn.
+                    write_turn(&mut stdout, session, 0, "first", true)?;
+                    write_turn(&mut stdout, session, 1, "second", true)?;
+                } else if scenario == "one-sidecar-turn-two-runtime-turns" {
+                    // The sidecar turn's first final; its second waits for the first
+                    // answer's playback, so the runtime has already ended a turn on it.
+                    write_speech(&mut stdout, session, 0, 1, "first")?;
                 } else if scenario == "two-turns-one-audio-after-playback" {
                     // The second turn waits for the first answer's first playback frame, so
                     // the runtime sees two turns rather than one joined inside the
@@ -613,6 +622,14 @@ fn run() -> Result<(), String> {
                     "two-turns-one-audio-after-playback" if !second_turn_sent => {
                         write_turn(&mut stdout, identity.session, 1, "second", false)?;
                         acknowledge_media(&mut stdout, identity)?;
+                        second_turn_sent = true;
+                    }
+                    // Once the first answer has played, the same sidecar turn goes on: a
+                    // second final, then audio covering both segments.
+                    "one-sidecar-turn-two-runtime-turns" if !second_turn_sent => {
+                        acknowledge_media(&mut stdout, identity)?;
+                        write_speech(&mut stdout, identity.session, 1, 2, "second")?;
+                        write_audio_for(&mut stdout, identity.session, 2, 2)?;
                         second_turn_sent = true;
                     }
                     _ => acknowledge_media(&mut stdout, identity)?,
@@ -941,6 +958,22 @@ fn write_turn(
     text: &str,
     with_audio: bool,
 ) -> Result<(), String> {
+    write_speech(writer, session, turn, 1, text)?;
+    if with_audio {
+        write_audio_for(writer, session, 1, 1)?;
+    }
+    Ok(())
+}
+
+/// One stretch of speech, the `turn`-th of the session by its timing, whose final is sidecar
+/// segment `segment`.
+fn write_speech(
+    writer: &mut impl Write,
+    session: u64,
+    turn: u64,
+    segment: u64,
+    text: &str,
+) -> Result<(), String> {
     write_json_frame(
         writer,
         VOICE_ACTIVITY,
@@ -955,7 +988,7 @@ fn write_turn(
         TRANSCRIPT_HYPOTHESIS,
         json!({
             "session_id": session,
-            "segment_id": 1,
+            "segment_id": segment,
             "text": text,
             "engine_final": true
         }),
@@ -968,21 +1001,30 @@ fn write_turn(
             "activity": "speech_ended",
             "at_ms": 20 + turn * 100
         }),
-    )?;
-    if with_audio && session_version() == TURN_AUDIO_PROTOCOL_VERSION {
-        write_turn_audio_frame(
-            writer,
-            session_version(),
-            TurnAudio {
-                session,
-                segment: 1,
-                final_segments: 1,
-                playback_overlap: false,
-                samples: &[1000; 16_000],
-            },
-        )?;
+    )
+}
+
+/// At version 2, the audio that ends a sidecar turn whose last final is `segment`.
+fn write_audio_for(
+    writer: &mut impl Write,
+    session: u64,
+    segment: u64,
+    final_segments: u16,
+) -> Result<(), String> {
+    if session_version() != TURN_AUDIO_PROTOCOL_VERSION {
+        return Ok(());
     }
-    Ok(())
+    write_turn_audio_frame(
+        writer,
+        session_version(),
+        TurnAudio {
+            session,
+            segment,
+            final_segments,
+            playback_overlap: false,
+            samples: &[1000; 16_000],
+        },
+    )
 }
 
 fn read_u64(payload: &[u8], offset: usize) -> u64 {

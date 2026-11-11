@@ -242,13 +242,27 @@ enum SidecarFramePayload {
 }
 
 /// A finished voice turn's audio: 16 kHz mono signed 16-bit samples.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) struct SidecarTurnAudioFrame {
     pub session_id: SessionId,
     pub segment_id: u64,
     pub final_segments: u16,
     pub playback_overlap: bool,
     pub samples: Vec<i16>,
+}
+
+/// Formatting a frame never prints the voice it carries.
+impl std::fmt::Debug for SidecarTurnAudioFrame {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SidecarTurnAudioFrame")
+            .field("session_id", &self.session_id)
+            .field("segment_id", &self.segment_id)
+            .field("final_segments", &self.final_segments)
+            .field("playback_overlap", &self.playback_overlap)
+            .field("sample_count", &self.samples.len())
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -272,7 +286,8 @@ impl SidecarFrame {
         }
     }
 
-    #[allow(dead_code)] // first used by the process layer
+    /// The gateway only reads turn audio; tests write it.
+    #[cfg(test)]
     pub(crate) const fn turn_audio(frame: SidecarTurnAudioFrame) -> Self {
         Self {
             version: TURN_AUDIO_PROTOCOL_VERSION,

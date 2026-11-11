@@ -1138,3 +1138,22 @@ fn fixture_path(relative: &str) -> PathBuf {
         .join(FIXTURE_ROOT)
         .join(relative)
 }
+
+#[test]
+fn formatting_turn_audio_never_prints_its_samples() {
+    let frame = SidecarTurnAudioFrame {
+        session_id: SessionId::new(7),
+        segment_id: 4,
+        final_segments: 1,
+        playback_overlap: true,
+        samples: vec![12_345, -23_456],
+    };
+    let rendered = format!(
+        "{frame:?} {:?} {:#?}",
+        SidecarFrame::turn_audio(frame.clone()),
+        frame
+    );
+    assert!(!rendered.contains("12345"));
+    assert!(!rendered.contains("23456"));
+    assert!(rendered.contains("sample_count: 2"));
+}

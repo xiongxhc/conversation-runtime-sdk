@@ -58,6 +58,11 @@ async fn run() -> Result<(), ()> {
         speaker_identity,
         status: _,
     } = adapters;
+    // Voice signatures live in the memory store; never start without a configured feature.
+    if speaker_identity.is_some() && memory_store.is_none() {
+        eprintln!("gateway speaker identity requires a memory store");
+        return Err(());
+    }
     let media_server = match media {
         Some(config) => Some(Arc::new(MediaServer::bind(config).await.map_err(|_| {
             eprintln!("gateway media server failed");
@@ -109,7 +114,7 @@ async fn run() -> Result<(), ()> {
         session = session.with_reconciliation(diarizer);
     }
     // Loading refuses `[speaker_identity]` until a voice embedding model is included, so this
-    // build never reaches it; when it does, the section is only accepted with `[memory]`.
+    // build never reaches it; the memory store is present, checked at startup above.
     if let (Some(identity), Some(store)) = (speaker_identity, memory_store.as_ref()) {
         session = attach_speaker_identity(
             session,

@@ -84,26 +84,73 @@ async fn a_turn_whose_audio_never_arrives_is_reported_late_and_still_answers() {
 
 #[tokio::test]
 async fn a_second_turn_never_reuses_the_first_turns_audio() {
-    let mut gateway = Gateway::start("two-turns-one-audio", Duration::from_millis(300)).await;
+    let mut gateway =
+        Gateway::start("two-turns-one-audio-after-playback", Duration::from_secs(2)).await;
     gateway.start_voice().await;
 
-    // The sidecar ends its first turn with that turn's audio (session segment 1) and sends a
-    // second turn without audio (segment 2), all inside the final-silence window, so the
-    // runtime answers both as one turn ending at segment 2. Segment 1's audio is not that
-    // turn's: the turn is late rather than identified from the first turn's voice.
-    let events = gateway.voice_events_through_turn_terminal(1).await;
-    let transcript = position(&events, "voice_transcript_final").expect("the turn's final");
-    assert_eq!(events[transcript]["segment_id"], "2");
-    assert_eq!(events[transcript]["text"], "firstsecond");
-    let late = position(&events, "voice_identity_late").expect("the turn was reported late");
-    assert_eq!(events[late]["turn_id"], events[transcript]["turn_id"]);
-    assert!(
-        position(&events, "voice_speaker").is_none(),
-        "no speaker is reported from another turn's audio: {events:?}"
+    // The sidecar ends its first turn with that turn's audio (session segment 1). Its second
+    // turn (segment 2) has no audio, and must not be identified from the first turn's. The
+    // second turn starts while the first answer is playing, so it interrupts that answer.
+    let events = gateway.voice_events_through_turn_terminal(2).await;
+    let finals: Vec<(&str, &str, &str)> = events
+        .iter()
+        .filter(|event| event["type"] == "voice_transcript_final")
+        .map(|event| {
+            (
+                event["turn_id"].as_str().unwrap_or_default(),
+                event["segment_id"].as_str().unwrap_or_default(),
+                event["text"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        finals,
+        [("1", "1", "first"), ("2", "2", "second")],
+        "{events:?}"
     );
-    let terminal = turn_terminal(&events).expect("the turn ended");
-    assert!(late < terminal);
-    assert_eq!(events[terminal]["event"]["type"], "turn_completed");
+    let identities: Vec<(&str, &str)> = events
+        .iter()
+        .filter_map(|event| {
+            let kind = event["type"].as_str()?;
+            matches!(kind, "voice_speaker" | "voice_identity_late")
+                .then(|| (kind, event["turn_id"].as_str().unwrap_or_default()))
+        })
+        .collect();
+    assert_eq!(
+        identities,
+        [("voice_speaker", "1"), ("voice_identity_late", "2")],
+        "{events:?}"
+    );
+    let speaker = position(&events, "voice_speaker").unwrap();
+    assert_eq!(events[speaker]["person_id"], gateway.jack.get().to_string());
+    assert_eq!(events[speaker]["confirmed"], true);
+
+    // The first turn is identified, then interrupted by the second, which is late; each
+    // turn's identity comes before that turn ends.
+    let terminals: Vec<(usize, &str, &str)> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| is_turn_terminal(event))
+        .map(|(index, event)| {
+            (
+                index,
+                event["event"]["turn_id"].as_str().unwrap_or_default(),
+                event["event"]["type"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        terminals
+            .iter()
+            .map(|(_, turn, kind)| (*turn, *kind))
+            .collect::<Vec<_>>(),
+        [("1", "turn_cancelled"), ("2", "turn_completed")],
+        "{events:?}"
+    );
+    let barge_in = position(&events, "voice_barge_in").expect("the second turn interrupted");
+    let late = position(&events, "voice_identity_late").unwrap();
+    assert!(speaker < barge_in && barge_in < terminals[0].0);
+    assert!(terminals[0].0 < late && late < terminals[1].0);
 
     gateway.stop().await;
 }

@@ -112,6 +112,7 @@ fn run() -> Result<(), String> {
     let mut last_media = None;
     let mut held_flush = false;
     let mut media_count = 0_u64;
+    let mut second_turn_sent = false;
 
     while let Ok(event) = event_receiver.recv() {
         match event {
@@ -325,6 +326,11 @@ fn run() -> Result<(), String> {
                     }
                 } else if scenario == "two-turns-one-audio" {
                     write_two_turns_one_audio(&mut stdout, session)?;
+                } else if scenario == "two-turns-one-audio-after-playback" {
+                    // The second turn waits for the first answer's first playback frame, so
+                    // the runtime sees two turns rather than one joined inside the
+                    // final-silence window.
+                    write_turn(&mut stdout, session, 0, "first", true)?;
                 } else if scenario == "turn-audio-at-version-one" {
                     write_turn_audio_frame(
                         &mut stdout,
@@ -601,6 +607,13 @@ fn run() -> Result<(), String> {
                         stdout
                             .flush()
                             .map_err(|_| "failed to flush partial pressure burst".to_owned())?;
+                    }
+                    // The second turn starts while the first answer's audio is still
+                    // unacknowledged, so the first answer is always interrupted by it.
+                    "two-turns-one-audio-after-playback" if !second_turn_sent => {
+                        write_turn(&mut stdout, identity.session, 1, "second", false)?;
+                        acknowledge_media(&mut stdout, identity)?;
+                        second_turn_sent = true;
                     }
                     _ => acknowledge_media(&mut stdout, identity)?,
                 }
@@ -915,48 +928,59 @@ fn write_turn_audio_frame(
 /// Two turns whose segment ids both restart at 1: only the first has audio,
 /// and only in a version 2 session.
 fn write_two_turns_one_audio(writer: &mut impl Write, session: u64) -> Result<(), String> {
-    for (turn, text) in [(0_u64, "first"), (1, "second")] {
-        write_json_frame(
+    write_turn(writer, session, 0, "first", true)?;
+    write_turn(writer, session, 1, "second", false)
+}
+
+/// One sidecar turn whose only final is segment 1, followed at version 2 by its audio when
+/// `with_audio`.
+fn write_turn(
+    writer: &mut impl Write,
+    session: u64,
+    turn: u64,
+    text: &str,
+    with_audio: bool,
+) -> Result<(), String> {
+    write_json_frame(
+        writer,
+        VOICE_ACTIVITY,
+        json!({
+            "session_id": session,
+            "activity": "speech_started",
+            "at_ms": 10 + turn * 100
+        }),
+    )?;
+    write_json_frame(
+        writer,
+        TRANSCRIPT_HYPOTHESIS,
+        json!({
+            "session_id": session,
+            "segment_id": 1,
+            "text": text,
+            "engine_final": true
+        }),
+    )?;
+    write_json_frame(
+        writer,
+        VOICE_ACTIVITY,
+        json!({
+            "session_id": session,
+            "activity": "speech_ended",
+            "at_ms": 20 + turn * 100
+        }),
+    )?;
+    if with_audio && session_version() == TURN_AUDIO_PROTOCOL_VERSION {
+        write_turn_audio_frame(
             writer,
-            VOICE_ACTIVITY,
-            json!({
-                "session_id": session,
-                "activity": "speech_started",
-                "at_ms": 10 + turn * 100
-            }),
+            session_version(),
+            TurnAudio {
+                session,
+                segment: 1,
+                final_segments: 1,
+                playback_overlap: false,
+                samples: &[1000; 16_000],
+            },
         )?;
-        write_json_frame(
-            writer,
-            TRANSCRIPT_HYPOTHESIS,
-            json!({
-                "session_id": session,
-                "segment_id": 1,
-                "text": text,
-                "engine_final": true
-            }),
-        )?;
-        write_json_frame(
-            writer,
-            VOICE_ACTIVITY,
-            json!({
-                "session_id": session,
-                "activity": "speech_ended",
-                "at_ms": 20 + turn * 100
-            }),
-        )?;
-        if turn == 0 && session_version() == TURN_AUDIO_PROTOCOL_VERSION {
-            write_turn_audio_frame(
-                writer,
-                session_version(),
-                TurnAudio {
-                    session,
-                    segment: 1,
-                    final_segments: 1,
-                    playback_overlap: false,
-                    samples: &[1000; 16_000],
-                },
-            )?;
-        }
     }
     Ok(())
 }

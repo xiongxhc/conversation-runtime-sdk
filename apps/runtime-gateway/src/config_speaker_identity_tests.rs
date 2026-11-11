@@ -184,3 +184,131 @@ fn a_test_voice_embedder_lets_the_section_load() {
         "speaker identity wait_ms must be within 100..=5000"
     );
 }
+
+/// An offline voice lane whose recognition runs in the voice sidecar, with its model directory
+/// and a never-started sidecar executable under `directory`.
+fn sidecar_voice(directory: &Path) -> String {
+    let model_path = directory.join("asr-model");
+    std::fs::create_dir(&model_path).unwrap();
+    let sidecar = directory.join("voice-sidecar");
+    std::fs::write(&sidecar, "#!/bin/sh\nexit 1\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let path = |path: &Path| path.to_string_lossy().replace('\\', "\\\\");
+    format!(
+        r#"
+[[provider_hosts]]
+id = "speech-host"
+ownership = "external"
+readiness_url = "http://127.0.0.1:8000/health"
+startup_timeout_ms = 5000
+environment = "inherit"
+
+[voice.capture]
+device = "system-default"
+
+[voice.turn]
+speech_start_ms = 200
+final_silence_ms = 600
+
+[voice.asr]
+backend = "whisperkit"
+execution = "local"
+provider = "local-speech-recognition"
+model_path = "{}"
+download = false
+
+[voice.speech]
+backend = "openai-compatible"
+execution = "local"
+provider = "local-speech-synthesis"
+provider_host = "speech-host"
+mode = "streaming"
+streaming_interval = 0.2
+endpoint = "http://127.0.0.1:8000/v1"
+model = "local-speech-model"
+voice = "local-voice"
+speed = 1.0
+language = "auto"
+instructions = "Speak clearly."
+max_tokens = 128
+repetition_penalty = 1.0
+max_text_bytes = 4096
+max_audio_bytes = 8388608
+
+[voice.audio]
+backend = "managed-sidecar"
+execution = "local"
+provider = "local-audio"
+sidecar_executable = "{}"
+max_error_bytes = 65536
+"#,
+        path(&model_path),
+        path(&sidecar)
+    )
+}
+
+#[test]
+fn a_configured_section_builds_the_identity_adapters() {
+    let key_env = "CONVERSATION_TEST_SPEAKER_IDENTITY_KEY_ADAPTERS";
+    std::env::set_var(key_env, SPEAKER_KEY);
+    let fixture = tempfile::tempdir().unwrap();
+    let (database, _) = initialized_store(fixture.path());
+    let path = fixture.path().join("gateway.toml");
+    let voice = sidecar_voice(fixture.path());
+    std::fs::write(&path, config(&database, key_env) + &voice).unwrap();
+
+    let adapters =
+        GatewayConfig::load_with_test_voice_embedder(&path, stand_in_embedder()).unwrap();
+
+    let identity = adapters
+        .speaker_identity
+        .as_ref()
+        .expect("the section builds speaker identity");
+    assert_eq!(identity.settings.wait, Duration::from_millis(1_000));
+    assert_eq!(
+        identity.embedder.model(),
+        &SignatureModel::new("ecapa", "1").unwrap()
+    );
+    assert!(adapters.context.speaker_identity_enabled());
+    assert!(
+        adapters
+            .voice
+            .as_ref()
+            .expect("the voice lane is configured")
+            .sidecar_turn_audio
+            .is_some(),
+        "recognition in the sidecar collects each turn's audio"
+    );
+}
+
+#[test]
+fn without_the_section_nothing_is_built() {
+    let fixture = tempfile::tempdir().unwrap();
+    let (database, _) = initialized_store(fixture.path());
+    let path = fixture.path().join("gateway.toml");
+    let without_section = config(&database, "UNUSED")
+        .split("\n[speaker_identity]")
+        .next()
+        .unwrap()
+        .to_owned();
+    let voice = sidecar_voice(fixture.path());
+    std::fs::write(&path, without_section + &voice).unwrap();
+
+    for adapters in [
+        GatewayConfig::load(&path).unwrap(),
+        GatewayConfig::load_with_test_voice_embedder(&path, stand_in_embedder()).unwrap(),
+    ] {
+        assert!(adapters.speaker_identity.is_none());
+        assert!(!adapters.context.speaker_identity_enabled());
+        assert!(adapters
+            .voice
+            .as_ref()
+            .expect("the voice lane is configured")
+            .sidecar_turn_audio
+            .is_none());
+    }
+}

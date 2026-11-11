@@ -6,8 +6,8 @@ use futures_util::{stream::FuturesUnordered, StreamExt};
 use conversation_model_adapters::{
     AdapterError, AdapterFuture, AudioCapture, CaptureEvent, FinalizedUtterance,
     OpenAiSpeechRecognitionConfig, OpenAiSpeechRecognizer, RecognitionEvent, RecognitionHypothesis,
-    RecognitionStream, SpeechRecognizer, StreamingSpeechSynthesizer, VoiceInput, VoiceInputEvent,
-    VoiceIoFactory, VoiceIoSession,
+    RecognitionStream, SidecarTurnAudio, SpeechRecognizer, StreamingSpeechSynthesizer, VoiceInput,
+    VoiceInputEvent, VoiceIoFactory, VoiceIoSession,
 };
 use conversation_protocol::{
     ComponentDescriptor, PrivacyMode, RuntimeError, RuntimeStage, SessionId, VoiceActivity,
@@ -38,6 +38,9 @@ pub struct GatewayVoiceAdapters {
     /// The remote recognizer selected by an online profile. Its capture is supplied only by the
     /// production media lease, after Task 6 attached that exact bounded receiver.
     pub online_recognition: Option<OpenAiSpeechRecognitionConfig>,
+    /// The handle `io` fills with each finished turn's audio when speaker identity is
+    /// configured and recognition runs in the voice sidecar; otherwise absent.
+    pub sidecar_turn_audio: Option<SidecarTurnAudio>,
 }
 
 impl GatewayVoiceAdapters {

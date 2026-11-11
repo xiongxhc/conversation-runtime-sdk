@@ -25,8 +25,8 @@ use conversation_runtime::{
     adopt_closed_recording, process_text, read_recording_alignment, reconcile_finalized_recording,
     reconcile_recording, ConversationContext, ProcessedText, RecordingAdoptionError,
     RecordingAlignmentItem, RecordingSettings, RecordingSummary, SessionRecorder,
-    TextProcessingRequest, TextTurnEventStream, TextTurnRuntime, VoiceSessionAdapters,
-    VoiceSessionEventStream, VoiceSessionRuntime,
+    SpeakerIdentityStage, TextProcessingRequest, TextTurnEventStream, TextTurnRuntime,
+    VoiceSessionAdapters, VoiceSessionEventStream, VoiceSessionRuntime,
 };
 #[cfg(not(test))]
 use ring::rand::{SecureRandom, SystemRandom};
@@ -37,6 +37,7 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use crate::memory_extraction::{MemoryExtractedCounts, MemoryExtractionSettings, MemoryExtractor};
+use crate::speaker_audio::{GatewayTurnAudio, MediaTurnAudio, MediaTurnAudioRegistration};
 use crate::voice_adapters::GatewayVoiceAdapters;
 use crate::{FrameError, FrameReader, FrameWriter, MediaLease, MediaServer};
 
@@ -79,8 +80,9 @@ fn next_gateway_session_id() -> SessionId {
 
 pub struct GatewaySession {
     protocol_v4: bool,
-    /// Speaker identity is configured: voice facts go to the identified speaker only.
-    speaker_identity: bool,
+    /// Speaker identity is configured: voice sessions identify each turn's speaker, and voice
+    /// facts go to the identified speaker only.
+    speaker_identity: Option<SpeakerIdentityLane>,
     control_closed: CancellationToken,
     session_id: SessionId,
     runtime: TextTurnRuntime,
@@ -142,6 +144,14 @@ struct ActiveMediaLease {
     server: Arc<MediaServer>,
     session_id: SessionId,
     _recognition_capture: Arc<dyn AudioCapture>,
+    /// The session's media-bridge turn audio, registered for speaker identity; dropped with the
+    /// lease so no voice outlives the session.
+    _turn_audio: Option<MediaTurnAudioRegistration>,
+}
+
+struct SpeakerIdentityLane {
+    stage: Arc<SpeakerIdentityStage>,
+    audio: Arc<GatewayTurnAudio>,
 }
 
 struct ActiveVoiceControl {
@@ -222,7 +232,7 @@ impl GatewaySession {
     ) -> Self {
         Self {
             protocol_v4: false,
-            speaker_identity: false,
+            speaker_identity: None,
             control_closed: CancellationToken::new(),
             session_id,
             runtime,
@@ -290,15 +300,20 @@ impl GatewaySession {
         self
     }
 
-    /// Enables extraction of durable memories from completed exchanges. The
-    /// extractor reports what it wrote through a channel the session forwards as
-    /// `MemoryExtracted` on the event lane; nothing it does can delay a turn.
-    /// Marks speaker identity as on for this session's voice exchanges.
-    pub fn with_speaker_identity(mut self) -> Self {
-        self.speaker_identity = true;
+    /// Identifies each voice turn's speaker through `stage`, whose turn audio `audio` supplies;
+    /// a media-bridge voice session registers its own capture there for its lifetime.
+    pub fn with_speaker_identity(
+        mut self,
+        stage: Arc<SpeakerIdentityStage>,
+        audio: Arc<GatewayTurnAudio>,
+    ) -> Self {
+        self.speaker_identity = Some(SpeakerIdentityLane { stage, audio });
         self
     }
 
+    /// Enables extraction of durable memories from completed exchanges. The
+    /// extractor reports what it wrote through a channel the session forwards as
+    /// `MemoryExtracted` on the event lane; nothing it does can delay a turn.
     pub fn with_memory_extraction(
         mut self,
         store: Arc<dyn MemoryStore>,
@@ -1329,11 +1344,16 @@ impl GatewaySession {
                         let media_io = network_factory.clone() as Arc<dyn VoiceIoFactory>;
                         let online_profile = RuntimeProfile::parse(&self.status.profile)
                             == Some(RuntimeProfile::Online);
+                        // Speaker identity cuts each recognised utterance's voice out of recent
+                        // capture. The buffer is attached last, once nothing else can refuse
+                        // the start before the lease takes it over.
+                        let media_turn_audio = (online_profile && self.speaker_identity.is_some())
+                            .then(|| Arc::new(MediaTurnAudio::new()));
                         let io = if online_profile {
                             match lane.adapters.online_media_io(
                                 media_io.clone(),
                                 Arc::clone(&recognition_capture),
-                                None,
+                                media_turn_audio.clone(),
                             ) {
                                 Some(io) => io,
                                 None => {
@@ -1353,11 +1373,32 @@ impl GatewaySession {
                         } else {
                             media_io
                         };
+                        let turn_audio = match (media_turn_audio, self.speaker_identity.as_ref()) {
+                            (Some(buffer), Some(identity)) => {
+                                if media_server
+                                    .hub()
+                                    .observe_capture(session_id, Arc::clone(&buffer) as _)
+                                    .await
+                                    .is_err()
+                                {
+                                    media_server.revoke(session_id).await;
+                                    return send_rejection(
+                                        normal,
+                                        &request_id,
+                                        command_error("media turn audio could not be attached"),
+                                    )
+                                    .map_err(CommandFailure::response);
+                                }
+                                Some(identity.audio.register_media(session_id, buffer))
+                            }
+                            _ => None,
+                        };
                         (
                             Some(ActiveMediaLease {
                                 server: Arc::clone(media_server),
                                 session_id,
                                 _recognition_capture: recognition_capture,
+                                _turn_audio: turn_audio,
                             }),
                             Some(descriptor),
                             io,
@@ -1372,6 +1413,9 @@ impl GatewaySession {
                 );
                 if let Some(recorder) = recorder.as_ref() {
                     adapters = adapters.with_recorder(Arc::clone(recorder));
+                }
+                if let Some(identity) = self.speaker_identity.as_ref() {
+                    adapters = adapters.with_speaker_identity(Arc::clone(&identity.stage));
                 }
                 let runtime = VoiceSessionRuntime::new(lane.context.clone(), adapters);
                 let mut event_stream = match runtime
@@ -1461,7 +1505,7 @@ impl GatewaySession {
                         self.provider_failure.clone(),
                     ),
                     self.protocol_v4,
-                    self.speaker_identity,
+                    self.speaker_identity.is_some(),
                 ));
                 voice.active = Some(ActiveVoiceSession {
                     runtime,
@@ -4339,6 +4383,7 @@ mod tests {
             speech: speech.clone(),
             policy: voice_policy(),
             online_recognition: Some(recognition),
+            sidecar_turn_audio: None,
         };
         let session = GatewaySession::new(unused_runtime(), online_status_with_voice())
             .with_voice(voice, language.clone())
@@ -4438,6 +4483,115 @@ mod tests {
         media.shutdown().await;
     }
 
+    struct StandInEmbedder(conversation_memory::SignatureModel);
+
+    impl conversation_runtime::VoiceEmbedder for StandInEmbedder {
+        fn model(&self) -> &conversation_memory::SignatureModel {
+            &self.0
+        }
+
+        fn embed(
+            &self,
+            _samples: Vec<f32>,
+            _cancellation: CancellationToken,
+        ) -> conversation_runtime::SpeakerFuture<'_, Result<Vec<f32>, RuntimeError>> {
+            Box::pin(async { Ok(vec![1.0, 0.0, 0.0, 0.0]) })
+        }
+    }
+
+    /// A media-bridge voice session's turn audio holds a person's voice, so it is registered
+    /// for speaker identity exactly while that voice session runs: a stop drops it, a later
+    /// voice session on the same gateway session id registers its own, and input EOF drops that.
+    #[tokio::test]
+    async fn media_turn_audio_lives_exactly_as_long_as_its_voice_session() {
+        const ONLINE_CREDENTIAL: &str = "CONVERSATION_ONLINE_TURN_AUDIO_TEST_CREDENTIAL";
+        std::env::set_var(ONLINE_CREDENTIAL, "fake-not-a-real-credential-0000");
+        // Recognition is not under test: its provider accepts connections and never answers.
+        let silent_recognizer = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let recognizer_endpoint = format!(
+            "ws://{}/v1/realtime?intent=transcription",
+            silent_recognizer.local_addr().unwrap()
+        );
+        let media = Arc::new(
+            MediaServer::bind(MediaServerConfig::loopback())
+                .await
+                .unwrap(),
+        );
+        let session_id = SessionId::new(706);
+        let recognition = OpenAiSpeechRecognitionConfig::new(
+            &recognizer_endpoint,
+            "scripted-asr-model",
+            ONLINE_CREDENTIAL,
+        )
+        .unwrap()
+        .with_server_vad(0.5, 300, 500)
+        .unwrap();
+        let language = Arc::new(MockGenerationLanguageModel::new(Vec::<String>::new()));
+        let voice = GatewayVoiceAdapters {
+            io: GatewayVoiceAdapters::unavailable_online_io(),
+            speech: Arc::new(PerRequestSpeech::default()),
+            policy: voice_policy(),
+            online_recognition: Some(recognition),
+            sidecar_turn_audio: None,
+        };
+        let (_store_directory, store) = initialized_store();
+        let audio = Arc::new(crate::GatewayTurnAudio::new(None));
+        let stage = conversation_runtime::SpeakerIdentityStage::new(
+            Arc::new(store),
+            Arc::new(conversation_memory::SignatureKey::from_hex(&"11".repeat(32)).unwrap()),
+            conversation_runtime::IdentityPolicy {
+                confident_score: 0.80,
+                possible_score: 0.60,
+                margin: 0.10,
+                anchor_score: 0.85,
+                min_sample_ms: 1_500,
+                maturity_speech_ms: 5_000,
+                refinement_cap: 3,
+            },
+            Duration::from_millis(100),
+            Arc::clone(&audio) as _,
+            Arc::new(StandInEmbedder(
+                conversation_memory::SignatureModel::new("ecapa", "1").unwrap(),
+            )),
+            Arc::new(conversation_runtime::LanguageModelNameClaimDetector::new(
+                language.clone(),
+            )),
+        );
+        let session = GatewaySession::new(unused_runtime(), online_status_with_voice())
+            .with_voice(voice, language)
+            .with_media_server(Arc::clone(&media))
+            .with_speaker_identity(Arc::new(stage), Arc::clone(&audio))
+            .with_test_session_id(session_id);
+        let mut gateway = InMemoryGateway::start(session).await;
+        assert!(!audio.has_media(session_id));
+
+        for start in ["identity-start-1", "identity-start-2"] {
+            gateway
+                .write(&format!(r#"{{"protocol_version":3,"type":"start_voice_session","request_id":"{start}","response_mode":"external_gate"}}"#))
+                .await;
+            gateway
+                .read_until(|message| message.contains(r#""type":"voice_session_started""#))
+                .await;
+            assert!(audio.has_media(session_id), "{start} registered its audio");
+            if start == "identity-start-1" {
+                gateway
+                    .write(r#"{"protocol_version":3,"type":"stop_voice_session","request_id":"identity-stop"}"#)
+                    .await;
+                gateway
+                    .read_until(|message| {
+                        message_type(message) == "command_accepted"
+                            && message.contains(r#""request_id":"identity-stop""#)
+                    })
+                    .await;
+                assert!(!audio.has_media(session_id), "the stop dropped the audio");
+            }
+        }
+
+        gateway.close().await;
+        assert!(!audio.has_media(session_id), "input EOF dropped the audio");
+        media.shutdown().await;
+    }
+
     /// The online bridge must also enter the existing external authorization flow: a scripted
     /// final transcript is inert until the meeting host explicitly authorizes that segment.
     #[tokio::test]
@@ -4465,6 +4619,7 @@ mod tests {
             speech: speech.clone(),
             policy: voice_policy(),
             online_recognition: Some(recognition),
+            sidecar_turn_audio: None,
         };
         let language = Arc::new(MockGenerationLanguageModel::new(["approved reply"]));
         let session = GatewaySession::new(unused_runtime(), online_status_with_voice())
@@ -4897,6 +5052,7 @@ mod tests {
             speech: speech.clone(),
             policy: voice_policy(),
             online_recognition: Some(recognition),
+            sidecar_turn_audio: None,
         };
         let session = GatewaySession::new(unused_runtime(), online_status_with_voice())
             .with_voice(voice, language.clone())
@@ -4995,6 +5151,7 @@ mod tests {
             speech: no_speech_frames(),
             policy: voice_policy(),
             online_recognition: None,
+            sidecar_turn_audio: None,
         };
         let session = GatewaySession::new(unused_runtime(), online_status_with_voice())
             .with_voice(voice, test_language())
@@ -5469,6 +5626,7 @@ mod tests {
             speech: no_speech_frames(),
             policy: voice_policy(),
             online_recognition: None,
+            sidecar_turn_audio: None,
         };
         let session = GatewaySession::new(runtime, status_with_voice()).with_voice(
             adapters,
@@ -5550,6 +5708,7 @@ mod tests {
             speech: no_speech_frames(),
             policy: voice_policy(),
             online_recognition: None,
+            sidecar_turn_audio: None,
         };
         let session = GatewaySession::new(runtime, status_with_voice()).with_voice(
             adapters,
@@ -5662,6 +5821,7 @@ mod tests {
             speech: no_speech_frames(),
             policy: voice_policy(),
             online_recognition: None,
+            sidecar_turn_audio: None,
         };
         let session =
             GatewaySession::new(runtime, status_with_voice()).with_voice(adapters, language);
@@ -7769,6 +7929,7 @@ mod tests {
             speech: Arc::new(PerRequestSpeech::default()),
             policy: voice_policy(),
             online_recognition: None,
+            sidecar_turn_audio: None,
         };
         let session = GatewaySession::new(unused_runtime(), status_with_voice())
             .with_voice(adapters, turn_language)
@@ -8715,6 +8876,7 @@ mod tests {
             speech: speech.clone(),
             policy: voice_policy(),
             online_recognition: None,
+            sidecar_turn_audio: None,
         };
         (adapters, VoiceTestGuards { io_factory, speech })
     }
@@ -8927,6 +9089,7 @@ mod tests {
             speech,
             policy: voice_policy(),
             online_recognition: None,
+            sidecar_turn_audio: None,
         };
         GatewaySession::new(unused_runtime(), status_with_voice()).with_voice(adapters, language)
     }
@@ -8950,6 +9113,7 @@ mod tests {
             speech,
             policy: voice_policy(),
             online_recognition: None,
+            sidecar_turn_audio: None,
         };
         let session = GatewaySession::new(unused_runtime(), status_with_voice())
             .with_voice(adapters, language);
@@ -8973,6 +9137,7 @@ mod tests {
             speech,
             policy: voice_policy(),
             online_recognition: None,
+            sidecar_turn_audio: None,
         };
         GatewaySession::new(runtime, status_with_voice()).with_voice(adapters, language)
     }

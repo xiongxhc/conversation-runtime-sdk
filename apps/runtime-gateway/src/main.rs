@@ -6,8 +6,8 @@ use std::sync::Arc;
 use conversation_memory::{MemoryClock, MemoryStore, SystemMemoryClock};
 use conversation_runtime::TextTurnRuntime;
 use conversation_runtime_gateway::{
-    input_relay, GatewayAdapters, GatewayConfig, GatewaySession, MediaServer, ProviderSupervisor,
-    ProviderSupervisorError,
+    attach_speaker_identity, input_relay, GatewayAdapters, GatewayConfig, GatewaySession,
+    MediaServer, ProviderSupervisor, ProviderSupervisorError,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -42,6 +42,7 @@ async fn run() -> Result<(), ()> {
         recording,
         diarizer,
         media,
+        speaker_identity,
         status: _,
     } = adapters;
     // The configuration loader validates this before any runtime component is
@@ -98,8 +99,11 @@ async fn run() -> Result<(), ()> {
         session = session.with_v4_control();
     }
     session = session.with_control_closed(relay.ended.clone());
+    let sidecar_turn_audio = voice
+        .as_ref()
+        .and_then(|voice| voice.sidecar_turn_audio.clone());
     if let Some(voice_adapters) = voice {
-        session = session.with_voice(voice_adapters, language);
+        session = session.with_voice(voice_adapters, language.clone());
     }
     if let Some(media_server) = media_server.as_ref() {
         session = session.with_media_server(Arc::clone(media_server));
@@ -109,6 +113,17 @@ async fn run() -> Result<(), ()> {
     }
     if let Some(diarizer) = diarizer {
         session = session.with_reconciliation(diarizer);
+    }
+    // Loading refuses `[speaker_identity]` until a voice embedding model is included, so this
+    // build never reaches it; when it does, the section is only accepted with `[memory]`.
+    if let (Some(identity), Some(store)) = (speaker_identity, memory_store.as_ref()) {
+        session = attach_speaker_identity(
+            session,
+            identity,
+            store.clone(),
+            language,
+            sidecar_turn_audio,
+        );
     }
     if let Some(store) = memory_store {
         let store: Arc<dyn MemoryStore> = Arc::new(store);

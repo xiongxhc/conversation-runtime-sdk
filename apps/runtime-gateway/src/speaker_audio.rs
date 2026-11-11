@@ -1,15 +1,104 @@
 //! Recent media-bridge capture, kept so a recognised utterance's own voice can be cut out of it
-//! for speaker identification.
+//! for speaker identification, and the gateway's source of every voice turn's audio.
 //!
 //! The buffer lives in memory only. Its samples never reach a log, trace, error message or disk.
 
-use std::collections::VecDeque;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use conversation_model_adapters::{
-    AudioFrame, CaptureObserver, CapturedTurnAudio, PcmSampleFormat, TimedCapture,
+    AudioFrame, CaptureObserver, CapturedTurnAudio, PcmSampleFormat, SidecarTurnAudio, TimedCapture,
 };
-use conversation_protocol::{SourceSampleRange, UtteranceCaptureEvidence};
+use conversation_protocol::{SessionId, SourceSampleRange, UtteranceCaptureEvidence};
+use conversation_runtime::{SpeakerFuture, TurnAudio, TurnAudioSource};
+use tokio_util::sync::CancellationToken;
+
+/// Where a gateway's voice sessions get each turn's audio: a session with registered
+/// media-bridge audio from that buffer, any other session from the sidecar's handle.
+pub struct GatewayTurnAudio {
+    sidecar: Option<SidecarTurnAudio>,
+    media: Mutex<HashMap<SessionId, Arc<MediaTurnAudio>>>,
+}
+
+/// Keeps one voice session's media-bridge audio registered; dropping it forgets the session.
+pub struct MediaTurnAudioRegistration {
+    owner: Arc<GatewayTurnAudio>,
+    session: SessionId,
+    audio: Arc<MediaTurnAudio>,
+}
+
+impl GatewayTurnAudio {
+    pub fn new(sidecar: Option<SidecarTurnAudio>) -> Self {
+        Self {
+            sidecar,
+            media: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Answers `session` from `audio` until the registration is dropped. A gateway session's
+    /// voice sessions share one id, so this replaces an earlier session's registration.
+    pub fn register_media(
+        self: &Arc<Self>,
+        session: SessionId,
+        audio: Arc<MediaTurnAudio>,
+    ) -> MediaTurnAudioRegistration {
+        self.media().insert(session, Arc::clone(&audio));
+        MediaTurnAudioRegistration {
+            owner: Arc::clone(self),
+            session,
+            audio,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_media(&self, session: SessionId) -> bool {
+        self.media().contains_key(&session)
+    }
+
+    fn media(&self) -> MutexGuard<'_, HashMap<SessionId, Arc<MediaTurnAudio>>> {
+        self.media.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl Drop for MediaTurnAudioRegistration {
+    fn drop(&mut self) {
+        let mut media = self.owner.media();
+        // Only this registration's own entry: a newer voice session may hold the same id.
+        if media
+            .get(&self.session)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.audio))
+        {
+            media.remove(&self.session);
+        }
+    }
+}
+
+impl TurnAudioSource for GatewayTurnAudio {
+    fn turn_audio(
+        &self,
+        session: SessionId,
+        segment_id: u64,
+        cancellation: CancellationToken,
+    ) -> SpeakerFuture<'_, Option<TurnAudio>> {
+        let media = self.media().get(&session).cloned();
+        Box::pin(async move {
+            let captured = match media {
+                Some(media) => media.turn_audio(segment_id),
+                None => {
+                    self.sidecar
+                        .as_ref()?
+                        .take(session, segment_id, cancellation)
+                        .await
+                }
+            }?;
+            Some(TurnAudio {
+                samples: captured.samples,
+                playback_overlap: captured.playback_overlap,
+                single_segment: captured.single_segment,
+            })
+        })
+    }
+}
 
 /// The format the online recogniser requires: 24 kHz mono signed 16-bit.
 const CAPTURE_RATE_HZ: u32 = 24_000;
@@ -363,6 +452,121 @@ pub(crate) mod test_frames {
     /// An utterance at `[start, end)` of this module's capture epoch.
     pub(crate) fn evidence(start: u64, end: u64) -> UtteranceCaptureEvidence {
         evidence_in(DOMAIN, EPOCH, start, end)
+    }
+}
+
+#[cfg(test)]
+mod gateway_turn_audio_tests {
+    use std::sync::Arc;
+
+    use conversation_model_adapters::{CaptureObserver, SidecarTurnAudio};
+    use conversation_protocol::SessionId;
+    use conversation_runtime::TurnAudioSource;
+    use futures_util::FutureExt;
+    use tokio_util::sync::CancellationToken;
+
+    use super::test_frames::{evidence, timed_run};
+    use super::{GatewayTurnAudio, MediaTurnAudio};
+
+    const SESSION: SessionId = SessionId::new(7);
+    const OTHER: SessionId = SessionId::new(8);
+    const BASE: u64 = 480_000;
+
+    /// A buffer holding 2 s of `value`, with segment 3 covering its middle second.
+    fn media_audio(value: i16) -> Arc<MediaTurnAudio> {
+        let audio = Arc::new(MediaTurnAudio::new());
+        for frame in timed_run(1, BASE, 100, value) {
+            audio.observe(&frame, false);
+        }
+        audio.note_final(3, Some(&evidence(BASE + 12_000, BASE + 36_000)));
+        audio
+    }
+
+    #[tokio::test]
+    async fn a_session_with_media_audio_is_answered_from_its_buffer() {
+        let source = Arc::new(GatewayTurnAudio::new(Some(SidecarTurnAudio::new())));
+        let _registration = source.register_media(SESSION, media_audio(1000));
+
+        // Answered at once from the buffer, never waiting on the sidecar handle.
+        let turn = source
+            .turn_audio(SESSION, 3, CancellationToken::new())
+            .now_or_never()
+            .expect("media audio is answered without waiting")
+            .expect("the segment is buffered");
+        assert_eq!(turn.samples.len(), 16_000);
+        assert!(turn.single_segment);
+        assert!(!turn.playback_overlap);
+        let expected = 1000.0 / 32_768.0;
+        assert!(turn
+            .samples
+            .iter()
+            .all(|sample| (sample - expected).abs() < 1e-4));
+
+        // A segment the buffer never saw has no audio, also at once.
+        assert_eq!(
+            source
+                .turn_audio(SESSION, 4, CancellationToken::new())
+                .now_or_never(),
+            Some(None)
+        );
+    }
+
+    #[tokio::test]
+    async fn other_sessions_are_answered_by_the_sidecar_handle() {
+        let source = Arc::new(GatewayTurnAudio::new(Some(SidecarTurnAudio::new())));
+        let _registration = source.register_media(SESSION, media_audio(1000));
+
+        // Another session goes to the sidecar handle, which waits for audio no sidecar
+        // session has offered yet, and gives nothing once cancelled.
+        let cancellation = CancellationToken::new();
+        let mut request = source.turn_audio(OTHER, 3, cancellation.clone());
+        assert!((&mut request).now_or_never().is_none(), "the handle waits");
+        cancellation.cancel();
+        assert_eq!(request.await, None);
+    }
+
+    #[tokio::test]
+    async fn dropping_the_registration_forgets_the_session() {
+        let source = Arc::new(GatewayTurnAudio::new(None));
+        let registration = source.register_media(SESSION, media_audio(1000));
+        drop(registration);
+        assert_eq!(
+            source
+                .turn_audio(SESSION, 3, CancellationToken::new())
+                .now_or_never(),
+            Some(None)
+        );
+
+        // A later voice session reuses the gateway session's id. Its registration replaces
+        // the stale one, and dropping the stale one never removes the newer session's.
+        let stale = source.register_media(SESSION, media_audio(1000));
+        let current = source.register_media(SESSION, media_audio(-2000));
+        drop(stale);
+        let turn = source
+            .turn_audio(SESSION, 3, CancellationToken::new())
+            .now_or_never()
+            .flatten()
+            .expect("the current session's buffer still answers");
+        let expected = -2000.0 / 32_768.0;
+        assert!((turn.samples[8_000] - expected).abs() < 1e-4);
+        drop(current);
+        assert_eq!(
+            source
+                .turn_audio(SESSION, 3, CancellationToken::new())
+                .now_or_never(),
+            Some(None)
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_sidecar_handle_or_media_audio_there_is_no_audio() {
+        let source = Arc::new(GatewayTurnAudio::new(None));
+        assert_eq!(
+            source
+                .turn_audio(SESSION, 1, CancellationToken::new())
+                .now_or_never(),
+            Some(None)
+        );
     }
 }
 

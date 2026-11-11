@@ -42,6 +42,7 @@ tests; see `docs/HUMAN-CHECKLIST.md` for the virtual-environment setup.
 | Structured text processing (`processText`) | `crates/runtime/src/text_processing.rs` |
 | Ordered online transcription | `crates/model-adapters/src/openai_speech_recognition.rs`, `docs/online-transcription.md` |
 | Anonymous after-the-fact diarization | `crates/model-adapters/src/diarization.rs`, `speechbrain_diarization.rs`, `openai_diarization.rs`, `platform/diarization-sidecar` |
+| Speaker identity live inputs (sidecar turn audio, media-bridge audio, name claims) | `apps/runtime-gateway/src/speaker_audio.rs`, `speaker_identity.rs`, `crates/runtime/src/speaker_claim_detector.rs`, `docs/voice-sidecar-protocol.md` |
 | Shared typed/spoken conversation context | `crates/runtime/src/conversation_context.rs` |
 | Persona, modes, response limits, corrections | `crates/runtime/src/conversation_quality.rs` |
 | Controlled local memory | `crates/memory/src/`, `docs/r5-controlled-memory-evaluation.md` |

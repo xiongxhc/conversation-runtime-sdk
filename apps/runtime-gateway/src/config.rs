@@ -18,8 +18,9 @@ use conversation_model_adapters::{
     OpenAiCompatibleStreamingSpeechConfig, OpenAiCompatibleStreamingSpeechSynthesizer,
     OpenAiDiarizationConfig, OpenAiLanguageConfig, OpenAiLanguageModel,
     OpenAiSpeechRecognitionConfig, OpenAiTranscriptionDiarizer, SidecarAsrBackend,
-    SpeechSynthesizer, SpeechbrainDiarizationConfig, SpeechbrainTranscriptionDiarizer,
-    StreamingSpeechSynthesizer, SystemDevice, TranscriptionDiarizer, VoiceIoFactory,
+    SidecarTurnAudio, SpeechSynthesizer, SpeechbrainDiarizationConfig,
+    SpeechbrainTranscriptionDiarizer, StreamingSpeechSynthesizer, SystemDevice,
+    TranscriptionDiarizer, VoiceIoFactory,
 };
 use conversation_protocol::{
     ClientComponentDescriptor, ComponentDescriptor, ComponentKind, ConversationMode,
@@ -38,6 +39,7 @@ use crate::media_server::{
     MediaServerConfig, MediaTlsConfig, DEFAULT_MEDIA_PACKET_READ_TIMEOUT_MS,
 };
 use crate::memory_extraction::MemoryExtractionSettings;
+use crate::speaker_identity::GatewaySpeakerIdentity;
 use crate::voice_adapters::{GatewayVoiceAdapters, VoicePolicyTemplate};
 
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
@@ -140,6 +142,9 @@ pub struct GatewayAdapters {
     /// Optional transport listener configuration. `main` owns the resulting server;
     /// configuration loading never binds a socket.
     pub media: Option<MediaServerConfig>,
+    /// Speaker identification, when `[speaker_identity]` is configured. Absent in the default
+    /// configuration, which identifies no one.
+    pub speaker_identity: Option<GatewaySpeakerIdentity>,
     pub status: RuntimeStatus,
 }
 
@@ -778,11 +783,21 @@ impl GatewayConfig {
                 .with_memory_provider(Arc::new(provider), ExecutionLocation::Local)
                 .map_err(runtime_error)?;
         }
+        if speaker_identity.is_some() {
+            context = context.with_speaker_identity();
+        }
 
         let voice = self
             .voice
             .as_ref()
-            .map(|voice| voice.build(self.privacy_mode.into(), components, provider_endpoints))
+            .map(|voice| {
+                voice.build(
+                    self.privacy_mode.into(),
+                    components,
+                    provider_endpoints,
+                    speaker_identity.is_some(),
+                )
+            })
             .transpose()?;
 
         let recording = self
@@ -797,9 +812,11 @@ impl GatewayConfig {
             .map(VoiceDiarizationConfig::diarizer)
             .transpose()?;
         // Last, so a configuration refused here has passed every other rule.
-        if speaker_identity.is_some() && voice_embedder.is_none() {
-            return Err(voice_embedding_model_unavailable());
-        }
+        let speaker_identity = match (speaker_identity, voice_embedder) {
+            (Some(settings), Some(embedder)) => Some(GatewaySpeakerIdentity { settings, embedder }),
+            (Some(_), None) => return Err(voice_embedding_model_unavailable()),
+            (None, _) => None,
+        };
 
         Ok(GatewayAdapters {
             context,
@@ -811,6 +828,7 @@ impl GatewayConfig {
             recording,
             diarizer,
             media,
+            speaker_identity,
             status,
         })
     }
@@ -1167,6 +1185,7 @@ impl VoiceConfig {
         privacy_mode: ProtocolPrivacyMode,
         components: Vec<ComponentDescriptor>,
         provider_endpoints: Option<ProviderEndpointOverrides<'_>>,
+        speaker_identity: bool,
     ) -> Result<GatewayVoiceAdapters, GatewayConfigError> {
         let policy = VoicePolicyTemplate::new(
             privacy_mode,
@@ -1176,7 +1195,7 @@ impl VoiceConfig {
         )
         .map_err(runtime_error)?;
 
-        let (io, online_recognition) = match self.asr.backend {
+        let (io, online_recognition, sidecar_turn_audio) = match self.asr.backend {
             VoiceAsrBackend::Whisperkit | VoiceAsrBackend::Sensevoice => {
                 let model_path = self
                     .asr
@@ -1204,9 +1223,15 @@ impl VoiceConfig {
                 if matches!(self.asr.backend, VoiceAsrBackend::Sensevoice) {
                     sidecar = sidecar.with_asr_backend(SidecarAsrBackend::Sensevoice);
                 }
+                // One handle: the sidecar session fills it, speaker identity reads it.
+                let turn_audio = speaker_identity.then(SidecarTurnAudio::new);
+                if let Some(turn_audio) = &turn_audio {
+                    sidecar = sidecar.with_turn_audio(turn_audio.clone());
+                }
                 (
                     Arc::new(MacOsVoiceSidecar::new(sidecar)) as Arc<dyn VoiceIoFactory>,
                     None,
+                    turn_audio,
                 )
             }
             VoiceAsrBackend::OpenaiStreaming => {
@@ -1220,6 +1245,7 @@ impl VoiceConfig {
                 (
                     GatewayVoiceAdapters::unavailable_online_io(),
                     Some(recognition),
+                    None,
                 )
             }
         };
@@ -1232,6 +1258,7 @@ impl VoiceConfig {
             )?,
             policy,
             online_recognition,
+            sidecar_turn_audio,
         })
     }
 }
